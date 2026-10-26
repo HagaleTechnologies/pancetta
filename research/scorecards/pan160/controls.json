@@ -1,0 +1,5085 @@
+{
+  "config": {
+    "a7_enabled": false,
+    "a7_freq_window_hz": 6.25,
+    "a7_snr7_threshold": 6.0,
+    "a7_snr7b_threshold": 1.8,
+    "a8_qso_state_ap_enabled": false,
+    "acceptance_gating_enabled": false,
+    "adaptive_ldpc_iters": false,
+    "ap4_full_message_mask_enabled": true,
+    "ap_dt_history_enabled": false,
+    "ap_injection_post_normalization": false,
+    "ap_llr_magnitude": 15.0,
+    "auto_passband_enabled": false,
+    "bicm_id_em_reestimation": false,
+    "bicm_id_iterations": 0,
+    "bicm_id_max_unsatisfied_checks": 18,
+    "block_score_rerank": true,
+    "bp_offset_subtract": 0.0,
+    "coherent_multipass_iterations": 3,
+    "coherent_subtract_full_frame_reference_enabled": false,
+    "coherent_subtract_full_frame_time_varying_enabled": false,
+    "coherent_subtract_mrc_threshold": 0.0,
+    "content_ap_enabled": false,
+    "costas_half_loop_disabled": false,
+    "costas_partial_metric_enabled": false,
+    "costas_two_baseline_enabled": false,
+    "costas_two_baseline_norm_threshold": 1.2,
+    "costas_two_baseline_percentile": 0.4,
+    "costas_two_baseline_tight_steps": 20,
+    "cq_ap_enabled": false,
+    "cross_cycle_averaging": true,
+    "cross_cycle_coherent": true,
+    "cross_cycle_coherent_mrc": true,
+    "cross_cycle_content_guard": null,
+    "cross_sequence_a7_enabled": false,
+    "cycle_audio_smoothing_enabled": false,
+    "deep_iters": 100,
+    "dt_history_enabled": false,
+    "dt_history_freq_window_hz": 25.0,
+    "dt_history_window_floor_s": 0.2,
+    "dt_history_window_iqr_scale": 3.0,
+    "escalation_enabled": false,
+    "escalation_parity_max": 30,
+    "fine_fft_rect_window": false,
+    "fine_sync_enabled": false,
+    "floor_candidates": 50,
+    "floor_iters": 25,
+    "fourth_pass_after_a7_enabled": false,
+    "ft8lib_sync_seeds_enabled": false,
+    "full_scale_subtraction_enabled": false,
+    "gaussian_ramp_subtract_enabled": false,
+    "gaussian_ramp_subtract_fraction": 0.11,
+    "impulse_robust_llr": null,
+    "joint_pair_retry": true,
+    "joint_residual_sync_relax_db": 0.0,
+    "joint_residual_sync_window_bins": 8,
+    "layered_bp": true,
+    "ldpc_feedback_attenuate_factor": 0.5,
+    "ldpc_feedback_boost_factor": 1.5,
+    "ldpc_feedback_erase_threshold": 1.0,
+    "ldpc_feedback_refinement_enabled": false,
+    "ldpc_iterations": 30,
+    "linear_power_averaging": false,
+    "llr_metric": "DualMax",
+    "llr_target_variance": 32.0,
+    "llr_whitening_enabled": false,
+    "max_ap_hypotheses": 8,
+    "max_ap_qsos": 4,
+    "max_candidates": 50,
+    "max_decode_passes": 1,
+    "max_parity_errors_for_osd": 6,
+    "max_sync_candidates": 100,
+    "min_ap_decode_confidence": 0.550000011920929,
+    "min_content_ap_confidence": 0.6000000238418579,
+    "min_sync_score": 3.0,
+    "neural_osd_enabled": true,
+    "nms_enabled": false,
+    "nms_freq_radius": 2,
+    "nms_score_delta_db": 0.0,
+    "nms_time_radius": 8,
+    "nsym_combining_enabled": false,
+    "osd_depth": null,
+    "osd_input": "BpPosterior",
+    "osd_npre2_preprocessing_enabled": false,
+    "pade_atanh": true,
+    "per_bin_candidate_selection": false,
+    "per_candidate_freq_tracker_alpha": 0.2,
+    "per_candidate_freq_tracker_enabled": false,
+    "per_candidate_freq_tracker_max_error_hz": 5.0,
+    "per_candidate_freq_tracker_max_step_hz": 1.5,
+    "protocol": "Ft8",
+    "relaxed_sync_near_partner_hz_radius": null,
+    "relaxed_sync_near_partner_score_delta": 0.0,
+    "residual_energy_stop_db": null,
+    "residual_min_sync_score": null,
+    "residual_snr_diagnostic": false,
+    "residual_snr_gate_db": null,
+    "sample_rate": 12000,
+    "soft_combiner_capacity": 256,
+    "soft_combiner_enabled": false,
+    "soft_combiner_key_tolerance": 0,
+    "soft_combiner_ttl_seconds": 180,
+    "sync_time_interp_delta_scale": 0.3,
+    "sync_time_interp_linear_power": false,
+    "sync_time_interp_max_delta_abs": null,
+    "sync_time_interp_score_gate": 0.0,
+    "sync_time_interpolation": true,
+    "three_method_spectral_sweep_enabled": false,
+    "three_stage_sync_cascade_enabled": false,
+    "time_varying_subtraction_enabled": false
+  },
+  "noise_accepted_messages_are_false_positives": true,
+  "noise_seed_range": [
+    2000,
+    2099
+  ],
+  "noise_truth": [],
+  "records": [
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.720544796,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.704472452,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "32caf698cd5cca9d082608cdd9ae796be8c4f17b71cb2dac2d033c2fc64d8c72",
+      "kind": "no-context",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.773102923,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.721754993,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "32caf698cd5cca9d082608cdd9ae796be8c4f17b71cb2dac2d033c2fc64d8c72",
+      "kind": "one-sighting",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.73109275,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.725604082,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "32caf698cd5cca9d082608cdd9ae796be8c4f17b71cb2dac2d033c2fc64d8c72",
+      "kind": "stale",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.69208564,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.730669166,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "32caf698cd5cca9d082608cdd9ae796be8c4f17b71cb2dac2d033c2fc64d8c72",
+      "kind": "wrong-sender",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.708432032,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.68260476,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "77cc26023f50d82dcde44b2fb56688eb56db9cb9afbb3af3b6308ec6d7a53ee1",
+      "kind": "shifted-dt",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.658394907,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.659973426,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a203cfed72ac59b9cea08fd8d06f94e1354b79e6355ca6a994f80aab6b32001b",
+      "kind": "noise-only",
+      "seed": 2000
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.624111718,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.627874924,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "e84bf3002bdb323e2bc2d3109fa65ded822cd6de26d3c0f00c84872502939c8b",
+      "kind": "noise-only",
+      "seed": 2001
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.621083837,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.741196705,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c67209271ca0a37cdd82420556002973408c950ac490151421333fa5c6a12016",
+      "kind": "noise-only",
+      "seed": 2002
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.607283035,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.605471539,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b5a098352a5c139444a2c4daaa3fb87b7660c74591b4124bb3c9291e12bb80cd",
+      "kind": "noise-only",
+      "seed": 2003
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.581437597,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.586295601,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "26e914f3577cea078cd8db27ded392ba105ba6c1e175c51c6144149b09be303d",
+      "kind": "noise-only",
+      "seed": 2004
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.745253987,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.703457211,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "2dccff11f52b1b75068e5fa6922c1bb9deb3f99ee3eac42e4c0e4dbdfc965637",
+      "kind": "noise-only",
+      "seed": 2005
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.75804204,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.810021511,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ee20a9a8b036353e1dd9d5ab75ca3c66aa37fd0e0d64cc98a664683702cd9fa1",
+      "kind": "noise-only",
+      "seed": 2006
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.729563904,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.676911611,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "f1ec8fad35186368ec9c8ea4c38c569dcb4f8a682629a3d45ea9c465c37f2a32",
+      "kind": "noise-only",
+      "seed": 2007
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.625421252,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.672624512,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1b247afa9e6ac7720a42f7171ccd0c9bbfac707fcb26f8bcce72266460e7aace",
+      "kind": "noise-only",
+      "seed": 2008
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.788991911,
+          "enabled": false,
+          "messages": [
+            "IZVV79TXHX <...>"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.730374994,
+          "enabled": true,
+          "messages": [
+            "IZVV79TXHX <...>"
+          ]
+        }
+      ],
+      "audio_sha256": "a3f9967bdb65e3485a40f2407a53c79dc9ca793407e3d5bafff93221f9a64cc9",
+      "kind": "noise-only",
+      "seed": 2009
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.610931454,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.674818171,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "0f3b1dd684163e8164124c199dac5f96cb9ba2800901bc6ac011163932d48994",
+      "kind": "noise-only",
+      "seed": 2010
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.67087585,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.631799879,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c11737dd21075db84e71f77f876c66ec34c0beb8d1aac474789a4172f327a988",
+      "kind": "noise-only",
+      "seed": 2011
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.690103439,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.693320047,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7deb8e212b6fa7bcdf190833c9dd1a845d772f92e412fe139a5e2a2353c9bdce",
+      "kind": "noise-only",
+      "seed": 2012
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.649253363,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.673872468,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "5f6a1d3fbe6981688ffa9bf655c28b8a1b677b28950e53f4fda9f2f858e7e380",
+      "kind": "noise-only",
+      "seed": 2013
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.644458691,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.637714102,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "888acbd73f7ff94a8cc33749a17185b66b8e1d06abd7871a780ed57d8ac235db",
+      "kind": "noise-only",
+      "seed": 2014
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.586189537,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.605064743,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a27e02ed609f4cece0849e8765fb70a5a80d714a86cdfaed0d0ae68536354da1",
+      "kind": "noise-only",
+      "seed": 2015
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.665937645,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.649660684,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7d0db9d930f7f2c6918df5141bee14e0294c44a35c219f2e4c36a13d84b6e903",
+      "kind": "noise-only",
+      "seed": 2016
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.651941473,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.645261015,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "e5ea406fe326a5004dea35562993442e1709e6fb5426703f2d370bff1859e7b6",
+      "kind": "noise-only",
+      "seed": 2017
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.665132383,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.721622766,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "5c55ea39e1b297d331594221576b453be634be62465f5568e2a7e3033f0b1a74",
+      "kind": "noise-only",
+      "seed": 2018
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.653940074,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.616418023,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "6d62a9d0f05e7a9563ad3d7ff42bf37af68071bca2855d8aea84cf74c3bded0f",
+      "kind": "noise-only",
+      "seed": 2019
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.77013954,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.762525216,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "30af60cff1b4f03b9f0baf5f7baab689a961daba0ef1fef189830eb9c9d9c0c4",
+      "kind": "noise-only",
+      "seed": 2020
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.676723039,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.664011362,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "59b9e1bd794f0ec2c0ca3915972bcb228db966189a12b984b4ff800cdd7bf82a",
+      "kind": "noise-only",
+      "seed": 2021
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.776557049,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.811880228,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a375fb171f00920e146765e0575664ca1a14f5f6fac5105c5625941c8573ea10",
+      "kind": "noise-only",
+      "seed": 2022
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.690126661,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.709568854,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b503fba776fb6744467fb881cf6ee0c790508995a7de62bb8c16215cc862e4d5",
+      "kind": "noise-only",
+      "seed": 2023
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.68360367,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.724682248,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1fbb9e7faf26a3ce6931f9e6b9fef5e1cbedfd67589b623eb4ed98f698a59da6",
+      "kind": "noise-only",
+      "seed": 2024
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.746122547,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.634377217,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c74cc9da41aa212a7d5af0341cf0678643d3a1b5489670c3d5d8b81ca352efa2",
+      "kind": "noise-only",
+      "seed": 2025
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.766576564,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.702382138,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "2047c9e6b8e359f6ac0ed08964007e696607e40b1b330f5009a212ea5bd9d480",
+      "kind": "noise-only",
+      "seed": 2026
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.658775288,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.639712239,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "cd117f156517b755ff8aab76327eef9e8fda8604fc2bf71c5ed12883aff0ffac",
+      "kind": "noise-only",
+      "seed": 2027
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.690079651,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.655629606,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "3efbf255eaeaf65cfddaf3b3bc2a2e65514da708c9fcf29f06b74d34e40f2733",
+      "kind": "noise-only",
+      "seed": 2028
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.76716722,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.744402292,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a3e542d8bb0552b9a731ad150f43b68ab2b209b7b619e22bbae102f62734d140",
+      "kind": "noise-only",
+      "seed": 2029
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.769754146,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.801177042,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "49f76e65b6fb1720cd1e079673e8960998eaff46b0b33bb4b2e07c428127283f",
+      "kind": "noise-only",
+      "seed": 2030
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.773427263,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.65914508,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ade6bf4107c3fc2a591d7640d095122c18644125a5c38b581f748a3dfa9305bf",
+      "kind": "noise-only",
+      "seed": 2031
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.742356891,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.739269448,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "3c4c7adf7be95649055ea5ba84520b6a4d270dcf2fce0a93c87dc66f4890179e",
+      "kind": "noise-only",
+      "seed": 2032
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.610091401,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.601017161,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "42c08a5ac96cfc5eea6da15801dad6a07d862dacc294611014f041dc40a0aefd",
+      "kind": "noise-only",
+      "seed": 2033
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.603452831,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.622814673,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "fb79be8915c76e21ea3e1adeb9b04381a96cd261c45b87e543339b12faf656b9",
+      "kind": "noise-only",
+      "seed": 2034
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.720641662,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.675378536,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "5f7ed0abe64d613ae9d4290fc3b9d6796769d841fe4779ede689f018f97d1d66",
+      "kind": "noise-only",
+      "seed": 2035
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.607654934,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.579180852,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "eb7de5922a79162361f8c42c7fb88d108b2d6e02f7beb52c3c5b1d016ba76c51",
+      "kind": "noise-only",
+      "seed": 2036
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.539133402,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.549108847,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "90adc40c085f4779df8dcf4b34186ceb86706622a455454f7e89bbb6c208c273",
+      "kind": "noise-only",
+      "seed": 2037
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.628458929,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.630526637,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "27a9ede4fc765549649651431573ce2d50e339c3fb050109355bd80caf3d7713",
+      "kind": "noise-only",
+      "seed": 2038
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.643571602,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.678656355,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ff02d48bdeab789ca906e42a03acb62e779fa0594d425b33ec8ecc18f003d309",
+      "kind": "noise-only",
+      "seed": 2039
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.675112993,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.620594476,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ba1c80fdc0ccb1506adb1ba2a09d7b6aa8510c367b5b0cfb76e7a26f13a8c245",
+      "kind": "noise-only",
+      "seed": 2040
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.622940128,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.66846097,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "13e8085bceddc57bfab99c29a332caa9006cd09131a229b6afbffc81df50dbc3",
+      "kind": "noise-only",
+      "seed": 2041
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.646737269,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.585323739,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7899321b32d896293231cb8073e788147e0788a6fe57d8f998d164a21cc596f6",
+      "kind": "noise-only",
+      "seed": 2042
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.696739207,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.725254107,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "769fd99a927c8276296cdf6bc4bb3cb3d6e32d2d4d49f3174c86a171b257a309",
+      "kind": "noise-only",
+      "seed": 2043
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.604474655,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.616500104,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7393a5ebd64053e7ee36ef044c45ee20f52dddd1aa28c804e534ba172ee8ae41",
+      "kind": "noise-only",
+      "seed": 2044
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.620112547,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.638073846,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "0dcf1dd78edec89d01d02b755d941dbab5bbad48999a71b3b125f8b9a3597ad7",
+      "kind": "noise-only",
+      "seed": 2045
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.667359285,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.682028706,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "2bc95d9b398f1602f6630468854943275ab7cdfe11e8bfc7bf629619f4f33389",
+      "kind": "noise-only",
+      "seed": 2046
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.617666561,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.625061355,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "0baf153ae610d990d4ac7459d3afd272cec35c09dc6e1836689801e9ba2b2649",
+      "kind": "noise-only",
+      "seed": 2047
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.678848258,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.672966701,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "cfca22d4000bd7c4d10cddd6f3c64dda92bff2ac13b48b5836145dcccc3b1eb8",
+      "kind": "noise-only",
+      "seed": 2048
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.64582851,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.652268829,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c3c7d42120f1e755b99124081023ad132850837b53153dc64dc0e978a45faf6e",
+      "kind": "noise-only",
+      "seed": 2049
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.65338582,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.651556411,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "6e09539dbd8abebda773662c92bb834c781513bd001aa5388738b033d854a887",
+      "kind": "noise-only",
+      "seed": 2050
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.606962622,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.610667047,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "149f89d46e68aa62d498de07b67f8f6701b3e760e7ac9b87e21f5830e9a4c96b",
+      "kind": "noise-only",
+      "seed": 2051
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.60199282,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.620162731,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "47a6a8a5543bd0be4c6e2d02e064921e914263101363243f1ebe2c7f95c450f5",
+      "kind": "noise-only",
+      "seed": 2052
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.670347423,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.721064426,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a9809cf0efb26b139d06ea4bc26ce4ebe72a1ca1b1553cd007d400dcefafb507",
+      "kind": "noise-only",
+      "seed": 2053
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.63279851,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 38
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.74260235,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1f8876ce8f3cf6413b9e31a4f88a8d1ad3aa1416680f7713ebaf488cc2e7f6ca",
+      "kind": "noise-only",
+      "seed": 2054
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.636057809,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 38
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.629503567,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1d1a01e189e4d22f08fe09db7fa19103c100d4a947ed5fed2d53837e8180eeed",
+      "kind": "noise-only",
+      "seed": 2055
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.634356282,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.686997462,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c31dd6ab616d7df88af8dedc62be94419cab8235b0295ee11fa5094b80cd850c",
+      "kind": "noise-only",
+      "seed": 2056
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.654882955,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.712188134,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "8eeb1a60dc5b310bc14be951fd3937fdf59937ff4b95071d72a9664917232130",
+      "kind": "noise-only",
+      "seed": 2057
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.659913274,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.731409754,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "32a1475a383f701113b6f4a553e6ac35f4e957940baa810e61b8eb381cc136f9",
+      "kind": "noise-only",
+      "seed": 2058
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.752884058,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.722213896,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "51860676daed93c532b3ca2ba8b171dc4f2e0ee3b2ff60483d1a94dfdeee80e2",
+      "kind": "noise-only",
+      "seed": 2059
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.626857018,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.665343517,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "42419f9d73f83fc62d3658a943393fd85efe80f7d776898272dc6d0d99e40f6c",
+      "kind": "noise-only",
+      "seed": 2060
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.7280489,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.627881426,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "e98fd443781aada82844dafcf40dcc4b5c5bd7b9cfc917b289d425dda115238e",
+      "kind": "noise-only",
+      "seed": 2061
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.651120117,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.653637331,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "864ca1b00184e85dc49dd7b39ade6ba3f7858ec9b2585f9cf3155564b7c3101c",
+      "kind": "noise-only",
+      "seed": 2062
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.544908942,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.533473622,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b3b20842776fdd478b57a3ae86da67396ec8a90e12d6cab770663cf706ce9886",
+      "kind": "noise-only",
+      "seed": 2063
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.600287359,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.597731104,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "72232707ca80db85a12d59f1864f77f476a20935bc7525201bbc895308580128",
+      "kind": "noise-only",
+      "seed": 2064
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.627859489,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.635494804,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "f17d47dd4b77599cb9fbb84fcd8202df458bfa3bef2520293efa7b868ecaa358",
+      "kind": "noise-only",
+      "seed": 2065
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.619669802,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.68256365,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a3096e4987f93bdb2222cbd2822af99f6cedb15f7a2a1ca8b4e8ccb2abf84442",
+      "kind": "noise-only",
+      "seed": 2066
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.697855091,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.713097499,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "f52b61af733e46005d5d0d6366add5241bf15d3a0a8e5bdb6d6d72e748da7c61",
+      "kind": "noise-only",
+      "seed": 2067
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.688406698,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 42
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.620708269,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "989def76499ed4e249ebdf3a468b14a4b97ccd3cb2c96c7196f22f7a6cd6c62e",
+      "kind": "noise-only",
+      "seed": 2068
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.609129681,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.678730498,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b56780319646016099241daf6f661ebbfe3ce07d757d4c4cf5bc68c3e216b1c7",
+      "kind": "noise-only",
+      "seed": 2069
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.62326636,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.633746615,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "43d0e92e82fa5d8375882be70058399b97f34ad8c672853457fff64e02dd3440",
+      "kind": "noise-only",
+      "seed": 2070
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.702808479,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.793445238,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "4aef89b87a3a485c38a6d5bdf7728afaddbb4aa6f55c8ccfa4965555e9ddfced",
+      "kind": "noise-only",
+      "seed": 2071
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.732313384,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.764991293,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a7f52839a1b3b4d71b6d53bc3589cc6fd1a2b09f57cb5f16aeb7f7d03eb87d49",
+      "kind": "noise-only",
+      "seed": 2072
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.63334835,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.666707339,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b998a7310f3a269656f9276e6adbe02d297fdf927af668cc8c2cf2a03161ec01",
+      "kind": "noise-only",
+      "seed": 2073
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.63112452,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.618267488,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ba529438be09a976115cbc2dfc5911bfc5829151f94be4c9a2efc7dae08c2343",
+      "kind": "noise-only",
+      "seed": 2074
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.80103296,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.879141495,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "23f122e105701239e2ac3b4ceaec581a86577797648c95fa1fa5f4138776c458",
+      "kind": "noise-only",
+      "seed": 2075
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.675131171,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.674423261,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "578de7b62cc1e998fa1ad2ea8c57d70f6ea7812217e370d879ebaad45959eec7",
+      "kind": "noise-only",
+      "seed": 2076
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.83329985,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.767882889,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ddb82acda13453b416b0c2a2918fc5900f31f03b91398e4dba808382bf37bffd",
+      "kind": "noise-only",
+      "seed": 2077
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.722458044,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.859247337,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "bc8fb8efde9a5344d40a746e8f532b5ee9ec0ec25de10a183825d6419743e12b",
+      "kind": "noise-only",
+      "seed": 2078
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.718033689,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.763779698,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "69b22b983a03bc27f2b37a82fbaa75b90f3b7047e1745b09a28b1964423c1747",
+      "kind": "noise-only",
+      "seed": 2079
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.817641335,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.818382059,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "70db41259614f1a75763e021b321b8ca64fef2d3b7969579533f48a8c0147e82",
+      "kind": "noise-only",
+      "seed": 2080
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.800973661,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.818236859,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b9ff06747793d4a04a51b87ece3400624193494d578bd3caeb7c9a19b914a117",
+      "kind": "noise-only",
+      "seed": 2081
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.836534762,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.819231511,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "6941d14cda5aa558ca86283f96af3b6f42c619334174dd22e98c52097085c61e",
+      "kind": "noise-only",
+      "seed": 2082
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.719682916,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.649486157,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "6e33aa505ae12f6708f20ac871c8d2647fddbc4752ba9c26426c978ee6e50203",
+      "kind": "noise-only",
+      "seed": 2083
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.808237032,
+          "enabled": false,
+          "messages": [
+            "CT8LIU I35HZB/P R CN11"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.700008508,
+          "enabled": true,
+          "messages": [
+            "CT8LIU I35HZB/P R CN11"
+          ]
+        }
+      ],
+      "audio_sha256": "dc76a097718d290cc585de307171d6a19e78550aa499a5c0bfefd3fc6bd58d1a",
+      "kind": "noise-only",
+      "seed": 2084
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.696604679,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.734040675,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "885428f5b1277e58faeccc8ccc5b37706c5786049e290221500fd8a542421c92",
+      "kind": "noise-only",
+      "seed": 2085
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.830613056,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.760249293,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "438dc2ba188bb556fa5600530f1a2f3a27a5a3d7a40ee2a5b6d183bc48b29a41",
+      "kind": "noise-only",
+      "seed": 2086
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.651429656,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.733539697,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "27aa17fdf62a0f96e8c65b12a505415e7e85f9d8ad7cbfae78d14eb00b34b893",
+      "kind": "noise-only",
+      "seed": 2087
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.801999802,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.777103925,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "34c163a08ef8f49e272652d18d790701567f97fa8fec73c1bff6e2c13583df2e",
+      "kind": "noise-only",
+      "seed": 2088
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.860164874,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.794153744,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "d97f716a373c1f3967553e4d34ea7f2de11f44142f8021176894497c3a88e64c",
+      "kind": "noise-only",
+      "seed": 2089
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.597066099,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.75512226,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "5cbaa42caf2c66842267299730ffd2dc456efd28fa81a206fe32b763f00aac52",
+      "kind": "noise-only",
+      "seed": 2090
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.684118752,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.641723533,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "501f76931cdf79b47cd0c5c02e5fef54206c21976e8e5364dd334651401f371a",
+      "kind": "noise-only",
+      "seed": 2091
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.725063908,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.706671899,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "218121fb1db6171cbe73c38957113813d7cc08cfc4d81a35d9fd89879a32f7e3",
+      "kind": "noise-only",
+      "seed": 2092
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.595413485,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.628309336,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "4ae3dd545df78469856affd0d6ba035d9c0e0fa0e92206de6f360cceb536c261",
+      "kind": "noise-only",
+      "seed": 2093
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.690180554,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.693864451,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "12d208d5b10eb509eb45f15315de5597ea856e5eb46881d6f403b4d12e16f771",
+      "kind": "noise-only",
+      "seed": 2094
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.669947364,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.657085642,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "d192539073f331312f832fa05c3e0370d14412c8153fb964bcf1835e4add431a",
+      "kind": "noise-only",
+      "seed": 2095
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.675871824,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.62178345,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "2579feffba7540ae560ec1e17ce74f0625bd810f3a39fc470dc907c9539cba89",
+      "kind": "noise-only",
+      "seed": 2096
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.622612047,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 6,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 48
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.603315238,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "dd22616b5f553fc586802ad2aeab21d021c45ba2b4e855c9b4c08ca520586fe0",
+      "kind": "noise-only",
+      "seed": 2097
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.613659336,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 44
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.597542535,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "2c90821d3443c8a8390cc4a644d9536094a885bf0c550ed71e4d4fd2f817def8",
+      "kind": "noise-only",
+      "seed": 2098
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.613201006,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 46
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed_seconds": 0.642574804,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "4eb74fdfd90d06dedc4083667a026b1740237f788f6f55c7de1833653196afef",
+      "kind": "noise-only",
+      "seed": 2099
+    }
+  ],
+  "version": 1
+}
