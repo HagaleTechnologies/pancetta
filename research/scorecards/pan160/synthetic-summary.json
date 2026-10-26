@@ -1,0 +1,911 @@
+{
+  "bootstrap_n": 1000,
+  "mean_delta_ci95": [
+    0.0,
+    0.0
+  ],
+  "session_bootstrap_seed": 45063,
+  "sessions": [
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.24328627,
+      "control_novel": [
+        [
+          0,
+          "ZB6FWX ZB7PYH/P R EB37"
+        ]
+      ],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.283080261,
+      "trial_novel": [
+        [
+          0,
+          "ZB6FWX ZB7PYH/P R EB37"
+        ]
+      ],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.327803063000001,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.362073484,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.995618783,
+      "control_novel": [],
+      "control_recovered": 10,
+      "eligible": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 8.225124012,
+      "trial_novel": [],
+      "trial_recovered": 10,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.390167284,
+      "control_novel": [],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.252147601,
+      "trial_novel": [],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.158216492,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.266028996999999,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.859314255,
+      "control_novel": [
+        [
+          2,
+          "MO7FOY A90EMW/P R IP43"
+        ]
+      ],
+      "control_recovered": 7,
+      "eligible": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.054678842,
+      "trial_novel": [
+        [
+          2,
+          "MO7FOY A90EMW/P R IP43"
+        ]
+      ],
+      "trial_recovered": 7,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.400163149000001,
+      "control_novel": [],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.258414875,
+      "trial_novel": [],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.048676583000001,
+      "control_novel": [],
+      "control_recovered": 10,
+      "eligible": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.1450173239999994,
+      "trial_novel": [],
+      "trial_recovered": 10,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 7,
+        "trial_recovered": 7,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.900403755,
+      "control_novel": [],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 8.158213495,
+      "trial_novel": [],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.789813790000001,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.626373871,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.568803034999999,
+      "control_novel": [],
+      "control_recovered": 7,
+      "eligible": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.838043596,
+      "trial_novel": [],
+      "trial_recovered": 7,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.69611803,
+      "control_novel": [],
+      "control_recovered": 6,
+      "eligible": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.693443757,
+      "trial_novel": [],
+      "trial_recovered": 6,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.500284781,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.4342496119999995,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.4447750699999995,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.410347896000001,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.136123671,
+      "control_novel": [],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.198748608000001,
+      "trial_novel": [],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.1616276889999995,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 7.017528211,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 7.182739384999999,
+      "control_novel": [],
+      "control_recovered": 8,
+      "eligible": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.972535589,
+      "trial_novel": [],
+      "trial_recovered": 8,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.485349391,
+      "control_novel": [],
+      "control_recovered": 9,
+      "eligible": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.4406140800000005,
+      "trial_novel": [],
+      "trial_recovered": 9,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.870078457,
+      "control_novel": [],
+      "control_recovered": 10,
+      "eligible": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.778330348999999,
+      "trial_novel": [],
+      "trial_recovered": 10,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 6,
+        "trial_recovered": 6,
+        "truth": 10
+      }
+    },
+    {
+      "cold": {
+        "control_recovered": 4,
+        "trial_recovered": 4,
+        "truth": 4
+      },
+      "completed_slots": 10,
+      "control_elapsed_seconds": 6.740278157999999,
+      "control_novel": [],
+      "control_recovered": 7,
+      "eligible": {
+        "control_recovered": 3,
+        "trial_recovered": 3,
+        "truth": 16
+      },
+      "eligible_control_slots": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "historical_slots_6_33": {
+        "control_recovered": 2,
+        "trial_recovered": 2,
+        "truth": 10
+      },
+      "lost": [],
+      "new": [],
+      "recall_delta": 0.0,
+      "status": "measured",
+      "trial_elapsed_seconds": 6.665200511999999,
+      "trial_novel": [],
+      "trial_recovered": 7,
+      "truth": 20,
+      "historical_slots_1_5": {
+        "control_recovered": 5,
+        "trial_recovered": 5,
+        "truth": 10
+      }
+    }
+  ],
+  "version": 1
+}

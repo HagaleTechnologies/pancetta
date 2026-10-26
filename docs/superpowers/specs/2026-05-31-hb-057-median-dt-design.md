@@ -179,34 +179,48 @@ Where the prior is wired:
    (production-config full sync_search) is NOT touched — its purpose is
    to surface callsigns, not exploit a history that doesn't exist yet.
 
-2. **AP path** (`par_try_ap_decode`). AP knows the candidate callsign
-   upfront (the entire mechanism is "decode the residual with this
-   callsign injected"). The sync_search that *finds* the AP position
-   can use the same DT prior to narrow time, increasing the SNR of the
-   integrated Costas score at the right t0 (narrower noise integration
-   window).
+2. **AP timing retry**, added experimentally for PAN-160. The ordinary
+   candidate and AP attempts run first. Failed AP seed frequencies can
+   receive additional timing trials near an explicitly named sender's fresh
+   prior. This requires an existing frequency seed and remains default-off.
 
-## Wire into AP — additional detail
+## AP call flow and timing coordinates
 
-`par_try_ap_decode` (called from V1 joint-pair-retry) currently:
-1. Runs `localized_costas_sync_search` to find the position.
-2. Extracts symbols at that position.
-3. Computes soft LLRs.
-4. Injects AP LLRs at the known callsign bits.
-5. `decode_soft`.
+The ordinary `par_try_ap_decode` receives a position already found by sync
+search. It extracts symbols, computes channel LLRs, injects callsign hints,
+and runs LDPC plus the existing acceptance checks. It does not itself call
+`localized_costas_sync_search`.
 
-Step 1 is where the DT prior helps: narrow the time-window before
-running Costas. Steps 2-5 are unchanged. The prior is per-known-call
-(AP2 = caller, AP1 = called); use the DT history of *whichever
-callsign the AP path is injecting at the sender position*. The sender
-maps to the bits-0-27 callsign in AP2 (and to bits-28-55 in the called
-position, but typically AP2 cares about the caller).
+With `ap_dt_history_enabled`, the shared window driver adds a bounded queue
+after ordinary candidate work. It scores legal rows within
+`median +/- max(0.2 seconds, 3 * IQR)`, skipping radii above 0.6 seconds.
+Four senders, four seed frequencies per sender and two positions per seed
+limit the queue to 32 extra LDPC calls across the entire window. Each call
+checks the decode deadline and uses only its named sender's AP hypothesis.
+
+The sender occupies payload bits 29-56; the receiver occupies bits 0-27.
+Active partners use AP3, recent callers with a local callsign use AP2, and
+recent callers without a local callsign use Caller injection. Receiver-only
+context never supplies transmitter timing. The retry also verifies the
+normalized decoded sender, including for AP2 whose legacy survival check
+only verifies the receiver.
+
+Native DT uses `(row - time_padding - 2) * spec_step / 12000`. FT8 rows
+span 0.08 seconds. Clearing fractional refinement on newly scored positions
+avoids applying the old seed's refinement to a different row. AP observations
+must come from two distinct accepted prior slots, be finite, and be no older
+than 30 minutes at the replay clock. The legacy V2 history remains separate.
+
+See [the PAN-160 experiment](../../../research/experiments/2026-10-26-pan160-timing-history.md)
+for measured results and missing original inputs. This change supplies no
+production coordinator history integration or production-default promotion.
 
 ## Configuration
 
 | config | type | default | meaning |
 |---|---|---|---|
-| `dt_history_enabled` | bool | true | master switch (also gates the storage struct from being instantiated) |
+| `dt_history_enabled` | bool | false | experimental V2 residual filter |
+| `ap_dt_history_enabled` | bool | false | independent sender-specific AP timing retries |
 | `dt_history_capacity` | usize | 10 | per-callsign ring buffer cap |
 | `dt_history_max_age_s` | f64 | 1800.0 | sighting expiry (30 min) |
 | `dt_history_window_floor_s` | f64 | 0.2 | minimum prior gate radius (the diagnostic's value) |

@@ -871,6 +871,9 @@ pub struct Ft8Config {
     /// flipping it, on this corpus, in this retest. See
     /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub dt_history_enabled: bool,
+    /// Experimental sender-specific timing retry. Independent of V2, default off.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ap_dt_history_enabled: bool,
 
     /// Minimum prior-gate radius (seconds). The gate width is
     /// `max(this, prior.iqr * dt_history_window_iqr_scale)`. Default 0.2.
@@ -1419,6 +1422,13 @@ pub struct Ft8Config {
     /// only; FT4/FT2 candidates fall back to dual-max. Default
     /// **`DualMax`** — byte-identical to the legacy path.
     pub llr_metric: LlrMetric,
+
+    /// Retry a failed DualMax FT8 AP0 candidate once with the Bessel metric.
+    /// A standard success skips the retry. The retry bypasses the soft combiner.
+    /// Disabled by default; inert for other protocols or a Bessel primary metric.
+    /// An expired decode budget skips this optional work.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bessel_fallback_enabled: bool,
 
     /// Per-iteration EM re-estimation of the
     /// block-constant (Es, N0) channel parameters inside the
@@ -2095,6 +2105,7 @@ impl Default for Ft8Config {
             // Eval harness flips this on to A/B-test the mechanism. See
             // `dt_history_window_floor_s` / `dt_history_window_iqr_scale`.
             dt_history_enabled: false,
+            ap_dt_history_enabled: false,
             dt_history_window_floor_s: 0.2,
             dt_history_window_iqr_scale: 3.0,
             // V2 default: 25 Hz = ~4 freq_bins. Set to 0.0 to fall back
@@ -2255,6 +2266,7 @@ impl Default for Ft8Config {
             // hb-253 (Batch 99): dual-max is the historical default;
             // Bessel is the probe-gated exact noncoherent metric.
             llr_metric: LlrMetric::DualMax,
+            bessel_fallback_enabled: false,
             // hb-259 (Batch 100): EM (Es, N0) re-estimation inside the
             // BICM-ID rescue. Default false — byte-identical legacy
             // path; the Batch 99 static estimator is used throughout.
@@ -2707,6 +2719,9 @@ pub struct Ft8Decoder {
     /// the union of prior-windows for callsigns decoded in the prior
     /// pass. `None` (default) restores the historical full-axis sweep.
     dt_priors: Option<std::sync::Arc<dyn crate::dt_history::DtPriorLookup>>,
+    dt_prior_time: Option<SystemTime>,
+    observe_dt_history: bool,
+    timing_diagnostics: crate::dt_history::TimingDiagnostics,
 
     /// Optional soft combiner for cross-reception LLR
     /// accumulation. Constructed eagerly when
@@ -2919,6 +2934,9 @@ impl Ft8Decoder {
             last_metrics: DecodingMetrics::default(),
             residual_snr_records: Vec::new(),
             dt_priors: None,
+            dt_prior_time: None,
+            observe_dt_history: false,
+            timing_diagnostics: Default::default(),
             soft_combiner,
             candidate_dump_enabled: false,
             candidate_dump: Vec::new(),
@@ -2939,6 +2957,24 @@ impl Ft8Decoder {
     ) -> Self {
         self.dt_priors = Some(priors);
         self
+    }
+
+    /// Observe V2 eligibility without enabling its candidate filter. Used by
+    /// the paired research control arm; ordinary decoder behavior is unchanged.
+    pub fn with_dt_history_diagnostics(mut self) -> Self {
+        self.observe_dt_history = true;
+        self
+    }
+
+    /// Fix the history query clock for deterministic offline replay.
+    pub fn with_dt_prior_time(mut self, at: SystemTime) -> Self {
+        self.dt_prior_time = Some(at);
+        self
+    }
+
+    /// Timing-history activity for the last window, independent of history size.
+    pub fn timing_diagnostics(&self) -> crate::dt_history::TimingDiagnostics {
+        self.timing_diagnostics.clone()
     }
 
     /// Drain the diagnostic accumulator. Returns the per-candidate
@@ -3223,8 +3259,14 @@ impl Ft8Decoder {
         self.residual_snr_records.clear();
         // hb-250: reset the candidate dump at the start of each window.
         self.candidate_dump.clear();
+<<<<<<< HEAD
         self.candidate_stage_raw_max
             .store(0, std::sync::atomic::Ordering::Relaxed);
+=======
+        self.timing_diagnostics = Default::default();
+        let dt_query_time = self.dt_prior_time.unwrap_or_else(SystemTime::now);
+        let mut ap_timing_state = ApTimingState::default();
+>>>>>>> d963768b62965bd077419f4284b34a05cf0881dd
         // Task 9 review fix: reset the budget-report telemetry here, at the
         // single choke point every public entry point funnels through,
         // rather than in each wrapper individually. Previously only
@@ -4112,6 +4154,7 @@ impl Ft8Decoder {
                 // hb-253 (Batch 99) demapper metric. DualMax (default)
                 // keeps the parallel paths byte-identical to legacy.
                 llr_metric: self.config.llr_metric,
+                bessel_fallback_enabled: self.config.bessel_fallback_enabled,
                 // hb-259 (Batch 100) EM channel re-estimation inside
                 // the BICM-ID rescue. false (default) = static
                 // Batch 99 estimator throughout, byte-identical.
@@ -4265,28 +4308,20 @@ impl Ft8Decoder {
                     } else {
                         &*ldpc_high
                     };
-                    // First try standard AP0 decode
-                    if let Some(msg) = par_decode_candidate(
+                    decode_candidate_with_bessel_fallback(
                         &ctx,
                         candidate,
-                        ldpc,
-                        deep_decoder.as_ref(),
-                        fft_buffer,
-                    ) {
-                        return Some(msg);
-                    }
-                    // AP0 failed — try AP-enhanced decoding if AP is active
-                    if !ctx.ap_active {
-                        return None;
-                    }
-                    // Only attempt AP decoding on candidates with reasonable sync quality.
-                    // Sync scores below 4.0 are likely noise — AP injection on noise produces
-                    // false decodes by forcing the user's callsign into random bit patterns.
-                    const MIN_SYNC_SCORE_FOR_AP: f64 = 3.0;
-                    if candidate.sync_score < MIN_SYNC_SCORE_FOR_AP {
-                        return None;
-                    }
-                    par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
+                        |attempt_ctx| {
+                            par_decode_candidate(
+                                attempt_ctx,
+                                candidate,
+                                ldpc,
+                                deep_decoder.as_ref(),
+                                fft_buffer,
+                            )
+                        },
+                        || par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass),
+                    )
                 };
 
             // Decoder-speed-overhaul Task 9: floor/budgeted candidate
@@ -4386,6 +4421,19 @@ impl Ft8Decoder {
             let per_candidate: Vec<Option<DecodedMessage>> =
                 floor_results.into_iter().chain(rest_results).collect();
 
+            let timing_decoded = if self.config.ap_dt_history_enabled {
+                self.retry_ap_timings(
+                    &ctx,
+                    &sync_candidates,
+                    &per_candidate,
+                    dt_query_time,
+                    &ldpc_init().1,
+                    &mut ap_timing_state,
+                )
+            } else {
+                Vec::new()
+            };
+            self.timing_diagnostics.ap = ap_timing_state.diagnostics.clone();
             let mut pass_decoded: Vec<DecodedMessage> = if self.candidate_dump_enabled {
                 // hb-250 premise probe: buffer per-candidate results so
                 // each sync candidate can be tagged with its decode
@@ -4418,6 +4466,8 @@ impl Ft8Decoder {
             } else {
                 per_candidate.into_iter().flatten().collect()
             };
+
+            pass_decoded.extend(timing_decoded);
 
             // hb-129: safety net — stamp any par_iter outputs that
             // weren't tagged at their CRC-pass site (par_decode_candidate /
@@ -7541,6 +7591,133 @@ impl Ft8Decoder {
     /// Extracts LLRs from the spectrogram path (cheaper than fine-timing FFT),
     /// then tries AP1 (own callsign as called station), AP2 (recent callers),
     /// AP3 (both calls known), and AP4 (AP3 + message type constraint).
+    /// Optional work runs after ordinary candidate work. All public decode
+    /// entry points share this queue, regardless of Rayon worker count.
+    fn retry_ap_timings(
+        &self,
+        ctx: &DecodeContext,
+        seeds: &[CostasCandidate],
+        results: &[Option<DecodedMessage>],
+        at: SystemTime,
+        ldpc: &LdpcDecoder,
+        state: &mut ApTimingState,
+    ) -> Vec<DecodedMessage> {
+        let mut decoded = Vec::new();
+        if !self.config.ap_dt_history_enabled
+            || self.config.protocol != Protocol::Ft8
+            || !ctx.ap_active
+        {
+            return decoded;
+        }
+        let Some(lookup) = &self.dt_priors else {
+            return decoded;
+        };
+        let last = ctx
+            .spectrogram
+            .num_steps
+            .saturating_sub(ctx.protocol_params.num_symbols * TIME_OSR + 1);
+        for sender in ap_timing_senders(ctx.ap_context) {
+            if !ctx.budget.has_time() {
+                state.diagnostics.budget_skips += 1;
+                break;
+            }
+            let Some(prior) = lookup.prior_at(&sender.call, at) else {
+                continue;
+            };
+            let rows = ap_timing_rows(
+                prior,
+                ctx.spectrogram.time_padding,
+                ctx.protocol_params.samples_per_symbol(SAMPLE_RATE) / TIME_OSR,
+                last,
+            );
+            if rows.is_empty() {
+                continue;
+            }
+            if !state.eligible.contains(&sender.call)
+                && state.eligible.len() >= AP_TIMING_MAX_SENDERS
+            {
+                continue;
+            }
+            state.eligible.insert(sender.call.clone());
+            state.diagnostics.eligible_targets = state.eligible.len() as u64;
+            for (seed, result) in seeds.iter().zip(results) {
+                if result.is_some() || seed.sync_score < 3. {
+                    continue;
+                }
+                if !ctx.budget.has_time() {
+                    state.diagnostics.budget_skips += 1;
+                    break;
+                }
+                let frequencies = state.seeds.entry(sender.call.clone()).or_default();
+                if frequencies.contains(&seed.freq_bin) || frequencies.len() >= AP_TIMING_MAX_SEEDS
+                {
+                    continue;
+                }
+                frequencies.insert(seed.freq_bin);
+                let mut positions = Vec::new();
+                for &row in &rows {
+                    for sub in 0..FREQ_OSR.min(ctx.spectrogram.freq_osr) {
+                        // Ordinary AP already tried both subbins at these rows.
+                        if seeds
+                            .iter()
+                            .any(|s| s.freq_bin == seed.freq_bin && s.time_step == row)
+                        {
+                            continue;
+                        }
+                        if !state
+                            .positions
+                            .insert((sender.call.clone(), row, seed.freq_bin, sub))
+                        {
+                            continue;
+                        }
+                        state.diagnostics.searched_rows += 1;
+                        let score =
+                            self.compute_costas_score(ctx.spectrogram, row, seed.freq_bin, sub);
+                        if score >= 3. {
+                            positions.push(CostasCandidate {
+                                time_step: row,
+                                freq_bin: seed.freq_bin,
+                                freq_sub: sub,
+                                sync_score: score,
+                                time_refinement: 0.,
+                            });
+                        }
+                    }
+                }
+                positions.sort_by(|a, b| {
+                    b.sync_score
+                        .total_cmp(&a.sync_score)
+                        .then(a.time_step.cmp(&b.time_step))
+                        .then(a.freq_sub.cmp(&b.freq_sub))
+                });
+                for position in positions.into_iter().take(AP_TIMING_MAX_POSITIONS) {
+                    if state.diagnostics.attempts >= AP_TIMING_MAX_ATTEMPTS {
+                        return decoded;
+                    }
+                    if !ctx.budget.has_time() {
+                        state.diagnostics.budget_skips += 1;
+                        return decoded;
+                    }
+                    if let Some(message) = try_ap_timing_position(
+                        ctx,
+                        &position,
+                        ldpc,
+                        &sender,
+                        &mut state.diagnostics,
+                    ) {
+                        if ap_timing_sender_matches(&message, &sender.call) {
+                            state.diagnostics.accepted += 1;
+                            decoded.push(message);
+                        } else {
+                            state.diagnostics.identity_rejections += 1;
+                        }
+                    }
+                }
+            }
+        }
+        decoded
+    }
+
     fn try_ap_decode(
         &self,
         candidate: &CostasCandidate,
@@ -8656,79 +8833,92 @@ impl Ft8Decoder {
         // `as_ref().expect("checked above")` keeps the short-circuit explicit and is
         // clearer than threading an `if let` through the flag and the large branch.
         #[allow(clippy::unnecessary_unwrap)]
-        let new_candidates: Vec<CostasCandidate> =
-            if self.config.dt_history_enabled && self.dt_priors.is_some() {
-                let lookup = self.dt_priors.as_ref().expect("checked above");
-                let sps_local = pp.samples_per_symbol(SAMPLE_RATE);
-                let spec_step_local = sps_local / TIME_OSR;
-                let floor = self.config.dt_history_window_floor_s;
-                let scale = self.config.dt_history_window_iqr_scale;
-                let freq_window = self.config.dt_history_freq_window_hz;
-                let tone_spacing = pp.tone_spacing;
+        let new_candidates: Vec<CostasCandidate> = if (self.config.dt_history_enabled
+            || self.observe_dt_history)
+            && self.dt_priors.is_some()
+        {
+            let lookup = self.dt_priors.as_ref().expect("checked above");
+            let sps_local = pp.samples_per_symbol(SAMPLE_RATE);
+            let spec_step_local = sps_local / TIME_OSR;
+            let floor = self.config.dt_history_window_floor_s;
+            let scale = self.config.dt_history_window_iqr_scale;
+            let freq_window = self.config.dt_history_freq_window_hz;
+            let tone_spacing = pp.tone_spacing;
 
-                if freq_window > 0.0 {
-                    // V2: per-candidate callsign-keyed sync.
+            if freq_window > 0.0 {
+                // V2: per-candidate callsign-keyed sync.
+                new_candidates
+                    .into_iter()
+                    .filter(|nc| {
+                        let sub_off = nc.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                        let cand_freq = nc.freq_bin as f64 * tone_spacing + sub_off;
+                        self.timing_diagnostics.v2_queries += 1;
+                        let priors = lookup.priors_near_freq(cand_freq, freq_window);
+                        if priors.is_empty() {
+                            self.timing_diagnostics.v2_without_prior += 1;
+                            // Cold-start for THIS candidate's freq — keep.
+                            return true;
+                        }
+                        let coarse_offset = candidate_offset_samples(
+                            nc.time_step,
+                            spectrogram.time_padding,
+                            spec_step_local,
+                        );
+                        let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                        self.timing_diagnostics.v2_hits += 1;
+                        let keep = priors.iter().any(|p| {
+                            let radius = floor.max(p.iqr * scale);
+                            let lo = p.median_dt - radius;
+                            let hi = p.median_dt + radius;
+                            t_s >= lo && t_s <= hi
+                        });
+                        if keep {
+                            self.timing_diagnostics.v2_inside += 1;
+                        } else {
+                            self.timing_diagnostics.v2_rejected += 1;
+                        }
+                        !self.config.dt_history_enabled || keep
+                    })
+                    .collect()
+            } else if !self.config.dt_history_enabled {
+                new_candidates
+            } else {
+                // V1 legacy path (SHELVED — retained behind
+                // freq_window=0 for back-compat).
+                let prior_windows: Vec<(f64, f64)> = decoded
+                    .iter()
+                    .filter_map(|m| m.message.from_callsign.as_deref())
+                    .filter_map(|call| {
+                        let bare = call.split('/').next().unwrap_or(call);
+                        lookup.prior(bare)
+                    })
+                    .map(|p| {
+                        let radius = floor.max(p.iqr * scale);
+                        (p.median_dt - radius, p.median_dt + radius)
+                    })
+                    .collect();
+                if prior_windows.is_empty() {
+                    new_candidates
+                } else {
                     new_candidates
                         .into_iter()
                         .filter(|nc| {
-                            let sub_off = nc.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                            let cand_freq = nc.freq_bin as f64 * tone_spacing + sub_off;
-                            let priors = lookup.priors_near_freq(cand_freq, freq_window);
-                            if priors.is_empty() {
-                                // Cold-start for THIS candidate's freq — keep.
-                                return true;
-                            }
                             let coarse_offset = candidate_offset_samples(
                                 nc.time_step,
                                 spectrogram.time_padding,
                                 spec_step_local,
                             );
                             let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
-                            priors.iter().any(|p| {
-                                let radius = floor.max(p.iqr * scale);
-                                let lo = p.median_dt - radius;
-                                let hi = p.median_dt + radius;
-                                t_s >= lo && t_s <= hi
-                            })
+                            prior_windows
+                                .iter()
+                                .any(|(lo, hi)| t_s >= *lo && t_s <= *hi)
                         })
                         .collect()
-                } else {
-                    // V1 legacy path (SHELVED — retained behind
-                    // freq_window=0 for back-compat).
-                    let prior_windows: Vec<(f64, f64)> = decoded
-                        .iter()
-                        .filter_map(|m| m.message.from_callsign.as_deref())
-                        .filter_map(|call| {
-                            let bare = call.split('/').next().unwrap_or(call);
-                            lookup.prior(bare)
-                        })
-                        .map(|p| {
-                            let radius = floor.max(p.iqr * scale);
-                            (p.median_dt - radius, p.median_dt + radius)
-                        })
-                        .collect();
-                    if prior_windows.is_empty() {
-                        new_candidates
-                    } else {
-                        new_candidates
-                            .into_iter()
-                            .filter(|nc| {
-                                let coarse_offset = candidate_offset_samples(
-                                    nc.time_step,
-                                    spectrogram.time_padding,
-                                    spec_step_local,
-                                );
-                                let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
-                                prior_windows
-                                    .iter()
-                                    .any(|(lo, hi)| t_s >= *lo && t_s <= *hi)
-                            })
-                            .collect()
-                    }
                 }
-            } else {
-                new_candidates
-            };
+            }
+        } else {
+            new_candidates
+        };
         if new_candidates.is_empty() {
             return Vec::new();
         }
@@ -10028,6 +10218,7 @@ impl Ft8Decoder {
 /// Captures all the state from `Ft8Decoder` that candidate decoding reads
 /// but never writes. Each rayon worker gets a shared `&DecodeContext` plus
 /// its own thread-local `LdpcDecoder` and FFT buffers.
+#[derive(Clone, Copy)]
 struct DecodeContext<'a> {
     protocol_params: &'a ProtocolParams,
     message_parser: &'a MessageParser,
@@ -10124,6 +10315,8 @@ struct DecodeContext<'a> {
     /// `DualMax` (default) is byte-identical to the legacy path. See
     /// `Ft8Config::llr_metric`.
     llr_metric: LlrMetric,
+    /// Optional failed-candidate Bessel AP0 retry. See `Ft8Config`.
+    bessel_fallback_enabled: bool,
     /// Per-iteration EM (Es, N0) re-estimation
     /// inside the BICM-ID rescue (Bessel metric path only). See
     /// `Ft8Config::bicm_id_em_reestimation`.
@@ -10526,6 +10719,42 @@ fn escalation_instrument(parity_errors: usize, ok: bool) {
     if let Some(file) = sink {
         let mut guard = file.lock().expect("escalation instrument mutex poisoned");
         let _ = writeln!(guard, "{parity_errors} {}", if ok { "ok" } else { "fail" });
+    }
+}
+
+/// Try the existing AP0 path first, then one candidate-local Bessel AP0 retry.
+/// The AP closure retains its original ordering and eligibility gates.
+fn decode_candidate_with_bessel_fallback<T>(
+    ctx: &DecodeContext,
+    candidate: &CostasCandidate,
+    mut ap0: impl FnMut(&DecodeContext) -> Option<T>,
+    ap: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    if let Some(result) = ap0(ctx) {
+        return Some(result);
+    }
+    if ctx.bessel_fallback_enabled
+        && ctx.llr_metric == LlrMetric::DualMax
+        && ctx.protocol_params.protocol == crate::Protocol::Ft8
+        && ctx.budget.has_time()
+    {
+        // The second pass must see fresh, single-reception LLRs. In
+        // particular it cannot accumulate the same audio a second time or
+        // evict a primary-pass bucket after a CRC success.
+        let retry_ctx = DecodeContext {
+            llr_metric: LlrMetric::Bessel,
+            soft_combiner: None,
+            ..*ctx
+        };
+        if let Some(result) = ap0(&retry_ctx) {
+            return Some(result);
+        }
+    }
+    // The pre-existing AP path only admits candidates with sufficient sync.
+    if ctx.ap_active && candidate.sync_score >= 3.0 {
+        ap()
+    } else {
+        None
     }
 }
 
@@ -26432,6 +26661,422 @@ mod impulse_robust_llr_tests {
     }
 }
 
+#[cfg(test)]
+mod bessel_fallback_tests {
+    use super::*;
+    #[cfg(feature = "transmit")]
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    #[cfg(feature = "transmit")]
+    fn rescue_samples() -> Vec<f32> {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message("CQ K1ABC FN42", None).unwrap();
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        let mut samples = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+        samples.resize(WINDOW_SAMPLES, 0.0);
+        let power = samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32;
+        let sigma = (power / 10.0f32.powf(-20.0 / 10.0) * 6000.0 / 2500.0).sqrt();
+        let mut rng = StdRng::seed_from_u64(194_445_316);
+        for pair in samples.chunks_mut(2) {
+            let u1 = rng.random_range(f32::EPSILON..1.0);
+            let u2 = rng.random_range(0.0..1.0);
+            let mag = (-2.0 * u1.ln()).sqrt() * sigma;
+            let angle = 2.0 * std::f32::consts::PI * u2;
+            pair[0] += mag * angle.cos();
+            if pair.len() == 2 {
+                pair[1] += mag * angle.sin();
+            }
+        }
+        samples
+    }
+
+    #[cfg(feature = "transmit")]
+    fn with_context(run: impl FnOnce(DecodeContext<'_>, CostasCandidate)) {
+        let decoder = Ft8Decoder::new(Ft8Config {
+            bessel_fallback_enabled: true,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+        let (audio, spectrogram, candidate) =
+            super::w2_5_acceptance_gating_tests::build_low_sync_real_signal(&decoder);
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
+            &decoder,
+            &spectrogram,
+            &audio,
+            &ap_context,
+        );
+        run(ctx, candidate);
+    }
+
+    #[test]
+    fn default_is_off() {
+        assert!(!Ft8Config::default().bessel_fallback_enabled);
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn first_success_skips_bessel_and_ap() {
+        with_context(|ctx, candidate| {
+            let mut metrics = Vec::new();
+            let mut ap_calls = 0;
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx,
+                &candidate,
+                |attempt| {
+                    metrics.push(attempt.llr_metric);
+                    Some(11)
+                },
+                || {
+                    ap_calls += 1;
+                    Some(33)
+                },
+            );
+            assert_eq!(result, Some(11));
+            assert_eq!(metrics, [LlrMetric::DualMax]);
+            assert_eq!(ap_calls, 0);
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn retry_uses_same_candidate_and_local_metric_then_short_circuits_ap() {
+        with_context(|ctx, candidate| {
+            let mut attempts = Vec::new();
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx,
+                &candidate,
+                |attempt| {
+                    attempts.push((attempt.llr_metric, attempt.soft_combiner.is_some()));
+                    (attempt.llr_metric == LlrMetric::Bessel).then_some(candidate.freq_bin)
+                },
+                || panic!("retry success must skip AP"),
+            );
+            assert_eq!(result, Some(candidate.freq_bin));
+            assert_eq!(
+                attempts,
+                [(LlrMetric::DualMax, false), (LlrMetric::Bessel, false)]
+            );
+            assert_eq!(ctx.llr_metric, LlrMetric::DualMax);
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn two_failures_reach_only_eligible_ap() {
+        with_context(|mut ctx, candidate| {
+            for (ap_active, score, expected_ap_calls) in
+                [(true, 4.0, 1), (false, 4.0, 0), (true, 2.9, 0)]
+            {
+                ctx.ap_active = ap_active;
+                let candidate = CostasCandidate {
+                    sync_score: score,
+                    ..candidate
+                };
+                let mut metrics = Vec::new();
+                let mut ap_calls = 0;
+                let result = decode_candidate_with_bessel_fallback(
+                    &ctx,
+                    &candidate,
+                    |attempt| {
+                        metrics.push(attempt.llr_metric);
+                        None::<u8>
+                    },
+                    || {
+                        ap_calls += 1;
+                        Some(7)
+                    },
+                );
+                assert_eq!(metrics, [LlrMetric::DualMax, LlrMetric::Bessel]);
+                assert_eq!(ap_calls, expected_ap_calls);
+                assert_eq!(result, (expected_ap_calls == 1).then_some(7));
+            }
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn ineligible_or_expired_context_never_retries() {
+        with_context(|ctx, candidate| {
+            let ft4 = ProtocolParams::ft4();
+            #[cfg(feature = "ft2")]
+            let ft2 = ProtocolParams::ft2();
+            let mut cases = vec![
+                DecodeContext {
+                    bessel_fallback_enabled: false,
+                    ..ctx
+                },
+                DecodeContext {
+                    llr_metric: LlrMetric::Bessel,
+                    ..ctx
+                },
+                DecodeContext {
+                    protocol_params: &ft4,
+                    ..ctx
+                },
+                DecodeContext {
+                    budget: DecodeBudget::until(Instant::now()),
+                    ..ctx
+                },
+            ];
+            #[cfg(feature = "ft2")]
+            cases.push(DecodeContext {
+                protocol_params: &ft2,
+                ..ctx
+            });
+            for case in cases {
+                let mut metrics = Vec::new();
+                let result = decode_candidate_with_bessel_fallback(
+                    &case,
+                    &candidate,
+                    |attempt| {
+                        metrics.push(attempt.llr_metric);
+                        None::<u8>
+                    },
+                    || panic!("AP is disabled"),
+                );
+                assert_eq!(result, None);
+                assert_eq!(metrics, [case.llr_metric]);
+            }
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn retry_never_counts_or_evicts_a_combiner_reception() {
+        use crate::soft_combiner::{CombinerKey, Mode, LLR_LEN};
+        with_context(|ctx, candidate| {
+            let key = CombinerKey::new(Mode::Ft8, candidate.freq_bin as u32, 0);
+            let llrs = [1.0f32; LLR_LEN];
+            let mut results = Vec::new();
+            for (enabled, retry_succeeds) in [(false, false), (true, false), (true, true)] {
+                let fresh =
+                    std::sync::Arc::new(std::sync::Mutex::new(SoftCombiner::with_defaults()));
+                let run_ctx = DecodeContext {
+                    bessel_fallback_enabled: enabled,
+                    soft_combiner: Some(&fresh),
+                    ..ctx
+                };
+                let result = decode_candidate_with_bessel_fallback(
+                    &run_ctx,
+                    &candidate,
+                    |attempt| {
+                        if let Some(cache) = attempt.soft_combiner {
+                            let combined = cache.lock().unwrap().combine(key, &llrs);
+                            assert_eq!(combined.repeat_count, 1);
+                        }
+                        (retry_succeeds && attempt.llr_metric == LlrMetric::Bessel).then_some(7)
+                    },
+                    || panic!("AP disabled"),
+                );
+                assert_eq!(result, (enabled && retry_succeeds).then_some(7));
+                let second = fresh.lock().unwrap().combine(key, &llrs);
+                assert_eq!(second.repeat_count, 2);
+                assert_eq!(second.llrs, [2.0; LLR_LEN]);
+                results.push((second.repeat_count, second.llrs));
+            }
+            assert_eq!(results[0], results[1]);
+            assert_eq!(results[0], results[2]);
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn one_candidate_retry_does_not_change_another_in_serial_or_rayon() {
+        with_context(|ctx, candidate_a| {
+            let candidate_b = CostasCandidate {
+                freq_bin: candidate_a.freq_bin + 8,
+                ..candidate_a
+            };
+            let run = |retry_succeeds: bool| {
+                let attempts = std::sync::Mutex::new(Vec::new());
+                let decode = |candidate: &CostasCandidate| {
+                    decode_candidate_with_bessel_fallback(
+                        &ctx,
+                        candidate,
+                        |attempt| {
+                            attempts
+                                .lock()
+                                .unwrap()
+                                .push((candidate.freq_bin, attempt.llr_metric));
+                            if candidate.freq_bin == candidate_b.freq_bin {
+                                Some(("B", 0.9f32))
+                            } else if retry_succeeds && attempt.llr_metric == LlrMetric::Bessel {
+                                Some(("A", 0.7f32))
+                            } else {
+                                None
+                            }
+                        },
+                        || panic!("AP disabled"),
+                    )
+                };
+                let serial = [decode(&candidate_a), decode(&candidate_b)];
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .unwrap();
+                let parallel = pool.install(|| {
+                    [candidate_a, candidate_b]
+                        .par_iter()
+                        .map(decode)
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(serial.to_vec(), parallel);
+                assert_eq!(serial[0], retry_succeeds.then_some(("A", 0.7)));
+                assert_eq!(serial[1], Some(("B", 0.9)));
+                let recorded = attempts.lock().unwrap();
+                let b_metrics: Vec<_> = recorded
+                    .iter()
+                    .filter(|(bin, _)| *bin == candidate_b.freq_bin)
+                    .map(|(_, metric)| *metric)
+                    .collect();
+                assert_eq!(b_metrics, [LlrMetric::DualMax, LlrMetric::DualMax]);
+            };
+            run(true);
+            run(false);
+        });
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_roundtrip_and_old_config_default() {
+        for enabled in [false, true] {
+            let config = Ft8Config {
+                bessel_fallback_enabled: enabled,
+                ..Ft8Config::default()
+            };
+            let value = serde_json::to_value(&config).expect("serialize");
+            assert_eq!(value["bessel_fallback_enabled"], enabled);
+            let parsed: Ft8Config = serde_json::from_value(value.clone()).expect("roundtrip");
+            assert_eq!(parsed.bessel_fallback_enabled, enabled);
+            let mut old = value;
+            old.as_object_mut()
+                .unwrap()
+                .remove("bessel_fallback_enabled");
+            let parsed: Ft8Config = serde_json::from_value(old).expect("old config");
+            assert!(!parsed.bessel_fallback_enabled);
+        }
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn real_candidate_fails_dual_max_and_recovers_on_bessel_retry() {
+        let decoder = Ft8Decoder::new(Ft8Config {
+            bessel_fallback_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let audio = decoder.preprocess_audio(&rescue_samples()).unwrap();
+        let spectrogram = decoder.compute_spectrogram(&audio).unwrap();
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, decoder.config.min_sync_score, None)
+            .unwrap();
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
+            &decoder,
+            &spectrogram,
+            &audio,
+            &ap_context,
+        );
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let mut found = false;
+        for candidate in &candidates {
+            let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+            let mut metrics = Vec::new();
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx,
+                candidate,
+                |attempt| {
+                    metrics.push(attempt.llr_metric);
+                    par_decode_candidate(
+                        attempt,
+                        candidate,
+                        &decoder.ldpc_decoder,
+                        None,
+                        &mut fft_buffer,
+                    )
+                },
+                || panic!("AP disabled"),
+            );
+            if result
+                .as_ref()
+                .is_some_and(|msg| msg.text == "CQ K1ABC FN42")
+            {
+                assert_eq!(metrics, [LlrMetric::DualMax, LlrMetric::Bessel]);
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "the frozen waveform must have a candidate rescued by Bessel AP0"
+        );
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn bessel_retry_uses_the_configured_refinement_path() {
+        for fine_sync_enabled in [false, true] {
+            let decoder = Ft8Decoder::new(Ft8Config {
+                bessel_fallback_enabled: true,
+                fine_sync_enabled,
+                max_decode_passes: 1,
+                ..Ft8Config::default()
+            })
+            .unwrap();
+            let audio = decoder.preprocess_audio(&rescue_samples()).unwrap();
+            let spectrogram = decoder.compute_spectrogram(&audio).unwrap();
+            let candidates = decoder
+                .costas_sync_search_with_threshold(
+                    &spectrogram,
+                    decoder.config.min_sync_score,
+                    None,
+                )
+                .unwrap();
+            let ap_context = crate::ap::ApContext::default();
+            let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
+                &decoder,
+                &spectrogram,
+                &audio,
+                &ap_context,
+            );
+            assert_eq!(ctx.fine_sync_enabled, fine_sync_enabled);
+            let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+            let mut saw_bessel = false;
+            for candidate in &candidates {
+                let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+                let mut metrics = Vec::new();
+                let _ = decode_candidate_with_bessel_fallback(
+                    &ctx,
+                    candidate,
+                    |attempt| {
+                        metrics.push(attempt.llr_metric);
+                        assert_eq!(attempt.fine_sync_enabled, fine_sync_enabled);
+                        par_decode_candidate(
+                            attempt,
+                            candidate,
+                            &decoder.ldpc_decoder,
+                            None,
+                            &mut fft_buffer,
+                        )
+                    },
+                    || panic!("AP disabled"),
+                );
+                saw_bessel |= metrics.contains(&LlrMetric::Bessel);
+                if saw_bessel {
+                    break;
+                }
+            }
+            assert!(
+                saw_bessel,
+                "failed AP0 must retry with the configured refinement path"
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Task W2.5 [A/B]: replace the blunt post-CRC confidence floors with the
 // W2.1 acceptance metric for decodes that cleanly pass it.
@@ -26457,7 +27102,7 @@ mod w2_5_acceptance_gating_tests {
     /// exactly the scenario the acceptance-gating design targets, not a
     /// toy construction.
     #[cfg(feature = "transmit")]
-    fn build_low_sync_real_signal(
+    pub(super) fn build_low_sync_real_signal(
         decoder: &Ft8Decoder,
     ) -> (Vec<f64>, Spectrogram, CostasCandidate) {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26507,7 +27152,7 @@ mod w2_5_acceptance_gating_tests {
     /// field-for-field (see the `let ctx = DecodeContext { ... }` site
     /// earlier in this file).
     #[cfg(feature = "transmit")]
-    fn build_ctx<'a>(
+    pub(super) fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
         spectrogram: &'a Spectrogram,
         audio: &'a [f64],
@@ -26555,6 +27200,7 @@ mod w2_5_acceptance_gating_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,
@@ -26843,6 +27489,7 @@ mod w26_ap_coverage_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,
@@ -27213,7 +27860,7 @@ mod ap5_hot_path_rescue_tests {
     /// candidate/spectrogram can be tried at both settings.
     #[cfg(feature = "transmit")]
     #[allow(clippy::too_many_arguments)]
-    fn build_ctx<'a>(
+    pub(super) fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
         spectrogram: &'a Spectrogram,
         audio: &'a [f64],
@@ -27262,6 +27909,7 @@ mod ap5_hot_path_rescue_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,
@@ -29171,5 +29819,451 @@ mod pan7_ft8lib_sync_seed_tests {
             "S0-ft8lib-seed stage was pushed for Protocol::Ft2 — the ft8_lib \
              FFI search ran despite every seed being unusable for this protocol"
         );
+    }
+}
+
+#[cfg(test)]
+mod pan160_tests {
+    use super::*;
+    use crate::dt_history::DtPrior;
+
+    #[test]
+    fn timing_rows_use_sample_offset_coordinates_and_reject_invalid_priors() {
+        let prior = DtPrior {
+            median_dt: -0.08,
+            iqr: 0.,
+            sighting_count: 2,
+        };
+        let rows = ap_timing_rows(prior, 4, 960, 20);
+        assert_eq!(rows, vec![3, 4, 5, 6, 7]);
+        assert_eq!(
+            ap_timing_rows(
+                DtPrior {
+                    median_dt: 0.04,
+                    ..prior
+                },
+                0,
+                960,
+                10
+            ),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            ap_timing_rows(
+                DtPrior {
+                    median_dt: 0.36,
+                    iqr: 0.15,
+                    ..prior
+                },
+                0,
+                960,
+                10
+            ),
+            (1..=10).collect::<Vec<_>>()
+        );
+        assert!(ap_timing_rows(
+            DtPrior {
+                median_dt: f64::NAN,
+                ..prior
+            },
+            0,
+            960,
+            10
+        )
+        .is_empty());
+        for row in rows {
+            let dt = candidate_offset_samples(row, 4, 960) as f64 / 12000.;
+            assert!((dt + 0.08).abs() <= 0.2 + 1e-12);
+        }
+        for iqr in [-0.1, f64::NAN, f64::INFINITY, 0.201] {
+            assert!(ap_timing_rows(DtPrior { iqr, ..prior }, 0, 960, 20).is_empty());
+        }
+        assert!(ap_timing_rows(
+            DtPrior {
+                median_dt: 100.,
+                ..prior
+            },
+            0,
+            960,
+            20
+        )
+        .is_empty());
+        assert!(ap_timing_rows(
+            DtPrior {
+                sighting_count: 1,
+                ..prior
+            },
+            0,
+            960,
+            20
+        )
+        .is_empty());
+        let edge = DtPrior {
+            median_dt: 0.64,
+            iqr: 0.,
+            sighting_count: 2,
+        };
+        assert_eq!(ap_timing_rows(edge, 0, 960, 10).last(), Some(&10));
+    }
+
+    #[test]
+    fn timing_senders_prefer_all_active_partners_and_never_local_call() {
+        use crate::ap::*;
+        let q = |call| QsoAp::new(call, QsoApProgress::WaitingForReport).unwrap();
+        let context = ApContext {
+            my_call: MyCallAp::new("K1ABC"),
+            active_qso: Some(q("K2XYZ")),
+            active_qsos: vec![q("K2XYZ"), q("W1AW")],
+            recent_calls: vec![
+                RecentCallAp::new("K1ABC", 0.).unwrap(),
+                RecentCallAp::new("W1AW", 0.).unwrap(),
+                RecentCallAp::new("K3ABC", 0.).unwrap(),
+            ],
+        };
+        let senders = ap_timing_senders(&context);
+        assert_eq!(
+            senders.iter().map(|s| s.call.as_str()).collect::<Vec<_>>(),
+            vec!["K2XYZ", "W1AW", "K3ABC"]
+        );
+        assert_eq!(
+            senders[1].context.active_qso.as_ref().unwrap().their_call,
+            "W1AW"
+        );
+        assert!(ap_timing_senders(&ApContext {
+            my_call: MyCallAp::new("K1ABC"),
+            ..Default::default()
+        })
+        .is_empty());
+    }
+}
+
+const AP_TIMING_MAX_SENDERS: usize = 4;
+const AP_TIMING_MAX_SEEDS: usize = 4;
+const AP_TIMING_MAX_POSITIONS: usize = 2;
+const AP_TIMING_MAX_ATTEMPTS: u64 = 32;
+
+struct ApTimingSender {
+    call: String,
+    context: crate::ap::ApContext,
+    recent: crate::ap::RecentCallAp,
+    level: crate::ap::ApLevel,
+}
+
+fn ap_timing_senders(context: &crate::ap::ApContext) -> Vec<ApTimingSender> {
+    use crate::ap::{ApLevel, RecentCallAp};
+    let mut out = Vec::new();
+    let local = context
+        .my_call
+        .as_ref()
+        .map(|c| crate::dt_history::normalize_dt_callsign(&c.callsign));
+    for qso in context.active_qso.iter().chain(context.active_qsos.iter()) {
+        let call = crate::dt_history::normalize_dt_callsign(&qso.their_call);
+        if call == "CQ"
+            || local.as_ref() == Some(&call)
+            || out.iter().any(|s: &ApTimingSender| s.call == call)
+        {
+            continue;
+        }
+        if let Some(recent) = RecentCallAp::new(&qso.their_call, 0.) {
+            out.push(ApTimingSender {
+                call,
+                context: crate::ap::ApContext {
+                    active_qso: Some(qso.clone()),
+                    ..context.clone()
+                },
+                recent,
+                level: ApLevel::Ap3,
+            });
+        }
+    }
+    for recent in &context.recent_calls {
+        let call = crate::dt_history::normalize_dt_callsign(&recent.callsign);
+        if call == "CQ" || local.as_ref() == Some(&call) || out.iter().any(|s| s.call == call) {
+            continue;
+        }
+        out.push(ApTimingSender {
+            call,
+            context: context.clone(),
+            recent: recent.clone(),
+            level: ApLevel::Ap2,
+        });
+    }
+    out
+}
+
+fn ap_timing_rows(prior: crate::DtPrior, padding: usize, step: usize, last: usize) -> Vec<usize> {
+    if prior.sighting_count < 2
+        || !prior.median_dt.is_finite()
+        || !prior.iqr.is_finite()
+        || prior.iqr < 0.
+        || step == 0
+    {
+        return Vec::new();
+    }
+    let radius = (3. * prior.iqr).max(0.2);
+    if radius > 0.6 {
+        return Vec::new();
+    }
+    // Use the same signed sample coordinates as extraction, including padding
+    // and the two-row sliding FFT lookback. Boundary comparisons allow roundoff.
+    (0..=last)
+        .filter(|&row| {
+            let dt = candidate_offset_samples(row, padding, step) as f64 / SAMPLE_RATE as f64;
+            (dt - prior.median_dt).abs() <= radius + 1e-12
+        })
+        .collect()
+}
+
+fn ap_timing_sender_matches(message: &DecodedMessage, sender: &str) -> bool {
+    message
+        .message
+        .from_callsign
+        .as_deref()
+        .is_some_and(|call| {
+            crate::dt_history::normalize_dt_callsign(call)
+                == crate::dt_history::normalize_dt_callsign(sender)
+        })
+}
+
+/// One sender-bound attempt, using the original AP acceptance pipeline.
+fn try_ap_timing_position(
+    ctx: &DecodeContext,
+    candidate: &CostasCandidate,
+    ldpc: &LdpcDecoder,
+    sender: &ApTimingSender,
+    diagnostics: &mut crate::dt_history::ApTimingDiagnostics,
+) -> Option<DecodedMessage> {
+    let tones = par_extract_symbols_from_spectrogram(
+        ctx.protocol_params,
+        ctx.spectrogram,
+        candidate,
+        ctx.sync_time_interp_linear_power,
+        ctx.linear_power_averaging,
+    );
+    let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tones);
+    maybe_whiten_llrs(
+        ctx.llr_whitening_enabled,
+        &mut llrs,
+        &tones,
+        ToneUnits::Db,
+        ctx.protocol_params,
+    );
+    maybe_impulse_robust_llrs(
+        ctx.impulse_robust_llr,
+        &mut llrs,
+        &tones,
+        ToneUnits::Db,
+        ctx.protocol_params,
+    );
+    let snr = par_estimate_snr_spectrogram(ctx.protocol_params, &tones);
+    let confidence = (candidate.sync_score / 12.).min(1.) as f32;
+    let freq = (candidate.freq_bin as f64 + candidate.freq_sub as f64 / FREQ_OSR as f64)
+        * ctx.protocol_params.tone_spacing;
+    let dt = candidate_offset_samples(
+        candidate.time_step,
+        ctx.spectrogram.time_padding,
+        ctx.protocol_params.samples_per_symbol(SAMPLE_RATE) / TIME_OSR,
+    ) as f64
+        / SAMPLE_RATE as f64;
+    // Extraction can use the last of a finite budget. Count only invocations
+    // that actually reach the existing AP LDPC/acceptance routine.
+    if !ctx.budget.has_time() {
+        diagnostics.budget_skips += 1;
+        return None;
+    }
+    diagnostics.attempts += 1;
+    if sender.context.my_call.is_some() {
+        par_try_ldpc_with_ap(
+            ctx,
+            ldpc,
+            &llrs,
+            sender.level.clone(),
+            &sender.context,
+            Some(&sender.recent),
+            snr,
+            confidence,
+            freq,
+            dt,
+            0.,
+        )
+    } else {
+        par_try_ldpc_with_recent_only(
+            ctx,
+            ldpc,
+            &llrs,
+            &sender.recent,
+            RecentInjectPos::Caller,
+            snr,
+            confidence,
+            freq,
+            dt,
+            0.,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ApTimingState {
+    diagnostics: crate::dt_history::ApTimingDiagnostics,
+    eligible: HashSet<String>,
+    seeds: std::collections::HashMap<String, HashSet<usize>>,
+    positions: HashSet<(String, usize, usize, usize)>,
+}
+
+#[cfg(all(test, feature = "transmit"))]
+mod pan160_queue_tests {
+    use super::*;
+    #[test]
+    fn warm_sender_after_four_cold_calls_is_eligible() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let history = std::sync::Arc::new(crate::InMemoryDtHistory::default());
+        let mut context = crate::ap::ApContext::default();
+        for call in ["K1ABC", "K2ABC", "K3ABC", "K4ABC", "W1AW"] {
+            context
+                .recent_calls
+                .push(crate::ap::RecentCallAp::new(call, 0.).unwrap());
+        }
+        history.record("W1AW", 0.36, now - std::time::Duration::from_secs(30));
+        history.record("W1AW", 0.36, now - std::time::Duration::from_secs(15));
+        let decoder = Ft8Decoder::new(Ft8Config {
+            ap_dt_history_enabled: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_dt_priors(history);
+        let samples = vec![0.; 180000];
+        let spec = decoder.compute_spectrogram(&samples).unwrap();
+        let ctx =
+            super::ap5_hot_path_rescue_tests::build_ctx(&decoder, &spec, &samples, &context, false);
+        let mut state = ApTimingState::default();
+        let seed = CostasCandidate {
+            time_step: 0,
+            freq_bin: 160,
+            freq_sub: 0,
+            sync_score: 10.,
+            time_refinement: 0.,
+        };
+        decoder.retry_ap_timings(
+            &ctx,
+            &[seed],
+            &[None],
+            now,
+            &decoder.ldpc_decoder,
+            &mut state,
+        );
+        assert_eq!(state.eligible, HashSet::from(["W1AW".to_string()]));
+        assert_eq!(state.diagnostics.eligible_targets, 1);
+        assert!(state.diagnostics.searched_rows > 0);
+    }
+
+    #[test]
+    fn queue_is_deterministic_bounded_deduplicated_and_budgeted() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let history = std::sync::Arc::new(crate::InMemoryDtHistory::default());
+        let mut context = crate::ap::ApContext::default();
+        for call in ["W1AW", "K1ABC", "K2XYZ", "K3ABC", "K4ABC"] {
+            context
+                .recent_calls
+                .push(crate::ap::RecentCallAp::new(call, 0.).unwrap());
+            history.record(call, 0.36, now - std::time::Duration::from_secs(30));
+            history.record(call, 0.36, now - std::time::Duration::from_secs(15));
+        }
+        let decoder = Ft8Decoder::new(Ft8Config {
+            ap_dt_history_enabled: true,
+            osd_depth: None,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_dt_priors(history);
+        let symbols = crate::Ft8Encoder::new()
+            .encode_message("CQ W1AW FN31", None)
+            .unwrap();
+        let mut samples = vec![0.; 180000];
+        for hz in [1000., 1300., 1600., 1900., 2200.] {
+            let signal = crate::Ft8Modulator::new(12000, hz, 1.)
+                .unwrap()
+                .modulate_symbols(&symbols, 0.)
+                .unwrap();
+            for (i, s) in signal.iter().enumerate() {
+                samples[i + 4320] += *s as f64;
+            }
+        }
+        let spec = decoder.compute_spectrogram(&samples).unwrap();
+        let mut ctx =
+            super::ap5_hot_path_rescue_tests::build_ctx(&decoder, &spec, &samples, &context, false);
+        let seeds: Vec<_> = [160, 208, 256, 304, 352]
+            .into_iter()
+            .map(|freq_bin| CostasCandidate {
+                time_step: 0,
+                freq_bin,
+                freq_sub: 0,
+                sync_score: 10.,
+                time_refinement: 0.,
+            })
+            .collect();
+        let results = vec![None; seeds.len()];
+        let mut first = ApTimingState::default();
+        let a = decoder.retry_ap_timings(
+            &ctx,
+            &seeds,
+            &results,
+            now,
+            &decoder.ldpc_decoder,
+            &mut first,
+        );
+        assert_eq!(first.diagnostics.attempts, 32);
+        assert_eq!(first.diagnostics.eligible_targets, 4);
+        assert!(first.seeds.values().all(|s| s.len() == 4));
+        let searched = first.diagnostics.searched_rows;
+        decoder.retry_ap_timings(
+            &ctx,
+            &seeds,
+            &results,
+            now,
+            &decoder.ldpc_decoder,
+            &mut first,
+        );
+        assert_eq!(first.diagnostics.attempts, 32);
+        assert_eq!(first.diagnostics.searched_rows, searched);
+        let mut second = ApTimingState::default();
+        let b = decoder.retry_ap_timings(
+            &ctx,
+            &seeds,
+            &results,
+            now,
+            &decoder.ldpc_decoder,
+            &mut second,
+        );
+        assert_eq!(first.positions, second.positions);
+        assert_eq!(
+            a.iter().map(|m| &m.text).collect::<Vec<_>>(),
+            b.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        ctx.budget = DecodeBudget::until(Instant::now());
+        let mut expired = ApTimingState::default();
+        assert!(decoder
+            .retry_ap_timings(
+                &ctx,
+                &seeds,
+                &results,
+                now,
+                &decoder.ldpc_decoder,
+                &mut expired
+            )
+            .is_empty());
+        assert_eq!(expired.diagnostics.attempts, 0);
+        assert!(expired.diagnostics.budget_skips > 0);
+    }
+    #[test]
+    fn sender_check_rejects_valid_message_for_another_caller() {
+        let m = DecodedMessage::new(
+            crate::message::Ft8Message::from_text("K1ABC K2XYZ -12"),
+            -10.,
+            0.9,
+            1000.,
+            0.36,
+        );
+        assert!(!ap_timing_sender_matches(&m, "W1AW"));
+        assert!(ap_timing_sender_matches(&m, "K2XYZ"));
     }
 }

@@ -23550,12 +23550,8 @@ mod pan118_worker_band_plan_tests {
         );
     }
 
-    /// The dial moving out of band between admission and key time (CAT
-    /// retune / split change during the pre-PTT wait) must still refuse
-    /// before PTT. The exact refusing site (post-wait re-key check or the
-    /// final pre-PTT check) depends on where in the slot the move lands,
-    /// so the assertion accepts either label — both are refusals before
-    /// PTT through the same unwind.
+    /// Park the worker at the PTT mutex, then move the dial out of band.
+    /// The final pre-PTT check must observe the new dial and refuse to key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dial_moved_out_of_band_before_key_is_refused() {
         let h = worker_harness().await;
@@ -23563,25 +23559,20 @@ mod pan118_worker_band_plan_tests {
             .operating_frequency_hz
             .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
 
-        request(&h, "CQ N0CALL FN20").await;
-        // Wait until the worker has admitted the frame (it appears in a
-        // TxQueueStatus push), then move the dial out of band — the frame
-        // is now queued against a dial that would key out of privilege.
+        let held = h.coordinator.ptt_sync_gate.lock().await;
         let text = "CQ N0CALL FN20";
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if h.tui_rx
-                .try_iter()
-                .any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text)))
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "worker did not queue the frame");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        request(&h, text).await;
+        tokio::time::timeout(
+            Duration::from_secs(40),
+            h.coordinator.tx_before_ptt_gate.notified(),
+        )
+        .await
+        .expect("worker must reach the pre-PTT gate before the dial moves");
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
         h.coordinator
             .operating_frequency_hz
             .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        drop(held);
 
         let (completed, diagnostics, ptt_on) =
             await_completion(&h, text, Duration::from_secs(45)).await;
@@ -23592,10 +23583,11 @@ mod pan118_worker_band_plan_tests {
         );
         assert!(!ptt_on, "no SetPtt(true) after the dial moved out of band");
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.contains("outside the configured amateur band plan")),
-            "a key-time gate must report the band-plan refusal, got {diagnostics:?}"
+            diagnostics.iter().any(|d| {
+                d.contains("TX blocked at final pre-PTT check")
+                    && d.contains("outside the configured amateur band plan")
+            }),
+            "the final pre-PTT gate must report the band-plan refusal, got {diagnostics:?}"
         );
     }
 
@@ -25339,10 +25331,37 @@ mod pan122_tx_log_worker_tests {
                 audio_enqueued |= matches!(msg.message_type, MessageType::AudioOutput { .. });
             }
             while h.hamlib_rx.try_recv().is_ok() {}
-            while h.autonomous_rx.try_recv().is_ok() {}
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(audio_enqueued, "the frame's audio must reach the output");
+
+        // File visibility precedes the best-effort TUI relay attempt. Keep
+        // TUI full until this frame completes, which happens after the relay.
+        // Leave Autonomous unread above so an early completion is retained.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            while h.hamlib_rx.try_recv().is_ok() {}
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    qso_id: None,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == TEXT {
+                        completed = Some(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed,
+            Some(true),
+            "the frame must complete successfully before draining TUI"
+        );
 
         let lines = await_tx_log_lines(&h, 1, Duration::from_secs(5)).await;
         assert_eq!(lines.len(), 1, "exactly one record: {lines:?}");
@@ -25355,6 +25374,8 @@ mod pan122_tx_log_worker_tests {
         assert_eq!(r.qso_id, None);
         assert_eq!(r.dial_hz, None, "dial unknown in the harness");
 
+        // Completion proves the relay already encountered the full route;
+        // draining now cannot admit a late TxFrameLogged event.
         let tui_frame_events = h
             .tui_rx
             .try_iter()
