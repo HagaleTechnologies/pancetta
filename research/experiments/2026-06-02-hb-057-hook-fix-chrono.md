@@ -228,3 +228,10 @@ Branch: `iter/2026-06-02-hb-057-hook-fix` (from main `77f3801`).
   hard-200): see hb-057 Session 2 SHELVE note for the citation.
 - hb-057 design spec:
   `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`.
+
+## PAN-160 follow-up, 2026-10-26
+
+The [PAN-160 experiment](2026-10-26-pan160-timing-history.md) adds strict
+SHA-matched input preflight and records the new AP-only experiment separately.
+The original 33 WAVs and 33 baseline caches are absent in the cloud checkout.
+This does not complete or invalidate the preserved continuous-session test.

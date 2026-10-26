@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "frozen_before_evaluation": true,
+  "seed_range": [
+    1000,
+    1009
+  ],
+  "noise_seed_range": [
+    2000,
+    2099
+  ],
+  "stable_dt": 0.36,
+  "moderate_offsets": [
+    0,
+    0.04,
+    -0.04,
+    0.08,
+    -0.08
+  ],
+  "warmup_slots": 2,
+  "weak_slots": 8,
+  "warmup_snr_db": -6,
+  "weak_snr_db": [
+    -19,
+    -20,
+    -21
+  ],
+  "threads": 4,
+  "profile": "dev; pancetta-ft8 opt-level=3",
+  "clock": "UNIX 1700000000 + slot * 15 seconds",
+  "target": "K1ABC W1AW -12",
+  "second_signal": "CQ K2XYZ FN42 at 1600 Hz, DT 0.8 s, amplitude 0.5",
+  "config_overrides": {
+    "max_decode_passes": 1,
+    "max_candidates": 50,
+    "max_sync_candidates": 100,
+    "ldpc_iterations": 30,
+    "osd_depth": null,
+    "dt_history_enabled": false
+  },
+  "calibration_basis": "Broad sweep recovered 36/36 at -18 dB and 6/36 at -21 dB. Held-out SNRs bracket this transition.",
+  "moderate_seed_range": [
+    1100,
+    1109
+  ],
+  "seed_policy": "Disjoint stable and moderate seeds; session-level bootstrap over all 20 independently seeded sessions."
+}
