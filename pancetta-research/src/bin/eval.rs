@@ -85,8 +85,10 @@ struct Args {
     /// knee (`--impulse-robust-llr <K>`; finite and > 0). `None` leaves
     /// the library default (off). See `Ft8Config::impulse_robust_llr`.
     impulse_robust_llr: Option<f64>,
+    /// PAN-155 [A/B]: retry failed DualMax FT8 AP0 candidates once with
+    /// Bessel. `None` leaves the library default (off). See
+    /// `Ft8Config::bessel_fallback_enabled`.
     bessel_fallback_enabled: Option<bool>,
-
     /// Decoder-TP-sensitivity Task W3.4 [A/B]: nsym=2/3 noncoherent
     /// combining LLR variants layered on top of the W3.3 matched-demod
     /// stage (only takes effect when `fine_sync_enabled` is ALSO

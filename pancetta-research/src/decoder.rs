@@ -609,15 +609,16 @@ impl Ft8Decoder {
         self
     }
 
-    /// Decoder-TP-sensitivity Task W3.3 [A/B]: master switch for the
-    /// per-candidate fine-sync + matched-demod stage that replaces the
-    /// legacy 21-trial fine-FFT fallback. See `Ft8Config::fine_sync_enabled`.
-    /// PAN-155: retry a failed DualMax FT8 AP0 candidate with Bessel.
+    /// PAN-155 [A/B]: retry a failed DualMax FT8 AP0 candidate once with
+    /// Bessel. See `Ft8Config::bessel_fallback_enabled`.
     pub fn with_bessel_fallback_enabled(mut self, on: bool) -> Self {
         self.config.bessel_fallback_enabled = on;
         self
     }
 
+    /// Decoder-TP-sensitivity Task W3.3 [A/B]: master switch for the
+    /// per-candidate fine-sync + matched-demod stage that replaces the
+    /// legacy 21-trial fine-FFT fallback. See `Ft8Config::fine_sync_enabled`.
     pub fn with_fine_sync_enabled(mut self, on: bool) -> Self {
         self.config.fine_sync_enabled = on;
         self

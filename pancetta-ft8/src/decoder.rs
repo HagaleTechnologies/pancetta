@@ -26478,7 +26478,9 @@ mod bessel_fallback_tests {
             let mag = (-2.0 * u1.ln()).sqrt() * sigma;
             let angle = 2.0 * std::f32::consts::PI * u2;
             pair[0] += mag * angle.cos();
-            if pair.len() == 2 { pair[1] += mag * angle.sin(); }
+            if pair.len() == 2 {
+                pair[1] += mag * angle.sin();
+            }
         }
         samples
     }
@@ -26595,13 +26597,28 @@ mod bessel_fallback_tests {
             #[cfg(feature = "ft2")]
             let ft2 = ProtocolParams::ft2();
             let mut cases = vec![
-                DecodeContext { bessel_fallback_enabled: false, ..ctx },
-                DecodeContext { llr_metric: LlrMetric::Bessel, ..ctx },
-                DecodeContext { protocol_params: &ft4, ..ctx },
-                DecodeContext { budget: DecodeBudget::until(Instant::now()), ..ctx },
+                DecodeContext {
+                    bessel_fallback_enabled: false,
+                    ..ctx
+                },
+                DecodeContext {
+                    llr_metric: LlrMetric::Bessel,
+                    ..ctx
+                },
+                DecodeContext {
+                    protocol_params: &ft4,
+                    ..ctx
+                },
+                DecodeContext {
+                    budget: DecodeBudget::until(Instant::now()),
+                    ..ctx
+                },
             ];
             #[cfg(feature = "ft2")]
-            cases.push(DecodeContext { protocol_params: &ft2, ..ctx });
+            cases.push(DecodeContext {
+                protocol_params: &ft2,
+                ..ctx
+            });
             for case in cases {
                 let mut metrics = Vec::new();
                 let result = decode_candidate_with_bessel_fallback(
@@ -26628,9 +26645,8 @@ mod bessel_fallback_tests {
             let llrs = [1.0f32; LLR_LEN];
             let mut results = Vec::new();
             for (enabled, retry_succeeds) in [(false, false), (true, false), (true, true)] {
-                let fresh = std::sync::Arc::new(std::sync::Mutex::new(
-                    SoftCombiner::with_defaults(),
-                ));
+                let fresh =
+                    std::sync::Arc::new(std::sync::Mutex::new(SoftCombiner::with_defaults()));
                 let run_ctx = DecodeContext {
                     bessel_fallback_enabled: enabled,
                     soft_combiner: Some(&fresh),
@@ -26674,7 +26690,10 @@ mod bessel_fallback_tests {
                         &ctx,
                         candidate,
                         |attempt| {
-                            attempts.lock().unwrap().push((candidate.freq_bin, attempt.llr_metric));
+                            attempts
+                                .lock()
+                                .unwrap()
+                                .push((candidate.freq_bin, attempt.llr_metric));
                             if candidate.freq_bin == candidate_b.freq_bin {
                                 Some(("B", 0.9f32))
                             } else if retry_succeeds && attempt.llr_metric == LlrMetric::Bessel {
@@ -26687,16 +26706,25 @@ mod bessel_fallback_tests {
                     )
                 };
                 let serial = [decode(&candidate_a), decode(&candidate_b)];
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .unwrap();
                 let parallel = pool.install(|| {
-                    [candidate_a, candidate_b].par_iter().map(decode).collect::<Vec<_>>()
+                    [candidate_a, candidate_b]
+                        .par_iter()
+                        .map(decode)
+                        .collect::<Vec<_>>()
                 });
                 assert_eq!(serial.to_vec(), parallel);
                 assert_eq!(serial[0], retry_succeeds.then_some(("A", 0.7)));
                 assert_eq!(serial[1], Some(("B", 0.9)));
                 let recorded = attempts.lock().unwrap();
-                let b_metrics: Vec<_> = recorded.iter().filter(|(bin, _)| *bin == candidate_b.freq_bin)
-                    .map(|(_, metric)| *metric).collect();
+                let b_metrics: Vec<_> = recorded
+                    .iter()
+                    .filter(|(bin, _)| *bin == candidate_b.freq_bin)
+                    .map(|(_, metric)| *metric)
+                    .collect();
                 assert_eq!(b_metrics, [LlrMetric::DualMax, LlrMetric::DualMax]);
             };
             run(true);
@@ -26708,13 +26736,18 @@ mod bessel_fallback_tests {
     #[test]
     fn serde_roundtrip_and_old_config_default() {
         for enabled in [false, true] {
-            let config = Ft8Config { bessel_fallback_enabled: enabled, ..Ft8Config::default() };
+            let config = Ft8Config {
+                bessel_fallback_enabled: enabled,
+                ..Ft8Config::default()
+            };
             let value = serde_json::to_value(&config).expect("serialize");
             assert_eq!(value["bessel_fallback_enabled"], enabled);
             let parsed: Ft8Config = serde_json::from_value(value.clone()).expect("roundtrip");
             assert_eq!(parsed.bessel_fallback_enabled, enabled);
             let mut old = value;
-            old.as_object_mut().unwrap().remove("bessel_fallback_enabled");
+            old.as_object_mut()
+                .unwrap()
+                .remove("bessel_fallback_enabled");
             let parsed: Ft8Config = serde_json::from_value(old).expect("old config");
             assert!(!parsed.bessel_fallback_enabled);
         }
@@ -26727,15 +26760,19 @@ mod bessel_fallback_tests {
             bessel_fallback_enabled: true,
             max_decode_passes: 1,
             ..Ft8Config::default()
-        }).unwrap();
+        })
+        .unwrap();
         let audio = decoder.preprocess_audio(&rescue_samples()).unwrap();
         let spectrogram = decoder.compute_spectrogram(&audio).unwrap();
-        let candidates = decoder.costas_sync_search_with_threshold(
-            &spectrogram, decoder.config.min_sync_score, None
-        ).unwrap();
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, decoder.config.min_sync_score, None)
+            .unwrap();
         let ap_context = crate::ap::ApContext::default();
         let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
-            &decoder, &spectrogram, &audio, &ap_context
+            &decoder,
+            &spectrogram,
+            &audio,
+            &ap_context,
         );
         let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
         let mut found = false;
@@ -26743,20 +26780,33 @@ mod bessel_fallback_tests {
             let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
             let mut metrics = Vec::new();
             let result = decode_candidate_with_bessel_fallback(
-                &ctx, candidate,
+                &ctx,
+                candidate,
                 |attempt| {
                     metrics.push(attempt.llr_metric);
-                    par_decode_candidate(attempt, candidate, &decoder.ldpc_decoder, None, &mut fft_buffer)
+                    par_decode_candidate(
+                        attempt,
+                        candidate,
+                        &decoder.ldpc_decoder,
+                        None,
+                        &mut fft_buffer,
+                    )
                 },
                 || panic!("AP disabled"),
             );
-            if result.as_ref().is_some_and(|msg| msg.text == "CQ K1ABC FN42") {
+            if result
+                .as_ref()
+                .is_some_and(|msg| msg.text == "CQ K1ABC FN42")
+            {
                 assert_eq!(metrics, [LlrMetric::DualMax, LlrMetric::Bessel]);
                 found = true;
                 break;
             }
         }
-        assert!(found, "the frozen waveform must have a candidate rescued by Bessel AP0");
+        assert!(
+            found,
+            "the frozen waveform must have a candidate rescued by Bessel AP0"
+        );
     }
 
     #[cfg(feature = "transmit")]
@@ -26768,15 +26818,23 @@ mod bessel_fallback_tests {
                 fine_sync_enabled,
                 max_decode_passes: 1,
                 ..Ft8Config::default()
-            }).unwrap();
+            })
+            .unwrap();
             let audio = decoder.preprocess_audio(&rescue_samples()).unwrap();
             let spectrogram = decoder.compute_spectrogram(&audio).unwrap();
-            let candidates = decoder.costas_sync_search_with_threshold(
-                &spectrogram, decoder.config.min_sync_score, None
-            ).unwrap();
+            let candidates = decoder
+                .costas_sync_search_with_threshold(
+                    &spectrogram,
+                    decoder.config.min_sync_score,
+                    None,
+                )
+                .unwrap();
             let ap_context = crate::ap::ApContext::default();
             let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
-                &decoder, &spectrogram, &audio, &ap_context
+                &decoder,
+                &spectrogram,
+                &audio,
+                &ap_context,
             );
             assert_eq!(ctx.fine_sync_enabled, fine_sync_enabled);
             let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
@@ -26785,18 +26843,30 @@ mod bessel_fallback_tests {
                 let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                 let mut metrics = Vec::new();
                 let _ = decode_candidate_with_bessel_fallback(
-                    &ctx, candidate,
+                    &ctx,
+                    candidate,
                     |attempt| {
                         metrics.push(attempt.llr_metric);
                         assert_eq!(attempt.fine_sync_enabled, fine_sync_enabled);
-                        par_decode_candidate(attempt, candidate, &decoder.ldpc_decoder, None, &mut fft_buffer)
+                        par_decode_candidate(
+                            attempt,
+                            candidate,
+                            &decoder.ldpc_decoder,
+                            None,
+                            &mut fft_buffer,
+                        )
                     },
                     || panic!("AP disabled"),
                 );
                 saw_bessel |= metrics.contains(&LlrMetric::Bessel);
-                if saw_bessel { break; }
+                if saw_bessel {
+                    break;
+                }
             }
-            assert!(saw_bessel, "failed AP0 must retry with the configured refinement path");
+            assert!(
+                saw_bessel,
+                "failed AP0 must retry with the configured refinement path"
+            );
         }
     }
 }

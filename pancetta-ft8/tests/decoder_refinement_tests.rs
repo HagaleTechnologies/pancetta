@@ -30,13 +30,20 @@ mod bessel_fallback_fixture {
             let mag = (-2.0 * u1.ln()).sqrt() * sigma;
             let angle = 2.0 * std::f32::consts::PI * u2;
             pair[0] += mag * angle.cos();
-            if pair.len() == 2 { pair[1] += mag * angle.sin(); }
+            if pair.len() == 2 {
+                pair[1] += mag * angle.sin();
+            }
         }
         clean
     }
 
     fn finds(samples: &[f32], config: Ft8Config) -> bool {
-        Ft8Decoder::new(config).unwrap().decode_window(samples).unwrap().iter().any(|m| m.text == MESSAGE)
+        Ft8Decoder::new(config)
+            .unwrap()
+            .decode_window(samples)
+            .unwrap()
+            .iter()
+            .any(|m| m.text == MESSAGE)
     }
 
     #[test]
@@ -44,16 +51,34 @@ mod bessel_fallback_fixture {
         // Seed 194445316 at -20 dB, 2500 Hz reference SNR, 0 Hz/0 s
         // offsets. Discovered with a bounded paired sweep, then frozen.
         let samples = signal(194_445_316, -20.0);
-        let default = Ft8Config { max_decode_passes: 1, ..Ft8Config::default() };
-        assert!(!finds(&samples, default.clone()), "DualMax must miss this encoded message");
-        assert!(finds(&samples, Ft8Config {
-            llr_metric: LlrMetric::Bessel,
-            ..default.clone()
-        }), "the existing Bessel metric must recover the encoded message");
-        assert!(finds(&samples, Ft8Config {
-            bessel_fallback_enabled: true,
-            ..default
-        }), "fallback must recover the same encoded message in one pass");
+        let default = Ft8Config {
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        };
+        assert!(
+            !finds(&samples, default.clone()),
+            "DualMax must miss this encoded message"
+        );
+        assert!(
+            finds(
+                &samples,
+                Ft8Config {
+                    llr_metric: LlrMetric::Bessel,
+                    ..default.clone()
+                }
+            ),
+            "the existing Bessel metric must recover the encoded message"
+        );
+        assert!(
+            finds(
+                &samples,
+                Ft8Config {
+                    bessel_fallback_enabled: true,
+                    ..default
+                }
+            ),
+            "fallback must recover the same encoded message in one pass"
+        );
     }
 
     #[test]
@@ -68,19 +93,44 @@ mod bessel_fallback_fixture {
         for (sample, added) in samples.iter_mut().zip(clean) {
             *sample += added * 2.0;
         }
-        let config = Ft8Config { max_decode_passes: 1, ..Ft8Config::default() };
-        let decode = |config| Ft8Decoder::new(config).unwrap().decode_window(&samples).unwrap();
+        let config = Ft8Config {
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        };
+        let decode = |config| {
+            Ft8Decoder::new(config)
+                .unwrap()
+                .decode_window(&samples)
+                .unwrap()
+        };
         let baseline = decode(config.clone());
-        let variant = decode(Ft8Config { bessel_fallback_enabled: true, ..config });
+        let variant = decode(Ft8Config {
+            bessel_fallback_enabled: true,
+            ..config
+        });
         let fields = |messages: &[pancetta_ft8::DecodedMessage]| {
-            let message = messages.iter().find(|m| m.text == "CQ W9XYZ EN50")
+            let message = messages
+                .iter()
+                .find(|m| m.text == "CQ W9XYZ EN50")
                 .expect("clean second candidate decodes");
-            (message.text.clone(), message.tone_symbols.clone(), message.frequency_offset,
-             message.time_offset, message.confidence, message.ap_level)
+            (
+                message.text.clone(),
+                message.tone_symbols.clone(),
+                message.frequency_offset,
+                message.time_offset,
+                message.confidence,
+                message.ap_level,
+            )
         };
         assert_eq!(fields(&baseline), fields(&variant));
-        assert!(variant.iter().any(|m| m.text == MESSAGE), "weak candidate must be rescued");
-        assert!(!baseline.iter().any(|m| m.text == MESSAGE), "the weak candidate must miss without retry");
+        assert!(
+            variant.iter().any(|m| m.text == MESSAGE),
+            "weak candidate must be rescued"
+        );
+        assert!(
+            !baseline.iter().any(|m| m.text == MESSAGE),
+            "the weak candidate must miss without retry"
+        );
     }
 
     #[test]
@@ -88,18 +138,36 @@ mod bessel_fallback_fixture {
         let samples = signal(194_445_316, -20.0);
         let mut default = Ft8Config::default();
         default.max_decode_passes = 1;
-        let decode = |config| Ft8Decoder::new(config).unwrap().decode_window(&samples).unwrap();
+        let decode = |config| {
+            Ft8Decoder::new(config)
+                .unwrap()
+                .decode_window(&samples)
+                .unwrap()
+        };
         let keys = |messages: Vec<pancetta_ft8::DecodedMessage>| {
-            messages.into_iter().map(|m| (m.text, m.frequency_offset, m.time_offset, m.confidence))
+            messages
+                .into_iter()
+                .map(|m| (m.text, m.frequency_offset, m.time_offset, m.confidence))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(keys(decode(default.clone())), keys(decode(Ft8Config {
-            bessel_fallback_enabled: false, ..default.clone()
-        })));
-        let global = Ft8Config { llr_metric: LlrMetric::Bessel, ..default };
-        assert_eq!(keys(decode(global.clone())), keys(decode(Ft8Config {
-            bessel_fallback_enabled: true, ..global
-        })));
+        assert_eq!(
+            keys(decode(default.clone())),
+            keys(decode(Ft8Config {
+                bessel_fallback_enabled: false,
+                ..default.clone()
+            }))
+        );
+        let global = Ft8Config {
+            llr_metric: LlrMetric::Bessel,
+            ..default
+        };
+        assert_eq!(
+            keys(decode(global.clone())),
+            keys(decode(Ft8Config {
+                bessel_fallback_enabled: true,
+                ..global
+            }))
+        );
     }
 }
 

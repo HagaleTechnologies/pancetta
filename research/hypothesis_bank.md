@@ -6821,6 +6821,17 @@ search to in-repo sources.
     variants are no longer a promising lane. hb-253 stays opt-in
     (`llr_metric = Bessel`, +0.273 dB solo / +0.506 dB composed
     synthetic); on-air A/B is the remaining validation path.
+    UPDATE 2026-10-26 (PAN-155): new invocation shape, same metric.
+    `Ft8Config::bessel_fallback_enabled` (default false; eval
+    `--bessel-fallback-enabled`) retries a failed DualMax FT8 AP0
+    candidate once with Bessel and never runs it after a DualMax
+    success. A frozen −20 dB generated fixture proves a real rescue.
+    Smoke A/B (fixtures + 64 generated noise WAVs, one thread):
+    fixtures 7/8 → 7/8, noise FP 0 → 0, elapsed +99.8% unlimited
+    (compare elapsed hard gate FAILED) and +14.4% at Standard.
+    hard_200 not evaluated: all 200 WAVs and truth caches are absent
+    in the implementation container. Default stays off. Details:
+    `research/experiments/2026-10-26-pan155-bessel-fallback.md`.
   mode: ft8
   mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
     Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
