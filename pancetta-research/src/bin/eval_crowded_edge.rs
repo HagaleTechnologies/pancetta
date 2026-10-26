@@ -148,7 +148,7 @@ fn totals(records: &[WavRecord], qualified_only: bool) -> Totals {
         crc_valid_displaced_windows: 0,
     };
     for record in records {
-        let Some(p) = &record.premise_on else {
+        let Some(p) = &record.premise_off else {
             if !qualified_only {
                 for (i, arm) in record.arms.iter().enumerate() {
                     arms[i].add(&arm.scores);
@@ -483,5 +483,21 @@ mod tests {
             (1, 2, 1, 1)
         );
         assert_eq!(f.arms[0].edge_tp, 2);
+    }
+    #[test]
+    fn crowded_edge_qualification_uses_production_arms_only() {
+        let mut rescued = window(false);
+        rescued.premise_off = Some(Premise {
+            cap_bound: true,
+            absent_at_200_present_at_600: true,
+            crc_valid_raised_cap: true,
+            ..Premise::default()
+        });
+        let full = totals(std::slice::from_ref(&rescued), false);
+        assert_eq!(full.crc_valid_displaced_windows, 1);
+        assert_eq!(
+            totals(std::slice::from_ref(&rescued), true).qualified_windows,
+            1
+        );
     }
 }

@@ -8,12 +8,13 @@ use std::collections::HashSet;
 pub struct ArmCounts {
     pub edge_tp: u32,
     pub distractor_tp: u32,
+    pub control_tp: u32,
     pub crowded_fp: u32,
     pub noise_fp: u32,
 }
 impl ArmCounts {
     pub fn total_tp(&self) -> u32 {
-        self.edge_tp + self.distractor_tp
+        self.edge_tp + self.distractor_tp + self.control_tp
     }
     pub fn total_fp(&self) -> u32 {
         self.crowded_fp + self.noise_fp
@@ -21,6 +22,7 @@ impl ArmCounts {
     pub fn add(&mut self, other: &Self) {
         self.edge_tp += other.edge_tp;
         self.distractor_tp += other.distractor_tp;
+        self.control_tp += other.control_tp;
         self.crowded_fp += other.crowded_fp;
         self.noise_fp += other.noise_fp;
     }
@@ -48,6 +50,8 @@ pub fn score_messages<'a>(
             found.insert(index);
             if truth.role == "edge-target" {
                 out.edge_tp += 1;
+            } else if truth.role == "control-target" {
+                out.control_tp += 1;
             } else {
                 out.distractor_tp += 1;
             }
@@ -213,11 +217,20 @@ mod tests {
             ArmCounts {
                 edge_tp: 1,
                 distractor_tp: 1,
+                control_tp: 0,
                 crowded_fp: 2,
                 noise_fp: 0
             }
         );
         assert_eq!(score_messages("noise", &[], ["CQ K5ARH EM12"]).noise_fp, 1);
+    }
+    #[test]
+    fn crowded_edge_control_truth_is_not_an_edge_tp() {
+        let truths = [signal("control-target", "CQ K5ARH EM12")];
+        let counts = score_messages("control", &truths, ["CQ K5ARH EM12"]);
+        assert_eq!(counts.edge_tp, 0);
+        assert_eq!(counts.control_tp, 1);
+        assert_eq!(counts.total_tp(), 1);
     }
     #[test]
     fn crowded_edge_cap_diagnosis_ignores_later_passes_and_order() {

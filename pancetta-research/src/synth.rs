@@ -89,8 +89,8 @@ pub fn generate_crowded_edge(
         "empty crowded-edge grid"
     );
     anyhow::ensure!(
-        (3..=7).contains(&config.distractor_count),
-        "distractor_count must be 3..=7"
+        (3..=40).contains(&config.distractor_count),
+        "distractor_count must be 3..=40"
     );
     anyhow::ensure!(
         config
@@ -110,16 +110,6 @@ pub fn generate_crowded_edge(
     const BOUNDARY_S: f64 = 10.0;
     const LEN: usize = 13 * SR + SR / 2;
     const TARGET: &str = "CQ K5ARH EM12";
-    const DISTRACTORS: [&str; 8] = [
-        "CQ K1AAA FN42",
-        "CQ K1AAB EN91",
-        "CQ K1AAC EM10",
-        "CQ K1AAD EL29",
-        "CQ K1AAE FM19",
-        "CQ K1AAF DM13",
-        "CQ K1AAG CN85",
-        "CQ K1AAH DN70",
-    ];
     let target_audio = modulate_message_at(TARGET, 2900.0)?;
     let reference_rms = signal_rms(&target_audio);
     let mut out = Vec::new();
@@ -160,12 +150,25 @@ pub fn generate_crowded_edge(
                 start_s,
                 capture_dt_s: start_s - CAPTURE_START_S,
                 snr_db: snr,
-                role: "edge-target".into(),
+                role: if kind == "edge" {
+                    "edge-target"
+                } else {
+                    "control-target"
+                }
+                .into(),
             });
             for j in 0..config.distractor_count {
-                let msg = DISTRACTORS[(index + j) % DISTRACTORS.len()];
-                let freq_hz = 450.0 + j as f64 * 380.0;
-                let audio = modulate_message_at(msg, freq_hz)?;
+                let number = 1 + ((index + j) / 26) % 9;
+                let suffix = (b'A' + ((index + j) % 26) as u8) as char;
+                let msg = format!("CQ K{number}AA{suffix} FN42");
+                let freq_hz = if config.distractor_count <= 7 {
+                    450.0 + j as f64 * 380.0
+                } else if config.distractor_count <= 24 {
+                    200.0 + j as f64 * 110.0
+                } else {
+                    200.0 + j as f64 * 65.0
+                };
+                let audio = modulate_message_at(&msg, freq_hz)?;
                 let gain =
                     10f64.powf((config.distractor_snr_db - config.noise_snr_db) / 20.0) as f32;
                 mix_at(
@@ -175,7 +178,7 @@ pub fn generate_crowded_edge(
                     gain,
                 );
                 signals.push(CrowdedEdgeSignal {
-                    message: msg.into(),
+                    message: msg,
                     freq_hz,
                     start_s: BOUNDARY_S,
                     capture_dt_s: BOUNDARY_S - CAPTURE_START_S,
@@ -270,6 +273,34 @@ mod crowded_edge_red_tests {
         assert_eq!(edge.1.len(), edge.0.sample_count * 2 + 44);
         let control = a.iter().find(|(entry, _)| entry.kind == "control").unwrap();
         assert!(control.0.signals[0].capture_dt_s >= 0.0);
+        assert_eq!(control.0.signals[0].role, "control-target");
+    }
+    #[test]
+    fn crowded_edge_dense_grid_keeps_unique_nonoverlapping_truths() {
+        let config = CrowdedEdgeConfig {
+            schema_version: 1,
+            generator_version: 1,
+            seed: 16120261027,
+            output_dir: "unused".into(),
+            repetitions: 1,
+            target_snr_db: vec![-17.0],
+            target_dt_s: vec![-0.65],
+            distractor_count: 40,
+            distractor_snr_db: 0.0,
+            noise_snr_db: -16.0,
+            noise_windows: 0,
+            in_window_controls: 0,
+        };
+        let (entry, _) = generate_crowded_edge(&config).unwrap().remove(0);
+        let messages: std::collections::HashSet<_> =
+            entry.signals.iter().map(|s| &s.message).collect();
+        assert_eq!(messages.len(), 41);
+        assert_eq!(entry.signals[0].role, "edge-target");
+        assert!(entry.signals[1..]
+            .windows(2)
+            .all(|pair| pair[1].freq_hz - pair[0].freq_hz >= 65.0));
+        assert!(entry.signals[1..].iter().all(|s| s.freq_hz >= 200.0));
+        assert!(entry.signals[1..].iter().all(|s| s.freq_hz + 50.0 < 2900.0));
     }
 }
 
