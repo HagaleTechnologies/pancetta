@@ -29478,9 +29478,6 @@ fn ap_timing_senders(context: &crate::ap::ApContext) -> Vec<ApTimingSender> {
         .as_ref()
         .map(|c| crate::dt_history::normalize_dt_callsign(&c.callsign));
     for qso in context.active_qso.iter().chain(context.active_qsos.iter()) {
-        if out.len() == AP_TIMING_MAX_SENDERS {
-            break;
-        }
         let call = crate::dt_history::normalize_dt_callsign(&qso.their_call);
         if call == "CQ"
             || local.as_ref() == Some(&call)
@@ -29501,9 +29498,6 @@ fn ap_timing_senders(context: &crate::ap::ApContext) -> Vec<ApTimingSender> {
         }
     }
     for recent in &context.recent_calls {
-        if out.len() == AP_TIMING_MAX_SENDERS {
-            break;
-        }
         let call = crate::dt_history::normalize_dt_callsign(&recent.callsign);
         if call == "CQ" || local.as_ref() == Some(&call) || out.iter().any(|s| s.call == call) {
             continue;
@@ -29640,6 +29634,49 @@ struct ApTimingState {
 #[cfg(all(test, feature = "transmit"))]
 mod pan160_queue_tests {
     use super::*;
+    #[test]
+    fn warm_sender_after_four_cold_calls_is_eligible() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let history = std::sync::Arc::new(crate::InMemoryDtHistory::default());
+        let mut context = crate::ap::ApContext::default();
+        for call in ["K1ABC", "K2ABC", "K3ABC", "K4ABC", "W1AW"] {
+            context
+                .recent_calls
+                .push(crate::ap::RecentCallAp::new(call, 0.).unwrap());
+        }
+        history.record("W1AW", 0.36, now - std::time::Duration::from_secs(30));
+        history.record("W1AW", 0.36, now - std::time::Duration::from_secs(15));
+        let decoder = Ft8Decoder::new(Ft8Config {
+            ap_dt_history_enabled: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_dt_priors(history);
+        let samples = vec![0.; 180000];
+        let spec = decoder.compute_spectrogram(&samples).unwrap();
+        let ctx =
+            super::ap5_hot_path_rescue_tests::build_ctx(&decoder, &spec, &samples, &context, false);
+        let mut state = ApTimingState::default();
+        let seed = CostasCandidate {
+            time_step: 0,
+            freq_bin: 160,
+            freq_sub: 0,
+            sync_score: 10.,
+            time_refinement: 0.,
+        };
+        decoder.retry_ap_timings(
+            &ctx,
+            &[seed],
+            &[None],
+            now,
+            &decoder.ldpc_decoder,
+            &mut state,
+        );
+        assert_eq!(state.eligible, HashSet::from(["W1AW".to_string()]));
+        assert_eq!(state.diagnostics.eligible_targets, 1);
+        assert!(state.diagnostics.searched_rows > 0);
+    }
+
     #[test]
     fn queue_is_deterministic_bounded_deduplicated_and_budgeted() {
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
