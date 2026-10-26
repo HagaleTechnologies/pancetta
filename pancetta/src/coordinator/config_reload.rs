@@ -27,8 +27,9 @@
 //!   nothing, and a change in a higher-priority source is applied by the next
 //!   reload.
 //! - An edit saved between the startup load and the watcher's first read is
-//!   reconciled when the watcher starts: its live remote-access changes are
-//!   applied then (see `start_config_reload_watcher`).
+//!   reconciled when the watcher starts: live remote-access changes are
+//!   applied and restart-required changes are reported then (see
+//!   `start_config_reload_watcher`).
 //! - C19: every reload is classified by [`classify_config_reload`]. A
 //!   QSO-latched field (callsign, grid, slot parity) is never written to the
 //!   running state at all — it is restart-required — so no reload can clobber
@@ -81,8 +82,7 @@ pub(crate) const MSG_STATION_AGENT_ENABLED: &str =
     "station_agent enabled — restart required before it takes effect";
 /// First line of a startup reconciliation (see
 /// `start_config_reload_watcher_with_settle`).
-pub(crate) const MSG_CHANGED_DURING_STARTUP: &str =
-    "Config changed while pancetta was starting — applying remote-access changes";
+pub(crate) const MSG_CHANGED_DURING_STARTUP: &str = "Config changed while pancetta was starting";
 /// Prefix of the line listing saved keys that need a restart.
 pub(crate) const MSG_RESTART_REQUIRED_PREFIX: &str = "Saved changes take effect after a restart:";
 /// At most this many key names are listed in that line.
@@ -246,6 +246,30 @@ fn is_security_key(key: &str) -> bool {
         .iter()
         .any(|k| key == *k || key.starts_with(&format!("{k}.")))
         || key == "network.wsjtx_udp.allow_tx_initiation"
+}
+
+/// Format the restart warning identically for startup reconciliation and
+/// ordinary reloads, including the cap on listed key names.
+fn restart_required_line(restart_keys: &[String]) -> Option<(DiagnosticLevel, String)> {
+    if restart_keys.is_empty() {
+        return None;
+    }
+    let mut listed = restart_keys
+        .iter()
+        .take(RESTART_KEYS_LISTED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if restart_keys.len() > RESTART_KEYS_LISTED {
+        listed.push_str(&format!(
+            " (+{} more)",
+            restart_keys.len() - RESTART_KEYS_LISTED
+        ));
+    }
+    Some((
+        DiagnosticLevel::Warn,
+        format!("{MSG_RESTART_REQUIRED_PREFIX} {listed}"),
+    ))
 }
 
 /// The dotted names of every leaf value that differs between `a` and `b`
@@ -702,55 +726,36 @@ impl super::ApplicationCoordinator {
         let mut lines = vec![(DiagnosticLevel::Info, MSG_RELOADED.to_string())];
         lines.extend(warning_lines);
         lines.extend(self.apply_security_config(&plan.apply_security).await);
-        if !restart_keys.is_empty() {
-            let mut listed = restart_keys
-                .iter()
-                .take(RESTART_KEYS_LISTED)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            if restart_keys.len() > RESTART_KEYS_LISTED {
-                listed.push_str(&format!(
-                    " (+{} more)",
-                    restart_keys.len() - RESTART_KEYS_LISTED
-                ));
-            }
-            lines.push((
-                DiagnosticLevel::Warn,
-                format!("{MSG_RESTART_REQUIRED_PREFIX} {listed}"),
-            ));
-        }
+        lines.extend(restart_required_line(&restart_keys));
         self.config_file_baseline = Some(new);
         self.emit_config_reload_lines(lines).await;
     }
 
-    /// Apply the live remote-access changes between the configuration the
-    /// station started with (the running snapshot) and `baseline`, the
-    /// watcher's first read. They differ only when the file was saved after
-    /// the startup load and before the watcher existed, an edit no watcher
-    /// event will ever report. Only the live parts (consent, allow-list
-    /// removals, disabling the agent) are applied; everything else stays as
-    /// it would after any reload.
+    /// Reconcile the running snapshot with the watcher's first valid read.
+    /// A save before the watcher existed produces no event: apply live
+    /// security changes now and report everything else as restart-required.
     async fn reconcile_startup_window(&mut self, baseline: &Config) {
         let running = self.config.read().await.clone();
-        let full = SecurityConfigDiff::diff(&running, baseline);
-        let live = SecurityConfigDiff {
-            station_agent_consent: full.station_agent_consent,
-            wsjtx_consent: full.wsjtx_consent,
-            allow_list_removed: full.allow_list_removed,
-            station_agent_disabled: full.station_agent_disabled,
-            ..Default::default()
-        };
-        if live.is_empty() {
+        let plan = ReloadApplyPlan::decide(&running, baseline, self.config_reload_qso_active());
+        // The classifier compares serialized TOML, whose HashMap key order
+        // can differ between independent loads of an unchanged file.
+        if changed_keys(&running, baseline).is_empty() && plan.apply_security.is_empty() {
             return;
         }
         warn!("{MSG_CHANGED_DURING_STARTUP}");
-        patch_live_security_fields(&mut *self.config.write().await, &live, baseline);
+        if plan.snapshot == SnapshotAction::PatchSecurity {
+            patch_live_security_fields(
+                &mut *self.config.write().await,
+                &plan.apply_security,
+                baseline,
+            );
+        }
         let mut lines = vec![(
             DiagnosticLevel::Warn,
             MSG_CHANGED_DURING_STARTUP.to_string(),
         )];
-        lines.extend(self.apply_security_config(&live).await);
+        lines.extend(self.apply_security_config(&plan.apply_security).await);
+        lines.extend(restart_required_line(&plan.restart_required_keys));
         self.emit_config_reload_lines(lines).await;
     }
 
@@ -1625,6 +1630,106 @@ mod tests {
         assert!(
             texts(&lines).contains(&MSG_STATION_AGENT_CONSENT_OFF),
             "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn startup_port_edit_warns_once_without_changing_the_running_port() {
+        let dir = temp_path("startup-port");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
+        let rx = tui_rx(&coordinator).await;
+        let original_port = coordinator.config.read().await.rig.interface.port.clone();
+        let mut saved = coordinator.config.read().await.clone();
+        saved.rig.interface.port = "/dev/ttyUSB1".to_string();
+        assert_ne!(saved.rig.interface.port, original_port);
+        std::fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        let lines = diagnostics(&rx);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                MSG_CHANGED_DURING_STARTUP,
+                "Saved changes take effect after a restart: rig.interface.port"
+            ]
+        );
+        assert_eq!(
+            coordinator.config.read().await.rig.interface.port,
+            original_port
+        );
+        assert_eq!(
+            coordinator
+                .config_file_baseline
+                .as_ref()
+                .unwrap()
+                .rig
+                .interface
+                .port,
+            saved.rig.interface.port
+        );
+
+        coordinator
+            .handle_config_reload(Ok((saved, Vec::new())))
+            .await;
+        assert!(
+            !diagnostics(&rx)
+                .iter()
+                .any(|(_, text)| text.starts_with(MSG_RESTART_REQUIRED_PREFIX)),
+            "an identical later reload must not repeat the warning"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn startup_allow_list_addition_reports_restart_without_granting_access() {
+        let dir = temp_path("startup-grant");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
+        let rx = tui_rx(&coordinator).await;
+        let mut saved = coordinator.config.read().await.clone();
+        saved
+            .network
+            .station_agent
+            .tx_allow_list
+            .push("C".to_string());
+        std::fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        let lines = diagnostics(&rx);
+        assert_eq!(
+            texts(&lines),
+            vec![MSG_CHANGED_DURING_STARTUP, MSG_ALLOW_LIST_ADDED]
+        );
+        assert_eq!(
+            coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .tx_allow_list,
+            vec!["A", "B"],
+            "a new key is not granted until restart"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
