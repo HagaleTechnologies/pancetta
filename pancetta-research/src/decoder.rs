@@ -53,6 +53,12 @@ pub trait DecoderUnderTest: Send + Sync {
     /// Opaque JSON snapshot of effective config — serialized into the
     /// scorecard for reproducibility.
     fn config_snapshot(&self) -> serde_json::Value;
+    /// Deterministic timestamp for the next offline slot.
+    fn set_slot_time(&self, _at: std::time::SystemTime) {}
+    /// Timing-history activity, not callsign snapshot size.
+    fn timing_diagnostics(&self) -> pancetta_ft8::dt_history::TimingDiagnostics {
+        Default::default()
+    }
     /// Chronological-replay diagnostic (2026-06-01): when stateful mode
     /// is active, returns the count of accumulated callsigns in the
     /// cross-WAV snapshot. The default returns `None` for stateless or
@@ -241,6 +247,10 @@ pub struct Ft8Decoder {
     /// production). `None` disables — `Ft8Config::dt_history_enabled`
     /// also gates the decoder-side narrowing.
     dt_history: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
+    ap_dt_history: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
+    observe_dt_history: bool,
+    slot_time: Mutex<Option<std::time::SystemTime>>,
+    timing_diagnostics: Mutex<pancetta_ft8::dt_history::TimingDiagnostics>,
     /// Chronological-replay tier substrate (2026-06-01). When `Some`, this
     /// decoder is operating in stateful mode: each successful `decode_wav`
     /// pushes its decoded callsigns into the shared deque, and the NEXT
@@ -320,6 +330,10 @@ impl Ft8Decoder {
             rolling_calls: Mutex::new(std::collections::VecDeque::new()),
             two_stage_first_config: None,
             dt_history: None,
+            ap_dt_history: None,
+            observe_dt_history: false,
+            slot_time: Mutex::new(None),
+            timing_diagnostics: Mutex::new(Default::default()),
             chrono_replay_state: None,
             budget_ms: None,
             partner_freq_hz: None,
@@ -388,6 +402,47 @@ impl Ft8Decoder {
     /// hb-057 V2 (Session 3): override the frequency window (Hz) for
     /// per-candidate callsign-keyed sync narrowing. Default 25.0. Set
     /// to 0.0 to fall back to V1 (union-of-pass-1-callsigns) behavior.
+    /// Maintain the legacy history and measure lookup eligibility in the
+    /// control arm, without applying the V2 residual candidate filter.
+    pub fn with_dt_history_control(mut self) -> Self {
+        self = self.with_dt_history(0.2, 3.);
+        self.config.dt_history_enabled = false;
+        self.observe_dt_history = true;
+        self
+    }
+
+    pub fn with_ap_dt_history(mut self, enabled: bool) -> Self {
+        self.config.ap_dt_history_enabled = enabled;
+        self.ap_dt_history = Some(std::sync::Arc::new(
+            pancetta_ft8::InMemoryDtHistory::default(),
+        ));
+        self
+    }
+
+    /// Actual eligible sender priors, including in the control arm.
+    pub fn eligible_timing_calls(
+        &self,
+        calls: &[String],
+        at: std::time::SystemTime,
+    ) -> Vec<String> {
+        use pancetta_ft8::DtPriorLookup;
+        calls
+            .iter()
+            .filter(|call| {
+                self.ap_dt_history
+                    .as_ref()
+                    .and_then(|h| h.prior_at(call, at))
+                    .is_some_and(|p| {
+                        p.sighting_count >= 2
+                            && p.iqr.is_finite()
+                            && p.iqr >= 0.
+                            && (3. * p.iqr).max(0.2) <= 0.6
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn with_dt_history_freq_window_hz(mut self, hz: f64) -> Self {
         self.config.dt_history_freq_window_hz = hz;
         self
@@ -1279,9 +1334,22 @@ impl DecoderUnderTest for Ft8Decoder {
         // hb-057 V1: attach the shared DT history (Arc cloned per-WAV;
         // the Arc<dyn DtPriorLookup> erases the concrete type so the
         // decoder doesn't need to know about `InMemoryDtHistory`).
-        if let Some(ref h) = self.dt_history {
+        let slot_time = self
+            .slot_time
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or_else(std::time::SystemTime::now);
+        if self.dt_history.is_some() || self.ap_dt_history.is_some() {
             decoder = decoder
-                .with_dt_priors(h.clone() as std::sync::Arc<dyn pancetta_ft8::DtPriorLookup>);
+                .with_dt_priors(std::sync::Arc::new(TimingLookup {
+                    legacy: self.dt_history.clone(),
+                    fresh: self.ap_dt_history.clone(),
+                }))
+                .with_dt_prior_time(slot_time);
+        }
+        if self.observe_dt_history {
+            decoder = decoder.with_dt_history_diagnostics();
         }
         let raw = if receipt_anchored {
             let (messages, timing, texts) = self
@@ -1460,6 +1528,12 @@ impl DecoderUnderTest for Ft8Decoder {
                     })?,
             }
         };
+        if let Ok(mut diagnostics) = self.timing_diagnostics.lock() {
+            *diagnostics = decoder.timing_diagnostics();
+        }
+        if let Some(history) = &self.ap_dt_history {
+            record_ap_timing_slot(history, raw.iter().chain(prelim.iter()), slot_time);
+        }
         // hb-057 V2 (Session 3): record each decoded (callsign, DT, freq)
         // into the shared history BEFORE consuming `raw`/`prelim`. The
         // next `decode_wav` call (next WAV in this tier) sees the
@@ -1509,6 +1583,19 @@ impl DecoderUnderTest for Ft8Decoder {
             push(d);
         }
         Ok(out)
+    }
+
+    fn set_slot_time(&self, at: std::time::SystemTime) {
+        if let Ok(mut time) = self.slot_time.lock() {
+            *time = Some(at);
+        }
+    }
+
+    fn timing_diagnostics(&self) -> pancetta_ft8::dt_history::TimingDiagnostics {
+        self.timing_diagnostics
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     fn config_snapshot(&self) -> serde_json::Value {
@@ -1985,5 +2072,103 @@ mod tests {
         assert_eq!(qso_filter_bin_range(1500.0), Some(230..=250));
         assert_eq!(qso_filter_bin_range(0.0), None);
         assert_eq!(qso_filter_bin_range(f64::NAN), None);
+    }
+}
+
+// Keep the preserved V2 recorder separate from the accepted native AP history.
+struct TimingLookup {
+    legacy: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
+    fresh: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
+}
+impl pancetta_ft8::DtPriorLookup for TimingLookup {
+    fn prior(&self, call: &str) -> Option<pancetta_ft8::DtPrior> {
+        self.legacy.as_ref().and_then(|h| h.prior(call))
+    }
+    fn priors_near_freq(&self, hz: f64, radius: f64) -> Vec<pancetta_ft8::DtPrior> {
+        self.legacy
+            .as_ref()
+            .map(|h| h.priors_near_freq(hz, radius))
+            .unwrap_or_default()
+    }
+    fn prior_at(&self, call: &str, at: std::time::SystemTime) -> Option<pancetta_ft8::DtPrior> {
+        self.fresh.as_ref().and_then(|h| h.prior_at(call, at))
+    }
+}
+
+fn record_ap_timing_slot<'a>(
+    history: &pancetta_ft8::InMemoryDtHistory,
+    messages: impl Iterator<Item = &'a pancetta_ft8::DecodedMessage>,
+    at: std::time::SystemTime,
+) {
+    let mut by_sender: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+    for message in messages {
+        if !message.time_offset.is_finite()
+            || pancetta_qso::callsign_continuity::has_high_risk_fp_pattern(&message.text)
+        {
+            continue;
+        }
+        if let Some(call) = &message.message.from_callsign {
+            let call = pancetta_ft8::dt_history::normalize_dt_callsign(call);
+            if !call.is_empty() && call != "CQ" {
+                by_sender.entry(call).or_default().push(message.time_offset);
+            }
+        }
+    }
+    for (call, mut times) in by_sender {
+        times.sort_by(f64::total_cmp);
+        if times.last().unwrap() - times[0] <= 0.6 {
+            // One accepted observation per sender per slot. Never average
+            // conflicting sources or count preliminary/main duplicates twice.
+            history.record(&call, times[times.len() / 2], at);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pan160_history_tests {
+    use super::*;
+    use pancetta_ft8::DtPriorLookup;
+    #[test]
+    fn accepted_slot_history_is_independent_deduplicated_and_not_truth_seeded() {
+        let a = Ft8Decoder::with_default_config().with_ap_dt_history(false);
+        let b = Ft8Decoder::with_default_config().with_ap_dt_history(true);
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1000);
+        let message = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::message::Ft8Message::from_text("CQ W1AW FN31"),
+            -10.,
+            0.9,
+            1000.,
+            0.32,
+        );
+        let history = a.ap_dt_history.as_ref().unwrap();
+        record_ap_timing_slot(history, [&message, &message].into_iter(), at);
+        assert!(history.prior_at("W1AW", at).is_none());
+        assert!(b.ap_dt_history.as_ref().unwrap().is_empty());
+        record_ap_timing_slot(
+            history,
+            [&message].into_iter(),
+            at + Duration::from_secs(15),
+        );
+        assert!(
+            history.prior_at("W1AW", at).is_none(),
+            "future slot cannot leak into earlier replay"
+        );
+        assert_eq!(
+            history
+                .prior_at("W1AW", at + Duration::from_secs(30))
+                .unwrap()
+                .sighting_count,
+            2
+        );
+        assert_eq!(b.config_snapshot()["ap_dt_history_enabled"], true);
+        assert_eq!(b.config_snapshot()["dt_history_enabled"], false);
+        let mut conflict = message.clone();
+        conflict.time_offset = 1.8;
+        record_ap_timing_slot(
+            b.ap_dt_history.as_ref().unwrap(),
+            [&message, &conflict].into_iter(),
+            at,
+        );
+        assert!(b.ap_dt_history.as_ref().unwrap().is_empty());
     }
 }
