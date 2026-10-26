@@ -177,6 +177,15 @@ ft8_lib WAVs, a summarizer that applies the decision rule, and a
 `--manifest` mode for a real storm-day A/B. Commands and the decision rule:
 `research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
 
+`eval --bessel-fallback-enabled` (PAN-155) sets
+`Ft8Config::bessel_fallback_enabled`: an FT8 candidate whose DualMax AP0
+attempt fails gets one more AP0 attempt with the Bessel metric, skipped once
+the decode budget expires. It is off by default and stays off: the smoke A/B
+doubled unlimited eval time, and hard-200 has not been run. Run both arms
+back-to-back on the same host and thread count, with the flag as the only
+difference. Commands and results:
+`research/experiments/2026-10-26-pan155-bessel-fallback.md`.
+
 ## Design
 
 See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.

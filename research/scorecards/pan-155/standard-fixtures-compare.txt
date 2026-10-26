@@ -1,0 +1,16 @@
+A: /tmp/pan155-eval-r4/budget-baseline.json (sha c7406177, score 0.1313)
+B: /tmp/pan155-eval-r4/budget-fallback.json (sha c7406177, score 0.1313 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.bessel_fallback_enabled          false → true
+ELAPSED GATE:
+  elapsed_seconds        10.3 → 11.8  (+14.4%, budget +20.0%)
+
+
+budget compare exit=0

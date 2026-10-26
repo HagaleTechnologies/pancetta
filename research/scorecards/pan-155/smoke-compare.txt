@@ -1,0 +1,22 @@
+A: /tmp/pan155-eval-r4/baseline.json (sha c7406177, score 0.1313)
+B: /tmp/pan155-eval-r4/fallback.json (sha c7406177, score 0.1313 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.bessel_fallback_enabled          false → true
+ELAPSED GATE:
+  elapsed_seconds        282.3 → 563.9  (+99.8%, budget +20.0%)
+
+############################################################
+# HARD GATE FAILURE — ELAPSED TIME REGRESSED BEYOND BUDGET
+# Raise --max-elapsed-regression-pct only with an explicit rationale.
+############################################################
+  elapsed_seconds        282.3 → 563.9  (+99.8%, budget +20.0%)
+
+
+compare exit=1

@@ -609,6 +609,13 @@ impl Ft8Decoder {
         self
     }
 
+    /// PAN-155 [A/B]: retry a failed DualMax FT8 AP0 candidate once with
+    /// Bessel. See `Ft8Config::bessel_fallback_enabled`.
+    pub fn with_bessel_fallback_enabled(mut self, on: bool) -> Self {
+        self.config.bessel_fallback_enabled = on;
+        self
+    }
+
     /// Decoder-TP-sensitivity Task W3.3 [A/B]: master switch for the
     /// per-candidate fine-sync + matched-demod stage that replaces the
     /// legacy 21-trial fine-FFT fallback. See `Ft8Config::fine_sync_enabled`.
@@ -1772,6 +1779,16 @@ mod jt9_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bessel_fallback_snapshot_tracks_opt_in_without_changing_primary_metric() {
+        let baseline = Ft8Decoder::with_default_config();
+        let variant = Ft8Decoder::with_default_config().with_bessel_fallback_enabled(true);
+        assert_eq!(baseline.config_snapshot()["bessel_fallback_enabled"], false);
+        assert_eq!(variant.config_snapshot()["bessel_fallback_enabled"], true);
+        assert_eq!(baseline.config_snapshot()["llr_metric"], "DualMax");
+        assert_eq!(variant.config_snapshot()["llr_metric"], "DualMax");
+    }
 
     fn fixture(rel: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
