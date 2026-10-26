@@ -4,9 +4,9 @@
 //! path. Regenerating from manifest + seed produces byte-identical WAVs.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::path::PathBuf;
-use sha2::{Digest, Sha256};
 
 /// Frozen PAN-161 corpus recipe. Times are relative to the nominal slot boundary.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -60,8 +60,14 @@ impl CrowdedEdgeManifest {
     pub const VERSION: u32 = 1;
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.schema_version == Self::VERSION, "unsupported crowded-edge manifest version");
-        anyhow::ensure!(self.generator_version == 1, "unsupported crowded-edge generator version");
+        anyhow::ensure!(
+            self.schema_version == Self::VERSION,
+            "unsupported crowded-edge manifest version"
+        );
+        anyhow::ensure!(
+            self.generator_version == 1,
+            "unsupported crowded-edge generator version"
+        );
         anyhow::ensure!(!self.entries.is_empty(), "empty crowded-edge manifest");
         Ok(())
     }
@@ -69,65 +75,135 @@ impl CrowdedEdgeManifest {
 
 /// Build all corpus WAV bytes in a fixed order. The returned paths remain
 /// canonical even when a CLI writes the bytes into a temporary directory.
-pub fn generate_crowded_edge(config: &CrowdedEdgeConfig) -> anyhow::Result<Vec<(CrowdedEdgeEntry, Vec<u8>)>> {
-    anyhow::ensure!(config.schema_version == 1 && config.generator_version == 1, "unsupported crowded-edge config version");
-    anyhow::ensure!(config.repetitions > 0 && !config.target_snr_db.is_empty() && !config.target_dt_s.is_empty(), "empty crowded-edge grid");
-    anyhow::ensure!((3..=7).contains(&config.distractor_count), "distractor_count must be 3..=7");
-    anyhow::ensure!(config.target_dt_s.iter().all(|&dt| (-0.65..=-0.55).contains(&dt)), "edge dt must stay in the decoder's negative-time search range");
-    anyhow::ensure!(config.target_snr_db.iter().all(|x| x.is_finite()) && config.distractor_snr_db.is_finite() && config.noise_snr_db.is_finite(), "nonfinite SNR");
+pub fn generate_crowded_edge(
+    config: &CrowdedEdgeConfig,
+) -> anyhow::Result<Vec<(CrowdedEdgeEntry, Vec<u8>)>> {
+    anyhow::ensure!(
+        config.schema_version == 1 && config.generator_version == 1,
+        "unsupported crowded-edge config version"
+    );
+    anyhow::ensure!(
+        config.repetitions > 0
+            && !config.target_snr_db.is_empty()
+            && !config.target_dt_s.is_empty(),
+        "empty crowded-edge grid"
+    );
+    anyhow::ensure!(
+        (3..=7).contains(&config.distractor_count),
+        "distractor_count must be 3..=7"
+    );
+    anyhow::ensure!(
+        config
+            .target_dt_s
+            .iter()
+            .all(|&dt| (-0.65..=-0.55).contains(&dt)),
+        "edge dt must stay in the decoder's negative-time search range"
+    );
+    anyhow::ensure!(
+        config.target_snr_db.iter().all(|x| x.is_finite())
+            && config.distractor_snr_db.is_finite()
+            && config.noise_snr_db.is_finite(),
+        "nonfinite SNR"
+    );
     const SR: usize = 12_000;
     const CAPTURE_START_S: f64 = 9.5;
     const BOUNDARY_S: f64 = 10.0;
     const LEN: usize = 13 * SR + SR / 2;
     const TARGET: &str = "CQ K5ARH EM12";
     const DISTRACTORS: [&str; 8] = [
-        "CQ K1AAA FN42", "CQ K1AAB EN91", "CQ K1AAC EM10", "CQ K1AAD EL29",
-        "CQ K1AAE FM19", "CQ K1AAF DM13", "CQ K1AAG CN85", "CQ K1AAH DN70",
+        "CQ K1AAA FN42",
+        "CQ K1AAB EN91",
+        "CQ K1AAC EM10",
+        "CQ K1AAD EL29",
+        "CQ K1AAE FM19",
+        "CQ K1AAF DM13",
+        "CQ K1AAG CN85",
+        "CQ K1AAH DN70",
     ];
     let target_audio = modulate_message_at(TARGET, 2900.0)?;
     let reference_rms = signal_rms(&target_audio);
     let mut out = Vec::new();
-    let edge_count = config.repetitions as usize * config.target_snr_db.len() * config.target_dt_s.len();
+    let edge_count =
+        config.repetitions as usize * config.target_snr_db.len() * config.target_dt_s.len();
     let total = edge_count + config.in_window_controls as usize + config.noise_windows as usize;
     for index in 0..total {
-        let kind = if index < edge_count { "edge" } else if index < edge_count + config.in_window_controls as usize { "control" } else { "noise" };
-        let seed = config.seed.wrapping_add((index as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let kind = if index < edge_count {
+            "edge"
+        } else if index < edge_count + config.in_window_controls as usize {
+            "control"
+        } else {
+            "noise"
+        };
+        let seed = config
+            .seed
+            .wrapping_add((index as u64).wrapping_mul(0x9e3779b97f4a7c15));
         let mut window = vec![0.0f32; LEN];
         let mut signals = Vec::new();
         if kind != "noise" {
             let snr = config.target_snr_db[index % config.target_snr_db.len()];
-            let dt = if kind == "control" { 0.0 } else { config.target_dt_s[(index / config.target_snr_db.len()) % config.target_dt_s.len()] };
+            let dt = if kind == "control" {
+                0.0
+            } else {
+                config.target_dt_s[(index / config.target_snr_db.len()) % config.target_dt_s.len()]
+            };
             let start_s = BOUNDARY_S + dt;
             let gain = 10f64.powf((snr - config.noise_snr_db) / 20.0) as f32;
-            mix_at(&mut window, &target_audio, ((start_s - CAPTURE_START_S) * SR as f64).round() as isize, gain);
+            mix_at(
+                &mut window,
+                &target_audio,
+                ((start_s - CAPTURE_START_S) * SR as f64).round() as isize,
+                gain,
+            );
             signals.push(CrowdedEdgeSignal {
-                message: TARGET.into(), freq_hz: 2900.0, start_s,
-                capture_dt_s: start_s - CAPTURE_START_S, snr_db: snr, role: "edge-target".into(),
+                message: TARGET.into(),
+                freq_hz: 2900.0,
+                start_s,
+                capture_dt_s: start_s - CAPTURE_START_S,
+                snr_db: snr,
+                role: "edge-target".into(),
             });
             for j in 0..config.distractor_count {
                 let msg = DISTRACTORS[(index + j) % DISTRACTORS.len()];
                 let freq_hz = 450.0 + j as f64 * 380.0;
                 let audio = modulate_message_at(msg, freq_hz)?;
-                let gain = 10f64.powf((config.distractor_snr_db - config.noise_snr_db) / 20.0) as f32;
-                mix_at(&mut window, &audio, ((BOUNDARY_S - CAPTURE_START_S) * SR as f64).round() as isize, gain);
+                let gain =
+                    10f64.powf((config.distractor_snr_db - config.noise_snr_db) / 20.0) as f32;
+                mix_at(
+                    &mut window,
+                    &audio,
+                    ((BOUNDARY_S - CAPTURE_START_S) * SR as f64).round() as isize,
+                    gain,
+                );
                 signals.push(CrowdedEdgeSignal {
-                    message: msg.into(), freq_hz, start_s: BOUNDARY_S,
+                    message: msg.into(),
+                    freq_hz,
+                    start_s: BOUNDARY_S,
                     capture_dt_s: BOUNDARY_S - CAPTURE_START_S,
-                    snr_db: config.distractor_snr_db, role: "distractor".into(),
+                    snr_db: config.distractor_snr_db,
+                    role: "distractor".into(),
                 });
             }
         }
         add_awgn_2500hz_ref(&mut window, reference_rms, config.noise_snr_db, seed);
         let peak = window.iter().fold(0.0f32, |p, x| p.max(x.abs()));
         let scale = if peak > 0.9 { 0.9 / peak } else { 1.0 };
-        for x in &mut window { *x *= scale; }
+        for x in &mut window {
+            *x *= scale;
+        }
         let bytes = crowded_wav_bytes(&window);
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let entry = CrowdedEdgeEntry {
-            wav_path: config.output_dir.join(format!("pan161_{index:04}_{kind}.wav")),
-            sha256, seed, sample_rate: SR as u32, sample_count: LEN,
-            capture_start_s: CAPTURE_START_S, peak_before_quantization: peak * scale,
-            signals, kind: kind.into(),
+            wav_path: config
+                .output_dir
+                .join(format!("pan161_{index:04}_{kind}.wav")),
+            sha256,
+            seed,
+            sample_rate: SR as u32,
+            sample_count: LEN,
+            capture_start_s: CAPTURE_START_S,
+            peak_before_quantization: peak * scale,
+            signals,
+            kind: kind.into(),
         };
         out.push((entry, bytes));
     }
@@ -137,7 +213,9 @@ pub fn generate_crowded_edge(config: &CrowdedEdgeConfig) -> anyhow::Result<Vec<(
 fn mix_at(dst: &mut [f32], src: &[f32], start: isize, gain: f32) {
     for (i, &x) in src.iter().enumerate() {
         let j = start + i as isize;
-        if j >= 0 && (j as usize) < dst.len() { dst[j as usize] += x * gain; }
+        if j >= 0 && (j as usize) < dst.len() {
+            dst[j as usize] += x * gain;
+        }
     }
 }
 
@@ -169,12 +247,18 @@ mod crowded_edge_red_tests {
     #[test]
     fn crowded_edge_geometry_and_determinism() {
         let config = CrowdedEdgeConfig {
-            schema_version: 1, generator_version: 1, seed: 161,
+            schema_version: 1,
+            generator_version: 1,
+            seed: 161,
             output_dir: "research/corpus/synth/wavs/pan161".into(),
-            repetitions: 1, target_snr_db: vec![-16.0],
-            target_dt_s: vec![-0.6], distractor_count: 4,
-            distractor_snr_db: -8.0, noise_snr_db: -16.0,
-            noise_windows: 1, in_window_controls: 1,
+            repetitions: 1,
+            target_snr_db: vec![-16.0],
+            target_dt_s: vec![-0.6],
+            distractor_count: 4,
+            distractor_snr_db: -8.0,
+            noise_snr_db: -16.0,
+            noise_windows: 1,
+            in_window_controls: 1,
         };
         let a = generate_crowded_edge(&config).unwrap();
         let b = generate_crowded_edge(&config).unwrap();
