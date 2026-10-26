@@ -735,11 +735,16 @@ impl super::ApplicationCoordinator {
     /// A save before the watcher existed produces no event: apply live
     /// security changes now and report everything else as restart-required.
     async fn reconcile_startup_window(&mut self, baseline: &Config) {
-        let running = self.config.read().await.clone();
-        let plan = ReloadApplyPlan::decide(&running, baseline, self.config_reload_qso_active());
+        // Load metadata is never an edit: startup's merged load carries a
+        // fresh instance id and timestamp that the merged reload loader drops.
+        let mut running = self.config.read().await.clone();
+        running.metadata = None;
+        let mut saved = baseline.clone();
+        saved.metadata = None;
+        let plan = ReloadApplyPlan::decide(&running, &saved, self.config_reload_qso_active());
         // The classifier compares serialized TOML, whose HashMap key order
         // can differ between independent loads of an unchanged file.
-        if changed_keys(&running, baseline).is_empty() && plan.apply_security.is_empty() {
+        if changed_keys(&running, &saved).is_empty() && plan.apply_security.is_empty() {
             return;
         }
         warn!("{MSG_CHANGED_DURING_STARTUP}");
@@ -1942,6 +1947,42 @@ mod tests {
         assert!(coordinator.config_reload_rx.is_some());
         assert!(diagnostics(&rx).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PAN-199: without `--config`, the running config keeps the startup
+    /// load's metadata (fresh instance id and timestamp) and the reload
+    /// loader drops it. That difference is not an edit, so an unchanged file
+    /// still reports nothing when the watcher starts.
+    #[tokio::test]
+    async fn merged_mode_startup_load_metadata_is_not_reported_as_an_edit() {
+        let root = temp_path("startup-merged-metadata");
+        let watched = root.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let path = watched.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
+        let rx = tui_rx(&coordinator).await;
+        let mut saved = coordinator.config.read().await.clone();
+        assert!(
+            saved.metadata.is_some(),
+            "startup's merged load has metadata"
+        );
+        saved.metadata = None;
+        std::fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+
+        coordinator.set_config_reload_loader(merged_loader(vec![watched.clone()]));
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        assert!(coordinator.config_reload_rx.is_some());
+        let lines = diagnostics(&rx);
+        assert!(lines.is_empty(), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
