@@ -148,7 +148,7 @@ pub struct VerifiedCapability {
     /// NEVER client-asserted at arm time. `None` ⇒ the token is NOT TX-enabled:
     /// even with the `tx` scope the station MUST refuse to arm (status/qsy are
     /// unaffected). `Some(t)` ⇒ arm is honored only if `t > now` (checked at arm
-    /// time via [`require_tx_enabled`]).
+    /// time via [`require_tx_enabled`], then retained on the arm for live checks).
     pub tx_enabled_until: Option<i64>,
     /// The operator callsign the IdP bound into this token (Part-97
     /// attribution), if any. When `Some`, an arm grant's client-signed
@@ -611,7 +611,9 @@ impl CapabilityVerifier {
         if armed_until <= now_ms {
             return Err(CapError::Expired);
         }
-        let ttl_ms = armed_until - now_ms;
+        let ttl_ms = armed_until
+            .checked_sub(now_ms)
+            .ok_or(CapError::ArmTooLong)?;
         if ttl_ms > MAX_ARM_MS {
             return Err(CapError::ArmTooLong);
         }
@@ -627,6 +629,32 @@ impl CapabilityVerifier {
         if !capability.scopes.iter().any(|s| s == "tx") {
             return Err(CapError::NoTxScope);
         }
+
+        // Retain the verified token horizons, with checked seconds-to-ms
+        // conversion. These remain live authority limits after acceptance.
+        let tx_enabled_until_ms = capability
+            .tx_enabled_until
+            .ok_or(CapError::NotTxEnabled)?
+            .checked_mul(1000)
+            .ok_or_else(|| CapError::MalformedClaim("txEnabledUntil".to_string()))?;
+        let mut verified = VerifiedArmGrant {
+            operator_callsign: String::new(),
+            ttl_ms,
+            armed_until_ms: armed_until,
+            capability_exp_ms: capability.exp_ms,
+            tx_enabled_until_ms,
+            effective_ttl_ms: 0,
+            heartbeat_interval_sec: heartbeat,
+            scope_tx: true,
+            jti: String::new(),
+            client_key_id: client_key_id.to_string(),
+        };
+        verified.effective_ttl_ms = verified
+            .effective_deadline()
+            .0
+            .checked_sub(now_ms)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(CapError::Expired)?;
 
         // 6. jti single-use within the session.
         let jti = obj
@@ -654,14 +682,8 @@ impl CapabilityVerifier {
             }
         }
 
-        Ok(VerifiedArmGrant {
-            operator_callsign,
-            ttl_ms,
-            armed_until_ms: armed_until,
-            heartbeat_interval_sec: heartbeat,
-            scope_tx: true,
-            jti,
-            client_key_id: client_key_id.to_string(),
-        })
+        verified.operator_callsign = operator_callsign;
+        verified.jti = jti;
+        Ok(verified)
     }
 }
