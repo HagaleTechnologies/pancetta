@@ -109,14 +109,13 @@ refuses the commit with `OffsetActionTriggerOutcomePending`. See
 `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
 `pancetta-qso/src/qso_manager.rs`.
 
-<<<<<<< HEAD
 Caller-admission gotcha (PAN-120): the QSO decode loop and autonomous initiation
 are separate paths. A new direct caller now requires local console presence or
 `autonomous.unattended_policy = "respond_only"`, even with the autonomous toggle
 off. The default is `off` and changes need a restart. Existing exchanges still
 advance without presence; autonomous CQ and pounce still require it. See the
 [normative decision](../../docs/DECISIONS/tx-scheduling.md#direct-caller-presence-policy-pan-120).
-=======
+
 TX-worker tests must wait on the worker stage they assert (PAN-237). In
 `pancetta/src/coordinator/tx.rs`,
 `headless_frame_is_durably_logged_even_when_the_tui_channel_is_full` leaves
@@ -128,4 +127,3 @@ dial, and releases the mutex before awaiting completion. Queue status alone
 does not hold the worker before its final band-plan check. Keep these event
 boundaries when changing the tests; a settling sleep cannot establish either
 ordering.
->>>>>>> d963768b62965bd077419f4284b34a05cf0881dd

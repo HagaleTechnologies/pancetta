@@ -1206,10 +1206,11 @@ fn classify_caller_answer(
 // unattended_policy is RespondOnly. Existing exchanges are processed first
 // and continue without this new-admission gate.
 //
-// 1. **TX policy and presence**: Disabled blocks entirely; otherwise require
+// 1. **Already in QSO** — if `process_message` (run first) is already driving
+//    an exchange with this station, or one completed within 120 s, skip (no
+//    duplicate). This is not a new caller, so it logs no caller outcome.
+// 2. **TX policy and presence**: Disabled blocks entirely; otherwise require
 //    operator presence or the configured direct-caller exception.
-// 2. **Already in QSO** — if `process_message` (run first) is already driving
-//    an exchange with this station, skip (no duplicate).
 // 3. **Half-duplex parity** — we'd TX on `opposite(their_parity)`; if that
 //    crosses the window our active QSOs are committed to, defer (the operator
 //    can still pick them manually). Keeps us off sequential-window TX.
@@ -1586,7 +1587,30 @@ async fn maybe_answer_caller(
         return;
     };
 
-    // Runtime TX policy wins attribution when both conditions refuse.
+    // 1. Don't open a duplicate — process_message already drives any active QSO
+    //    with this station (it ran before us this cycle). Also suppress for a
+    //    recently-completed QSO (120 s window): if the DX sends another RR73
+    //    right after we already exchanged 73s, the bounded auto-resend-73 path
+    //    (`maybe_auto_resend_73`) handles it — opening a brand-new QSO here
+    //    would produce spurious duplicate 73s. Explicit operator re-work via
+    //    StartQso / Space does NOT come through this function, so it is
+    //    unaffected by this gate. This runs before the TX-policy and presence
+    //    refusals below: such a decode is not a new caller attempt, so it must
+    //    not be logged as a suppressed direct-call reply (PAN-120).
+    if qso_manager
+        .has_active_or_recent_qso_with(
+            &answer.their_call,
+            frequency_hz,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    {
+        debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
+        return;
+    }
+
+    // 2. New caller: runtime TX policy, then operator presence. TX policy
+    //    wins attribution when both conditions refuse.
     let policy =
         pancetta_core::TxPolicy::from_u8(tx_policy.load(std::sync::atomic::Ordering::Relaxed));
     if !policy.allows_any_tx() {
@@ -1615,26 +1639,6 @@ async fn maybe_answer_caller(
             respond_only_admitted = 0,
             "Direct-call reply suppressed by operator-presence gate"
         );
-        return;
-    }
-
-    // 2. Don't open a duplicate — process_message already drives any active QSO
-    //    with this station (it ran before us this cycle). Also suppress for a
-    //    recently-completed QSO (120 s window): if the DX sends another RR73
-    //    right after we already exchanged 73s, the bounded auto-resend-73 path
-    //    (`maybe_auto_resend_73`) handles it — opening a brand-new QSO here
-    //    would produce spurious duplicate 73s. Explicit operator re-work via
-    //    StartQso / Space does NOT come through this function, so it is
-    //    unaffected by this gate.
-    if qso_manager
-        .has_active_or_recent_qso_with(
-            &answer.their_call,
-            frequency_hz,
-            std::time::Duration::from_secs(120),
-        )
-        .await
-    {
-        debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
         return;
     }
 
@@ -15802,6 +15806,32 @@ mod pan120_tests {
             .any(|v| v["fields"]["respond_only_admitted"] == 1));
     }
 
+    #[tokio::test]
+    async fn pan120_existing_or_recent_qso_has_no_new_caller_refusal_log() {
+        for existing in ["active", "recent"] {
+            for policy in [TxPolicy::Full, TxPolicy::Disabled] {
+                let st = Station::new(false, TxPolicy::Full).await;
+                let opening = if existing == "active" {
+                    "K5ARH W1ABC FN31"
+                } else {
+                    "K5ARH W1ABC RR73"
+                };
+                st.answer(&call(opening), UnattendedPolicy::Off, true).await;
+                st.tx_policy.store(policy.as_u8(), Ordering::Relaxed);
+
+                let mut rx = st.manager.subscribe();
+                let logs = st
+                    .answer(&call("K5ARH W1ABC R-12"), UnattendedPolicy::Off, false)
+                    .await;
+                assert!(drain(&mut rx).is_empty(), "{existing} {policy:?}");
+                assert!(
+                    !logs.iter().any(|event| event["target"] == "tx.policy"),
+                    "existing={existing} policy={policy:?} logs={logs:?}"
+                );
+            }
+        }
+    }
+
     struct LoopHarness {
         coordinator: super::super::ApplicationCoordinator,
         manager: QsoManager,
@@ -16037,8 +16067,37 @@ mod pan120_tests {
                 } else {
                     "K5ARH W1ABC R-12"
                 };
+                // The QSO loop is a task on this current-thread runtime, so a
+                // thread-scoped subscriber sees its caller-admission records.
+                let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let writer = Capture(bytes.clone());
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                let guard = tracing::subscriber::set_default(subscriber);
                 h.decode(incoming, 102, 14_074_000).await;
                 let (continued_id, reply) = h.wait_for_send(&mut rx).await;
+                h.barrier().await;
+                drop(guard);
+                let logs: Vec<serde_json::Value> = String::from_utf8(bytes.lock().unwrap().clone())
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(
+                    logs.iter().any(|event| event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("active or recently-completed QSO exists"))),
+                    "loop must reach caller admission for the continued QSO: {logs:?}"
+                );
+                assert!(
+                    !logs.iter().any(|event| event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with("Direct-call reply"))),
+                    "continued QSO {setting:?} cq={started_with_cq} logged as a caller outcome: {logs:?}"
+                );
                 assert_eq!(continued_id, id, "existing QSO must be reused");
                 if started_with_cq {
                     assert!(
@@ -16051,7 +16110,6 @@ mod pan120_tests {
                         "must advance existing exchange: {reply:?}"
                     );
                 }
-                h.barrier().await;
                 assert_eq!(h.manager.active_qso_count().await, 1);
             }
         }
