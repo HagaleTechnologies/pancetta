@@ -1,14 +1,14 @@
 ---
 slug: pan162-impulse-llr-storm
 mode: ft8
-state: tooling-built-measurement-pending
+state: measured-candidate-k6-production-gate-pending
 created: 2026-10-25T23:55:00Z
-last_updated: 2026-10-25
+last_updated: 2026-10-26
 branch: PAN-162
 parent_hypothesis: hb-256
-scorecard: research/scorecards/pan162-impulse-llr-offair.json (storm scorecard research/scorecards/pan162-impulse-llr-storm.json not yet produced)
-delta_vs_main: none in production. Off-air do-no-harm (c′) on 60 vendored WAVs — ΔTP k=6 +1, k=3 -7
-disposition: STAYS OFF BY DEFAULT (no verdict yet). The synthetic storm shards have not been run, so the pre-registered rule has nothing to decide on; `Ft8Config::impulse_robust_llr` stays `None` and production is unchanged. Phase 6 skipped: no verdict.
+scorecard: research/scorecards/pan162-impulse-llr-storm.json (synthetic plants, verdict) and research/scorecards/pan162-impulse-llr-offair.json (off-air do-no-harm)
+delta_vs_main: none in production. Storm plant (decision) k=6 threshold shift +0.465 dB [+0.308, +0.653]; awgn k=6 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7
+disposition: STAYS OFF BY DEFAULT for now. The pre-registered verdict is candidate-k6, which triggers Phase 6; its native-only production gate (synth-clean, noise_1000, elapsed) has not run, and the coordinator default is set only if that gate passes. `Ft8Config::impulse_robust_llr` stays `None` and production is unchanged.
 ---
 
 # PAN-162: hb-256's lightning-static LLR knee, measured on the stormiest days
@@ -37,13 +37,56 @@ RAYON_NUM_THREADS=6 target/release/examples/batch104_impulse_llr_storm_remeasure
   --output research/scorecards/pan162-impulse-llr-offair.json                         # 103 s
 ```
 
-**Not run:** the twelve synthetic shards (`awgn`, `base`, `storm`, `severe` ×
-`off`, `k3`, `k6`; 29,400 decodes) and `--summarize`. At the measured off-air
-throughput they need well over half an hour of exclusive CPU, which did not
-fit beside the repository gate inside this run's deadline. They are the next
-step (commands below); nothing about the pre-registration changes in the
-meantime. The port-fidelity cross-check against batch101's published rows
-runs with them.
+The implement run did not run the twelve synthetic shards or `--summarize`.
+They ran in the remediate run below, with the pre-registration unchanged.
+
+## What was run in the remediate run (2026-10-26)
+
+Same host class: Catalyst cloud container, 6-CPU cgroup quota
+(`600000 100000`), release build at branch PAN-162 commit 4f36178. The shard
+directory was `/workspace/tmp/pan162-rem/shards`, a scratch path outside the
+checkout; the shards ran one at a time from a shell loop, in this order:
+
+```sh
+cargo build --release -p pancetta-research --example batch104_impulse_llr_storm_remeasure \
+  --bin eval --bin compare
+export RAYON_NUM_THREADS=6
+B=target/release/examples/batch104_impulse_llr_storm_remeasure
+for plant in awgn storm base severe; do for config in off k3 k6; do
+  $B --plant $plant --config $config --shard-dir /workspace/tmp/pan162-rem/shards
+done; done
+$B --summarize --shard-dir /workspace/tmp/pan162-rem/shards \
+  --offair research/scorecards/pan162-impulse-llr-offair.json \
+  --output research/scorecards/pan162-impulse-llr-storm.json
+```
+
+Shard wall times (decodes are seeded, so contention changes only time, never outcomes; the six awgn and storm shards shared the CPU quota with the aborted eval arms below, a build, or both):
+
+| shard | exit | wall (s) |
+|---|---|---|
+| awgn-off | 0 | 323 |
+| awgn-k3 | 0 | 215 |
+| awgn-k6 | 0 | 309 |
+| storm-off | 0 | 560 |
+| storm-k3 | 0 | 464 |
+| storm-k6 | 0 | 492 |
+| base-off | 0 | 157 |
+| base-k3 | 0 | 148 |
+| base-k6 | 0 | 176 |
+| severe-off | 0 | 139 |
+| severe-k3 | 0 | 165 |
+| severe-k6 | 0 | 182 |
+
+`--summarize` reported no grid extension, ran `check_invariants()` before saving, and printed:
+
+```text
+PAN-162 verdict: candidate-k6 — storm k=6 +0.465 dB [+0.308, +0.653], k=3 +0.523 dB [+0.358, +0.732]; awgn k=6 +0.000 dB, k=3 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7
+```
+
+The scorecard records `commit` 4f36178 and `rayon_threads` 6. Its sha256,
+`90f1527ca2605744bd70d154d8a4abd7c80ae57f21e9e8cb9a14baad86b76f2c`, equals that
+of the validate phase's independent scratch run of the same commands at the
+same commit, so the record reproduces byte for byte.
 
 ## Instrument (Scenario 1)
 
@@ -103,7 +146,8 @@ Paired per-WAV bootstrap (n=1000, seed 0xb007; reported, not gated): k=6
 
 Against bar (c′) ΔTP ≥ −2: **k=6 passes, k=3 fails**. Under the decision
 rule, k=3 can therefore at best reach `stays-off-harm-gate`; only k=6 can
-still become a candidate, and only if the storm plant clears bar (b).
+still become a candidate, and only if the storm plant clears bar (b). It
+does (see Verdict).
 
 Reference-list parsing note: 85 of the 1298 vendored reference lines carry a
 WSJT-X country annotation after the message (`CQ TA6CQ KN70      AS Turkey`).
@@ -162,31 +206,185 @@ If all of these pass, the final disposition is **default-on** for FT8 at that k.
 
 **Stop rule (copied from PAN-158 on purpose):** do not change seeds, plants, grids, trials, bars or k order after seeing results. Do not search for favourable seeds, add plants, or call a below-bar result complete with a different meaning. A failing gate is a resolved outcome ("stays off by default, same as today"), not a question for a human.
 
+## Results: synthetic plants
+
+`research/scorecards/pan162-impulse-llr-storm.json` (per-trial bitstrings,
+rates, thresholds, paired bootstrap CIs and the verdict; `check_invariants()`
+recomputes every derived number and the verdict from the bitstrings). The
+grid-extension rule did not apply: every curve crosses 50% inside its
+pre-registered grid, and none is at ≥ 50% at the bottom point.
+
+### `awgn` — 200 trials/point, mean impulsive-block fraction 0.0000
+
+| SNR (dB) | off | k3 | k6 |
+|---|---|---|---|
+| -21.0 | 0.5% | 0.5% | 0.5% |
+| -20.5 | 0.5% | 0.5% | 0.5% |
+| -20.0 | 1.5% | 1.5% | 1.5% |
+| -19.5 | 14.0% | 14.0% | 14.0% |
+| -19.0 | 30.0% | 30.0% | 30.0% |
+| -18.5 | 61.0% | 61.0% | 61.0% |
+| -18.0 | 81.5% | 81.5% | 81.5% |
+| -17.5 | 95.5% | 95.5% | 95.5% |
+| -17.0 | 99.0% | 99.0% | 99.0% |
+| -16.5 | 100.0% | 100.0% | 100.0% |
+| -16.0 | 100.0% | 100.0% | 100.0% |
+| threshold | -18.68 | -18.68 | -18.68 |
+
+- shift off → k=6: +0.000 dB, 95% CI [+0.000, +0.000], significant=false, undefined resamples 0/1000
+- shift off → k=3: +0.000 dB, 95% CI [+0.000, +0.000], significant=false, undefined resamples 0/1000
+
+### `storm` — 200 trials/point, mean impulsive-block fraction 0.0949
+
+| SNR (dB) | off | k3 | k6 |
+|---|---|---|---|
+| -21.0 | 0.0% | 0.0% | 0.0% |
+| -20.5 | 0.0% | 0.0% | 0.0% |
+| -20.0 | 0.0% | 0.0% | 0.0% |
+| -19.5 | 3.5% | 4.0% | 4.0% |
+| -19.0 | 5.0% | 9.0% | 7.5% |
+| -18.5 | 14.5% | 23.0% | 21.0% |
+| -18.0 | 25.5% | 41.0% | 37.5% |
+| -17.5 | 41.5% | 61.5% | 60.0% |
+| -17.0 | 59.0% | 84.0% | 79.5% |
+| -16.5 | 71.0% | 89.0% | 88.5% |
+| -16.0 | 80.5% | 97.5% | 95.0% |
+| -15.5 | 87.5% | 98.5% | 98.0% |
+| -15.0 | 92.0% | 100.0% | 100.0% |
+| -14.5 | 95.0% | 100.0% | 100.0% |
+| -14.0 | 95.0% | 100.0% | 100.0% |
+| -13.5 | 97.5% | 100.0% | 100.0% |
+| -13.0 | 99.5% | 100.0% | 100.0% |
+| -12.5 | 99.5% | 100.0% | 100.0% |
+| -12.0 | 99.5% | 100.0% | 100.0% |
+| threshold | -17.26 | -17.78 | -17.72 |
+
+- shift off → k=6: +0.465 dB, 95% CI [+0.308, +0.653], significant=true, undefined resamples 0/1000
+- shift off → k=3: +0.523 dB, 95% CI [+0.358, +0.732], significant=true, undefined resamples 0/1000
+
+### `base` — 100 trials/point, mean impulsive-block fraction 0.0396
+
+| SNR (dB) | off | k3 | k6 |
+|---|---|---|---|
+| -21.0 | 0.0% | 0.0% | 0.0% |
+| -20.5 | 0.0% | 0.0% | 0.0% |
+| -20.0 | 0.0% | 0.0% | 0.0% |
+| -19.5 | 6.0% | 7.0% | 7.0% |
+| -19.0 | 17.0% | 21.0% | 20.0% |
+| -18.5 | 41.0% | 47.0% | 46.0% |
+| -18.0 | 56.0% | 61.0% | 61.0% |
+| -17.5 | 72.0% | 80.0% | 82.0% |
+| -17.0 | 86.0% | 96.0% | 94.0% |
+| -16.5 | 97.0% | 99.0% | 100.0% |
+| -16.0 | 99.0% | 100.0% | 100.0% |
+| -15.5 | 100.0% | 100.0% | 100.0% |
+| -15.0 | 99.0% | 100.0% | 100.0% |
+| -14.5 | 99.0% | 100.0% | 100.0% |
+| -14.0 | 100.0% | 100.0% | 100.0% |
+| -13.5 | 100.0% | 100.0% | 100.0% |
+| -13.0 | 100.0% | 100.0% | 100.0% |
+| -12.5 | 100.0% | 100.0% | 100.0% |
+| -12.0 | 100.0% | 100.0% | 100.0% |
+| threshold | -18.20 | -18.39 | -18.37 |
+
+- shift off → k=6: +0.167 dB, 95% CI [+0.038, +0.519], significant=true, undefined resamples 0/1000
+- shift off → k=3: +0.193 dB, 95% CI [+0.049, +0.535], significant=true, undefined resamples 0/1000
+
+### `severe` — 100 trials/point, mean impulsive-block fraction 0.1857
+
+| SNR (dB) | off | k3 | k6 |
+|---|---|---|---|
+| -21.0 | 0.0% | 0.0% | 0.0% |
+| -20.5 | 0.0% | 0.0% | 0.0% |
+| -20.0 | 0.0% | 0.0% | 0.0% |
+| -19.5 | 1.0% | 1.0% | 1.0% |
+| -19.0 | 1.0% | 1.0% | 1.0% |
+| -18.5 | 3.0% | 7.0% | 7.0% |
+| -18.0 | 4.0% | 13.0% | 10.0% |
+| -17.5 | 7.0% | 25.0% | 21.0% |
+| -17.0 | 16.0% | 48.0% | 43.0% |
+| -16.5 | 28.0% | 69.0% | 60.0% |
+| -16.0 | 40.0% | 79.0% | 75.0% |
+| -15.5 | 49.0% | 82.0% | 77.0% |
+| -15.0 | 66.0% | 90.0% | 87.0% |
+| -14.5 | 54.0% | 92.0% | 87.0% |
+| -14.0 | 69.0% | 96.0% | 91.0% |
+| -13.5 | 78.0% | 96.0% | 93.0% |
+| -13.0 | 84.0% | 97.0% | 95.0% |
+| -12.5 | 86.0% | 95.0% | 95.0% |
+| -12.0 | 84.0% | 98.0% | 95.0% |
+| threshold | -15.47 | -16.95 | -16.79 |
+
+- shift off → k=6: +1.324 dB, 95% CI [+0.771, +1.666], significant=true, undefined resamples 0/1000
+- shift off → k=3: +1.482 dB, 95% CI [+0.981, +1.766], significant=true, undefined resamples 0/1000
+
+| plant (mean IBF) | threshold off / k3 / k6 (dB) | shift k=6 [95% CI] | shift k=3 [95% CI] |
+|---|---|---|---|
+| `awgn` (0.0000) | -18.68 / -18.68 / -18.68 | +0.000 [+0.000, +0.000] | +0.000 [+0.000, +0.000] |
+| `base` (0.0396) | -18.20 / -18.39 / -18.37 | +0.167 [+0.038, +0.519] | +0.193 [+0.049, +0.535] |
+| **`storm` (0.0949), decision plant** | -17.26 / -17.78 / -17.72 | **+0.465 [+0.308, +0.653]** | +0.523 [+0.358, +0.732] |
+| `severe` (0.1857) | -15.47 / -16.95 / -16.79 | +1.324 [+0.771, +1.666] | +1.482 [+0.981, +1.766] |
+
+Shift = threshold(off) − threshold(k), so positive is a gain. Undefined
+resamples: 0 of 1000 for every plant and knee.
+
+**Port-fidelity cross-check (recorded, not a gate).** First 50 trials at −21.0…−16.0 dB, compared with the batch101 rows quoted in the plan: `awgn`/`off` `0,0,1,5,16,33,40,49,49,50,50` (identical); `base`/`off` `0,0,0,3,8,19,26,35,42,49,49` (identical). `base`/`k3` `0,0,0,4,8,23,28,41,49,50,50` and `base`/`k6` `0,0,0,4,8,22,28,42,48,50,50` (batch101: `0,0,0,4,8,23,28,41,49,50,50` and `0,0,0,4,8,22,28,42,48,50,50`).
+
 ## Verdict
 
-No verdict yet: the storm scorecard does not exist, and the default stays off
-— the ticket's "stays off by default otherwise, same as today". When the
-shards are run, `--summarize` writes the scorecard, prints `verdict_line()`,
-and this doc must quote that line verbatim.
+PAN-162 verdict: candidate-k6 — storm k=6 +0.465 dB [+0.308, +0.653], k=3 +0.523 dB [+0.358, +0.732]; awgn k=6 +0.000 dB, k=3 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7
 
-Phase 6 skipped: no verdict.
+Applying the bars to k=6 first: (a) awgn shift +0.000 dB ≥ −0.05 passes;
+(b) storm shift +0.465 dB [+0.308, +0.653] ≥ +0.30 with `ci_low` > 0 and no
+undefined resamples passes; (c′) off-air ΔTP +1 ≥ −2 passes. k=6 is the
+candidate. (k=3 also clears (a) and (b), but fails (c′) at ΔTP −7, and it is
+evaluated second.) The storm plant clears bar (b) that the original batch101
+plant missed: on `base` (the batch101 plant re-measured with a CI) k=6 gains
++0.167 dB [+0.038, +0.519], below the bar as in batch101, and the gain grows with
+burst rate (`severe`: +1.324 dB [+0.771, +1.666]).
 
-## Next step: the pre-registered synthetic run
+## Phase 6: production gate (triggered, not yet run)
+
+`candidate-k6` triggers the plan's Phase 6. Its first step is the
+pre-registered native-only production gate above (synth-clean, noise_1000 and
+the elapsed gate, control vs `--impulse-robust-llr 6`); only if that passes
+does the coordinator turn the knee on for FT8. The gate has not run yet, so
+**the default stays off** and production is unchanged: the coordinator does
+not set the knee, and `Ft8Config::default().impulse_robust_llr` is `None`.
+
+Why it did not run here: its eval arms cost far more than the storm shards.
+In this container, a native-only, unlimited-budget `eval --tier noise_1000`
+arm with `RAYON_NUM_THREADS=1` reached its 40th noise WAV (read from the
+process's open WAV file) after 371 s while ten
+runnable threads (the shards, a build, both arms) shared the 6-CPU quota,
+about 0.6 of a core each. That is roughly 5.5 CPU-s per WAV, or about 90
+single-core minutes per 1000-WAV arm (an estimate from one partial run). The
+two noise arms, plus the two synth-clean arms, do not fit beside the storm
+shards and the repository gate inside one phase deadline. Two attempts
+were stopped and discarded, so no production-gate number exists: all four
+arms at `RAYON_NUM_THREADS=3`, beside the shards (stopped after 193 s), then
+the two noise arms at `RAYON_NUM_THREADS=1` (stopped after 371 s). The
+next run should give the four arms the container to themselves, as PAN-158
+did, with the commands below (both arms of a pair at the same
+`RAYON_NUM_THREADS`, so `compare`'s elapsed gate is enforced):
 
 ```sh
-cargo build --release -p pancetta-research --example batch104_impulse_llr_storm_remeasure
-PAN162_RUN=$(mktemp -d /tmp/pan162-measurement.XXXXXX); export RAYON_NUM_THREADS=<CPU quota>
-B=target/release/examples/batch104_impulse_llr_storm_remeasure
-for plant in awgn storm base severe; do for config in off k3 k6; do
-  $B --plant $plant --config $config --shard-dir "$PAN162_RUN/shards"
-done; done
-$B --summarize --shard-dir "$PAN162_RUN/shards" \
-  --offair research/scorecards/pan162-impulse-llr-offair.json \
-  --output research/scorecards/pan162-impulse-llr-storm.json
+target/release/gen-synth --config research/corpus/synth/manifests/clean.config.json --output "$PAN162_RUN/clean.manifest.json"
+target/release/gen-noise --count 1000 --seed 20260706 --birdie-fraction 0.3 \
+  --output-dir "$PAN162_RUN/noise-wavs" --manifest "$PAN162_RUN/noise.manifest.json" --label noise_1000
+target/release/eval --tier synth-clean --mode ft8 --output research/scorecards/pan162-synth-control.json
+target/release/eval --tier synth-clean --mode ft8 --impulse-robust-llr 6 --output research/scorecards/pan162-synth-variant.json
+target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/noise.manifest.json" --output research/scorecards/pan162-noise-control.json
+target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/noise.manifest.json" --impulse-robust-llr 6 --output research/scorecards/pan162-noise-variant.json
+target/release/compare research/scorecards/pan162-synth-control.json research/scorecards/pan162-synth-variant.json --bootstrap-n 1000 --bootstrap-seed 0xb007
+target/release/compare research/scorecards/pan162-noise-control.json research/scorecards/pan162-noise-variant.json
 ```
 
-Shards are resumable. If `--summarize` reports that the grid-extension rule
-applies, run exactly the extra shard commands it prints, then summarize again.
+If the gate passes, the plan's steps 6.2-6.3 follow (coordinator FT8 default
+`Some(6.0)` in `apply_effort_overrides`, the knee in `DecoderRebuildKey`,
+CHANGELOG and digest). If it fails, the final disposition is
+`stays-off-harm-gate`.
+
 
 ## Caveats
 

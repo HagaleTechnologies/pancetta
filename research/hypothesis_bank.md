@@ -6854,7 +6854,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: tooling built, verdict pending.]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate not yet run, default stays off.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6908,6 +6908,20 @@ search to in-repo sources.
     did not fit the implement run and have not been run, so there is no
     verdict yet and the default stays off. Details and commands:
     `research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
+
+    UPDATE 2026-10-26 (PAN-162): the pre-registered synthetic re-measure ran
+    (12 shards, 29,400 decodes, paired threshold bootstrap n=1000).
+    Threshold shift off → k=6 [95% CI] / off → k=3: storm (p=0.05,
+    decision plant) +0.465 dB [+0.308, +0.653] / +0.523 dB [+0.358, +0.732]; base (the batch101 plant) +0.167 dB [+0.038, +0.519] / +0.193 dB [+0.049, +0.535];
+    severe (p=0.10) +1.324 dB [+0.771, +1.666] / +1.482 dB [+0.981, +1.766]; awgn exactly +0.000 for both. Off-air
+    do-no-harm on the 60 vendored WAVs: ΔTP k=6 +1, k=3 −7 (bar ≥ −2).
+    Verdict `candidate-k6`: k=6 clears all three bars, k=3 fails the
+    off-air bar. The gain the batch101 plant could not show past the bar
+    appears once bursts hit about 10% of symbols, and grows with burst
+    rate. The plan's native-only production gate (synth-clean, noise_1000,
+    elapsed) has not run yet: its noise arms cost about 90 single-core
+    minutes each here. Until it passes, the default stays off; operators
+    in heavy QRN can still opt in with Some(6.0).
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 
