@@ -158,6 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DX Hunter rows scored from a cqdx spot now include the spot's reporter
+  count, best SNR and age (PAN-227). The `w` breakdown shows them instead of
+  `network reports: none` and `1.00` freshness, and stale spots or spots with
+  a single weak reporter rank lower.
+
 - An autonomous CQ whose opening transmission is rejected by a full TX
   queue now clears its pending association and restores its speculative
   offset and unanswered-CQ count, even if the CQ stops before another
