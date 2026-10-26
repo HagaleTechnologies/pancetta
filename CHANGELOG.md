@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TUI device, rig and bookmark saves now go to the file a `--config` symlink
+  points to when you save, so after a dotfiles manager repoints the link they
+  land in the same file reloads and the next restart read (PAN-200). Before,
+  they kept writing to the file the link pointed to at startup. A save through
+  a symlink whose target is missing is refused, and the link is left in place.
+
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta

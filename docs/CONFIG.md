@@ -812,7 +812,9 @@ priority over both config and environment.
 Pancetta watches its config file for changes while it runs: the file
 given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
 path is a symlink, both edits to the file it points at and repointing
-the symlink itself are picked up. The file's directory is watched even
+the symlink itself are picked up. Device, rig and bookmark choices saved
+from the TUI go to the file the symlink points to at the moment you save.
+The file's directory is watched even
 while the file does not exist, so creating it later is picked up too
 (when the directory itself does not exist, nothing is watched and every
 change needs a restart). A save is picked up within a few seconds. With
