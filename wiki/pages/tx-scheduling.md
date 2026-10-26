@@ -86,15 +86,16 @@ load-bearing constraint: every concurrent active QSO must share one parity so
 the opposite window stays free to hear. Read that gotcha before changing any
 admission or coalescing logic.
 
-Testing gotcha (PAN-82): a test that trips the stall threshold via
-`rearm_manual_calls_at` must rearm on DISTINCT own-parity TX slots (the
-`for slot in [1i64, 3]` / `opened_at + 15*slot` pattern — a +15/+30 pair can
-resolve to the same own-parity slot under PAN-128's one-count-per-own-parity-
-slot rule, leaving the threshold never deterministically tripped) and must
-report the threshold frame aired (`confirm_last_frame_aired`) before a
-`StallDetected`-origin `apply_tx_offset_switch`, or PAN-182's trigger hold
-refuses the commit with `OffsetActionTriggerOutcomePending` on wall-clock
-phase alone. See `an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency`
-and `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
-`pancetta-qso/src/qso_manager.rs` for the repaired shape.
-
+Testing gotcha (PAN-82, PAN-239): a test that trips the stall threshold via
+`rearm_manual_calls_at` must rearm on DISTINCT own-parity TX slots, and should
+anchor the rearm instants to the QSO's own slot grid (`next_own_ft8_slot`, as
+`stall_on_two_own_parity_slots` does) rather than to `opened_at`. `opened_at`
+is the real wall clock, so `opened_at`-relative rearms resolve to different
+slots depending on the second the test started, and a +15/+30 pair can
+collapse onto one slot under PAN-128's one-count-per-own-parity-slot rule. It
+must also report the threshold frame aired (`confirm_last_frame_aired`) before
+a `StallDetected`-origin `apply_tx_offset_switch`, or PAN-182's trigger hold
+refuses the commit with `OffsetActionTriggerOutcomePending`. See
+`an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency` and
+`an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
+`pancetta-qso/src/qso_manager.rs`.
