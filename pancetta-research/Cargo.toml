@@ -50,6 +50,14 @@ name = "gen-synth-pair"
 path = "src/bin/gen_synth_pair.rs"
 
 [[bin]]
+name = "gen-crowded-edge"
+path = "src/bin/gen_crowded_edge.rs"
+
+[[bin]]
+name = "eval-crowded-edge"
+path = "src/bin/eval_crowded_edge.rs"
+
+[[bin]]
 name = "gen-noise"
 path = "src/bin/gen_noise.rs"
 
