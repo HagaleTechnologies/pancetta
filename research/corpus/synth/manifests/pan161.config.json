@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "generator_version": 1,
+  "seed": 16120261026,
+  "output_dir": "research/corpus/synth/wavs/pan161",
+  "repetitions": 8,
+  "target_snr_db": [-16.0, -13.0],
+  "target_dt_s": [-0.55, -0.60, -0.65],
+  "distractor_count": 6,
+  "distractor_snr_db": -8.0,
+  "noise_snr_db": -16.0,
+  "noise_windows": 8,
+  "in_window_controls": 8
+}

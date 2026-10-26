@@ -1,0 +1,3923 @@
+{
+  "schema_version": 1,
+  "generator_version": 1,
+  "config": {
+    "schema_version": 1,
+    "generator_version": 1,
+    "seed": 16120261026,
+    "output_dir": "research/corpus/synth/wavs/pan161",
+    "repetitions": 8,
+    "target_snr_db": [
+      -16.0,
+      -13.0
+    ],
+    "target_dt_s": [
+      -0.55,
+      -0.6,
+      -0.65
+    ],
+    "distractor_count": 6,
+    "distractor_snr_db": -8.0,
+    "noise_snr_db": -16.0,
+    "noise_windows": 8,
+    "in_window_controls": 8
+  },
+  "entries": [
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0000_edge.wav",
+      "sha256": "e364c0f2337c297f6430ada10b87ec2b3923fa70b67c849526da9976be57fffc",
+      "seed": 16120261026,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18495318,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0001_edge.wav",
+      "sha256": "892f883d8afb901d83f43c2dd10079114e45e61bdf32677651f9fae233bb8d04",
+      "seed": 11400714835443459511,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18841869,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0002_edge.wav",
+      "sha256": "ef42e2981510345b33aa3e9332feb159ef20f9550e4fccaa929092d4f2fb972a",
+      "seed": 4354685581057106380,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.2077077,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0003_edge.wav",
+      "sha256": "d5d6f2b0c6782b131aec47af1b7e74957bfa27497d0fdd6153735a409ba857e9",
+      "seed": 15755400400380304865,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17491153,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0004_edge.wav",
+      "sha256": "caceb8df74622771fc3ccf4b3931a7b25521d815b69e414f7e3b8a3a0681a742",
+      "seed": 8709371145993951734,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18781558,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0005_edge.wav",
+      "sha256": "c1057b9416a6cc355b9cef19462f3de641a4769b2738bfc90c039b10d015cdad",
+      "seed": 1663341891607598603,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19732872,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0006_edge.wav",
+      "sha256": "4752f95b853761a0b514206714fd7562c19101bb3168de99e534617c9df85bd0",
+      "seed": 13064056710930797088,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19632834,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0007_edge.wav",
+      "sha256": "bb9e7029cc8a21423e4ac9386f2917db743274cb014a9de6a15fa005f60c2551",
+      "seed": 6018027456544443957,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18209784,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0008_edge.wav",
+      "sha256": "cf1f01a294f6b6fa01a9918500159ff0546d56774f6c5e6829e06493a44aa3e1",
+      "seed": 17418742275867642442,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18254584,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0009_edge.wav",
+      "sha256": "7460c27120c8ce2d8c200450d442038d225c4bb4163c29a2bbd739f8ccc949f4",
+      "seed": 10372713021481289311,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19105804,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0010_edge.wav",
+      "sha256": "4e6bfa85d622e88f51d4ed35c96e380dd90bb5c109ccc0a34a8376a2832b6503",
+      "seed": 3326683767094936180,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.20865917,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0011_edge.wav",
+      "sha256": "0441495aa6505b76ff4face85a4ae2d94cf22baf4d9d37194293f8851b16e3c9",
+      "seed": 14727398586418134665,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18309541,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0012_edge.wav",
+      "sha256": "fb2dd7fb182f1b9352915bce7dae04e48f86c77e1d6e09328693968b5daf9dee",
+      "seed": 7681369332031781534,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18108378,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0013_edge.wav",
+      "sha256": "e9af4e15242452ae99bb2f06897eefa241256e87695d7592cbf1b2f9c55a4bfd",
+      "seed": 635340077645428403,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1888159,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0014_edge.wav",
+      "sha256": "119bda411fae27f0179f7b805a854e625de46eefc81594b0310153adb4c63b95",
+      "seed": 12036054896968626888,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17733197,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0015_edge.wav",
+      "sha256": "de0de30a56a2ec0712913e5769db8b87596391d277a7b83e3dad12adaad230d7",
+      "seed": 4990025642582273757,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18579917,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0016_edge.wav",
+      "sha256": "d7a8b1ac31c043ad1311cd25cb3cc842a5eca3dcfc136749f86b22667c6ea66a",
+      "seed": 16390740461905472242,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17562038,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0017_edge.wav",
+      "sha256": "e453f5d9fc200796159cb4029af0ab7f053ec1690957b80e6febb874de7ba1b1",
+      "seed": 9344711207519119111,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18628174,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0018_edge.wav",
+      "sha256": "3c9b8c0386704eeaa2347357f6a320ee29d0e3145a711bdf553c0ead960caf27",
+      "seed": 2298681953132765980,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17522457,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0019_edge.wav",
+      "sha256": "4218d12bebe7d443070c0be499cb37f550e1d7663f213e6018116b2c80146ee0",
+      "seed": 13699396772455964465,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19257736,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0020_edge.wav",
+      "sha256": "2600193d67430b8c791721fce341cd3f04cbf415061429954f6a1cd640744f8f",
+      "seed": 6653367518069611334,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17808281,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0021_edge.wav",
+      "sha256": "6832e7fa41368325e1c93309dd05ad288ba0b6bb5536fabc61850165392b2852",
+      "seed": 18054082337392809819,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1795689,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0022_edge.wav",
+      "sha256": "d57739be2810f72e264b0dd77872174d98daf0734c7683e936e86ef3a96b9f31",
+      "seed": 11008053083006456688,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18122898,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0023_edge.wav",
+      "sha256": "cf2ef6689bfff7b9b127dc23b52a82d81af67665254ead8172968c755dd03866",
+      "seed": 3962023828620103557,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.20854291,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0024_edge.wav",
+      "sha256": "945b5e66eafd7d70febd3749994b75d721a8ded1b098dad15d4206af30e8cb4e",
+      "seed": 15362738647943302042,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1788214,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0025_edge.wav",
+      "sha256": "0a881526f700eb17027331a3b425536c150b38a393a02e8132549c2b1db93669",
+      "seed": 8316709393556948911,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18811509,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0026_edge.wav",
+      "sha256": "3b098733f65d1634a25c65df76ebbcdc46ddf88574be9dc9c33ec15a17ca8f37",
+      "seed": 1270680139170595780,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17565557,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0027_edge.wav",
+      "sha256": "f97fa9aa7790cabb14ae4df0226706c8f4dd3a814e40cbd527da951b3deaa111",
+      "seed": 12671394958493794265,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17200461,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0028_edge.wav",
+      "sha256": "8651ddc2d269562505ddad77224b559dfbe9d00a816e1967201890cba362c047",
+      "seed": 5625365704107441134,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19241484,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0029_edge.wav",
+      "sha256": "54b511da7a8943a1b189d6ecf039d8134b5f92c04bbb2eb2f6252b26ae233952",
+      "seed": 17026080523430639619,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17609465,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0030_edge.wav",
+      "sha256": "15d8e35741c2398a0ed440753104f667a746650076dfa649c3f2939bfaa4ad1f",
+      "seed": 9980051269044286488,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18975607,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0031_edge.wav",
+      "sha256": "bc9d4841504aa82a3596f0a4ea36cb00569e0a837c7e18301e2c3aced9cd2392",
+      "seed": 2934022014657933357,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19188298,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0032_edge.wav",
+      "sha256": "22ee89cd11a28b0d1f10ed32ec654739e55d1e269ff70272b76d406dd5d13c9b",
+      "seed": 14334736833981131842,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18572974,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0033_edge.wav",
+      "sha256": "46d66951511aa832b0c4f35254a8ed2967a235178297984067ac533873a8a44f",
+      "seed": 7288707579594778711,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19778915,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0034_edge.wav",
+      "sha256": "604f290ecd3598845fc40926536a5617504cc60331e280b1e0e5ec9b623f1932",
+      "seed": 242678325208425580,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18910202,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0035_edge.wav",
+      "sha256": "91fa973f69d3ecab01496e517eab98478072827c35e49e4d8b73da9b6912cf23",
+      "seed": 11643393144531624065,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18989432,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0036_edge.wav",
+      "sha256": "132f8d926011c063c892fe285bcbf2df1c05b72276049e6909cab2d6d5fb4d51",
+      "seed": 4597363890145270934,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17494705,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0037_edge.wav",
+      "sha256": "41ab96b5e7556002491c07b938df7a71baf8580d4cb35c8256615d1d0f0b549e",
+      "seed": 15998078709468469419,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1686433,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0038_edge.wav",
+      "sha256": "9ed1c1d2276b1d8015bd2da11ce2084044d80a16a5097baffb6cd24f454b36ea",
+      "seed": 8952049455082116288,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18067577,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0039_edge.wav",
+      "sha256": "624bdddf817615e1ead317d8a4e7ce9d0d6e7368519fddad45459390387cbab7",
+      "seed": 1906020200695763157,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.20931885,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0040_edge.wav",
+      "sha256": "02284f16f07ef4ce5d064e6e4635efa72a04036b592fa9d16c8fa131944502e6",
+      "seed": 13306735020018961642,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19365528,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0041_edge.wav",
+      "sha256": "79b12fa8df7a4422fc2d8f548ce864d40f408074b7e8ff2a2cfad61f4d8b84d1",
+      "seed": 6260705765632608511,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1843913,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0042_edge.wav",
+      "sha256": "b3e9949554143a7b541b49c2f44aae63a4160f28ee1359a5f359399e7888278a",
+      "seed": 17661420584955806996,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.19092211,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0043_edge.wav",
+      "sha256": "752e71f35f3b34d874f3483cb21c1f2916e13f62bb8ca2310ab5bd944085d510",
+      "seed": 10615391330569453865,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.21365333,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.45,
+          "capture_dt_s": -0.05000000000000071,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0044_edge.wav",
+      "sha256": "a99a6859dffdc7d70eb3f7bd4ed26d70f26b95f92e0b3cbabc21cb50e563b333",
+      "seed": 3569362076183100734,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17785001,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0045_edge.wav",
+      "sha256": "4c3c4b80546d8f9c7cfed95cd59ea1c9dc7d0ed2b70c778cd0eff71213e35770",
+      "seed": 14970076895506299219,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18419859,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.4,
+          "capture_dt_s": -0.09999999999999964,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0046_edge.wav",
+      "sha256": "f5c3c2be1912c4210f99f383a2e4b357fd5da667bea0d054f55a7c2bb3d10dfa",
+      "seed": 7924047641119946088,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.18388885,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0047_edge.wav",
+      "sha256": "0de17c4b5f5812fbaa016a13d030fe83ecf286d5397cfea3bc08c3504024d9cd",
+      "seed": 878018386733592957,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.20981118,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 9.35,
+          "capture_dt_s": -0.15000000000000036,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "edge"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0048_control.wav",
+      "sha256": "f4600b8379ccd1651f29b3be5ba164e506fdc122872346c9d1721d36cd05f9d1",
+      "seed": 12278733206056791442,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17528632,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0049_control.wav",
+      "sha256": "42fb690363011e94ac7699f8c3e761bf060f08fa4e9d3c4125f26678594e3245",
+      "seed": 5232703951670438311,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.175628,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0050_control.wav",
+      "sha256": "c420873e87e29e191e66fcc92045a563e72b08a17469809d0b21bffe8d447520",
+      "seed": 16633418770993636796,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.187915,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0051_control.wav",
+      "sha256": "044b59f5a21b928c48d9417bdbf9dc3772ba2905a212e6f543997da1974631bb",
+      "seed": 9587389516607283665,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1772658,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0052_control.wav",
+      "sha256": "d4866047d6a65cdda074d1382ba8178b1fe82f4070d3ba2a02991d9627a0121c",
+      "seed": 2541360262220930534,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.17861754,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0053_control.wav",
+      "sha256": "cc94e534a0d2d581fe9c78b78cf645f79ee83b22f4c865ea23adc2a69f1fd72b",
+      "seed": 13942075081544129019,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.20561697,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAF DM13",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0054_control.wav",
+      "sha256": "37baace959761daa06d9f1aed34e8cfb3e53cc9d15e278449a2bf5c3370ca439",
+      "seed": 6896045827157775888,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1962809,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -16.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAG CN85",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0055_control.wav",
+      "sha256": "88a59bb3d4c5e418cb439c3fdad409f230a0111a2086aa730c8d99ac93230786",
+      "seed": 18296760646480974373,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1811263,
+      "signals": [
+        {
+          "message": "CQ K5ARH EM12",
+          "freq_hz": 2900.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -13.0,
+          "role": "edge-target"
+        },
+        {
+          "message": "CQ K1AAH DN70",
+          "freq_hz": 450.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAA FN42",
+          "freq_hz": 830.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAB EN91",
+          "freq_hz": 1210.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAC EM10",
+          "freq_hz": 1590.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAD EL29",
+          "freq_hz": 1970.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        },
+        {
+          "message": "CQ K1AAE FM19",
+          "freq_hz": 2350.0,
+          "start_s": 10.0,
+          "capture_dt_s": 0.5,
+          "snr_db": -8.0,
+          "role": "distractor"
+        }
+      ],
+      "kind": "control"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0056_noise.wav",
+      "sha256": "84221d4196f3be08e6fa98ad3f61bc35e21104bcdece99b23ff83ca3f6c3a539",
+      "seed": 11250731392094621242,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.15344027,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0057_noise.wav",
+      "sha256": "4542fdbc62f6986afa02fc0ea3bbfad29d8e6d18e37fc6736a12f3ca8c7074cf",
+      "seed": 4204702137708268111,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.14395076,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0058_noise.wav",
+      "sha256": "edbaf30968b974abeb21d4d5702924159c2067d12879a9f08d373b659867e36c",
+      "seed": 15605416957031466596,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.15134786,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0059_noise.wav",
+      "sha256": "b2fb9755da5be67a577ac006928593e391ce9e0799a4eb7dcd33c9cc5e0a8865",
+      "seed": 8559387702645113465,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.1440321,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0060_noise.wav",
+      "sha256": "6eb47de032d70dc21532a607d361c5bc60ebdd38510ae37553ae8ee66cda3cec",
+      "seed": 1513358448258760334,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.15061554,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0061_noise.wav",
+      "sha256": "2681ca6866e85e91d19356d08a78c712d58e34329b7da85908cf1b58fafe461a",
+      "seed": 12914073267581958819,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.15537274,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0062_noise.wav",
+      "sha256": "d2051b4a9f0cba9b6e2f55cfdbb602043464b5e815bcc823187fb09e9dd60ac1",
+      "seed": 5868044013195605688,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.15637004,
+      "signals": [],
+      "kind": "noise"
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pan161/pan161_0063_noise.wav",
+      "sha256": "e228e10c304f9b281b6003626e4970941a1e3b943adf20f824f2e235c98825c7",
+      "seed": 17268758832518804173,
+      "sample_rate": 12000,
+      "sample_count": 162000,
+      "capture_start_s": 9.5,
+      "peak_before_quantization": 0.14677349,
+      "signals": [],
+      "kind": "noise"
+    }
+  ]
+}
