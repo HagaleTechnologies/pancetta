@@ -1182,7 +1182,8 @@ impl super::ApplicationCoordinator {
         // SaveRigBookmark, and DeleteRigBookmark all persist here instead
         // of a hardcoded `~/.pancetta/pancetta.toml`, so an operator
         // running under `--config <custom-path>` doesn't have picker/
-        // bookmark saves silently land in the wrong file.
+        // bookmark saves silently land in the wrong file. PAN-200 keeps
+        // the as-given path here; each write resolves it on the worker.
         let cmd_config_path = self.config_path.clone();
         // PAN-62 review round 2 (Codex P1): precomputed at startup (never
         // in this relay loop, which must stay free of synchronous disk
@@ -2623,9 +2624,10 @@ impl super::ApplicationCoordinator {
                                 let write_output = output_device.clone();
                                 let submitted = cmd_config_write_tx.send(ConfigFileWriteRequest {
                                     work: Box::new(move || {
+                                        let target = resolve_config_write_target(&write_path)?;
                                         pancetta_config::Config::default()
                                             .set_audio_devices_in_file(
-                                                &write_path,
+                                                &target,
                                                 write_input.as_deref(),
                                                 write_output.as_deref(),
                                             )
@@ -2849,8 +2851,10 @@ impl super::ApplicationCoordinator {
                                     let submitted =
                                         cmd_config_write_tx.send(ConfigFileWriteRequest {
                                             work: Box::new(move || {
+                                                let target =
+                                                    resolve_config_write_target(&write_path)?;
                                                 pancetta_config::Config::default().set_rig_in_file(
-                                                    &write_path,
+                                                    &target,
                                                     &write_model,
                                                     &write_port,
                                                     baud_rate,
@@ -3827,11 +3831,60 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
     }
 }
 
+/// PAN-200: resolve the file a targeted write replaces when the write runs
+/// on the blocking worker, so a repointed `--config` symlink gets the save.
+/// Atomic replacement must land on the real target, never on the symlink
+/// (PAN-62), so a dangling symlink refuses the write. A missing plain path
+/// (first-run default) is written as given.
+fn resolve_config_write_target(
+    config_path: &std::path::Path,
+) -> pancetta_config::ConfigResult<std::path::PathBuf> {
+    match std::fs::canonicalize(config_path) {
+        Ok(target) => Ok(target),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(config_path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    Err(pancetta_config::ConfigError::Validation(format!(
+                        "{} is a symlink to a missing file",
+                        config_path.display()
+                    )))
+                }
+                _ => Ok(config_path.to_path_buf()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// PAN-200 review (Codex P2): the `[rig].bookmarks` list the config file at
+/// `path` holds now, or `None` when the file or the key is missing. A
+/// bookmark write applies its mutation to this list, so a save after a
+/// repoint keeps the new target's own bookmarks instead of replacing them
+/// with the running (pre-repoint) list.
+fn read_rig_bookmarks_in_file(
+    path: &std::path::Path,
+) -> pancetta_config::ConfigResult<Option<Vec<pancetta_config::rig::RigBookmark>>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let doc: toml::Table = toml::from_str(&contents).map_err(|e| {
+        pancetta_config::ConfigError::Validation(format!("Failed to parse config: {}", e))
+    })?;
+    let Some(bookmarks) = doc.get("rig").and_then(|rig| rig.get("bookmarks")) else {
+        return Ok(None);
+    };
+    bookmarks.clone().try_into().map(Some).map_err(|e| {
+        pancetta_config::ConfigError::Validation(format!("Failed to parse rig bookmarks: {}", e))
+    })
+}
+
 /// One targeted config-file write (PAN-62: the coordinator's `config_path`,
 /// not always `~/.pancetta/pancetta.toml`), queued for serialized
 /// processing by the worker `spawn_config_file_write_worker` spawns
 /// (PAN-61 review round 7, P1). `work` performs the actual blocking
-/// `std::fs` I/O (matching the `set_*_in_file` methods' shape) and is only
+/// `std::fs` I/O, including write-time target resolution (PAN-200), and is only
 /// ever run on tokio's blocking-thread pool inside the worker, never
 /// inline on the caller's own task.
 struct ConfigFileWriteRequest {
@@ -3894,6 +3947,7 @@ fn spawn_config_file_write_worker() -> (
 /// half: a single task processes one mutation fully (stage, submit to the
 /// file-write worker, await its result, commit to shared state) before
 /// starting the next, so every stage-read is guaranteed fresh.
+#[derive(Clone)]
 enum BookmarkMutation {
     Save(pancetta_config::rig::RigBookmark),
     Delete(String),
@@ -3982,13 +4036,38 @@ fn spawn_bookmark_mutation_worker(
             }
 
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let (written_tx, written_rx) = tokio::sync::oneshot::channel();
             let write_path = config_path.clone();
             let write_staged = staged.clone();
+            let write_mutation = mutation.clone();
             if write_tx
                 .send(ConfigFileWriteRequest {
                     work: Box::new(move || {
+                        let target = resolve_config_write_target(&write_path)?;
+                        // PAN-200 review (Codex P2): apply the mutation to
+                        // the list the target holds now. After a repoint
+                        // that is not the running list; replacing it would
+                        // drop the new target's own bookmarks. A target with
+                        // no list keeps the running one, which a lower
+                        // config layer may supply (PAN-63).
+                        let written = match read_rig_bookmarks_in_file(&target)? {
+                            Some(mut on_disk) => {
+                                match write_mutation {
+                                    BookmarkMutation::Save(bookmark) => {
+                                        upsert_rig_bookmark(&mut on_disk, bookmark)
+                                    }
+                                    BookmarkMutation::Delete(name) => {
+                                        on_disk.retain(|b| b.name != name)
+                                    }
+                                }
+                                on_disk
+                            }
+                            None => write_staged,
+                        };
                         pancetta_config::Config::default()
-                            .set_rig_bookmarks_in_file(&write_path, &write_staged)
+                            .set_rig_bookmarks_in_file(&target, &written)?;
+                        let _ = written_tx.send(written);
+                        Ok(())
                     }),
                     respond: resp_tx,
                 })
@@ -4021,6 +4100,11 @@ fn spawn_bookmark_mutation_worker(
                     name,
                     config_path.display()
                 );
+                // The list the write job persisted, which the in-memory
+                // state and the TUI now mirror (PAN-200 review).
+                if let Ok(written) = written_rx.await {
+                    staged = written;
+                }
                 {
                     let mut cfg = config.write().await;
                     // PAN-63: always `Some`, even for a delete-to-empty --
@@ -5194,6 +5278,207 @@ mod tui_relay_tests {
             config.read().await.rig.effective_bookmarks().is_empty(),
             "in-memory bookmarks must NOT reflect a rejected save"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bookmark_save_after_a_config_symlink_repoint_lands_in_the_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link_dir, v1_dir, v2_dir) = (
+            dir.path().join("link"),
+            dir.path().join("v1"),
+            dir.path().join("v2"),
+        );
+        for path in [&link_dir, &v1_dir, &v2_dir] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let v1 = v1_dir.join("pancetta.toml");
+        let v2 = v2_dir.join("pancetta.toml");
+        std::fs::write(&v1, "# v1\n").unwrap();
+        std::fs::write(&v2, "# v2\n").unwrap();
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink(&v1, &link).unwrap();
+
+        let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+        let (write_tx, _write_handle) = spawn_config_file_write_worker();
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let (bookmark_tx, _bookmark_handle) =
+            spawn_bookmark_mutation_worker(config, write_tx, tui_msg_tx, link.clone(), true);
+
+        let save = |name: &str| {
+            bookmark_tx
+                .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {
+                    name: name.to_string(),
+                    model: "FTdx10".to_string(),
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 38400,
+                    ptt_method: pancetta_config::rig::PttMethod::None,
+                }))
+                .unwrap();
+        };
+        async fn next_status(
+            rx: &crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        ) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                        status, ..
+                    }) = rx.try_recv()
+                    {
+                        return status;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("bookmark worker must report a status")
+        }
+
+        save("Before");
+        assert_eq!(next_status(&tui_msg_rx).await, "Saved bookmark 'Before'");
+        assert!(std::fs::read_to_string(&v1).unwrap().contains("Before"));
+
+        let tmp_link = link_dir.join(".pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&v2, &tmp_link).unwrap();
+        std::fs::rename(&tmp_link, &link).unwrap();
+
+        save("After");
+        assert_eq!(next_status(&tui_msg_rx).await, "Saved bookmark 'After'");
+        let new_contents = std::fs::read_to_string(&v2).unwrap();
+        let parsed: toml::Value = toml::from_str(&new_contents).unwrap();
+        let bookmarks = parsed["rig"]["bookmarks"].as_array().unwrap();
+        assert!(bookmarks
+            .iter()
+            .any(|item| item["name"].as_str() == Some("After")));
+        assert!(new_contents.contains("# v2"));
+        assert!(!std::fs::read_to_string(&v1).unwrap().contains("After"));
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), v2);
+    }
+
+    /// PAN-200 review (Codex P2): the running bookmark list came from v1.
+    /// After the link is repointed at v2, a save applies to v2's own list
+    /// instead of replacing it with the running one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bookmark_save_after_a_config_symlink_repoint_keeps_the_new_targets_bookmarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = dir.path().join("v1.toml");
+        let v2 = dir.path().join("v2.toml");
+        let bookmark = |name: &str| pancetta_config::rig::RigBookmark {
+            name: name.to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::None,
+        };
+        let names = |list: &[pancetta_config::rig::RigBookmark]| {
+            list.iter().map(|b| b.name.clone()).collect::<Vec<_>>()
+        };
+        pancetta_config::Config::default()
+            .set_rig_bookmarks_in_file(&v1, &[bookmark("V1Only")])
+            .unwrap();
+        pancetta_config::Config::default()
+            .set_rig_bookmarks_in_file(&v2, &[bookmark("V2Only")])
+            .unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(&v1, &link).unwrap();
+
+        let mut config = pancetta_config::Config::default();
+        config.rig.bookmarks = Some(vec![bookmark("V1Only")]);
+        let config = Arc::new(tokio::sync::RwLock::new(config));
+        let (write_tx, _write_handle) = spawn_config_file_write_worker();
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let (bookmark_tx, _bookmark_handle) = spawn_bookmark_mutation_worker(
+            config.clone(),
+            write_tx,
+            tui_msg_tx,
+            link.clone(),
+            true,
+        );
+
+        let tmp_link = dir.path().join(".pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&v2, &tmp_link).unwrap();
+        std::fs::rename(&tmp_link, &link).unwrap();
+
+        bookmark_tx
+            .send(BookmarkMutation::Save(bookmark("After")))
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. }) =
+                    tui_msg_rx.try_recv()
+                {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bookmark worker must report a status");
+
+        assert_eq!(status, "Saved bookmark 'After'");
+        assert_eq!(
+            names(&read_rig_bookmarks_in_file(&v2).unwrap().unwrap()),
+            ["V2Only", "After"]
+        );
+        assert_eq!(
+            names(&read_rig_bookmarks_in_file(&v1).unwrap().unwrap()),
+            ["V1Only"]
+        );
+        assert_eq!(
+            names(config.read().await.rig.effective_bookmarks()),
+            ["V2Only", "After"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_config_write_target_follows_a_repointed_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = dir.path().join("v1.toml");
+        let v2 = dir.path().join("v2.toml");
+        std::fs::write(&v1, "# v1\n").unwrap();
+        std::fs::write(&v2, "# v2\n").unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(&v1, &link).unwrap();
+        assert_eq!(
+            resolve_config_write_target(&link).unwrap(),
+            v1.canonicalize().unwrap()
+        );
+        let tmp_link = dir.path().join(".pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&v2, &tmp_link).unwrap();
+        std::fs::rename(&tmp_link, &link).unwrap();
+        assert_eq!(
+            resolve_config_write_target(&link).unwrap(),
+            v2.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_config_write_target_refuses_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
+        assert!(resolve_config_write_target(&link)
+            .unwrap_err()
+            .to_string()
+            .contains("is a symlink to a missing file"));
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn resolve_config_write_target_returns_a_missing_path_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/pancetta.toml");
+        assert_eq!(resolve_config_write_target(&path).unwrap(), path);
     }
 
     /// Poll `rx` (never a blocking `recv()` -- see the bookmark-worker test

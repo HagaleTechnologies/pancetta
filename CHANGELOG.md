@@ -158,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TUI device, rig and bookmark saves now go to the file a `--config` symlink
+  points to when you save, so after a dotfiles manager repoints the link they
+  land in the same file reloads and the next restart read (PAN-200). Before,
+  they kept writing to the file the link pointed to at startup. When that file
+  already has bookmarks, a bookmark save or delete edits its list instead of
+  replacing it with the list the TUI was showing. A save through a symlink
+  whose target is missing is refused, and the link is left in place.
+
 - An autonomous CQ whose opening transmission is rejected by a full TX
   queue now clears its pending association and restores its speculative
   offset and unanswered-CQ count, even if the CQ stops before another
