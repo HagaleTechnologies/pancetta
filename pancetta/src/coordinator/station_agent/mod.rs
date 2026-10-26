@@ -7129,7 +7129,7 @@ mod tests {
                 agent_key_id: "agent_this".to_string(),
                 client_key_id: "client_a".to_string(),
                 scopes: vec!["status".to_string()],
-                created_at: "2026-07-20T00:00:00Z".to_string(),
+                created_at: 1_784_505_600,
                 role: None,
                 delegated_by: None,
             },
@@ -7138,7 +7138,7 @@ mod tests {
                 agent_key_id: "agent_other".to_string(),
                 client_key_id: "client_b".to_string(),
                 scopes: vec!["status".to_string()],
-                created_at: "2026-07-20T00:00:00Z".to_string(),
+                created_at: 1_784_505_600,
                 role: None,
                 delegated_by: None,
             },
@@ -7169,7 +7169,7 @@ mod tests {
                 agent_key_id: "agent_this".to_string(),
                 client_key_id: "client_owner_absent".to_string(),
                 scopes: vec!["status".to_string(), "qsy".to_string(), "tx".to_string()],
-                created_at: "2026-07-20T00:00:00Z".to_string(),
+                created_at: 1_784_505_600,
                 role: None,
                 delegated_by: None,
             },
@@ -7180,7 +7180,7 @@ mod tests {
                 agent_key_id: "agent_this".to_string(),
                 client_key_id: "client_delegate".to_string(),
                 scopes: vec!["status".to_string(), "qsy".to_string()],
-                created_at: "2026-07-20T00:00:00Z".to_string(),
+                created_at: 1_784_505_600,
                 role: Some("owner".to_string()),
                 delegated_by: Some("user_owner_123".to_string()),
             },
@@ -7191,7 +7191,7 @@ mod tests {
                 agent_key_id: "agent_other".to_string(),
                 client_key_id: "client_unrelated".to_string(),
                 scopes: vec!["status".to_string()],
-                created_at: "2026-07-20T00:00:00Z".to_string(),
+                created_at: 1_784_505_600,
                 role: None,
                 delegated_by: None,
             },
@@ -7405,7 +7405,7 @@ mod tests {
                         "agentKeyId": "agent_this",
                         "clientKeyId": CLIENT_KEY_ID,
                         "scopes": ["status", "qsy"],
-                        "createdAt": "2026-08-15T00:00:00Z",
+                        "createdAt": 1786752000,
                         "role": "owner",
                         "delegatedBy": "some_owner_user_id"
                     }]
@@ -7472,7 +7472,7 @@ mod tests {
                         "agentKeyId": "agent_this",
                         "clientKeyId": CLIENT_KEY_ID,
                         "scopes": ["status", "qsy"],
-                        "createdAt": "2026-08-15T00:00:00Z",
+                        "createdAt": 1786752000,
                         "role": "owner",
                         "delegatedBy": "some_owner_user_id"
                     }]
@@ -7575,7 +7575,7 @@ mod tests {
                         "agentKeyId": "agent_this",
                         "clientKeyId": CLIENT_KEY_ID,
                         "scopes": ["status", "qsy"],
-                        "createdAt": "2026-08-15T00:00:00Z",
+                        "createdAt": 1786752000,
                         "role": "owner",
                         "delegatedBy": "some_owner_user_id"
                     }]
@@ -8136,7 +8136,7 @@ mod tests {
                         "agentKeyId": AGENT_KEY_ID,
                         "clientKeyId": CLIENT_KEY_ID,
                         "scopes": ["status", "qsy", "tx"],
-                        "createdAt": "2026-08-15T00:00:00Z",
+                        "createdAt": 1786752000,
                         "role": "owner",
                         "delegatedBy": "some_owner_user_id"
                     }]
@@ -8812,7 +8812,7 @@ mod tests {
             "agentKeyId": "agent_this",
             "clientKeyId": client_kid,
             "scopes": ["status", "qsy"],
-            "createdAt": "2026-08-15T00:00:00Z",
+            "createdAt": 1786752000,
             "role": "owner"
         })
     }
