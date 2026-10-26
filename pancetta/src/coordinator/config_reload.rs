@@ -1388,6 +1388,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pan120_unattended_policy_reload_requires_restart_and_preserves_caller_policy() {
+        use pancetta_config::UnattendedPolicy;
+        for (running, requested) in [
+            (UnattendedPolicy::Off, UnattendedPolicy::RespondOnly),
+            (UnattendedPolicy::RespondOnly, UnattendedPolicy::Off),
+        ] {
+            let mut initial = base();
+            initial.autonomous.unattended_policy = running;
+            let (mut coordinator, _audit_tmp) = test_coordinator(initial).await;
+            let rx = tui_rx(&coordinator).await;
+            let before = toml::to_string(&*coordinator.config.read().await).unwrap();
+            let mut new = coordinator.config.read().await.clone();
+            new.autonomous.unattended_policy = requested;
+            coordinator
+                .handle_config_reload(Ok((new, Vec::new())))
+                .await;
+
+            let effective = coordinator.config.read().await;
+            assert_eq!(effective.autonomous.unattended_policy, running);
+            assert_eq!(toml::to_string(&*effective).unwrap(), before);
+            let lines = diagnostics(&rx);
+            assert!(
+                texts(&lines).contains(
+                    &"Saved changes take effect after a restart: autonomous.unattended_policy"
+                ),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reload_with_a_non_security_change_keeps_running_config_and_says_restart() {
         let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
