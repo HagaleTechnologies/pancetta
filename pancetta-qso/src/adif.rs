@@ -39,6 +39,11 @@ pub enum AdifError {
 
     #[error("Encoding error: {message}")]
     Encoding { message: String },
+
+    /// A declared length that runs past the end of the input, or swallows a
+    /// tag and lands on no field boundary (PAN-214).
+    #[error("Field length does not match its value: {field}")]
+    LengthMismatch { field: String },
 }
 
 /// ADIF data type enumeration
@@ -116,12 +121,23 @@ pub struct AdifRecordError {
     pub call: Option<String>,
 }
 
+/// How a file counts its value lengths (PAN-214). ADIF counts characters but
+/// allows only ASCII in .adi files, where the two agree; for UTF-8 values
+/// writers differ — pancetta's own writer counts bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthUnit {
+    Bytes,
+    Characters,
+}
+
 /// Every record in an ADIF file, each parsed on its own (PAN-127), so one
 /// malformed record no longer hides the records around it.
 #[derive(Debug)]
 pub struct AdifParse {
     pub header: AdifHeader,
     pub records: Vec<Result<AdifRecord, AdifRecordError>>,
+    /// The unit this file's lengths were read in (PAN-214).
+    pub length_unit: LengthUnit,
 }
 
 /// ADIF file header
@@ -235,6 +251,11 @@ pub struct AdifQso {
 
     /// Additional fields
     pub additional_fields: HashMap<String, String>,
+
+    /// ADIF data-type indicators (`<NAME:LEN:TYPE>`) the record carried, by
+    /// field name, so the index → export path writes them back (PAN-214).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub field_types: HashMap<String, String>,
 }
 
 /// ADIF field names under which an imported record's QSL status is kept in
@@ -352,12 +373,38 @@ impl AdifProcessor {
     /// record is parsed on its own, so one malformed record is reported in
     /// place and the records around it still read. Input that is not UTF-8
     /// is read as Latin-1.
+    ///
+    /// The length unit is decided once per file (PAN-214): a UTF-8 file with
+    /// non-ASCII bytes is read once counting bytes and once counting
+    /// characters, and the reading fewer values contradict is kept (see
+    /// [`read_value`]). A value both units read cleanly, such as tag-shaped
+    /// text in a character-counted value, decides nothing and follows the
+    /// file; a tie reads as bytes, pancetta's own convention.
     pub fn parse_bytes(&self, data: &[u8]) -> AdifParse {
         let text = std::str::from_utf8(data).ok(); // None ⇒ decode as Latin-1
+
+        // One byte is one character: nothing to decide.
+        if text.is_none() || data.is_ascii() {
+            return self.parse_in(data, text, LengthUnit::Bytes).0;
+        }
+        let (by_bytes, against_bytes) = self.parse_in(data, text, LengthUnit::Bytes);
+        let (by_chars, against_chars) = self.parse_in(data, text, LengthUnit::Characters);
+        if against_chars < against_bytes {
+            by_chars
+        } else {
+            by_bytes
+        }
+    }
+
+    /// The tokenizer behind [`Self::parse_bytes`], reading lengths in `unit`
+    /// where that unit lands on a field boundary. Also returns how many values
+    /// contradicted `unit`: only the other unit read them cleanly (PAN-214).
+    fn parse_in(&self, data: &[u8], text: Option<&str>, unit: LengthUnit) -> (AdifParse, usize) {
         let mut header_fields: Option<HashMap<String, AdifField>> = None;
         let mut records = Vec::new();
         let mut fields = HashMap::new();
         let mut error: Option<AdifError> = None;
+        let mut against = 0;
         let mut pos = 0;
 
         loop {
@@ -411,26 +458,45 @@ impl AdifProcessor {
             };
             let data_type = parts.next().map(str::to_string);
 
-            let (value, end) = read_value(data, text, pos, length);
-            pos = end;
-            fields.insert(
-                name.clone(),
-                AdifField {
-                    name,
+            match read_value(data, text, pos, length, unit) {
+                Cut::Value {
                     value,
-                    length,
-                    data_type,
-                },
-            );
+                    end,
+                    contradicts,
+                } => {
+                    against += usize::from(contradicts);
+                    pos = end;
+                    fields.insert(
+                        name.clone(),
+                        AdifField {
+                            name,
+                            value,
+                            length,
+                            data_type,
+                        },
+                    );
+                }
+                // The length cannot be right: the record is unreadable, and
+                // scanning resumes at the value's first byte, so an <EOR> it
+                // would have swallowed still closes this record and the next
+                // one reads (PAN-214).
+                Cut::Mismatch => {
+                    error.get_or_insert(AdifError::LengthMismatch {
+                        field: spec.clone(),
+                    });
+                }
+            }
         }
 
         // A trailing record with no <EOR> still counts.
         push_record(&mut records, &mut fields, &mut error);
 
-        AdifParse {
+        let parsed = AdifParse {
             header: self.header_from_fields(header_fields.unwrap_or_default()),
             records,
-        }
+            length_unit: unit,
+        };
+        (parsed, against)
     }
 
     /// Parse ADIF data from a string. Fails on the first record that cannot
@@ -514,10 +580,11 @@ impl AdifProcessor {
 
         output.push_str("<EOH>\n\n");
 
-        // Write records
+        // Write records, each field with its type indicator if it has one
+        // (PAN-214)
         for record in &file.records {
             for field in record.fields.values() {
-                output.push_str(&self.format_field(&field.name, &field.value)?);
+                output.push_str(&self.format_kept_field(field)?);
             }
             output.push_str("<EOR>\n\n");
         }
@@ -621,6 +688,7 @@ impl AdifProcessor {
             comment,
             notes: None,
             additional_fields,
+            field_types: metadata.adif_field_types.clone(),
         }
     }
 
@@ -685,6 +753,7 @@ impl AdifProcessor {
                     multiplier: None,
                 }),
             tags: Self::tags_with_unmodeled_fields(adif_qso),
+            adif_field_types: adif_qso.field_types.clone(),
             notes: adif_qso.comment.clone(),
             tx_parity: None,
             initiated_by: Default::default(),
@@ -805,7 +874,20 @@ impl AdifProcessor {
             comment: self.get_field_value(record, "COMMENT"),
             notes: self.get_field_value(record, "NOTES"),
             additional_fields: self.additional_fields_of(record),
+            field_types: Self::field_types_of(record),
         })
+    }
+
+    /// The type indicator of every field that carried one (PAN-214).
+    fn field_types_of(record: &AdifRecord) -> HashMap<String, String> {
+        record
+            .fields
+            .iter()
+            .filter_map(|(name, field)| {
+                let data_type = field.data_type.as_ref().filter(|t| !t.is_empty())?;
+                Some((name.clone(), data_type.clone()))
+            })
+            .collect()
     }
 
     /// [`Self::extract_additional_fields`] plus a TIME_OFF that has no
@@ -926,6 +1008,13 @@ impl AdifProcessor {
         // Add additional fields
         for (key, value) in &qso.additional_fields {
             self.add_field(&mut fields, key, value);
+        }
+
+        // An imported field's type indicator goes back on the field (PAN-214).
+        for (name, data_type) in &qso.field_types {
+            if let Some(field) = fields.get_mut(name) {
+                field.data_type = Some(data_type.clone());
+            }
         }
 
         AdifRecord { fields }
@@ -1173,7 +1262,8 @@ impl AdifProcessor {
         let record = self.qso_to_record(qso);
         let mut out = String::new();
         for field in record.fields.values() {
-            out.push_str(&self.format_field(&field.name, &field.value)?);
+            // An imported field keeps its type indicator (PAN-214).
+            out.push_str(&self.format_kept_field(field)?);
         }
         out.push_str("<EOR>\n\n");
         Ok(out)
@@ -1286,42 +1376,98 @@ fn push_record(
     }
 }
 
-/// ADIF counts a value's length in characters, but pancetta (and most C/Python
-/// writers) count bytes. Cut at the byte count unless only the character count
-/// lands just before the next tag. Non-UTF-8 input is Latin-1: one byte, one char.
-fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize) -> (String, usize) {
-    let byte_end = start.saturating_add(len).min(data.len());
-    let Some(text) = text else {
-        return (
-            data[start..byte_end].iter().map(|&b| b as char).collect(),
-            byte_end,
-        );
-    };
-    if data[start..byte_end].is_ascii() {
-        return (text[start..byte_end].to_string(), byte_end);
-    }
-    // A byte count can land inside a character: round up to the next boundary.
-    let byte_cut = (byte_end..=text.len())
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(text.len());
-    let char_cut = text[start..]
-        .char_indices()
-        .nth(len)
-        .map_or(text.len(), |(i, _)| start + i);
-    let end = if before_tag(data, byte_cut) || !before_tag(data, char_cut) {
-        byte_cut
-    } else {
-        char_cut
-    };
-    (text[start..end].to_string(), end)
+/// How [`read_value`] cut a value (PAN-214).
+enum Cut {
+    /// The value and the byte position just past it. `contradicts` is set
+    /// when the preferred unit landed on no field boundary and the other unit
+    /// did, so the other unit's cut was taken.
+    Value {
+        value: String,
+        end: usize,
+        contradicts: bool,
+    },
+    /// The declared length runs past the end of the input, or lands on no
+    /// field boundary after swallowing a real tag.
+    Mismatch,
 }
 
-/// True when only whitespace separates `at` from the end, or from a `<` that
-/// opens a real tag: one [`next_tag`] does not start over (no other `<`
-/// comes before its `>`) and whose spec is `<EOR>`, `<EOH>` or carries a
-/// length (`<NAME:LEN…>`), or a tag the file ends inside of. A stray `<` in a
-/// value, such as the one in `üñabc<x<MODE:3>`, is not a tag, and neither is
-/// a closed lookalike with no length, such as the `<x>` in `€ñab<x>`.
+/// ADIF counts a value's length in characters, but pancetta (and most C/Python
+/// writers) count bytes. Cut at the length in `unit`, the unit
+/// [`AdifProcessor::parse_bytes`] is trying for the whole file, when that cut
+/// lands on a field boundary ([`before_tag`]); otherwise at the length in the
+/// other unit when only that one does, which counts as a vote against `unit`.
+/// When neither does, the value keeps the `unit` cut and ADIF's text between a
+/// value and the next tag is ignored, unless the cut has swallowed a real tag
+/// or the input ends before the length: then the length is a mismatch. ASCII
+/// spans get the same boundary checks, so an overrun in a plain ASCII record
+/// is caught too (PAN-214). Non-UTF-8 input is Latin-1: one byte, one char.
+fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize, unit: LengthUnit) -> Cut {
+    // None: the input ends before `len` bytes / characters.
+    let byte_cut = start
+        .checked_add(len)
+        .filter(|&end| end <= data.len())
+        .map(|end| match text {
+            // A byte count can land inside a character: round up to the next boundary.
+            Some(text) => (end..=text.len())
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(text.len()),
+            None => end,
+        });
+    let char_cut = match text {
+        Some(text) => {
+            let rest = &text[start..];
+            match rest.char_indices().nth(len) {
+                Some((i, _)) => Some(start + i),
+                // Exactly `len` characters left is a cut at the end.
+                None => (rest.chars().count() == len).then_some(text.len()),
+            }
+        }
+        None => byte_cut,
+    };
+    let (preferred, other) = match unit {
+        LengthUnit::Bytes => (byte_cut, char_cut),
+        LengthUnit::Characters => (char_cut, byte_cut),
+    };
+    let fits = |cut: Option<usize>| cut.filter(|&cut| before_tag(data, cut));
+    let (end, contradicts) = match (fits(preferred), fits(other)) {
+        (Some(end), _) => (end, false),
+        (None, Some(end)) => (end, true),
+        (None, None) => match preferred.or(other) {
+            None => return Cut::Mismatch,
+            Some(end) if swallows_tag(data, start, end) => return Cut::Mismatch,
+            // ADIF ignores text between a value and the next '<'.
+            Some(end) => (end, false),
+        },
+    };
+    Cut::Value {
+        value: decode(data, text, start, end),
+        end,
+        contradicts,
+    }
+}
+
+/// True when a real tag (`<EOR>`, `<EOH>` or `<NAME:LEN…>`, as
+/// [`before_tag`] defines one) opens inside `data[start..end]` (PAN-214).
+fn swallows_tag(data: &[u8], start: usize, end: usize) -> bool {
+    data[start..end]
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == b'<')
+        .any(|(i, _)| {
+            let open = start + i;
+            matches!(next_tag(data, open), Some((at, close))
+                if at == open && is_tag_spec(&data[open + 1..close]))
+        })
+}
+
+/// True when a cut at `at` lands on a field boundary, the test both units of
+/// the per-file length vote are held to (PAN-214): only whitespace separates
+/// `at` from the end, or from a `<` that opens a real tag: one [`next_tag`]
+/// does not start over (no other `<` comes before its `>`) and whose spec is
+/// `<EOR>`, `<EOH>` or carries a length (`<NAME:LEN…>`), or a tag the file
+/// ends inside of. A stray `<` in a value, such as the one in
+/// `üñabc<x<MODE:3>`, is not a tag, and neither is a closed lookalike with no
+/// length, such as the `<x>` in `€ñab<x>`.
 fn before_tag(data: &[u8], at: usize) -> bool {
     let Some(i) = data[at..].iter().position(|b| !b.is_ascii_whitespace()) else {
         return true;
@@ -1427,6 +1573,7 @@ ADIF Export for Test Program
             comment: Some("Great QSO!".to_string()),
             notes: None,
             additional_fields: HashMap::new(),
+            field_types: HashMap::new(),
         };
 
         let record = processor.qso_to_record(&qso);
@@ -1489,6 +1636,7 @@ ADIF Export for Test Program
             their_state: None,
             contest_info: None,
             tags: HashMap::new(),
+            adif_field_types: HashMap::new(),
             notes: notes.map(|s| s.to_string()),
             tx_parity: None,
             initiated_by: CallInitiation::Manual,
@@ -2050,6 +2198,208 @@ ADIF Export for Test Program
         assert_eq!(record.fields["NAME"].value, "Müñoz");
     }
 
+    /// A record's fields by name, or its error message with its CALL.
+    type Outcome = Result<std::collections::BTreeMap<String, String>, (String, Option<String>)>;
+
+    /// The outcome of each record, in file order.
+    fn outcomes(parsed: &AdifParse) -> Vec<Outcome> {
+        parsed
+            .records
+            .iter()
+            .map(|r| match r {
+                Ok(record) => Ok(field_map(record)),
+                Err(e) => Err((e.error.to_string(), e.call.clone())),
+            })
+            .collect()
+    }
+
+    fn length_mismatch(field: &str) -> String {
+        AdifError::LengthMismatch {
+            field: field.to_string(),
+        }
+        .to_string()
+    }
+
+    /// PAN-214 (PR #451 review, Codex): the ticket's record in a file whose other
+    /// multi-byte values count characters. Both cuts of NOTES land before a valid
+    /// tag, so NOTES decides nothing and follows the file.
+    #[test]
+    fn parse_bytes_keeps_tag_shaped_text_in_a_character_counted_value() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <NAME:5>Müñoz \
+                    <NOTES:9>€€€<X:1>z<MODE:3>FT8<EOR>\n\
+                    <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <QTH:6>Zürich \
+                    <MODE:3>FT8<EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.length_unit, LengthUnit::Characters);
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+        let w1aw = parsed.records[0].as_ref().unwrap();
+        assert_eq!(w1aw.fields["NAME"].value, "Müñoz");
+        assert_eq!(w1aw.fields["NOTES"].value, "€€€<X:1>z");
+        assert_eq!(w1aw.fields["MODE"].value, "FT8");
+        assert!(!w1aw.fields.contains_key("X"), "{:?}", w1aw.fields);
+        let k1abc = parsed.records[1].as_ref().unwrap();
+        assert_eq!(k1abc.fields["QTH"].value, "Zürich");
+    }
+
+    /// PAN-214: the same text counted in bytes reads at its byte lengths.
+    #[test]
+    fn parse_bytes_keeps_tag_shaped_text_in_a_byte_counted_value() {
+        let adif = "<CALL:4>W1AW <NAME:7>Müñoz <NOTES:15>€€€<X:1>z <MODE:3>FT8 <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.length_unit, LengthUnit::Bytes);
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NAME"].value, "Müñoz");
+        assert_eq!(record.fields["NOTES"].value, "€€€<X:1>z");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+        assert!(!record.fields.contains_key("X"), "{:?}", record.fields);
+    }
+
+    /// PAN-214: with no value that only one unit reads cleanly, the file reads
+    /// as bytes, pancetta's own convention.
+    #[test]
+    fn parse_bytes_reads_a_file_with_no_deciding_value_as_bytes() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 \
+                    <NOTES:9>€€€<X:1>z<MODE:3>FT8<EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.length_unit, LengthUnit::Bytes);
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NOTES"].value, "€€€");
+        assert_eq!(record.fields["X"].value, "z");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+    }
+
+    /// PAN-214: in a character-counted file, a value that only its byte count
+    /// reads cleanly is still read at its byte count.
+    #[test]
+    fn parse_bytes_reads_the_odd_value_out_in_its_own_unit() {
+        let adif = "<CALL:4>W1AW <NAME:5>Müñoz <NOTES:3>€€€ <EOR>\n\
+                    <CALL:5>K1ABC <QTH:7>Zürich<MODE:3>FT8<EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.length_unit, LengthUnit::Characters);
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+        let w1aw = parsed.records[0].as_ref().unwrap();
+        assert_eq!(w1aw.fields["NAME"].value, "Müñoz");
+        assert_eq!(w1aw.fields["NOTES"].value, "€€€");
+        let k1abc = parsed.records[1].as_ref().unwrap();
+        assert_eq!(k1abc.fields["QTH"].value, "Zürich");
+        assert_eq!(k1abc.fields["MODE"].value, "FT8");
+    }
+
+    /// The W1AW record of the overrun tests, whose COMMENT declares `length`,
+    /// followed by a K1ABC record.
+    fn overrun_file(length: usize) -> String {
+        format!(
+            "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+             <COMMENT:{length}>x <EOR>\n\
+             <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <MODE:3>FT8<EOR>\n"
+        )
+    }
+
+    /// PAN-214 (PR #451 review, Codex): a length that runs past the end of the
+    /// file makes only its own record unreadable; the next record still reads.
+    #[test]
+    fn parse_bytes_rejects_a_length_that_runs_past_the_end_of_the_file() {
+        let parsed = AdifProcessor::new().parse_bytes(overrun_file(999).as_bytes());
+
+        let outcomes = outcomes(&parsed);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert_eq!(
+            outcomes[0],
+            Err((length_mismatch("COMMENT:999"), Some("W1AW".to_string())))
+        );
+        let k1abc = outcomes[1].as_ref().expect("K1ABC reads");
+        assert_eq!(k1abc["CALL"], "K1ABC");
+        assert_eq!(k1abc["TIME_ON"], "121500");
+    }
+
+    /// PAN-214: a shorter overrun that ends inside the next record used to
+    /// give W1AW the next record's TIME_ON and MODE.
+    #[test]
+    fn parse_bytes_rejects_a_length_that_runs_into_the_next_record() {
+        let parsed = AdifProcessor::new().parse_bytes(overrun_file(30).as_bytes());
+
+        let outcomes = outcomes(&parsed);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert_eq!(
+            outcomes[0],
+            Err((length_mismatch("COMMENT:30"), Some("W1AW".to_string())))
+        );
+        let k1abc = outcomes[1].as_ref().expect("K1ABC reads");
+        assert_eq!(k1abc["CALL"], "K1ABC");
+        assert_eq!(k1abc["TIME_ON"], "121500");
+    }
+
+    #[test]
+    fn parse_bytes_rejects_a_length_that_swallows_the_next_field() {
+        let adif = "<CALL:4>W1AW <COMMENT:10>x <MODE:3>FT8 <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(
+            outcomes(&parsed),
+            [Err((
+                length_mismatch("COMMENT:10"),
+                Some("W1AW".to_string())
+            ))]
+        );
+    }
+
+    #[test]
+    fn parse_bytes_rejects_a_truncated_last_value() {
+        let adif = "<CALL:4>W1AW <NAME:7>Mü";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(
+            outcomes(&parsed),
+            [Err((length_mismatch("NAME:7"), Some("W1AW".to_string())))]
+        );
+    }
+
+    /// ADIF allows any text but `<` between a value and the next tag.
+    #[test]
+    fn parse_bytes_still_ignores_text_after_a_value() {
+        let adif = "<CALL:4>W1AWxyz <MODE:3>FT8 <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["CALL"].value, "W1AW");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+    }
+
+    /// A value whose length fits keeps tag-shaped text, as pancetta writes it.
+    #[test]
+    fn parse_bytes_keeps_an_eor_inside_a_value_whose_length_fits() {
+        let adif = "<CALL:4>W1AW <NOTES:5><EOR> <EOR>\n<CALL:5>K1ABC <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+        assert_eq!(
+            parsed.records[0].as_ref().unwrap().fields["NOTES"].value,
+            "<EOR>"
+        );
+    }
+
+    /// The startup replay reads through `parse_string`, which still fails the
+    /// whole file on the first unreadable record.
+    #[test]
+    fn parse_string_fails_on_a_length_mismatch() {
+        match AdifProcessor::new().parse_string(&overrun_file(999)) {
+            Err(AdifError::LengthMismatch { field }) => assert_eq!(field, "COMMENT:999"),
+            other => panic!("expected LengthMismatch(COMMENT:999), got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_bytes_decodes_latin1_values() {
         let adif = b"<CALL:4>W1AW <NAME:4>Jos\xe9 <EOR>\n";
@@ -2143,6 +2493,102 @@ ADIF Export for Test Program
         assert!(processor.record_to_qso(&reread.records[0]).is_ok());
     }
 
+    // ── PAN-214: type indicators survive the index → export path ────────────
+
+    const TYPED_RECORD: &[u8] = b"<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 \
+                                  <MODE:3>FT8 <APP_LOGGER_SCORE:2:N>42 <EOR>";
+
+    fn typed_record(processor: &AdifProcessor) -> AdifRecord {
+        let parsed = processor.parse_bytes(TYPED_RECORD);
+        only_record(&parsed).clone()
+    }
+
+    #[test]
+    fn record_to_qso_keeps_field_type_indicators() {
+        let processor = AdifProcessor::new();
+
+        let qso = processor.record_to_qso(&typed_record(&processor)).unwrap();
+
+        let expected = HashMap::from([("APP_LOGGER_SCORE".to_string(), "N".to_string())]);
+        assert_eq!(qso.field_types, expected);
+        assert_eq!(processor.adif_to_qso(&qso).adif_field_types, expected);
+    }
+
+    #[test]
+    fn qso_to_record_writes_type_indicators_back() {
+        let processor = AdifProcessor::new();
+        let qso = processor.record_to_qso(&typed_record(&processor)).unwrap();
+        let metadata = processor.adif_to_qso(&qso);
+
+        let record = processor.qso_to_record(&processor.qso_to_adif(&metadata, None));
+
+        let field = &record.fields["APP_LOGGER_SCORE"];
+        assert_eq!(field.value, "42");
+        assert_eq!(field.data_type.as_deref(), Some("N"));
+        assert_eq!(record.fields["CALL"].data_type, None);
+    }
+
+    #[test]
+    fn generate_string_renders_a_type_indicator() {
+        let processor = AdifProcessor::new();
+        let file = AdifFile {
+            header: AdifHeader::default(),
+            records: vec![typed_record(&processor)],
+        };
+
+        let output = processor.generate_string(&file).unwrap();
+
+        assert!(output.contains("<APP_LOGGER_SCORE:2:N>42 "), "{output}");
+    }
+
+    #[test]
+    fn generate_record_renders_a_type_indicator() {
+        let processor = AdifProcessor::new();
+        let qso = processor.record_to_qso(&typed_record(&processor)).unwrap();
+
+        let output = processor.generate_record(&qso).unwrap();
+
+        assert!(output.contains("<APP_LOGGER_SCORE:2:N>42 "), "{output}");
+    }
+
+    #[test]
+    fn generate_string_is_unchanged_for_untyped_records() {
+        let processor = AdifProcessor::new();
+        let record = |call: &str| AdifRecord {
+            fields: HashMap::from([(
+                "CALL".to_string(),
+                AdifField {
+                    name: "CALL".to_string(),
+                    value: call.to_string(),
+                    length: call.len(),
+                    data_type: None,
+                },
+            )]),
+        };
+        let file = AdifFile {
+            header: AdifHeader {
+                version: "3.1.0".to_string(),
+                program_id: "TestProg".to_string(),
+                program_version: "1.2".to_string(),
+                created_timestamp: Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap(),
+                fields: HashMap::new(),
+            },
+            records: vec![record("W1AW"), record("K1ABC")],
+        };
+
+        let output = processor.generate_string(&file).unwrap();
+
+        assert_eq!(
+            output,
+            "ADIF Export for TestProg\n\
+             Generated on 2024-01-01 12:00:00 UTC\n\n\
+             <ADIF_VER:5>3.1.0 <PROGRAMID:8>TestProg <PROGRAMVERSION:3>1.2 \
+             <CREATED_TIMESTAMP:15>20240101 120000 <EOH>\n\n\
+             <CALL:4>W1AW <EOR>\n\n\
+             <CALL:5>K1ABC <EOR>\n\n"
+        );
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
@@ -2183,6 +2629,30 @@ ADIF Export for Test Program
 
                 let rendered = processor.render_record(&record).unwrap();
                 let reread = processor.parse_string(&rendered).unwrap();
+
+                prop_assert_eq!(reread.records.len(), 1);
+                prop_assert_eq!(field_map(&reread.records[0]), fields);
+            }
+
+            /// A record written with character counts reads back exactly,
+            /// whenever its values hold no '<' and do not end in whitespace
+            /// (then a byte cut either equals the character cut or lands
+            /// mid-value on text that is not a tag) (PAN-214).
+            #[test]
+            fn character_counted_records_read_back(
+                fields in proptest::collection::btree_map(
+                    "[A-Z_]{1,12}",
+                    "[a-zA-Z0-9üñé€:>\n ]{0,23}[a-zA-Z0-9üñé€]",
+                    1..8,
+                )
+            ) {
+                let mut rendered = String::new();
+                for (name, value) in &fields {
+                    rendered.push_str(&format!("<{name}:{}>{value} ", value.chars().count()));
+                }
+                rendered.push_str("<EOR>");
+
+                let reread = AdifProcessor::new().parse_string(&rendered).unwrap();
 
                 prop_assert_eq!(reread.records.len(), 1);
                 prop_assert_eq!(field_map(&reread.records[0]), fields);

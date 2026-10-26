@@ -239,12 +239,17 @@ pancetta import ~/wsjtx_log.adi
   `~/.pancetta/qsos.adi` with every field unchanged, QSL status included.
 - **Your log is backed up first.** Before the first write, `qsos.adi` is
   copied to `~/.pancetta/qsos.adi.bak` (or the next free `.bak.N`). The
-  output names the backup and ends with the exact steps to undo the import.
+  output names the backup.
+- **You can undo it.** The output ends with the undo command,
+  `pancetta import --undo <receipt>`, naming the receipt the import saved
+  in `~/.pancetta/imports/`. Undo removes only the contacts that import
+  added, keeps anything logged since, and works while Pancetta runs.
 - **Nothing is uploaded.** Imported contacts never go to QRZ, LoTW,
   ClubLog or cqdx; only QSOs pancetta completes do.
 
 Pancetta loads the imported contacts into its worked-station history the
-next time it starts.
+next time it starts. An import that finds Pancetta writing to your logbook
+waits for it to finish.
 
 ### …switch bands or modes?
 

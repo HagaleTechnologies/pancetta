@@ -1003,6 +1003,7 @@ mod tests {
             their_state: None,
             contest_info: None,
             tags: HashMap::new(),
+            adif_field_types: HashMap::new(),
             notes: None,
             tx_parity: None,
             initiated_by: Default::default(),

@@ -142,6 +142,7 @@ pub mod async_logger;
 pub mod autonomous;
 pub mod exchange;
 pub mod frequency;
+pub mod logbook_lock;
 pub mod priority;
 pub mod qso_manager;
 pub mod states;

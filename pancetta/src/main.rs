@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pancetta_config::Config;
+use pancetta_qso::logbook_lock::{LogbookGuard, LogbookLock};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,8 +164,10 @@ enum Commands {
     /// written. A contact already in your logbook (same callsign, band and
     /// mode, starting within 30 minutes) is skipped, as is one repeated in the
     /// file. Before anything is written, the logbook is copied to
-    /// ~/.pancetta/qsos.adi.bak (or the next free .bak.N). Use --dry-run to
-    /// see the result first; it changes nothing.
+    /// ~/.pancetta/qsos.adi.bak (or the next free .bak.N), and the import saves
+    /// a receipt in ~/.pancetta/imports/ that --undo uses to remove exactly the
+    /// contacts it added. Use --dry-run to see the result first; it changes
+    /// nothing.
     //
     // "30 minutes" is `pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES`;
     // `import_duplicate_window_is_thirty_minutes` keeps the two in step.
@@ -235,12 +238,18 @@ struct ExportArgs {
 #[derive(Clone, Args)]
 struct ImportArgs {
     /// ADIF file to import (.adi), e.g. an export from WSJT-X, N1MM, LoTW or QRZ
-    file: PathBuf,
+    #[arg(required_unless_present = "undo")]
+    file: Option<PathBuf>,
 
     /// Show what would be added, skipped as duplicates, or rejected, without
     /// changing your logbook
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// Undo an earlier import: remove exactly the contacts it added and keep
+    /// every contact logged since. RECEIPT is the file that import named
+    #[arg(long, value_name = "RECEIPT", conflicts_with_all = ["file", "dry_run"])]
+    undo: Option<PathBuf>,
 }
 
 #[derive(Clone, Args)]
@@ -499,7 +508,10 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
-        Commands::Import(args) => import_command(args).await,
+        Commands::Import(args) => match args.undo.clone() {
+            Some(receipt) => undo_import_command(receipt).await,
+            None => import_command(args).await,
+        },
         Commands::Pair(args) => pair_command(args, cli).await,
         Commands::Identity(args) => identity_command(args, cli).await,
     }
@@ -695,13 +707,33 @@ fn pancetta_data_dir() -> PathBuf {
         .join(".pancetta")
 }
 
+/// The files `pancetta import`, `--undo` and `export` work on, all in
+/// [`pancetta_data_dir`] (PAN-214).
+struct LogbookPaths {
+    /// The logbook, `qsos.adi`.
+    adif: PathBuf,
+    /// Its search index, `qso.db`.
+    db: PathBuf,
+    /// Where each import saves the receipt `--undo` reads.
+    imports: PathBuf,
+}
+
+impl LogbookPaths {
+    fn new() -> Self {
+        let dir = pancetta_data_dir();
+        Self {
+            adif: dir.join("qsos.adi"),
+            db: dir.join("qso.db"),
+            imports: dir.join("imports"),
+        }
+    }
+}
+
 async fn export_command(args: ExportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
     use pancetta_qso::async_database::{QsoDatabase, QsoFilter, QueryOptions};
 
-    let db_path = args
-        .database
-        .unwrap_or_else(|| pancetta_data_dir().join("qso.db"));
+    let db_path = args.database.unwrap_or_else(|| LogbookPaths::new().db);
 
     if !db_path.exists() {
         eprintln!("QSO database not found at {}", db_path.display());
@@ -764,53 +796,137 @@ enum ImportOutcome<'a> {
     DryRun,
     /// No new contacts: no backup was made and nothing was written.
     NothingAdded,
-    /// The new contacts were appended to `adif` and indexed into `db`.
-    /// `backup` is the copy made first, or `None` for a new logbook.
-    Added {
-        backup: Option<&'a Path>,
-        adif: &'a Path,
-        db: &'a Path,
-    },
+    /// The new contacts were appended and indexed; `receipt` is what
+    /// `--undo` reads to remove exactly them (PAN-214).
+    Added { receipt: &'a Path },
 }
 
 /// At most this many unreadable records are listed one by one.
 const IMPORT_UNREADABLE_LISTED: usize = 20;
 
+/// How long `pancetta import` (and `--undo`) waits for its turn at the logbook.
+const IMPORT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which command is waiting for the logbook, for the closing words of its
+/// refusals (PAN-214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    /// `pancetta import <FILE>`.
+    Import,
+    /// `pancetta import --undo <RECEIPT>`.
+    Undo,
+}
+
+impl Verb {
+    /// `this import` / `this undo`.
+    fn task(self) -> &'static str {
+        match self {
+            Verb::Import => "this import",
+            Verb::Undo => "this undo",
+        }
+    }
+
+    /// What a refusal left as it was.
+    fn unchanged(self) -> &'static str {
+        match self {
+            Verb::Import => "nothing was imported.",
+            Verb::Undo => "nothing was changed.",
+        }
+    }
+}
+
+/// The refusal when the logbook lock cannot be opened or taken.
+fn cannot_lock(adif: &Path, verb: Verb) -> String {
+    format!(
+        "Cannot lock your logbook {} for {}; {}",
+        adif.display(),
+        verb.task(),
+        verb.unchanged()
+    )
+}
+
+/// Wait for the logbook lock, printing the waiting line on the first busy try;
+/// refuse, changing nothing, once `wait` passes. The refusal names
+/// [`IMPORT_LOCK_WAIT`], the wait both commands use, whatever `wait` is
+/// (PAN-214).
+async fn wait_for_logbook<'a>(
+    lock: &'a LogbookLock,
+    adif: &Path,
+    wait: std::time::Duration,
+    verb: Verb,
+) -> Result<LogbookGuard<'a>> {
+    let turn = lock
+        .lock_within(wait, || {
+            println!(
+                "Waiting for Pancetta to finish writing to {}...",
+                adif.display()
+            )
+        })
+        .await
+        .with_context(|| cannot_lock(adif, verb))?;
+    turn.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} stayed busy for {} seconds (is another `pancetta import` running?); {}",
+            adif.display(),
+            IMPORT_LOCK_WAIT.as_secs(),
+            verb.unchanged()
+        )
+    })
+}
+
+/// The logbook's bytes, or `None` when there is no logbook yet.
+fn read_logbook(adif: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(adif) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Cannot read your logbook {}", adif.display())),
+    }
+}
+
+/// The refusal for an index (`qso.db`) without the logbook (`qsos.adi`) it
+/// is built from: startup has not yet moved the log into the logbook.
+fn refuse_unmigrated_index(adif: &Path, db: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Pancetta has not yet moved your log from {} into {}. Start Pancetta once so it \
+         can do that, then run this import again.",
+        db.display(),
+        adif.display()
+    )
+}
+
 /// `pancetta import <FILE> [--dry-run]` (PAN-127): append the new contacts
 /// from another logger's ADIF file to `~/.pancetta/qsos.adi`, verbatim, and
 /// index them into `~/.pancetta/qso.db`. Duplicates and unreadable records
-/// are decided by [`pancetta_qso::adif_import::plan_import`]; the logbook is
-/// backed up (and the backup verified) before the first write.
+/// are decided by [`pancetta_qso::adif_import::plan_import`]. The plan is
+/// made without the logbook lock, so a dry run changes nothing; the lock is
+/// then held from re-checking the plan against the logbook, through the
+/// verified backup and the receipt, to the append, so no live QSO lands
+/// inside the imported block (PAN-214).
 async fn import_command(args: ImportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
-    use pancetta_qso::adif_import::plan_import;
-    use pancetta_qso::adif_log_writer::AdifLogWriter;
+    use pancetta_qso::adif_import::{plan_import, ImportReceipt, RECEIPT_VERSION};
+    use pancetta_qso::adif_log_writer::{prepare_import_block, write_import_block};
     use pancetta_qso::async_database::QsoDatabase;
 
-    let data_dir = pancetta_data_dir();
-    let adif = data_dir.join("qsos.adi");
-    let db = data_dir.join("qso.db");
+    let Some(file) = args.file.as_deref() else {
+        anyhow::bail!("Name the ADIF file to import, or use --undo <RECEIPT>");
+    };
+    let LogbookPaths { adif, db, imports } = LogbookPaths::new();
     let processor = AdifProcessor::new();
 
-    let bytes = std::fs::read(&args.file)
-        .with_context(|| format!("Cannot read import file {}", args.file.display()))?;
+    let bytes = std::fs::read(file)
+        .with_context(|| format!("Cannot read import file {}", file.display()))?;
     let incoming = processor.parse_bytes(&bytes);
     if incoming.records.is_empty() {
         anyhow::bail!(
             "No ADIF records found in {} — is it an ADIF (.adi) file?",
-            args.file.display()
+            file.display()
         );
     }
 
     let adif_exists = adif.exists();
-    let db_existed = db.exists();
-    if !adif_exists && db_existed {
-        anyhow::bail!(
-            "Pancetta has not yet moved your log from {} into {}. Start Pancetta once so it \
-             can do that, then run this import again.",
-            db.display(),
-            adif.display()
-        );
+    if !adif_exists && db.exists() {
+        return Err(refuse_unmigrated_index(&adif, &db));
     }
 
     let logbook_bytes = if adif_exists {
@@ -822,16 +938,42 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         None
     };
     let logbook = logbook_bytes.as_deref().map(|b| processor.parse_bytes(b));
-    let mut plan = plan_import(&processor, &incoming, logbook.as_ref());
-    print!(
-        "{}",
-        format_import_header(&args.file, &adif, &plan, adif_exists)
-    );
+    let plan = plan_import(&processor, &incoming, logbook.as_ref());
+    print!("{}", format_import_header(file, &adif, &plan, adif_exists));
 
     if args.dry_run {
         print!("{}", format_import_report(&plan, ImportOutcome::DryRun));
         return Ok(());
     }
+    if plan.to_add.is_empty() {
+        print!(
+            "{}",
+            format_import_report(&plan, ImportOutcome::NothingAdded)
+        );
+        return Ok(());
+    }
+
+    // From here to the append, Pancetta's live logging waits for its turn,
+    // so the logbook cannot change under the plan (PAN-214).
+    let lock = LogbookLock::open(&adif).with_context(|| cannot_lock(&adif, Verb::Import))?;
+    let turn = wait_for_logbook(&lock, &adif, IMPORT_LOCK_WAIT, Verb::Import).await?;
+    let current = read_logbook(&adif)?;
+    let db_existed = db.exists();
+    if current.is_none() && db_existed {
+        return Err(refuse_unmigrated_index(&adif, &db));
+    }
+    let planned = logbook_bytes.as_deref().unwrap_or_default();
+    let now = current.as_deref().unwrap_or_default();
+    if !now.starts_with(planned) {
+        anyhow::bail!(
+            "Your logbook {} changed while this import was being planned; nothing was \
+             imported. Run the import again.",
+            adif.display()
+        );
+    }
+    // Contacts the station logged since the plan was made were never
+    // checked for duplicates: replan against them before writing.
+    let plan = replan_after_logbook_growth(&processor, &incoming, now, planned, plan);
     if plan.to_add.is_empty() {
         print!(
             "{}",
@@ -853,22 +995,19 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     );
 
     // Back up before the first write, and check the copy really holds the
-    // logbook the plan was built from. A QSO the running station appends in
-    // the meantime only makes the copy longer, never different.
-    let backup = match &logbook_bytes {
-        Some(before) => {
+    // logbook the plan was checked against. Under the lock nothing else
+    // writes it, so the copy must be exactly those bytes.
+    let backup = match &current {
+        Some(now) => {
             let bak = create_backup(&adif)?;
             let copied = std::fs::read(&bak)
                 .with_context(|| format!("Cannot read the backup {}", bak.display()))?;
-            if !copied.starts_with(before) {
+            if copied != *now {
                 anyhow::bail!(
                     "The backup {} does not match your logbook; nothing was imported.",
                     bak.display()
                 );
             }
-            // A longer copy holds contacts the plan never checked for
-            // duplicates; replan against it before writing (PAN-127).
-            plan = replan_after_logbook_growth(&processor, &incoming, &copied, before, plan);
             println!("{}", import_header_line("Backup:", bak.display()));
             Some(bak)
         }
@@ -878,28 +1017,49 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         }
     };
 
+    // The receipt is on disk before the append, so appended contacts always
+    // have one; it is removed again whenever nothing was appended (PAN-214).
+    let block = prepare_import_block(&adif, &processor, &plan.to_add)
+        .with_context(|| format!("Failed to add contacts to {}", adif.display()))?;
+    let receipt = ImportReceipt {
+        version: RECEIPT_VERSION,
+        logbook: adif.clone(),
+        import_file: std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()),
+        imported_at: chrono::Utc::now(),
+        contacts: plan.to_add.len(),
+        backup,
+        offset: block.offset,
+        added: block.added.clone(),
+        undone_at: None,
+    };
+    let receipt_path = write_import_receipt(&imports, &receipt).with_context(|| {
+        format!(
+            "Cannot save the undo receipt in {}; nothing was imported.",
+            imports.display()
+        )
+    })?;
+
     // Marked before the first write and cleared only once every new row is
     // indexed (and the index was current to begin with), so an import
-    // stopped part-way still gets its index rebuilt at the next start. A marker left by an earlier interrupted import is not
-    // ours to clear: its missing rows are not among the ones added here.
+    // stopped part-way still gets its index rebuilt at the next start. A
+    // marker left by an earlier interrupted import is not ours to clear: its
+    // missing rows are not among the ones added here.
     let marker = QsoDatabase::rebuild_marker(&db);
-    let marked_here = mark_index_incomplete(&marker)
-        .with_context(|| format!("Cannot write {}", marker.display()))?;
+    let marked_here = match mark_index_incomplete(&marker) {
+        Ok(created) => created,
+        Err(e) => {
+            let _ = std::fs::remove_file(&receipt_path);
+            return Err(e).with_context(|| format!("Cannot write {}", marker.display()));
+        }
+    };
 
-    let writer = AdifLogWriter::open(&adif)
-        .await
-        .with_context(|| format!("Cannot open your logbook {}", adif.display()))?;
-    for record in &plan.to_add {
-        writer
-            .append_record(record)
-            .await
-            .with_context(|| format!("Failed to add contacts to {}", adif.display()))?;
+    if let Err(e) = write_import_block(&adif, &block) {
+        let _ = std::fs::remove_file(&receipt_path);
+        return Err(e).with_context(|| format!("Failed to add contacts to {}", adif.display()));
     }
-    writer
-        .sync_all()
-        .await
-        .with_context(|| format!("Failed to save {}", adif.display()))?;
-    drop(writer);
+    // Indexing can take a while; the station may log again meanwhile.
+    drop(turn);
+    drop(lock);
 
     let indexed = index_imported_contacts(&processor, &plan.to_add, &adif, &db, db_existed).await;
     if index_was_behind || indexed.is_err() {
@@ -916,9 +1076,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         format_import_report(
             &plan,
             ImportOutcome::Added {
-                backup: backup.as_deref(),
-                adif: &adif,
-                db: &db,
+                receipt: &receipt_path,
             },
         )
     );
@@ -934,12 +1092,13 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-/// The verified backup `copied` is the logbook as it stood at backup time.
-/// When it is longer than `before` — the bytes [`import_command`] planned
-/// against — the running station completed a QSO in between that was never
-/// checked for duplicates, so the plan is rebuilt against the copy: an
-/// incoming record matching that contact must be skipped, not appended a
-/// second time. An unchanged logbook returns the plan as it came (PAN-127).
+/// `logbook` is the logbook as it stands once [`import_command`] holds the
+/// lock. When it is longer than `before` — the bytes the plan was built
+/// against — the running station completed a QSO after the plan was made
+/// that was never checked for duplicates, so the plan is rebuilt against
+/// it: an incoming record matching that contact must be skipped, not
+/// appended a second time. An unchanged logbook returns the plan as it came
+/// (PAN-127, PAN-214).
 fn replan_after_logbook_growth(
     processor: &pancetta_qso::adif::AdifProcessor,
     incoming: &pancetta_qso::adif::AdifParse,
@@ -952,6 +1111,276 @@ fn replan_after_logbook_growth(
     }
     let grown = processor.parse_bytes(copied);
     pancetta_qso::adif_import::plan_import(processor, incoming, Some(&grown))
+}
+
+/// Save `receipt` in `dir` as `import-YYYYMMDD-HHMMSS.json` (UTC, from its
+/// `imported_at`), or the first free `-2`, `-3`, ... `-100` variant, and
+/// return its path. Like [`create_backup`], each name is created
+/// exclusively, so an earlier receipt or a symlink planted at the name is
+/// never followed or overwritten; owner-only (0600) on Unix. It is flushed
+/// to disk before returning: the append that follows relies on it (PAN-214).
+fn write_import_receipt(
+    dir: &Path,
+    receipt: &pancetta_qso::adif_import::ImportReceipt,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let stem = format!("import-{}", receipt.imported_at.format("%Y%m%d-%H%M%S"));
+    let json = receipt.to_json();
+    for n in 1..=100 {
+        let path = if n == 1 {
+            dir.join(format!("{stem}.json"))
+        } else {
+            dir.join(format!("{stem}-{n}.json"))
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to create {}", path.display()))
+            }
+        };
+        if let Err(e) = file
+            .write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            // Ours: created exclusively above.
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("Failed to write {}", path.display()));
+        }
+        // On Unix a new file's name is durable only once its directory is
+        // flushed; best effort, as Windows cannot open a directory.
+        #[cfg(unix)]
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "{stem}.json and {stem}-2.json to {stem}-100.json all exist in {}",
+        dir.display()
+    )
+}
+
+/// Replace the receipt at `path` with `receipt`: written to `<path>.tmp`,
+/// flushed, then renamed over, so a crash leaves the old receipt or the new
+/// one, never half of one (PAN-214).
+fn rewrite_import_receipt(
+    path: &Path,
+    receipt: &pancetta_qso::adif_import::ImportReceipt,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    // A leftover (or planted) `.tmp` is removed rather than written through.
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(receipt.to_json().as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// Why `pancetta import --undo` left the logbook alone (PAN-214).
+enum UndoRefusal<'a> {
+    /// The receipt is marked undone, at this time.
+    AlreadyUndone(chrono::DateTime<chrono::Utc>),
+    /// The receipt names `receipt`, not this Pancetta's logbook `logbook`.
+    OtherLogbook {
+        receipt: &'a Path,
+        logbook: &'a Path,
+    },
+    /// The imported block is no longer in the logbook byte for byte;
+    /// `backup` is the logbook as it was before the import, if there was one.
+    BlockNotFound { backup: Option<&'a Path> },
+}
+
+impl std::fmt::Display for UndoRefusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndoRefusal::AlreadyUndone(at) => write!(
+                f,
+                "This import was already undone at {}; your logbook was not changed.",
+                at.format("%Y-%m-%d %H:%M UTC")
+            ),
+            UndoRefusal::OtherLogbook { receipt, logbook } => write!(
+                f,
+                "This receipt belongs to the logbook {}, not {}; nothing was changed.",
+                receipt.display(),
+                logbook.display()
+            ),
+            UndoRefusal::BlockNotFound { backup } => {
+                f.write_str(
+                    "Your logbook no longer holds the contacts this import added exactly as \
+                     they were added, so they cannot be removed automatically; nothing was \
+                     changed.",
+                )?;
+                match backup {
+                    Some(bak) => write!(
+                        f,
+                        " Your logbook as it was before the import is {}.",
+                        bak.display()
+                    ),
+                    None => f.write_str(" There was no logbook before this import."),
+                }
+            }
+        }
+    }
+}
+
+/// `pancetta import --undo <RECEIPT>` (PAN-214): remove exactly the block of
+/// contacts an earlier import appended, as its receipt recorded it, and keep
+/// every contact logged before or after it. It runs while Pancetta does:
+/// under the logbook lock it rewrites `qsos.adi` in place, so the station's
+/// append handle stays valid, and it marks the index for a rebuild at the
+/// next start instead of touching a `qso.db` the station holds.
+async fn undo_import_command(receipt_path: PathBuf) -> Result<()> {
+    use pancetta_qso::adif::AdifProcessor;
+    use pancetta_qso::adif_import::{ImportReceipt, ReceiptError};
+    use pancetta_qso::adif_log_writer::{locate_import_block, remove_import_block};
+    use pancetta_qso::async_database::QsoDatabase;
+
+    let LogbookPaths { adif, db, .. } = LogbookPaths::new();
+    let bytes = std::fs::read(&receipt_path)
+        .with_context(|| format!("Cannot read import receipt {}", receipt_path.display()))?;
+    let mut receipt = match ImportReceipt::from_json(&bytes) {
+        Ok(receipt) => receipt,
+        Err(ReceiptError::NotAReceipt(_)) => {
+            anyhow::bail!(
+                "{} is not a pancetta import receipt",
+                receipt_path.display()
+            )
+        }
+        Err(ReceiptError::UnsupportedVersion(version)) => anyhow::bail!(
+            "{} is a version {version} import receipt, which this Pancetta cannot undo; \
+             nothing was changed.",
+            receipt_path.display()
+        ),
+    };
+    if let Some(at) = receipt.undone_at {
+        anyhow::bail!("{}", UndoRefusal::AlreadyUndone(at));
+    }
+    if receipt.logbook != adif {
+        anyhow::bail!(
+            "{}",
+            UndoRefusal::OtherLogbook {
+                receipt: &receipt.logbook,
+                logbook: &adif,
+            }
+        );
+    }
+
+    let lock = LogbookLock::open(&adif).with_context(|| cannot_lock(&adif, Verb::Undo))?;
+    let turn = wait_for_logbook(&lock, &adif, IMPORT_LOCK_WAIT, Verb::Undo).await?;
+    let current = read_logbook(&adif)?.unwrap_or_default();
+    let Some(at) = locate_import_block(&current, receipt.offset, &receipt.added) else {
+        anyhow::bail!(
+            "{}",
+            UndoRefusal::BlockNotFound {
+                backup: receipt.backup.as_deref(),
+            }
+        );
+    };
+    let len = receipt.added.len();
+
+    let bak = create_backup(&adif)?;
+    let copied =
+        std::fs::read(&bak).with_context(|| format!("Cannot read the backup {}", bak.display()))?;
+    if copied != current {
+        anyhow::bail!(
+            "The backup {} does not match your logbook; nothing was changed.",
+            bak.display()
+        );
+    }
+    // Marked before the rewrite, so a failure to mark changes nothing; a
+    // rebuild of an index that turns out current is harmless.
+    if db.exists() {
+        let marker = QsoDatabase::rebuild_marker(&db);
+        mark_index_incomplete(&marker)
+            .with_context(|| format!("Cannot write {}; nothing was changed.", marker.display()))?;
+    }
+    remove_import_block(&adif, &current, at, len).with_context(|| {
+        format!(
+            "Failed to remove the imported contacts from {}; your logbook as it was before \
+             this undo is {}",
+            adif.display(),
+            bak.display()
+        )
+    })?;
+    drop(turn);
+    drop(lock);
+
+    let kept = AdifProcessor::new()
+        .parse_bytes(&current[at + len..])
+        .records
+        .len();
+    receipt.undone_at = Some(chrono::Utc::now());
+    let marked = rewrite_import_receipt(&receipt_path, &receipt);
+    print!("{}", format_undo_report(&receipt, &adif, &bak, kept));
+    if let Err(e) = marked {
+        anyhow::bail!(
+            "The imported contacts were removed, but {} could not be marked as undone ({e}).",
+            receipt_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// What `pancetta import --undo` did: the import it undid, the logbook, the
+/// copy taken just before the rewrite, and the counts (PAN-214).
+fn format_undo_report(
+    receipt: &pancetta_qso::adif_import::ImportReceipt,
+    adif: &Path,
+    backup: &Path,
+    kept: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        import_header_line(
+            "Import:",
+            format!(
+                "{} ({}, added {})",
+                receipt.import_file.display(),
+                count_of(receipt.contacts, "contact", "contacts"),
+                receipt.imported_at.format("%Y-%m-%d %H:%M UTC")
+            )
+        )
+    );
+    let _ = writeln!(out, "{}", import_header_line("Logbook:", adif.display()));
+    let _ = writeln!(out, "{}", import_header_line("Backup:", backup.display()));
+    out.push('\n');
+    let _ = writeln!(out, "  {:<20}{}", "Removed:", receipt.contacts);
+    let _ = writeln!(out, "  {:<20}{}", "Logged since, kept:", kept);
+    out.push('\n');
+    out.push_str(
+        "Pancetta drops the removed contacts from its search index (which `pancetta export` \
+         reads) and its worked-station history the next time it starts.\n",
+    );
+    out
 }
 
 /// Index the contacts `import_command` just appended. An existing index only
@@ -1153,29 +1582,36 @@ fn format_import_report(
         ImportOutcome::NothingAdded => {
             out.push_str("Nothing to add; your logbook was not changed.\n");
         }
-        ImportOutcome::Added { backup, adif, db } => {
+        ImportOutcome::Added { receipt } => {
             out.push_str(
                 "Pancetta loads the imported contacts into its worked-station history the \
                  next time it starts.\n",
             );
-            let _ = match backup {
-                Some(bak) => writeln!(
-                    out,
-                    "To undo this import: stop Pancetta, copy {} over {}, then delete {}.",
-                    bak.display(),
-                    adif.display(),
-                    db.display()
-                ),
-                None => writeln!(
-                    out,
-                    "To undo this import: stop Pancetta, then delete {} and {}.",
-                    adif.display(),
-                    db.display()
-                ),
-            };
+            let _ = writeln!(
+                out,
+                "To undo this import, run: pancetta import --undo {}",
+                shell_arg(receipt)
+            );
+            out.push_str(
+                "Undoing removes only what this import added; contacts Pancetta logs in the \
+                 meantime stay in your logbook.\n",
+            );
         }
     }
     out
+}
+
+/// `path` as one shell argument: bare when it holds only
+/// `[A-Za-z0-9._/\:-]`, otherwise in double quotes (a Windows profile
+/// directory with a space) (PAN-214).
+fn shell_arg(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = |c: char| c.is_ascii_alphanumeric() || "._/\\:-".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        text
+    } else {
+        format!("\"{text}\"")
+    }
 }
 
 async fn test_audio_command(args: TestAudioArgs) -> Result<()> {
@@ -3085,8 +3521,8 @@ mod tests {
 
     const IMPORT_FILE: &str = "/home/op/wsjtx_log.adi";
     const LOGBOOK: &str = "/home/op/.pancetta/qsos.adi";
-    const INDEX: &str = "/home/op/.pancetta/qso.db";
     const BACKUP: &str = "/home/op/.pancetta/qsos.adi.bak";
+    const RECEIPT: &str = "/home/op/.pancetta/imports/import-20261026-101500.json";
 
     fn records(n: usize) -> Vec<AdifRecord> {
         vec![
@@ -3128,11 +3564,9 @@ mod tests {
         )
     }
 
-    fn added(backup: Option<&'static str>) -> ImportOutcome<'static> {
+    fn added(receipt: &'static str) -> ImportOutcome<'static> {
         ImportOutcome::Added {
-            backup: backup.map(Path::new),
-            adif: Path::new(LOGBOOK),
-            db: Path::new(INDEX),
+            receipt: Path::new(receipt),
         }
     }
 
@@ -3216,7 +3650,7 @@ mod tests {
         let text = header(&plan, true)
             + &import_header_line("Backup:", BACKUP)
             + "\n"
-            + &format_import_report(&plan, added(Some(BACKUP)));
+            + &format_import_report(&plan, added(RECEIPT));
         assert_eq!(
             text,
             concat!(
@@ -3233,14 +3667,18 @@ mod tests {
                 "\n",
                 "Pancetta loads the imported contacts into its worked-station history the next \
                  time it starts.\n",
-                "To undo this import: stop Pancetta, copy /home/op/.pancetta/qsos.adi.bak over \
-                 /home/op/.pancetta/qsos.adi, then delete /home/op/.pancetta/qso.db.\n",
+                "To undo this import, run: pancetta import --undo \
+                 /home/op/.pancetta/imports/import-20261026-101500.json\n",
+                "Undoing removes only what this import added; contacts Pancetta logs in the \
+                 meantime stay in your logbook.\n",
             )
         );
     }
 
+    /// A new logbook gets the same receipt-based undo as an existing one:
+    /// deleting qsos.adi would also delete contacts logged since (PAN-214).
     #[test]
-    fn import_report_new_logbook_undo_deletes_both_files() {
+    fn import_report_new_logbook_offers_the_same_undo() {
         let plan = ImportPlan {
             logbook_contacts: 0,
             ..design_plan()
@@ -3248,20 +3686,163 @@ mod tests {
         let text = header(&plan, false)
             + &import_header_line("Backup:", "none (new logbook)")
             + "\n"
-            + &format_import_report(&plan, added(None));
+            + &format_import_report(&plan, added(RECEIPT));
         assert!(
             text.contains("Logbook:     /home/op/.pancetta/qsos.adi (new)\n"),
             "{text}"
         );
         assert!(text.contains("Backup:      none (new logbook)\n"), "{text}");
         assert!(
-            text.ends_with(
-                "To undo this import: stop Pancetta, then delete /home/op/.pancetta/qsos.adi \
-                 and /home/op/.pancetta/qso.db.\n"
-            ),
+            text.ends_with(concat!(
+                "To undo this import, run: pancetta import --undo \
+                 /home/op/.pancetta/imports/import-20261026-101500.json\n",
+                "Undoing removes only what this import added; contacts Pancetta logs in the \
+                 meantime stay in your logbook.\n",
+            )),
             "{text}"
         );
         assert!(!text.contains(" copy "), "{text}");
+        assert!(!text.contains("delete"), "{text}");
+    }
+
+    /// The printed undo is meant to be pasted into a shell, so a receipt
+    /// path with a space (a Windows profile directory) is quoted, and an
+    /// ordinary one is left bare (PAN-214).
+    #[test]
+    fn import_report_quotes_a_receipt_path_with_a_space() {
+        let spaced = r"C:\Users\Jo Op\.pancetta\imports\import-20261026-101500.json";
+        let text = format_import_report(&design_plan(), added(spaced));
+        assert!(
+            text.contains(
+                "To undo this import, run: pancetta import --undo \
+                 \"C:\\Users\\Jo Op\\.pancetta\\imports\\import-20261026-101500.json\"\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(shell_arg(Path::new(RECEIPT)), RECEIPT);
+        let windows = r"C:\Users\JoOp\.pancetta\imports\import-20261026-101500-2.json";
+        assert_eq!(shell_arg(Path::new(windows)), windows);
+        assert_eq!(
+            shell_arg(Path::new("/home/o'p/r.json")),
+            "\"/home/o'p/r.json\""
+        );
+    }
+
+    /// The receipt the `undo_*` tests read back: two contacts from LoTW,
+    /// imported at the time the Design for review shows.
+    fn design_receipt() -> pancetta_qso::adif_import::ImportReceipt {
+        use chrono::TimeZone;
+        pancetta_qso::adif_import::ImportReceipt {
+            version: pancetta_qso::adif_import::RECEIPT_VERSION,
+            logbook: PathBuf::from(LOGBOOK),
+            import_file: PathBuf::from("/home/op/lotw.adi"),
+            imported_at: chrono::Utc
+                .with_ymd_and_hms(2026, 10, 26, 10, 15, 0)
+                .unwrap(),
+            contacts: 2,
+            backup: Some(PathBuf::from(BACKUP)),
+            offset: 153,
+            added: String::new(),
+            undone_at: None,
+        }
+    }
+
+    #[test]
+    fn undo_report_matches_the_design() {
+        let text = format_undo_report(
+            &design_receipt(),
+            Path::new(LOGBOOK),
+            Path::new("/home/op/.pancetta/qsos.adi.bak.1"),
+            1,
+        );
+        assert_eq!(
+            text,
+            concat!(
+                "Import:      /home/op/lotw.adi (2 contacts, added 2026-10-26 10:15 UTC)\n",
+                "Logbook:     /home/op/.pancetta/qsos.adi\n",
+                "Backup:      /home/op/.pancetta/qsos.adi.bak.1\n",
+                "\n",
+                "  Removed:            2\n",
+                "  Logged since, kept: 1\n",
+                "\n",
+                "Pancetta drops the removed contacts from its search index (which `pancetta \
+                 export` reads) and its worked-station history the next time it starts.\n",
+            )
+        );
+        // Undo works while Pancetta runs; it never tells the operator to stop it.
+        assert!(!text.contains("stop"), "{text}");
+    }
+
+    #[test]
+    fn undo_errors_match_the_design() {
+        use chrono::TimeZone;
+        let undone = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 26, 10, 20, 0)
+            .unwrap();
+        assert_eq!(
+            UndoRefusal::AlreadyUndone(undone).to_string(),
+            "This import was already undone at 2026-10-26 10:20 UTC; your logbook was not changed."
+        );
+        assert_eq!(
+            UndoRefusal::OtherLogbook {
+                receipt: Path::new("/other/.pancetta/qsos.adi"),
+                logbook: Path::new(LOGBOOK),
+            }
+            .to_string(),
+            "This receipt belongs to the logbook /other/.pancetta/qsos.adi, not \
+             /home/op/.pancetta/qsos.adi; nothing was changed."
+        );
+        let not_found = "Your logbook no longer holds the contacts this import added exactly as \
+                         they were added, so they cannot be removed automatically; nothing was \
+                         changed.";
+        assert_eq!(
+            UndoRefusal::BlockNotFound {
+                backup: Some(Path::new(BACKUP)),
+            }
+            .to_string(),
+            format!(
+                "{not_found} Your logbook as it was before the import is \
+                 /home/op/.pancetta/qsos.adi.bak."
+            )
+        );
+        assert_eq!(
+            UndoRefusal::BlockNotFound { backup: None }.to_string(),
+            format!("{not_found} There was no logbook before this import.")
+        );
+    }
+
+    /// The refusal names the commands' real 30 s wait, whatever wait the
+    /// caller passed (here a short one, so the test is quick) (PAN-214).
+    #[tokio::test]
+    async fn waiting_for_the_logbook_gives_up_with_the_designed_error() {
+        use pancetta_qso::logbook_lock::LogbookLock;
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let holder = LogbookLock::open(&adif).unwrap();
+        let _held = holder
+            .try_lock()
+            .unwrap()
+            .expect("nobody else holds the lock");
+        let waiter = LogbookLock::open(&adif).unwrap();
+        let short = std::time::Duration::from_millis(150);
+
+        for (verb, unchanged) in [
+            (Verb::Import, "nothing was imported."),
+            (Verb::Undo, "nothing was changed."),
+        ] {
+            let refusal = match wait_for_logbook(&waiter, &adif, short, verb).await {
+                Ok(_) => panic!("the lock is held, so the wait must give up"),
+                Err(e) => e.to_string(),
+            };
+            assert_eq!(
+                refusal,
+                format!(
+                    "{} stayed busy for 30 seconds (is another `pancetta import` running?); \
+                     {unchanged}",
+                    adif.display()
+                )
+            );
+        }
     }
 
     #[test]
@@ -3422,6 +4003,8 @@ mod tests {
         );
         assert!(help.contains("~/.pancetta/qsos.adi.bak"), "{help}");
         assert!(help.contains("-n, --dry-run"), "{help}");
+        assert!(help.contains("receipt in ~/.pancetta/imports/"), "{help}");
+        assert!(help.contains("--undo <RECEIPT>"), "{help}");
     }
 
     #[test]

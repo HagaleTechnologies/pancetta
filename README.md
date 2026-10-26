@@ -270,7 +270,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
-| `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). |
+| `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
 | `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |
 | `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |
 | `pancetta --replay <wav-dir>` | Feed a directory of WAVs through the full TUI pipeline. |
