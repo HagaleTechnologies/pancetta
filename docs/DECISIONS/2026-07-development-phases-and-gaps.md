@@ -61,11 +61,13 @@
   replaced, so that frame stays counted. Its Autonomous behaviour already
   matches the ownership rule. (Surfaced by PAN-185, 2026-10-23.)
 
-- **An auto-sequence request the TX channel never accepted sends Autonomous
-  no completion.** The QSO forwarder withdraws the intent and rolls back the
-  engine's ledger attempt, but tells Autonomous nothing, because an older
-  queued request for the QSO may still own its outcome. Only reachable when
-  the 10,000-message TX channel is full. (Surfaced by PAN-185, 2026-10-23.)
+- **A rejected auto-sequence resend sends Autonomous no completion.** The
+  QSO forwarder withdraws the intent and rolls back the engine's ledger
+  attempt, but an older accepted request may still own the Autonomous
+  outcome. PAN-238 repairs registered opening self-CQs only: their rejected
+  enqueue sends a durable failed completion because no predecessor owns an
+  outcome. The resend gap remains when the 10,000-message TX channel is
+  full. (Surfaced by PAN-185, 2026-10-23.)
 
 - **Supervisor coverage:** the restartable set includes Dsp/Ft8Decoder (PAN-4, using retained
   `DecodePipelineHandles`), Hamlib/StationAgent (PAN-5, with pre-restart teardown) and

@@ -158,11 +158,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - TUI device, rig and bookmark saves now go to the file a `--config` symlink
   points to when you save, so after a dotfiles manager repoints the link they
   land in the same file reloads and the next restart read (PAN-200). Before,
   they kept writing to the file the link pointed to at startup. A save through
   a symlink whose target is missing is refused, and the link is left in place.
+=======
+- An autonomous CQ whose opening transmission is rejected by a full TX
+  queue now clears its pending association and restores its speculative
+  offset and unanswered-CQ count, even if the CQ stops before another
+  transmission reaches the worker. Later rejected resends leave the
+  accepted opening's outcome with the TX worker (PAN-238).
+>>>>>>> d963768b62965bd077419f4284b34a05cf0881dd
 
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,

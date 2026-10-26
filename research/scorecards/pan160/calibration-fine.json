@@ -1,0 +1,4782 @@
+{
+  "config": {
+    "a7_enabled": false,
+    "a7_freq_window_hz": 6.25,
+    "a7_snr7_threshold": 6.0,
+    "a7_snr7b_threshold": 1.8,
+    "a8_qso_state_ap_enabled": false,
+    "acceptance_gating_enabled": false,
+    "adaptive_ldpc_iters": false,
+    "ap4_full_message_mask_enabled": true,
+    "ap_dt_history_enabled": false,
+    "ap_injection_post_normalization": false,
+    "ap_llr_magnitude": 15.0,
+    "auto_passband_enabled": false,
+    "bicm_id_em_reestimation": false,
+    "bicm_id_iterations": 0,
+    "bicm_id_max_unsatisfied_checks": 18,
+    "block_score_rerank": true,
+    "bp_offset_subtract": 0.0,
+    "coherent_multipass_iterations": 3,
+    "coherent_subtract_full_frame_reference_enabled": false,
+    "coherent_subtract_full_frame_time_varying_enabled": false,
+    "coherent_subtract_mrc_threshold": 0.0,
+    "content_ap_enabled": false,
+    "costas_half_loop_disabled": false,
+    "costas_partial_metric_enabled": false,
+    "costas_two_baseline_enabled": false,
+    "costas_two_baseline_norm_threshold": 1.2,
+    "costas_two_baseline_percentile": 0.4,
+    "costas_two_baseline_tight_steps": 20,
+    "cq_ap_enabled": false,
+    "cross_cycle_averaging": true,
+    "cross_cycle_coherent": true,
+    "cross_cycle_coherent_mrc": true,
+    "cross_cycle_content_guard": null,
+    "cross_sequence_a7_enabled": false,
+    "cycle_audio_smoothing_enabled": false,
+    "deep_iters": 100,
+    "dt_history_enabled": false,
+    "dt_history_freq_window_hz": 25.0,
+    "dt_history_window_floor_s": 0.2,
+    "dt_history_window_iqr_scale": 3.0,
+    "escalation_enabled": false,
+    "escalation_parity_max": 30,
+    "fine_fft_rect_window": false,
+    "fine_sync_enabled": false,
+    "floor_candidates": 50,
+    "floor_iters": 25,
+    "fourth_pass_after_a7_enabled": false,
+    "ft8lib_sync_seeds_enabled": false,
+    "full_scale_subtraction_enabled": false,
+    "gaussian_ramp_subtract_enabled": false,
+    "gaussian_ramp_subtract_fraction": 0.11,
+    "impulse_robust_llr": null,
+    "joint_pair_retry": true,
+    "joint_residual_sync_relax_db": 0.0,
+    "joint_residual_sync_window_bins": 8,
+    "layered_bp": true,
+    "ldpc_feedback_attenuate_factor": 0.5,
+    "ldpc_feedback_boost_factor": 1.5,
+    "ldpc_feedback_erase_threshold": 1.0,
+    "ldpc_feedback_refinement_enabled": false,
+    "ldpc_iterations": 30,
+    "linear_power_averaging": false,
+    "llr_metric": "DualMax",
+    "llr_target_variance": 32.0,
+    "llr_whitening_enabled": false,
+    "max_ap_hypotheses": 8,
+    "max_ap_qsos": 4,
+    "max_candidates": 50,
+    "max_decode_passes": 1,
+    "max_parity_errors_for_osd": 6,
+    "max_sync_candidates": 100,
+    "min_ap_decode_confidence": 0.550000011920929,
+    "min_content_ap_confidence": 0.6000000238418579,
+    "min_sync_score": 3.0,
+    "neural_osd_enabled": true,
+    "nms_enabled": false,
+    "nms_freq_radius": 2,
+    "nms_score_delta_db": 0.0,
+    "nms_time_radius": 8,
+    "nsym_combining_enabled": false,
+    "osd_depth": null,
+    "osd_input": "BpPosterior",
+    "osd_npre2_preprocessing_enabled": false,
+    "pade_atanh": true,
+    "per_bin_candidate_selection": false,
+    "per_candidate_freq_tracker_alpha": 0.2,
+    "per_candidate_freq_tracker_enabled": false,
+    "per_candidate_freq_tracker_max_error_hz": 5.0,
+    "per_candidate_freq_tracker_max_step_hz": 1.5,
+    "protocol": "Ft8",
+    "relaxed_sync_near_partner_hz_radius": null,
+    "relaxed_sync_near_partner_score_delta": 0.0,
+    "residual_energy_stop_db": null,
+    "residual_min_sync_score": null,
+    "residual_snr_diagnostic": false,
+    "residual_snr_gate_db": null,
+    "sample_rate": 12000,
+    "soft_combiner_capacity": 256,
+    "soft_combiner_enabled": false,
+    "soft_combiner_key_tolerance": 0,
+    "soft_combiner_ttl_seconds": 180,
+    "sync_time_interp_delta_scale": 0.3,
+    "sync_time_interp_linear_power": false,
+    "sync_time_interp_max_delta_abs": null,
+    "sync_time_interp_score_gate": 0.0,
+    "sync_time_interpolation": true,
+    "three_method_spectral_sweep_enabled": false,
+    "three_stage_sync_cascade_enabled": false,
+    "time_varying_subtraction_enabled": false
+  },
+  "records": [
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.638966337,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.614356481,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "0ebbbba6e62c4f030774d2b3764f004e562ea9250f3f61e75d25d5986caaaf11",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.565700881,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 30
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.572531935,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "7d00ce8e5e7bca5637432cba610bcf106087546acb431bfd59403e00efc57b6b",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.641787123,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 5,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.623659995,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "b0431619f7caced13a6b5dd1d1c90030d77fbac53788ec77cfac6f7d3bbd5b94",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.608445758,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.601364604,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "7746ad5f037b36d9418ca46c357baa7f97a4fce0ffe989ce8950b7e3e54bef7d",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.573838061,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 30
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.584783705,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "fd3f2614f084655505cc31bac9aea03d887beaa2b182ca21311ad8a19a7c0c32",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.592614369,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.595831743,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "10c615bfc2664542cfc4441e1266163e8fc853d454711e0e5e9617caae03888d",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 20,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.604459997,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.60391412,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1b860d85ebf61997fa93e227ff5ef775dbbb0810f0e1d2cf288b1871644c9765",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.583069409,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.590919659,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "835de049553f0039ca2a3fd56dc7112a720c3c2ba53b5cc5999575fe6862b612",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.590008053,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.579849799,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "c2fd66d8eaa71c3457ab9cf815576302bdebe7571caa86e7af9de1e00c374410",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.590502133,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.580194267,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7b3facfb00493aaf34652ebc4baf65a227c426fefc769a52fe98b4c2b572efe7",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.56331638,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.572785517,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "905545bd77b444e608193d73f885cbf5cd1a08395217e7abaedb4fcb259a93a5",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.581385167,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.57022629,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "269211090e82966a0c57d90a2bc509c981fe8d05d4fec68cbf288c46c1fd7f85",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 20,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.589632945,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.598848084,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "321d1aab3ea23b0de4d9e2728e9f774d080c54a8c0bc2926f46a2041c4286740",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 20,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.561237667,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.544746478,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "9c02c96448d3c0a9f7ddec7d2c09394e598d45e22c5dadb2a91b01dd14feee7b",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 20,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.546353991,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.554735011,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "ab48fc8d04e51c25a766ea85656d698111b1e3a86c390570f83542e0bec4ffdd",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 20,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.623652894,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 30
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.607903511,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "9dd86540ea67cc88e1a3fa007265a133a8b83a28350b559243e192d10451bea9",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.579545122,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.597209108,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c5d8d7b06a858aea872260e46cbc2c818bceefe1251803497497f306c82246ea",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.623729437,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 30
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.629020202,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "05d49756eb8e163981fd50bfea4e64879e43f13f40a271ab813e3fa9393ca16c",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.645950667,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.64419299,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "681e6cfe871959af91c139d91f2c3d202debe1d889157bc516637fc31c83f44b",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.631691036,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.615450539,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b88d660e0be5e3528e9d76962ce234cd9e1c16ad5f3ca657cb7dbf432899e8e3",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.642405586,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.652767822,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "b927bdc4a1e0f24b44d30a207d89abc486fe6d2371107b4113e3db130e99c2c5",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 21,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.641369536,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.627201257,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "e7ac6304745aee3f803ae82d1cf5fe4da46f0d7e16894deaa53b6c5aa9bad63c",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.592207574,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.599224546,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "25f31049d9d2d7abe6a506cb01b50c97a91ec004072cbfdd3b0a9055516b43a2",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.625451183,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.607509765,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "33fea13c9f66182c7decf1ee7a6f6c409ad620413e6e7b97998952b4c4bfaa63",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.613640359,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.623007453,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "c4e2fa084fc53d0d817548534447e072aac1736b9b8fcf50da58d205dd06ced6",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.620775514,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.609308508,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "df41293f1362b2cbf5b071ebb5affceb5f48b15f624fd504c17d29dfc0020df5",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.639260904,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.614977805,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "3798c9ac128fdd2ab18af09ab303cdc26398bc4b95e26f994c088cf849e639d0",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 21,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.628287447,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.625469995,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "b5036ba98c5703f0e0c6405b70a4683c0355f941b18e4ddc168e47da2eb05841",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 21,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.606677967,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.605204554,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "1e9a75c2a41e6f12338f75e018646fa603771a076f00e9a7829efe5045482117",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 21,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.603244055,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.609891813,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "d174941e68d979fc9e6e3a4f280346b51c2e5849ba1f929dd65aa8ee5480e2fc",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 21,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.650064569,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.646901417,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "7b479ddb318d8fb582bf7b894bc1e9826ea34e9923509ae5e2d6716dd1952dd9",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.650972919,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.666988692,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "e47cc1296a5434d1a1a82686e881e11dc24a69804b4d86886cf85112445099c0",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.662373468,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.669919846,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "31a302936cee715a6c07351572e8ad53df95877a01050b5c9d631c16d56084ec",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.665693825,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.654201541,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "76629e3d85423477847e113c5b70d9c83c4cd1b3a82c41c7a896ee8ca4d8fb5e",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.650340226,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.645165418,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "9b0f3789f58541accfd18fa3539ed9ff33f625c7b9c6dc799a9f3f59a465ec07",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.659220183,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.653652557,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "ba53fdb9de02e3b38ebac5b8dffca32d5f43c5e739c183a143ecfec3346ab809",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 22,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.65726319,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.663214708,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "a342d01f3db6f57d6165591712090a3006c03722833a187a729c031cc9d56c94",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.688617153,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.646386073,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "62832351b27d7b9b01e5f09611787a83ea84ae6914027f8988a93c55d1b33350",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.664127824,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.67160894,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "d817fb0076a50df55712347629daf125b772a5a940128663902fd5a4785c05a0",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.65064246,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.665752441,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "e865effea332b56a73b8cf86045276ee31a748489562783c49cedcc085c59418",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.652772328,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.656133642,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "d0277857068bee441b4abbda1d1067a799ad5125a9ca3f200fa97b0f3da8423f",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.655286147,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.658485256,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "089ca6090a396e4ca9198bb4964dde85da7143aa9cfa633a197614b1c84eb6a2",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 22,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.648649128,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.647629841,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "e8835c5c80141bd9c785ae03213205edc38eccdda66eb2c13a94d9f82eafa207",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 22,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.672260453,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.657051707,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "dbd74cc21ca8ce7e8f1037e502b13850c1fc008776a0834cbad634573a56ecb6",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 22,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.635311542,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.630872739,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "e35616cc258415390261532f639b21dc221757539e8ba3181f1efb6aad62a958",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 22,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.58348633,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.584279893,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "be323c9d89f5bda4a354200848039f56698cb5eef07e17b550c80fe151d9aa3a",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.564213697,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.567465646,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "2935c63fbdf53d603e8f2a09b53fde351ef2607990db8afb818caa87b7dd77e2",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.586689015,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.579709062,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "bf8e6db7fad18ccf19f60a107a9fcc53a40be562ee695a0bc40bf3d5e36d72cb",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.577638035,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.592758094,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "6aee71dfc8f551a464d4106f25fba6b07b818c0e94baa95dbdb761a9d1d38eb7",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.584266777,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 38
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.581301247,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "79dcf9b614351f9601555c38ad09ee7f7cd65f737449b0272496e8acda4269df",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.579327012,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.623404785,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "68ae15cc5937f757ba0fc3acc1fd1cd3c44c0fc49218f4e9d0e06ea5280f9e6a",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 23,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.594294342,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.59408597,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "0f27006d47cd8012037c8deecd847ec1fad5487df65f347e1f0c4291b794a83c",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.57260904,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 38
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.573661611,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "950b407c5419fa0ddc3edd3ebc7bae26bc879dda6caa41be9311c154e3272148",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.616970718,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.590150975,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "a3c55b21380fada306ace466798e6e6650e2165ca5c9c76dade6c346a6e3b59b",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.578532565,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.604575284,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "3fdd5797735b507fe334a2a5f098c341d83fc0ea68b82e842c372ab1c8b40cc3",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.555555602,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.548638287,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "645ac658006b86e488049d1bd3d0a2fc403621852796c3c4f369ee623e0a0c59",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.595549281,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.597716028,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "2fbe049dc0d0fd81fc14e43d360d0f4d08a2c5447daeba7509df3359f698d7a2",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 23,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.563090088,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.577754118,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "a9e28795ffdb3ade024a1bd18c99a2bf0b63ab52384523223036a1660842ce6a",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 23,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.590565182,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.548389588,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "d643fe4de3aad1a73bdc2be69faec46c873e9f52291ce2c9573396addf029a0a",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 23,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.60262412,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.58273045,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "4b6ebe0affdb960642513c8efc75e284c50a13b4c588a4e2662cc4b68487a8f3",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 23,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.668645511,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.679154404,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "a02943141b4605aa15eba9045a4f4d28d016adbb7810a58ebee3cea544e08cbe",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.670928456,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.666050778,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "d2fab12da76aaa9349fca7645de2ac1be0bdb6fe76ee34d5f11fc75c5c60d428",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.676403497,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.67244067,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "dc2c9469b3ff844701bd6b4480f6fd1be96d50b2067d8dce48d2069fa1091286",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.691479872,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.628549608,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "e9ed8e9fe1ea1df4cd0f7f241a94135c34bb12c3dc851c5c530370dfe61ca7a9",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.667231919,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.651451106,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "f83c2fba611dda37c303e4b274d4f98b827f987fb49798b195e19a6cdc8d1ae3",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.669126933,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.667720657,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "21d0ca39a7c3d24fca940e8f9d7cbe726c6a565981c808f9ba224c00b82f7fd0",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 24,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.626707501,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.667649463,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "53d7fbd172e0386097c5927ee0ebf6cde03431004e28eeb37e0e3f88eeb76b7b",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.677000877,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.680788063,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "255ee8514f75bae823cefcae5ab1e16b0124acd105dcfad9c7df486eb6a0c94c",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.691587862,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.697839164,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "8c5a70edcff0c1b5ff4a0500fdcb65576b93279ef1c291649828c95c98c98f3e",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.698066031,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 5,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.643393122,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "3c50b6ab39f90fcfa44629ba7d6c27e0352b3eb482e48093d6c0967b4375560f",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.71563167,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 40
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.691796713,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "d79deacac18caece28c6d88311a838fb7cf4cffe2871d55f0ab2aa29ba36fc3b",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.659541385,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.722778716,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "3d113bec471262d664535e7cf969d6ef9768217b65256195ff7bdc157a73be2c",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 24,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.650448956,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 5,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.643296278,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "9c2df5116a19c87728069554d6bc2174ae287a7032b6fd337351aec40d84b7aa",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 24,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.6817667,
+          "enabled": false,
+          "messages": [
+            "J24QVK I70AQS PN91"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 3,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.687415267,
+          "enabled": true,
+          "messages": [
+            "J24QVK I70AQS PN91"
+          ]
+        }
+      ],
+      "audio_sha256": "1195dffdfbf102c477f67a574e7f7d97884c4e3d959823fd5663981b5bac6cb5",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 24,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.678649124,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.660458608,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "ad7ffc1fa768179411c4e864196b6beae94d38d40adb34ea81c6ca075a28434d",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 24,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.586850173,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.588053026,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "0bd9b1541ffdba84b4eeac921ad00290370d4f3a6eece4f668368639bd6efdea",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.594853801,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.592505082,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "9ff33bb057214b82bf38a4857a87de19252823e6d7801fbbf9f523f53eabc5ea",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.617767984,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 4,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.621727894,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "91a70e60a59839665cb8a4fb449e596972180a55a33bfffd17b7487a4146d38f",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.587158571,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.585561737,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "73a50b3c5e726fdc6576cb3d2cffff181a47ad32503425bab361ba921f10cbe2",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.587548705,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.588811411,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "c9e1b8f977e265556a5a928f309a2e8fe59568b77226803fcb0b8685855d086b",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.625005209,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.60366636,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "049f4c25cbe665485c3d614bea05b1d371058583a7ea55bc945da84e6bf0482b",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 25,
+      "snr": -19.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.576219108,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.588730006,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "deead5a127c16d69d3932680248aebae86582c2476cd314238249e9af4c3acac",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.557579105,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.580251974,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "50e69dc7d9730c67f48ae05bf18b2cb5253327826d3a4c70a971fd3a708e1f26",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.620847054,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.60867927,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "ca13c3d9fcff7b05d2374dc940ca1307c0b3f456264771272dcbe837fac9fc39",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.586991864,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.586857322,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "248662f18773f50df0c9a78045491a25fab86369ced66a3bb8e3e5fb77f4c2c9",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.554473651,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.568211519,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "0877cb853918eff665cf7d11096fac2823f744d7eebcc9c1622be25c5c49ed80",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.625133076,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.6330915,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "930989a091d3e6e99cc1520e4f0e8d158644890a4588edfa59b84576ca91dcf2",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 25,
+      "snr": -20.5
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.589108235,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 36
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.582904212,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "0519ecb5b5753f83d0392f3488670426c645ded79626a5b64032d7f025ef898e",
+      "dt": 0.32,
+      "rescued": false,
+      "seed": 25,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.55791215,
+          "enabled": false,
+          "messages": []
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 1,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 32
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.567037578,
+          "enabled": true,
+          "messages": []
+        }
+      ],
+      "audio_sha256": "7e847364d0616341f781445d3d1bb8021689be8565c21f527b009dbc5c245226",
+      "dt": 0.4,
+      "rescued": false,
+      "seed": 25,
+      "snr": -21.0
+    },
+    {
+      "arms": [
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 0,
+              "budget_skips": 0,
+              "eligible_targets": 0,
+              "identity_rejections": 0,
+              "searched_rows": 0
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.609001013,
+          "enabled": false,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        },
+        {
+          "diagnostics": {
+            "ap": {
+              "accepted": 0,
+              "attempts": 2,
+              "budget_skips": 0,
+              "eligible_targets": 1,
+              "identity_rejections": 0,
+              "searched_rows": 34
+            },
+            "v2_hits": 0,
+            "v2_inside": 0,
+            "v2_queries": 0,
+            "v2_rejected": 0,
+            "v2_without_prior": 0
+          },
+          "elapsed": 0.585091517,
+          "enabled": true,
+          "messages": [
+            "K1ABC W1AW -12"
+          ]
+        }
+      ],
+      "audio_sha256": "4bd95b83524c72592884da6337cb2c8945f0fb9096b29628f6ec855a7614edba",
+      "dt": 0.48,
+      "rescued": false,
+      "seed": 25,
+      "snr": -21.0
+    }
+  ],
+  "version": 1
+}
