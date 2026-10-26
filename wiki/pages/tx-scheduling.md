@@ -79,6 +79,15 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   keyed pivot reports and its absorbed request drops silently. See
   `docs/DECISIONS/tx-scheduling.md`.
 
+A registered self-CQ opening has no accepted predecessor. The QSO forwarder
+marks it before starting the CQ and consumes that marker on its first
+`MessageToSend`, whether the TX channel accepts it or rejects it. A rejected
+opening sends a durable failed `TransmitComplete` to Autonomous, after its
+registration, so cancellation needs no later TX request to settle the pending
+association and speculative state. An accepted opening leaves completion to
+the worker. Later rejected resends send only the QSO accounting report because
+an accepted predecessor may still own the outcome (PAN-238).
+
 ## Why it is shaped this way
 
 FT8 is deaf while transmitting, so the half-duplex [[parity-rule]] is the
