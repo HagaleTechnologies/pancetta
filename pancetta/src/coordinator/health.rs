@@ -1874,12 +1874,16 @@ mod degraded_summary_tests {
     #[tokio::test]
     async fn audit_maintenance_runs_one_pass_at_a_time() {
         use pancetta_agent::audit::{AuditEvent, AuditKind, AuditLog};
+        use std::sync::Arc;
+        use std::time::Duration;
+
         let path = std::env::temp_dir().join(format!(
             "pancetta-health-audit-maintenance-{}.log",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        let audit = AuditLog::new(&path);
+        // Slow writes must not refill the burst allowance.
+        let audit = AuditLog::with_clock_for_test(&path, Arc::new(|| Duration::ZERO));
         for _ in 0..25 {
             audit
                 .append(&AuditEvent {
