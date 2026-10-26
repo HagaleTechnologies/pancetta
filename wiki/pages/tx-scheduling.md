@@ -98,3 +98,9 @@ phase alone. See `an_advance_rescuing_the_pre_switch_cq_latches_the_callers_freq
 and `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
 `pancetta-qso/src/qso_manager.rs` for the repaired shape.
 
+Caller-admission gotcha (PAN-120): the QSO decode loop and autonomous initiation
+are separate paths. A new direct caller now requires local console presence or
+`autonomous.unattended_policy = "respond_only"`, even with the autonomous toggle
+off. The default is `off` and changes need a restart. Existing exchanges still
+advance without presence; autonomous CQ and pounce still require it. See the
+[normative decision](../../docs/DECISIONS/tx-scheduling.md#direct-caller-presence-policy-pan-120).

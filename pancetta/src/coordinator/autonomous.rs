@@ -198,6 +198,58 @@ mod spot_frequency_tests {
 mod pan6_diagnostic_tests {
     use super::*;
 
+    #[test]
+    fn pan120_presence_diagnostics_name_policy_and_remain_edge_triggered() {
+        for (unattended_policy, direct_reply_text) in [
+            (pancetta_config::UnattendedPolicy::Off, "require presence"),
+            (
+                pancetta_config::UnattendedPolicy::RespondOnly,
+                "may pass the presence gate",
+            ),
+        ] {
+            let mut state = GateDiagState::default();
+            let first = gate_diagnostics_for_slot(
+                &mut state,
+                &plan(0, 0, 2),
+                true,
+                pancetta_core::TxPolicy::Full,
+                false,
+                unattended_policy,
+            );
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].target, "tx.policy");
+            assert_eq!(first[0].level, pancetta_core::DiagnosticLevel::Info);
+            assert_eq!(first[0].text, format!(
+                "No console activity in {}s. Autonomous CQ/pounce suppressed. New direct-call replies {direct_reply_text} (unattended_policy={unattended_policy}). Existing QSOs continue. Press any key to resume initiation.",
+                super::super::OPERATOR_PRESENCE_WINDOW.as_secs(),
+            ));
+            assert!(gate_diagnostics_for_slot(
+                &mut state,
+                &plan(0, 0, 2),
+                true,
+                pancetta_core::TxPolicy::Full,
+                false,
+                unattended_policy,
+            )
+            .is_empty());
+            let resumed = gate_diagnostics_for_slot(
+                &mut state,
+                &SlotPlan::default(),
+                true,
+                pancetta_core::TxPolicy::Full,
+                true,
+                unattended_policy,
+            );
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(
+                resumed[0].text,
+                "Operator present — autonomous initiation resumed"
+            );
+            assert_eq!(resumed[0].target, "tx.policy");
+            assert_eq!(resumed[0].level, pancetta_core::DiagnosticLevel::Info);
+        }
+    }
+
     fn plan(runtime: usize, policy: usize, presence: usize) -> SlotPlan {
         SlotPlan {
             runtime_gate_dropped: runtime,
@@ -216,7 +268,8 @@ mod pan6_diagnostic_tests {
                 &plan(2, 0, 0),
                 false,
                 pancetta_core::TxPolicy::Full,
-                true
+                true,
+                pancetta_config::UnattendedPolicy::Off,
             )
             .len(),
             1
@@ -227,6 +280,7 @@ mod pan6_diagnostic_tests {
             false,
             pancetta_core::TxPolicy::Full,
             true,
+            pancetta_config::UnattendedPolicy::Off,
         )
         .is_empty());
         let resumed = gate_diagnostics_for_slot(
@@ -235,6 +289,7 @@ mod pan6_diagnostic_tests {
             true,
             pancetta_core::TxPolicy::Full,
             true,
+            pancetta_config::UnattendedPolicy::Off,
         );
         assert_eq!(resumed.len(), 1);
         assert!(resumed[0].text.contains("resumed"));
@@ -249,6 +304,7 @@ mod pan6_diagnostic_tests {
             true,
             pancetta_core::TxPolicy::RespondOnly,
             true,
+            pancetta_config::UnattendedPolicy::Off,
         );
         let changed = gate_diagnostics_for_slot(
             &mut state,
@@ -256,6 +312,7 @@ mod pan6_diagnostic_tests {
             true,
             pancetta_core::TxPolicy::Disabled,
             true,
+            pancetta_config::UnattendedPolicy::Off,
         );
         assert_eq!(first.len(), 1);
         assert_eq!(changed.len(), 1);
@@ -271,10 +328,13 @@ mod pan6_diagnostic_tests {
             true,
             pancetta_core::TxPolicy::RespondOnly,
             false,
+            pancetta_config::UnattendedPolicy::Off,
         );
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics.iter().any(|d| d.text.contains("TX policy")));
-        assert!(!diagnostics.iter().any(|d| d.text.contains("presence gate")));
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.text.starts_with("No console activity")));
     }
 
     #[test]
@@ -286,6 +346,7 @@ mod pan6_diagnostic_tests {
             true,
             pancetta_core::TxPolicy::Full,
             true,
+            pancetta_config::UnattendedPolicy::Off,
         )
         .is_empty());
     }
@@ -299,6 +360,7 @@ mod pan6_diagnostic_tests {
             false,
             pancetta_core::TxPolicy::Disabled,
             false,
+            pancetta_config::UnattendedPolicy::Off,
         );
         assert!(diagnostics
             .iter()
@@ -1509,9 +1571,9 @@ pub(crate) fn plan_slot_transmissions(
     // (recent console activity). QSO-in-progress items (qso_id == Some) always
     // flow. The presence gate is the FCC §97.221 control: an unattended station
     // (automatic control) must not ORIGINATE contact on the standard FT8
-    // frequencies; it may only continue/respond. "Present" = the operator did
-    // something at the console within the presence window (see the autonomous
-    // dispatch). Headless / idle → not present → respond-only initiation.
+    // frequencies. "Present" = local console activity within the presence
+    // window. New direct-call replies use a separate admission path governed
+    // by unattended_policy; neither setting relaxes this CQ/pounce gate.
     let initiation_allowed = policy.allows_initiation() && operator_present;
     let mut policy_dropped = 0;
     let mut presence_dropped = 0;
@@ -1591,6 +1653,7 @@ pub(crate) fn gate_diagnostics_for_slot(
     runtime_gate_open: bool,
     policy: pancetta_core::TxPolicy,
     operator_present: bool,
+    unattended_policy: pancetta_config::UnattendedPolicy,
 ) -> Vec<GateDiagnostic> {
     use pancetta_core::DiagnosticLevel as L;
     let mut out = Vec::new();
@@ -1625,7 +1688,18 @@ pub(crate) fn gate_diagnostics_for_slot(
     state.policy_suppressing = policy_now;
     let presence_now = policy.allows_initiation() && !operator_present;
     if presence_now && !state.presence_suppressing {
-        out.push(GateDiagnostic { target: "tx.policy", level: L::Info, text: format!("Operator-presence gate (FCC §97.221) — no console activity in {}s; suppressing autonomous initiation. Press any key to resume", super::OPERATOR_PRESENCE_WINDOW.as_secs()) });
+        let direct_reply_text = match unattended_policy {
+            pancetta_config::UnattendedPolicy::Off => "require presence",
+            pancetta_config::UnattendedPolicy::RespondOnly => "may pass the presence gate",
+        };
+        out.push(GateDiagnostic {
+            target: "tx.policy",
+            level: L::Info,
+            text: format!(
+                "No console activity in {}s. Autonomous CQ/pounce suppressed. New direct-call replies {direct_reply_text} (unattended_policy={unattended_policy}). Existing QSOs continue. Press any key to resume initiation.",
+                super::OPERATOR_PRESENCE_WINDOW.as_secs(),
+            ),
+        });
     } else if !presence_now && state.presence_suppressing {
         out.push(GateDiagnostic {
             target: "tx.policy",
@@ -1736,6 +1810,7 @@ impl super::ApplicationCoordinator {
 
         let config = self.config.read().await;
         let auto_config_enabled = config.autonomous.enabled;
+        let unattended_policy = config.autonomous.unattended_policy;
 
         // hb-161 + 2026-07-29 follow-up: seed the runtime gate. An
         // interactive (TUI) launch always starts CLOSED regardless of
@@ -2829,8 +2904,9 @@ impl super::ApplicationCoordinator {
                             // (CQ-self + pounce) is only allowed when the
                             // operator has interacted with the console within
                             // OPERATOR_PRESENCE_WINDOW. Headless / idle → not
-                            // present → respond-only initiation (the station may
-                            // still continue in-progress QSOs).
+                            // present → no CQ/pounce initiation. Existing QSOs
+                            // continue; new callers follow unattended_policy in
+                            // the QSO component's separate admission path.
                             let operator_present = super::operator_present_now(
                                 &last_operator_input_ms,
                             );
@@ -2857,6 +2933,7 @@ impl super::ApplicationCoordinator {
                             if plan.policy_dropped > 0 {
                                 info!(
                                     target: "tx.policy",
+                                    %unattended_policy,
                                     "TX policy {}: suppressing {} autonomous initiation \
                                      item(s) this cycle (QSO-in-progress items kept)",
                                     policy.label(),
@@ -2866,12 +2943,14 @@ impl super::ApplicationCoordinator {
                             if plan.presence_dropped > 0 {
                                 info!(
                                     target: "tx.policy",
-                                    "Operator-presence gate (FCC §97.221): no console \
-                                     activity in the last {}s — suppressing {} autonomous \
-                                     initiation item(s); responding/in-progress kept. \
+                                    %unattended_policy,
+                                    "Operator-presence gate: no console activity in the last {}s; \
+                                     suppressing {} autonomous CQ/pounce item(s). Existing QSOs continue; \
+                                     new direct-call replies follow unattended_policy={}. \
                                      Press any key at the station to resume initiation.",
                                     super::OPERATOR_PRESENCE_WINDOW.as_secs(),
-                                    plan.presence_dropped
+                                    plan.presence_dropped,
+                                    unattended_policy
                                 );
                             }
 
@@ -2904,6 +2983,7 @@ impl super::ApplicationCoordinator {
                                     runtime_gate_open,
                                     policy,
                                     operator_present,
+                                    unattended_policy,
                                 )
                             {
                                 crate::coordinator::tx::emit_diagnostic_full(
@@ -4355,6 +4435,24 @@ mod plan_slot_transmissions_tests {
     }
 
     // --- operator-presence gate (FCC §97.221) ----------------------------
+
+    #[test]
+    fn pan120_absent_operator_drops_self_cq_and_pounce_keeps_continuation() {
+        let items = vec![
+            opening("CQ K5ARH EM10", 1200.0),
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("W1AW K5ARH R-12", "q7"),
+        ];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], false, None);
+        assert!(plan.qso_starts.is_empty());
+        assert!(plan.dry_run_openings.is_empty());
+        assert_eq!(plan.presence_dropped, 2);
+        assert_eq!(plan.policy_dropped, 0);
+        assert_eq!(plan.runtime_gate_dropped, 0);
+        assert_eq!(plan.tx_items.len(), 1);
+        assert_eq!(plan.tx_items[0].0.qso_id.as_deref(), Some("q7"));
+        assert_eq!(plan.tx_items[0].0.message_text, "W1AW K5ARH R-12");
+    }
 
     #[test]
     fn absent_operator_suppresses_initiation_keeps_in_progress() {
@@ -6989,6 +7087,91 @@ mod fq_f9_placement_feed_when_disabled_tests {
             out.push(m);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn pan120_both_unattended_policies_keep_autonomous_openings_presence_gated() {
+        for unattended_policy in [
+            pancetta_config::UnattendedPolicy::Off,
+            pancetta_config::UnattendedPolicy::RespondOnly,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let mut coordinator = build_coordinator(true, true).await;
+            coordinator.pancetta_home_override = Some(home.path().to_path_buf());
+            coordinator.replay_path = Some(home.path().join("capture"));
+            {
+                let mut config = coordinator.config.write().await;
+                config.autonomous.unattended_policy = unattended_policy;
+                config.autonomous.cq_after_idle_cycles = 1;
+                config.autonomous.min_dx_score = 0.0;
+            }
+            assert_eq!(
+                coordinator.last_operator_input_ms.load(Ordering::Relaxed),
+                0
+            );
+            let (_, tui_rx) = coordinator
+                .message_bus
+                .create_channel(ComponentId::Tui)
+                .await
+                .unwrap();
+            let (_, qso_rx) = coordinator
+                .message_bus
+                .create_channel(ComponentId::Qso)
+                .await
+                .unwrap();
+            let (_, ft8_rx) = coordinator
+                .message_bus
+                .create_channel(ComponentId::Ft8Transmitter)
+                .await
+                .unwrap();
+            coordinator.start_autonomous_component().await.unwrap();
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Decoder,
+                    ComponentId::Autonomous,
+                    MessageType::DecodedMessage(cq_decoded_message()),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+
+            // A presence diagnostic proves the first slot reached the gate.
+            // The next slot's status is a barrier: all dispatch work from the
+            // previous slot has finished before this observation.
+            tokio::time::timeout(Duration::from_secs(40), async {
+                let mut saw_presence_diagnostic = false;
+                loop {
+                    while let Ok(message) = tui_rx.try_recv() {
+                        match message.message_type {
+                            MessageType::DiagnosticEvent {
+                                target: "tx.policy",
+                                text,
+                                ..
+                            } if text.starts_with("No console activity") => {
+                                assert!(text
+                                    .contains(&format!("unattended_policy={unattended_policy}")));
+                                saw_presence_diagnostic = true;
+                            }
+                            MessageType::AutonomousStatus(_) if saw_presence_diagnostic => return,
+                            _ => {}
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("two autonomous slot ticks must complete");
+            assert!(
+                drain(&qso_rx).is_empty(),
+                "{unattended_policy}: no autonomous opening reaches Qso"
+            );
+            assert!(
+                drain(&ft8_rx).is_empty(),
+                "{unattended_policy}: no autonomous frame reaches TX"
+            );
+            coordinator.shutdown_signal.store(true, Ordering::Release);
+        }
     }
 
     /// PAN-185: the Autonomous loop reads through its durable inbox, so a
