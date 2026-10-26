@@ -578,7 +578,33 @@ mode-scaled base coalesce window minus the safety margin, mirrored as
 `keep_call_acceptance_cap_ms` — else the first own slot strictly after —
 a PR-review follow-up; attributing an in-window emission to the next own
 slot instead split one real TX opportunity across two ledger keys and both
-incremented, firing the switch one transmission early); when a
+incremented, firing the switch one transmission early). That rule is only a
+prediction (PAN-223): the worker decides from the instant it dequeues the
+request, so an emission inside own slot S's cap that reaches the worker after
+the cap (or waits in its queue) airs in S's successor, the slot the next
+off-parity rearm also books, and one TX opportunity counted twice. The worker
+now reports `QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot }`
+durably once each frame's `TxSchedule` is final (after the defer-time liveness
+drop, before Step 4's PTT wait, for every single request, bundle item and
+re-key pass), and `QsoManager::record_scheduled_tx_slot` re-keys that attempt
+to the worker's `target_slot`. A re-key moves or removes a count and never adds
+one: an uncounted attempt stays uncounted, a counted one hands its old slot's
+count to a surviving same-slot sibling (the heir rule below), or, when another
+attempt already counts the worker's slot, its count is the duplicate and is
+released exactly as a no-heir rollback releases one (decrement, revoke, hold
+re-point; one shared helper), else the count moves with it. A held stall
+trigger follows its attempt, so a frame that aired before the worker's slot
+cannot release it. Reports converge in either order relative to the
+successor's rearm. Rejected alternative: counting only on worker reports,
+which would move the threshold check, action raising and PAN-182 trigger
+arming out of the rearm. Known residual: an attempt the worker coalesces away
+(newest-wins, PAN-75) is never scheduled and keeps its prediction; that needs
+the worker blocked over a slot on another QSO's frame, so only
+`max_concurrent_qsos > 1` (default 1) can reach it — follow-up "Absorbed
+keep-call attempts should take their surviving request's scheduled slot".
+Pivoted-in attempts and in-flight duplicate drops also keep their prediction,
+which can only name the same slot as, or a later slot than, the frame that
+carried them, so they never fire the switch early. When a
 payload-scoped rollback removes the
 attempt holding a slot's count while a same-slot sibling survives, the
 count is handed to that sibling instead of being decremented (the slot still

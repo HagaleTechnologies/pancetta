@@ -158,6 +158,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The stall detector behind adaptive TX-offset switching could count one
+  transmission twice when a keep-call re-send reached the TX worker just
+  after the current slot's acceptance window, and so fire the TX-offset
+  switch one unanswered transmission early. It now records the slot the TX
+  worker actually scheduled each frame into, not the slot predicted when the
+  re-send was emitted (PAN-223).
+
 - An autonomous CQ whose opening transmission is rejected by a full TX
   queue now clears its pending association and restores its speculative
   offset and unanswered-CQ count, even if the CQ stops before another
