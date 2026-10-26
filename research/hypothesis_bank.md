@@ -6854,7 +6854,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied.]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: tooling built, verdict pending.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6894,6 +6894,20 @@ search to in-repo sources.
     UPDATE 2026-09-16: neither re-open path (the per-day impulsiveness
     metric or a storm-season on-air A/B) has been built. Reopen tracked as
     PAN-162.
+
+    UPDATE 2026-10-25 (PAN-162): re-open path (a) is built. A per-slot
+    impulsiveness instrument (`pancetta-research/src/impulsiveness.rs`:
+    fraction of 160 ms blocks above 3× a 25-block in-slot local median) and
+    the `impulse-survey` binary rank capture days and emit a storm-day
+    manifest. The batch101 plant is now `noise::ImpulseBurstPlant`
+    (byte-identical), with STORM (p=0.05) and SEVERE (p=0.10) variants, and
+    `batch104_impulse_llr_storm_remeasure` implements the pre-registered
+    re-measure (storm decision plant, paired threshold bootstrap, off-air
+    do-no-harm on the 60 vendored ft8_lib WAVs). eval gained
+    `--impulse-robust-llr <K>`. The synthetic storm shards (29,400 decodes)
+    did not fit the implement run and have not been run, so there is no
+    verdict yet and the default stays off. Details and commands:
+    `research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 

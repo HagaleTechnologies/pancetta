@@ -1468,6 +1468,10 @@ pub struct Ft8Config {
     /// `Some(k)` = attenuation knee in units of median symbol power
     /// (k=3 aggressive, k=6 conservative). Applied after LLR whitening
     /// and before variance normalisation on every demapper output path.
+    /// PAN-162 built the storm re-measure tooling (impulsiveness survey,
+    /// stormier synthetic plant, off-air do-no-harm check); its verdict is
+    /// pending, so the knee stays off by default
+    /// (`research/experiments/2026-10-25-pan162-impulse-llr-storm.md`).
     pub impulse_robust_llr: Option<f64>,
 
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
