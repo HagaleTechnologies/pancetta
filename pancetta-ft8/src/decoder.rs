@@ -1420,6 +1420,13 @@ pub struct Ft8Config {
     /// **`DualMax`** — byte-identical to the legacy path.
     pub llr_metric: LlrMetric,
 
+    /// Retry a failed DualMax FT8 AP0 candidate once with the Bessel metric.
+    /// A standard success skips the retry. The retry bypasses the soft combiner.
+    /// Disabled by default; inert for other protocols or a Bessel primary metric.
+    /// An expired decode budget skips this optional work.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bessel_fallback_enabled: bool,
+
     /// Per-iteration EM re-estimation of the
     /// block-constant (Es, N0) channel parameters inside the
     /// BICM-ID rescue loop (Cheng, Valenti & Torrieri, "Turbo-NFSK:
@@ -2255,6 +2262,7 @@ impl Default for Ft8Config {
             // hb-253 (Batch 99): dual-max is the historical default;
             // Bessel is the probe-gated exact noncoherent metric.
             llr_metric: LlrMetric::DualMax,
+            bessel_fallback_enabled: false,
             // hb-259 (Batch 100): EM (Es, N0) re-estimation inside the
             // BICM-ID rescue. Default false — byte-identical legacy
             // path; the Batch 99 static estimator is used throughout.
@@ -4099,6 +4107,7 @@ impl Ft8Decoder {
                 // hb-253 (Batch 99) demapper metric. DualMax (default)
                 // keeps the parallel paths byte-identical to legacy.
                 llr_metric: self.config.llr_metric,
+                bessel_fallback_enabled: self.config.bessel_fallback_enabled,
                 // hb-259 (Batch 100) EM channel re-estimation inside
                 // the BICM-ID rescue. false (default) = static
                 // Batch 99 estimator throughout, byte-identical.
@@ -4252,28 +4261,20 @@ impl Ft8Decoder {
                     } else {
                         &*ldpc_high
                     };
-                    // First try standard AP0 decode
-                    if let Some(msg) = par_decode_candidate(
+                    decode_candidate_with_bessel_fallback(
                         &ctx,
                         candidate,
-                        ldpc,
-                        deep_decoder.as_ref(),
-                        fft_buffer,
-                    ) {
-                        return Some(msg);
-                    }
-                    // AP0 failed — try AP-enhanced decoding if AP is active
-                    if !ctx.ap_active {
-                        return None;
-                    }
-                    // Only attempt AP decoding on candidates with reasonable sync quality.
-                    // Sync scores below 4.0 are likely noise — AP injection on noise produces
-                    // false decodes by forcing the user's callsign into random bit patterns.
-                    const MIN_SYNC_SCORE_FOR_AP: f64 = 3.0;
-                    if candidate.sync_score < MIN_SYNC_SCORE_FOR_AP {
-                        return None;
-                    }
-                    par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
+                        |attempt_ctx| {
+                            par_decode_candidate(
+                                attempt_ctx,
+                                candidate,
+                                ldpc,
+                                deep_decoder.as_ref(),
+                                fft_buffer,
+                            )
+                        },
+                        || par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass),
+                    )
                 };
 
             // Decoder-speed-overhaul Task 9: floor/budgeted candidate
@@ -10011,6 +10012,7 @@ impl Ft8Decoder {
 /// Captures all the state from `Ft8Decoder` that candidate decoding reads
 /// but never writes. Each rayon worker gets a shared `&DecodeContext` plus
 /// its own thread-local `LdpcDecoder` and FFT buffers.
+#[derive(Clone, Copy)]
 struct DecodeContext<'a> {
     protocol_params: &'a ProtocolParams,
     message_parser: &'a MessageParser,
@@ -10107,6 +10109,8 @@ struct DecodeContext<'a> {
     /// `DualMax` (default) is byte-identical to the legacy path. See
     /// `Ft8Config::llr_metric`.
     llr_metric: LlrMetric,
+    /// Optional failed-candidate Bessel AP0 retry. See `Ft8Config`.
+    bessel_fallback_enabled: bool,
     /// Per-iteration EM (Es, N0) re-estimation
     /// inside the BICM-ID rescue (Bessel metric path only). See
     /// `Ft8Config::bicm_id_em_reestimation`.
@@ -10509,6 +10513,42 @@ fn escalation_instrument(parity_errors: usize, ok: bool) {
     if let Some(file) = sink {
         let mut guard = file.lock().expect("escalation instrument mutex poisoned");
         let _ = writeln!(guard, "{parity_errors} {}", if ok { "ok" } else { "fail" });
+    }
+}
+
+/// Try the existing AP0 path first, then one candidate-local Bessel AP0 retry.
+/// The AP closure retains its original ordering and eligibility gates.
+fn decode_candidate_with_bessel_fallback<T>(
+    ctx: &DecodeContext,
+    candidate: &CostasCandidate,
+    mut ap0: impl FnMut(&DecodeContext) -> Option<T>,
+    ap: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    if let Some(result) = ap0(ctx) {
+        return Some(result);
+    }
+    if ctx.bessel_fallback_enabled
+        && ctx.llr_metric == LlrMetric::DualMax
+        && ctx.protocol_params.protocol == crate::Protocol::Ft8
+        && ctx.budget.has_time()
+    {
+        // The second pass must see fresh, single-reception LLRs. In
+        // particular it cannot accumulate the same audio a second time or
+        // evict a primary-pass bucket after a CRC success.
+        let retry_ctx = DecodeContext {
+            llr_metric: LlrMetric::Bessel,
+            soft_combiner: None,
+            ..*ctx
+        };
+        if let Some(result) = ap0(&retry_ctx) {
+            return Some(result);
+        }
+    }
+    // The pre-existing AP path only admits candidates with sufficient sync.
+    if ctx.ap_active && candidate.sync_score >= 3.0 {
+        ap()
+    } else {
+        None
     }
 }
 
@@ -26415,6 +26455,226 @@ mod impulse_robust_llr_tests {
     }
 }
 
+#[cfg(test)]
+mod bessel_fallback_tests {
+    use super::*;
+    #[cfg(feature = "transmit")]
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    #[cfg(feature = "transmit")]
+    fn rescue_samples() -> Vec<f32> {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message("CQ K1ABC FN42", None).unwrap();
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        let mut samples = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+        samples.resize(WINDOW_SAMPLES, 0.0);
+        let power = samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32;
+        let sigma = (power / 10.0f32.powf(-20.0 / 10.0) * 6000.0 / 2500.0).sqrt();
+        let mut rng = StdRng::seed_from_u64(194_445_316);
+        for pair in samples.chunks_mut(2) {
+            let u1 = rng.random_range(f32::EPSILON..1.0);
+            let u2 = rng.random_range(0.0..1.0);
+            let mag = (-2.0 * u1.ln()).sqrt() * sigma;
+            let angle = 2.0 * std::f32::consts::PI * u2;
+            pair[0] += mag * angle.cos();
+            if pair.len() == 2 { pair[1] += mag * angle.sin(); }
+        }
+        samples
+    }
+
+    #[cfg(feature = "transmit")]
+    fn with_context(run: impl FnOnce(DecodeContext<'_>, CostasCandidate)) {
+        let decoder = Ft8Decoder::new(Ft8Config {
+            bessel_fallback_enabled: true,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+        let (audio, spectrogram, candidate) =
+            super::w2_5_acceptance_gating_tests::build_low_sync_real_signal(&decoder);
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
+            &decoder,
+            &spectrogram,
+            &audio,
+            &ap_context,
+        );
+        run(ctx, candidate);
+    }
+
+    #[test]
+    fn default_is_off() {
+        assert!(!Ft8Config::default().bessel_fallback_enabled);
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn first_success_skips_bessel_and_ap() {
+        with_context(|ctx, candidate| {
+            let mut metrics = Vec::new();
+            let mut ap_calls = 0;
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx,
+                &candidate,
+                |attempt| {
+                    metrics.push(attempt.llr_metric);
+                    Some(11)
+                },
+                || {
+                    ap_calls += 1;
+                    Some(33)
+                },
+            );
+            assert_eq!(result, Some(11));
+            assert_eq!(metrics, [LlrMetric::DualMax]);
+            assert_eq!(ap_calls, 0);
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn retry_uses_same_candidate_and_local_metric_then_short_circuits_ap() {
+        with_context(|ctx, candidate| {
+            let mut attempts = Vec::new();
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx,
+                &candidate,
+                |attempt| {
+                    attempts.push((attempt.llr_metric, attempt.soft_combiner.is_some()));
+                    (attempt.llr_metric == LlrMetric::Bessel).then_some(candidate.freq_bin)
+                },
+                || panic!("retry success must skip AP"),
+            );
+            assert_eq!(result, Some(candidate.freq_bin));
+            assert_eq!(
+                attempts,
+                [(LlrMetric::DualMax, false), (LlrMetric::Bessel, false)]
+            );
+            assert_eq!(ctx.llr_metric, LlrMetric::DualMax);
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn two_failures_reach_only_eligible_ap() {
+        with_context(|mut ctx, candidate| {
+            for (ap_active, score, expected_ap_calls) in
+                [(true, 4.0, 1), (false, 4.0, 0), (true, 2.9, 0)]
+            {
+                ctx.ap_active = ap_active;
+                let candidate = CostasCandidate {
+                    sync_score: score,
+                    ..candidate
+                };
+                let mut metrics = Vec::new();
+                let mut ap_calls = 0;
+                let result = decode_candidate_with_bessel_fallback(
+                    &ctx,
+                    &candidate,
+                    |attempt| {
+                        metrics.push(attempt.llr_metric);
+                        None::<u8>
+                    },
+                    || {
+                        ap_calls += 1;
+                        Some(7)
+                    },
+                );
+                assert_eq!(metrics, [LlrMetric::DualMax, LlrMetric::Bessel]);
+                assert_eq!(ap_calls, expected_ap_calls);
+                assert_eq!(result, (expected_ap_calls == 1).then_some(7));
+            }
+        });
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn ineligible_or_expired_context_never_retries() {
+        with_context(|ctx, candidate| {
+            let ft4 = ProtocolParams::ft4();
+            #[cfg(feature = "ft2")]
+            let ft2 = ProtocolParams::ft2();
+            let mut cases = vec![
+                DecodeContext { bessel_fallback_enabled: false, ..ctx },
+                DecodeContext { llr_metric: LlrMetric::Bessel, ..ctx },
+                DecodeContext { protocol_params: &ft4, ..ctx },
+                DecodeContext { budget: DecodeBudget::until(Instant::now()), ..ctx },
+            ];
+            #[cfg(feature = "ft2")]
+            cases.push(DecodeContext { protocol_params: &ft2, ..ctx });
+            for case in cases {
+                let mut metrics = Vec::new();
+                let result = decode_candidate_with_bessel_fallback(
+                    &case,
+                    &candidate,
+                    |attempt| {
+                        metrics.push(attempt.llr_metric);
+                        None::<u8>
+                    },
+                    || panic!("AP is disabled"),
+                );
+                assert_eq!(result, None);
+                assert_eq!(metrics, [case.llr_metric]);
+            }
+        });
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_roundtrip_and_old_config_default() {
+        for enabled in [false, true] {
+            let config = Ft8Config { bessel_fallback_enabled: enabled, ..Ft8Config::default() };
+            let value = serde_json::to_value(&config).expect("serialize");
+            assert_eq!(value["bessel_fallback_enabled"], enabled);
+            let parsed: Ft8Config = serde_json::from_value(value.clone()).expect("roundtrip");
+            assert_eq!(parsed.bessel_fallback_enabled, enabled);
+            let mut old = value;
+            old.as_object_mut().unwrap().remove("bessel_fallback_enabled");
+            let parsed: Ft8Config = serde_json::from_value(old).expect("old config");
+            assert!(!parsed.bessel_fallback_enabled);
+        }
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn real_candidate_fails_dual_max_and_recovers_on_bessel_retry() {
+        let decoder = Ft8Decoder::new(Ft8Config {
+            bessel_fallback_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        }).unwrap();
+        let audio = decoder.preprocess_audio(&rescue_samples()).unwrap();
+        let spectrogram = decoder.compute_spectrogram(&audio).unwrap();
+        let candidates = decoder.costas_sync_search_with_threshold(
+            &spectrogram, decoder.config.min_sync_score, None
+        ).unwrap();
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = super::w2_5_acceptance_gating_tests::build_ctx(
+            &decoder, &spectrogram, &audio, &ap_context
+        );
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let mut found = false;
+        for candidate in &candidates {
+            let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+            let mut metrics = Vec::new();
+            let result = decode_candidate_with_bessel_fallback(
+                &ctx, candidate,
+                |attempt| {
+                    metrics.push(attempt.llr_metric);
+                    par_decode_candidate(attempt, candidate, &decoder.ldpc_decoder, None, &mut fft_buffer)
+                },
+                || panic!("AP disabled"),
+            );
+            if result.as_ref().is_some_and(|msg| msg.text == "CQ K1ABC FN42") {
+                assert_eq!(metrics, [LlrMetric::DualMax, LlrMetric::Bessel]);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the frozen waveform must have a candidate rescued by Bessel AP0");
+    }
+}
+
 // ===========================================================================
 // Task W2.5 [A/B]: replace the blunt post-CRC confidence floors with the
 // W2.1 acceptance metric for decodes that cleanly pass it.
@@ -26440,7 +26700,7 @@ mod w2_5_acceptance_gating_tests {
     /// exactly the scenario the acceptance-gating design targets, not a
     /// toy construction.
     #[cfg(feature = "transmit")]
-    fn build_low_sync_real_signal(
+    pub(super) fn build_low_sync_real_signal(
         decoder: &Ft8Decoder,
     ) -> (Vec<f64>, Spectrogram, CostasCandidate) {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26490,7 +26750,7 @@ mod w2_5_acceptance_gating_tests {
     /// field-for-field (see the `let ctx = DecodeContext { ... }` site
     /// earlier in this file).
     #[cfg(feature = "transmit")]
-    fn build_ctx<'a>(
+    pub(super) fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
         spectrogram: &'a Spectrogram,
         audio: &'a [f64],
@@ -26538,6 +26798,7 @@ mod w2_5_acceptance_gating_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,
@@ -26826,6 +27087,7 @@ mod w26_ap_coverage_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,
@@ -27245,6 +27507,7 @@ mod ap5_hot_path_rescue_tests {
             bicm_id_iterations: decoder.config.bicm_id_iterations,
             bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
             llr_metric: decoder.config.llr_metric,
+            bessel_fallback_enabled: decoder.config.bessel_fallback_enabled,
             bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
             impulse_robust_llr: decoder.config.impulse_robust_llr,
             escalation_enabled: decoder.config.escalation_enabled,

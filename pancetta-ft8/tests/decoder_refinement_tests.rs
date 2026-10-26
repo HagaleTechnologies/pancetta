@@ -7,6 +7,57 @@
 use pancetta_ft8::{Ft8Config, Ft8Decoder, SAMPLE_RATE, WINDOW_SAMPLES};
 
 #[cfg(feature = "transmit")]
+mod bessel_fallback_fixture {
+    use super::*;
+    use pancetta_ft8::{Ft8Encoder, Ft8Modulator, LlrMetric};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    const MESSAGE: &str = "CQ K1ABC FN42";
+
+    fn signal(seed: u64, snr_db: f32) -> Vec<f32> {
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(MESSAGE, None).unwrap();
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        let mut clean = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+        clean.resize(WINDOW_SAMPLES, 0.0);
+        let power = clean.iter().map(|v| v * v).sum::<f32>() / clean.len() as f32;
+        // SNR is referenced to 2500 Hz, as in Batch 99's synthetic sweep.
+        let sigma = (power / 10.0f32.powf(snr_db / 10.0) * 6000.0 / 2500.0).sqrt();
+        let mut rng = StdRng::seed_from_u64(seed);
+        for pair in clean.chunks_mut(2) {
+            let u1 = rng.random_range(f32::EPSILON..1.0);
+            let u2 = rng.random_range(0.0..1.0);
+            let mag = (-2.0 * u1.ln()).sqrt() * sigma;
+            let angle = 2.0 * std::f32::consts::PI * u2;
+            pair[0] += mag * angle.cos();
+            if pair.len() == 2 { pair[1] += mag * angle.sin(); }
+        }
+        clean
+    }
+
+    fn finds(samples: &[f32], config: Ft8Config) -> bool {
+        Ft8Decoder::new(config).unwrap().decode_window(samples).unwrap().iter().any(|m| m.text == MESSAGE)
+    }
+
+    #[test]
+    fn failed_dual_max_candidate_is_recovered_by_bessel_fallback() {
+        // Seed 194445316 at -20 dB, 2500 Hz reference SNR, 0 Hz/0 s
+        // offsets. Discovered with a bounded paired sweep, then frozen.
+        let samples = signal(194_445_316, -20.0);
+        let default = Ft8Config { max_decode_passes: 1, ..Ft8Config::default() };
+        assert!(!finds(&samples, default.clone()), "DualMax must miss this encoded message");
+        assert!(finds(&samples, Ft8Config {
+            llr_metric: LlrMetric::Bessel,
+            ..default.clone()
+        }), "the existing Bessel metric must recover the encoded message");
+        assert!(finds(&samples, Ft8Config {
+            bessel_fallback_enabled: true,
+            ..default
+        }), "fallback must recover the same encoded message in one pass");
+    }
+}
+
+#[cfg(feature = "transmit")]
 mod refinement {
     use super::*;
 

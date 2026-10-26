@@ -85,6 +85,8 @@ struct Args {
     /// knee (`--impulse-robust-llr <K>`; finite and > 0). `None` leaves
     /// the library default (off). See `Ft8Config::impulse_robust_llr`.
     impulse_robust_llr: Option<f64>,
+    bessel_fallback_enabled: Option<bool>,
+
     /// Decoder-TP-sensitivity Task W3.4 [A/B]: nsym=2/3 noncoherent
     /// combining LLR variants layered on top of the W3.3 matched-demod
     /// stage (only takes effect when `fine_sync_enabled` is ALSO
@@ -357,6 +359,8 @@ impl Args {
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut fine_sync_enabled: Option<bool> = None;
         let mut impulse_robust_llr: Option<f64> = None;
+        let mut bessel_fallback_enabled: Option<bool> = None;
+
         let mut nsym_combining_enabled: Option<bool> = None;
         let mut per_candidate_freq_tracker_enabled: Option<bool> = None;
         let mut time_varying_subtraction_enabled: Option<bool> = None;
@@ -606,6 +610,9 @@ impl Args {
                 }
                 "--fine-fft-rect-window" => {
                     fine_fft_rect_window = Some(true);
+                }
+                "--bessel-fallback-enabled" => {
+                    bessel_fallback_enabled = Some(true);
                 }
                 "--fine-sync-enabled" => {
                     fine_sync_enabled = Some(true);
@@ -1027,6 +1034,7 @@ impl Args {
                     eprintln!("  --costas-half-loop-disabled: F5 [A/B] — evaluate only half=0 in the Costas sync kernel's half-symbol inner loop instead of max(half=0, half=1) (default off)");
                     eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
+                    eprintln!("  --bessel-fallback-enabled: PAN-155 [A/B] — retry failed DualMax FT8 AP0 candidates once with Bessel; skip after success or budget expiry. Default off.");
                     eprintln!("  --fine-sync-enabled: decoder-TP-sensitivity Task W3.3 [A/B] — per-candidate fine-sync + matched-demod stage replacing the legacy 21-trial fine-FFT fallback (default off). See Ft8Config::fine_sync_enabled.");
                     eprintln!("  --impulse-robust-llr K: hb-256 / PAN-162 [A/B] — impulse-robust per-symbol LLR weighting with knee K (finite, > 0; e.g. 6). Default off. See Ft8Config::impulse_robust_llr.");
                     eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
@@ -1150,6 +1158,8 @@ impl Args {
             fine_fft_rect_window,
             fine_sync_enabled,
             impulse_robust_llr,
+            bessel_fallback_enabled,
+
             nsym_combining_enabled,
             per_candidate_freq_tracker_enabled,
             time_varying_subtraction_enabled,
@@ -2569,6 +2579,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     if let Some(on) = args.fine_fft_rect_window {
         d = d.with_fine_fft_rect_window(on);
     }
+    if let Some(on) = args.bessel_fallback_enabled {
+        d = d.with_bessel_fallback_enabled(on);
+    }
     if let Some(on) = args.fine_sync_enabled {
         d = d.with_fine_sync_enabled(on);
     }
@@ -3350,6 +3363,17 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod arg_tests {
     use super::*;
+
+    #[test]
+    fn bessel_fallback_flag_is_optional_and_enables_variant() {
+        assert_eq!(parse(&[]).unwrap().bessel_fallback_enabled, None);
+        assert_eq!(
+            parse(&["--bessel-fallback-enabled"])
+                .unwrap()
+                .bessel_fallback_enabled,
+            Some(true)
+        );
+    }
 
     fn parse(extra: &[&str]) -> anyhow::Result<Args> {
         let base = [
