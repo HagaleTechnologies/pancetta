@@ -38,7 +38,9 @@ cited, not restated. Spec:
   dispatches control frames (Arm/Heartbeat/Disarm/Qsy/TxRequest). Remote TX
   requests carry `TxOrigin::Remote` and are arm-gated end to end.
 - **Armed-TX gate** — `ArmState::tx_permitted` (`pancetta-agent/src/arm.rs`) is
-  a pure AND of armed ∧ scope ∧ TTL ∧ heartbeat-fresh ∧ consent ∧ ¬kill; the
+  a pure AND of armed, scope, all authority deadlines, fresh heartbeat, channel consent
+  and no local kill. The earliest of the arm window, its capability expiry and TX enablement
+  ends authority at equality. The
   coordinator gate [[fail-closed-arm-gate]] fails CLOSED and ANDs under
   `TxPolicy`.
 - **Gotcha: a remote QSO's identity outlives its controller (PAN-137).**
@@ -84,3 +86,18 @@ re-check queued behind it. TX-worker interrupts release PTT before the audit
 write. Audit failure is a readiness warning only, never a TX mute cause, and a
 valid arm proceeds. The normative text is in
 `docs/DECISIONS/remote-operation.md` (PAN-104) and `docs/CONFIG.md`.
+
+## Arm authority deadlines (PAN-105)
+
+The verified grant retains all three signed horizons and an effective elapsed cap. Every
+permission read, heartbeat and sweep checks them. Earliest-source reasons are
+`capability-expired`, `tx-enablement-expired`, and `ttl-expired`; ties use that order.
+Real enabled tokens require capability expiry to equal enablement, so capability wins.
+A new hello token does not change the original arm's horizon. Expiry is terminal and
+recovery needs a fresh signed arm. Grant expiry preserves controller ownership and the
+Noise peer; separate hello expiry still follows its own eviction rules.
+
+Single and summed-bundle playback rechecks the same gate about every 50 ms. Denial releases
+PTT before confirmed audio flush and reports failure after acknowledgment, independently of
+audit or notification delivery. Device and transport scheduling add latency. Test clocks must
+share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.

@@ -85,9 +85,14 @@ control (no relay `seq`, per our concurrence). This layer is schema-independent 
     on heartbeat/idle timeout or channel loss → **auto-disarm (fail TX-off)**. §97.109(c).
     The client sends heartbeats at its signed `heartbeatIntervalSec` cadence (5–15 s); the station
     disarms after 30 s without an accepted one, measured on the monotonic clock, and also at the
-    signed `armedUntil` (wall clock). Expiry is final: a heartbeat at or after the deadline cannot
+    earliest of `armedUntil`, the arm capability's `exp`, and `txEnabledUntil` on the wall clock.
+    The verified remaining lifetime also caps monotonic and suspend-aware elapsed authority.
+    Ties prefer capability, then enablement, then arm, with reasons `capability-expired`,
+    `tx-enablement-expired`, and `ttl-expired`. Expiry is final: a heartbeat at or after the deadline cannot
     revive the arm, even on the same session, and the station loop sweeps for expiry on its own.
-    Only a fresh signed arm restores TX.
+    Only a fresh signed arm restores TX. Refreshing hello authority does not extend the arm.
+    Already keyed remote playback rechecks the same gate about every 50 ms, releases PTT,
+    then confirms audio flush before reporting failure. Device and transport delays still apply.
   - (b) **No unattended remote origination:** the remote path exposes *human-driven* TX only; autonomous CQ
     origination is never remotely armable. §97.221.
   - (c) **Operator-callsign attribution + append-only audit log:** record who armed TX and what was sent.

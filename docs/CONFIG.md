@@ -842,7 +842,15 @@ moment longer before reloading.
   remote transmission: queued remote frames are dropped and audited
   `not-armed`, and a transmission in progress stops within ~50 ms (PTT
   off). The arm record itself is kept; re-enabling consent re-allows an
-  existing arm within its TTL and heartbeat. To kill a client's arm,
+  existing arm only while its arm window, authorizing capability expiry,
+  TX enablement horizon and heartbeat limit all remain valid. At the earliest
+  authority deadline TX is denied, even at equality. Expiry consumes the arm;
+  re-enabling consent or refreshing hello authority cannot revive it.
+  Capability wins tied deadlines, then enablement, then arm, with audit reasons
+  `capability-expired`, `tx-enablement-expired`, and `ttl-expired`.
+  Already keyed remote playback releases PTT before confirmed audio flush;
+  the roughly 50 ms permission poll also depends on device and transport latency.
+  To kill a client's arm,
   remove it from `tx_allow_list` (below) or disarm from the TUI.
 - `[network.wsjtx_udp].enabled` / `allow_tx_initiation` — the WSJT-X UDP
   channel's own consent bit (`enabled && allow_tx_initiation`), same
