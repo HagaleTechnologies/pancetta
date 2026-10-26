@@ -55,6 +55,52 @@ mod bessel_fallback_fixture {
             ..default
         }), "fallback must recover the same encoded message in one pass");
     }
+
+    #[test]
+    fn unrelated_candidate_keeps_accepted_fields_when_another_retries() {
+        let mut samples = signal(194_445_316, -20.0);
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message("CQ W9XYZ EN50", None).unwrap();
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        // The clean second station is 250 Hz away and twice the reference
+        // amplitude. Both signals share the same noisy 15-second window.
+        let clean = modulator.modulate_symbols(&symbols, 250.0).unwrap();
+        for (sample, added) in samples.iter_mut().zip(clean) {
+            *sample += added * 2.0;
+        }
+        let config = Ft8Config { max_decode_passes: 1, ..Ft8Config::default() };
+        let decode = |config| Ft8Decoder::new(config).unwrap().decode_window(&samples).unwrap();
+        let baseline = decode(config.clone());
+        let variant = decode(Ft8Config { bessel_fallback_enabled: true, ..config });
+        let fields = |messages: &[pancetta_ft8::DecodedMessage]| {
+            let message = messages.iter().find(|m| m.text == "CQ W9XYZ EN50")
+                .expect("clean second candidate decodes");
+            (message.text.clone(), message.tone_symbols.clone(), message.frequency_offset,
+             message.time_offset, message.confidence, message.ap_level)
+        };
+        assert_eq!(fields(&baseline), fields(&variant));
+        assert!(variant.iter().any(|m| m.text == MESSAGE), "weak candidate must be rescued");
+        assert!(!baseline.iter().any(|m| m.text == MESSAGE), "the weak candidate must miss without retry");
+    }
+
+    #[test]
+    fn global_bessel_and_disabled_fallback_keep_their_existing_results() {
+        let samples = signal(194_445_316, -20.0);
+        let mut default = Ft8Config::default();
+        default.max_decode_passes = 1;
+        let decode = |config| Ft8Decoder::new(config).unwrap().decode_window(&samples).unwrap();
+        let keys = |messages: Vec<pancetta_ft8::DecodedMessage>| {
+            messages.into_iter().map(|m| (m.text, m.frequency_offset, m.time_offset, m.confidence))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(decode(default.clone())), keys(decode(Ft8Config {
+            bessel_fallback_enabled: false, ..default.clone()
+        })));
+        let global = Ft8Config { llr_metric: LlrMetric::Bessel, ..default };
+        assert_eq!(keys(decode(global.clone())), keys(decode(Ft8Config {
+            bessel_fallback_enabled: true, ..global
+        })));
+    }
 }
 
 #[cfg(feature = "transmit")]
