@@ -145,8 +145,11 @@ pub struct AuthorizationEdge {
     #[serde(rename = "clientKeyId")]
     pub client_key_id: String,
     pub scopes: Vec<String>,
+    /// Unix epoch seconds. dispensa Q-0076 (2026-10-25): the contract typed
+    /// this as a string, but cqdx has always sent an integer, so every poll
+    /// failed to decode until this was corrected.
     #[serde(rename = "createdAt")]
-    pub created_at: String,
+    pub created_at: i64,
     /// Whether the POLLING CALLER is this edge's grantor ("owner") or a
     /// delegate guest ("delegate") — computed server-side as
     /// `grantedByUserId == callerId`. **Not** usable to detect whether an
