@@ -617,6 +617,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-256 / PAN-162 [A/B]: impulse-robust per-symbol LLR weighting knee
+    /// (`None` = off, the library default). See
+    /// `Ft8Config::impulse_robust_llr`.
+    pub fn with_impulse_robust_llr(mut self, knee: Option<f64>) -> Self {
+        self.config.impulse_robust_llr = knee;
+        self
+    }
+
     /// Decoder-TP-sensitivity Task W3.4 [A/B]: master switch for the
     /// nsym=2/3 noncoherent combining LLR variants layered on top of the
     /// Task W3.3 matched-demod stage. Only takes effect when

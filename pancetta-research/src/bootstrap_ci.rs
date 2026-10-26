@@ -36,6 +36,7 @@
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 /// Output of a bootstrap CI on a per-tier delta.
 ///
@@ -43,7 +44,7 @@ use rand::{RngExt, SeedableRng};
 /// pairs and the statistic is `Σ recovered`, then `mean`, `ci_low`, and
 /// `ci_high` are in decode units (e.g. +5.2 means "B recovered 5.2 more
 /// decodes than A on average across bootstrap resamples of the WAV set").
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeltaCi {
     /// Bootstrap mean of the per-resample delta statistic (= mean over
     /// N resamples of `Σ_w stat_b[w] − Σ_w stat_a[w]`). Approximately
@@ -160,6 +161,148 @@ where
         ci_high,
         significant,
         n_bootstrap,
+    }
+}
+
+/// SNR at which a decode-rate curve first crosses 50%, scanning from the
+/// lowest SNR upward and linearly interpolating between the bracketing
+/// points (ported from batch101's `threshold_50`). `rates[0] >= 0.5`
+/// returns `snrs[0]`; a curve that never reaches 50% (or is empty)
+/// returns `None`. `snrs` must be ascending and the same length as `rates`.
+pub fn threshold_50(snrs: &[f64], rates: &[f64]) -> Option<f64> {
+    assert_eq!(
+        snrs.len(),
+        rates.len(),
+        "threshold_50: snrs/rates length mismatch"
+    );
+    if rates.is_empty() {
+        return None;
+    }
+    if rates[0] >= 0.5 {
+        return Some(snrs[0]);
+    }
+    for k in 1..rates.len() {
+        if rates[k] >= 0.5 && rates[k - 1] < 0.5 {
+            let span = snrs[k] - snrs[k - 1];
+            let frac = (0.5 - rates[k - 1]) / (rates[k] - rates[k - 1]);
+            return Some(snrs[k - 1] + frac * span);
+        }
+    }
+    None
+}
+
+/// Paired-bootstrap CI on a 50%-threshold shift
+/// `threshold_50(off) − threshold_50(on)` (dB; positive = `on` improves).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ThresholdShiftCi {
+    /// Shift on the observed data; `None` when either threshold is undefined.
+    pub point: Option<f64>,
+    /// Type-7 2.5th percentile over resamples with a defined shift.
+    pub ci_low: Option<f64>,
+    /// Type-7 97.5th percentile over resamples with a defined shift.
+    pub ci_high: Option<f64>,
+    /// `ci_low > 0 || ci_high < 0` (false when the CI is undefined).
+    pub significant: bool,
+    pub n_bootstrap: usize,
+    /// Resamples where either resampled threshold was undefined.
+    pub undefined_resamples: usize,
+}
+
+fn rates_of(rows: &[Vec<bool>]) -> Vec<f64> {
+    rows.iter()
+        .map(|r| {
+            if r.is_empty() {
+                0.0
+            } else {
+                r.iter().filter(|&&b| b).count() as f64 / r.len() as f64
+            }
+        })
+        .collect()
+}
+
+/// Paired bootstrap of the 50%-threshold shift between two per-trial
+/// success matrices (`off[point][trial]`, `on[point][trial]`). At each SNR
+/// point, trial indices are resampled independently with replacement and
+/// the SAME indices are applied to `off` and `on`. The CI is the type-7
+/// 2.5/97.5 percentile range over resamples whose shift is defined;
+/// undefined resamples are counted. Deterministic for a given seed.
+///
+/// Panics when `snrs`, `off` and `on` differ in length or when `off[i]`
+/// and `on[i]` hold different trial counts (callers must align them),
+/// matching `bootstrap_recall_delta`'s contract.
+pub fn bootstrap_threshold_shift(
+    snrs: &[f64],
+    off: &[Vec<bool>],
+    on: &[Vec<bool>],
+    n_bootstrap: usize,
+    seed: u64,
+) -> ThresholdShiftCi {
+    assert_eq!(
+        snrs.len(),
+        off.len(),
+        "bootstrap_threshold_shift requires aligned inputs (snrs vs off points)"
+    );
+    assert_eq!(
+        off.len(),
+        on.len(),
+        "bootstrap_threshold_shift requires aligned inputs (off vs on points)"
+    );
+    for (i, (a, b)) in off.iter().zip(on).enumerate() {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "bootstrap_threshold_shift requires aligned inputs (trial count at point {i})"
+        );
+    }
+    let shift = |a: &[f64], b: &[f64]| -> Option<f64> {
+        Some(threshold_50(snrs, a)? - threshold_50(snrs, b)?)
+    };
+    let point = shift(&rates_of(off), &rates_of(on));
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut stats: Vec<f64> = Vec::with_capacity(n_bootstrap);
+    let mut undefined = 0usize;
+    let mut r_off = vec![0.0f64; snrs.len()];
+    let mut r_on = vec![0.0f64; snrs.len()];
+    for _ in 0..n_bootstrap {
+        for (p, (a, b)) in off.iter().zip(on).enumerate() {
+            let n = a.len();
+            if n == 0 {
+                r_off[p] = 0.0;
+                r_on[p] = 0.0;
+                continue;
+            }
+            let (mut sa, mut sb) = (0usize, 0usize);
+            for _ in 0..n {
+                let i = rng.random_range(0..n);
+                sa += a[i] as usize;
+                sb += b[i] as usize;
+            }
+            r_off[p] = sa as f64 / n as f64;
+            r_on[p] = sb as f64 / n as f64;
+        }
+        match shift(&r_off, &r_on) {
+            Some(s) => stats.push(s),
+            None => undefined += 1,
+        }
+    }
+    stats.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let (ci_low, ci_high) = if stats.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(percentile_sorted(&stats, 2.5)),
+            Some(percentile_sorted(&stats, 97.5)),
+        )
+    };
+    let significant = matches!(ci_low, Some(l) if l > 0.0) || matches!(ci_high, Some(h) if h < 0.0);
+    ThresholdShiftCi {
+        point,
+        ci_low,
+        ci_high,
+        significant,
+        n_bootstrap,
+        undefined_resamples: undefined,
     }
 }
 
@@ -376,5 +519,120 @@ mod tests {
             ci.ci_low,
             ci.ci_high
         );
+    }
+
+    fn grid(lo: f64, n: usize) -> Vec<f64> {
+        (0..n).map(|k| lo + 0.5 * k as f64).collect()
+    }
+
+    fn over50(xs: &[u32]) -> Vec<f64> {
+        xs.iter().map(|&x| x as f64 / 50.0).collect()
+    }
+
+    #[test]
+    fn threshold_50_batch101_awgn_off() {
+        let snrs = grid(-21.0, 11);
+        let rates = over50(&[0, 0, 1, 5, 16, 33, 40, 49, 49, 50, 50]);
+        let t = threshold_50(&snrs, &rates).unwrap();
+        assert_eq!(format!("{t:.2}"), "-18.74", "{t}");
+    }
+
+    #[test]
+    fn threshold_50_batch101_impulsive_k6_shift() {
+        let snrs = grid(-21.0, 11);
+        let off = over50(&[0, 0, 0, 3, 8, 19, 26, 35, 42, 49, 49]);
+        let k6 = over50(&[0, 0, 0, 4, 8, 22, 28, 42, 48, 50, 50]);
+        let shift = threshold_50(&snrs, &off).unwrap() - threshold_50(&snrs, &k6).unwrap();
+        assert_eq!(format!("{shift:+.3}"), "+0.179", "{shift}");
+    }
+
+    #[test]
+    fn threshold_50_edges() {
+        let snrs = grid(-21.0, 4);
+        assert_eq!(threshold_50(&snrs, &[0.0; 4]), None);
+        assert_eq!(threshold_50(&snrs, &[0.5, 0.2, 0.9, 1.0]), Some(-21.0));
+        assert_eq!(threshold_50(&snrs, &[0.6, 0.7, 0.9, 1.0]), Some(-21.0));
+        assert_eq!(threshold_50(&[], &[]), None);
+        // Exact interpolation: 0.25 -> 0.75 over 0.5 dB crosses at the midpoint.
+        assert_eq!(threshold_50(&snrs, &[0.0, 0.25, 0.75, 1.0]), Some(-20.25));
+    }
+
+    fn rows(counts: &[usize], n: usize) -> Vec<Vec<bool>> {
+        counts
+            .iter()
+            .map(|&c| (0..n).map(|i| i < c).collect())
+            .collect()
+    }
+
+    #[test]
+    fn threshold_shift_identical_inputs_zero() {
+        let snrs = grid(-21.0, 6);
+        let off = rows(&[0, 3, 10, 25, 38, 50], 50);
+        let ci = bootstrap_threshold_shift(&snrs, &off, &off, 1000, 0xb007);
+        assert_eq!(ci.point, Some(0.0));
+        assert_eq!(ci.ci_low, Some(0.0));
+        assert_eq!(ci.ci_high, Some(0.0));
+        assert!(!ci.significant);
+        assert_eq!(ci.n_bootstrap, 1000);
+    }
+
+    #[test]
+    fn threshold_shift_strictly_better_on_is_significant() {
+        let snrs = grid(-21.0, 8);
+        let off = rows(&[0, 0, 2, 8, 20, 35, 48, 50], 50);
+        // `on` is the off curve moved one point (0.5 dB) earlier; every
+        // trial that succeeds in `off` also succeeds in `on`.
+        let on = rows(&[0, 2, 8, 20, 35, 48, 50, 50], 50);
+        let ci = bootstrap_threshold_shift(&snrs, &off, &on, 1000, 0xb007);
+        let p = ci.point.unwrap();
+        assert!((p - 0.5).abs() < 0.2, "{p}");
+        assert!(ci.ci_low.unwrap() > 0.0, "{ci:?}");
+        assert!(ci.significant);
+    }
+
+    #[test]
+    fn threshold_shift_seed_determinism() {
+        let snrs = grid(-21.0, 6);
+        let off: Vec<Vec<bool>> = (0..6)
+            .map(|p| (0..40).map(|t| (t * 7 + p * 3) % 10 < p * 2).collect())
+            .collect();
+        let on: Vec<Vec<bool>> = (0..6)
+            .map(|p| (0..40).map(|t| (t * 3 + p) % 10 < p * 2 + 1).collect())
+            .collect();
+        let a = bootstrap_threshold_shift(&snrs, &off, &on, 500, 99);
+        let b = bootstrap_threshold_shift(&snrs, &off, &on, 500, 99);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn threshold_shift_all_undefined() {
+        let snrs = grid(-21.0, 3);
+        let off = rows(&[0, 0, 0], 10);
+        let ci = bootstrap_threshold_shift(&snrs, &off, &off, 100, 1);
+        assert_eq!(ci.point, None);
+        assert_eq!((ci.ci_low, ci.ci_high), (None, None));
+        assert_eq!(ci.undefined_resamples, 100);
+        assert!(!ci.significant);
+    }
+
+    #[test]
+    #[should_panic(expected = "aligned inputs")]
+    fn threshold_shift_mismatched_points_panic() {
+        let snrs = grid(-21.0, 3);
+        bootstrap_threshold_shift(&snrs, &rows(&[0, 1, 2], 4), &rows(&[0, 1], 4), 10, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "aligned inputs")]
+    fn threshold_shift_mismatched_trials_panic() {
+        let snrs = grid(-21.0, 2);
+        bootstrap_threshold_shift(&snrs, &rows(&[0, 1], 4), &rows(&[0, 1], 5), 10, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "aligned inputs")]
+    fn threshold_shift_mismatched_snrs_panic() {
+        let snrs = grid(-21.0, 3);
+        bootstrap_threshold_shift(&snrs, &rows(&[0, 1], 4), &rows(&[0, 1], 4), 10, 0);
     }
 }
