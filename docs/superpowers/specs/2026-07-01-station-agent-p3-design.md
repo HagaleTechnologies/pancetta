@@ -68,8 +68,13 @@ stream: decode `env.payload` → `read_msg1`/`write_msg2` (msg2 back out as an `
 - **txArmGrant verification → `VerifiedArmGrant`:** rebuild the canonical bytes (Rust `serde_json` over a
   sorted map — verified byte-for-byte), verify `clientSig` (Ed25519) against the client's pinned key,
   check `aud == agentKeyId`, `armedUntil` in the future, carry `operatorCallsign` + derive `ttl_ms` from
-  `armedUntil` + `heartbeatIntervalSec`. Produce the P2 `VerifiedArmGrant { operator_callsign, ttl_ms,
-  scope_tx }` and feed `ArmState::arm(...)`. **This is the ONLY producer of a VerifiedArmGrant** in the
+  `armedUntil` + `heartbeatIntervalSec`. Retain `armed_until_ms`, `capability_exp_ms`, checked
+  `tx_enabled_until_ms`, and `effective_ttl_ms` alongside raw `ttl_ms`, attribution, scope and
+  identity bindings. The effective deadline is `min(armedUntil, exp, txEnabledUntil)`, exclusive
+  at equality. Ties prefer capability, then enablement, then arm, reporting `capability-expired`,
+  `tx-enablement-expired`, or `ttl-expired`. Feed the verified grant to `ArmState::arm(...)`,
+  which caps elapsed lifetime by both verification-time and acceptance-time remaining authority.
+  **This is the ONLY producer of a VerifiedArmGrant** in the
   live path (P2 kept it a pure value; P3 is where it's minted, after all checks).
 
 ### L4 — Command execution
@@ -78,7 +83,11 @@ Decrypted control frames are rig-api.v1 `clientCommand`s. Map onto the **existin
 - QSY/tune/split/mode → existing `RigControlMessage`/band-change/`SetSplit`.
 - **TX request → the existing `TransmitRequest` path with `origin: TxOrigin::Remote`** — the P2 gate does
   the rest (keys only if the arm permits, re-checked at key-time). Heartbeats from the client refresh
-  `ArmState::heartbeat`; a missed heartbeat (`heartbeatIntervalSec`-derived) auto-disarms.
+  `ArmState::heartbeat`; 30 seconds of silence auto-disarms, independent of the sending cadence.
+  Heartbeat, sweep and permission reads enforce the same authority deadlines. Expiry is terminal;
+  a fresh signed arm is required, and renewing hello authority never extends the old arm.
+  Already keyed remote single and bundled playback polls the gate about every 50 ms, releases
+  PTT and confirms audio flush before reporting failure. Device and transport latency still apply.
 - The agent **never** exposes autonomous origination remotely (ADR-0002 §5b).
 
 ## Component + config

@@ -47,8 +47,10 @@
 //!   standard monotonic clock stops while the host sleeps: an operator silent
 //!   through a suspend longer than the window must re-arm on wake. Either
 //!   clock reaching a limit expires the arm.
-//! - The grant's signed absolute deadline (`armedUntil`) is checked against
-//!   **wall** time ([`ArmTime::unix_ms`]). Either clock expiring denies TX.
+//! - The earliest of `armedUntil`, capability `exp` and `txEnabledUntil`
+//!   is checked against **wall** time ([`ArmTime::unix_ms`]). Its remaining
+//!   lifetime at verification also caps elapsed authority after acceptance.
+//!   Ties prefer capability, then enablement, then arm; expiry is exclusive.
 //! - `heartbeatIntervalSec` is the client's *sending* cadence ([5,15] s). The
 //!   station's silence limit is the fixed [`HEARTBEAT_TIMEOUT_MS`] for every
 //!   accepted cadence; the cadence is carried for audit, not used as a timeout.
@@ -169,11 +171,18 @@ pub struct VerifiedArmGrant {
     pub operator_callsign: String,
     /// Verified lifetime cap for the arm, in milliseconds (`armedUntil` minus
     /// the verification instant). [`ArmState::arm`] re-measures the remaining
-    /// time to [`Self::armed_until_ms`] at acceptance and uses the smaller.
+    /// authority at acceptance and applies all verification-time caps.
     pub ttl_ms: i64,
     /// The signed absolute arm deadline (`txArmGrant.armedUntil`, unix ms),
     /// checked against wall time for the life of the arm.
     pub armed_until_ms: i64,
+    /// Capability expiry from the verified token, in Unix milliseconds.
+    pub capability_exp_ms: i64,
+    /// Verified TX enablement horizon, converted from seconds to Unix milliseconds.
+    pub tx_enabled_until_ms: i64,
+    /// Remaining lifetime at verification, bounded by all three deadlines.
+    /// Acceptance must never enlarge this cap, even if wall time rolls back.
+    pub effective_ttl_ms: i64,
     /// The verified heartbeat sending cadence (`heartbeatIntervalSec`, 5–15 s).
     /// The station's silence limit stays [`HEARTBEAT_TIMEOUT_MS`] regardless.
     pub heartbeat_interval_sec: i64,
@@ -190,6 +199,28 @@ pub struct VerifiedArmGrant {
     /// CURRENT arm's controller is still TX-arm-eligible, independent of the
     /// ham-radio `operator_callsign` attribution above.
     pub client_key_id: String,
+}
+
+impl VerifiedArmGrant {
+    /// Earliest signed authority deadline and its cause. Ties prefer capability,
+    /// then enablement, then the arm window.
+    pub(crate) fn effective_deadline(&self) -> (i64, DisarmReason) {
+        authority_deadline(
+            self.armed_until_ms,
+            self.capability_exp_ms,
+            self.tx_enabled_until_ms,
+        )
+    }
+}
+
+fn authority_deadline(arm: i64, capability: i64, enablement: i64) -> (i64, DisarmReason) {
+    if capability <= enablement && capability <= arm {
+        (capability, DisarmReason::CapabilityExpired)
+    } else if enablement <= arm {
+        (enablement, DisarmReason::TxEnablementExpired)
+    } else {
+        (arm, DisarmReason::TtlExpired)
+    }
 }
 
 /// Why TX is (not) permitted, for audit `detail` and diagnostics.
@@ -209,6 +240,10 @@ pub enum DenyReason {
     NotArmed,
     /// The grant TTL has elapsed.
     Expired,
+    /// The capability that authorized this arm has expired.
+    CapabilityExpired,
+    /// The verified TX enablement horizon has expired.
+    TxEnablementExpired,
     /// No heartbeat within [`HEARTBEAT_TIMEOUT_MS`] — dead-man triggered.
     HeartbeatLost,
     /// The station-local consent gate of the channel being queried is OFF
@@ -227,6 +262,8 @@ impl DenyReason {
         match self {
             DenyReason::NotArmed => "not-armed",
             DenyReason::Expired => "ttl-expired",
+            DenyReason::CapabilityExpired => "capability-expired",
+            DenyReason::TxEnablementExpired => "tx-enablement-expired",
             DenyReason::HeartbeatLost => "heartbeat-lost",
             DenyReason::NoLocalConsent => "no-local-consent",
             DenyReason::LocallyKilled => "locally-killed",
@@ -266,6 +303,10 @@ pub enum DisarmReason {
     OperatorDisarm,
     /// The grant TTL elapsed.
     TtlExpired,
+    /// The capability that authorized this arm has expired.
+    CapabilityExpired,
+    /// The verified TX enablement horizon has expired.
+    TxEnablementExpired,
     /// No heartbeat within the dead-man window.
     HeartbeatLost,
     /// The station-agent component terminated unexpectedly.
@@ -286,6 +327,8 @@ impl DisarmReason {
         match self {
             DisarmReason::OperatorDisarm => "operator-disarm",
             DisarmReason::TtlExpired => "ttl-expired",
+            DisarmReason::CapabilityExpired => "capability-expired",
+            DisarmReason::TxEnablementExpired => "tx-enablement-expired",
             DisarmReason::HeartbeatLost => "heartbeat-lost",
             DisarmReason::ComponentCrash => "component-crash",
             DisarmReason::AuthorizationRevoked => "authorization-revoked",
@@ -322,11 +365,15 @@ struct ArmedSession {
     armed_at: Instant,
     /// Suspend-aware clock reading when the arm was accepted.
     armed_at_suspend_aware_ms: i64,
-    /// Maximum monotonic lifetime: the smaller of the verified `ttl_ms` and
-    /// the time left to `armed_until_ms` when the arm was accepted.
+    /// Maximum elapsed lifetime: the minimum of raw TTL, verification-time
+    /// effective TTL and remaining authority at acceptance.
     lifetime: Duration,
     /// Signed absolute deadline (unix ms), checked against wall time.
     armed_until_ms: i64,
+    capability_exp_ms: i64,
+    tx_enabled_until_ms: i64,
+    /// Source of the immutable elapsed lifetime cap.
+    lifetime_reason: DisarmReason,
     /// Monotonic instant of the last accepted heartbeat (seeded by `arm`).
     last_heartbeat: Instant,
     /// Suspend-aware clock reading of the last accepted heartbeat.
@@ -347,8 +394,8 @@ struct ArmedSession {
 }
 
 impl ArmedSession {
-    /// The deadline that has passed at `now`, if any. TTL (wall `armedUntil`
-    /// or monotonic lifetime) wins over heartbeat loss. Deadlines are
+    /// The deadline that has passed at `now`, if any. The earliest authority
+    /// horizon or its elapsed backstop wins over heartbeat loss. Deadlines are
     /// exclusive (`>=`). Elapsed time is measured on both the monotonic and
     /// the suspend-aware clock, and either one reaching a limit expires the
     /// arm. A sample earlier than a stored reading on either clock cannot be
@@ -364,8 +411,16 @@ impl ArmedSession {
                 self.armed_at_suspend_aware_ms,
                 lifetime_ms,
             );
-        if now.unix_ms >= self.armed_until_ms || lifetime_over {
-            return Some(DisarmReason::TtlExpired);
+        let (deadline, reason) = authority_deadline(
+            self.armed_until_ms,
+            self.capability_exp_ms,
+            self.tx_enabled_until_ms,
+        );
+        if now.unix_ms >= deadline {
+            return Some(reason);
+        }
+        if lifetime_over {
+            return Some(self.lifetime_reason.clone());
         }
         let silence_over = now
             .monotonic
@@ -472,12 +527,12 @@ impl ArmState {
     // --- events ------------------------------------------------------------
 
     /// Arm from a verified grant. Records the accept instant, the effective
-    /// lifetime, the signed `armedUntil`, operator and cadence, and seeds the
+    /// lifetime, all signed authority horizons, operator and cadence, and seeds the
     /// heartbeat to `now`.
     ///
-    /// The effective lifetime is the smaller of the verified `ttl_ms` and the
-    /// time left to `armedUntil` at `now`, so a delay between verification and
-    /// acceptance (or a wall-clock step in between) cannot extend the grant.
+    /// The elapsed lifetime is the minimum of raw `ttl_ms`, verified
+    /// `effective_ttl_ms` and remaining absolute authority at `now`. Delayed
+    /// acceptance or wall rollback cannot enlarge the verified cap.
     ///
     /// If the grant lacks TX scope, or its signed deadline has already passed
     /// at `now`, the state is **not** changed and a `TxDenied` audit effect is
@@ -511,15 +566,22 @@ impl ArmState {
             })];
         }
 
-        let lifetime_ms = grant
-            .ttl_ms
-            .min(grant.armed_until_ms.saturating_sub(now.unix_ms));
+        let (deadline, deadline_reason) = grant.effective_deadline();
+        let authority_lifetime = grant
+            .effective_ttl_ms
+            .min(deadline.saturating_sub(now.unix_ms));
+        let lifetime_reason = if grant.ttl_ms < authority_lifetime {
+            DisarmReason::TtlExpired
+        } else {
+            deadline_reason
+        };
+        let lifetime_ms = grant.ttl_ms.min(authority_lifetime);
         if lifetime_ms <= 0 {
             return vec![ArmEffect::Audit(AuditEvent {
                 ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxDenied,
                 operator_callsign: Some(grant.operator_callsign),
-                detail: format!("arm rejected: {}", DenyReason::Expired.as_str()),
+                detail: format!("arm rejected: {}", lifetime_reason.as_str()),
             })];
         }
 
@@ -529,6 +591,9 @@ impl ArmState {
             armed_at_suspend_aware_ms: now.suspend_aware_ms,
             lifetime: Duration::from_millis(lifetime_ms.unsigned_abs()),
             armed_until_ms: grant.armed_until_ms,
+            capability_exp_ms: grant.capability_exp_ms,
+            tx_enabled_until_ms: grant.tx_enabled_until_ms,
+            lifetime_reason,
             last_heartbeat: now.monotonic,
             last_heartbeat_suspend_aware_ms: now.suspend_aware_ms,
             heartbeat_interval_sec: grant.heartbeat_interval_sec,
@@ -720,7 +785,7 @@ impl ArmState {
     // --- the gate ----------------------------------------------------------
 
     /// **The safety gate.** Returns `true` **iff ALL** of:
-    /// currently armed AND wall `now < armedUntil` AND monotonic time since the
+    /// currently armed AND wall time before every authority deadline AND monotonic time since the
     /// arm `< lifetime` AND monotonic silence since the last heartbeat
     /// `< HEARTBEAT_TIMEOUT_MS` AND `channel`'s own local consent is on AND
     /// `local_kill == false` AND the grant carries TX scope.
@@ -738,7 +803,7 @@ impl ArmState {
 
     /// The same gate as [`tx_permitted`](Self::tx_permitted), but returning the
     /// first-closed gate for audit `detail` / diagnostics. Evaluation order:
-    /// NotArmed → NoTxScope → Expired → HeartbeatLost → NoLocalConsent →
+    /// NotArmed → NoTxScope → authority expiry → HeartbeatLost → NoLocalConsent →
     /// LocallyKilled. The *result* is an AND; the order only picks which reason
     /// is reported when several gates are closed. `NoLocalConsent` reads only
     /// `channel`'s own consent bit.
@@ -755,7 +820,22 @@ impl ArmState {
         }
         match s.expired_reason(now) {
             Some(DisarmReason::TtlExpired) => return TxPermit::Denied(DenyReason::Expired),
-            Some(_) => return TxPermit::Denied(DenyReason::HeartbeatLost),
+            Some(DisarmReason::CapabilityExpired) => {
+                return TxPermit::Denied(DenyReason::CapabilityExpired)
+            }
+            Some(DisarmReason::TxEnablementExpired) => {
+                return TxPermit::Denied(DenyReason::TxEnablementExpired)
+            }
+            Some(DisarmReason::HeartbeatLost) => {
+                return TxPermit::Denied(DenyReason::HeartbeatLost)
+            }
+            Some(
+                DisarmReason::OperatorDisarm
+                | DisarmReason::ComponentCrash
+                | DisarmReason::AuthorizationRevoked,
+            ) => {
+                return TxPermit::Denied(DenyReason::NotArmed);
+            }
             None => {}
         }
         if !self.channel_consent(channel) {
@@ -810,6 +890,9 @@ mod tests {
             operator_callsign: "N0CALL".to_string(),
             ttl_ms: TTL,
             armed_until_ms: T0 + TTL,
+            capability_exp_ms: T0 + TTL + 3_600_000,
+            tx_enabled_until_ms: T0 + TTL + 3_600_000,
+            effective_ttl_ms: TTL,
             heartbeat_interval_sec: 10,
             scope_tx,
             jti: JTI.to_string(),
@@ -933,6 +1016,9 @@ mod tests {
             operator_callsign: "W1AW".to_string(),
             ttl_ms: TTL,
             armed_until_ms: T0 + TTL,
+            capability_exp_ms: T0 + TTL + 3_600_000,
+            tx_enabled_until_ms: T0 + TTL + 3_600_000,
+            effective_ttl_ms: TTL,
             heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "arm-jti-2".to_string(),
@@ -1141,6 +1227,9 @@ mod tests {
             operator_callsign: "N0CALL".to_string(),
             ttl_ms: TTL,
             armed_until_ms: T0 + TTL,
+            capability_exp_ms: T0 + TTL + 3_600_000,
+            tx_enabled_until_ms: T0 + TTL + 3_600_000,
+            effective_ttl_ms: TTL,
             heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "arm-jti-2".to_string(),
@@ -1165,6 +1254,9 @@ mod tests {
             operator_callsign: "N0CALL".to_string(),
             ttl_ms,
             armed_until_ms,
+            capability_exp_ms: armed_until_ms + 3_600_000,
+            tx_enabled_until_ms: armed_until_ms + 3_600_000,
+            effective_ttl_ms: ttl_ms,
             heartbeat_interval_sec: cadence,
             scope_tx: true,
             jti: jti.to_string(),
@@ -1614,6 +1706,9 @@ mod tests {
                 operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 armed_until_ms: T0 + short_ttl,
+                capability_exp_ms: T0 + short_ttl + 3_600_000,
+                tx_enabled_until_ms: T0 + short_ttl + 3_600_000,
+                effective_ttl_ms: short_ttl,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1722,6 +1817,9 @@ mod tests {
                 operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 armed_until_ms: T0 + short_ttl,
+                capability_exp_ms: T0 + short_ttl + 3_600_000,
+                tx_enabled_until_ms: T0 + short_ttl + 3_600_000,
+                effective_ttl_ms: short_ttl,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1749,6 +1847,9 @@ mod tests {
                 operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 armed_until_ms: after_expiry + short_ttl,
+                capability_exp_ms: after_expiry + short_ttl + 3_600_000,
+                tx_enabled_until_ms: after_expiry + short_ttl + 3_600_000,
+                effective_ttl_ms: short_ttl,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1796,6 +1897,9 @@ mod tests {
                 operator_callsign: "N0CALL".into(),
                 ttl_ms: 10_000,
                 armed_until_ms: T0 + 10_000,
+                capability_exp_ms: T0 + 10_000 + 3_600_000,
+                tx_enabled_until_ms: T0 + 10_000 + 3_600_000,
+                effective_ttl_ms: 10_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1852,6 +1956,9 @@ mod tests {
                 operator_callsign: "N0CALL".into(),
                 ttl_ms: 5_000,
                 armed_until_ms: T0 + 5_000,
+                capability_exp_ms: T0 + 5_000 + 3_600_000,
+                tx_enabled_until_ms: T0 + 5_000 + 3_600_000,
+                effective_ttl_ms: 5_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1951,9 +2058,181 @@ mod tests {
         }
     }
 
+    // These trusted state-machine fixtures deliberately allow unequal token
+    // horizons. Production signed enabled tokens still require equality.
+    fn pan105_grant(arm: i64, capability: i64, enablement: i64) -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            ttl_ms: arm,
+            armed_until_ms: T0 + arm,
+            capability_exp_ms: T0 + capability,
+            tx_enabled_until_ms: T0 + enablement,
+            effective_ttl_ms: arm.min(capability).min(enablement),
+            ..grant(true)
+        }
+    }
+
+    #[test]
+    fn pan105_deadlines_are_exclusive_attributed_and_terminal() {
+        for (arm, cap, enabled, reason, deny) in [
+            (
+                900_000,
+                600_000,
+                600_000,
+                DisarmReason::CapabilityExpired,
+                DenyReason::CapabilityExpired,
+            ),
+            (
+                900_000,
+                800_000,
+                700_000,
+                DisarmReason::TxEnablementExpired,
+                DenyReason::TxEnablementExpired,
+            ),
+            (
+                500_000,
+                800_000,
+                700_000,
+                DisarmReason::TtlExpired,
+                DenyReason::Expired,
+            ),
+            (
+                600_000,
+                600_000,
+                600_000,
+                DisarmReason::CapabilityExpired,
+                DenyReason::CapabilityExpired,
+            ),
+            (
+                700_000,
+                800_000,
+                700_000,
+                DisarmReason::TxEnablementExpired,
+                DenyReason::TxEnablementExpired,
+            ),
+        ] {
+            let deadline = arm.min(cap).min(enabled);
+            for heartbeat_first in [false, true] {
+                let mut st = armed_consented();
+                st.set_channel_consent(ConsentChannel::WsjtxUdp, true, T0);
+                st.arm(pan105_grant(arm, cap, enabled), at(T0));
+                for seq in 1..(deadline / 10_000) {
+                    assert!(st
+                        .heartbeat(JTI, seq as u64, at(T0 + seq * 10_000))
+                        .is_empty());
+                }
+                for ch in [ConsentChannel::StationAgent, ConsentChannel::WsjtxUdp] {
+                    assert!(st.tx_permitted(at(T0 + deadline - 1), ch));
+                    assert_eq!(
+                        st.tx_permit_reason(at(T0 + deadline), ch),
+                        TxPermit::Denied(deny.clone())
+                    );
+                    // Earliest source still wins when observation crosses all
+                    // three horizons and the heartbeat deadline as well.
+                    assert_eq!(
+                        st.tx_permit_reason(at(T0 + 910_000), ch),
+                        TxPermit::Denied(deny.clone())
+                    );
+                }
+                let effects = if heartbeat_first {
+                    st.heartbeat(JTI, 1000, at(T0 + deadline))
+                } else {
+                    st.tick(at(T0 + deadline))
+                };
+                assert_eq!(disarm_counts(&effects, reason.clone()), (1, 1));
+                assert!(effects.iter().any(|e| matches!(e, ArmEffect::Audit(ev)
+                    if ev.detail == format!("auto-disarm: {}", reason.as_str()))));
+                assert!(!st.is_armed());
+                assert!(st.tick(at(T0 + deadline + 1)).is_empty());
+                assert!(st.heartbeat(JTI, 1001, at(T0 + deadline + 1)).is_empty());
+                assert!(st.heartbeat("wrong", 0, at(T0 + deadline + 1)).is_empty());
+                assert_eq!(
+                    st.tx_permit_reason(at(T0 + deadline + 1), ConsentChannel::StationAgent),
+                    TxPermit::Denied(DenyReason::NotArmed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pan105_wall_and_elapsed_backstops_preserve_the_limiting_reason() {
+        for (g, expected) in [
+            (
+                pan105_grant(90_000, 20_000, 40_000),
+                DenyReason::CapabilityExpired,
+            ),
+            (
+                pan105_grant(90_000, 40_000, 20_000),
+                DenyReason::TxEnablementExpired,
+            ),
+            (pan105_grant(20_000, 40_000, 90_000), DenyReason::Expired),
+        ] {
+            let mut st = armed_consented();
+            st.arm(g, at3(T0, 0, 0));
+            // The last heartbeat is fresh for every sample, including rollback.
+            st.heartbeat(JTI, 1, at3(T0 + 10_000, 10_000, 10_000));
+            for now in [
+                at3(T0 + 20_000, 10_001, 10_001),
+                at3(T0 - 1, 20_000, 10_001),
+                at3(T0 - 1, 10_001, 20_000),
+            ] {
+                assert_eq!(
+                    st.tx_permit_reason(now, ConsentChannel::StationAgent),
+                    TxPermit::Denied(expected.clone())
+                );
+            }
+            assert!(!st.tx_permitted(at3(T0, 10_001, -1), ConsentChannel::StationAgent));
+            let backwards = ArmTime {
+                monotonic: mono_base() - Duration::from_millis(1),
+                ..at3(T0, 0, 0)
+            };
+            assert!(!st.tx_permitted(backwards, ConsentChannel::StationAgent));
+        }
+        let mut st = armed_consented();
+        let mut g = pan105_grant(90_000, 40_000, 50_000);
+        g.ttl_ms = 10_000; // An independently tighter raw lifetime keeps its reason.
+        st.arm(g, at3(T0, 0, 0));
+        assert_eq!(
+            st.tx_permit_reason(at3(T0, 10_000, 10_000), ConsentChannel::StationAgent),
+            TxPermit::Denied(DenyReason::Expired)
+        );
+    }
+
+    #[test]
+    fn pan105_acceptance_never_extends_verified_authority_or_replaces_on_refusal() {
+        for (arm, cap, enabled) in [
+            (90_000, 20_000, 40_000),
+            (90_000, 40_000, 20_000),
+            (20_000, 40_000, 90_000),
+        ] {
+            let g = pan105_grant(arm, cap, enabled);
+            let mut st = armed_consented();
+            st.arm(g.clone(), at3(T0 + 19_999, 0, 0));
+            assert!(st.tx_permitted(at3(T0 + 19_999, 0, 0), ConsentChannel::StationAgent));
+            assert!(!st.tx_permitted(at3(T0 + 20_000, 1, 1), ConsentChannel::StationAgent));
+            // A failed replacement at the horizon must leave the prior arm alone.
+            let mut current = armed_consented();
+            let mut replacement = g.clone();
+            replacement.jti = "replacement".into();
+            let effects = current.arm(replacement, at(T0 + 20_000));
+            assert_eq!(effects.len(), 1);
+            assert_eq!(current.current_arm_jti(), Some(JTI));
+            assert!(current.tx_permitted(at(T0 + 20_000), ConsentChannel::StationAgent));
+            // Rollback from verification time cannot turn the 20s cap into 30s.
+            st.arm(g, at3(T0 - 10_000, 0, 0));
+            assert!(st.tx_permitted(
+                at3(T0 + 9_999, 19_999, 19_999),
+                ConsentChannel::StationAgent
+            ));
+            assert!(!st.tx_permitted(
+                at3(T0 + 10_000, 20_000, 20_000),
+                ConsentChannel::StationAgent
+            ));
+        }
+    }
+
     /// A shadow model of every gate, computed independently of `ArmState`'s
     /// internals, to cross-check the safety invariant for each channel `ch`:
-    /// permitted(ch) ⇒ armed ∧ scope ∧ wall < armedUntil ∧ lifetime left (mono
+    /// permitted(ch) ⇒ armed ∧ scope ∧ wall before all horizons ∧ lifetime left (mono
     /// and suspend-aware) ∧ heartbeat-fresh (mono and suspend-aware) ∧
     /// consent(ch) ∧ ¬killed.
     ///
@@ -1965,6 +2244,8 @@ mod tests {
         armed_at_mono: i64,
         lifetime: i64,
         armed_until_unix: i64,
+        capability_until_unix: i64,
+        enablement_until_unix: i64,
         last_hb_mono: i64,
         armed_at_susp: i64,
         last_hb_susp: i64,
@@ -1981,6 +2262,8 @@ mod tests {
                 armed_at_mono: 0,
                 lifetime: 0,
                 armed_until_unix: 0,
+                capability_until_unix: 0,
+                enablement_until_unix: 0,
                 last_hb_mono: 0,
                 armed_at_susp: 0,
                 last_hb_susp: 0,
@@ -1998,6 +2281,8 @@ mod tests {
         }
         fn deadline_passed(&self, unix: i64, mono: i64, susp: i64) -> bool {
             unix >= self.armed_until_unix
+                || unix >= self.capability_until_unix
+                || unix >= self.enablement_until_unix
                 || mono < self.armed_at_mono
                 || mono - self.armed_at_mono >= self.lifetime
                 || mono < self.last_hb_mono
@@ -2057,13 +2342,29 @@ mod tests {
                         // signed deadline is `ttl` past wall time, as verified.
                         let scope = rng.below(2) == 1;
                         let ttl = 1 + rng.below(90_000) as i64;
+                        let cap = if rng.below(3) == 0 {
+                            ttl
+                        } else {
+                            1 + rng.below(90_000) as i64
+                        };
+                        let enabled = if rng.below(3) == 0 {
+                            cap
+                        } else {
+                            1 + rng.below(90_000) as i64
+                        };
+                        let verified_unix = unix + rng.below(40_001) as i64 - 20_000;
+                        let verified_cap = ttl.min(cap).min(enabled);
+                        let remaining = (verified_unix + verified_cap) - unix;
                         arm_ordinal += 1;
                         let jti = format!("arm-{arm_ordinal}");
                         st.arm(
                             VerifiedArmGrant {
                                 operator_callsign: "N0CALL".into(),
                                 ttl_ms: ttl,
-                                armed_until_ms: unix + ttl,
+                                armed_until_ms: verified_unix + ttl,
+                                capability_exp_ms: verified_unix + cap,
+                                tx_enabled_until_ms: verified_unix + enabled,
+                                effective_ttl_ms: verified_cap,
                                 heartbeat_interval_sec: 10,
                                 scope_tx: scope,
                                 jti: jti.clone(),
@@ -2073,11 +2374,13 @@ mod tests {
                         );
                         // Shadow: arm only takes effect if scope_tx AND the
                         // station-agent channel's own consent is on.
-                        if scope && sh.consent_sa {
+                        if scope && sh.consent_sa && remaining > 0 {
                             sh.armed = true;
                             sh.armed_at_mono = mono;
-                            sh.lifetime = ttl;
-                            sh.armed_until_unix = unix + ttl;
+                            sh.lifetime = ttl.min(verified_cap).min(remaining);
+                            sh.armed_until_unix = verified_unix + ttl;
+                            sh.capability_until_unix = verified_unix + cap;
+                            sh.enablement_until_unix = verified_unix + enabled;
                             sh.last_hb_mono = mono;
                             sh.armed_at_susp = susp;
                             sh.last_hb_susp = susp;

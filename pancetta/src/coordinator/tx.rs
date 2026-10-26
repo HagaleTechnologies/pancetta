@@ -1057,6 +1057,7 @@ pub enum SleepOutcome {
 ///
 /// See docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md,
 /// "Abort + re-key mechanics."
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn interruptible_sleep_or_supersede(
     total: Duration,
@@ -1074,6 +1075,38 @@ async fn interruptible_sleep_or_supersede(
         &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
         Option<&str>,
     )>,
+) -> SleepOutcome {
+    interruptible_sleep_or_supersede_with_clock(
+        total,
+        shutdown,
+        abort,
+        inbox,
+        in_flight_items,
+        pivoted_once,
+        remote_tx_arm,
+        &pancetta_agent::arm::ArmTime::now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn interruptible_sleep_or_supersede_with_clock(
+    total: Duration,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inbox: &TxInbox,
+    in_flight_items: &[crate::message_bus::TransmitRequestItem],
+    pivoted_once: &std::collections::HashMap<String, (String, f64)>,
+    // PAN-92: the in-flight frame's own origin/identity, re-checked against
+    // the live arm on every poll tick (below) so an explicit disarm — or the
+    // dead-man/heartbeat/TTL/local-kill gates ArmState already enforces —
+    // interrupts a transmission ALREADY keyed, not just future ones. `None`
+    // for a `TxOrigin::Local` in-flight frame, which is never gated.
+    remote_tx_arm: Option<(
+        &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        Option<&str>,
+    )>,
+    arm_clock: &(dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync),
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
 
@@ -1143,78 +1176,77 @@ async fn interruptible_sleep_or_supersede(
     // keying the stale in-flight frame for the whole slot. Draining
     // everything currently available before going back to the caller (and
     // ultimately to `sleep()`) closes that window.
-    let check_once = |inbox: &TxInbox,
-                      siphoned: &mut Vec<ComponentMessage>|
-     -> Option<SleepOutcome> {
-        loop {
-            if shutdown.load(Ordering::Acquire) {
-                return Some(SleepOutcome::AbortedByShutdown);
-            }
-            if abort.load(Ordering::Acquire) {
-                return Some(SleepOutcome::AbortedByOperator);
-            }
-            // PAN-92: re-check the remote-TX arm gate on every tick for a
-            // Remote in-flight frame — a disarm (explicit, dead-man,
-            // heartbeat-lost, TTL-expired, or local-kill) must stop a
-            // transmission ALREADY keyed, not just block the next one.
-            if let Some((arm, client_key_id)) = remote_tx_arm {
-                if !remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, client_key_id) {
-                    return Some(SleepOutcome::AbortedByDisarm);
+    let check_once =
+        |inbox: &TxInbox, siphoned: &mut Vec<ComponentMessage>| -> Option<SleepOutcome> {
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return Some(SleepOutcome::AbortedByShutdown);
                 }
-            }
-            let Ok(message) = inbox.try_recv() else {
-                return None;
-            };
-            let is_supersede_candidate = matches!(
-                message.message_type,
-                MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
-            );
-            if is_supersede_candidate {
-                // The in-flight side's own authorization: `remote_tx_arm`
-                // being `Some` means the in-flight frame is Remote (with
-                // this client_key_id); `None` means Local (see this
-                // function's own param doc above).
-                let (in_flight_origin, in_flight_remote_client_key_id) = match remote_tx_arm {
-                    Some((_, client_key_id)) => {
-                        (crate::message_bus::TxOrigin::Remote, client_key_id)
+                if abort.load(Ordering::Acquire) {
+                    return Some(SleepOutcome::AbortedByOperator);
+                }
+                // PAN-92: re-check the remote-TX arm gate on every tick for a
+                // Remote in-flight frame — a disarm (explicit, dead-man,
+                // heartbeat-lost, TTL-expired, or local-kill) must stop a
+                // transmission ALREADY keyed, not just block the next one.
+                if let Some((arm, client_key_id)) = remote_tx_arm {
+                    if !remote_tx_permitted_for(arm, arm_clock, client_key_id) {
+                        return Some(SleepOutcome::AbortedByDisarm);
                     }
-                    None => (crate::message_bus::TxOrigin::Local, None),
+                }
+                let Ok(message) = inbox.try_recv() else {
+                    return None;
                 };
-                match classify_incoming_during_tx(
-                    &message.message_type,
-                    in_flight_items,
-                    pivoted_once,
-                    in_flight_origin,
-                    in_flight_remote_client_key_id,
-                ) {
-                    // Silent to Autonomous: the keyed pivoted frame owns the
-                    // QSO's outcome (ownership rule: `report_unaired_frame`,
-                    // PAN-185).
-                    IncomingDuringTx::Drop => {}
-                    // PAN-73 round 2: not a match for any in-flight QSO —
-                    // requeue rather than discard (see IncomingDuringTx::Requeue).
-                    IncomingDuringTx::Requeue => {
-                        if let Some(message_type) =
-                            strip_already_sent_items(message.message_type, in_flight_items)
-                        {
-                            siphoned.push(ComponentMessage {
-                                message_type,
-                                ..message
-                            });
+                let is_supersede_candidate = matches!(
+                    message.message_type,
+                    MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
+                );
+                if is_supersede_candidate {
+                    // The in-flight side's own authorization: `remote_tx_arm`
+                    // being `Some` means the in-flight frame is Remote (with
+                    // this client_key_id); `None` means Local (see this
+                    // function's own param doc above).
+                    let (in_flight_origin, in_flight_remote_client_key_id) = match remote_tx_arm {
+                        Some((_, client_key_id)) => {
+                            (crate::message_bus::TxOrigin::Remote, client_key_id)
+                        }
+                        None => (crate::message_bus::TxOrigin::Local, None),
+                    };
+                    match classify_incoming_during_tx(
+                        &message.message_type,
+                        in_flight_items,
+                        pivoted_once,
+                        in_flight_origin,
+                        in_flight_remote_client_key_id,
+                    ) {
+                        // Silent to Autonomous: the keyed pivoted frame owns the
+                        // QSO's outcome (ownership rule: `report_unaired_frame`,
+                        // PAN-185).
+                        IncomingDuringTx::Drop => {}
+                        // PAN-73 round 2: not a match for any in-flight QSO —
+                        // requeue rather than discard (see IncomingDuringTx::Requeue).
+                        IncomingDuringTx::Requeue => {
+                            if let Some(message_type) =
+                                strip_already_sent_items(message.message_type, in_flight_items)
+                            {
+                                siphoned.push(ComponentMessage {
+                                    message_type,
+                                    ..message
+                                });
+                            }
+                        }
+                        IncomingDuringTx::Supersede { .. } => {
+                            abort.store(true, Ordering::Release);
+                            return Some(SleepOutcome::Superseded(message.message_type));
                         }
                     }
-                    IncomingDuringTx::Supersede { .. } => {
-                        abort.store(true, Ordering::Release);
-                        return Some(SleepOutcome::Superseded(message.message_type));
-                    }
+                } else {
+                    // Not a supersede candidate (e.g. TuneRequest). Siphon it so
+                    // it is put back after the sleep instead of being lost.
+                    siphoned.push(message);
                 }
-            } else {
-                // Not a supersede candidate (e.g. TuneRequest). Siphon it so
-                // it is put back after the sleep instead of being lost.
-                siphoned.push(message);
             }
-        }
-    };
+        };
 
     let outcome = 'sleep: {
         if let Some(outcome) = check_once(inbox, &mut siphoned) {
@@ -1250,6 +1282,49 @@ mod interruptible_sleep_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn pan105_playback_wait_reports_aborted_by_disarm_at_capability_boundary() {
+        use pancetta_agent::arm::{ArmState, ArmTime, ConsentChannel, VerifiedArmGrant};
+        let base = ArmTime::now();
+        let arm = Arc::new(std::sync::Mutex::new(ArmState::new()));
+        {
+            let mut state = arm.lock().unwrap();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, base.unix_ms);
+            state.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "N0CALL".into(),
+                    ttl_ms: 900_000,
+                    armed_until_ms: base.unix_ms + 900_000,
+                    capability_exp_ms: base.unix_ms + 600_000,
+                    tx_enabled_until_ms: base.unix_ms + 600_000,
+                    effective_ttl_ms: 600_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "pan105".into(),
+                    client_key_id: "client-a".into(),
+                },
+                base,
+            );
+        }
+        let (_tx, rx) = crossbeam_channel::bounded(8);
+        let inbox = TxInbox::new(rx, TxRequeue::default());
+        let outcome = interruptible_sleep_or_supersede_with_clock(
+            Duration::from_secs(1),
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            &inbox,
+            &[],
+            &std::collections::HashMap::new(),
+            Some((&arm, Some("client-a"))),
+            &|| ArmTime {
+                unix_ms: base.unix_ms + 600_000,
+                ..base
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SleepOutcome::AbortedByDisarm));
+    }
 
     #[tokio::test]
     async fn returns_false_and_waits_full_duration_when_not_aborted() {
@@ -1362,6 +1437,9 @@ mod interruptible_sleep_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-siphoned-jti".to_string(),
@@ -1455,6 +1533,9 @@ mod interruptible_sleep_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-fifo-jti".to_string(),
@@ -1553,6 +1634,9 @@ mod interruptible_sleep_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-mid-sleep-jti".to_string(),
@@ -2240,6 +2324,9 @@ mod interruptible_sleep_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pan136-item-binding-refresh".to_string(),
@@ -7700,6 +7787,18 @@ impl super::ApplicationCoordinator {
 
     /// Start FT8 transmitter component
     pub(crate) async fn start_transmitter_component(&mut self) -> Result<()> {
+        self.start_transmitter_component_with_clock(std::sync::Arc::new(
+            pancetta_agent::arm::ArmTime::now,
+        ))
+        .await
+    }
+
+    /// The injected clock is sampled under the arm lock during playback.
+    /// Production supplies ArmTime::now; tests share the accepted arm's timeline.
+    async fn start_transmitter_component_with_clock(
+        &mut self,
+        arm_clock: std::sync::Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+    ) -> Result<()> {
         let span = span!(Level::INFO, "start_transmitter");
         let _enter = span.enter();
 
@@ -9693,7 +9792,7 @@ impl super::ApplicationCoordinator {
                                         // ptt_guard in scope — drop on any loop exit fires
                                         // PTT-off. A qualifying request arriving here supersedes
                                         // the in-flight frame (aborts + re-keys).
-                                        match interruptible_sleep_or_supersede(
+                                        match interruptible_sleep_or_supersede_with_clock(
                                             to_slot,
                                             &shutdown,
                                             &abort_current_tx,
@@ -9718,6 +9817,7 @@ impl super::ApplicationCoordinator {
                                             } else {
                                                 None
                                             },
+                                            arm_clock.as_ref(),
                                         )
                                         .await
                                         {
@@ -10190,7 +10290,7 @@ impl super::ApplicationCoordinator {
                                         // PAN-135: expected playback end bounds an unconfirmed disarm flush.
                                         let playback_end = audio_enqueued_at
                                             + Duration::from_millis(audio_duration_ms);
-                                        match interruptible_sleep_or_supersede(
+                                        match interruptible_sleep_or_supersede_with_clock(
                                             playback_end.saturating_duration_since(
                                                 tokio::time::Instant::now(),
                                             ),
@@ -10217,6 +10317,7 @@ impl super::ApplicationCoordinator {
                                             } else {
                                                 None
                                             },
+                                            arm_clock.as_ref(),
                                         )
                                         .await
                                         {
@@ -12725,7 +12826,7 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         continue;
                                     }
-                                    match interruptible_sleep_or_supersede(
+                                    match interruptible_sleep_or_supersede_with_clock(
                                         to_slot,
                                         &shutdown,
                                         &abort_current_tx,
@@ -12740,6 +12841,7 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             None
                                         },
+                                        arm_clock.as_ref(),
                                     )
                                     .await
                                     {
@@ -13017,7 +13119,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-135: expected playback end bounds an unconfirmed disarm flush.
                                     let playback_end = audio_enqueued_at
                                         + Duration::from_millis(audio_duration_ms);
-                                    match interruptible_sleep_or_supersede(
+                                    match interruptible_sleep_or_supersede_with_clock(
                                         playback_end
                                             .saturating_duration_since(tokio::time::Instant::now()),
                                         &shutdown,
@@ -13033,6 +13135,7 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             None
                                         },
+                                        arm_clock.as_ref(),
                                     )
                                     .await
                                     {
@@ -15831,6 +15934,9 @@ mod disarm_interrupt_signal_tests {
                     operator_callsign: "K5ARH".to_string(),
                     ttl_ms: 120_000,
                     armed_until_ms: now_ms + 120_000,
+                    capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                    tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                    effective_ttl_ms: 120_000,
                     heartbeat_interval_sec: 10,
                     scope_tx: true,
                     jti: "pan134-predicate".to_string(),
@@ -16009,6 +16115,9 @@ mod disarm_interrupt_signal_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pre-ptt-recheck-jti".to_string(),
@@ -18431,6 +18540,9 @@ mod coalesce_tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "channel-backlog-stop-order".into(),
@@ -19079,6 +19191,9 @@ mod coalesce_tests {
                     operator_callsign: "K5ARH".into(),
                     ttl_ms: 120_000,
                     armed_until_ms: now_ms + 120_000,
+                    capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                    tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                    effective_ttl_ms: 120_000,
                     heartbeat_interval_sec: 10,
                     scope_tx: true,
                     jti: "channel-backlog".into(),
@@ -19183,6 +19298,9 @@ mod coalesce_tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pan136-item-binding".into(),
@@ -19294,6 +19412,9 @@ mod coalesce_tests {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "mixed-bundle-jti".to_string(),
@@ -20325,6 +20446,43 @@ mod protocol_tx_tests {
 /// **fails CLOSED** (denies) — the opposite of `tx_qso_is_live`'s fail-open.
 #[cfg(test)]
 mod remote_arm_gate_tests {
+    #[test]
+    fn pan105_all_authority_horizons_deny_before_tick() {
+        use pancetta_agent::arm::DenyReason;
+        for (source, reason) in [
+            (0, DenyReason::Expired),
+            (1, DenyReason::CapabilityExpired),
+            (2, DenyReason::TxEnablementExpired),
+        ] {
+            let mut grant = grant();
+            match source {
+                0 => grant.armed_until_ms = NOW + 20_000,
+                1 => grant.capability_exp_ms = NOW + 20_000,
+                _ => grant.tx_enabled_until_ms = NOW + 20_000,
+            }
+            grant.effective_ttl_ms = 20_000;
+            let mut state = ArmState::new();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+            state.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+            state.arm(grant, at(NOW));
+            let arm = Arc::new(Mutex::new(state));
+
+            for ch in [ConsentChannel::StationAgent, ConsentChannel::WsjtxUdp] {
+                assert!(remote_tx_permitted(&arm, || at(NOW + 19_999), ch));
+                assert!(!remote_tx_permitted(&arm, || at(NOW + 20_000), ch));
+                assert_eq!(
+                    arm.lock().unwrap().tx_permit_reason(at(NOW + 20_000), ch),
+                    pancetta_agent::arm::TxPermit::Denied(reason.clone())
+                );
+            }
+
+            assert!(
+                arm.lock().unwrap().is_armed(),
+                "pure checks do not consume the arm"
+            );
+        }
+    }
+
     use super::remote_tx_permitted;
     use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
@@ -20347,6 +20505,9 @@ mod remote_arm_gate_tests {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
             armed_until_ms: NOW + 120_000,
+            capability_exp_ms: NOW + 120_000 + 3_600_000,
+            tx_enabled_until_ms: NOW + 120_000 + 3_600_000,
+            effective_ttl_ms: 120_000,
             heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
@@ -20484,6 +20645,50 @@ mod remote_arm_gate_tests {
 /// authorize a QSO it never requested.
 #[cfg(test)]
 mod remote_arm_gate_identity_tests {
+    #[test]
+    fn pan105_all_authority_horizons_deny_before_tick() {
+        use pancetta_agent::arm::DenyReason;
+        for (source, reason) in [
+            (0, DenyReason::Expired),
+            (1, DenyReason::CapabilityExpired),
+            (2, DenyReason::TxEnablementExpired),
+        ] {
+            let mut grant = grant_for("client-a");
+            match source {
+                0 => grant.armed_until_ms = NOW + 20_000,
+                1 => grant.capability_exp_ms = NOW + 20_000,
+                _ => grant.tx_enabled_until_ms = NOW + 20_000,
+            }
+            grant.effective_ttl_ms = 20_000;
+            let mut state = ArmState::new();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+            state.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+            state.arm(grant, at(NOW));
+            let arm = Arc::new(Mutex::new(state));
+
+            for identity in [Some("client-a"), None] {
+                assert!(remote_tx_permitted_for(&arm, || at(NOW + 19_999), identity));
+                assert!(!remote_tx_permitted_for(
+                    &arm,
+                    || at(NOW + 20_000),
+                    identity
+                ));
+            }
+            assert!(!remote_tx_permitted_for(&arm, || at(NOW), Some("client-b")));
+            assert_eq!(
+                arm.lock()
+                    .unwrap()
+                    .tx_permit_reason(at(NOW + 20_000), ConsentChannel::StationAgent),
+                pancetta_agent::arm::TxPermit::Denied(reason)
+            );
+
+            assert!(
+                arm.lock().unwrap().is_armed(),
+                "pure checks do not consume the arm"
+            );
+        }
+    }
+
     use super::remote_tx_permitted_for;
     use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
@@ -20506,6 +20711,9 @@ mod remote_arm_gate_identity_tests {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
             armed_until_ms: NOW + 120_000,
+            capability_exp_ms: NOW + 120_000 + 3_600_000,
+            tx_enabled_until_ms: NOW + 120_000 + 3_600_000,
+            effective_ttl_ms: 120_000,
             heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
@@ -20637,6 +20845,52 @@ mod remote_arm_gate_identity_tests {
 
 #[cfg(test)]
 mod arm_snapshot_attribution_tests {
+    #[test]
+    fn pan105_all_authority_horizons_deny_before_tick() {
+        use pancetta_agent::arm::DenyReason;
+        for (source, reason) in [
+            (0, DenyReason::Expired),
+            (1, DenyReason::CapabilityExpired),
+            (2, DenyReason::TxEnablementExpired),
+        ] {
+            let mut grant = grant_for("N0CALL", "client-a");
+            match source {
+                0 => grant.armed_until_ms = NOW + 20_000,
+                1 => grant.capability_exp_ms = NOW + 20_000,
+                _ => grant.tx_enabled_until_ms = NOW + 20_000,
+            }
+            grant.effective_ttl_ms = 20_000;
+            let mut state = ArmState::new();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+            state.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+            state.arm(grant, at(NOW));
+            let arm = Arc::new(Mutex::new(state));
+
+            for ms in [19_999, 20_000] {
+                let snapshot = ArmSnapshot::take(&arm, || at(NOW + ms));
+                for identity in [Some("client-a"), Some("client-b"), None] {
+                    assert_eq!(
+                        snapshot.permits(identity),
+                        super::remote_tx_permitted_for(&arm, || at(NOW + ms), identity)
+                    );
+                }
+                assert_eq!(snapshot.permits(Some("client-a")), ms < 20_000);
+                assert_eq!(snapshot.operator_callsign.as_deref(), Some("N0CALL"));
+            }
+            assert_eq!(
+                arm.lock()
+                    .unwrap()
+                    .tx_permit_reason(at(NOW + 20_000), ConsentChannel::StationAgent),
+                pancetta_agent::arm::TxPermit::Denied(reason)
+            );
+
+            assert!(
+                arm.lock().unwrap().is_armed(),
+                "pure checks do not consume the arm"
+            );
+        }
+    }
+
     use super::ArmSnapshot;
     use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
@@ -20659,6 +20913,9 @@ mod arm_snapshot_attribution_tests {
             operator_callsign: operator_callsign.to_string(),
             ttl_ms: 120_000,
             armed_until_ms: NOW + 120_000,
+            capability_exp_ms: NOW + 120_000 + 3_600_000,
+            tx_enabled_until_ms: NOW + 120_000 + 3_600_000,
+            effective_ttl_ms: 120_000,
             heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-snapshot-test-jti".to_string(),
@@ -21640,6 +21897,14 @@ mod pan115_worker_gate_tests {
         cfg: Config,
         prepare: impl FnOnce(&mut ApplicationCoordinator),
     ) -> Harness {
+        worker_harness_with_clock(cfg, prepare, Arc::new(pancetta_agent::arm::ArmTime::now)).await
+    }
+
+    pub(super) async fn worker_harness_with_clock(
+        cfg: Config,
+        prepare: impl FnOnce(&mut ApplicationCoordinator),
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+    ) -> Harness {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
             cfg,
@@ -21687,7 +21952,7 @@ mod pan115_worker_gate_tests {
         // fixture needs an Audio destination even though it uses no device.
         bus.get_or_create_channel(ComponentId::Audio).await.unwrap();
         coordinator
-            .start_transmitter_component()
+            .start_transmitter_component_with_clock(arm_clock)
             .await
             .expect("TX worker starts");
         Harness {
@@ -23285,12 +23550,8 @@ mod pan118_worker_band_plan_tests {
         );
     }
 
-    /// The dial moving out of band between admission and key time (CAT
-    /// retune / split change during the pre-PTT wait) must still refuse
-    /// before PTT. The exact refusing site (post-wait re-key check or the
-    /// final pre-PTT check) depends on where in the slot the move lands,
-    /// so the assertion accepts either label — both are refusals before
-    /// PTT through the same unwind.
+    /// Park the worker at the PTT mutex, then move the dial out of band.
+    /// The final pre-PTT check must observe the new dial and refuse to key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dial_moved_out_of_band_before_key_is_refused() {
         let h = worker_harness().await;
@@ -23298,25 +23559,20 @@ mod pan118_worker_band_plan_tests {
             .operating_frequency_hz
             .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
 
-        request(&h, "CQ N0CALL FN20").await;
-        // Wait until the worker has admitted the frame (it appears in a
-        // TxQueueStatus push), then move the dial out of band — the frame
-        // is now queued against a dial that would key out of privilege.
+        let held = h.coordinator.ptt_sync_gate.lock().await;
         let text = "CQ N0CALL FN20";
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if h.tui_rx
-                .try_iter()
-                .any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text)))
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "worker did not queue the frame");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        request(&h, text).await;
+        tokio::time::timeout(
+            Duration::from_secs(40),
+            h.coordinator.tx_before_ptt_gate.notified(),
+        )
+        .await
+        .expect("worker must reach the pre-PTT gate before the dial moves");
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
         h.coordinator
             .operating_frequency_hz
             .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        drop(held);
 
         let (completed, diagnostics, ptt_on) =
             await_completion(&h, text, Duration::from_secs(45)).await;
@@ -23327,10 +23583,11 @@ mod pan118_worker_band_plan_tests {
         );
         assert!(!ptt_on, "no SetPtt(true) after the dial moved out of band");
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.contains("outside the configured amateur band plan")),
-            "a key-time gate must report the band-plan refusal, got {diagnostics:?}"
+            diagnostics.iter().any(|d| {
+                d.contains("TX blocked at final pre-PTT check")
+                    && d.contains("outside the configured amateur band plan")
+            }),
+            "the final pre-PTT gate must report the band-plan refusal, got {diagnostics:?}"
         );
     }
 
@@ -24036,6 +24293,9 @@ mod pan136_bundle_binding_worker_tests {
                     operator_callsign: "K5ARH".to_string(),
                     ttl_ms: 120_000,
                     armed_until_ms: now_ms + 120_000,
+                    capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                    tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                    effective_ttl_ms: 120_000,
                     heartbeat_interval_sec: 5,
                     scope_tx: true,
                     jti: jti.clone(),
@@ -24532,6 +24792,7 @@ mod pan135_worker_disarm_tests {
     use crate::message_bus::{RigControlMessage, TxOrigin};
     use crossbeam_channel::Receiver;
     use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
+    use std::sync::Arc;
 
     const TEXT: &str = "CQ N0CALL FN20";
 
@@ -24555,6 +24816,9 @@ mod pan135_worker_disarm_tests {
                     operator_callsign: "N0CALL".into(),
                     ttl_ms: 120_000,
                     armed_until_ms: now_ms + 120_000,
+                    capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                    tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                    effective_ttl_ms: 120_000,
                     heartbeat_interval_sec: 10,
                     scope_tx: true,
                     jti: "pan135-worker".into(),
@@ -24599,6 +24863,208 @@ mod pan135_worker_disarm_tests {
         .await
         .expect("frame must enter playback");
         (h, audio_rx)
+    }
+
+    async fn pan105_playback(
+        bundle: bool,
+        origin: TxOrigin,
+    ) -> (
+        Harness,
+        Receiver<ComponentMessage>,
+        Arc<std::sync::atomic::AtomicI64>,
+        ArmTime,
+    ) {
+        let base = ArmTime::now();
+        let elapsed = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let clock_elapsed = elapsed.clone();
+        let clock = Arc::new(move || {
+            let ms = clock_elapsed.load(Ordering::SeqCst);
+            ArmTime {
+                unix_ms: base.unix_ms + ms,
+                monotonic: base.monotonic + Duration::from_millis(ms as u64),
+                suspend_aware_ms: base.suspend_aware_ms + ms,
+            }
+        });
+        let h = super::pan115_worker_gate_tests::worker_harness_with_clock(
+            pancetta_config::Config::default(),
+            |_| {},
+            clock,
+        )
+        .await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+        {
+            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            arm.set_channel_consent(ConsentChannel::StationAgent, true, base.unix_ms);
+            arm.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "N0CALL".into(),
+                    ttl_ms: 900_000,
+                    armed_until_ms: base.unix_ms + 900_000,
+                    capability_exp_ms: base.unix_ms + 600_000,
+                    tx_enabled_until_ms: base.unix_ms + 600_000,
+                    effective_ttl_ms: 600_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "pan105-playback".into(),
+                    client_key_id: "client-a".into(),
+                },
+                base,
+            );
+        }
+        let identity = (origin == TxOrigin::Remote).then(|| "client-a".to_string());
+        let message = if bundle {
+            MessageType::MultiTransmitRequest {
+                items: [1500.0, 1700.0]
+                    .into_iter()
+                    .map(|frequency_offset| crate::message_bus::TransmitRequestItem {
+                        attempt_id: None,
+                        message_text: TEXT.into(),
+                        frequency_offset,
+                        qso_id: None,
+                        origin,
+                        remote_client_key_id: identity.clone(),
+                    })
+                    .collect(),
+                tx_parity: None,
+                origin,
+                remote_client_key_id: identity,
+            }
+        } else {
+            MessageType::TransmitRequest {
+                attempt_id: None,
+                message_text: TEXT.into(),
+                frequency_offset: 1500.0,
+                qso_id: None,
+                tx_parity: None,
+                origin,
+                remote_client_key_id: identity,
+            }
+        };
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Ft8Transmitter,
+                message,
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "frame must key before authority expires"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if audio_rx.try_iter().any(|m| {
+                    matches!(m.message_type,
+                    MessageType::AudioOutput { samples, .. } if !samples.is_empty())
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("frame entered playback");
+        (h, audio_rx, elapsed, base)
+    }
+
+    async fn pan105_expiry_interrupts_playback(bundle: bool) {
+        let (h, audio_rx, elapsed, base) = pan105_playback(bundle, TxOrigin::Remote).await;
+        elapsed.store(600_000, Ordering::SeqCst);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes flush acknowledgment");
+        {
+            let arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            assert!(
+                arm.is_armed(),
+                "the worker uses a pure permission check, not disarm()"
+            );
+            assert_eq!(
+                arm.tx_permit_reason(
+                    ArmTime {
+                        unix_ms: base.unix_ms + 600_000,
+                        ..base
+                    },
+                    ConsentChannel::StationAgent
+                ),
+                pancetta_agent::arm::TxPermit::Denied(
+                    pancetta_agent::arm::DenyReason::CapabilityExpired
+                )
+            );
+        }
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(completed(&h), None, "no completion before the flush ack");
+        ack.complete(true);
+        let expected_completions = if bundle { 2 } else { 1 };
+        let mut failures = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while failures < expected_completions {
+                for message in h.autonomous_rx.try_iter() {
+                    if let MessageType::TransmitComplete {
+                        message_text,
+                        success,
+                        ..
+                    } = message.message_type
+                    {
+                        assert_eq!(message_text, TEXT);
+                        assert!(!success, "every expired bundle item must fail");
+                        failures += 1;
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every interrupted item completes after flush acknowledgment");
+        assert_eq!(failures, expected_completions);
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+        assert_eq!(ptt_offs(&h), 0, "no duplicate unkey after flush");
+        assert!(
+            !audio_rx
+                .try_iter()
+                .any(|m| matches!(m.message_type, MessageType::AudioOutput { .. })),
+            "expired audio is not requeued after flush"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan105_capability_expiry_interrupts_active_single_tx() {
+        pan105_expiry_interrupts_playback(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan105_capability_expiry_interrupts_active_summed_bundle() {
+        pan105_expiry_interrupts_playback(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan105_remote_expiry_does_not_interrupt_local_playback() {
+        let (h, audio_rx, elapsed, _) = pan105_playback(false, TxOrigin::Local).await;
+        elapsed.store(600_000, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                assert!(
+                    !audio_rx
+                        .try_iter()
+                        .any(|m| matches!(m.message_type, MessageType::AudioFlush { .. })),
+                    "remote arm expiry must not flush local audio"
+                );
+                if let Some(success) = completed(&h) {
+                    break success;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local frame completes");
+        assert!(result);
     }
 
     fn disarm(h: &Harness) {
@@ -24865,10 +25331,37 @@ mod pan122_tx_log_worker_tests {
                 audio_enqueued |= matches!(msg.message_type, MessageType::AudioOutput { .. });
             }
             while h.hamlib_rx.try_recv().is_ok() {}
-            while h.autonomous_rx.try_recv().is_ok() {}
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(audio_enqueued, "the frame's audio must reach the output");
+
+        // File visibility precedes the best-effort TUI relay attempt. Keep
+        // TUI full until this frame completes, which happens after the relay.
+        // Leave Autonomous unread above so an early completion is retained.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            while h.hamlib_rx.try_recv().is_ok() {}
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    qso_id: None,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == TEXT {
+                        completed = Some(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed,
+            Some(true),
+            "the frame must complete successfully before draining TUI"
+        );
 
         let lines = await_tx_log_lines(&h, 1, Duration::from_secs(5)).await;
         assert_eq!(lines.len(), 1, "exactly one record: {lines:?}");
@@ -24881,6 +25374,8 @@ mod pan122_tx_log_worker_tests {
         assert_eq!(r.qso_id, None);
         assert_eq!(r.dial_hz, None, "dial unknown in the harness");
 
+        // Completion proves the relay already encountered the full route;
+        // draining now cannot admit a late TxFrameLogged event.
         let tui_frame_events = h
             .tui_rx
             .try_iter()

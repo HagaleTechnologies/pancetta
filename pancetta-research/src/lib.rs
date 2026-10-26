@@ -16,6 +16,7 @@ pub mod metrics;
 
 pub mod bootstrap_ci;
 pub use bootstrap_ci::{bootstrap_novel_delta, bootstrap_recall_delta, DeltaCi};
+pub use bootstrap_ci::{bootstrap_threshold_shift, threshold_50, ThresholdShiftCi};
 
 pub mod decoder;
 pub use decoder::{Decode, DecoderUnderTest, Ft8Decoder, Jt9Decoder};
@@ -47,3 +48,7 @@ pub mod tier_slots;
 pub use tier_slots::{is_heavy_tier, SlotGuard, TierSlotPool, DEFAULT_POOL_DIR};
 
 pub mod candidate_split;
+
+pub mod impulsiveness;
+
+pub mod storm_remeasure;

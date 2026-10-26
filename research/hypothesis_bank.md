@@ -824,6 +824,16 @@ current_ratio: 0.051
     given current evidence, but the chrono-replay retest that would give a
     truly conclusive answer remains outstanding — PAN-160 keeps this open
     alongside candidate (a), not closed.
+  status_2026_10_26_pan160: The AP-only timing retry is implemented experimentally,
+    default off, with fresh sender priors and a 32-attempt per-window cap.
+    Twenty held-out synthetic sessions exercised 158 extra attempts but gained
+    and lost zero target messages (128/200 in both arms). No positive rescue
+    fixture was found in 324 calibration pairs. The 100 noise pairs retained
+    the same two ordinary-path false positives, with none added by the retry.
+    Original mini33 remains blocked: all 33 WAVs and 33 trusted caches are
+    missing. The hard-200 corpus caveat and both earlier corrections still
+    apply. No production benefit or original-recording completion is claimed.
+    Evidence: research/experiments/2026-10-26-pan160-timing-history.md.
   status_2026_05_31_session1: SCOPED → PROCEED. Multi-pass is back (hb-079 coherent + hb-080 N=3 + hb-086 V1 joint-pair-retry all GRADUATED), so the prior is no longer latent. Diagnostic `hb057_dt_history_potential.rs` on top-20 hard-200: 38.6% of 647 missed truths are sent by callsigns with stable (<0.1s) or moderate (0.1–0.3s) cross-WAV DT variance — the TARGET population. Kill-switch (10%) cleared by 3.86×. Recoverable-by-prior upper bound at ±0.2s leave-one-out median gate = same 38.6% (the window comfortably covers stable+moderate variance by construction — gate-coverage upper bound, not LDPC-conversion estimate). Design spec at `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`. Storage: coordinator-level (cross-WAV history is the recovery population; per-decoder-thread design has zero access on fresh threads). Hook points: localized_costas_sync_search + AP-path sync_search ONLY (pass 1 untouched — preserves new-station discovery). Window: max(0.2s, IQR × 3) around per-callsign median; 10-sighting ring buffer, 30-min eviction. Session 2 implements + sweeps; Session 3 grad/shelve. Diagnostic-first re-run inside Session 2 confirms population before build.
   ---- original priority entry below ----
   [PRIORITY-WAS: 0.35, spawned 2026-05-25 from mr-002]
@@ -6821,6 +6831,17 @@ search to in-repo sources.
     variants are no longer a promising lane. hb-253 stays opt-in
     (`llr_metric = Bessel`, +0.273 dB solo / +0.506 dB composed
     synthetic); on-air A/B is the remaining validation path.
+    UPDATE 2026-10-26 (PAN-155): new invocation shape, same metric.
+    `Ft8Config::bessel_fallback_enabled` (default false; eval
+    `--bessel-fallback-enabled`) retries a failed DualMax FT8 AP0
+    candidate once with Bessel and never runs it after a DualMax
+    success. A frozen −20 dB generated fixture proves a real rescue.
+    Smoke A/B (fixtures + 64 generated noise WAVs, one thread):
+    fixtures 7/8 → 7/8, noise FP 0 → 0, elapsed +99.8% unlimited
+    (compare elapsed hard gate FAILED) and +14.4% at Standard.
+    hard_200 not evaluated: all 200 WAVs and truth caches are absent
+    in the implementation container. Default stays off. Details:
+    `research/experiments/2026-10-26-pan155-bessel-fallback.md`.
   mode: ft8
   mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
     Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
@@ -6854,7 +6875,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied.]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate not yet run, default stays off.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6894,6 +6915,34 @@ search to in-repo sources.
     UPDATE 2026-09-16: neither re-open path (the per-day impulsiveness
     metric or a storm-season on-air A/B) has been built. Reopen tracked as
     PAN-162.
+
+    UPDATE 2026-10-25 (PAN-162): re-open path (a) is built. A per-slot
+    impulsiveness instrument (`pancetta-research/src/impulsiveness.rs`:
+    fraction of 160 ms blocks above 3× a 25-block in-slot local median) and
+    the `impulse-survey` binary rank capture days and emit a storm-day
+    manifest. The batch101 plant is now `noise::ImpulseBurstPlant`
+    (byte-identical), with STORM (p=0.05) and SEVERE (p=0.10) variants, and
+    `batch104_impulse_llr_storm_remeasure` implements the pre-registered
+    re-measure (storm decision plant, paired threshold bootstrap, off-air
+    do-no-harm on the 60 vendored ft8_lib WAVs). eval gained
+    `--impulse-robust-llr <K>`. The synthetic storm shards (29,400 decodes)
+    did not fit the implement run and have not been run, so there is no
+    verdict yet and the default stays off. Details and commands:
+    `research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
+
+    UPDATE 2026-10-26 (PAN-162): the pre-registered synthetic re-measure ran
+    (12 shards, 29,400 decodes, paired threshold bootstrap n=1000).
+    Threshold shift off → k=6 [95% CI] / off → k=3: storm (p=0.05,
+    decision plant) +0.465 dB [+0.308, +0.653] / +0.523 dB [+0.358, +0.732]; base (the batch101 plant) +0.167 dB [+0.038, +0.519] / +0.193 dB [+0.049, +0.535];
+    severe (p=0.10) +1.324 dB [+0.771, +1.666] / +1.482 dB [+0.981, +1.766]; awgn exactly +0.000 for both. Off-air
+    do-no-harm on the 60 vendored WAVs: ΔTP k=6 +1, k=3 −7 (bar ≥ −2).
+    Verdict `candidate-k6`: k=6 clears all three bars, k=3 fails the
+    off-air bar. The gain the batch101 plant could not show past the bar
+    appears once bursts hit about 10% of symbols, and grows with burst
+    rate. The plan's native-only production gate (synth-clean, noise_1000,
+    elapsed) has not run yet: its noise arms cost about 90 single-core
+    minutes each here. Until it passes, the default stays off; operators
+    in heavy QRN can still opt in with Some(6.0).
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 

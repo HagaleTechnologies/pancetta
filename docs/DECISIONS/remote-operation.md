@@ -400,7 +400,8 @@ Normative station behaviour for heartbeat timing:
 - **Cadence vs. silence limit.** `heartbeatIntervalSec` (validated to [5,15] s) is how often the
   client *sends*. The station's silence limit is the fixed `HEARTBEAT_TIMEOUT_MS` = 30 s for every
   accepted cadence; it is not derived from the cadence. The verified cadence and the signed
-  `armedUntil` are carried on `VerifiedArmGrant` and recorded in the arm audit
+  `armedUntil` are carried on `VerifiedArmGrant`, alongside the capability and enablement
+  horizons added by PAN-105. The effective lifetime and cadence are recorded in the arm audit
   (`armed ttl_ms=… heartbeat_interval_sec=… heartbeat_timeout_ms=30000`). Changing the limit, or
   tying it to the cadence, is a dispensa contract question, not a local tweak.
 - **Expiry is terminal.** Once 30 s pass without an accepted heartbeat, or the arm's lifetime ends,
@@ -415,9 +416,9 @@ Normative station behaviour for heartbeat timing:
   items per iteration so a busy read stream cannot hold the sweep off. The TX worker's key-time
   check stays independent of both.
 - **Two clocks.** Local liveness (silence, the arm's maximum lifetime) is measured on the monotonic
-  clock, so a wall-clock step cannot stretch it. The signed `armedUntil` is checked against wall
-  time. At acceptance the lifetime is `min(verified ttl, armedUntil − now)`, so a delay between
-  verification and acceptance cannot extend the grant. Production gates take their `ArmTime`
+  clock, so a wall-clock step cannot stretch it. Signed authority deadlines are checked against wall
+  time. PAN-105 bounds acceptance by the raw TTL, the verified effective TTL and remaining authority
+  at acceptance, so neither delayed acceptance nor rollback can enlarge the verified lifetime. Production gates take their `ArmTime`
   sample after acquiring the arm lock. A monotonic sample earlier than a stored instant denies.
 - **Suspend counts as silence.** `Instant`'s monotonic clock stops while the host sleeps on Linux
   and macOS, so silence and lifetime are also measured on a suspend-aware clock (Linux
@@ -425,6 +426,40 @@ Normative station behaviour for heartbeat timing:
   a limit expires the arm, so an operator silent through a suspend longer than 30 s must re-arm on
   wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
   suspend-aware sample earlier than the stored one denies.
+
+## Accepted arms end at the earliest authority expiry (PAN-105), 2026-10-24
+
+The effective TX deadline is `min(armedUntil, capability exp, txEnabledUntil)`.
+All three verified absolute horizons travel with the arm. The verifier converts enablement
+seconds to milliseconds with checked arithmetic and retains the remaining effective lifetime.
+It still rejects a raw arm window exceeding 60 minutes before applying the tighter bound.
+At acceptance the elapsed lifetime is the minimum of the raw TTL, that verified effective
+lifetime and the time remaining to the earliest absolute deadline. Wall rollback cannot
+extend it; both monotonic and suspend-aware clocks enforce the stored elapsed cap.
+
+At the deadline, equality means expired. Every permission read, heartbeat and session sweep
+checks the same predicate. The earliest authority source supplies the reason even if several
+horizons have passed by the time of observation. Ties prefer capability, then enablement,
+then arm. Enabled production tokens require `exp == txEnabledUntil`, so that tie reports
+`capability-expired`. Independent enablement expiry reports `tx-enablement-expired`; the arm
+window keeps `ttl-expired`. Authority expiry takes precedence over simultaneous heartbeat loss.
+The elapsed backstop preserves its limiting source under wall rollback; an independently
+shorter raw TTL keeps the arm reason.
+
+Expiry consumes the arm once and broadcasts the existing `controlState` with
+`transmitArmed:false`. A pure read before that mutation gives the typed expiry reason;
+afterward it gives `not-armed`, while the audit retains `auto-disarm: <source>`.
+The controller slot, Noise session and consumed-JTI cache remain. The capability that
+originally authorized the arm is distinct from replaceable hello authority. A refreshed
+hello or renewed local consent cannot extend the old arm. Recovery requires a fresh signed,
+previously unseen arm with current authority. No wire fields or signature inputs change.
+
+Already keyed remote single frames and summed bundles stop through the existing playback
+permission poll, approximately every 50 ms. PTT-off precedes confirmed audio flush, audit
+and notification delivery; unsuccessful completion waits for the flush acknowledgment.
+Permission is denied at the exact boundary, but physical unkeying also depends on device
+and transport scheduling. Session receive polling is bounded at 200 ms and is independent
+of the worker gate. Local-origin playback does not consult remote arm authority.
 
 ## Relay session IO is bounded (PAN-102), 2026-10-14
 

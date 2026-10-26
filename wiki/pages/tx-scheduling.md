@@ -79,6 +79,15 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   keyed pivot reports and its absorbed request drops silently. See
   `docs/DECISIONS/tx-scheduling.md`.
 
+A registered self-CQ opening has no accepted predecessor. The QSO forwarder
+marks it before starting the CQ and consumes that marker on its first
+`MessageToSend`, whether the TX channel accepts it or rejects it. A rejected
+opening sends a durable failed `TransmitComplete` to Autonomous, after its
+registration, so cancellation needs no later TX request to settle the pending
+association and speculative state. An accepted opening leaves completion to
+the worker. Later rejected resends send only the QSO accounting report because
+an accepted predecessor may still own the outcome (PAN-238).
+
 ## Why it is shaped this way
 
 FT8 is deaf while transmitting, so the half-duplex [[parity-rule]] is the
@@ -86,21 +95,37 @@ load-bearing constraint: every concurrent active QSO must share one parity so
 the opposite window stays free to hear. Read that gotcha before changing any
 admission or coalescing logic.
 
-Testing gotcha (PAN-82): a test that trips the stall threshold via
-`rearm_manual_calls_at` must rearm on DISTINCT own-parity TX slots (the
-`for slot in [1i64, 3]` / `opened_at + 15*slot` pattern — a +15/+30 pair can
-resolve to the same own-parity slot under PAN-128's one-count-per-own-parity-
-slot rule, leaving the threshold never deterministically tripped) and must
-report the threshold frame aired (`confirm_last_frame_aired`) before a
-`StallDetected`-origin `apply_tx_offset_switch`, or PAN-182's trigger hold
-refuses the commit with `OffsetActionTriggerOutcomePending` on wall-clock
-phase alone. See `an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency`
-and `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
-`pancetta-qso/src/qso_manager.rs` for the repaired shape.
+Testing gotcha (PAN-82, PAN-239): a test that trips the stall threshold via
+`rearm_manual_calls_at` must rearm on DISTINCT own-parity TX slots, and should
+anchor the rearm instants to the QSO's own slot grid (`next_own_ft8_slot`, as
+`stall_on_two_own_parity_slots` does) rather than to `opened_at`. `opened_at`
+is the real wall clock, so `opened_at`-relative rearms resolve to different
+slots depending on the second the test started, and a +15/+30 pair can
+collapse onto one slot under PAN-128's one-count-per-own-parity-slot rule. It
+must also report the threshold frame aired (`confirm_last_frame_aired`) before
+a `StallDetected`-origin `apply_tx_offset_switch`, or PAN-182's trigger hold
+refuses the commit with `OffsetActionTriggerOutcomePending`. See
+`an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency` and
+`an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
+`pancetta-qso/src/qso_manager.rs`.
 
+<<<<<<< HEAD
 Caller-admission gotcha (PAN-120): the QSO decode loop and autonomous initiation
 are separate paths. A new direct caller now requires local console presence or
 `autonomous.unattended_policy = "respond_only"`, even with the autonomous toggle
 off. The default is `off` and changes need a restart. Existing exchanges still
 advance without presence; autonomous CQ and pounce still require it. See the
 [normative decision](../../docs/DECISIONS/tx-scheduling.md#direct-caller-presence-policy-pan-120).
+=======
+TX-worker tests must wait on the worker stage they assert (PAN-237). In
+`pancetta/src/coordinator/tx.rs`,
+`headless_frame_is_durably_logged_even_when_the_tui_channel_is_full` leaves
+TUI unread until the matching successful `TransmitComplete`. A visible log
+record alone is too early: the best-effort TUI relay follows the durable
+append. `dial_moved_out_of_band_before_key_is_refused` holds `ptt_sync_gate`
+before submitting its request, waits for `tx_before_ptt_gate`, changes the
+dial, and releases the mutex before awaiting completion. Queue status alone
+does not hold the worker before its final band-plan check. Keep these event
+boundaries when changing the tests; a settling sleep cannot establish either
+ordering.
+>>>>>>> d963768b62965bd077419f4284b34a05cf0881dd

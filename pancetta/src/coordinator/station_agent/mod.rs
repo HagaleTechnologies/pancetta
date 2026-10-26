@@ -3021,6 +3021,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 300_000,
                 armed_until_ms: NOW + 300_000,
+                capability_exp_ms: NOW + 300_000 + 3_600_000,
+                tx_enabled_until_ms: NOW + 300_000 + 3_600_000,
+                effective_ttl_ms: 300_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "test-jti".to_string(),
@@ -6341,6 +6344,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
                 armed_until_ms: NOW + 3_600_000,
+                capability_exp_ms: NOW + 3_600_000 + 3_600_000,
+                tx_enabled_until_ms: NOW + 3_600_000 + 3_600_000,
+                effective_ttl_ms: 3_600_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "renewal-arm".to_string(),
@@ -7609,6 +7615,9 @@ mod tests {
                     operator_callsign: "K5ARH".to_string(),
                     ttl_ms: 3_600_000, // 1h — long enough that only the poll-driven disarm can end it
                     armed_until_ms: NOW + 3_600_000,
+                    capability_exp_ms: NOW + 3_600_000 + 3_600_000,
+                    tx_enabled_until_ms: NOW + 3_600_000 + 3_600_000,
+                    effective_ttl_ms: 3_600_000,
                     heartbeat_interval_sec: 10,
                     scope_tx: true,
                     jti: "revocation-test-jti".to_string(),
@@ -7728,6 +7737,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
                 armed_until_ms: real_now + 3_600_000,
+                capability_exp_ms: real_now + 3_600_000 + 3_600_000,
+                tx_enabled_until_ms: real_now + 3_600_000 + 3_600_000,
+                effective_ttl_ms: 3_600_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "broadcast-test-jti".to_string(),
@@ -7910,6 +7922,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
                 armed_until_ms: real_now + 3_600_000,
+                capability_exp_ms: real_now + 3_600_000 + 3_600_000,
+                tx_enabled_until_ms: real_now + 3_600_000 + 3_600_000,
+                effective_ttl_ms: 3_600_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "malformed-frame-test-jti".to_string(),
@@ -8931,6 +8946,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 300_000,
                 armed_until_ms: NOW + 300_000,
+                capability_exp_ms: NOW + 300_000 + 3_600_000,
+                tx_enabled_until_ms: NOW + 300_000 + 3_600_000,
+                effective_ttl_ms: 300_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "reconcile-arm-jti".to_string(),
@@ -10355,6 +10373,189 @@ mod tests {
         assert_eq!(clients[0].control_states().last(), Some(&(true, false)));
     }
 
+    fn pan105_token(
+        agent: &str,
+        client: &str,
+        issued_ms: i64,
+        expires_ms: i64,
+        jti: &str,
+    ) -> String {
+        mint_jws(
+            &json!({"alg": "EdDSA", "kid": IDP_KID, "typ": "JWT"}),
+            &json!({"iss": "cqdx", "operatorCallsign": OPERATOR, "aud": agent,
+                "clientKeyId": client, "scopes": ["status", "tx"],
+                "iat": issued_ms / 1000, "exp": expires_ms / 1000,
+                "txEnabledUntil": expires_ms / 1000, "jti": jti}),
+            &idp_key(),
+        )
+    }
+
+    fn pan105_hello(issued_ms: i64, expires_ms: i64) -> Pan97Frame {
+        Box::new(move |c| {
+            hello_frame_bytes(&pan105_token(
+                &c.agent_kid,
+                &c.kid,
+                issued_ms,
+                expires_ms,
+                "pan105-hello",
+            ))
+        })
+    }
+
+    fn pan105_fresh_arm(jti: &'static str) -> Pan97Frame {
+        Box::new(move |c| {
+            let mut frame = tx_arm_frame(&c.agent_kid, &c.session_id, jti, NOW + 900_000);
+            frame["capabilityToken"] = json!(pan105_token(
+                &c.agent_kid,
+                &c.kid,
+                NOW + 610_000,
+                NOW + 1_200_000,
+                "pan105-fresh-cap"
+            ));
+            let grant = frame["grant"].as_object_mut().unwrap();
+            grant.insert("capabilityJti".into(), json!("pan105-fresh-cap"));
+            grant.insert("armedAt".into(), json!(NOW + 610_000));
+            let sig = client_key().sign(&domain_separated(&canonical_bytes(grant)));
+            grant.insert("clientSig".into(), json!(b64url(&sig.to_bytes())));
+            serde_json::to_vec(&frame).unwrap()
+        })
+    }
+
+    #[tokio::test]
+    async fn pan105_session_expiry_survives_hello_refresh_and_recovers_only_with_fresh_arm() {
+        // Quiet, valid traffic and malformed traffic all return through the
+        // real session sweep. Hello authority remains independently valid.
+        for traffic in 0..3 {
+            let sess = Pan97Session::new(&[PEER_B]);
+            let old_arm = sess.ctx.arm.clone();
+            let fresh_arm = sess.ctx.arm.clone();
+            let mut script = vec![
+                Pan97Step::SendAt(NOW, 0, pan105_hello(NOW, NOW + 1_200_000)),
+                Pan97Step::SendAt(NOW, 1, pan105_hello(NOW, NOW + 1_200_000)),
+                Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 900_000)),
+            ];
+            for seq in 1..60 {
+                script.push(Pan97Step::SendAt(
+                    NOW + seq * 10_000,
+                    0,
+                    pan97_heartbeat("arm-jti-1", seq as u64),
+                ));
+                if seq == 40 {
+                    script.push(Pan97Step::SendAt(
+                        NOW + 400_000,
+                        0,
+                        pan105_hello(NOW + 400_000, NOW + 1_600_000),
+                    ));
+                }
+            }
+            script.push(match traffic {
+                0 => Pan97Step::QuietAt(NOW + 600_000),
+                1 => Pan97Step::SendAt(NOW + 600_000, 0, pan97_benign()),
+                _ => Pan97Step::SendAt(NOW + 600_000, 0, Box::new(|_| b"not-json".to_vec())),
+            });
+            script.extend([
+                pan97_check(move || assert!(!old_arm.lock().unwrap().is_armed())),
+                Pan97Step::SendAt(NOW + 600_000, 0, pan97_heartbeat("arm-jti-1", 60)),
+                Pan97Step::QuietAt(NOW + 610_000),
+                // Replaying the consumed signed arm cannot resurrect it.
+                Pan97Step::SendAt(NOW + 610_000, 0, pan97_arm("arm-jti-1", NOW + 900_000)),
+                // Even fresh authority cannot reuse the consumed arm JTI.
+                Pan97Step::SendAt(NOW + 610_000, 0, pan105_fresh_arm("arm-jti-1")),
+                Pan97Step::SendAt(NOW + 610_000, 0, pan105_fresh_arm("arm-jti-2")),
+                Pan97Step::SendAt(NOW + 620_000, 0, pan97_heartbeat("arm-jti-2", 1)),
+                Pan97Step::SendAt(NOW + 630_000, 0, pan97_heartbeat("arm-jti-1", 100)),
+                pan97_check(move || {
+                    let arm = fresh_arm.lock().unwrap();
+                    assert_eq!(arm.current_arm_jti(), Some("arm-jti-2"));
+                    assert!(arm.tx_permitted(at(NOW + 649_999), ConsentChannel::StationAgent));
+                    assert!(
+                        !arm.tx_permitted(at(NOW + 650_000), ConsentChannel::StationAgent),
+                        "old-JTI heartbeat must not refresh the new arm"
+                    );
+                }),
+            ]);
+            let (ctx, clients) = sess.run(script, &mut None).await;
+            assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+            assert!(ctx.peers.contains_key(CLIENT_KEY_ID) && ctx.peers.contains_key(PEER_B));
+            assert!(ctx.seen_jtis.contains("arm-jti-1") && ctx.seen_jtis.contains("arm-jti-2"));
+            assert_eq!(audit_count(&ctx, "auto-disarm: capability-expired"), 1);
+            assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 0);
+            assert_eq!(
+                audit_count(&ctx, "arm rejected: arm grant: replayed jti"),
+                1
+            );
+            assert_eq!(audit_count(&ctx, "heartbeat rejected: arm_jti mismatch"), 1);
+            for (idx, c) in clients.iter().enumerate() {
+                let states = c.control_states();
+                let armed_pos = states.iter().position(|s| *s == (idx == 0, true)).unwrap();
+                let after_arm = &states[armed_pos..];
+                assert_eq!(
+                    after_arm
+                        .iter()
+                        .filter(|s| **s == (idx == 0, false))
+                        .count(),
+                    1
+                );
+                assert_eq!(states.last(), Some(&(idx == 0, true)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pan105_boundary_heartbeat_disarms_before_refresh_without_a_sweep() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.into(),
+            PeerCtx::authorized_until(vec!["status".into(), "tx".into()], NOW + 1_200_000),
+        );
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        let frame = tx_arm_frame(AGENT_KEY_ID, SESSION_ID, "arm-jti-1", NOW + 900_000);
+        dispatch_action(
+            ControlAction::Arm {
+                capability_token: token_for_agent(AGENT_KEY_ID),
+                grant: frame["grant"].clone(),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        for seq in 1..=61 {
+            let now = NOW + seq * 10_000;
+            ctx.clock = fixed_clock(now);
+            let d = dispatch_action(
+                ControlAction::Heartbeat {
+                    arm_jti: "arm-jti-1".into(),
+                    seq: seq as u64,
+                },
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                at(now),
+            )
+            .await;
+            if seq == 60 {
+                assert_eq!(
+                    pan97_states(&d.sends),
+                    vec![(CLIENT_KEY_ID.into(), true, false)]
+                );
+            } else {
+                assert!(
+                    d.sends.is_empty(),
+                    "heartbeat remains silent without a transition"
+                );
+            }
+        }
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        assert_eq!(audit_count(&ctx, "auto-disarm: capability-expired"), 1);
+        assert!(sweep_arm_expiry(&ctx, at(NOW + 610_000)).is_empty());
+    }
+
     /// The display drain hands control back to the loop after at most
     /// `READ_STREAM_DRAIN_MAX` items, so a flooded read stream cannot hold
     /// off the sweep.
@@ -10366,6 +10567,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 300_000,
                 armed_until_ms: NOW + 300_000,
+                capability_exp_ms: NOW + 300_000 + 3_600_000,
+                tx_enabled_until_ms: NOW + 300_000 + 3_600_000,
+                effective_ttl_ms: 300_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "arm-jti-1".to_string(),
@@ -10963,6 +11167,9 @@ mod tests {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
                 armed_until_ms: NOW + 3_600_000,
+                capability_exp_ms: NOW + 3_600_000 + 3_600_000,
+                tx_enabled_until_ms: NOW + 3_600_000 + 3_600_000,
+                effective_ttl_ms: 3_600_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: jti.to_string(),

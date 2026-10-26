@@ -3588,6 +3588,15 @@ impl super::ApplicationCoordinator {
                 // cloned here because the event task shadows the original.
                 let display_feed_for_admission = display_feed_enabled.clone();
 
+                // PAN-238: only a registered opening has no accepted predecessor
+                // that might still own the Autonomous outcome. Consume its marker
+                // on the first MessageToSend, whether enqueue succeeds or fails.
+                let opening_self_cqs =
+                    Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
+                        pancetta_qso::QsoId,
+                    >::new()));
+                let opening_self_cqs_for_events = opening_self_cqs.clone();
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -3663,6 +3672,10 @@ impl super::ApplicationCoordinator {
                                         reason, ..
                                     } = &new_state
                                     {
+                                        opening_self_cqs_for_events
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .remove(&qso_id);
                                         if let Ok(mut set) = active_tx_qsos.write() {
                                             set.remove(&key);
                                         }
@@ -3853,6 +3866,10 @@ impl super::ApplicationCoordinator {
                                 remote_origin,
                                 remote_client_key_id,
                             }) => {
+                                let is_opening_self_cq = opening_self_cqs_for_events
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&qso_id);
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
                                     &tx_callsign,
@@ -3937,7 +3954,7 @@ impl super::ApplicationCoordinator {
                                                     MessageType::QsoMessage(
                                                         crate::message_bus::QsoMessage::TxFrameNotSent {
                                                             qso_id: qso_id.to_string(),
-                                                            message_text: text,
+                                                            message_text: text.clone(),
                                                             replaced: None,
                                                             attempt_id,
                                                         },
@@ -3945,6 +3962,23 @@ impl super::ApplicationCoordinator {
                                                     Instant::now(),
                                                 ))
                                                 .await;
+                                            if is_opening_self_cq {
+                                                // No worker received this opening, so no
+                                                // worker outcome can settle its registration.
+                                                tx_bus
+                                                    .send_message_durable(ComponentMessage::new(
+                                                        ComponentId::Qso,
+                                                        ComponentId::Autonomous,
+                                                        MessageType::TransmitComplete {
+                                                            success: false,
+                                                            message_text: text,
+                                                            duration_ms: 0,
+                                                            qso_id: Some(qso_id.to_string()),
+                                                        },
+                                                        Instant::now(),
+                                                    ))
+                                                    .await;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -3963,6 +3997,10 @@ impl super::ApplicationCoordinator {
                             Ok(pancetta_qso::QsoEvent::QsoCompleted {
                                 qso_id, metadata, ..
                             }) => {
+                                opening_self_cqs_for_events
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&qso_id);
                                 // Drop-stale-TX grace window. A normally
                                 // completing QSO emits its FINAL 73 right at
                                 // completion, so we must NOT purge it from the
@@ -4220,6 +4258,10 @@ impl super::ApplicationCoordinator {
                                 metadata,
                                 ..
                             }) => {
+                                opening_self_cqs_for_events
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&qso_id);
                                 // Drop-stale-TX gate: a failed QSO must stop
                                 // transmitting immediately. (StateChanged-into-
                                 // Failed already purges, but a QsoFailed not
@@ -5143,7 +5185,13 @@ impl super::ApplicationCoordinator {
                                                     )
                                                     .await
                                                     {
-                                                        qso_manager
+                                                        if cq_attempt_id.is_some() {
+                                                            opening_self_cqs
+                                                                .lock()
+                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                .insert(pre_generated_qso_id);
+                                                        }
+                                                        let started = qso_manager
                                                             .start_cq_with_id(
                                                                 pre_generated_qso_id,
                                                                 frequency,
@@ -5151,7 +5199,14 @@ impl super::ApplicationCoordinator {
                                                                 false,
                                                                 None,
                                                             )
-                                                            .await
+                                                            .await;
+                                                        if started.is_err() {
+                                                            opening_self_cqs
+                                                                .lock()
+                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                .remove(&pre_generated_qso_id);
+                                                        }
+                                                        started
                                                     } else {
                                                         Err(pancetta_qso::QsoManagerError::Internal {
                                                             message: format!(
@@ -8783,6 +8838,9 @@ mod auto_73_tests {
                 operator_callsign: "W1AW".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "auto73-rollback-test-jti".to_string(),
@@ -8836,6 +8894,9 @@ mod auto_73_tests {
                 operator_callsign: "W1AW".to_string(),
                 ttl_ms: 120_000,
                 armed_until_ms: now_ms + 120_000,
+                capability_exp_ms: now_ms + 120_000 + 3_600_000,
+                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
+                effective_ttl_ms: 120_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pan138-auto73-jti".to_string(),
@@ -12022,6 +12083,362 @@ mod respond_to_caller_admission_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn pan238_speculative_cq() -> (pancetta_qso::AutonomousOperator, u64, f64) {
+        let mut config = pancetta_qso::AutonomousConfig {
+            enabled: true,
+            slot_parity: pancetta_qso::SlotParityConfig::Even,
+            cq_after_idle_cycles: 2,
+            cq_no_response_switch_after: 1,
+            tx_offset_hz: 1700.0,
+            ..Default::default()
+        };
+        config.listen_cycle.initial_interval = 100;
+        let mut op =
+            pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: vec![0.0; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &pancetta_qso::autonomous::NullDxEvaluator);
+        }
+        let before_offset = op.tx_offset_hz();
+        op.decide_at(0);
+        let actions = op.decide_at(0);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, pancetta_qso::OperatorAction::Transmit { .. })));
+        let attempt = op.last_cq_attempt_id().unwrap();
+        assert_ne!(
+            op.tx_offset_hz(),
+            before_offset,
+            "fixture must speculate an offset change"
+        );
+        (op, attempt, before_offset)
+    }
+
+    async fn pan238_wait_until(description: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out: {description}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn pan238_dispatch_cq(
+        coordinator: &ApplicationCoordinator,
+        attempt: u64,
+        frequency: f64,
+    ) {
+        assert!(coordinator
+            .message_bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::StartAutonomousQso {
+                    callsign: None,
+                    frequency,
+                    parity: Some(SlotParity::Even),
+                    cq_attempt_id: Some(attempt),
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap());
+    }
+
+    async fn pan238_coordinator() -> ApplicationCoordinator {
+        let mut coordinator = test_coordinator().await;
+        coordinator.message_bus = crate::message_bus::MessageBus::new(1).unwrap();
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".into();
+            cfg.station.grid_square = "FN42".into();
+        }
+        coordinator
+    }
+
+    #[tokio::test]
+    async fn pan238_rejected_opening_settles_after_cancellation_with_autonomous_backpressure() {
+        let mut coordinator = pan238_coordinator().await;
+        let (tx_sender, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, autonomous_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        let autonomous = coordinator
+            .message_bus
+            .durable_inbox(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        tx_sender
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let (op, attempt, before_offset) = pan238_speculative_cq();
+        pan238_dispatch_cq(&coordinator, attempt, op.tx_offset_hz()).await;
+
+        // Registration occupies the only Autonomous channel slot. No TX worker
+        // runs, so the rejected opening must produce its own durable completion.
+        pan238_wait_until(
+            "failed opening completion parked behind registration",
+            || {
+                coordinator
+                    .message_bus
+                    .durable_lane_len(ComponentId::Autonomous)
+                    == 1
+            },
+        )
+        .await;
+        assert_eq!(autonomous_rx.len(), 1);
+        let registration = autonomous.try_recv().unwrap();
+        let MessageType::QsoMessage(QsoMessage::AutonomousCqOpened {
+            qso_id,
+            attempt_id: cq_attempt_id,
+        }) = registration.message_type
+        else {
+            panic!("registration must precede completion");
+        };
+        assert_eq!(cq_attempt_id, attempt);
+        let mut pending = std::collections::HashMap::from([(qso_id.clone(), attempt)]);
+        let id = qso_id.parse().unwrap();
+        assert!(manager.get_qso(id).await.is_ok());
+        let key = super::super::active_tx_qso_key(&qso_id);
+        assert!(!coordinator
+            .latest_tx_intent
+            .read()
+            .unwrap()
+            .contains_key(&key));
+        coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(key.clone());
+        manager.cancel_qso(id).await.unwrap();
+        pan238_wait_until("cancelled opening processed", || {
+            !coordinator.active_tx_qsos.read().unwrap().contains(&key)
+        })
+        .await;
+        assert!(manager.get_qso(id).await.is_err());
+        assert_eq!(tx.len(), 1, "no later request was accepted");
+        assert!(matches!(
+            tx.try_recv().unwrap().message_type,
+            MessageType::AudioData(_)
+        ));
+
+        let completion = autonomous.try_recv().unwrap();
+        let MessageType::TransmitComplete {
+            success,
+            message_text,
+            duration_ms,
+            qso_id: Some(completed_id),
+        } = completion.message_type
+        else {
+            panic!("rejected opening must have a completion");
+        };
+        assert!(!success);
+        assert_eq!(duration_ms, 0);
+        assert_eq!(message_text, "CQ W1ABC FN42");
+        assert_eq!(completed_id, qso_id);
+        let operator = tokio::sync::Mutex::new(op);
+        super::super::autonomous::settle_self_cq_completion(
+            &operator,
+            &mut pending,
+            &completed_id,
+            success,
+        )
+        .await;
+        assert!(pending.is_empty());
+        let mut op = operator.lock().await;
+        assert_eq!(op.last_cq_attempt_id(), None, "matching snapshot consumed");
+        assert_eq!(
+            op.tx_offset_hz(),
+            before_offset,
+            "pre-attempt offset restored"
+        );
+        op.decide_at(0);
+        let next = op.decide_at(0);
+        assert!(next
+            .iter()
+            .any(|a| matches!(a, pancetta_qso::OperatorAction::Transmit { .. })));
+        assert!(
+            !next
+                .iter()
+                .any(|a| matches!(a, pancetta_qso::OperatorAction::FrequencyShift { .. })),
+            "failed CQ must not count toward the switch threshold"
+        );
+        assert!(autonomous.try_recv().is_err(), "exactly one completion");
+        assert_eq!(
+            coordinator
+                .message_bus
+                .durable_lane_len(ComponentId::Autonomous),
+            0
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn pan238_accepted_opening_keeps_outcome_ownership_when_resend_is_rejected() {
+        let mut coordinator = pan238_coordinator().await;
+        let (_, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, autonomous_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        let autonomous = coordinator
+            .message_bus
+            .durable_inbox(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        pan238_dispatch_cq(&coordinator, 42, 1500.0).await;
+        pan238_wait_until("opening accepted", || {
+            !tx.is_empty() && !autonomous_rx.is_empty()
+        })
+        .await;
+        let MessageType::QsoMessage(QsoMessage::AutonomousCqOpened { qso_id, .. }) =
+            autonomous.try_recv().unwrap().message_type
+        else {
+            panic!("expected registration");
+        };
+        let key = super::super::active_tx_qso_key(&qso_id);
+        pan238_wait_until("opening intent confirmed queued", || {
+            coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|intent| intent.request_queued)
+        })
+        .await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // Keep the accepted opening in the capacity-one channel while a resend
+        // tries to enqueue. The opening still owns the eventual worker outcome.
+        let id = qso_id.parse().unwrap();
+        // The autonomous opening has no Sent log entry for resend_last_tx.
+        // Emit the repeated CQ through the manager's normal message path.
+        manager
+            .send_message(
+                id,
+                pancetta_qso::MessageType::Cq {
+                    callsign: "W1ABC".into(),
+                    grid: Some("FN42".into()),
+                },
+                1500.0,
+            )
+            .await;
+        pan238_wait_until("rejected resend intent withdrawn", || {
+            !coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .contains_key(&key)
+        })
+        .await;
+        // Seed the active-set entry as a terminal-event barrier. start_cq
+        // emits only MessageToSend, so it does not populate this set itself.
+        // The forwarder removes the entry after finishing the rejected resend.
+        coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(key.clone());
+        manager.cancel_qso(id).await.unwrap();
+        pan238_wait_until("terminal event processed", || {
+            !coordinator.active_tx_qsos.read().unwrap().contains(&key)
+        })
+        .await;
+        assert!(
+            autonomous.try_recv().is_err(),
+            "resend must not settle the accepted opening"
+        );
+        let MessageType::TransmitRequest {
+            qso_id: Some(queued_id),
+            ..
+        } = tx.try_recv().unwrap().message_type
+        else {
+            panic!("the accepted opening must remain queued");
+        };
+        assert_eq!(queued_id, qso_id);
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn pan238_completion_settles_once_and_preserves_success_and_unmatched_attempts() {
+        let (op, attempt, _) = pan238_speculative_cq();
+        let operator = tokio::sync::Mutex::new(op);
+        let mut pending = std::collections::HashMap::from([("opening".to_string(), attempt)]);
+        super::super::autonomous::settle_self_cq_completion(
+            &operator,
+            &mut pending,
+            "unrelated",
+            false,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(operator.lock().await.last_cq_attempt_id(), Some(attempt));
+        super::super::autonomous::settle_self_cq_completion(
+            &operator,
+            &mut pending,
+            "opening",
+            true,
+        )
+        .await;
+        assert!(pending.is_empty());
+        assert_eq!(operator.lock().await.last_cq_attempt_id(), Some(attempt));
+        // Success preserves the streak: the next CQ must reach the configured
+        // one-CQ switch threshold. This also validates the rollback test's oracle.
+        let newer = {
+            let mut op = operator.lock().await;
+            op.decide_at(0);
+            let actions = op.decide_at(0);
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, pancetta_qso::OperatorAction::FrequencyShift { .. })));
+            op.last_cq_attempt_id().unwrap()
+        };
+        assert_ne!(newer, attempt);
+        pending.insert("newer".into(), newer);
+        let offset = operator.lock().await.tx_offset_hz();
+        super::super::autonomous::settle_self_cq_completion(
+            &operator,
+            &mut pending,
+            "opening",
+            false,
+        )
+        .await;
+        assert_eq!(
+            pending,
+            std::collections::HashMap::from([("newer".to_string(), newer)])
+        );
+        assert_eq!(operator.lock().await.last_cq_attempt_id(), Some(newer));
+        assert_eq!(operator.lock().await.tx_offset_hz(), offset);
     }
 
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a

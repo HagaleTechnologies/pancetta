@@ -15,6 +15,23 @@ use tracing::{debug, error, info, span, warn, Level};
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 use pancetta_core::slot::SlotParity;
 
+/// Settle the tracked self-CQ once, preserving generation-aware rollback.
+pub(super) async fn settle_self_cq_completion(
+    operator: &tokio::sync::Mutex<pancetta_qso::AutonomousOperator>,
+    pending_self_cq_qsos: &mut std::collections::HashMap<String, u64>,
+    qso_id: &str,
+    success: bool,
+) {
+    if let Some(attempt_id) = pending_self_cq_qsos.remove(qso_id) {
+        if !success {
+            operator
+                .lock()
+                .await
+                .restore_cq_state_for_attempt(attempt_id);
+        }
+    }
+}
+
 /// Classify a surviving autonomous *opening* TX item into the parameters for a
 /// [`crate::message_bus::QsoMessage::StartAutonomousQso`]. Kept pure (no I/O,
 /// no task state) so the freq/parity-resolution logic can be unit-tested
@@ -3392,14 +3409,12 @@ impl super::ApplicationCoordinator {
                                                 qso_id: Some(qso_id),
                                                 ..
                                             } => {
-                                                if let Some(attempt_id) =
-                                                    pending_self_cq_qsos.remove(&qso_id)
-                                                {
-                                                    if !success {
-                                                        let mut op = operator.lock().await;
-                                                        op.restore_cq_state_for_attempt(attempt_id);
-                                                    }
-                                                }
+                                                settle_self_cq_completion(
+                                                    &operator,
+                                                    &mut pending_self_cq_qsos,
+                                                    &qso_id,
+                                                    success,
+                                                ).await;
                                             }
                                             _ => {}
                                         }

@@ -1364,3 +1364,74 @@ fn token_without_callsign_accepts_grant_callsign() {
         .expect("no token callsign ⇒ grant callsign accepted");
     assert_eq!(out.operator_callsign, "W1AW");
 }
+
+#[test]
+fn accepted_arm_stops_at_capability_expiry() {
+    use pancetta_agent::arm::{ArmState, ArmTime, ConsentChannel, DenyReason, TxPermit};
+    use std::time::{Duration, Instant};
+    let mut raw = base_grant();
+    raw.insert("armedUntil".into(), json!(NOW_MS + 900_000));
+    let grant = full_verify(
+        &default_verifier(),
+        &valid_token(),
+        &sign_grant(raw, &client_key()),
+        &client_key().verifying_key(),
+        NOW_MS,
+    )
+    .unwrap();
+    assert_eq!(grant.armed_until_ms, NOW_MS + 900_000);
+    assert_eq!(grant.ttl_ms, 900_000);
+    assert_eq!(grant.capability_exp_ms, NOW_MS + 600_000);
+    assert_eq!(grant.tx_enabled_until_ms, NOW_MS + 600_000);
+    assert_eq!(grant.effective_ttl_ms, 600_000);
+    let origin = Instant::now();
+    let at = |ms: i64| ArmTime {
+        unix_ms: NOW_MS + ms,
+        monotonic: origin + Duration::from_millis(ms as u64),
+        suspend_aware_ms: ms,
+    };
+    let mut state = ArmState::new();
+    state.set_channel_consent(ConsentChannel::StationAgent, true, NOW_MS);
+    state.arm(grant, at(0));
+    for seq in 1..60 {
+        state.heartbeat("arm-jti-1", seq, at(seq as i64 * 10_000));
+    }
+    assert!(state.tx_permitted(at(599_999), ConsentChannel::StationAgent));
+    for ms in [600_000, 610_000] {
+        assert_eq!(
+            state.tx_permit_reason(at(ms), ConsentChannel::StationAgent),
+            TxPermit::Denied(DenyReason::CapabilityExpired)
+        );
+    }
+    for seq in 60..=61 {
+        state.heartbeat("arm-jti-1", seq, at(seq as i64 * 10_000));
+    }
+    assert!(!state.tx_permitted(at(610_000), ConsentChannel::StationAgent));
+}
+
+#[test]
+fn arm_verification_rejects_unrepresentable_enablement_and_stale_capability() {
+    let v = default_verifier();
+    let mut cap = valid_cap(&v);
+    // Synthetic verified-claim fixtures isolate the handoff's checked units.
+    cap.tx_enabled_until = Some(i64::MAX);
+    let check = |cap: &VerifiedCapability| {
+        v.verify_arm_grant(
+            &valid_grant(),
+            cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &no_revocations(),
+            SESSION_ID,
+            NOW_MS,
+            &mut HashSet::new(),
+        )
+    };
+    assert_eq!(
+        check(&cap),
+        Err(CapError::MalformedClaim("txEnabledUntil".into()))
+    );
+    cap.tx_enabled_until = Some(NOW_MS / 1000 + 600);
+    cap.exp_ms = NOW_MS;
+    assert_eq!(check(&cap), Err(CapError::Expired));
+}

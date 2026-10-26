@@ -36,6 +36,9 @@
 //!     10-30 dB above the noise floor, like lightning static;
 //!   - expected duty cycle ≈ p · E[dur] = 4% of symbols impacted.
 //!
+//! PAN-162: the plant now lives in `noise::add_impulse_bursts` as
+//! `ImpulseBurstPlant::BATCH101`; output is byte-identical.
+//!
 //! Pre-registered bars (see
 //! `research/notes/2026-06-12-batch101-impulse-llr.md`):
 //!   (a) pure AWGN: robust-on must NOT regress — threshold regression
@@ -57,16 +60,14 @@
 use anyhow::{Context, Result};
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
 use pancetta_research::metrics::hash_normalize_message;
-use pancetta_research::noise::gaussian_noise;
+use pancetta_research::noise::{add_impulse_bursts, gaussian_noise, ImpulseBurstPlant};
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const SAMPLE_RATE: f32 = 12_000.0;
-/// FT8 symbol period in samples at 12 kHz (1920 = 160 ms).
-const SYMBOL_SAMPLES: usize = 1920;
 
 /// 20 distinct standard messages (CQ / grid / report / RR73 shapes).
 const MESSAGES: [&str; 20] = [
@@ -107,39 +108,6 @@ impl NoisePlant {
         match self {
             NoisePlant::PureAwgn => "pure AWGN",
             NoisePlant::Impulsive => "impulsive",
-        }
-    }
-}
-
-/// Bernoulli-timed broadband impulse bursts added IN PLACE on top of
-/// the base AWGN. See module docs for the model spec.
-fn add_impulse_bursts(rng: &mut StdRng, noise: &mut [f32], sigma_base: f32) {
-    let n_symbols = noise.len().div_ceil(SYMBOL_SAMPLES);
-    // Per-symbol extra-noise σ accumulated from all active bursts (in
-    // power, since independent Gaussian components add in variance).
-    let mut extra_var = vec![0.0f64; n_symbols];
-    for s in 0..n_symbols {
-        if rng.random_range(0.0f64..1.0) < 0.02 {
-            let dur = rng.random_range(1usize..=3);
-            let amp_db = rng.random_range(10.0f64..30.0);
-            let sigma_burst = sigma_base as f64 * 10f64.powf(amp_db / 20.0);
-            for d in 0..dur {
-                if s + d < n_symbols {
-                    extra_var[s + d] += sigma_burst * sigma_burst;
-                }
-            }
-        }
-    }
-    for (s, &var) in extra_var.iter().enumerate() {
-        if var <= 0.0 {
-            continue;
-        }
-        let sigma = (var as f32).sqrt();
-        let start = s * SYMBOL_SAMPLES;
-        let end = ((s + 1) * SYMBOL_SAMPLES).min(noise.len());
-        let burst = gaussian_noise(rng, end - start, sigma);
-        for (x, b) in noise[start..end].iter_mut().zip(burst) {
-            *x += b;
         }
     }
 }
@@ -228,7 +196,7 @@ fn part_a_synthetic(trials: usize) -> Result<()> {
                 let mut rng = StdRng::seed_from_u64(seed);
                 let mut noise = gaussian_noise(&mut rng, WINDOW_SAMPLES, sigma);
                 if plant == NoisePlant::Impulsive {
-                    add_impulse_bursts(&mut rng, &mut noise, sigma);
+                    add_impulse_bursts(&mut rng, &mut noise, sigma, &ImpulseBurstPlant::BATCH101);
                 }
                 let recv: Vec<f32> = clean.iter().zip(&noise).map(|(s, n)| s + n).collect();
                 for (ci, &(knee, _)) in CONFIGS.iter().enumerate() {

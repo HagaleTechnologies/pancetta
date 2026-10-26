@@ -19574,6 +19574,31 @@ mod pan72_stall_detection_tests {
             })
     }
 
+    /// PAN-239: two silent rearms on two consecutive own-parity FT8 TX
+    /// slots, each 1 s in — inside the 1.7 s current-slot acceptance window
+    /// — so each feeds its own slot and PAN-128 counts both. Anchored to the
+    /// QSO's own slot grid rather than `opened_at`, whose phase is the real
+    /// wall clock's: the rearms resolve the same way on every run.
+    async fn stall_on_two_own_parity_slots(
+        manager: &QsoManager,
+        qso_id: QsoId,
+        opened_at: DateTime<Utc>,
+    ) {
+        let tx_parity = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .tx_parity
+            .expect("manual QSOs latch a TX parity at creation");
+        let own_slot = next_own_ft8_slot(opened_at + Duration::seconds(15), tx_parity);
+        for k in [0i64, 2] {
+            manager
+                .rearm_manual_calls_at(own_slot + Duration::seconds(1 + 15 * k))
+                .await;
+        }
+    }
+
     /// DX sends us a plain signal report — a genuine forward advance from
     /// `RespondingToCq` to `SendingReport` (their_report: None rung).
     async fn send_report(manager: &QsoManager, report: i8, text: &str) {
@@ -21828,17 +21853,12 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Two silent rearm cycles on DISTINCT own-parity TX slots (slots 1
-        // and 3): PAN-128 counts one stall per own-parity slot, so the old
-        // +15/+30 pair can collapse onto the same slot — leaving no armed
-        // PAN-182 trigger to release and making the commit below pass or
-        // fail on real wall-clock phase. The slot-3 rearm re-sends our CQ
+        // Two silent rearm cycles on two consecutive own-parity TX slots,
+        // each 1 s into the slot (PAN-239): anchored to the QSO's own slot
+        // grid, not `opened_at`, so every run takes the same path whatever
+        // wall-clock second it started in. The second rearm re-sends our CQ
         // at FREQ and trips the stall threshold.
-        for slot in [1i64, 3] {
-            manager
-                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
-                .await;
-        }
+        stall_on_two_own_parity_slots(&manager, qso_id, opened_at).await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             2,
@@ -22063,15 +22083,10 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Stall out on FREQ across DISTINCT own-parity TX slots (slots 1 and
-        // 3, per PAN-128's one-count-per-own-parity-slot rule — a +15/+30
-        // pair can resolve to the same slot and leave no armed PAN-182
-        // trigger); the threshold-crossing rearm re-sends there.
-        for slot in [1i64, 3] {
-            manager
-                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
-                .await;
-        }
+        // Stall out on FREQ across two consecutive own-parity TX slots,
+        // anchored to the QSO's own slot grid (PAN-239); the
+        // threshold-crossing rearm re-sends there.
+        stall_on_two_own_parity_slots(&manager, qso_id, opened_at).await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             2,

@@ -79,3 +79,7 @@ path = "src/bin/leaderboard.rs"
 [[bin]]
 name = "ft4-candidate-split"
 path = "src/bin/ft4_candidate_split.rs"
+
+[[bin]]
+name = "impulse-survey"
+path = "src/bin/impulse_survey.rs"

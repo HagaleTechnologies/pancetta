@@ -155,6 +155,37 @@ contracts *are* preserved and are enforced by tests: noise-floor RMS, AWGN σ at
 the 2500 Hz reference bandwidth, SNR scaling, Gaussianity, and exact birdie
 counts all hold identically on both sides of the bump.
 
+## Impulsiveness survey and the hb-256 storm re-measure (PAN-162)
+
+`impulse-survey` ranks capture days by impulsive (lightning-static)
+interference without decoding. Per slot it counts the 160 ms blocks whose
+power exceeds 3× the median of a 25-block window kept inside the slot
+(`src/impulsiveness.rs`), then ranks days by mean impulsive-block fraction
+and can emit a manifest of the stormiest days' slots:
+
+```bash
+cargo run --release -p pancetta-research --bin impulse-survey -- \
+  --dir ~/.pancetta/recordings --output survey.json \
+  --emit-manifest research/corpus/curated/ft8/storm_top3.manifest.json --top-days 3 --min-fraction 0.02
+```
+
+`examples/batch104_impulse_llr_storm_remeasure.rs` runs the pre-registered
+re-measure of `Ft8Config::impulse_robust_llr` (off / k=3 / k=6): resumable
+per-(plant, config) shards on the synthetic burst plants
+(`noise::ImpulseBurstPlant`), an off-air do-no-harm check on the vendored
+ft8_lib WAVs, a summarizer that applies the decision rule, and a
+`--manifest` mode for a real storm-day A/B. Commands and the decision rule:
+`research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
+
+`eval --bessel-fallback-enabled` (PAN-155) sets
+`Ft8Config::bessel_fallback_enabled`: an FT8 candidate whose DualMax AP0
+attempt fails gets one more AP0 attempt with the Bessel metric, skipped once
+the decode budget expires. It is off by default and stays off: the smoke A/B
+doubled unlimited eval time, and hard-200 has not been run. Run both arms
+back-to-back on the same host and thread count, with the flag as the only
+difference. Commands and results:
+`research/experiments/2026-10-26-pan155-bessel-fallback.md`.
+
 ## Design
 
 See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
