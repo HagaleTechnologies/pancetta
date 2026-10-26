@@ -1586,6 +1586,21 @@ async fn maybe_answer_caller(
         return;
     };
 
+    // An existing exchange was already advanced by process_message this cycle;
+    // it is not a new caller attempt and must not be logged as a refusal.
+    // A recently completed exchange uses the bounded auto-resend-73 path.
+    if qso_manager
+        .has_active_or_recent_qso_with(
+            &answer.their_call,
+            frequency_hz,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    {
+        debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
+        return;
+    }
+
     // Runtime TX policy wins attribution when both conditions refuse.
     let policy =
         pancetta_core::TxPolicy::from_u8(tx_policy.load(std::sync::atomic::Ordering::Relaxed));
@@ -1615,26 +1630,6 @@ async fn maybe_answer_caller(
             respond_only_admitted = 0,
             "Direct-call reply suppressed by operator-presence gate"
         );
-        return;
-    }
-
-    // 2. Don't open a duplicate — process_message already drives any active QSO
-    //    with this station (it ran before us this cycle). Also suppress for a
-    //    recently-completed QSO (120 s window): if the DX sends another RR73
-    //    right after we already exchanged 73s, the bounded auto-resend-73 path
-    //    (`maybe_auto_resend_73`) handles it — opening a brand-new QSO here
-    //    would produce spurious duplicate 73s. Explicit operator re-work via
-    //    StartQso / Space does NOT come through this function, so it is
-    //    unaffected by this gate.
-    if qso_manager
-        .has_active_or_recent_qso_with(
-            &answer.their_call,
-            frequency_hz,
-            std::time::Duration::from_secs(120),
-        )
-        .await
-    {
-        debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
         return;
     }
 
@@ -15383,6 +15378,32 @@ mod pan120_tests {
         assert!(!logs
             .iter()
             .any(|v| v["fields"]["respond_only_admitted"] == 1));
+    }
+
+    #[tokio::test]
+    async fn pan120_existing_or_recent_qso_has_no_new_caller_refusal_log() {
+        for existing in ["active", "recent"] {
+            for policy in [TxPolicy::Full, TxPolicy::Disabled] {
+                let st = Station::new(false, TxPolicy::Full).await;
+                let opening = if existing == "active" {
+                    "K5ARH W1ABC FN31"
+                } else {
+                    "K5ARH W1ABC RR73"
+                };
+                st.answer(&call(opening), UnattendedPolicy::Off, true).await;
+                st.tx_policy.store(policy.as_u8(), Ordering::Relaxed);
+
+                let mut rx = st.manager.subscribe();
+                let logs = st
+                    .answer(&call("K5ARH W1ABC R-12"), UnattendedPolicy::Off, false)
+                    .await;
+                assert!(drain(&mut rx).is_empty(), "{existing} {policy:?}");
+                assert!(
+                    !logs.iter().any(|event| event["target"] == "tx.policy"),
+                    "existing={existing} policy={policy:?} logs={logs:?}"
+                );
+            }
+        }
     }
 
     struct LoopHarness {
