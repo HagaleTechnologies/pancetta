@@ -379,21 +379,31 @@ async fn forward_config_reload_events(
 
 /// The directory holding `path`'s symlink target, every symlink resolved
 /// (the path's own directory when it is not a symlink). A symlink repointed
-/// at a file that does not exist yet cannot be resolved whole (PAN-196): its
-/// target's directory is then read from the link itself (a relative target
-/// counts from the link's directory), so the file's creation there is seen.
-/// `None` when that directory does not exist either, or `path` is a missing
-/// regular file.
+/// at a file that does not exist yet cannot be resolved whole (PAN-196): the
+/// links are then followed one by one (a relative target counts from its
+/// link's directory) to the missing file, whose directory is watched so the
+/// file's creation there is seen. `None` when that directory does not exist
+/// either, the links loop, or `path` is a missing regular file.
 fn resolve_config_target_dir(path: &Path) -> Option<PathBuf> {
+    /// Linux's own limit on symlinks followed in one lookup.
+    const MAX_LINKS: usize = 40;
     if let Ok(target) = std::fs::canonicalize(path) {
         return target.parent().map(Path::to_path_buf);
     }
-    let target = std::fs::read_link(path).ok()?;
-    let target = match path.parent() {
-        Some(link_dir) => link_dir.join(target),
-        None => target,
-    };
-    std::fs::canonicalize(target.parent()?).ok()
+    let mut file = path.to_path_buf();
+    for hop in 0..=MAX_LINKS {
+        let Ok(target) = std::fs::read_link(&file) else {
+            if hop == 0 {
+                return None;
+            }
+            return std::fs::canonicalize(file.parent()?).ok();
+        };
+        file = match file.parent() {
+            Some(link_dir) => link_dir.join(target),
+            None => target,
+        };
+    }
+    None
 }
 
 /// Whether `path` exists (following symlinks), checked off the async runtime.
@@ -2896,6 +2906,38 @@ mod tests {
         let missing = link_dir.join("missing.toml");
         std::os::unix::fs::symlink("../v3/pancetta.toml", &missing).unwrap();
         assert_eq!(resolve_config_target_dir(&missing), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PAN-196: a link to a second link whose target does not exist yet
+    /// resolves to the missing file's directory, not the second link's; a
+    /// missing regular file and a link loop resolve to nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_chain_resolves_to_its_final_target_directory() {
+        let root = temp_path("dangling-chain");
+        let (link_dir, mid_dir, new_dir) = (root.join("link"), root.join("mid"), root.join("v2"));
+        for d in [&link_dir, &mid_dir, &new_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mid = mid_dir.join("current.toml");
+        std::os::unix::fs::symlink("../v2/pancetta.toml", &mid).unwrap();
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink(&mid, &link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(
+            resolve_config_target_dir(&link),
+            Some(std::fs::canonicalize(&new_dir).unwrap())
+        );
+
+        assert_eq!(
+            resolve_config_target_dir(&link_dir.join("absent.toml")),
+            None
+        );
+        let (a, b) = (link_dir.join("a.toml"), link_dir.join("b.toml"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert_eq!(resolve_config_target_dir(&a), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
