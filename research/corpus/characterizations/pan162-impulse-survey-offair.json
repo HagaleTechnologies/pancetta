@@ -1,0 +1,971 @@
+{
+  "instrument": {
+    "block_samples": 1920,
+    "window_blocks": 25,
+    "knee": 3.0,
+    "silent_block_power": 1e-8,
+    "sample_rate": 12000
+  },
+  "days": [
+    {
+      "day": "20170923",
+      "slots": 4,
+      "silent_slots": 0,
+      "mean_fraction": 0.005376344086021506,
+      "p90_fraction": 0.021505376344086023,
+      "impulsive_slot_share": 0.25,
+      "max_fraction": 0.021505376344086023
+    },
+    {
+      "day": "20170709",
+      "slots": 1,
+      "silent_slots": 0,
+      "mean_fraction": 0.0,
+      "p90_fraction": 0.0,
+      "impulsive_slot_share": 0.0,
+      "max_fraction": 0.0
+    },
+    {
+      "day": "20181201",
+      "slots": 1,
+      "silent_slots": 0,
+      "mean_fraction": 0.0,
+      "p90_fraction": 0.0,
+      "impulsive_slot_share": 0.0,
+      "max_fraction": 0.0
+    },
+    {
+      "day": "20190227",
+      "slots": 1,
+      "silent_slots": 0,
+      "mean_fraction": 0.0,
+      "p90_fraction": 0.0,
+      "impulsive_slot_share": 0.0,
+      "max_fraction": 0.0
+    },
+    {
+      "day": "20191111",
+      "slots": 9,
+      "silent_slots": 0,
+      "mean_fraction": 0.0,
+      "p90_fraction": 0.0,
+      "impulsive_slot_share": 0.0,
+      "max_fraction": 0.0
+    },
+    {
+      "day": "20210703",
+      "slots": 1,
+      "silent_slots": 0,
+      "mean_fraction": 0.0,
+      "p90_fraction": 0.0,
+      "impulsive_slot_share": 0.0,
+      "max_fraction": 0.0
+    }
+  ],
+  "undated_slots": 58,
+  "skipped_wrong_rate": 7,
+  "unreadable": 0,
+  "silent_slots": 0,
+  "wavs": [
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110115.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.2164253684002988,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110130.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.0554343586986594,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110145.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.6339481945272494,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110200.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.02164429536072,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110215.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.071612513935709,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110615.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.7215069908194134,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110630.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 4.39148903870645,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110645.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.9433929842532816,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/191111_110700.wav",
+      "day": "20191111",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.729589806774464,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_01.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.0719781535094213,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_02.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.6813697747333792,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_03.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.6332844922485388,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_04.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.19975672473259,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_05.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7873408295742592,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_06.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.3053320988049975,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_07.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.5919739383061167,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_08.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7015435562094775,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_09.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.8343268461977094,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_10.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.754418673301852,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_11.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.2831610076332827,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_12.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.6463871612515402,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_13.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.9355731479530788,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_14.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.599198663036774,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_15.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.2151984070612083,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_16.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.5482080464127443,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_17.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7442987774780763,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_18.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.1796421378878597,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_19.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.9553387541510973,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_20.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.15454303617178855,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_21.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.5857763956331701,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_22.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.2449825287083303,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_23.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.6314694666398541,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_24.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.600296074120444,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_25.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7886619867986735,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_26.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.1094495213544129,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_27.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.3605693560221529,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_28.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.708643498797603,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_29.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.8379823306996799,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_30.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.168645338670689,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_31.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.930688502614795,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_32.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.6462708391906848,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_33.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.9777630165357423,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_34.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7561308216916475,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_35.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.9896954664455704,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_36.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.15830398773165133,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_37.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.105292492749646,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/20m_busy/test_38.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.3125011164872746,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test1.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.46478583758739694,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test10.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.6842347024468127,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test11.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.2061798467563194,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test12.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 3.3931999259874384,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test13.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.3601761598958553,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test14_12k.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.194349567154077,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test15_12k.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 4.045004284843566,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test2.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.23624768802439,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test3.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.9639112079006977,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test4.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.4562610735818713,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test5.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.847787662652997,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test6.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.7883893470878927,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test7.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.8117971381371086,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test8.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.7740608238827433,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/vendor/ft8_lib/test/wav/websdr_test9.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 4.552032285058467,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/basicft8/170923_082000.wav",
+      "day": "20170923",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 3.2641613121209723,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/basicft8/170923_082015.wav",
+      "day": "20170923",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 3.2360792006922696,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/basicft8/170923_082030.wav",
+      "day": "20170923",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.9129781013840852,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/basicft8/170923_082045.wav",
+      "day": "20170923",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 2,
+        "impulsive_block_fraction": 0.021505376344086023,
+        "peak_excess_db": 5.848452757392178,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/basicft8/live_now.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 2.018593609483249,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_cq.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.0038591086931502906,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_report.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.005285534808049238,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_rr73.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.006134197472306972,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/jtdx/000000_000001.wav",
+      "day": null,
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.2974539044985185,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/jtdx/190227_155815.wav",
+      "day": "20190227",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.4672919654659944,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/wsjt/170709_135615.wav",
+      "day": "20170709",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 0.5391767707377102,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/wsjt/181201_180245.wav",
+      "day": "20181201",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.3835164058266796,
+        "silent": false
+      }
+    },
+    {
+      "path": "pancetta-ft8/tests/fixtures/wav/wsjt/210703_133430.wav",
+      "day": "20210703",
+      "sample_rate": 12000,
+      "slot": {
+        "blocks": 93,
+        "impulsive_blocks": 0,
+        "impulsive_block_fraction": 0.0,
+        "peak_excess_db": 1.1670533265714533,
+        "silent": false
+      }
+    }
+  ]
+}

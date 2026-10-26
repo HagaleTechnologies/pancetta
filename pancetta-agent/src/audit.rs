@@ -384,6 +384,16 @@ impl AuditLog {
         Self::with_options(path, Limits::default(), Arc::new(move || start.elapsed()))
     }
 
+    /// Test-only constructor with caller-supplied monotonic time so rate
+    /// limiting and maintenance are independent of filesystem or scheduler delays.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_clock_for_test(
+        path: impl Into<PathBuf>,
+        clock: Arc<dyn Fn() -> Duration + Send + Sync>,
+    ) -> Self {
+        Self::with_options(path, Limits::default(), clock)
+    }
+
     fn with_options(path: impl Into<PathBuf>, limits: Limits, clock: MonotonicClock) -> Self {
         let now = clock();
         let full = u64::from(limits.burst) * 1000;

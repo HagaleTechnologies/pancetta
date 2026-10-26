@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An autonomous CQ whose opening transmission is rejected by a full TX
+  queue now clears its pending association and restores its speculative
+  offset and unanswered-CQ count, even if the CQ stops before another
+  transmission reaches the worker. Later rejected resends leave the
+  accepted opening's outcome with the TX worker (PAN-238).
+
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta

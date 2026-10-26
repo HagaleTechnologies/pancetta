@@ -81,6 +81,10 @@ struct Args {
     /// legacy 21-trial fine-FFT fallback. See
     /// `Ft8Config::fine_sync_enabled`.
     fine_sync_enabled: Option<bool>,
+    /// hb-256 / PAN-162 [A/B]: impulse-robust per-symbol LLR weighting
+    /// knee (`--impulse-robust-llr <K>`; finite and > 0). `None` leaves
+    /// the library default (off). See `Ft8Config::impulse_robust_llr`.
+    impulse_robust_llr: Option<f64>,
     /// Decoder-TP-sensitivity Task W3.4 [A/B]: nsym=2/3 noncoherent
     /// combining LLR variants layered on top of the W3.3 matched-demod
     /// stage (only takes effect when `fine_sync_enabled` is ALSO
@@ -302,6 +306,19 @@ struct Args {
     effort_name: Option<String>,
 }
 
+/// Parses `--impulse-robust-llr`'s knee: a finite value > 0 (fail-closed).
+fn parse_impulse_robust_llr(s: &str) -> anyhow::Result<f64> {
+    let k: f64 = s
+        .trim()
+        .parse()
+        .with_context(|| format!("--impulse-robust-llr: not a number: {s:?}"))?;
+    anyhow::ensure!(
+        k.is_finite() && k > 0.0,
+        "--impulse-robust-llr must be finite and > 0, got {s:?}"
+    );
+    Ok(k)
+}
+
 impl Args {
     fn parse() -> anyhow::Result<Self> {
         Self::parse_from(std::env::args().skip(1))
@@ -340,6 +357,7 @@ impl Args {
         let mut escalation_enabled: Option<bool> = None;
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut fine_sync_enabled: Option<bool> = None;
+        let mut impulse_robust_llr: Option<f64> = None;
         let mut nsym_combining_enabled: Option<bool> = None;
         let mut per_candidate_freq_tracker_enabled: Option<bool> = None;
         let mut time_varying_subtraction_enabled: Option<bool> = None;
@@ -593,6 +611,11 @@ impl Args {
                 }
                 "--fine-sync-enabled" => {
                     fine_sync_enabled = Some(true);
+                }
+                "--impulse-robust-llr" => {
+                    impulse_robust_llr = Some(parse_impulse_robust_llr(
+                        &iter.next().context("--impulse-robust-llr needs a value")?,
+                    )?);
                 }
                 "--nsym-combining-enabled" => {
                     nsym_combining_enabled = Some(true);
@@ -1010,6 +1033,7 @@ impl Args {
                     eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --fine-sync-enabled: decoder-TP-sensitivity Task W3.3 [A/B] — per-candidate fine-sync + matched-demod stage replacing the legacy 21-trial fine-FFT fallback (default off). See Ft8Config::fine_sync_enabled.");
+                    eprintln!("  --impulse-robust-llr K: hb-256 / PAN-162 [A/B] — impulse-robust per-symbol LLR weighting with knee K (finite, > 0; e.g. 6). Default off. See Ft8Config::impulse_robust_llr.");
                     eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
                     eprintln!("  --per-candidate-freq-tracker-enabled: decoder-TP-sensitivity Task W3.6 [A/B] — re-test of the per-candidate frequency tracker as a consumer of the W3.3 matched-demod stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::per_candidate_freq_tracker_enabled.");
                     eprintln!("  --time-varying-subtraction-enabled: decoder-TP-sensitivity Task W4.2/W4.3 [A/B] — per-block time-varying GFSK subtraction, replacing the legacy whole-signal fit; only observable when --max-passes >= 2 (default off). See Ft8Config::time_varying_subtraction_enabled.");
@@ -1130,6 +1154,7 @@ impl Args {
             escalation_enabled,
             fine_fft_rect_window,
             fine_sync_enabled,
+            impulse_robust_llr,
             nsym_combining_enabled,
             per_candidate_freq_tracker_enabled,
             time_varying_subtraction_enabled,
@@ -2556,6 +2581,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     if let Some(on) = args.fine_sync_enabled {
         d = d.with_fine_sync_enabled(on);
     }
+    if args.impulse_robust_llr.is_some() {
+        d = d.with_impulse_robust_llr(args.impulse_robust_llr);
+    }
     if let Some(on) = args.nsym_combining_enabled {
         d = d.with_nsym_combining_enabled(on);
     }
@@ -3391,6 +3419,29 @@ mod arg_tests {
         )
         .unwrap();
         assert_eq!(args.effort_budget_ms, Some(800));
+    }
+
+    #[test]
+    fn parse_impulse_robust_llr_flag() {
+        assert_eq!(parse(&[]).unwrap().impulse_robust_llr, None);
+        let args = parse(&["--impulse-robust-llr", "6"]).unwrap();
+        assert_eq!(args.impulse_robust_llr, Some(6.0));
+        assert_eq!(
+            parse(&["--impulse-robust-llr", "3.0"])
+                .unwrap()
+                .impulse_robust_llr,
+            Some(3.0)
+        );
+        for bad in ["0", "-1", "NaN", "inf", "-inf", "abc"] {
+            let err = parse(&["--impulse-robust-llr", bad]).unwrap_err();
+            assert!(
+                err.to_string().contains("--impulse-robust-llr"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(parse(&["--impulse-robust-llr"]).is_err());
+        assert_eq!(parse_impulse_robust_llr("6").unwrap(), 6.0);
+        assert!(parse_impulse_robust_llr("0.0").is_err());
     }
 
     #[test]

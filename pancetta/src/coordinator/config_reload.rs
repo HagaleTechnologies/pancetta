@@ -377,6 +377,35 @@ async fn forward_config_reload_events(
     }
 }
 
+/// The directory holding `path`'s symlink target, every symlink resolved
+/// (the path's own directory when it is not a symlink). A symlink repointed
+/// at a file that does not exist yet cannot be resolved whole (PAN-196): the
+/// links are then followed one by one (a relative target counts from its
+/// link's directory) to the missing file, whose directory is watched so the
+/// file's creation there is seen. `None` when that directory does not exist
+/// either, the links loop, or `path` is a missing regular file.
+fn resolve_config_target_dir(path: &Path) -> Option<PathBuf> {
+    /// Linux's own limit on symlinks followed in one lookup.
+    const MAX_LINKS: usize = 40;
+    if let Ok(target) = std::fs::canonicalize(path) {
+        return target.parent().map(Path::to_path_buf);
+    }
+    let mut file = path.to_path_buf();
+    for hop in 0..=MAX_LINKS {
+        let Ok(target) = std::fs::read_link(&file) else {
+            if hop == 0 {
+                return None;
+            }
+            return std::fs::canonicalize(file.parent()?).ok();
+        };
+        file = match file.parent() {
+            Some(link_dir) => link_dir.join(target),
+            None => target,
+        };
+    }
+    None
+}
+
 /// Whether `path` exists (following symlinks), checked off the async runtime.
 async fn path_exists(path: PathBuf) -> bool {
     tokio::task::spawn_blocking(move || path.exists())
@@ -582,14 +611,12 @@ impl super::ApplicationCoordinator {
             return false;
         }
         let path = self.config_watch_path.clone();
-        let Ok(Ok(target)) = tokio::task::spawn_blocking(move || std::fs::canonicalize(path)).await
+        let Ok(Some(target_dir)) =
+            tokio::task::spawn_blocking(move || resolve_config_target_dir(&path)).await
         else {
             return false;
         };
-        let dir = target
-            .parent()
-            .map(Path::to_path_buf)
-            .filter(|d| !self.config_link_dirs.contains(d));
+        let dir = Some(target_dir).filter(|d| !self.config_link_dirs.contains(d));
         if dir == self.config_target_dir {
             return false;
         }
@@ -630,9 +657,15 @@ impl super::ApplicationCoordinator {
     /// directory not watched yet, watch it and re-read the file once, so an
     /// edit made there before the watch existed is not missed.
     pub(crate) async fn handle_config_reload(&mut self, outcome: ConfigReloadOutcome) {
+        let failed = outcome.as_ref().err().cloned();
         self.apply_config_reload(outcome).await;
         if self.watch_config_target_dir().await {
             let outcome = run_reload_loader(self.reload_loader()).await;
+            // A target that is still missing (PAN-196) or still broken fails
+            // the same way again: that error was just reported.
+            if matches!((&outcome, &failed), (Err(e), Some(f)) if e == f) {
+                return;
+            }
             self.apply_config_reload(outcome).await;
         }
     }
@@ -1324,6 +1357,9 @@ mod tests {
                 operator_callsign: "K1TEST".to_string(),
                 ttl_ms: 300_000,
                 armed_until_ms: now.unix_ms + 300_000,
+                capability_exp_ms: now.unix_ms + 300_000 + 3_600_000,
+                tx_enabled_until_ms: now.unix_ms + 300_000 + 3_600_000,
+                effective_ttl_ms: 300_000,
                 heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pan103-arm".to_string(),
@@ -2569,14 +2605,30 @@ mod tests {
         want: bool,
         act: impl Fn(),
     ) -> ConfigReloadOutcome {
+        resave_until(
+            rx,
+            |outcome| {
+                matches!(outcome, Ok((c, _)) if c.network.station_agent.remote_tx_enabled == want)
+            },
+            act,
+        )
+        .await
+    }
+
+    /// Repeat `act` until a reload outcome `wanted` accepts arrives (see
+    /// [`resave_until_consent`]).
+    async fn resave_until(
+        rx: &mut mpsc::Receiver<ConfigReloadOutcome>,
+        wanted: impl Fn(&ConfigReloadOutcome) -> bool,
+        act: impl Fn(),
+    ) -> ConfigReloadOutcome {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 act();
                 let wait = tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
                         let outcome = rx.recv().await.expect("channel open");
-                        if matches!(&outcome, Ok((c, _)) if c.network.station_agent.remote_tx_enabled == want)
-                        {
+                        if wanted(&outcome) {
                             return outcome;
                         }
                     }
@@ -2675,6 +2727,220 @@ mod tests {
         })
         .await;
         assert!(outcome.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PAN-196: the symlink is repointed at a file in an unwatched directory
+    /// BEFORE that file exists. The dangling link still names the new
+    /// directory, which is watched from the handled repoint on, so the
+    /// file's first creation is applied live: the removed client is evicted
+    /// and disarmed with no further save.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symlink_repointed_at_a_file_created_later_applies_its_revocation() {
+        let root = temp_path("dangling-symlink");
+        let (link_dir, old_dir, new_dir) = (root.join("link"), root.join("v1"), root.join("v2"));
+        for d in [&link_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        config.network.station_agent.enabled = true;
+        config.network.station_agent.relay_url = Some("wss://relay.example.test".to_string());
+        config.network.station_agent.pairing_api_url =
+            Some("https://pair.example.test".to_string());
+        let old_target = old_dir.join("pancetta.toml");
+        std::fs::write(&old_target, toml::to_string(&config).unwrap()).unwrap();
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+
+        let (mut coordinator, _audit_tmp) = test_coordinator(config.clone()).await;
+        let live = crate::coordinator::station_agent::StationAgentLiveHandles {
+            tx_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            client_keys: Arc::new(std::sync::RwLock::new(Default::default())),
+            revocation_pending: Arc::new(AtomicBool::new(false)),
+            authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stop_requested: Default::default(),
+        };
+        coordinator.station_agent_live = Some(live.clone());
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        arm_client(&coordinator, "A");
+        assert!(permitted(&coordinator, "A"));
+        let tui = tui_rx(&coordinator).await;
+
+        coordinator.config_path = std::fs::canonicalize(&link).unwrap();
+        coordinator.set_config_watch_path(link.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut rx = coordinator
+            .config_reload_rx
+            .take()
+            .expect("watcher started");
+        assert_eq!(
+            coordinator.config_target_dir,
+            Some(std::fs::canonicalize(&old_dir).unwrap())
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = diagnostics(&tui);
+
+        // Repoint at a file that does not exist yet: the load fails.
+        let new_target = new_dir.join("pancetta.toml");
+        let tmp_link = link_dir.join(".pancetta.toml.tmp");
+        let outcome = resave_until(&mut rx, Result::is_err, || {
+            let _ = std::fs::remove_file(&tmp_link);
+            std::os::unix::fs::symlink(&new_target, &tmp_link).unwrap();
+            std::fs::rename(&tmp_link, &link).unwrap();
+        })
+        .await;
+        assert!(!new_target.exists());
+        coordinator.handle_config_reload(outcome).await;
+        assert_eq!(
+            coordinator.config_target_dir,
+            Some(std::fs::canonicalize(&new_dir).unwrap()),
+            "the missing target's directory is watched before the file exists"
+        );
+        // The previous configuration stays in force while the file is missing.
+        assert_eq!(
+            coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .tx_allow_list,
+            vec!["A".to_string(), "B".to_string()]
+        );
+        assert!(live.tx_allow_list.read().unwrap().contains("A"));
+        assert!(permitted(&coordinator, "A"));
+        let lines = diagnostics(&tui);
+        assert_eq!(
+            texts(&lines)
+                .iter()
+                .filter(|t| t.starts_with("Config reload failed: ")
+                    && t.ends_with(" — previous configuration still active"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+
+        // Wait out the library's 500 ms reload debounce (the repoint's first
+        // event reloaded the old target), then create the file exactly once.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let mut pruned = config.clone();
+        pruned.network.station_agent.tx_allow_list = vec!["B".to_string()];
+        std::fs::write(&new_target, toml::to_string(&pruned).unwrap()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let outcome = rx.recv().await.expect("channel open");
+                if outcome.is_ok() {
+                    return outcome;
+                }
+            }
+        })
+        .await
+        .expect("creating the new target is reloaded without another save");
+        coordinator.handle_config_reload(outcome).await;
+
+        assert_eq!(
+            coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .tx_allow_list,
+            vec!["B".to_string()]
+        );
+        assert!(!live.tx_allow_list.read().unwrap().contains("A"));
+        assert!(!live.tx_arm_allow_list.read().unwrap().contains("A"));
+        assert!(!permitted(&coordinator, "A"));
+        assert_eq!(
+            live.authz_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(live
+            .revocation_pending
+            .load(std::sync::atomic::Ordering::Acquire));
+        let lines = diagnostics(&tui);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                MSG_RELOADED,
+                "tx_allow_list entry removed: A — session evicted, authorization revoked"
+            ],
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PAN-196: a relative link target that does not exist yet is resolved
+    /// against the link's own directory, not the process working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_relative_symlink_resolves_to_its_target_directory() {
+        let root = temp_path("dangling-relative");
+        let (link_dir, new_dir) = (root.join("link"), root.join("v2"));
+        for d in [&link_dir, &new_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink("../v2/pancetta.toml", &link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(
+            resolve_config_target_dir(&link),
+            Some(std::fs::canonicalize(&new_dir).unwrap())
+        );
+
+        // A target directory that does not exist either resolves to nothing,
+        // so the previous target's watch is kept.
+        let missing = link_dir.join("missing.toml");
+        std::os::unix::fs::symlink("../v3/pancetta.toml", &missing).unwrap();
+        assert_eq!(resolve_config_target_dir(&missing), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PAN-196: a link to a second link whose target does not exist yet
+    /// resolves to the missing file's directory, not the second link's; a
+    /// missing regular file and a link loop resolve to nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_chain_resolves_to_its_final_target_directory() {
+        let root = temp_path("dangling-chain");
+        let (link_dir, mid_dir, new_dir) = (root.join("link"), root.join("mid"), root.join("v2"));
+        for d in [&link_dir, &mid_dir, &new_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mid = mid_dir.join("current.toml");
+        std::os::unix::fs::symlink("../v2/pancetta.toml", &mid).unwrap();
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink(&mid, &link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(
+            resolve_config_target_dir(&link),
+            Some(std::fs::canonicalize(&new_dir).unwrap())
+        );
+
+        assert_eq!(
+            resolve_config_target_dir(&link_dir.join("absent.toml")),
+            None
+        );
+        let (a, b) = (link_dir.join("a.toml"), link_dir.join("b.toml"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert_eq!(resolve_config_target_dir(&a), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
