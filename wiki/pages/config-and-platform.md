@@ -44,6 +44,10 @@ so it applies only while the 1 ms floor-only budget is published. Eco with a
 `budget_ms` override other than 1 runs without it until a live effort cycle publishes
 Eco's own 1 ms; an explicit `budget_ms = 1` keeps it on. See
 [Eco-preset fine sync](../../docs/DECISIONS/config-and-platform.md#eco-preset-fine-sync-pan-158-2026-10-25).
+The second FT8-only policy field is `impulse_robust_llr` (PAN-241): `Some(6.0)` on FT8
+at every preset, `None` otherwise, keyed as `impulse_robust_llr_bits` because `f64`
+is not `Eq`. See
+[FT8 impulse-robust LLR knee](../../docs/DECISIONS/config-and-platform.md#ft8-impulse-robust-llr-knee-pan-162-pan-241-2026-10-27).
 
 Second gotcha (PAN-90): **a new config struct needs container-level
 `#[serde(default)]` and a `Default` impl**, or `pancetta-config/tests/partial_tables.rs`

@@ -544,6 +544,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The live station's FT8 decodes now down-weight the soft bits of any
+  symbol whose total tone power jumps above 6 times the candidate's median,
+  as a lightning-static crash does (hb-256's impulse-robust LLR knee,
+  `impulse_robust_llr = 6.0`), at every decode-effort preset. On a synthetic plant with frequent noise
+  bursts this moved the decode threshold +0.465 dB (95% CI +0.308 to
+  +0.653) at no cost on plain Gaussian noise, and it decoded one more signal
+  on the 60 vendored off-air recordings. On the production gate it changed
+  nothing measurable: 285 of 550 synthetic weak signals recovered either
+  way, 5 → 5 false decodes on 1000 noise files, elapsed −4.5%
+  (synthetic) and +14.0% (noise). FT4 and FT2 decode as before, and so
+  does `--wav` file playback, which builds its decoder from the library
+  default. Synthetic, vendored off-air and single-host evidence only
+  (PAN-162, PAN-241).
+
 - The Eco decode-effort preset, and Auto on hosts the hardware probe rates
   Slow, now retries an FT8 candidate whose first decode attempt fails at a
   refined timing and frequency estimate (Task W3.3's fine sync) while the

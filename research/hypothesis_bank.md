@@ -6875,7 +6875,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate not yet run, default stays off.]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHIPPED-FT8-K6 2026-10-27 PAN-241 — coordinator default Some(6.0) for FT8 after PAN-162's production gate passed; previously SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate passed (PAN-241: synth-clean recovered Δ+0, CI [+0, +0], elapsed −4.5%; noise_1000 false positives 5 → 5, noise files decoded 5 → 5, elapsed +14.0%), default-on for FT8 at k=6.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6942,7 +6942,21 @@ search to in-repo sources.
     rate. The plan's native-only production gate (synth-clean, noise_1000,
     elapsed) has not run yet: its noise arms cost about 90 single-core
     minutes each here. Until it passes, the default stays off; operators
-    in heavy QRN can still opt in with Some(6.0).
+    in heavy QRN can still opt in with Some(6.0). (Superseded: PAN-241
+    ran the gate and it passed; see the next UPDATE.)
+
+    UPDATE 2026-10-27 (PAN-241): the synth-clean leg of the production
+    gate ran native-only and serially (6 threads, both arms alone in the
+    container): recovered 285 → 285 of 550 (Δ+0, paired 95% CI
+    [+0.0, +0.0]), novel 7 → 7, elapsed 663.1 → 633.4 s (−4.5%, budget
+    +20%). All three synth-clean bars pass. The noise_1000 leg then ran
+    the same way: false_positives_total 5 → 5,
+    noise_files_decoded 5 → 5, elapsed 1042.2 → 1188.1 s
+    (+14.0%, budget +20%). Every bar passes, so k=6 ships default-on
+    for FT8 through the coordinator: `apply_effort_overrides` sets
+    `impulse_robust_llr = Some(6.0)` on FT8 and `None` on FT4 and FT2,
+    and the library default stays `None`. Scorecards:
+    `research/scorecards/pan162-{synth,noise}-{control,variant}.json`.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 
