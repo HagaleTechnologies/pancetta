@@ -161,7 +161,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - `pancetta import` fixes from the PAN-127 review (PAN-214). Tag-shaped
   text inside a value counted in characters (`<NOTES:9>€€€<X:1>z`) now stays
   in the value instead of becoming a field: the reader decides once per file
@@ -179,7 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contacts (after 60 seconds it is written anyway, never dropped). Undo removes only the imported contacts,
   so a contact logged while the import ran, or since, is kept; the old undo
   restored the pre-import backup and lost it.
-=======
+
 - DX Hunter rows scored from a cqdx spot now include the spot's reporter
   count, best SNR and age (PAN-227). The `w` breakdown shows them instead of
   `network reports: none` and `1.00` freshness, and stale spots or spots with
@@ -198,7 +197,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already has bookmarks, a bookmark save or delete edits its list instead of
   replacing it with the list the TUI was showing. A save through a symlink
   whose target is missing is refused, and the link is left in place.
->>>>>>> bfac5043c33acb8e963638b6226cb51afbd482a1
 
 - An autonomous CQ whose opening transmission is rejected by a full TX
   queue now clears its pending association and restores its speculative

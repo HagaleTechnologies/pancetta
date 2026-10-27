@@ -1252,6 +1252,31 @@ fn undo_removes_the_import_and_keeps_a_contact_logged_since() {
     assert!(receipt.undone_at.is_some(), "{receipt:?}");
 }
 
+/// PAN-214: an undo run while another import is still indexing (here into a
+/// new index, so `qso.db` is not there yet) writes its own name into that
+/// import's rebuild marker, so the import does not clear the undo's rebuild
+/// request when it finishes.
+#[test]
+fn undo_takes_over_the_rebuild_marker_of_an_import_still_indexing() {
+    let s = Scratch::new();
+    s.seed_logbook(
+        &pancetta_logbook(&[pancetta_record("K9XYZ", "20231201", "090000")]),
+        true,
+    );
+    let file = s.write_file("lotw.adi", contacts(&["N0AAA", "N0BBB"]));
+    let receipt = assert_undo_lines(&s, &s.import_ok(&file));
+    std::fs::remove_file(s.db()).unwrap();
+    let marker = QsoDatabase::rebuild_marker(&s.db());
+    std::fs::write(&marker, "import /elsewhere/import-x.json\n").unwrap();
+
+    s.undo_ok(&receipt);
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        format!("undo {}\n", receipt.display())
+    );
+}
+
 /// PAN-214: undo also keeps a live QSO that was waiting on the lock with
 /// the import, whichever of the two wrote first.
 #[test]

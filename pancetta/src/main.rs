@@ -1043,9 +1043,11 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     // indexed (and the index was current to begin with), so an import
     // stopped part-way still gets its index rebuilt at the next start. A
     // marker left by an earlier interrupted import is not ours to clear: its
-    // missing rows are not among the ones added here.
+    // missing rows are not among the ones added here. Nor is ours once an
+    // undo or another import has asked for a rebuild while this one indexed.
     let marker = QsoDatabase::rebuild_marker(&db);
-    let marked_here = match mark_index_incomplete(&marker) {
+    let marker_owner = format!("import {}", receipt_path.display());
+    let marked_here = match mark_index_incomplete(&marker, &marker_owner) {
         Ok(created) => created,
         Err(e) => {
             let _ = std::fs::remove_file(&receipt_path);
@@ -1094,7 +1096,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     // ones are added: keep it marked, since a later live write can make
     // qso.db look newer than qsos.adi again (PAN-127).
     if marked_here && indexed.is_ok() && !index_was_behind {
-        let _ = std::fs::remove_file(&marker);
+        clear_own_index_marker(&adif, &marker, &marker_owner).await;
     }
     print!(
         "{}",
@@ -1362,10 +1364,12 @@ async fn undo_import_command(receipt_path: PathBuf) -> Result<()> {
         );
     }
     // Marked before the rewrite, so a failure to mark changes nothing; a
-    // rebuild of an index that turns out current is harmless.
-    if db.exists() {
-        let marker = QsoDatabase::rebuild_marker(&db);
-        mark_index_incomplete(&marker)
+    // rebuild of an index that turns out current is harmless. An existing
+    // marker is taken over, so an import still indexing (its index may not
+    // exist yet) cannot clear it.
+    let marker = QsoDatabase::rebuild_marker(&db);
+    if db.exists() || marker.exists() {
+        mark_index_incomplete(&marker, &format!("undo {}", receipt_path.display()))
             .with_context(|| format!("Cannot write {}; nothing was changed.", marker.display()))?;
     }
     remove_import_block(&adif, &current, at, len).with_context(|| {
@@ -1454,27 +1458,69 @@ async fn index_imported_contacts(
     Ok(())
 }
 
-/// Create the index's rebuild marker and flush it to disk. Returns whether
-/// this call created it; `false` means one was already there.
-fn mark_index_incomplete(marker: &Path) -> std::io::Result<bool> {
+/// Create the index's rebuild marker holding `owner`, and flush it to disk.
+/// Returns whether this call created it; `false` means one was already there,
+/// and `owner` then replaces what it held, so whoever created it sees that a
+/// later rebuild request arrived and leaves it for the next start. Callers
+/// hold the logbook lock (PAN-214).
+fn mark_index_incomplete(marker: &Path, owner: &str) -> std::io::Result<bool> {
     // A new logbook's directory may not exist yet.
     let dir = marker.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
-    match std::fs::OpenOptions::new()
+    let created = match write_marker_file(marker, owner) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Taken over by renaming a new file onto it, so a symlink planted
+            // at the marker is replaced, never followed, and the marker never
+            // reads as empty.
+            let mut tmp = marker.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            let _ = std::fs::remove_file(&tmp);
+            write_marker_file(&tmp, owner)?;
+            if let Err(e) = std::fs::rename(&tmp, marker) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            false
+        }
+        Err(e) => return Err(e),
+    };
+    // On Unix a new or renamed file's name is durable only once its
+    // directory is flushed; best effort, as Windows cannot open a directory.
+    #[cfg(unix)]
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    Ok(created)
+}
+
+/// Create `path` exclusively, holding `owner` and a newline (so a torn write
+/// never reads as a whole owner), flushed to disk.
+fn write_marker_file(path: &Path, owner: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(marker)
-    {
-        Ok(file) => {
-            file.sync_all()?;
-            // On Unix a new file's name is durable only once its directory
-            // is flushed; best effort, as Windows cannot open a directory.
-            #[cfg(unix)]
-            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
+        .open(path)?;
+    file.write_all(format!("{owner}\n").as_bytes())?;
+    file.sync_all()
+}
+
+/// Remove the rebuild marker `import_command` created, but only while it
+/// still holds `owner`: an undo or another import that asked for a rebuild
+/// while this import indexed rewrote it, and the index then still holds
+/// contacts the logbook lost, or misses some it gained. Checked and removed
+/// under the logbook lock, which every rebuild request holds; when the lock
+/// stays busy, the marker is left and the next start rebuilds the index,
+/// which is harmless (PAN-214).
+async fn clear_own_index_marker(adif: &Path, marker: &Path, owner: &str) {
+    let Ok(lock) = LogbookLock::open(adif) else {
+        return;
+    };
+    let Ok(Some(_turn)) = lock.lock_within(IMPORT_LOCK_WAIT, || {}).await else {
+        return;
+    };
+    if std::fs::read(marker).is_ok_and(|held| held == format!("{owner}\n").as_bytes()) {
+        let _ = std::fs::remove_file(marker);
     }
 }
 
@@ -3892,6 +3938,54 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// An undo that runs while an import is still indexing finds the
+    /// import's rebuild marker already there. The import must then leave it
+    /// when it finishes: the undo's rewrite of the logbook can be older than
+    /// the import's index commit, so the marker is the only thing left that
+    /// makes the next start drop the removed contacts (PAN-214).
+    #[tokio::test]
+    async fn an_import_leaves_a_rebuild_marker_another_request_took_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let marker = dir.path().join("qso.db.rebuild");
+
+        assert!(mark_index_incomplete(&marker, "import a.json").unwrap());
+        assert!(!mark_index_incomplete(&marker, "undo b.json").unwrap());
+        clear_own_index_marker(&adif, &marker, "import a.json").await;
+        assert!(
+            marker.exists(),
+            "the undo's rebuild request must survive the import's cleanup"
+        );
+
+        let own = dir.path().join("own.rebuild");
+        assert!(mark_index_incomplete(&own, "import c.json").unwrap());
+        clear_own_index_marker(&adif, &own, "import c.json").await;
+        assert!(
+            !own.exists(),
+            "an untouched marker is the import's to clear"
+        );
+    }
+
+    /// Taking over a marker never writes through a symlink planted at it.
+    #[cfg(unix)]
+    #[test]
+    fn taking_over_a_rebuild_marker_never_follows_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let marker = dir.path().join("qso.db.rebuild");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        assert!(!mark_index_incomplete(&marker, "undo b.json").unwrap());
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!std::fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "undo b.json\n");
     }
 
     #[test]
