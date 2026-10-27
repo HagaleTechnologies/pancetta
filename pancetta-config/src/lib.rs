@@ -1880,7 +1880,10 @@ mod merge_guard {
 
         assert_carries_all::<autonomous::AutonomousConfig>(
             "AutonomousConfig",
-            &[("slot_parity", json!("even"))],
+            &[
+                ("slot_parity", json!("even")),
+                ("unattended_policy", json!("respond_only")),
+            ],
             |a, b| a.merge_with(b),
         );
 

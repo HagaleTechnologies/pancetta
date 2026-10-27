@@ -5,9 +5,9 @@
 //! This module defines `DtPrior` and the `DtPriorLookup` trait that the
 //! decoder consumes during the residual sync pass. A reference in-memory
 //! implementation (`InMemoryDtHistory`) is provided for the eval harness;
-//! the production pancetta coordinator wraps `pancetta_qso::CrossTimeState`
-//! and provides its own adapter (kept out of this crate to avoid a
-//! pancetta-ft8 → pancetta-qso dep edge).
+//! the production coordinator does not yet attach this lookup. Its separate
+//! `pancetta_qso::CrossTimeState` would need a provenance-aware adapter before
+//! these native research results could apply to the station.
 //!
 //! # Mechanism (V1)
 //!
@@ -38,6 +38,17 @@
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
+
+/// Canonical sender key for standard FT8 calls, including /R and /P suffixes.
+/// The legacy recorder keeps its existing key semantics; AP callers use this
+/// key before recording or looking up a sender.
+pub fn normalize_dt_callsign(call: &str) -> String {
+    call.split('/')
+        .next()
+        .unwrap_or(call)
+        .trim()
+        .to_ascii_uppercase()
+}
 
 /// Default minimum sightings before a DT prior is returned.
 pub const DEFAULT_MIN_SIGHTINGS: usize = 2;
@@ -76,6 +87,11 @@ pub trait DtPriorLookup: Send + Sync {
     /// available (insufficient sightings, expired, unknown callsign).
     fn prior(&self, callsign: &str) -> Option<DtPrior>;
 
+    /// A fresh prior at the query time. Legacy stores safely opt out.
+    fn prior_at(&self, _callsign: &str, _at: SystemTime) -> Option<DtPrior> {
+        None
+    }
+
     /// V2 (Session 3): return the union of DT priors for all callsigns
     /// whose recent sightings were within `freq_window_hz` of
     /// `target_freq_hz`. The decoder uses this at residual-sync time to
@@ -94,8 +110,8 @@ pub trait DtPriorLookup: Send + Sync {
 /// In-memory reference implementation of `DtPriorLookup`.
 ///
 /// Thread-safe via `Mutex`. Capacity-bounded per callsign and per-sighting
-/// age-bounded. Designed for eval-harness use; production wraps
-/// `pancetta_qso::CrossTimeState` instead.
+/// age-bounded. Used by the research harness; production maintains a separate
+/// `pancetta_qso::CrossTimeState` without this decoder adapter.
 pub struct InMemoryDtHistory {
     inner: Mutex<DtHistoryInner>,
 }
@@ -219,6 +235,26 @@ impl DtPriorLookup for InMemoryDtHistory {
         Some(compute_prior_from_dts(&mut dts))
     }
 
+    fn prior_at(&self, callsign: &str, at: SystemTime) -> Option<DtPrior> {
+        let g = self.inner.lock().ok()?;
+        let entries = g.entries.get(callsign)?;
+        let mut timestamps = std::collections::HashSet::new();
+        let mut dts: Vec<f64> = entries
+            .iter()
+            .filter(|s| {
+                s.dt_s.is_finite()
+                    && at.duration_since(s.at).is_ok_and(|age| age <= g.max_age)
+                    && timestamps.insert(s.at)
+            })
+            .map(|s| s.dt_s)
+            .collect();
+        if dts.len() < g.min_sightings.max(2) {
+            return None;
+        }
+        let prior = compute_prior_from_dts(&mut dts);
+        (prior.median_dt.is_finite() && prior.iqr.is_finite()).then_some(prior)
+    }
+
     /// V2: walk every tracked callsign; for each, check if ANY of its
     /// (non-NaN) sightings is within `freq_window_hz` of
     /// `target_freq_hz`. If yes AND that callsign meets `min_sightings`,
@@ -251,6 +287,55 @@ impl DtPriorLookup for InMemoryDtHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_prior_requires_distinct_finite_past_slots() {
+        let h = InMemoryDtHistory::new(10, Duration::from_secs(60), 2);
+        let t = t0();
+        assert!(h.prior_at("W1AW", t).is_none());
+        h.record("W1AW", 0.2, t);
+        h.record("W1AW", 0.2, t);
+        assert!(h.prior_at("W1AW", t + Duration::from_secs(30)).is_none());
+        h.record("W1AW", 0.3, t + Duration::from_secs(15));
+        assert!(h.prior_at("W1AW", t).is_none());
+        let p = h.prior_at("W1AW", t + Duration::from_secs(60)).unwrap();
+        assert_eq!(p.sighting_count, 2);
+        assert!((p.median_dt - 0.25).abs() < 1e-9);
+        assert!(p.iqr.is_finite());
+        assert!(h.prior_at("W1AW", t + Duration::from_secs(61)).is_none());
+        assert!(h.prior_at("W1AW", t + Duration::from_secs(3600)).is_none());
+        assert!(h.prior("W1AW").is_some(), "legacy lookup stays unchanged");
+        h.record("W1AW", f64::NAN, t + Duration::from_secs(30));
+        h.record("W1AW", f64::INFINITY, t + Duration::from_secs(45));
+        assert_eq!(
+            h.prior_at("W1AW", t + Duration::from_secs(60))
+                .unwrap()
+                .sighting_count,
+            2
+        );
+    }
+
+    #[test]
+    fn fresh_prior_capacity_and_legacy_opt_out() {
+        struct Legacy;
+        impl DtPriorLookup for Legacy {
+            fn prior(&self, _: &str) -> Option<DtPrior> {
+                Some(DtPrior {
+                    median_dt: 0.3,
+                    iqr: 0.0,
+                    sighting_count: 2,
+                })
+            }
+        }
+        assert!(Legacy.prior_at("W1AW", t0()).is_none());
+        let h = InMemoryDtHistory::new(2, Duration::from_secs(60), 2);
+        for i in 0..3 {
+            h.record("W1AW", i as f64 * 0.1, t0() + Duration::from_secs(i * 15));
+        }
+        let p = h.prior_at("W1AW", t0() + Duration::from_secs(45)).unwrap();
+        assert_eq!(p.sighting_count, 2);
+        assert!((p.median_dt - 0.15).abs() < 1e-9);
+    }
 
     fn t0() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
@@ -352,4 +437,40 @@ mod tests {
         // But the V1 prior() path still finds the callsign.
         assert!(h.prior("K1ABC").is_some());
     }
+}
+
+/// Research telemetry, reset for each decode window.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TimingDiagnostics {
+    /// V2 frequency queries.
+    pub v2_queries: u64,
+    /// Queries returning at least one prior.
+    pub v2_hits: u64,
+    /// Residual candidates retained without a prior.
+    pub v2_without_prior: u64,
+    /// Residual candidates retained inside prior windows.
+    pub v2_inside: u64,
+    /// Residual candidates rejected outside all windows.
+    pub v2_rejected: u64,
+    /// Sender-bound AP retry activity.
+    pub ap: ApTimingDiagnostics,
+}
+
+/// Sender-bound AP retry counters.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ApTimingDiagnostics {
+    /// Distinct senders with usable priors.
+    pub eligible_targets: u64,
+    /// New time/frequency positions scored.
+    pub searched_rows: u64,
+    /// Additional LDPC invocations, capped at 32 per window.
+    pub attempts: u64,
+    /// Accepted results before normal message deduplication.
+    pub accepted: u64,
+    /// CRC-valid results rejected for mismatching sender.
+    pub identity_rejections: u64,
+    /// Optional groups or attempts skipped after deadline.
+    pub budget_skips: u64,
 }

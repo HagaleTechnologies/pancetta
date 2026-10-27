@@ -234,6 +234,7 @@ modes). Edits take effect on restart (the band plan is not among the
 ```toml
 [autonomous]
 enabled = false            # Master enable. Off by default; opt-in to TX.
+unattended_policy = "off" # "off" or "respond_only"; requires restart
 slot_parity = "auto"       # "even", "odd", or "auto"
 cq_after_idle_cycles = 10  # Idle TX cycles before calling CQ (~150 s at 10)
 cq_no_response_switch_after = 4 # Consecutive no-response self-CQs before switching TX frequency (Auto mode only)
@@ -249,6 +250,7 @@ dry_run = false            # Log autonomous TX decisions without keying the rig
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
 | `slot_parity` | enum | `"auto"` | FT8 alternates even/odd 15 s slots; `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
 | `cq_no_response_switch_after` | integer | `4` | Consecutive self-CQs with zero responses before switching TX frequency. Auto mode only (Hold mode tracks but never acts). Must be ≥ 1. |
@@ -259,6 +261,37 @@ dry_run = false            # Log autonomous TX decisions without keying the rig
 | `min_multi_slot_score` | float | `0.7` | 0.0–1.0. Applies only to second-and-later concurrent QSOs. |
 | `cq_direction` | string | `""` | Appended to CQ (`CQ DX <call> <grid>`). |
 | `dry_run` | bool | `false` | Autonomous TransmitRequests are logged, not sent. Manual TX unaffected. |
+
+Presence means a local console keypress within the last 120 seconds. Headless
+startup has no presence; remote heartbeats do not refresh it. To permit a new
+automatic reply to a decoded transmission addressed to this station without
+console activity, opt in and restart:
+
+```toml
+[autonomous]
+unattended_policy = "respond_only"
+```
+
+This setting applies to direct callers even when `autonomous.enabled = false`.
+That switch controls the autonomous engine's own openings. Self-CQ and pouncing
+on another station's CQ still require presence under either setting. This is
+separate from the runtime `TxPolicy::RespondOnly` hotkey state; runtime
+`TxPolicy::Disabled` still blocks replies. Existing QSOs can finish after
+presence expires, including a response to a CQ already opened while attended.
+Explicit manual actions and manual/Fox repeating CQ retain their existing rules.
+
+On upgrade, omitted `unattended_policy` selects `off`. Before PAN-120, new direct
+callers could be answered without presence. Select `respond_only` and restart
+to retain that behavior. Invalid values fail config loading and list `off` and
+`respond_only` as the allowed choices.
+
+The repository's [§97.221(c) analysis](fcc-part97-compliance.md#2-automatically-controlled-digital-station--97221-the-binding-rule)
+uses the rationale of responding to a locally or remotely controlled station.
+A decoded callsign alone does not prove how the other station is controlled.
+The product policy permits only direct-call replies to bypass presence; it
+preserves the independent runtime TX policy, duplicate, parity, capacity, and
+transmitter safety checks. The setting grants no remote authority or RF safety
+exemption.
 
 > **There is no `mode` key.** Earlier revisions of this document described
 > `[autonomous_operator]` with `mode = "hunt" / "cq" / "hybrid"`,
@@ -812,7 +845,9 @@ priority over both config and environment.
 Pancetta watches its config file for changes while it runs: the file
 given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
 path is a symlink, both edits to the file it points at and repointing
-the symlink itself are picked up. The file's directory is watched even
+the symlink itself are picked up. Device, rig and bookmark choices saved
+from the TUI go to the file the symlink points to at the moment you save.
+The file's directory is watched even
 while the file does not exist, so creating it later is picked up too
 (when the directory itself does not exist, nothing is watched and every
 change needs a restart). A save is picked up within a few seconds. With

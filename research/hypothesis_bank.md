@@ -824,6 +824,16 @@ current_ratio: 0.051
     given current evidence, but the chrono-replay retest that would give a
     truly conclusive answer remains outstanding — PAN-160 keeps this open
     alongside candidate (a), not closed.
+  status_2026_10_26_pan160: The AP-only timing retry is implemented experimentally,
+    default off, with fresh sender priors and a 32-attempt per-window cap.
+    Twenty held-out synthetic sessions exercised 158 extra attempts but gained
+    and lost zero target messages (128/200 in both arms). No positive rescue
+    fixture was found in 324 calibration pairs. The 100 noise pairs retained
+    the same two ordinary-path false positives, with none added by the retry.
+    Original mini33 remains blocked: all 33 WAVs and 33 trusted caches are
+    missing. The hard-200 corpus caveat and both earlier corrections still
+    apply. No production benefit or original-recording completion is claimed.
+    Evidence: research/experiments/2026-10-26-pan160-timing-history.md.
   status_2026_05_31_session1: SCOPED → PROCEED. Multi-pass is back (hb-079 coherent + hb-080 N=3 + hb-086 V1 joint-pair-retry all GRADUATED), so the prior is no longer latent. Diagnostic `hb057_dt_history_potential.rs` on top-20 hard-200: 38.6% of 647 missed truths are sent by callsigns with stable (<0.1s) or moderate (0.1–0.3s) cross-WAV DT variance — the TARGET population. Kill-switch (10%) cleared by 3.86×. Recoverable-by-prior upper bound at ±0.2s leave-one-out median gate = same 38.6% (the window comfortably covers stable+moderate variance by construction — gate-coverage upper bound, not LDPC-conversion estimate). Design spec at `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`. Storage: coordinator-level (cross-WAV history is the recovery population; per-decoder-thread design has zero access on fresh threads). Hook points: localized_costas_sync_search + AP-path sync_search ONLY (pass 1 untouched — preserves new-station discovery). Window: max(0.2s, IQR × 3) around per-callsign median; 10-sighting ring buffer, 30-min eviction. Session 2 implements + sweeps; Session 3 grad/shelve. Diagnostic-first re-run inside Session 2 confirms population before build.
   ---- original priority entry below ----
   [PRIORITY-WAS: 0.35, spawned 2026-05-25 from mr-002]

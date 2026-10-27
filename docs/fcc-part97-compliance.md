@@ -93,6 +93,23 @@ the bandwidth condition (c)(2) is always met. The deciding condition is
   frequency isn't in §97.221(b). **Unattended autonomous CQ on 14.074 is the
   contravention.**
 
+### Implemented product policy (PAN-120, 2026-10-24 decision)
+
+`[autonomous].unattended_policy` defaults to `off`. New automatic replies to
+calls addressed to this station require recent console activity unless the
+operator selects `respond_only` and restarts. The opt-in relaxes only that
+presence condition; runtime TX policy and all other admission and transmitter
+checks still apply. Established exchanges can continue after presence expires.
+
+This direct-call-only decision is narrower than the older recommendation below,
+which proposed allowing pounce too. Autonomous self-CQ and pounce both remain
+presence-gated under either setting. No frequency-based exception was added.
+The decision uses this document's rationale of responding to a station under
+local or remote control. Decoding a callsign does not establish the other
+station's control status. This note records product behavior, not a new legal conclusion.
+See [the config reference](CONFIG.md#autonomous--the-brain) for the restart
+requirement and the change from the previous unrestricted caller-admission path.
+
 ## 3. Identification — §97.119 — COMPLIANT
 
 > (a) … transmit its assigned call sign … at the end of each communication, and
@@ -124,7 +141,7 @@ with the operator, as the rules intend.
 
 ---
 
-## Recommendation (for the operator to decide)
+## Original recommendations (2026-06-23)
 
 The contravention is narrow and avoidable. Options, roughly in order of
 least-surprise:
@@ -149,9 +166,8 @@ least-surprise:
    automatic control **only** when the current dial is inside a §97.221(b)
    segment; otherwise respond-only. (More complex; combine with #2.)
 
-I have **not** changed any operating behavior — per your instruction, this is
-the finding; you decide how to proceed. If you want, the cleanest first step is
-option #2 wired onto the existing `TxPolicy::RespondOnly` machinery.
+These recommendations preceded PAN-120. The implemented product policy above
+records the narrower direct-caller decision and its separate config setting.
 
 *Sources: 47 CFR §97.109, §97.113, §97.119, §97.221 (Cornell LII mirror,
 read 2026-06-23).*

@@ -219,6 +219,7 @@ struct Args {
     /// reflects cross-WAV (cross-session-proxy) history. Defaults to
     /// (floor_s=0.2, iqr_scale=3.0) per the spec.
     hb057_dt_history_enabled: Option<bool>,
+    hb057_ap_dt_history_enabled: Option<bool>,
     /// hb-057 V1: override the minimum prior-gate radius (seconds).
     hb057_dt_history_window_floor_s: Option<f64>,
     /// hb-057 V1: override the IQR scaling factor for the prior gate.
@@ -401,6 +402,7 @@ impl Args {
         let mut a7_snr7b_threshold: Option<f64> = None;
         let mut a7_freq_window_hz: Option<f64> = None;
         let mut hb057_dt_history_enabled: Option<bool> = None;
+        let mut hb057_ap_dt_history_enabled = None;
         let mut hb057_dt_history_window_floor_s: Option<f64> = None;
         let mut hb057_dt_history_window_iqr_scale: Option<f64> = None;
         let mut hb057_dt_history_freq_window_hz: Option<f64> = None;
@@ -851,6 +853,9 @@ impl Args {
                     );
                     a7_enabled.get_or_insert(true);
                 }
+                "--hb057-ap-dt-history-enabled" => {
+                    hb057_ap_dt_history_enabled = Some(true);
+                }
                 "--hb057-dt-history-enabled" => {
                     hb057_dt_history_enabled = Some(true);
                 }
@@ -1200,6 +1205,7 @@ impl Args {
             a7_snr7b_threshold,
             a7_freq_window_hz,
             hb057_dt_history_enabled,
+            hb057_ap_dt_history_enabled,
             hb057_dt_history_window_floor_s,
             hb057_dt_history_window_iqr_scale,
             hb057_dt_history_freq_window_hz,
@@ -1980,6 +1986,9 @@ fn run_chrono_replay_tier(
         snapshot_at_start
     );
     for (i, entry) in entries.iter().enumerate() {
+        let at = chrono::DateTime::parse_from_rfc3339(&entry.wav_timestamp)?;
+        decoder.set_slot_time(at.with_timezone(&chrono::Utc).into());
+
         let baseline_path = workspace
             .join("research/baselines/ft8")
             .join(format!("{}.json", entry.wav_sha256));
@@ -2701,6 +2710,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(hz) = args.a7_freq_window_hz {
         d = d.with_a7_freq_window_hz(hz);
+    }
+    if matches!(args.hb057_ap_dt_history_enabled, Some(true)) {
+        d = d.with_ap_dt_history(true);
     }
     if matches!(args.hb057_dt_history_enabled, Some(true)) {
         let floor = args.hb057_dt_history_window_floor_s.unwrap_or(0.2);
@@ -4164,5 +4176,34 @@ mod novel_classification_tests {
         assert_eq!(with.novel_decodes, Some(2));
         assert_eq!(with.novels_verified, Some(1));
         assert_eq!(with.novels_unverified, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod pan160_flag_tests {
+    use super::*;
+    #[test]
+    fn timing_flags_are_independent_in_effective_snapshots() {
+        for (general, ap) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut flags = vec![
+                "--tier",
+                "fixtures",
+                "--mode",
+                "ft8",
+                "--output",
+                "/tmp/pan160-unused.json",
+            ];
+            if general {
+                flags.push("--hb057-dt-history-enabled");
+            }
+            if ap {
+                flags.push("--hb057-ap-dt-history-enabled");
+            }
+            let args = Args::parse_from(flags.into_iter().map(str::to_string)).unwrap();
+            let decoder = build_decoder_from_args(&args, pancetta_ft8::Protocol::Ft8);
+            let snapshot = decoder.config_snapshot();
+            assert_eq!(snapshot["dt_history_enabled"], general);
+            assert_eq!(snapshot["ap_dt_history_enabled"], ap);
+        }
     }
 }
