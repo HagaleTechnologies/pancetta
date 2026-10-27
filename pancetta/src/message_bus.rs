@@ -902,6 +902,16 @@ pub enum QsoMessage {
         /// when the frame carried none; the rollback then matches content.
         attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
+    /// PAN-223: the slot the TX worker scheduled a QSO frame into
+    /// (`TxSchedule::target_slot`), sent once the schedule is final and before
+    /// the PTT wait. Qso re-keys the frame's ledger attempt to it through
+    /// `QsoManager::record_scheduled_tx_slot`, so the stall count follows the
+    /// worker's decision rather than the rearm's prediction.
+    TxFrameScheduled {
+        qso_id: String,
+        attempt_id: pancetta_qso::TxAttemptId,
+        target_slot: chrono::DateTime<chrono::Utc>,
+    },
     /// PAN-182: a QSO frame that aired, mirrored by Ft8Transmitter after
     /// playback alongside the Autonomous completion. Qso uses it to release
     /// a stall offset action held on that frame through

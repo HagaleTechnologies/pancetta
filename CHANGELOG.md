@@ -162,6 +162,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count, best SNR and age (PAN-227). The `w` breakdown shows them instead of
   `network reports: none` and `1.00` freshness, and stale spots or spots with
   a single weak reporter rank lower.
+- The stall detector behind adaptive TX-offset switching could count one
+  transmission twice when a keep-call re-send reached the TX worker just
+  after the current slot's acceptance window, and so fire the TX-offset
+  switch one unanswered transmission early. It now records the slot the TX
+  worker actually scheduled each frame into, not the slot predicted when the
+  re-send was emitted (PAN-223).
 
 - TUI device, rig and bookmark saves now go to the file a `--config` symlink
   points to when you save, so after a dotfiles manager repoints the link they
