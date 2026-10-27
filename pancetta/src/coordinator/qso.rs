@@ -5745,6 +5745,15 @@ impl super::ApplicationCoordinator {
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    let outcome = qso_manager.record_scheduled_tx_slot(id, attempt_id, target_slot).await;
+                                                    debug!(target: "qso", "TX frame scheduled for QSO {} (attempt {:?}) into {}: {:?}", qso_id, attempt_id, target_slot, outcome);
+                                                }
+                                                Err(e) => debug!(target: "qso", "TxFrameScheduled: bad QSO id '{}': {}", qso_id, e),
+                                            }
+                                        }
                                         crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
@@ -11888,6 +11897,84 @@ mod respond_to_caller_admission_tests {
                 break;
             }
             assert!(Instant::now() < deadline, "QSO loop did not apply rollback");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-223 through the running QSO loop: an in-cap rearm and its
+    /// off-parity successor both counted (the late-report order), and the TX
+    /// worker's `TxFrameScheduled` for the first one, deferred to the slot the
+    /// successor feeds, takes the duplicate count back off.
+    #[tokio::test]
+    async fn pan223_tx_frame_scheduled_reaches_the_keep_call_ledger() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        // Yield so the spawned event-forwarding task subscribes first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager.get_qso(id).await.unwrap().metadata;
+        let own = opened
+            .tx_parity
+            .expect("a manual QSO latches its TX parity");
+        let s0 = opened.stall_cycles;
+        let x = pancetta_core::slot::next_slot_with_parity_with_period(
+            opened.last_call_at.unwrap() + chrono::Duration::seconds(15),
+            own,
+            15_000_000_000,
+        );
+        manager
+            .rearm_manual_calls_at(x + chrono::Duration::milliseconds(1_600))
+            .await;
+        let (_, a) = pan183_next_transmit_request(&tx, &qso).await;
+        let a = a.expect("the rearm records a ledger attempt");
+        manager
+            .rearm_manual_calls_at(x + chrono::Duration::milliseconds(16_600))
+            .await;
+        assert_eq!(
+            manager.get_qso(id).await.unwrap().metadata.stall_cycles,
+            s0 + 2,
+            "precondition: before the worker's report the prediction double-counts"
+        );
+
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::TxFrameScheduled {
+                    qso_id: qso.clone(),
+                    attempt_id: a,
+                    target_slot: x + chrono::Duration::seconds(30),
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while manager.get_qso(id).await.unwrap().metadata.stall_cycles != s0 + 1 {
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not apply the scheduled-slot report"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         coordinator

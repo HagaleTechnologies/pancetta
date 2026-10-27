@@ -158,6 +158,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The stall detector behind adaptive TX-offset switching could count one
+  transmission twice when a keep-call re-send reached the TX worker just
+  after the current slot's acceptance window, and so fire the TX-offset
+  switch one unanswered transmission early. It now records the slot the TX
+  worker actually scheduled each frame into, not the slot predicted when the
+  re-send was emitted (PAN-223).
+
 - TUI device, rig and bookmark saves now go to the file a `--config` symlink
   points to when you save, so after a dotfiles manager repoints the link they
   land in the same file reloads and the next restart read (PAN-200). Before,

@@ -109,6 +109,15 @@ refuses the commit with `OffsetActionTriggerOutcomePending`. See
 `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
 `pancetta-qso/src/qso_manager.rs`.
 
+Testing gotcha (PAN-223): the stall ledger's slot comes from the TX worker's
+`TxFrameScheduled` report (`QsoManager::record_scheduled_tx_slot`), not only
+from the rearm's prediction, so a manager test of a deferred frame drives it by
+calling that method with the slot the worker would pick. A real-worker test
+that needs a deterministic schedule should give the request the parity of the
+slot after `now` (it always defers to that slot's start), or wait into a slot
+past FT8's 1.7 s acceptance cap; see `pan223_scheduled_slot_worker_tests` in
+`pancetta/src/coordinator/tx.rs`.
+
 Caller-admission gotcha (PAN-120): the QSO decode loop and autonomous initiation
 are separate paths. A new direct caller now requires local console presence or
 `autonomous.unattended_policy = "respond_only"`, even with the autonomous toggle
