@@ -6875,7 +6875,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate not yet run, default stays off.]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied; PAN-162 storm re-measure: candidate-k6 (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN 0.000 dB, off-air ΔTP +1); production gate: synth-clean leg passed (PAN-241: recovered Δ+0, CI [+0, +0], elapsed −4.5%), noise_1000 leg not yet run, default stays off.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6943,6 +6943,17 @@ search to in-repo sources.
     elapsed) has not run yet: its noise arms cost about 90 single-core
     minutes each here. Until it passes, the default stays off; operators
     in heavy QRN can still opt in with Some(6.0).
+
+    UPDATE 2026-10-27 (PAN-241): the synth-clean leg of the production
+    gate ran native-only and serially (6 threads, both arms alone in the
+    container): recovered 285 → 285 of 550 (Δ+0, paired 95% CI
+    [+0.0, +0.0]), novel 7 → 7, elapsed 663.1 → 633.4 s (−4.5%, budget
+    +20%). All three synth-clean bars pass. The noise_1000 leg (no rise in
+    false_positives_total or noise_files_decoded, elapsed within +20%)
+    did not fit in the phase and is owed to a follow-up. If it passes, k=6
+    ships default-on for FT8 through the coordinator; if it fails, the
+    disposition is stays-off-harm-gate. Until then the default stays off.
+    Scorecards: `research/scorecards/pan162-synth-{control,variant}.json`.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 

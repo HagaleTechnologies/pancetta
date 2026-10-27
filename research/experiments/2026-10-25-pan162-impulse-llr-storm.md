@@ -1,14 +1,14 @@
 ---
 slug: pan162-impulse-llr-storm
 mode: ft8
-state: measured-candidate-k6-production-gate-pending
+state: measured-candidate-k6-production-gate-synth-leg-passed-noise-leg-pending
 created: 2026-10-25T23:55:00Z
-last_updated: 2026-10-26
+last_updated: 2026-10-27
 branch: PAN-162
 parent_hypothesis: hb-256
-scorecard: research/scorecards/pan162-impulse-llr-storm.json (synthetic plants, verdict) and research/scorecards/pan162-impulse-llr-offair.json (off-air do-no-harm)
-delta_vs_main: none in production. Storm plant (decision) k=6 threshold shift +0.465 dB [+0.308, +0.653]; awgn k=6 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7
-disposition: STAYS OFF BY DEFAULT for now. The pre-registered verdict is candidate-k6, which triggers Phase 6; its native-only production gate (synth-clean, noise_1000, elapsed) has not run, and the coordinator default is set only if that gate passes. `Ft8Config::impulse_robust_llr` stays `None` and production is unchanged.
+scorecard: research/scorecards/pan162-impulse-llr-storm.json (synthetic plants, verdict), research/scorecards/pan162-impulse-llr-offair.json (off-air do-no-harm) and research/scorecards/pan162-synth-{control,variant}.json (production gate, synth-clean leg)
+delta_vs_main: none in production. Storm plant (decision) k=6 threshold shift +0.465 dB [+0.308, +0.653]; awgn k=6 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7; production gate synth-clean k=6 recovered Δ+0 (95% CI [+0.0, +0.0]), elapsed -4.5%
+disposition: STAYS OFF BY DEFAULT for now. The pre-registered verdict is candidate-k6, which triggers Phase 6. Of its native-only production gate, the synth-clean leg (recall and elapsed) passed in PAN-241; the noise_1000 leg (false positives and elapsed) has not run. The coordinator default is set only if that leg passes too, and a failure makes the final disposition stays-off-harm-gate. `Ft8Config::impulse_robust_llr` stays `None` and production is unchanged.
 ---
 
 # PAN-162: hb-256's lightning-static LLR knee, measured on the stormiest days
@@ -343,47 +343,121 @@ plant missed: on `base` (the batch101 plant re-measured with a CI) k=6 gains
 +0.167 dB [+0.038, +0.519], below the bar as in batch101, and the gain grows with
 burst rate (`severe`: +1.324 dB [+0.771, +1.666]).
 
-## Phase 6: production gate (triggered, not yet run)
+## Phase 6: production gate (synth-clean leg passed, noise_1000 leg owed)
 
 `candidate-k6` triggers the plan's Phase 6. Its first step is the
 pre-registered native-only production gate above (synth-clean, noise_1000 and
-the elapsed gate, control vs `--impulse-robust-llr 6`); only if that passes
-does the coordinator turn the knee on for FT8. The gate has not run yet, so
-**the default stays off** and production is unchanged: the coordinator does
-not set the knee, and `Ft8Config::default().impulse_robust_llr` is `None`.
+the elapsed gate, control vs `--impulse-robust-llr 6`); only if all of it
+passes does the coordinator turn the knee on for FT8. PAN-241 ran the
+synth-clean leg, and it passed. The noise_1000 leg has not run, so the gate
+has no final result and **the default stays off**: production is unchanged,
+the coordinator does not set the knee, and
+`Ft8Config::default().impulse_robust_llr` is `None`.
 
-Why it did not run here: its eval arms cost far more than the storm shards.
-In this container, a native-only, unlimited-budget `eval --tier noise_1000`
-arm with `RAYON_NUM_THREADS=1` reached its 40th noise WAV (read from the
-process's open WAV file) after 371 s while ten
-runnable threads (the shards, a build, both arms) shared the 6-CPU quota,
-about 0.6 of a core each. That is roughly 5.5 CPU-s per WAV, or about 90
-single-core minutes per 1000-WAV arm (an estimate from one partial run). The
-two noise arms, plus the two synth-clean arms, do not fit beside the storm
-shards and the repository gate inside one phase deadline. Two attempts
-were stopped and discarded, so no production-gate number exists: all four
-arms at `RAYON_NUM_THREADS=3`, beside the shards (stopped after 193 s), then
-the two noise arms at `RAYON_NUM_THREADS=1` (stopped after 371 s). The
-next run should give the four arms the container to themselves, as PAN-158
-did, with the commands below (both arms of a pair at the same
-`RAYON_NUM_THREADS`, so `compare`'s elapsed gate is enforced):
+### Synth-clean leg (PAN-241, 2026-10-27): passed
+
+Host: Catalyst cloud container `8ea99d0ef503/linux/x86_64` on a shared
+machine, 6-CPU cgroup quota (`/sys/fs/cgroup/cpu.max` = `600000 100000`),
+`RAYON_NUM_THREADS=6` for both arms (`harness.cores_used` 6 in both
+scorecards), release build at branch PAN-241 (`d963768`, clean tree). The two
+arms ran serially, with nothing else running in the container. `gen-synth`
+regenerates the WAVs under `research/corpus/synth/wavs/clean` that
+`eval --tier synth-clean` reads through the tracked
+`research/corpus/synth/manifests/clean.manifest.json`; the manifest it writes
+to `$PAN162_RUN` is a by-product.
 
 ```sh
+cargo build --release -p pancetta-research --bin eval --bin compare --bin gen-synth --bin gen-noise
+PAN162_RUN=$(mktemp -d)
 target/release/gen-synth --config research/corpus/synth/manifests/clean.config.json --output "$PAN162_RUN/clean.manifest.json"
+RAYON_NUM_THREADS=6 target/release/eval --tier synth-clean --mode ft8 --output research/scorecards/pan162-synth-control.json
+RAYON_NUM_THREADS=6 target/release/eval --tier synth-clean --mode ft8 --impulse-robust-llr 6 --output research/scorecards/pan162-synth-variant.json
+target/release/compare research/scorecards/pan162-synth-control.json research/scorecards/pan162-synth-variant.json --bootstrap-n 1000 --bootstrap-seed 0xb007
+```
+
+| arm | `impulse_robust_llr` | wall (UTC) | `elapsed_seconds` | recovered | novel |
+|---|---|---|---|---|---|
+| control | `null` | 16:39:07-16:50:10 | 663.1 | 285 / 550 | 7 |
+| variant | `6.0` | 16:50:10-17:00:43 | 633.4 | 285 / 550 | 7 |
+
+`compare` exited 0 and printed:
+
+```
+A: research/scorecards/pan162-synth-control.json (sha d963768b, score 0.1390)
+B: research/scorecards/pan162-synth-variant.json (sha d963768b, score 0.1390 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  synth-clean               rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  synth-clean               novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.impulse_robust_llr               null → 6.0
+ELAPSED GATE:
+  elapsed_seconds        663.1 → 633.4  (-4.5%, budget +20.0%)
+```
+
+| bar | measured | result |
+|---|---|---|
+| recovered Δ ≥ −2 | +0 | pass |
+| paired recall CI not significantly negative | [+0.0, +0.0], not significant | pass |
+| elapsed within +20% (synth-clean) | −4.5% | pass |
+
+The variant scorecard records `git.dirty: true` because the control arm's
+scorecard was by then an untracked file; no tracked file changed until the
+variant arm had finished, both arms record the same `head_sha`, and both ran
+the same `target/release/eval`, built at 16:38 before the first arm. The
+machine is shared: during the control arm its load average was about 23 and
+the container's cgroup was being throttled. The pre-registered contention
+clause asks for a rerun only when an elapsed failure coincides with
+contention, and this elapsed bar passed. The planning run for PAN-241 (same
+commands at `RAYON_NUM_THREADS=2`, not committed) gave the same per-WAV
+outcomes and elapsed 1229.6 → 1168.8 s (−4.9%).
+
+### Noise_1000 leg: owed (deferred to a follow-up)
+
+The noise_1000 pair did not run. Its arms took about 1.64 times a synth-clean
+arm in the PAN-241 planning run (noise control 2012.4 s against synth control
+1229.6 s, both at 2 threads), so on this host each would have needed about
+18 minutes, and the pair could not finish before the phase's repository gate.
+Running it beside the gate or a build would break the serial elapsed bar,
+so it was deferred whole. The follow-up runs, with both arms alone on the
+host at one `RAYON_NUM_THREADS` (the cgroup quota, `cpu.max` quota ÷ period):
+
+```sh
+cargo build --release -p pancetta-research --bin eval --bin compare --bin gen-noise
+PAN162_RUN=$(mktemp -d)
+export RAYON_NUM_THREADS=6   # set to this host's CPU quota; same value for both arms
 target/release/gen-noise --count 1000 --seed 20260706 --birdie-fraction 0.3 \
   --output-dir "$PAN162_RUN/noise-wavs" --manifest "$PAN162_RUN/noise.manifest.json" --label noise_1000
-target/release/eval --tier synth-clean --mode ft8 --output research/scorecards/pan162-synth-control.json
-target/release/eval --tier synth-clean --mode ft8 --impulse-robust-llr 6 --output research/scorecards/pan162-synth-variant.json
 target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/noise.manifest.json" --output research/scorecards/pan162-noise-control.json
 target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/noise.manifest.json" --impulse-robust-llr 6 --output research/scorecards/pan162-noise-variant.json
-target/release/compare research/scorecards/pan162-synth-control.json research/scorecards/pan162-synth-variant.json --bootstrap-n 1000 --bootstrap-seed 0xb007
 target/release/compare research/scorecards/pan162-noise-control.json research/scorecards/pan162-noise-variant.json
 ```
 
-If the gate passes, the plan's steps 6.2-6.3 follow (coordinator FT8 default
-`Some(6.0)` in `apply_effort_overrides`, the knee in `DecoderRebuildKey`,
-CHANGELOG and digest). If it fails, the final disposition is
-`stays-off-harm-gate`.
+The rule then applies mechanically. If neither `false_positives_total` nor
+`noise_files_decoded` increases and elapsed stays within +20%, the final
+disposition is **default-on** for FT8 at k=6: the plan's steps 6.2-6.3
+follow (coordinator FT8 default `Some(6.0)` in `apply_effort_overrides`, the
+knee in `DecoderRebuildKey`, CHANGELOG and digest). Otherwise the final
+disposition is `stays-off-harm-gate`. The synth-clean leg above does not
+need to be rerun: each pair's elapsed bar compares its own two arms.
+
+### PAN-162's attempts
+
+PAN-162's implement run did not run the gate: its eval arms cost far more
+than the storm shards. In that container, a native-only, unlimited-budget
+`eval --tier noise_1000` arm with `RAYON_NUM_THREADS=1` reached its 40th
+noise WAV (read from the process's open WAV file) after 371 s while ten
+runnable threads (the shards, a build, both arms) shared the 6-CPU quota,
+about 0.6 of a core each. That is roughly 5.5 CPU-s per WAV, or about 90
+single-core minutes per 1000-WAV arm (an estimate from one partial run). Two
+attempts were stopped and discarded, so neither produced a production-gate
+number: all four arms at `RAYON_NUM_THREADS=3`, beside the shards (stopped
+after 193 s), then the two noise arms at `RAYON_NUM_THREADS=1` (stopped after
+371 s).
 
 
 ## Caveats

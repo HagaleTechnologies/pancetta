@@ -1477,11 +1477,21 @@ pub struct Ft8Config {
     /// `None` (default) = off, byte-identical to the legacy path.
     /// `Some(k)` = attenuation knee in units of median symbol power
     /// (k=3 aggressive, k=6 conservative). Applied after LLR whitening
-    /// and before variance normalisation on every demapper output path.
+    /// and before variance normalisation on every standard demapper
+    /// output path. The BICM-ID rescue (`bicm_id_iterations > 0`, off by
+    /// default and in production) uses those weighted LLRs only as its
+    /// seed (seed BP, near-converged gate, first extrinsic, scale
+    /// anchor); the SOMAP metrics it refreshes every iteration are
+    /// rebuilt from raw tone powers and carry neither this per-symbol
+    /// weighting nor LLR whitening.
     /// PAN-162's pre-registered storm re-measure returned `candidate-k6`
-    /// (k=6 clears the stormier plant's +0.3 dB bar at zero AWGN cost);
-    /// its native-only production gate has not run, so the knee stays off
-    /// by default (`research/experiments/2026-10-25-pan162-impulse-llr-storm.md`).
+    /// (k=6 clears the stormier plant's +0.3 dB bar at zero AWGN cost).
+    /// Its native-only production gate is half run: the synth-clean leg
+    /// passed (PAN-241: recovered Δ+0, CI [+0, +0]; elapsed −4.5%), and
+    /// the noise_1000 leg is still owed. Until that leg passes the knee
+    /// stays off by default; if it fails, the final disposition is
+    /// `stays-off-harm-gate`
+    /// (`research/experiments/2026-10-25-pan162-impulse-llr-storm.md`).
     pub impulse_robust_llr: Option<f64>,
 
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
