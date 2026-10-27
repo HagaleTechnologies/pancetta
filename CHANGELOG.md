@@ -158,6 +158,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A QSO that completes while pancetta is shutting down keeps its ClubLog,
+  QRZ Logbook, eQSL and cqdx.io uploads (PAN-232). Shutdown now cancels a
+  QRZ XML lookup still in flight and queues the uploads without the
+  looked-up grid or state, instead of losing them when the lookup outlasted
+  the 2-second shutdown window; they are sent at the next start. Shutdown
+  with uploads enabled no longer waits out that window when nothing is in
+  flight. An unreadable upload queue file is now renamed to
+  `upload_outbox.json.corrupt-<seconds>-<random id>`, so a second one in the
+  same second no longer replaces the first.
 - DX Hunter rows scored from a cqdx spot now include the spot's reporter
   count, best SNR and age (PAN-227). The `w` breakdown shows them instead of
   `network reports: none` and `1.00` freshness, and stale spots or spots with

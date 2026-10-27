@@ -6,8 +6,8 @@
 //!   upload is written there before its first attempt and removed only when
 //!   the service accepts it (or reports a duplicate). The file holds QSO data
 //!   only: credentials are added by the clients at send time. A file that
-//!   cannot be read is renamed to `<file>.corrupt-<unix-seconds>`, never
-//!   deleted.
+//!   cannot be read is renamed to `<file>.corrupt-<unix-seconds>-<uuid>`,
+//!   never deleted or overwritten.
 //! - [`RetrySchedule`] is the capped exponential backoff of
 //!   `[network.reliability.retry]`, followed by a slow lane.
 //! - [`Lane`] is the retry state of one destination. Callers always pass
@@ -194,7 +194,7 @@ impl OutboxStore {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (store, None),
             Err(e) => {
-                let q = store.quarantine(format!("could not read: {e}"));
+                let q = store.quarantine(format!("could not read: {e}"), Utc::now());
                 return (store, Some(q));
             }
         };
@@ -206,14 +206,22 @@ impl OutboxStore {
             Ok(f) => format!("unknown schema_version {}", f.schema_version),
             Err(e) => format!("not valid queue JSON: {e}"),
         };
-        let q = store.quarantine(reason);
+        let q = store.quarantine(reason, Utc::now());
         (store, Some(q))
     }
 
-    fn quarantine(&self, reason: String) -> Quarantine {
-        let secs = Utc::now().timestamp();
+    /// Move the unreadable queue file aside to
+    /// `<file>.corrupt-<unix-seconds>-<uuid>`, never deleting it. The random
+    /// part keeps two quarantines in the same second (or after the clock steps
+    /// back) from resolving to one path, where `rename` would replace the
+    /// first (PAN-232).
+    fn quarantine(&self, reason: String, now: DateTime<Utc>) -> Quarantine {
         let mut name = self.path.as_os_str().to_owned();
-        name.push(format!(".corrupt-{secs}"));
+        name.push(format!(
+            ".corrupt-{}-{}",
+            now.timestamp(),
+            Uuid::new_v4().simple()
+        ));
         let target = PathBuf::from(name);
         match std::fs::rename(&self.path, &target) {
             Ok(()) => Quarantine {
@@ -899,10 +907,44 @@ mod tests {
         assert_eq!(store.len(), 0);
         assert!(!path.exists());
         assert_eq!(std::fs::read(&q.moved_to).unwrap(), b"{ not json");
-        assert!(q
+        // `upload_outbox.json.corrupt-<unix-seconds>-<32 lowercase hex>`.
+        let name = q
             .moved_to
+            .file_name()
+            .unwrap()
             .to_string_lossy()
-            .contains("upload_outbox.json.corrupt-"));
+            .into_owned();
+        let suffix = name
+            .strip_prefix("upload_outbox.json.corrupt-")
+            .unwrap_or_else(|| panic!("{name}"));
+        let (secs, id) = suffix.split_once('-').unwrap_or_else(|| panic!("{name}"));
+        assert!(
+            !secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit()),
+            "{name}"
+        );
+        assert_eq!(id.len(), 32, "{name}");
+        assert!(
+            id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn two_quarantines_in_the_same_second_keep_both_files() {
+        // PAN-232: the second quarantine in one second used to rename onto
+        // the first one's path and erase it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        let (store, _) = OutboxStore::open(path.clone());
+        let now = Utc::now();
+        std::fs::write(&path, b"{ first").unwrap();
+        let first = store.quarantine("first".to_string(), now);
+        std::fs::write(&path, b"{ second").unwrap();
+        let second = store.quarantine("second".to_string(), now);
+        assert!(!first.rename_failed && !second.rename_failed);
+        assert_ne!(first.moved_to, second.moved_to);
+        assert_eq!(std::fs::read(&first.moved_to).unwrap(), b"{ first");
+        assert_eq!(std::fs::read(&second.moved_to).unwrap(), b"{ second");
     }
 
     #[test]
