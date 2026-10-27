@@ -8,6 +8,15 @@
 
 # Known gaps and TODOs
 
+- **The ADIF writer handles at most one completion after the shutdown flag.**
+  `start_adif_subscriber` (`coordinator/qso.rs`) checks the flag between
+  events, so a second `QsoCompleted` emitted while the Qso task finishes its
+  last message is not appended to `qsos.adi`, though the upload subscriber
+  now queues its uploads. The detached promote task in the Qso events task
+  sleeps `completed_tx_grace` and ignores shutdown, so a completion it emits
+  after `stop_upload_outbox` reaches neither. (Surfaced by PAN-232,
+  2026-10-27.)
+
 - **Auto-73 after the 45-second rework grace can reset the resend cap.**
   Without a QSO inside `COMPLETED_QSO_REWORK_GRACE`, an auto-73 opens a new
   completed QSO and emits `QsoCompleted`. The completion handler then
