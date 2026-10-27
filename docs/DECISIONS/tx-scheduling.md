@@ -166,7 +166,45 @@ amendment in `docs/superpowers/specs/2026-09-12-pan-143-ptt-shared-synchronizati
 
 ## Half-duplex parity scheduler + always-answer-callers (#39)
 
-`pancetta-qso/src/qso_manager.rs`, `pancetta/src/coordinator/qso.rs`: FT8 is deaf while transmitting, so **every concurrent active QSO must transmit on the same parity** — the opposite 15s window stays free to hear responses; we never TX in sequential windows. Pure `admit_new_qso(current_side, desired) -> TxAdmission::{Admit,Queue}` (idle adopts the side, unpinned desire rides the live side, same-side runs concurrent, cross-side queues — never preempts) + `QsoManager::current_tx_side()` (the parity active QSOs are committed to). Gated into the autonomous `StartAutonomousQso` handler: a cross-parity pounce/CQ is deferred this slot (the DX re-CQs and we re-evaluate once the side clears). **Always-answer-callers**: an always-on decode-loop path (`classify_caller_answer` + `maybe_answer_caller`) answers a station calling us **independent of the autonomous toggle** — `classify_caller_answer` maps a frame directed at us to the reply rung (CqResponse→Report, SignalReport→ReportAck, ReportAck→Rr73, FinalConfirmation→73; compound-aware). Gated by TxPolicy != Disabled + no-active-QSO-with-them (`has_active_qso_with`) + parity-admit + capacity (`max_concurrent_qsos`); it's a *response* not unattended *initiation*, so the FCC presence gate doesn't apply. Carries no failure-backoff, so it also satisfies #43 part 2 (answer a DX that calls us after our initiation watchdog retired the QSO).
+`pancetta-qso/src/qso_manager.rs`, `pancetta/src/coordinator/qso.rs`: FT8 is deaf while transmitting, so **every concurrent active QSO must transmit on the same parity** — the opposite 15s window stays free to hear responses; we never TX in sequential windows. Pure `admit_new_qso(current_side, desired) -> TxAdmission::{Admit,Queue}` (idle adopts the side, unpinned desire rides the live side, same-side runs concurrent, cross-side queues — never preempts) + `QsoManager::current_tx_side()` (the parity active QSOs are committed to). Gated into the autonomous `StartAutonomousQso` handler: a cross-parity pounce/CQ is deferred this slot (the DX re-CQs and we re-evaluate once the side clears). **Always-answer-callers**: an always-on decode-loop path (`classify_caller_answer` + `maybe_answer_caller`) answers a station calling us **independent of the autonomous toggle** — `classify_caller_answer` maps a frame directed at us to the reply rung (CqResponse→Report, SignalReport→ReportAck, ReportAck→Rr73, FinalConfirmation→73; compound-aware). Gated by TxPolicy != Disabled + no-active-or-recent-QSO-with-them (`has_active_or_recent_qso_with`) + parity-admit + capacity (`max_concurrent_qsos`). Since PAN-120, new caller admission also requires console presence or `unattended_policy = "respond_only"`. Carries no failure-backoff, so it also satisfies #43 part 2 (answer a DX that calls us after our initiation watchdog retired the QSO).
+
+## Direct-caller presence policy (PAN-120)
+
+The three opening paths remain distinct: `start_cq` originates CQ,
+`respond_to_cq_with` pounces on another station's CQ, and `respond_to_caller`
+answers a decoded call addressed to us. Autonomous CQ and pounce still pass
+`allows_initiation() && operator_present`; the new config never enters that
+scheduling predicate.
+
+`[autonomous].unattended_policy` is `off` by default. `off` requires presence to
+open an automatic direct-call reply; `respond_only` permits that admission
+without console activity. This changes the previous default, which admitted new
+direct callers without checking presence. The QSO component snapshots the
+setting at startup, independently of `autonomous.enabled`, and reads the shared
+local-keypress atomic for each attempt under its admission lock. Changes require
+a restart; remote heartbeats remain excluded from presence.
+
+Existing-QSO processing runs first and remains outside this new admission gate.
+An established exchange, including an answer to an already-open CQ, can advance
+as the same QSO after presence expires. Duplicate/recent contacts, parity,
+capacity, runtime TX policy and downstream safety checks keep their own gates.
+The policy is applied in the decode-loop caller helper, leaving explicit manual
+and remote manager calls unchanged. It is distinct from runtime
+`TxPolicy::RespondOnly`; `TxPolicy::Disabled` blocks a new caller reply.
+
+Autonomous `policy_dropped` and `presence_dropped` counts still describe only
+CQ/pounce openings. Caller admission emits its own structured `tx.policy` event
+with the callsign, reply step, setting and outcome counts. Only a successful
+`respond_to_caller` result without presence reports `respond_only_admitted=1`,
+with the actual QSO id. That records admission, not PTT or delivery. Runtime TX
+policy wins attribution when both policy and presence block. The existing
+presence-transition diagnostic explains which caller rule is in force; it
+remains edge-triggered in the same diagnostics overlay.
+
+The rationale follows the repository's [§97.221(c) analysis](../fcc-part97-compliance.md),
+with a narrower product decision than its older pounce recommendation. A decoded
+callsign alone does not prove how the other station is controlled. No
+frequency-based unattended exception is introduced. See [configuration](../CONFIG.md#autonomous--the-brain).
 
 ## Manual multi-transmit + cross-parity queue (#40)
 
@@ -578,7 +616,33 @@ mode-scaled base coalesce window minus the safety margin, mirrored as
 `keep_call_acceptance_cap_ms` — else the first own slot strictly after —
 a PR-review follow-up; attributing an in-window emission to the next own
 slot instead split one real TX opportunity across two ledger keys and both
-incremented, firing the switch one transmission early); when a
+incremented, firing the switch one transmission early). That rule is only a
+prediction (PAN-223): the worker decides from the instant it dequeues the
+request, so an emission inside own slot S's cap that reaches the worker after
+the cap (or waits in its queue) airs in S's successor, the slot the next
+off-parity rearm also books, and one TX opportunity counted twice. The worker
+now reports `QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot }`
+durably once each frame's `TxSchedule` is final (after the defer-time liveness
+drop, before Step 4's PTT wait, for every single request, bundle item and
+re-key pass), and `QsoManager::record_scheduled_tx_slot` re-keys that attempt
+to the worker's `target_slot`. A re-key moves or removes a count and never adds
+one: an uncounted attempt stays uncounted, a counted one hands its old slot's
+count to a surviving same-slot sibling (the heir rule below), or, when another
+attempt already counts the worker's slot, its count is the duplicate and is
+released exactly as a no-heir rollback releases one (decrement, revoke, hold
+re-point; one shared helper), else the count moves with it. A held stall
+trigger follows its attempt, so a frame that aired before the worker's slot
+cannot release it. Reports converge in either order relative to the
+successor's rearm. Rejected alternative: counting only on worker reports,
+which would move the threshold check, action raising and PAN-182 trigger
+arming out of the rearm. Known residual: an attempt the worker coalesces away
+(newest-wins, PAN-75) is never scheduled and keeps its prediction; that needs
+the worker blocked over a slot on another QSO's frame, so only
+`max_concurrent_qsos > 1` (default 1) can reach it — follow-up "Absorbed
+keep-call attempts should take their surviving request's scheduled slot".
+Pivoted-in attempts and in-flight duplicate drops also keep their prediction,
+which can only name the same slot as, or a later slot than, the frame that
+carried them, so they never fire the switch early. When a
 payload-scoped rollback removes the
 attempt holding a slot's count while a same-slot sibling survives, the
 count is handed to that sibling instead of being decremented (the slot still

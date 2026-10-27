@@ -347,6 +347,35 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
     }
 }
 
+/// The TX worker's base coalesce-collection window at FT8 (its
+/// `COALESCE_COLLECT_WINDOW_MS`), mode-scaled like there. Mirrored for
+/// [`keep_call_acceptance_cap_ms`]; `pancetta-qso` cannot depend on the
+/// `pancetta` crate that owns the original.
+const TX_WORKER_COALESCE_COLLECT_WINDOW_MS: u64 = 800;
+
+/// The TX worker's fixed (unscaled) coalesce safety margin (its
+/// `COALESCE_CAP_SAFETY_MARGIN_MS`). Mirrored for
+/// [`keep_call_acceptance_cap_ms`].
+const TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
+
+/// Mirror of the TX worker's `current_slot_acceptance_cap_ms` (PAN-117),
+/// the cap `schedule_tx` decides current-slot acceptance against for a
+/// single `TransmitRequest` — which every keep-call re-send is: the
+/// mode-scaled `tx_late_max_ms`, minus the mode-scaled base coalesce
+/// window, minus the fixed safety margin, saturating at 0. Each term is
+/// scaled and rounded separately, exactly as the worker's
+/// `tx_late_max_ms_effective` / `coalesce_collect_window_ms` do, from the
+/// live slot length (FT8 15 s → ratio 1, FT4 1/2, FT2 ~0.213) instead of a
+/// second protocol source. FT8 at the 3000 ms default → 1700 ms; FT4 →
+/// 600 ms; FT2 → 0 ms.
+fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
+    let ratio = slot_millis as f64 / 15_000.0;
+    let scale = |ms: u64| ((ms as f64) * ratio).round() as u64;
+    scale(tx_late_max_ms)
+        .saturating_sub(scale(TX_WORKER_COALESCE_COLLECT_WINDOW_MS))
+        .saturating_sub(TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS) as i64
+}
+
 /// The own-parity TX slot a keep-call rearm emission at `now` feeds
 /// (PAN-128), derived with the TX scheduler's own current-slot
 /// acceptance rule (`pancetta::coordinator::tx::schedule_tx`): the
@@ -354,6 +383,14 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
 /// `QsoMetadata::tx_parity` and `now` is still inside the worker's
 /// queue-time acceptance window ([`keep_call_acceptance_cap_ms`]);
 /// otherwise the first own-parity slot STRICTLY after `now`.
+///
+/// The result is PROVISIONAL (PAN-223): the TX worker decides the real
+/// target slot from the instant it dequeues the request, and reports it
+/// (`QsoMessage::TxFrameScheduled`) once the schedule is final;
+/// [`QsoManager::record_scheduled_tx_slot`] then re-keys the attempt to that
+/// slot. An emission inside the acceptance cap that reaches the worker after
+/// it, or waits in its queue, is deferred to the next own slot, which no
+/// prediction made at emission time can know.
 ///
 /// A QSO is parity-constrained and only keys on slots matching its latched
 /// `QsoMetadata::tx_parity` — every OTHER protocol slot (every 30 s under
@@ -391,7 +428,9 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
 /// `tx_late_max_ms` minus the mode-scaled base coalesce window minus the
 /// fixed safety margin — 1700 ms for FT8 at the 3000 ms default), which is
 /// what `schedule_tx` is actually called with for a keep-call
-/// `TransmitRequest`. It must match exactly, in both directions: a WIDER
+/// `TransmitRequest`. It should match exactly, in both directions, so the
+/// provisional key is already right whenever the worker dequeues the
+/// emission promptly and the re-key changes nothing: a WIDER
 /// ledger window tags an emission the worker defers (say 2.0 s into own
 /// slot S) with S, while its off-parity successor feeding the same deferred
 /// slot gets S's successor, so the first emission after a reset or advance
@@ -402,35 +441,6 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
 /// switch or the one-time `tx_parity_provisional` correction changes the
 /// values this returns, which can add at most one extra count at the
 /// boundary.
-/// The TX worker's base coalesce-collection window at FT8 (its
-/// `COALESCE_COLLECT_WINDOW_MS`), mode-scaled like there. Mirrored for
-/// [`keep_call_acceptance_cap_ms`]; `pancetta-qso` cannot depend on the
-/// `pancetta` crate that owns the original.
-const TX_WORKER_COALESCE_COLLECT_WINDOW_MS: u64 = 800;
-
-/// The TX worker's fixed (unscaled) coalesce safety margin (its
-/// `COALESCE_CAP_SAFETY_MARGIN_MS`). Mirrored for
-/// [`keep_call_acceptance_cap_ms`].
-const TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
-
-/// Mirror of the TX worker's `current_slot_acceptance_cap_ms` (PAN-117),
-/// the cap `schedule_tx` decides current-slot acceptance against for a
-/// single `TransmitRequest` — which every keep-call re-send is: the
-/// mode-scaled `tx_late_max_ms`, minus the mode-scaled base coalesce
-/// window, minus the fixed safety margin, saturating at 0. Each term is
-/// scaled and rounded separately, exactly as the worker's
-/// `tx_late_max_ms_effective` / `coalesce_collect_window_ms` do, from the
-/// live slot length (FT8 15 s → ratio 1, FT4 1/2, FT2 ~0.213) instead of a
-/// second protocol source. FT8 at the 3000 ms default → 1700 ms; FT4 →
-/// 600 ms; FT2 → 0 ms.
-fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
-    let ratio = slot_millis as f64 / 15_000.0;
-    let scale = |ms: u64| ((ms as f64) * ratio).round() as u64;
-    scale(tx_late_max_ms)
-        .saturating_sub(scale(TX_WORKER_COALESCE_COLLECT_WINDOW_MS))
-        .saturating_sub(TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS) as i64
-}
-
 fn keep_call_tx_slot(
     now: DateTime<Utc>,
     slot_millis: i64,
@@ -1269,8 +1279,11 @@ struct KeepCallAttempt {
     // one surviving attempt per own-parity TX slot carries `true`, so
     // `stall_cycles` rises once per own TX slot, not once per emission.
     bumped_stall: bool,
-    // The own-parity TX slot this emission feeds (`keep_call_tx_slot`);
-    // `None` for attempts that never count toward the stall streak and
+    // The own-parity TX slot this emission feeds: the rearm's prediction
+    // (`keep_call_tx_slot`) until the TX worker reports the slot it
+    // scheduled the frame into, then that slot (PAN-223,
+    // `record_scheduled_tx_slot`); `None` for attempts that never count
+    // toward the stall streak and
     // never inherit one either (`resend_last_tx`, the offset-switch
     // retransmit, and anything a stall reset cleared — the reset retires
     // the slot key with the increment).
@@ -1304,7 +1317,8 @@ struct PendingStallTrigger {
     attempt_id: TxAttemptId,
     emitted_at: DateTime<Utc>,
     // The own-parity TX slot the trigger feeds; no frame that aired before
-    // it started can be the trigger.
+    // it started can be the trigger. Follows its attempt's re-key to the
+    // TX worker's scheduled slot (PAN-223).
     tx_slot: Option<DateTime<Utc>>,
     raw_text: String,
     frequency_hz: f64,
@@ -1423,6 +1437,33 @@ pub enum UnsentAttemptRollback {
     NoMatchingAttempt,
     /// Missing or terminal QSOs have no live bookkeeping to restore.
     QsoNotActive,
+}
+
+/// PAN-223: what [`QsoManager::record_scheduled_tx_slot`] did with the TX
+/// worker's report of the slot it scheduled a frame into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledTxSlot {
+    /// The QSO is unknown or no longer active.
+    QsoNotActive,
+    /// No surviving ledger attempt has this id (an opening call or advance,
+    /// which record none, or an attempt already rolled back or aged out).
+    /// Never falls back to content matching (PAN-183).
+    NoMatchingAttempt,
+    /// The attempt records no slot (`resend_last_tx`, the offset-switch
+    /// retransmit, or a key a stall reset retired): never keyed, never counts.
+    NoSlotKey,
+    /// The rearm's prediction already named the worker's slot.
+    Unchanged,
+    /// Re-keyed; the attempt held no count and gains none.
+    RekeyedUncounted,
+    /// Re-keyed; its count moved to a slot no other attempt counted.
+    CountMoved,
+    /// Re-keyed uncounted; a surviving attempt still keyed to the old slot
+    /// took that slot's count (the PAN-128 heir rule).
+    CountLeftWithSibling,
+    /// Another attempt already counted the worker's slot: this attempt's
+    /// count was the duplicate and is gone.
+    DuplicateCountRemoved { stall_cycles: u32 },
 }
 
 /// What a manual open or re-call actually did (PAN-138).
@@ -4420,29 +4461,7 @@ impl QsoManager {
                     }
                 }
                 None => {
-                    let threshold = self.config.timeouts.qso_stall_switch_after;
-                    let was_at_threshold = progress.metadata.stall_cycles >= threshold;
-                    progress.metadata.stall_cycles =
-                        progress.metadata.stall_cycles.saturating_sub(1);
-                    if was_at_threshold && progress.metadata.stall_cycles < threshold {
-                        entry.stall_action_revoked = true;
-                    }
-                    // PAN-182 (PR #507 review): with no heir the streak lost
-                    // one count, but a NEWER counted attempt can keep it at
-                    // or above the threshold — the trigger was peeled by a
-                    // payload-qualified rollback after a later own-slot
-                    // emission already pushed the streak past it. That newer
-                    // attempt is now the decisive count and its outcome is
-                    // just as unresolved as the trigger's was, so the hold
-                    // moves to it instead of vanishing; otherwise the next
-                    // drain commits before its frame airs (the PAN-182 race
-                    // again).
-                    if trigger_rolled_back && progress.metadata.stall_cycles >= threshold {
-                        if let Some(newest) = entry.attempts.iter().rposition(|a| a.bumped_stall) {
-                            entry.pending_stall_trigger =
-                                Some(PendingStallTrigger::from_attempt(&entry.attempts[newest]));
-                        }
-                    }
+                    self.release_one_stall_count(entry, &mut progress.metadata, trigger_rolled_back)
                 }
             }
         }
@@ -4458,6 +4477,142 @@ impl QsoManager {
         UnsentAttemptRollback::RolledBack {
             call_count: progress.metadata.call_count,
         }
+    }
+
+    // One own-parity TX slot lost its only counted attempt (a no-heir
+    // rollback, or a PAN-223 re-key that found the attempt's count a
+    // duplicate): take the count off the streak, revoke a raised action the
+    // streak no longer justifies, and re-point a hold the released attempt
+    // carried. The caller has already cleared the released attempt's
+    // `bumped_stall` (or removed it) and, when it was the trigger, its
+    // `pending_stall_trigger`.
+    fn release_one_stall_count(
+        &self,
+        entry: &mut KeepCallLedger,
+        metadata: &mut QsoMetadata,
+        released_trigger: bool,
+    ) {
+        let threshold = self.config.timeouts.qso_stall_switch_after;
+        let was_at_threshold = metadata.stall_cycles >= threshold;
+        metadata.stall_cycles = metadata.stall_cycles.saturating_sub(1);
+        if was_at_threshold && metadata.stall_cycles < threshold {
+            entry.stall_action_revoked = true;
+        }
+        // PAN-182 (PR #507 review): with no heir the streak lost one count,
+        // but a NEWER counted attempt can keep it at or above the threshold
+        // — the trigger was peeled by a payload-qualified rollback after a
+        // later own-slot emission already pushed the streak past it. That
+        // newer attempt is now the decisive count and its outcome is just as
+        // unresolved as the trigger's was, so the hold moves to it instead of
+        // vanishing; otherwise the next drain commits before its frame airs
+        // (the PAN-182 race again).
+        if released_trigger && metadata.stall_cycles >= threshold {
+            if let Some(newest) = entry.attempts.iter().rposition(|a| a.bumped_stall) {
+                entry.pending_stall_trigger =
+                    Some(PendingStallTrigger::from_attempt(&entry.attempts[newest]));
+            }
+        }
+    }
+
+    /// PAN-223: key a keep-call attempt by the slot the TX worker actually
+    /// scheduled its frame into (`TxSchedule::target_slot`), replacing the
+    /// rearm's `keep_call_tx_slot` prediction. A re-key moves or removes a slot
+    /// count, never adds one:
+    ///
+    /// - an uncounted attempt is re-keyed and stays uncounted; the next rearm
+    ///   feeding the new slot counts it, as it would have;
+    /// - a counted attempt whose old slot still has a surviving attempt hands
+    ///   that slot's count to the newest such sibling (the PAN-128 heir rule);
+    /// - otherwise, if another attempt already counts the worker's slot, this
+    ///   attempt's count was the duplicate and is released exactly as a
+    ///   no-heir rollback releases one (decrement, revoke, hold re-point);
+    /// - otherwise the count moves with the attempt.
+    ///
+    /// A held stall trigger follows its attempt. Ids are authoritative: an id
+    /// with no surviving attempt is a no-op. Repeated or late reports converge
+    /// in any order.
+    pub async fn record_scheduled_tx_slot(
+        &self,
+        qso_id: QsoId,
+        attempt_id: TxAttemptId,
+        target_slot: DateTime<Utc>,
+    ) -> ScheduledTxSlot {
+        let mut qsos = self.qsos.write().await;
+        let Some(progress) = qsos.get_mut(&qso_id).filter(|p| p.state.is_active()) else {
+            return ScheduledTxSlot::QsoNotActive;
+        };
+        let mut ledger = self
+            .keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = ledger.get_mut(&qso_id) else {
+            return ScheduledTxSlot::NoMatchingAttempt;
+        };
+        let Some(index) = entry
+            .attempts
+            .iter()
+            .position(|attempt| attempt.attempt_id == attempt_id)
+        else {
+            return ScheduledTxSlot::NoMatchingAttempt;
+        };
+        let Some(old_slot) = entry.attempts[index].tx_slot else {
+            return ScheduledTxSlot::NoSlotKey;
+        };
+        if old_slot == target_slot {
+            return ScheduledTxSlot::Unchanged;
+        }
+        entry.attempts[index].tx_slot = Some(target_slot);
+        let is_trigger = entry
+            .pending_stall_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.is_attempt(&entry.attempts[index]));
+        if is_trigger {
+            if let Some(trigger) = entry.pending_stall_trigger.as_mut() {
+                trigger.tx_slot = Some(target_slot);
+            }
+        }
+        if !entry.attempts[index].bumped_stall {
+            return ScheduledTxSlot::RekeyedUncounted;
+        }
+        let heir = entry
+            .attempts
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(i, a)| *i != index && a.tx_slot == Some(old_slot))
+            .map(|(i, _)| i);
+        let outcome = if let Some(heir) = heir {
+            entry.attempts[index].bumped_stall = false;
+            entry.attempts[heir].bumped_stall = true;
+            if is_trigger {
+                entry.pending_stall_trigger =
+                    Some(PendingStallTrigger::from_attempt(&entry.attempts[heir]));
+            }
+            ScheduledTxSlot::CountLeftWithSibling
+        } else if entry
+            .attempts
+            .iter()
+            .enumerate()
+            .any(|(i, a)| i != index && a.bumped_stall && a.tx_slot == Some(target_slot))
+        {
+            entry.attempts[index].bumped_stall = false;
+            if is_trigger {
+                entry.pending_stall_trigger = None;
+            }
+            self.release_one_stall_count(entry, &mut progress.metadata, is_trigger);
+            ScheduledTxSlot::DuplicateCountRemoved {
+                stall_cycles: progress.metadata.stall_cycles,
+            }
+        } else {
+            ScheduledTxSlot::CountMoved
+        };
+        debug!(
+            target: "qso",
+            "PAN-223: QSO {} attempt {:?} re-keyed from {} to the TX worker's slot {}: \
+             {:?}, stall_cycles={}",
+            qso_id, attempt_id, old_slot, target_slot, outcome, progress.metadata.stall_cycles
+        );
+        outcome
     }
 
     /// PAN-182: the TX worker reports a QSO frame that aired, at `aired_at`
@@ -4536,6 +4691,26 @@ impl QsoManager {
                     .attempts
                     .iter()
                     .map(|a| (a.attempt_id, a.bumped_stall))
+                    .collect()
+            })
+    }
+
+    /// Oldest first: each surviving attempt's id, whether it holds its slot's
+    /// stall increment, and the slot it is keyed to (PAN-223).
+    #[cfg(test)]
+    fn keep_call_attempt_slots(
+        &self,
+        qso_id: QsoId,
+    ) -> Vec<(TxAttemptId, bool, Option<DateTime<Utc>>)> {
+        self.keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&qso_id)
+            .map_or_else(Vec::new, |entry| {
+                entry
+                    .attempts
+                    .iter()
+                    .map(|a| (a.attempt_id, a.bumped_stall, a.tx_slot))
                     .collect()
             })
     }
@@ -19580,6 +19755,31 @@ mod pan72_stall_detection_tests {
             })
     }
 
+    /// PAN-239: two silent rearms on two consecutive own-parity FT8 TX
+    /// slots, each 1 s in — inside the 1.7 s current-slot acceptance window
+    /// — so each feeds its own slot and PAN-128 counts both. Anchored to the
+    /// QSO's own slot grid rather than `opened_at`, whose phase is the real
+    /// wall clock's: the rearms resolve the same way on every run.
+    async fn stall_on_two_own_parity_slots(
+        manager: &QsoManager,
+        qso_id: QsoId,
+        opened_at: DateTime<Utc>,
+    ) {
+        let tx_parity = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .tx_parity
+            .expect("manual QSOs latch a TX parity at creation");
+        let own_slot = next_own_ft8_slot(opened_at + Duration::seconds(15), tx_parity);
+        for k in [0i64, 2] {
+            manager
+                .rearm_manual_calls_at(own_slot + Duration::seconds(1 + 15 * k))
+                .await;
+        }
+    }
+
     /// DX sends us a plain signal report — a genuine forward advance from
     /// `RespondingToCq` to `SendingReport` (their_report: None rung).
     async fn send_report(manager: &QsoManager, report: i8, text: &str) {
@@ -21834,17 +22034,12 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Two silent rearm cycles on DISTINCT own-parity TX slots (slots 1
-        // and 3): PAN-128 counts one stall per own-parity slot, so the old
-        // +15/+30 pair can collapse onto the same slot — leaving no armed
-        // PAN-182 trigger to release and making the commit below pass or
-        // fail on real wall-clock phase. The slot-3 rearm re-sends our CQ
+        // Two silent rearm cycles on two consecutive own-parity TX slots,
+        // each 1 s into the slot (PAN-239): anchored to the QSO's own slot
+        // grid, not `opened_at`, so every run takes the same path whatever
+        // wall-clock second it started in. The second rearm re-sends our CQ
         // at FREQ and trips the stall threshold.
-        for slot in [1i64, 3] {
-            manager
-                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
-                .await;
-        }
+        stall_on_two_own_parity_slots(&manager, qso_id, opened_at).await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             2,
@@ -22069,15 +22264,10 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Stall out on FREQ across DISTINCT own-parity TX slots (slots 1 and
-        // 3, per PAN-128's one-count-per-own-parity-slot rule — a +15/+30
-        // pair can resolve to the same slot and leave no armed PAN-182
-        // trigger); the threshold-crossing rearm re-sends there.
-        for slot in [1i64, 3] {
-            manager
-                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
-                .await;
-        }
+        // Stall out on FREQ across two consecutive own-parity TX slots,
+        // anchored to the QSO's own slot grid (PAN-239); the
+        // threshold-crossing rearm re-sends there.
+        stall_on_two_own_parity_slots(&manager, qso_id, opened_at).await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             2,
@@ -23544,6 +23734,383 @@ mod pan72_stall_detection_tests {
             1,
             "a deferred own-slot rearm and its off-parity successor feed one \
              real TX slot and must share its ledger key"
+        );
+    }
+
+    // ── PAN-223 ──
+    // The rearm's `keep_call_tx_slot` key is a prediction; the TX worker
+    // picks the real slot from the instant it dequeues the frame and reports
+    // it (`TxFrameScheduled` → `record_scheduled_tx_slot`). An emission
+    // inside own slot S's 1.7 s acceptance cap that the worker dequeues past
+    // the cap airs in S+2 (x+30 below), the slot the next off-parity rearm
+    // feeds too: one real TX opportunity, one count, in either report order.
+    // Times are anchored on the own-slot grid (PAN-239).
+
+    /// Threshold 2, a manual QSO latched to the Even TX parity, and `x`, the
+    /// first own slot a full protocol slot after it opened.
+    async fn pan223_open(threshold: u32) -> (QsoManager, QsoId, DateTime<Utc>) {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = threshold;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        (manager, qso_id, x)
+    }
+
+    async fn pan223_stall(manager: &QsoManager, qso_id: QsoId) -> u32 {
+        manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles
+    }
+
+    fn pan223_last_attempt(manager: &QsoManager, qso_id: QsoId) -> TxAttemptId {
+        manager.keep_call_attempt_ids(qso_id).last().unwrap().0
+    }
+
+    async fn pan223_last_text(manager: &QsoManager, qso_id: QsoId) -> String {
+        manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn pan223_in_cap_rearm_the_worker_deferred_counts_once_with_its_off_parity_successor() {
+        use pancetta_core::slot::SlotParity;
+
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let mut rx = manager.subscribe();
+        let ms = Duration::milliseconds;
+
+        // A, 1.6 s into own slot x: inside the 1.7 s cap, so the rearm
+        // predicts x.
+        manager.rearm_manual_calls_at(x + ms(1_600)).await;
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        let a = pan223_last_attempt(&manager, qso_id);
+        // The worker dequeues it 200 ms later, past the cap: it defers the
+        // frame to the next own slot.
+        assert_eq!(
+            keep_call_tx_slot(x + ms(1_800), 15_000, 3000, Some(SlotParity::Even)),
+            x + Duration::seconds(30),
+            "precondition: a dequeue past the cap targets the next own slot"
+        );
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+                .await,
+            ScheduledTxSlot::CountMoved
+        );
+
+        // B, the off-parity rearm before x+30: the same real TX slot.
+        manager.rearm_manual_calls_at(x + ms(16_600)).await;
+        let b = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(
+            pan223_stall(&manager, qso_id).await,
+            1,
+            "one real TX opportunity (x+30) must count once"
+        );
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
+            "threshold 2 must not trip after one real transmission"
+        );
+        assert_eq!(
+            manager.keep_call_attempt_slots(qso_id),
+            vec![
+                (a, true, Some(x + Duration::seconds(30))),
+                (b, false, Some(x + Duration::seconds(30))),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pan223_schedule_report_after_the_successor_removes_the_duplicate_count() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let mut rx = manager.subscribe();
+        let ms = Duration::milliseconds;
+
+        manager.rearm_manual_calls_at(x + ms(1_600)).await;
+        let a = pan223_last_attempt(&manager, qso_id);
+        manager.rearm_manual_calls_at(x + ms(16_600)).await;
+        let b = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(
+            pan223_stall(&manager, qso_id).await,
+            2,
+            "precondition: before the report the prediction double-counts"
+        );
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })));
+        let raised_at_generation = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .advance_generation;
+
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+                .await,
+            ScheduledTxSlot::DuplicateCountRemoved { stall_cycles: 1 }
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        assert_eq!(
+            manager.keep_call_attempt_slots(qso_id),
+            vec![
+                (a, false, Some(x + Duration::seconds(30))),
+                (b, true, Some(x + Duration::seconds(30))),
+            ]
+        );
+        let result = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                FREQ + 200.0,
+                OffsetRelocationOrigin::StallDetected {
+                    raised_at_generation,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionStallRolledBack { .. })
+            ),
+            "the action raised on the duplicate count is revoked, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan223_ledger_slot_is_the_worker_target_slot() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let s = Duration::seconds;
+
+        manager
+            .rearm_manual_calls_at(x + Duration::milliseconds(1_600))
+            .await;
+        let a = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(manager.keep_call_attempt_slots(qso_id)[0].2, Some(x));
+
+        manager.record_scheduled_tx_slot(qso_id, a, x + s(30)).await;
+        assert_eq!(
+            manager.keep_call_attempt_slots(qso_id)[0].2,
+            Some(x + s(30)),
+            "the ledger slot is the slot the worker scheduled"
+        );
+        // A supersede re-schedules the frame: the newest report wins.
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, a, x + s(60)).await,
+            ScheduledTxSlot::CountMoved
+        );
+        assert_eq!(
+            manager.keep_call_attempt_slots(qso_id)[0].2,
+            Some(x + s(60))
+        );
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, a, x + s(60)).await,
+            ScheduledTxSlot::Unchanged
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn pan223_matching_prediction_and_unknown_ids_change_nothing() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let s = Duration::seconds;
+
+        manager.rearm_manual_calls_at(x + s(16)).await;
+        let p = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, p, x + s(30)).await,
+            ScheduledTxSlot::Unchanged
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, TxAttemptId(u64::MAX), x + s(60))
+                .await,
+            ScheduledTxSlot::NoMatchingAttempt,
+            "an unknown id never falls back to content matching"
+        );
+
+        let text = pan223_last_text(&manager, qso_id).await;
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(qso_id, &text, None, Some(p), x + s(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, p, x + s(60)).await,
+            ScheduledTxSlot::NoMatchingAttempt
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 0);
+
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(Uuid::new_v4(), p, x + s(60))
+                .await,
+            ScheduledTxSlot::QsoNotActive
+        );
+    }
+
+    #[tokio::test]
+    async fn pan223_unslotted_and_reset_retired_attempts_are_never_rekeyed() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        manager.resend_last_tx(qso_id).await.unwrap();
+        let resend = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, resend, x + Duration::seconds(30))
+                .await,
+            ScheduledTxSlot::NoSlotKey
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 0);
+
+        let manager = pan182_threshold_one();
+        let (qso_id, rearm_at, _) = pan182_raise(&manager).await;
+        let pre_reset = pan223_last_attempt(&manager, qso_id);
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("a released stall switch commits and resets the streak");
+        assert_eq!(pan223_stall(&manager, qso_id).await, 0);
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, pre_reset, rearm_at + Duration::seconds(30))
+                .await,
+            ScheduledTxSlot::NoSlotKey,
+            "a stall reset retires the slot key with the count"
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn pan223_uncounted_rekey_never_adds_a_count() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let s = Duration::seconds;
+
+        // P (off-parity) holds x+30's count; A, 1 s into x+30, shares it.
+        manager.rearm_manual_calls_at(x + s(16)).await;
+        manager.rearm_manual_calls_at(x + s(31)).await;
+        let a = pan223_last_attempt(&manager, qso_id);
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, a, x + s(60)).await,
+            ScheduledTxSlot::RekeyedUncounted
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        // The next rearm feeding x+60 counts it: two real slots, two counts.
+        manager.rearm_manual_calls_at(x + s(46)).await;
+        assert_eq!(pan223_stall(&manager, qso_id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn pan223_a_surviving_same_slot_sibling_keeps_the_old_slot_count() {
+        let (manager, qso_id, x) = pan223_open(2).await;
+        let s = Duration::seconds;
+
+        manager.rearm_manual_calls_at(x + s(16)).await;
+        let p = pan223_last_attempt(&manager, qso_id);
+        manager.rearm_manual_calls_at(x + s(31)).await;
+        let a = pan223_last_attempt(&manager, qso_id);
+
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, p, x + s(60)).await,
+            ScheduledTxSlot::CountLeftWithSibling
+        );
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        assert_eq!(
+            manager.keep_call_attempt_slots(qso_id),
+            vec![(p, false, Some(x + s(60))), (a, true, Some(x + s(30)))]
+        );
+    }
+
+    #[tokio::test]
+    async fn pan223_a_held_trigger_follows_its_attempt_to_the_worker_slot() {
+        let (manager, qso_id, x) = pan223_open(1).await;
+        let s = Duration::seconds;
+
+        manager
+            .rearm_manual_calls_at(x + Duration::milliseconds(1_600))
+            .await;
+        assert_eq!(pan223_stall(&manager, qso_id).await, 1);
+        let a = pan223_last_attempt(&manager, qso_id);
+        let text = pan223_last_text(&manager, qso_id).await;
+        assert_eq!(
+            manager.record_scheduled_tx_slot(qso_id, a, x + s(30)).await,
+            ScheduledTxSlot::CountMoved
+        );
+
+        let aired = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired, x + s(13))
+                .await,
+            "a frame that aired in slot x is not the trigger the worker put in x+30"
+        );
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired, x + s(43))
+                .await,
+            "the trigger's own x+30 frame releases the hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan223_removing_a_trigger_duplicate_moves_the_hold_to_the_slot_holder() {
+        let (manager, qso_id, x) = pan223_open(1).await;
+        let ms = Duration::milliseconds;
+
+        manager.rearm_manual_calls_at(x + ms(1_600)).await;
+        let a = pan223_last_attempt(&manager, qso_id);
+        let text = pan223_last_text(&manager, qso_id).await;
+        manager.rearm_manual_calls_at(x + ms(16_600)).await;
+        assert_eq!(pan223_stall(&manager, qso_id).await, 2);
+
+        assert_eq!(
+            manager
+                .record_scheduled_tx_slot(qso_id, a, x + Duration::seconds(30))
+                .await,
+            ScheduledTxSlot::DuplicateCountRemoved { stall_cycles: 1 }
+        );
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(qso_id, &text, None, Some(a), x + ms(20_000))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "the hold moved to the x+30 slot holder, which has not aired: got {result:?}"
         );
     }
 

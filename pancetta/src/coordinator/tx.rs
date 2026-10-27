@@ -3134,6 +3134,33 @@ async fn report_frame_sent(
         .await;
 }
 
+/// PAN-223: tell the QSO engine which slot this frame was scheduled into.
+/// Takes the `TxSchedule` itself so the reported slot cannot differ from
+/// the one the worker waits for. Durable (PAN-185); its only await is the
+/// channel table's read lock, and callers send it before Step 4's PTT wait.
+async fn report_frame_scheduled(
+    message_bus: &MessageBus,
+    qso_id: Option<&str>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+    schedule: &TxSchedule,
+) {
+    let (Some(qso_id), Some(attempt_id)) = (qso_id, attempt_id) else {
+        return;
+    };
+    message_bus
+        .send_message_durable(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameScheduled {
+                qso_id: qso_id.to_string(),
+                attempt_id,
+                target_slot: schedule.target_slot,
+            }),
+            Instant::now(),
+        ))
+        .await;
+}
+
 /// The offset and binding a transmitted frame carried (PAN-182).
 fn aired_payload(
     frequency_hz: f64,
@@ -8761,6 +8788,19 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
 
+                                        // PAN-223: the stall ledger keys this frame's
+                                        // keep-call attempt by the slot chosen here, not
+                                        // the rearm's prediction. Every `'key_and_send`
+                                        // pass reports, so a re-key reports its
+                                        // superseding attempt and schedule.
+                                        report_frame_scheduled(
+                                            &message_bus,
+                                            qso_id.as_deref(),
+                                            attempt_id,
+                                            &schedule,
+                                        )
+                                        .await;
+
                                         // --- Step 4: Wait until PTT engage instant ---
                                         // PAN-114: waits on the wall clock (re-read every
                                         // 50 ms chunk), so a clock jump during the wait is
@@ -11444,6 +11484,18 @@ impl super::ApplicationCoordinator {
                                     } else {
                                         (items, samples, item_texts, encoded_qso_ids)
                                     };
+
+                                    // PAN-223: report each item that survived the
+                                    // defer-time liveness filter at the bundle's slot.
+                                    for item in &items {
+                                        report_frame_scheduled(
+                                            &message_bus,
+                                            item.qso_id.as_deref(),
+                                            item.attempt_id,
+                                            &schedule,
+                                        )
+                                        .await;
+                                    }
 
                                     // --- Step 3 (deferred): the audio buffer is now
                                     // built once, fresh, immediately before Step 5 —
@@ -23550,12 +23602,8 @@ mod pan118_worker_band_plan_tests {
         );
     }
 
-    /// The dial moving out of band between admission and key time (CAT
-    /// retune / split change during the pre-PTT wait) must still refuse
-    /// before PTT. The exact refusing site (post-wait re-key check or the
-    /// final pre-PTT check) depends on where in the slot the move lands,
-    /// so the assertion accepts either label — both are refusals before
-    /// PTT through the same unwind.
+    /// Park the worker at the PTT mutex, then move the dial out of band.
+    /// The final pre-PTT check must observe the new dial and refuse to key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dial_moved_out_of_band_before_key_is_refused() {
         let h = worker_harness().await;
@@ -23563,25 +23611,20 @@ mod pan118_worker_band_plan_tests {
             .operating_frequency_hz
             .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
 
-        request(&h, "CQ N0CALL FN20").await;
-        // Wait until the worker has admitted the frame (it appears in a
-        // TxQueueStatus push), then move the dial out of band — the frame
-        // is now queued against a dial that would key out of privilege.
+        let held = h.coordinator.ptt_sync_gate.lock().await;
         let text = "CQ N0CALL FN20";
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if h.tui_rx
-                .try_iter()
-                .any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text)))
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "worker did not queue the frame");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        request(&h, text).await;
+        tokio::time::timeout(
+            Duration::from_secs(40),
+            h.coordinator.tx_before_ptt_gate.notified(),
+        )
+        .await
+        .expect("worker must reach the pre-PTT gate before the dial moves");
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
         h.coordinator
             .operating_frequency_hz
             .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        drop(held);
 
         let (completed, diagnostics, ptt_on) =
             await_completion(&h, text, Duration::from_secs(45)).await;
@@ -23592,10 +23635,11 @@ mod pan118_worker_band_plan_tests {
         );
         assert!(!ptt_on, "no SetPtt(true) after the dial moved out of band");
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.contains("outside the configured amateur band plan")),
-            "a key-time gate must report the band-plan refusal, got {diagnostics:?}"
+            diagnostics.iter().any(|d| {
+                d.contains("TX blocked at final pre-PTT check")
+                    && d.contains("outside the configured amateur band plan")
+            }),
+            "the final pre-PTT gate must report the band-plan refusal, got {diagnostics:?}"
         );
     }
 
@@ -25339,10 +25383,37 @@ mod pan122_tx_log_worker_tests {
                 audio_enqueued |= matches!(msg.message_type, MessageType::AudioOutput { .. });
             }
             while h.hamlib_rx.try_recv().is_ok() {}
-            while h.autonomous_rx.try_recv().is_ok() {}
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(audio_enqueued, "the frame's audio must reach the output");
+
+        // File visibility precedes the best-effort TUI relay attempt. Keep
+        // TUI full until this frame completes, which happens after the relay.
+        // Leave Autonomous unread above so an early completion is retained.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            while h.hamlib_rx.try_recv().is_ok() {}
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    qso_id: None,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == TEXT {
+                        completed = Some(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed,
+            Some(true),
+            "the frame must complete successfully before draining TUI"
+        );
 
         let lines = await_tx_log_lines(&h, 1, Duration::from_secs(5)).await;
         assert_eq!(lines.len(), 1, "exactly one record: {lines:?}");
@@ -25355,6 +25426,8 @@ mod pan122_tx_log_worker_tests {
         assert_eq!(r.qso_id, None);
         assert_eq!(r.dial_hz, None, "dial unknown in the harness");
 
+        // Completion proves the relay already encountered the full route;
+        // draining now cannot admit a late TxFrameLogged event.
         let tui_frame_events = h
             .tui_rx
             .try_iter()
@@ -25892,6 +25965,292 @@ mod pan182_audio_delivery_tests {
         assert!(
             !sent_mirror,
             "no aired mirror may be sent for a frame that never keyed audio"
+        );
+    }
+}
+
+/// PAN-223: `report_frame_scheduled` carries the worker's own
+/// `TxSchedule::target_slot` to the QSO engine, durably, and only for frames
+/// that name both a QSO and a ledger attempt.
+#[cfg(test)]
+mod pan223_frame_scheduled_report_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use pancetta_core::slot::{SlotParity, SLOT_NS};
+    use pancetta_qso::TxAttemptId;
+
+    /// 2026-01-01 00:00:00 UTC is an Even FT8 slot start (as in
+    /// `schedule_tx_tests::at`).
+    fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
+        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+    }
+
+    /// 2.3 s into own slot 0: past FT8's 1.7 s acceptance cap, so deferred
+    /// to the next own slot.
+    fn deferred_schedule() -> TxSchedule {
+        schedule_tx(
+            at(2.3),
+            SlotParity::Even,
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            12_000,
+            SLOT_NS,
+        )
+    }
+
+    #[tokio::test]
+    async fn report_frame_scheduled_carries_the_schedule_target_slot() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let schedule = deferred_schedule();
+        assert_eq!(schedule.target_slot, at(30.0));
+
+        report_frame_scheduled(&bus, Some("qa"), Some(TxAttemptId(7)), &schedule).await;
+
+        let msg = qso.try_recv().expect("the report reaches Qso");
+        assert_eq!(msg.source, ComponentId::Ft8Transmitter);
+        match msg.message_type {
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameScheduled {
+                qso_id,
+                attempt_id,
+                target_slot,
+            }) => {
+                assert_eq!(qso_id, "qa");
+                assert_eq!(attempt_id, TxAttemptId(7));
+                assert_eq!(target_slot, schedule.target_slot);
+            }
+            other => panic!("expected TxFrameScheduled, got {other:?}"),
+        }
+        assert!(qso.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn report_frame_scheduled_skips_frames_without_a_qso_or_attempt() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let schedule = deferred_schedule();
+
+        report_frame_scheduled(&bus, None, Some(TxAttemptId(7)), &schedule).await;
+        report_frame_scheduled(&bus, Some("qa"), None, &schedule).await;
+
+        assert!(
+            qso.try_recv().is_err(),
+            "a frame with no QSO or no attempt has no ledger entry to re-key"
+        );
+    }
+
+    /// PAN-185: a full Qso channel parks the report instead of dropping it.
+    #[tokio::test]
+    async fn pan223_full_qso_channel_still_delivers_tx_frame_scheduled() {
+        let bus = MessageBus::new(1).unwrap();
+        let qso = bus.durable_inbox(ComponentId::Qso).await.unwrap();
+        let (qso_tx, _) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
+        qso_tx
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Qso,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                    qso_id: "filler".into(),
+                    message_text: "FILLER".into(),
+                    replaced: None,
+                    attempt_id: None,
+                }),
+                Instant::now(),
+            ))
+            .unwrap();
+        let before = bus.get_statistics();
+        let schedule = deferred_schedule();
+
+        report_frame_scheduled(&bus, Some("qa"), Some(TxAttemptId(7)), &schedule).await;
+
+        let after = bus.get_statistics();
+        assert_eq!(after.parked_messages, before.parked_messages + 1);
+        assert_eq!(after.dropped_messages, before.dropped_messages);
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                if qso_id == "filler"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameScheduled {
+                ref qso_id,
+                attempt_id: TxAttemptId(7),
+                target_slot,
+            }) if qso_id == "qa" && target_slot == at(30.0)
+        ));
+        assert!(qso.try_recv().is_err());
+    }
+}
+
+/// PAN-223: the real TX worker reports the slot `schedule_tx` picked from its
+/// own dequeue instant. Each test ends at the report and never waits for the
+/// slot itself.
+#[cfg(test)]
+mod pan223_scheduled_slot_worker_tests {
+    use super::pan115_worker_gate_tests::{worker_harness, Harness};
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, QsoMessage, TransmitRequestItem, TxOrigin,
+    };
+    use pancetta_core::slot::{current_slot_start_with_period, SlotParity, SLOT_NS};
+    use pancetta_qso::TxAttemptId;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    type Report = (String, TxAttemptId, chrono::DateTime<chrono::Utc>);
+
+    /// Dial on 20m and `qsos` live, as the QSO coordinator leaves them.
+    fn setup(h: &Harness, qsos: &[&str]) {
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        let mut live = h.coordinator.active_tx_qsos.write().unwrap();
+        for qso in qsos {
+            live.insert(super::super::active_tx_qso_key(qso));
+        }
+    }
+
+    async fn send(h: &Harness, message_type: MessageType) {
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                message_type,
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    fn request(qso: &str, id: u64, parity: SlotParity) -> MessageType {
+        MessageType::TransmitRequest {
+            attempt_id: Some(TxAttemptId(id)),
+            message_text: "K9ZZ K5ARH EM12".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some(qso.to_string()),
+            tx_parity: Some(parity),
+            origin: TxOrigin::Local,
+            remote_client_key_id: None,
+        }
+    }
+
+    /// Every `TxFrameScheduled` on the Qso channel until `count` arrived or
+    /// 5 s passed, then 300 ms more so a duplicate would show up.
+    async fn scheduled_reports(h: &Harness, count: usize) -> Vec<Report> {
+        let mut reports = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut drain = |reports: &mut Vec<Report>| {
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                if let MessageType::QsoMessage(QsoMessage::TxFrameScheduled {
+                    qso_id,
+                    attempt_id,
+                    target_slot,
+                }) = msg.message_type
+                {
+                    reports.push((qso_id, attempt_id, target_slot));
+                }
+            }
+        };
+        while reports.len() < count && Instant::now() < deadline {
+            drain(&mut reports);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drain(&mut reports);
+        reports
+    }
+
+    /// The start of the slot after the current one, and its parity: a
+    /// request with that parity always defers to it.
+    fn next_slot() -> (chrono::DateTime<chrono::Utc>, SlotParity) {
+        let next = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS)
+            + chrono::Duration::nanoseconds(SLOT_NS);
+        (next, SlotParity::of_with_period(next, SLOT_NS))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_request_reports_its_attempt_and_deferred_target() {
+        let h = worker_harness().await;
+        setup(&h, &["qa"]);
+        let (next, parity) = next_slot();
+
+        send(&h, request("qa", 41, parity)).await;
+
+        assert_eq!(
+            scheduled_reports(&h, 1).await,
+            vec![("qa".to_string(), TxAttemptId(41), next)]
+        );
+    }
+
+    /// AC 1, worker half: a request the worker dequeues past own slot S's
+    /// 1.7 s acceptance cap is reported at S + 30 s, never S.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_dequeued_past_the_acceptance_cap_reports_the_next_own_slot() {
+        let h = worker_harness().await;
+        setup(&h, &["qa"]);
+        // Wait until 2.0-12.0 s into a slot (at most ~5 s).
+        let now = chrono::Utc::now();
+        let phase = now - current_slot_start_with_period(now, SLOT_NS);
+        let wait = if phase < chrono::Duration::milliseconds(2_000) {
+            chrono::Duration::milliseconds(2_000) - phase
+        } else if phase > chrono::Duration::milliseconds(12_000) {
+            chrono::Duration::milliseconds(17_000) - phase
+        } else {
+            chrono::Duration::zero()
+        };
+        tokio::time::sleep(wait.to_std().unwrap()).await;
+        let s = current_slot_start_with_period(chrono::Utc::now(), SLOT_NS);
+        let own = SlotParity::of_with_period(s, SLOT_NS);
+
+        send(&h, request("qa", 42, own)).await;
+
+        let reports = scheduled_reports(&h, 1).await;
+        assert_eq!(
+            reports,
+            vec![(
+                "qa".to_string(),
+                TxAttemptId(42),
+                s + chrono::Duration::seconds(30)
+            )],
+            "dequeued past the cap of own slot {s}, the frame is scheduled into the next own slot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_reports_each_item_at_the_bundle_target() {
+        let h = worker_harness().await;
+        setup(&h, &["qa", "qb"]);
+        let (next, parity) = next_slot();
+        let item = |text: &str, offset: f64, qso: &str, id: u64| TransmitRequestItem {
+            attempt_id: Some(TxAttemptId(id)),
+            message_text: text.to_string(),
+            frequency_offset: offset,
+            qso_id: Some(qso.to_string()),
+            origin: TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+
+        send(
+            &h,
+            MessageType::MultiTransmitRequest {
+                items: vec![
+                    item("SM2LIY K5ARH R-14", 1000.0, "qa", 51),
+                    item("C6AVD K5ARH EM10", 1600.0, "qb", 52),
+                ],
+                tx_parity: Some(parity),
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            scheduled_reports(&h, 2).await,
+            vec![
+                ("qa".to_string(), TxAttemptId(51), next),
+                ("qb".to_string(), TxAttemptId(52), next),
+            ]
         );
     }
 }

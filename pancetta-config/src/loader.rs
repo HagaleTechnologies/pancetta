@@ -1950,6 +1950,49 @@ enabled = true
     }
 
     #[test]
+    fn pan120_discovered_unattended_policy_reaches_effective_config() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(
+            &path,
+            "[autonomous]\nunattended_policy = \"respond_only\"\n",
+        )
+        .unwrap();
+        let loader = loader_over(dir.path());
+        let config = loader.load().unwrap();
+        assert_eq!(
+            config.autonomous.unattended_policy,
+            crate::UnattendedPolicy::RespondOnly
+        );
+        assert_eq!(loader.loaded_files(), vec![path]);
+        assert!(
+            loader.load_warnings().is_empty(),
+            "{:?}",
+            loader.load_warnings()
+        );
+    }
+
+    #[test]
+    fn pan120_discovered_invalid_unattended_policy_is_fatal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[autonomous]\nunattended_policy = \"answer_cq\"\n").unwrap();
+        match loader_over(dir.path()).load() {
+            Err(ConfigError::FileLoad {
+                path: loaded_path,
+                reason,
+            }) => {
+                assert_eq!(loaded_path, path);
+                let error = reason.to_string();
+                for expected in ["answer_cq", "off", "respond_only"] {
+                    assert!(error.contains(expected), "{error}");
+                }
+            }
+            other => panic!("expected FileLoad, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn discovered_file_with_syntax_error_is_fatal() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pancetta.toml");

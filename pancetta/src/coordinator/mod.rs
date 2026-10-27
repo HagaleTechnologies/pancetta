@@ -1030,7 +1030,8 @@ pub struct ApplicationCoordinator {
     /// PAN-103: the config-file watcher. Watching stops when it is dropped.
     config_reload_watcher: Option<pancetta_config::hot_reload::ConfigHotReload>,
     /// PAN-103: the config file path as the operator gave it, symlinks NOT
-    /// resolved (`config_path` is the resolved write target). Reloads read
+    /// resolved (`config_path` is the absolute, link-preserving write path).
+    /// Reloads read
     /// and watch this path so repointing a symlinked config is picked up.
     /// Defaults to `config_path`; `main.rs` sets it via
     /// [`ApplicationCoordinator::set_config_watch_path`].
@@ -1292,15 +1293,17 @@ pub struct ApplicationCoordinator {
     /// SaveRigBookmark/DeleteRigBookmark handlers persist here instead of
     /// a hardcoded `~/.pancetta/pancetta.toml`, so an operator running
     /// under `--config <custom-path>` has their picker/bookmark saves
-    /// land in the file that actually gets reloaded on restart.
+    /// land in the file that actually gets reloaded on restart. PAN-200:
+    /// this path is absolute but symlinks are not resolved until each TUI
+    /// write runs, so a repointed link sends saves to its current target.
     pub(crate) config_path: PathBuf,
 
     /// PAN-62 review round 2 (Codex P1): whether `config_path` is TOML
     /// (the targeted setters `SelectDevice`/`SelectRig`/`SaveRigBookmark`/
     /// `DeleteRigBookmark` write through only understand TOML). Computed
     /// ONCE at startup from the raw `--config` path (see `main.rs`'s
-    /// `config_write_is_toml` for why it must NOT use `config_path`'s own,
-    /// possibly-symlink-resolved, name) and stored here so the TUI relay
+    /// `config_write_is_toml` for why it uses the as-given path's name)
+    /// and stored here so the TUI relay
     /// loop never performs synchronous disk I/O to check it -- that loop
     /// also services OperatorEmergencyStop/StopTx/TogglePtt/AbortQso, and
     /// a stalled filesystem must never suspend those.

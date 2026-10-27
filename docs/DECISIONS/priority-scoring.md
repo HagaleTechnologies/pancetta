@@ -113,6 +113,25 @@ The cqdx path still uses default weights and has no session failure history;
 the detail view states that limitation. Local relay scores use operator weights
 and the coordinator's shared lookup. DX-cluster-only rows remain unscored.
 
+## cqdx rows score their spot's reports and age (PAN-227, 2026-10-26)
+
+PAN-94's cqdx score passed need, history and rarity to the scorer but not the
+spot's reports or age. `DxStationLookupAdapter` used the trait's `None`
+defaults for `network_snr` and `network_last_seen`, so every cqdx-scored row
+got no report bonus, `1.00` freshness and `network reports: none` in the Why
+overlay, whatever its `Rpt` and `Last` columns showed.
+
+`score_network_spot` now passes `reporter_count.zip(best_snr_network)` as the
+network reports and `last_seen_network` as the last-heard time. A report needs
+both a count and a best SNR; with either missing the row has no reports, which
+matches the coordinator's `cqdx_bridge` rule and the scorer's SNR-gated bonus.
+The scorer's bonus thresholds and freshness buckets are unchanged.
+
+Freshness is captured when the row is scored: on each cqdx merge and on a
+QSO-outcome rescore (`refresh_local_rank`). It does not re-age between those,
+so the Why overlay always shows the freshness the stored score used. The
+autonomous path already read both inputs through `CachedStationLookup`.
+
 ## Needed is a claim with availability (PAN-93, 2026-10-22)
 
 cqdx.io's needed-DXCC and needed-grid lists were plain sets, and an empty set

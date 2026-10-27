@@ -6,6 +6,25 @@
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 
+/// Presence policy for automatically opening replies to direct callers.
+/// Autonomous CQ and calls to other stations' CQ always require presence.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnattendedPolicy {
+    #[default]
+    Off,
+    RespondOnly,
+}
+
+impl std::fmt::Display for UnattendedPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::RespondOnly => "respond_only",
+        })
+    }
+}
+
 /// How the operator picks its TX slot parity.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -209,6 +228,9 @@ fn default_qso_stall_switch_after() -> u32 {
 pub struct AutonomousConfig {
     /// Enable autonomous mode.
     pub enabled: bool,
+    /// Allow new direct-call replies without recent console activity.
+    /// Applies independently of `enabled`; requires restart to change.
+    pub unattended_policy: UnattendedPolicy,
     /// TX slot parity selection.
     pub slot_parity: SlotParitySetting,
     /// Number of idle TX cycles before calling CQ (~150 s at default 10).
@@ -260,6 +282,7 @@ impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            unattended_policy: UnattendedPolicy::Off,
             slot_parity: SlotParitySetting::Auto,
             cq_after_idle_cycles: 10,
             cq_no_response_switch_after: default_cq_no_response_switch_after(),
@@ -328,6 +351,7 @@ impl ConfigSection for AutonomousConfig {
 
     fn merge_with(&mut self, other: Self) {
         self.enabled = other.enabled;
+        self.unattended_policy = other.unattended_policy;
         self.slot_parity = other.slot_parity;
         self.cq_after_idle_cycles = other.cq_after_idle_cycles;
         self.cq_no_response_switch_after = other.cq_no_response_switch_after;
@@ -351,6 +375,62 @@ impl ConfigSection for AutonomousConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan120_omitted_unattended_policy_defaults_off() {
+        let config: AutonomousConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(config.unattended_policy, UnattendedPolicy::Off);
+        assert_eq!(
+            AutonomousConfig::default().unattended_policy,
+            UnattendedPolicy::Off
+        );
+    }
+
+    #[test]
+    fn pan120_full_config_omitted_or_empty_autonomous_defaults_off() {
+        for input in ["", "[autonomous]\n"] {
+            let config: crate::Config = toml::from_str(input).unwrap();
+            assert_eq!(config.autonomous.unattended_policy, UnattendedPolicy::Off);
+        }
+    }
+
+    #[test]
+    fn pan120_unattended_policy_valid_values_roundtrip() {
+        for (value, expected) in [
+            ("off", UnattendedPolicy::Off),
+            ("respond_only", UnattendedPolicy::RespondOnly),
+        ] {
+            let config: AutonomousConfig =
+                toml::from_str(&format!("unattended_policy = \"{value}\"\n")).unwrap();
+            assert_eq!(config.unattended_policy, expected);
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(serialized.contains(&format!("unattended_policy = \"{value}\"")));
+            let restored: AutonomousConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(restored.unattended_policy, expected);
+        }
+    }
+
+    #[test]
+    fn pan120_unattended_policy_rejects_invalid_value() {
+        let error = toml::from_str::<AutonomousConfig>("unattended_policy = \"answer_cq\"")
+            .unwrap_err()
+            .to_string();
+        for expected in ["answer_cq", "off", "respond_only"] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn pan120_unattended_policy_merges_in_both_directions() {
+        let mut config = AutonomousConfig::default();
+        for policy in [UnattendedPolicy::RespondOnly, UnattendedPolicy::Off] {
+            config.merge_with(AutonomousConfig {
+                unattended_policy: policy,
+                ..AutonomousConfig::default()
+            });
+            assert_eq!(config.unattended_policy, policy);
+        }
+    }
 
     #[test]
     fn test_default_autonomous_config() {
