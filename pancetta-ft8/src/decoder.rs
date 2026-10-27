@@ -2741,6 +2741,9 @@ pub struct Ft8Decoder {
     /// `candidate_dump_enabled` is true; drained by
     /// `take_candidate_dump`.
     candidate_dump: Vec<SyncCandidateRecord>,
+    /// PAN-161 diagnostic: largest raw Costas list before the configured cap.
+    /// Only populated by the candidate-dump entry point.
+    candidate_stage_raw_max: std::sync::atomic::AtomicUsize,
 
     /// Phase 2 "anytime decoder" plumbing (Task 8): the budget for the
     /// decode window currently in progress. Set at the entry of
@@ -2937,6 +2940,7 @@ impl Ft8Decoder {
             soft_combiner,
             candidate_dump_enabled: false,
             candidate_dump: Vec::new(),
+            candidate_stage_raw_max: std::sync::atomic::AtomicUsize::new(0),
             current_budget: DecodeBudget::unlimited(),
             current_budget_report: DecodeBudgetReport::default(),
             baseband_taps: crate::baseband::design_decimation_lowpass(),
@@ -3001,6 +3005,13 @@ impl Ft8Decoder {
         self.candidate_dump_enabled = false;
         let dump = std::mem::take(&mut self.candidate_dump);
         Ok((result?, dump))
+    }
+
+    /// Largest pre-truncation Costas list in the last diagnostic decode.
+    #[doc(hidden)]
+    pub fn candidate_stage_raw_max(&self) -> usize {
+        self.candidate_stage_raw_max
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the current protocol parameters
@@ -3248,6 +3259,8 @@ impl Ft8Decoder {
         self.residual_snr_records.clear();
         // hb-250: reset the candidate dump at the start of each window.
         self.candidate_dump.clear();
+        self.candidate_stage_raw_max
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.timing_diagnostics = Default::default();
         let dt_query_time = self.dt_prior_time.unwrap_or_else(SystemTime::now);
         let mut ap_timing_state = ApTimingState::default();
@@ -7061,6 +7074,10 @@ impl Ft8Decoder {
                 .partial_cmp(&a.sync_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        if self.candidate_dump_enabled {
+            self.candidate_stage_raw_max
+                .fetch_max(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         candidates.truncate(self.config.max_sync_candidates);
 
         // Non-maximum suppression: remove weaker candidates near stronger ones.

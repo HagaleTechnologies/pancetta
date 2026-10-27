@@ -136,6 +136,7 @@ min_multi_slot_score = 0.7
 qso_stall_switch_after = 4
 slot_parity = "auto"
 tx_offset_hz = 1500.0
+unattended_policy = "off"
 
 [autonomous.band_hopping]
 enabled = false

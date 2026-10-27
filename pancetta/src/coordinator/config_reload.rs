@@ -1388,6 +1388,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pan120_unattended_policy_reload_requires_restart_and_preserves_caller_policy() {
+        use pancetta_config::UnattendedPolicy;
+        for (running, requested) in [
+            (UnattendedPolicy::Off, UnattendedPolicy::RespondOnly),
+            (UnattendedPolicy::RespondOnly, UnattendedPolicy::Off),
+        ] {
+            let mut initial = base();
+            initial.autonomous.unattended_policy = running;
+            let (mut coordinator, _audit_tmp) = test_coordinator(initial).await;
+            let rx = tui_rx(&coordinator).await;
+            let before = toml::to_string(&*coordinator.config.read().await).unwrap();
+            let mut new = coordinator.config.read().await.clone();
+            new.autonomous.unattended_policy = requested;
+            coordinator
+                .handle_config_reload(Ok((new, Vec::new())))
+                .await;
+
+            let effective = coordinator.config.read().await;
+            assert_eq!(effective.autonomous.unattended_policy, running);
+            assert_eq!(toml::to_string(&*effective).unwrap(), before);
+            let lines = diagnostics(&rx);
+            assert!(
+                texts(&lines).contains(
+                    &"Saved changes take effect after a restart: autonomous.unattended_policy"
+                ),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reload_with_a_non_security_change_keeps_running_config_and_says_restart() {
         let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
@@ -2791,7 +2822,7 @@ mod tests {
     /// `--config` names a symlink that a dotfile manager repoints at a new
     /// file in another directory; the new file is then edited, once before
     /// the coordinator handled the repoint and once after.
-    /// `config_path` is the resolved target, as `main.rs` passes it.
+    /// `config_path` is the as-given link, as `main.rs` passes it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_follows_a_symlinked_config_repointed_at_a_new_file() {
@@ -2809,7 +2840,7 @@ mod tests {
         std::os::unix::fs::symlink(&old_target, &link).unwrap();
 
         let (mut coordinator, _audit_tmp) = test_coordinator(config.clone()).await;
-        coordinator.config_path = std::fs::canonicalize(&link).unwrap();
+        coordinator.config_path = link.clone();
         coordinator.set_config_watch_path(link.clone());
         coordinator
             .start_config_reload_watcher_with_settle(Duration::from_millis(100))
