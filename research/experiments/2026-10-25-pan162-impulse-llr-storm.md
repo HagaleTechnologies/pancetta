@@ -1,14 +1,14 @@
 ---
 slug: pan162-impulse-llr-storm
 mode: ft8
-state: measured-candidate-k6-production-gate-synth-leg-passed-noise-leg-pending
+state: shipped
 created: 2026-10-25T23:55:00Z
 last_updated: 2026-10-27
 branch: PAN-162
 parent_hypothesis: hb-256
-scorecard: research/scorecards/pan162-impulse-llr-storm.json (synthetic plants, verdict), research/scorecards/pan162-impulse-llr-offair.json (off-air do-no-harm) and research/scorecards/pan162-synth-{control,variant}.json (production gate, synth-clean leg)
-delta_vs_main: none in production. Storm plant (decision) k=6 threshold shift +0.465 dB [+0.308, +0.653]; awgn k=6 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7; production gate synth-clean k=6 recovered Δ+0 (95% CI [+0.0, +0.0]), elapsed -4.5%
-disposition: STAYS OFF BY DEFAULT for now. The pre-registered verdict is candidate-k6, which triggers Phase 6. Of its native-only production gate, the synth-clean leg (recall and elapsed) passed in PAN-241; the noise_1000 leg (false positives and elapsed) has not run. The coordinator default is set only if that leg passes too, and a failure makes the final disposition stays-off-harm-gate. `Ft8Config::impulse_robust_llr` stays `None` and production is unchanged.
+scorecard: research/scorecards/pan162-impulse-llr-storm.json (synthetic plants, verdict), research/scorecards/pan162-impulse-llr-offair.json (off-air do-no-harm) and research/scorecards/pan162-{synth,noise}-{control,variant}.json (production gate)
+delta_vs_main: FT8 decodes run the k=6 knee (coordinator default). Storm plant (decision) k=6 threshold shift +0.465 dB [+0.308, +0.653]; awgn k=6 +0.000 dB; off-air ΔTP k=6 +1, k=3 -7; production gate synth-clean k=6 recovered Δ+0 (95% CI [+0.0, +0.0]), elapsed -4.5%; noise_1000 false_positives_total 5 → 5, noise_files_decoded 5 → 5, elapsed +14.0%
+disposition: SHIPPED for FT8 at k=6. The pre-registered verdict is candidate-k6, which triggers Phase 6, and its native-only production gate passed in PAN-241 (synth-clean and noise_1000 legs, elapsed on both). `apply_effort_overrides` sets `impulse_robust_llr = Some(6.0)` for FT8 and `None` for FT4 and FT2; the library default `Ft8Config::impulse_robust_llr` stays `None`.
 ---
 
 # PAN-162: hb-256's lightning-static LLR knee, measured on the stormiest days
@@ -343,16 +343,14 @@ plant missed: on `base` (the batch101 plant re-measured with a CI) k=6 gains
 +0.167 dB [+0.038, +0.519], below the bar as in batch101, and the gain grows with
 burst rate (`severe`: +1.324 dB [+0.771, +1.666]).
 
-## Phase 6: production gate (synth-clean leg passed, noise_1000 leg owed)
+## Phase 6: production gate
 
 `candidate-k6` triggers the plan's Phase 6. Its first step is the
 pre-registered native-only production gate above (synth-clean, noise_1000 and
 the elapsed gate, control vs `--impulse-robust-llr 6`); only if all of it
-passes does the coordinator turn the knee on for FT8. PAN-241 ran the
-synth-clean leg, and it passed. The noise_1000 leg has not run, so the gate
-has no final result and **the default stays off**: production is unchanged,
-the coordinator does not set the knee, and
-`Ft8Config::default().impulse_robust_llr` is `None`.
+passes does the coordinator turn the knee on for FT8. PAN-241 ran both legs,
+and every bar passed, so the final disposition is **default-on for FT8 at
+k=6** (see "Disposition" below).
 
 ### Synth-clean leg (PAN-241, 2026-10-27): passed
 
@@ -416,20 +414,23 @@ contention, and this elapsed bar passed. The planning run for PAN-241 (same
 commands at `RAYON_NUM_THREADS=2`, not committed) gave the same per-WAV
 outcomes and elapsed 1229.6 → 1168.8 s (−4.9%).
 
-### Noise_1000 leg: owed (deferred to a follow-up)
+### Noise_1000 leg (PAN-241, 2026-10-27): passed
 
-The noise_1000 pair did not run. Its arms took about 1.64 times a synth-clean
-arm in the PAN-241 planning run (noise control 2012.4 s against synth control
-1229.6 s, both at 2 threads), so on this host each would have needed about
-18 minutes, and the pair could not finish before the phase's repository gate.
-Running it beside the gate or a build would break the serial elapsed bar,
-so it was deferred whole. The follow-up runs, with both arms alone on the
-host at one `RAYON_NUM_THREADS` (the cgroup quota, `cpu.max` quota ÷ period):
+Host: Catalyst cloud container `f429152c3267/linux/x86_64` on a shared machine,
+6-CPU cgroup quota (`/sys/fs/cgroup/cpu.max` = `600000 100000`),
+`RAYON_NUM_THREADS=6` for both arms (`harness.cores_used` 6 in both
+scorecards), release build at branch PAN-241 (`a1e6622`), built at 21:02
+before the first arm. `a1e6622` differs from the synth leg's `d963768` only
+in doc text and the two synth scorecards. The two arms ran serially, with no
+build or test running in the container. The remediate round's coordinator and
+doc edits were written while the arms ran, so both scorecards record
+`git.dirty: true`; `eval` does not depend on the `pancetta` crate, and the
+binary both arms ran was built before any edit.
 
 ```sh
 cargo build --release -p pancetta-research --bin eval --bin compare --bin gen-noise
 PAN162_RUN=$(mktemp -d)
-export RAYON_NUM_THREADS=6   # set to this host's CPU quota; same value for both arms
+export RAYON_NUM_THREADS=6
 target/release/gen-noise --count 1000 --seed 20260706 --birdie-fraction 0.3 \
   --output-dir "$PAN162_RUN/noise-wavs" --manifest "$PAN162_RUN/noise.manifest.json" --label noise_1000
 target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/noise.manifest.json" --output research/scorecards/pan162-noise-control.json
@@ -437,13 +438,56 @@ target/release/eval --tier noise_1000 --mode ft8 --noise-manifest "$PAN162_RUN/n
 target/release/compare research/scorecards/pan162-noise-control.json research/scorecards/pan162-noise-variant.json
 ```
 
-The rule then applies mechanically. If neither `false_positives_total` nor
-`noise_files_decoded` increases and elapsed stays within +20%, the final
-disposition is **default-on** for FT8 at k=6: the plan's steps 6.2-6.3
-follow (coordinator FT8 default `Some(6.0)` in `apply_effort_overrides`, the
-knee in `DecoderRebuildKey`, CHANGELOG and digest). Otherwise the final
-disposition is `stays-off-harm-gate`. The synth-clean leg above does not
-need to be rerun: each pair's elapsed bar compares its own two arms.
+| arm | `impulse_robust_llr` | wall (UTC) | `elapsed_seconds` | `false_positives_total` | `noise_files_decoded` |
+|---|---|---|---|---|---|
+| control | `null` | 21:02:27-21:19:49 | 1042.2 | 5 | 5 |
+| variant | `6.0` | 21:19:49-21:39:37 | 1188.1 | 5 | 5 |
+
+`compare` exited 0 and printed:
+
+```
+A: research/scorecards/pan162-noise-control.json (sha a1e6622b, score 0.0000)
+B: research/scorecards/pan162-noise-variant.json (sha a1e6622b, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.impulse_robust_llr               null → 6.0
+ELAPSED GATE:
+  elapsed_seconds        1042.2 → 1188.1  (+14.0%, budget +20.0%)
+```
+
+| bar | measured | result |
+|---|---|---|
+| `false_positives_total` does not increase | 5 → 5 | pass |
+| `noise_files_decoded` does not increase | 5 → 5 | pass |
+| elapsed within +20% (noise_1000) | +14.0% | pass |
+
+The machine is shared: the host's load average was about 24 when the control
+arm started, 18.5 when it ended and 36.5 when the variant arm ended, so part of
+the +14.0% is likely contention. The pre-registered contention clause asks for
+a rerun only when an elapsed failure coincides with contention, and this
+elapsed bar passed, so the pair was not rerun.
+The validate run for PAN-241 ran the same pair in another container
+(not committed) and got false positives 5 → 5, noise files decoded 5 → 5 and
+elapsed 1189.0 → 1230.6 s (+3.5%).
+
+### Disposition: default-on for FT8 at k=6
+
+Every bar of the gate passed: synth-clean recovered Δ+0 with a paired recall
+CI of [+0.0, +0.0], noise_1000 false positives and noise files decoded did
+not rise, and elapsed stayed within +20% on both corpora (−4.5% and
++14.0%). PAN-241 applied the plan's steps 6.2-6.3:
+`pancetta/src/coordinator/effort.rs` sets `impulse_robust_llr` to
+`FT8_IMPULSE_ROBUST_LLR_KNEE` (6.0) for FT8 on every `apply_effort_overrides`
+call and to `None` for FT4 and FT2, and the knee is a `DecoderRebuildKey`
+field, so a protocol switch rebuilds the live decoder. The library default
+`Ft8Config::default().impulse_robust_llr` stays `None`. The operator-side
+revert rule below ("If the default shipped") now applies.
 
 ### PAN-162's attempts
 

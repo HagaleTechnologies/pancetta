@@ -137,6 +137,14 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
     }
 }
 
+/// hb-256's impulse-robust LLR knee (`Ft8Config::impulse_robust_llr`) for
+/// FT8, in units of the candidate's median symbol power. PAN-162's
+/// pre-registered storm re-measure picked k=6, and PAN-241 ran the
+/// native-only production gate it triggered (synth-clean, noise_1000,
+/// elapsed), which passed:
+/// `research/experiments/2026-10-25-pan162-impulse-llr-storm.md`.
+pub(crate) const FT8_IMPULSE_ROBUST_LLR_KNEE: f64 = 6.0;
+
 /// Apply per-effort-preset `Ft8Config` field overrides (PAN-156/PAN-157).
 ///
 /// Until PAN-156, `Ft8Config` flags could only be tuned globally (or by
@@ -270,6 +278,14 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// Evidence:
 /// `research/experiments/2026-10-25-pan158-eco-fine-sync.md`.
 ///
+/// ## PAN-162: impulse-robust LLR knee — FT8 at k=6, every preset
+///
+/// `impulse_robust_llr` (hb-256's per-symbol knee for lightning-static
+/// noise) is [`FT8_IMPULSE_ROBUST_LLR_KNEE`] whenever the protocol is FT8,
+/// whatever the preset, tier or budget, and `None` on any other protocol.
+/// It is assigned on every call, so a switch to FT4 clears it and a
+/// switch back sets it again. The library default stays `None`.
+///
 /// Every field this function writes is a decoder-rebuild trigger in
 /// `coordinator/ft8.rs`'s `DecoderRebuildKey`
 /// (`every_effort_override_field_is_a_rebuild_trigger` guards that for
@@ -300,6 +316,9 @@ pub(crate) fn apply_effort_overrides(
     config.fine_sync_enabled = resolve_effective_effort(effort, tier) == DecodeEffort::Eco
         && config.protocol == pancetta_ft8::Protocol::Ft8
         && effective_budget_ms == 1;
+    // PAN-162/PAN-241: assigned on every call, so a switch to FT4 clears it.
+    config.impulse_robust_llr =
+        (config.protocol == pancetta_ft8::Protocol::Ft8).then_some(FT8_IMPULSE_ROBUST_LLR_KNEE);
     match resolve_effective_effort(effort, tier) {
         // Round-9-of-PAN-157 review finding (P1): explicitly restore both
         // fields to their true defaults here, not just "leave them
@@ -677,7 +696,8 @@ mod tests {
     /// PAN-158 bound fine sync to FT8 Eco at its 1 ms budget. Every other
     /// combination of a non-`Max` preset — including `Auto`, which never
     /// literally resolves to `Max` today — must remain byte-identical to
-    /// the default: no override, and no accidental clobber of a value the
+    /// the default apart from PAN-162's FT8 knee, which every FT8 preset
+    /// sets: no other override, and no accidental clobber of a value the
     /// operator (or a future config file) set manually. Each preset is
     /// checked at budget `0` (never eligible) and at its real preset
     /// budget, where only Eco and Auto-on-Slow turn fine sync on.
@@ -708,11 +728,13 @@ mod tests {
                             "{:?}",
                             Ft8Config {
                                 fine_sync_enabled: eligible,
+                                impulse_robust_llr: Some(FT8_IMPULSE_ROBUST_LLR_KNEE),
                                 ..Ft8Config::default()
                             }
                         ),
                         "{effort:?} on {tier:?} at {budget_ms} ms must change no \
-                         Ft8Config field beyond the Eco fine-sync override"
+                         Ft8Config field beyond the Eco fine-sync override and \
+                         the FT8 impulse-robust LLR knee"
                     );
                 }
             }
@@ -765,6 +787,7 @@ mod tests {
                             && (budget_ms == 0 || budget_ms >= 2000);
                         let mut expected = custom_config(protocol);
                         expected.fine_sync_enabled = eco && ft8 && budget_ms == 1;
+                        expected.impulse_robust_llr = ft8.then_some(FT8_IMPULSE_ROBUST_LLR_KNEE);
                         if multipass {
                             expected.max_decode_passes = 2;
                             expected.time_varying_subtraction_enabled = true;
@@ -924,6 +947,60 @@ mod tests {
         assert!(
             !w.ft8().fine_sync_enabled,
             "a protocol switch keeps the 250 ms override, so fine sync stays off"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-162/PAN-241: impulse-robust LLR knee on FT8 only
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn impulse_robust_llr_is_the_knee_exactly_on_ft8() {
+        use pancetta_ft8::Protocol::{Ft4, Ft8};
+        for effort in ALL_EFFORTS {
+            for tier in ALL_TIERS {
+                for protocol in [Ft8, Ft4] {
+                    for budget_ms in [0u64, 1, 2, 250, 1000, 2000, 5000] {
+                        for stray in [None, Some(1.0)] {
+                            let mut config = Ft8Config {
+                                impulse_robust_llr: stray,
+                                ..custom_config(protocol)
+                            };
+                            apply_effort_overrides(effort, tier, budget_ms, &mut config);
+                            assert_eq!(
+                                config.impulse_robust_llr,
+                                (protocol == Ft8).then_some(FT8_IMPULSE_ROBUST_LLR_KNEE),
+                                "{effort:?}/{tier:?}/{protocol:?}/{budget_ms} ms from {stray:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_protocol_toggles_the_impulse_robust_llr_knee() {
+        use pancetta_ft8::Protocol::{Ft4, Ft8};
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 250);
+        assert_eq!(w.ft8().impulse_robust_llr, Some(6.0));
+
+        w.switch_protocol(Ft4, DecodeEffort::Standard, HardwareTier::Fast);
+        assert_eq!(w.ft8().impulse_robust_llr, None, "FT4 must clear the knee");
+
+        w.switch_protocol(Ft8, DecodeEffort::Standard, HardwareTier::Fast);
+        assert_eq!(w.ft8().impulse_robust_llr, Some(6.0), "back on FT8");
+
+        let mut config = Ft8Config {
+            protocol: Ft4,
+            impulse_robust_llr: Some(1.0),
+            ..Ft8Config::default()
+        };
+        apply_effort_overrides(DecodeEffort::Eco, HardwareTier::Fast, 1, &mut config);
+        assert_eq!(
+            config.impulse_robust_llr, None,
+            "a stray FT4 value is reset"
         );
     }
 

@@ -1484,13 +1484,14 @@ pub struct Ft8Config {
     /// anchor); the SOMAP metrics it refreshes every iteration are
     /// rebuilt from raw tone powers and carry neither this per-symbol
     /// weighting nor LLR whitening.
-    /// PAN-162's pre-registered storm re-measure returned `candidate-k6`
-    /// (k=6 clears the stormier plant's +0.3 dB bar at zero AWGN cost).
-    /// Its native-only production gate is half run: the synth-clean leg
-    /// passed (PAN-241: recovered Δ+0, CI [+0, +0]; elapsed −4.5%), and
-    /// the noise_1000 leg is still owed. Until that leg passes the knee
-    /// stays off by default; if it fails, the final disposition is
-    /// `stays-off-harm-gate`
+    /// The library default stays `None`. The coordinator's
+    /// `apply_effort_overrides` sets `Some(6.0)` for FT8 and `None` for
+    /// FT4 and FT2. PAN-162's pre-registered storm re-measure returned
+    /// `candidate-k6` (storm plant k=6 +0.465 dB [+0.308, +0.653], AWGN
+    /// +0.000 dB), and the native-only production gate it triggered
+    /// passed in PAN-241: synth-clean recovered Δ+0 (CI [+0, +0]),
+    /// elapsed −4.5%; noise_1000 false positives 5 → 5, noise
+    /// files decoded 5 → 5, elapsed +14.0%
     /// (`research/experiments/2026-10-25-pan162-impulse-llr-storm.md`).
     pub impulse_robust_llr: Option<f64>,
 
