@@ -1603,6 +1603,7 @@ mod tests {
                 their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
+                adif_field_types: HashMap::new(),
                 notes: None,
                 tx_parity: None,
                 initiated_by: Default::default(),
@@ -1732,6 +1733,7 @@ mod tests {
                 their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
+                adif_field_types: HashMap::new(),
                 notes: None,
                 tx_parity: None,
                 initiated_by: Default::default(),
@@ -1851,6 +1853,7 @@ mod tests {
                 their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
+                adif_field_types: HashMap::new(),
                 notes: None,
                 tx_parity: None,
                 initiated_by: Default::default(),
@@ -2205,6 +2208,95 @@ mod tests {
                 "{name} lost through import → export: {exported:?}"
             );
         }
+        db.close().await;
+    }
+
+    /// PAN-214: an imported field's ADIF type indicator survives import →
+    /// index → export, so `pancetta export` writes `<APP_LOGGER_SCORE:2:N>42`
+    /// back as read instead of dropping the `:N`.
+    #[tokio::test]
+    async fn imported_type_indicators_survive_index_and_export() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <APP_LOGGER_SCORE:2:N>42 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        // The same conversion `pancetta export` applies to each indexed row.
+        let progresses = db
+            .search_qsos(&QsoFilter::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(progresses.len(), 1);
+        let metadata = &progresses[0].metadata;
+        let adif_qso = processor.qso_to_adif(metadata, metadata.contest_info.as_ref());
+        let exported = processor
+            .generate_string(&crate::adif::AdifFile {
+                header: crate::adif::AdifHeader::default(),
+                records: vec![processor.qso_to_record(&adif_qso)],
+            })
+            .unwrap();
+
+        assert!(
+            exported.contains("<APP_LOGGER_SCORE:2:N>42"),
+            "the :N type indicator was lost through import → export: {exported}"
+        );
+        db.close().await;
+    }
+
+    /// PAN-214: a row stored before `adif_field_types` existed has no such key
+    /// in its persisted `QsoMetadata`. It must still load, with no type
+    /// indicators, rather than drop out of every search.
+    #[tokio::test]
+    async fn a_row_stored_before_type_indicators_still_loads() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <APP_LOGGER_SCORE:2:N>42 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+        let key_type = "SELECT json_type(progress_data, '$.metadata.adif_field_types') FROM qsos";
+        let stored: Option<String> = sqlx::query_scalar(key_type)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("object"),
+            "the import stored no types"
+        );
+        // Rewrite the row to its pre-PAN-214 shape: no `adif_field_types` key.
+        sqlx::query(
+            "UPDATE qsos SET \
+             progress_data = json_remove(progress_data, '$.metadata.adif_field_types'), \
+             metadata = json_remove(metadata, '$.adif_field_types')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let stored: Option<String> = sqlx::query_scalar(key_type)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
+
+        let progresses = db
+            .search_qsos(&QsoFilter::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(progresses.len(), 1, "the pre-PAN-214 row failed to load");
+        assert!(
+            progresses[0].metadata.adif_field_types.is_empty(),
+            "{:?}",
+            progresses[0].metadata.adif_field_types
+        );
         db.close().await;
     }
 

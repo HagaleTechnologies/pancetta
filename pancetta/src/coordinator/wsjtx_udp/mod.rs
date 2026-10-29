@@ -1998,6 +1998,7 @@ mod qso_logged_tests {
             their_state: None,
             contest_info: None,
             tags: std::collections::HashMap::new(),
+            adif_field_types: std::collections::HashMap::new(),
             notes: None,
             tx_parity: None,
             initiated_by: Default::default(),

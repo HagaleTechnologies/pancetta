@@ -49,8 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Records that cannot be read are listed by position and callsign, and the
   rest still import. The logbook is copied to `qsos.adi.bak` (or the next
   free `.bak.N`) and the copy checked before anything is written; the output
-  names it and prints the undo steps. `--dry-run` shows the result and
-  changes nothing. Imported contacts are never uploaded.
+  names it. Each import that adds contacts saves a receipt in
+  `~/.pancetta/imports/`, and `pancetta import --undo <RECEIPT>` removes
+  exactly the contacts that import added, keeping everything logged before
+  or since, even while Pancetta runs (PAN-214). `--dry-run` shows the result
+  and changes nothing. Imported contacts are never uploaded.
 
 - Config hot-reload is now real for remote-access settings (PAN-103): saving
   `pancetta.toml` while pancetta runs applies remote-access revocations to the
@@ -157,6 +160,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- `pancetta import` fixes from the PAN-127 review (PAN-214). Tag-shaped
+  text inside a value counted in characters (`<NOTES:9>€€€<X:1>z`) now stays
+  in the value instead of becoming a field: the reader decides once per file
+  whether lengths count bytes or characters, and reads bytes, Pancetta's own
+  convention, when nothing in the file decides it. A length that runs past
+  its record (`<COMMENT:999>`) no longer swallows the contacts after it; that
+  record is listed as `Field length does not match its value: COMMENT:999`
+  and the next one imports; a value that is itself a whole tag (`<NOTES:5><EOR>`)
+  still reads when ignored text follows it. `pancetta export` keeps an imported field's type
+  indicator (`<APP_LOGGER_SCORE:2:N>42`, which it wrote as
+  `<APP_LOGGER_SCORE:2>42`). An import and Pancetta's own logging now take
+  turns at `qsos.adi` through the lock file `qsos.adi.lock`: an import that
+  finds Pancetta writing prints `Waiting for Pancetta to finish writing to …`
+  and refuses, changing nothing, if the logbook is still busy after 30
+  seconds; a QSO completed during an import is written after the imported
+  contacts (after 60 seconds it is written anyway, never dropped). Undo removes only the imported contacts,
+  so a contact logged while the import ran, or since, is kept; the old undo
+  restored the pre-import backup and lost it.
 
 - A QSO that completes while pancetta is shutting down keeps its ClubLog,
   QRZ Logbook, eQSL and cqdx.io uploads (PAN-232). Shutdown now cancels a

@@ -492,6 +492,13 @@ pub struct QsoMetadata {
     /// Additional tags
     pub tags: HashMap<String, String>,
 
+    /// ADIF data-type indicators of an imported record's fields, by field name
+    /// (`APP_LOGGER_SCORE` → `N`), so `pancetta export` writes
+    /// `<APP_LOGGER_SCORE:2:N>42` back as read (PAN-214). Empty for every QSO
+    /// pancetta logs itself, and then left out of the stored JSON.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub adif_field_types: HashMap<String, String>,
+
     /// Notes
     pub notes: Option<String>,
 
@@ -1278,6 +1285,7 @@ mod tests {
             their_state: None,
             contest_info: None,
             tags: HashMap::new(),
+            adif_field_types: HashMap::new(),
             notes: None,
             tx_parity: None,
             tx_parity_provisional: false,
@@ -1308,6 +1316,18 @@ mod tests {
         obj.remove("their_state");
         let back: QsoMetadata = serde_json::from_value(obj.into()).unwrap();
         assert!(back.their_state.is_none());
+    }
+
+    /// PAN-214: a QSO pancetta logs itself carries no type indicators, and its
+    /// stored JSON stays exactly as it was before the field existed.
+    #[test]
+    fn metadata_without_field_types_serializes_as_before() {
+        let metadata = test_metadata("W5ABC");
+        assert!(metadata.adif_field_types.is_empty());
+
+        let json = serde_json::to_string(&metadata).unwrap();
+
+        assert!(!json.contains("adif_field_types"), "{json}");
     }
 
     #[test]

@@ -2296,6 +2296,7 @@ mod tests {
                 their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
+                adif_field_types: HashMap::new(),
                 notes: None,
                 tx_parity: None,
                 initiated_by: Default::default(),
@@ -2348,6 +2349,7 @@ mod tests {
                 comment: Some("Test QSO".to_string()),
                 notes: None,
                 additional_fields: HashMap::new(),
+                field_types: HashMap::new(),
             };
 
             let record = QsoDatabaseRecord {
