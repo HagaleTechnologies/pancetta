@@ -179,6 +179,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a contact logged while the import ran, or since, is kept; the old undo
   restored the pre-import backup and lost it.
 
+- A QSO that completes while pancetta is shutting down keeps its ClubLog,
+  QRZ Logbook, eQSL and cqdx.io uploads (PAN-232). Shutdown now cancels a
+  QRZ XML lookup still in flight and queues the uploads without the
+  looked-up grid or state, instead of losing them when the lookup outlasted
+  the 2-second shutdown window; they are sent at the next start. Shutdown
+  with uploads enabled no longer waits out that window when nothing is in
+  flight. An unreadable upload queue file is now renamed to
+  `upload_outbox.json.corrupt-<seconds>-<random id>`, so a second one in the
+  same second no longer replaces the first.
 - DX Hunter rows scored from a cqdx spot now include the spot's reporter
   count, best SNR and age (PAN-227). The `w` breakdown shows them instead of
   `network reports: none` and `1.00` freshness, and stale spots or spots with
@@ -555,6 +564,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- The live station's FT8 decodes now down-weight the soft bits of any
+  symbol whose total tone power jumps above 6 times the candidate's median,
+  as a lightning-static crash does (hb-256's impulse-robust LLR knee,
+  `impulse_robust_llr = 6.0`), at every decode-effort preset. On a synthetic plant with frequent noise
+  bursts this moved the decode threshold +0.465 dB (95% CI +0.308 to
+  +0.653) at no cost on plain Gaussian noise, and it decoded one more signal
+  on the 60 vendored off-air recordings. On the production gate it changed
+  nothing measurable: 285 of 550 synthetic weak signals recovered either
+  way, 5 → 5 false decodes on 1000 noise files, elapsed −4.5%
+  (synthetic) and +14.0% (noise). FT4 and FT2 decode as before, and so
+  does `--wav` file playback, which builds its decoder from the library
+  default. Synthetic, vendored off-air and single-host evidence only
+  (PAN-162, PAN-241).
 
 - The Eco decode-effort preset, and Auto on hosts the hardware probe rates
   Slow, now retries an FT8 candidate whose first decode attempt fails at a

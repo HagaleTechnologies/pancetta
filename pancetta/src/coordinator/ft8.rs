@@ -76,6 +76,9 @@ pub(crate) struct DecoderRebuildKey {
     pub(crate) time_varying_subtraction_enabled: bool,
     /// PAN-158: on for FT8 Eco at its 1 ms budget.
     pub(crate) fine_sync_enabled: bool,
+    /// PAN-162/PAN-241: the FT8 impulse-robust LLR knee, as `f64::to_bits`
+    /// (`f64` is not `Eq`).
+    pub(crate) impulse_robust_llr_bits: Option<u64>,
 }
 
 impl DecoderRebuildKey {
@@ -86,6 +89,7 @@ impl DecoderRebuildKey {
             protocol: cfg.protocol,
             time_varying_subtraction_enabled: cfg.time_varying_subtraction_enabled,
             fine_sync_enabled: cfg.fine_sync_enabled,
+            impulse_robust_llr_bits: cfg.impulse_robust_llr.map(f64::to_bits),
         }
     }
 }
@@ -2827,6 +2831,24 @@ mod decode_window_refresh_tests {
             ..Ft8Config::default()
         };
         assert_ne!(DecoderRebuildKey::of(&off), DecoderRebuildKey::of(&on));
+    }
+
+    /// `every_effort_override_field_is_a_rebuild_trigger` cannot catch a
+    /// missing knee field: the knee only ever changes together with
+    /// `protocol`, which is already in the key.
+    #[test]
+    fn impulse_robust_llr_alone_changes_the_rebuild_key() {
+        let off = Ft8Config::default();
+        let on = Ft8Config {
+            impulse_robust_llr: Some(6.0),
+            ..Ft8Config::default()
+        };
+        let other = Ft8Config {
+            impulse_robust_llr: Some(3.0),
+            ..Ft8Config::default()
+        };
+        assert_ne!(DecoderRebuildKey::of(&off), DecoderRebuildKey::of(&on));
+        assert_ne!(DecoderRebuildKey::of(&on), DecoderRebuildKey::of(&other));
     }
 
     #[test]

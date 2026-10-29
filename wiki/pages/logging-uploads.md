@@ -8,8 +8,8 @@ sources:
   - docs/DECISIONS/logging-uploads.md
   - pancetta/src/coordinator/qso.rs
 verified:
-  commit: a13a126
-  date: 2026-10-17
+  commit: bfac504
+  date: 2026-10-27
 links:
   - overview
 ---
@@ -32,6 +32,14 @@ duplicate is advisory and non-fatal everywhere. Gotcha worth knowing: enabling
 an upload target requires credentials or validation rejects it, and credentials
 are never logged. Endpoint shapes, status-code mappings, and the cqdx idempotency
 key are normative in the digest and the dispensa `cqdx-api.v1` contract.
+
+Gotcha (PAN-232): the upload subscriber does not stop on the shutdown flag;
+it stops when `stop_upload_outbox` asks it to (after the QSO components are
+joined), because the Qso task can still complete a QSO after the flag flips.
+Shutdown cancels a QRZ XML lookup in flight rather than waiting for it. The
+worker closes its queue once every `UploadOutboxHandle` is dropped, so a new
+long-lived holder of a handle must also watch `stop_requested()`, or every
+shutdown waits out the 2 s backstop.
 
 Gotcha (PAN-122): the local TX log `~/.pancetta/tx-log.jsonl` is written by
 the TX worker directly through `TxFrameLog` (`coordinator/tx_log.rs`), never

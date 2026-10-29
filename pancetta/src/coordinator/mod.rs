@@ -1321,6 +1321,12 @@ pub struct ApplicationCoordinator {
     /// helpers set this to an isolated temp dir.
     pub(crate) pancetta_home_override: Option<PathBuf>,
 
+    /// PAN-232: test-only override for the QRZ XML endpoint the QSO upload
+    /// subscriber's `QrzXmlClient` talks to, so a coordinator test can point it
+    /// at a server that never answers. Always `None` in production (nothing
+    /// outside `#[cfg(test)]` code ever sets it).
+    pub(crate) qrz_xml_base_url_override: Option<String>,
+
     /// One-shot test transmission. If Some, after startup the coordinator
     /// injects a single TransmitRequest with this message text and shuts
     /// down on TransmitComplete. Used for hardware bench validation.
@@ -2336,6 +2342,7 @@ impl ApplicationCoordinator {
             config_path,
             config_write_is_toml,
             pancetta_home_override: None,
+            qrz_xml_base_url_override: None,
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(

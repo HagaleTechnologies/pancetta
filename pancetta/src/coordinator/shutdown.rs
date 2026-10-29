@@ -154,9 +154,10 @@ impl super::ApplicationCoordinator {
             }
         }
 
-        // PAN-57: the upload worker. The Qso tasks above are gone, so once
-        // the coordinator's own handle drops the worker's grace window ends;
-        // wait for it to save what it took before the runtime goes away.
+        // PAN-57/PAN-232: the upload worker. Every QSO component above has
+        // stopped, so no more QSOs complete: ask the upload subscribers to
+        // queue what they hold and let go, then wait for the worker to save
+        // it before the runtime goes away.
         super::upload_outbox::stop_upload_outbox(
             self.upload_outbox.take(),
             self.upload_outbox_task.take(),

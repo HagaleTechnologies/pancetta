@@ -604,8 +604,10 @@ Each entry has a `destination` (`clublog`, `qrz_logbook`, `eqsl`,
 and a `state` (`pending` or `held`). To discard queued uploads, stop
 pancetta and delete the file, or delete single entries from it. A file
 pancetta cannot read is never deleted: it is renamed to
-`upload_outbox.json.corrupt-<unix-seconds>` and pancetta starts with an
-empty queue. `--replay` never opens the queue.
+`upload_outbox.json.corrupt-<unix-seconds>-<random id>` (for example
+`upload_outbox.json.corrupt-1793075331-dc9739adfebb4f0988c42523f9a4257d`)
+and pancetta starts with an empty queue. Each unreadable file gets its own
+name, so an earlier one is never replaced. `--replay` never opens the queue.
 
 ### Customizing PSKReporter
 

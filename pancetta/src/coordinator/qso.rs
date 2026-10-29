@@ -3020,6 +3020,7 @@ impl super::ApplicationCoordinator {
         // read (below) and the non-replay writers look for `~/.pancetta` --
         // always `None` in production (see the field's own doc comment).
         let pancetta_home_override = self.pancetta_home_override.clone();
+        let qrz_xml_base_url = self.qrz_xml_base_url_override.clone();
         let upload_enabled = logbook_upload_enabled(
             clublog_cfg.enabled,
             qrz_cfg.enabled,
@@ -3403,7 +3404,9 @@ impl super::ApplicationCoordinator {
                 // pipeline: ClubLog/QRZ/eQSL/cqdx.io uploads are handed to the
                 // durable pending-upload queue (PAN-57), which retries them
                 // and survives restarts; LoTW keeps its single tqsl attempt in
-                // its own task.
+                // its own task. At shutdown it cancels a QRZ lookup in flight
+                // and keeps queuing completions until `stop_upload_outbox`
+                // asks it to finish (PAN-232).
                 if upload_enabled {
                     start_qso_upload_subscriber(
                         upload_outbox.clone(),
@@ -3413,6 +3416,7 @@ impl super::ApplicationCoordinator {
                         qso_manager.subscribe(),
                         shutdown.clone(),
                         qso_lookup.clone(),
+                        qrz_xml_base_url.clone(),
                     );
                 }
 
@@ -9293,7 +9297,8 @@ fn needs_qrz_enrichment(metadata: &pancetta_qso::QsoMetadata) -> bool {
 /// the result (hit or miss) for the session, and merges it into `metadata`
 /// via [`merge_qrz_lookup`]. Never blocks or fails the pipeline: any
 /// error/timeout is logged at debug (target `dx.qrz`) and the metadata is
-/// left unchanged.
+/// left unchanged. Coordinator shutdown cancels it at its next `.await`
+/// (PAN-232).
 async fn maybe_enrich_from_qrz(
     metadata: &mut pancetta_qso::QsoMetadata,
     client: &pancetta_dx::QrzXmlClient,
@@ -9373,10 +9378,31 @@ async fn maybe_enrich_from_qrz(
     }
 }
 
+/// How often the QSO upload subscriber re-checks the shutdown flag while a
+/// QRZ lookup is in flight. The flag is a plain `AtomicBool`; 50 ms is the TX
+/// worker's `interruptible_sleep` cadence.
+const UPLOAD_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Resolves once the shutdown flag is set.
+async fn shutdown_requested(shutdown: &std::sync::atomic::AtomicBool) {
+    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(UPLOAD_SHUTDOWN_POLL).await;
+    }
+}
+
+/// Resolves when coordinator shutdown asks the upload subscriber to finish.
+/// Without a queue nothing asks: the subscriber runs until the runtime ends.
+async fn upload_subscriber_finish(outbox: Option<&super::upload_outbox::UploadOutboxHandle>) {
+    match outbox {
+        Some(outbox) => outbox.stop_requested().await,
+        None => std::future::pending().await,
+    }
+}
+
 // rationale: the queue handle, one explicit config arg per remaining direct
-// destination (LoTW, QRZ XML) plus the event source + shared handles —
-// bundling them into a struct would just move the same fields without
-// improving clarity.
+// destination (LoTW, QRZ XML) plus the event source + shared handles and the
+// QRZ XML test endpoint — bundling them into a struct would just move the
+// same fields without improving clarity.
 #[allow(clippy::too_many_arguments)]
 fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
@@ -9386,6 +9412,7 @@ fn start_qso_upload_subscriber(
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
+    qrz_xml_base_url: Option<String>,
 ) {
     use std::sync::Arc;
 
@@ -9416,11 +9443,16 @@ fn start_qso_upload_subscriber(
         && !qrz_xml_cfg.password.is_empty()
     {
         let agent = format!("pancetta-{}", env!("CARGO_PKG_VERSION"));
-        Some(Arc::new(pancetta_dx::QrzXmlClient::new(
+        let mut client = pancetta_dx::QrzXmlClient::new(
             qrz_xml_cfg.username.clone(),
             qrz_xml_cfg.password.clone(),
             agent,
-        )))
+        );
+        // Always `None` in production; see `qrz_xml_base_url_override`.
+        if let Some(url) = qrz_xml_base_url {
+            client = client.with_base_url(url);
+        }
+        Some(Arc::new(client))
     } else {
         None
     };
@@ -9446,16 +9478,58 @@ fn start_qso_upload_subscriber(
         let processor =
             pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
 
-        while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            match events.recv().await {
+        // PAN-232: with a queue, the subscriber runs until coordinator
+        // shutdown asks it to finish (`stop_upload_outbox`, after every QSO
+        // component has stopped), not just until the shutdown flag: the QSO
+        // component can still complete a QSO after the flag flips. It then
+        // queues the completions already in its channel and drops its handle,
+        // which lets the worker close its queue at once.
+        let mut draining = false;
+        loop {
+            let event = if draining {
+                match events.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n))
+                    }
+                    // Empty or Closed: nothing left to queue.
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => event,
+                    () = upload_subscriber_finish(outbox.as_ref()) => {
+                        draining = true;
+                        continue;
+                    }
+                }
+            };
+            match event {
                 Ok(pancetta_qso::QsoEvent::QsoCompleted { mut metadata, .. }) => {
                     // Best-effort QRZ XML enrichment: fill a MISSING their-grid
                     // (and name/dxcc in notes for logging) before rendering the
                     // ADIF record. No-op when the client is disabled or the grid
                     // is already known from decode/cqdx; never blocks or fails
-                    // the upload pipeline.
+                    // the upload pipeline. PAN-232: never hold a completed QSO's
+                    // uploads for it once shutdown has started. A lookup can
+                    // take its 30 s client timeout (twice with a login), far
+                    // past the worker's shutdown window, so the shutdown flag
+                    // cancels it. Biased toward the lookup, so a cached answer
+                    // still lands at shutdown.
                     if let Some(client) = qrz_xml_client.clone() {
-                        maybe_enrich_from_qrz(&mut metadata, &client, &qrz_xml_cache).await;
+                        let call = metadata
+                            .their_callsign
+                            .clone()
+                            .unwrap_or_else(|| "?".to_string());
+                        tokio::select! {
+                            biased;
+                            () = maybe_enrich_from_qrz(&mut metadata, &client, &qrz_xml_cache) => {}
+                            () = shutdown_requested(&shutdown) => info!(
+                                target: "qso.upload",
+                                "Shutdown: QRZ lookup for {call} cancelled — its uploads are queued without QRZ data"
+                            ),
+                        }
                     }
 
                     // PAN-85: session-scoped only — the ADIF writer and the
@@ -11186,6 +11260,198 @@ mod replay_history_seed_tests {
         let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path);
         assert_eq!(store.len(), 1, "batch taken before shutdown was saved");
         assert_eq!(store.entries()[0].call, "K1ABC");
+    }
+
+    /// A QRZ XML endpoint that accepts every connection and never answers. The
+    /// receiver gets one `()` per accepted connection. It is tokio's channel,
+    /// because the test runtime is current-thread and a blocking recv would
+    /// stall it.
+    fn silent_qrz_server() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+                let _ = tx.send(());
+            }
+        });
+        (format!("http://{addr}/xml/current/"), rx)
+    }
+
+    /// Records every payload it is given and accepts it.
+    struct RecordingTransport(std::sync::Mutex<Vec<String>>);
+
+    impl super::super::upload_outbox::OutboxTransport for RecordingTransport {
+        fn destinations(&self) -> Vec<pancetta_dx::upload_outbox::UploadDestination> {
+            vec![pancetta_dx::upload_outbox::UploadDestination::ClubLog]
+        }
+
+        async fn deliver(
+            &self,
+            _d: pancetta_dx::upload_outbox::UploadDestination,
+            payload: String,
+        ) -> super::super::upload_outbox::Delivery {
+            self.0.lock().unwrap().push(payload);
+            super::super::upload_outbox::Delivery::Accepted { duplicate: false }
+        }
+    }
+
+    /// `live_coordinator_with_home` with ClubLog enabled (dummy credentials).
+    async fn clublog_coordinator(home: &std::path::Path) -> ApplicationCoordinator {
+        let coordinator = live_coordinator_with_home(home).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator
+    }
+
+    fn outbox_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME)
+    }
+
+    /// PAN-232 Tier 1: a QSO that completes while its QRZ XML lookup hangs
+    /// still has its uploads queued when pancetta shuts down, without the
+    /// QRZ data, shutdown does not wait for the lookup, and the next start
+    /// sends them.
+    #[tokio::test]
+    async fn qso_completed_during_a_hung_qrz_lookup_is_queued_at_shutdown_and_sent_at_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (qrz_url, mut qrz_connections) = silent_qrz_server();
+        let mut coordinator = clublog_coordinator(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.qrz_xml.enabled = true;
+            cfg.network.qrz_xml.username = "user".to_string();
+            cfg.network.qrz_xml.password = "pass".to_string();
+        }
+        coordinator.qrz_xml_base_url_override = Some(qrz_url);
+        coordinator.start_qso_component().await.unwrap();
+        // Let the writers and the upload subscriber subscribe.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let manager = coordinator
+            .qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("QSO manager published");
+        super::replay_local_log_tests::complete_one_qso(&manager).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), qrz_connections.recv())
+            .await
+            .expect("the QRZ lookup for K1DEF started")
+            .expect("server thread alive");
+
+        let started = std::time::Instant::now();
+        coordinator.shutdown().await.unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "shutdown waited for the QRZ lookup: {took:?}"
+        );
+
+        let path = outbox_path(tmp.path());
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path.clone());
+        assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
+        let entry = &store.entries()[0];
+        assert_eq!(entry.call, "K1DEF");
+        assert_eq!(
+            entry.destination,
+            pancetta_dx::upload_outbox::UploadDestination::ClubLog
+        );
+        assert!(
+            !entry.payload.contains("<STATE:"),
+            "queued with QRZ data it never got: {}",
+            entry.payload
+        );
+        drop(store);
+
+        // The next start sends it.
+        let transport = Arc::new(RecordingTransport(std::sync::Mutex::new(Vec::new())));
+        let timing = super::super::upload_outbox::OutboxTiming {
+            slow_retry: std::time::Duration::from_millis(200),
+            drain_spacing: std::time::Duration::from_millis(5),
+            tick: std::time::Duration::from_millis(5),
+            shutdown_grace: std::time::Duration::from_millis(100),
+            persist_retry: std::time::Duration::from_millis(5),
+            persist_retry_cap: std::time::Duration::from_millis(20),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (handle, task) = super::super::upload_outbox::start_upload_outbox(
+            path.clone(),
+            transport.clone(),
+            pancetta_dx::upload_outbox::RetrySchedule::new(3, 10, 40, 2.0, 0.0, timing.slow_retry),
+            timing,
+            Arc::new(std::sync::Mutex::new(
+                super::super::upload_outbox::UploadHealth::default(),
+            )),
+            None,
+            shutdown.clone(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while transport.0.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued upload was not sent at the next start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        super::super::upload_outbox::stop_upload_outbox(Some(handle), Some(task), timing).await;
+        let sent = transport.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("K1DEF"), "{}", sent[0]);
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path);
+        assert_eq!(store.len(), 0, "delivered upload left in the queue");
+    }
+
+    /// PAN-232 Tier 2: with uploads enabled and nothing in flight, the worker
+    /// closes its queue as soon as the upload subscriber lets go, instead of
+    /// waiting out a fixed grace window.
+    #[tokio::test]
+    async fn shutdown_closes_the_upload_queue_at_once_when_no_qso_is_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = clublog_coordinator(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        coordinator.shutdown().await.unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "shutdown waited out the upload worker's grace window: {took:?}"
+        );
+    }
+
+    /// PAN-232 guard: the QSO component can still complete a QSO after the
+    /// shutdown flag flips (it finishes the message it is handling), so the
+    /// upload subscriber must keep receiving until shutdown asks it to
+    /// finish, not stop on the flag alone.
+    #[tokio::test]
+    async fn qso_completed_after_the_shutdown_flag_still_has_its_uploads_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = clublog_coordinator(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let manager = coordinator
+            .qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("QSO manager published");
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        // More than four of the subscriber's shutdown polls.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        super::replay_local_log_tests::complete_one_qso(&manager).await;
+        coordinator.shutdown().await.unwrap();
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(outbox_path(tmp.path()));
+        assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
+        assert_eq!(store.entries()[0].call, "K1DEF");
     }
 
     /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`

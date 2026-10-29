@@ -14,6 +14,10 @@
 //! memory, the write is retried with capped backoff, and they are sent once
 //! a write succeeds.
 //!
+//! At shutdown the worker starts no new attempts but keeps taking batches
+//! until every handle is gone; `stop_upload_outbox` asks the subscribers to
+//! finish once the QSO components have stopped (PAN-232).
+//!
 //! There is exactly one worker per process (owned by the coordinator, reused
 //! across Qso restarts), because a Qso crash-restart can briefly leave two
 //! upload subscribers alive, and two writers on one file must never happen.
@@ -34,7 +38,7 @@ use pancetta_dx::upload_outbox::{
     Lane, NewUpload, OutboxStore, RetryDelay, RetrySchedule, UploadDestination, OUTBOX_MAX_ENTRIES,
 };
 use pancetta_dx::UploadFailureClass;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -337,9 +341,11 @@ pub(crate) struct OutboxTiming {
     pub drain_spacing: Duration,
     /// How often the worker wakes up to look for due work.
     pub tick: Duration,
-    /// After shutdown, how long the worker keeps taking new batches (a
-    /// subscriber may already be handling a completed QSO) before it closes
-    /// the channel. Ends early once every handle is dropped.
+    /// Backstop for coordinator shutdown: how long after
+    /// [`stop_upload_outbox`] asks the subscribers to finish the worker still
+    /// waits for one that has not dropped its handle before it closes the
+    /// channel. Normally unused: the channel closes as soon as every handle
+    /// is gone (PAN-232).
     pub shutdown_grace: Duration,
     /// First retry delay after a failed queue write; doubles per failure.
     pub persist_retry: Duration,
@@ -400,6 +406,10 @@ pub(crate) struct DestinationHealth {
 pub(crate) struct UploadOutboxHandle {
     tx: mpsc::Sender<Vec<NewUpload>>,
     destinations: Arc<[UploadDestination]>,
+    /// Set once, by [`stop_upload_outbox`]: every QSO component has
+    /// stopped, so subscribers queue what they hold and drop their
+    /// handles (PAN-232).
+    stop: Arc<watch::Sender<bool>>,
 }
 
 impl UploadOutboxHandle {
@@ -409,9 +419,10 @@ impl UploadOutboxHandle {
     }
 
     /// Queue a batch. Waits for room in the channel. Once the worker sees
-    /// shutdown it closes the channel, then saves what is already in it; a
-    /// batch sent after the close (or after the worker is gone) is not queued
-    /// and is logged at warn.
+    /// shutdown it keeps taking batches until every handle is gone (or its
+    /// backstop after the stop request), then closes the channel and saves
+    /// what is in it; a batch sent after the close (or after the worker is
+    /// gone) is not queued and is logged at warn.
     pub(crate) async fn enqueue(&self, batch: Vec<NewUpload>) {
         if batch.is_empty() {
             return;
@@ -425,6 +436,15 @@ impl UploadOutboxHandle {
                 call
             );
         }
+    }
+
+    /// Resolves once coordinator shutdown asks the upload subscribers to
+    /// finish ([`stop_upload_outbox`]). A subscriber then queues the
+    /// completions it still holds and drops its handle, which lets the
+    /// worker close its channel at once.
+    pub(crate) async fn stop_requested(&self) {
+        let mut stop = self.stop.subscribe();
+        let _ = stop.wait_for(|stop| *stop).await;
     }
 
     /// Whether the worker has stopped taking batches (it closed its inbox).
@@ -467,17 +487,22 @@ pub(crate) fn start_upload_outbox<T: OutboxTransport>(
 /// that finish.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
-/// Coordinator shutdown: drop the coordinator's own handle (so the worker's
-/// grace window can end once the subscribers are gone too) and wait for the
-/// worker to drain and save, bounded by the grace window plus
-/// [`SHUTDOWN_DRAIN`]. Awaiting it here keeps runtime teardown from
-/// cancelling the worker mid-save. The shutdown flag must already be set.
+/// Coordinator shutdown, once every QSO component has stopped: ask the
+/// upload subscribers to finish (they queue the completions they still hold
+/// and drop their handles), drop the coordinator's own handle, and wait for
+/// the worker to save and close. The worker closes its channel as soon as
+/// every handle is gone; the wait is bounded by `shutdown_grace` (its
+/// backstop for a subscriber that never lets go) plus [`SHUTDOWN_DRAIN`].
+/// Awaiting it here keeps runtime teardown from cancelling the worker
+/// mid-save. The shutdown flag must already be set.
 pub(crate) async fn stop_upload_outbox(
     handle: Option<UploadOutboxHandle>,
     task: Option<tokio::task::JoinHandle<()>>,
     timing: OutboxTiming,
 ) {
-    drop(handle);
+    if let Some(handle) = handle {
+        handle.stop.send_replace(true);
+    }
     let Some(task) = task else {
         return;
     };
@@ -511,6 +536,7 @@ fn spawn_upload_outbox<T: OutboxTransport>(
     let (tx, rx) = mpsc::channel(256);
     let destinations: Arc<[UploadDestination]> = transport.destinations().into();
     let (results_tx, results_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(false);
     let worker = Worker {
         path,
         capacity,
@@ -521,6 +547,7 @@ fn spawn_upload_outbox<T: OutboxTransport>(
         health,
         bus,
         shutdown,
+        stop: stop_rx,
         lanes: HashMap::new(),
         refused_full: 0,
         persist_blocked: false,
@@ -531,7 +558,14 @@ fn spawn_upload_outbox<T: OutboxTransport>(
         results_tx,
     };
     let task = tokio::spawn(worker.run(rx, results_rx));
-    (UploadOutboxHandle { tx, destinations }, task)
+    (
+        UploadOutboxHandle {
+            tx,
+            destinations,
+            stop: Arc::new(stop_tx),
+        },
+        task,
+    )
 }
 
 type DeliveryResult = (Uuid, UploadDestination, Delivery);
@@ -546,6 +580,9 @@ struct Worker<T: OutboxTransport> {
     health: Arc<std::sync::Mutex<UploadHealth>>,
     bus: Option<MessageBus>,
     shutdown: Arc<AtomicBool>,
+    /// The stop request [`stop_upload_outbox`] sends; starts the shutdown
+    /// backstop.
+    stop: watch::Receiver<bool>,
     lanes: HashMap<UploadDestination, Lane>,
     refused_full: usize,
     /// The unreadable queue file could not be moved aside: never overwrite it.
@@ -663,12 +700,21 @@ impl<T: OutboxTransport> Worker<T> {
                 _ = tokio::time::sleep(self.timing.tick) => {}
             }
         }
-        // Shutdown: start no new attempts. A subscriber that was already
-        // handling a completed QSO when the flag flipped enqueues just after
-        // it, so keep saving batches (and recording attempts that finish) for
-        // a short grace window, or until every handle is gone.
-        let grace = tokio::time::sleep(self.timing.shutdown_grace);
-        tokio::pin!(grace);
+        // Shutdown: start no new attempts, but keep saving batches (and
+        // recording attempts that finish) until every handle is gone. A
+        // subscriber may be handling a completed QSO, and the QSO component
+        // can still complete one until coordinator shutdown has stopped it.
+        // `stop_upload_outbox` then asks the subscribers to finish; they
+        // queue what they hold and drop their handles, which ends this loop
+        // at once. `shutdown_grace` after that request is only a backstop for
+        // a subscriber that never lets go (PAN-232).
+        let grace = self.timing.shutdown_grace;
+        let mut stop = self.stop.clone();
+        let backstop = async move {
+            let _ = stop.wait_for(|stop| *stop).await;
+            tokio::time::sleep(grace).await;
+        };
+        tokio::pin!(backstop);
         while inbox_open {
             tokio::select! {
                 batch = inbox.recv() => match batch {
@@ -676,7 +722,14 @@ impl<T: OutboxTransport> Worker<T> {
                     None => inbox_open = false,
                 },
                 Some(result) = results.recv() => self.on_result(&mut store, result).await,
-                _ = &mut grace => break,
+                () = &mut backstop => {
+                    warn!(
+                        target: "qso.upload",
+                        "upload queue closed {} after shutdown asked the QSO upload subscribers to finish; one was still running, and an upload it queues later is not saved",
+                        format_wait(grace)
+                    );
+                    break;
+                }
             }
         }
         // Then save every batch the channel already took. Closing first
@@ -1415,10 +1468,12 @@ mod tests {
         rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
         wait_until(|| rig.transport.calls_to(ClubLog) == 1).await;
         rig.shutdown.store(true, Ordering::Release);
-        tokio::time::timeout(Duration::from_secs(1), rig.task)
-            .await
-            .expect("worker stops within 1s")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING),
+        )
+        .await
+        .expect("worker stops within 1s");
         let (store, _) = OutboxStore::open(rig.path.clone());
         assert_eq!(store.len(), 1);
     }
@@ -1430,10 +1485,12 @@ mod tests {
         let rig = start(FakeTransport::new(&[ClubLog]));
         rig.shutdown.store(true, Ordering::Release);
         rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
-        tokio::time::timeout(Duration::from_secs(1), rig.task)
-            .await
-            .expect("worker stops within 1s")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING),
+        )
+        .await
+        .expect("worker stops within 1s");
         let (store, _) = OutboxStore::open(rig.path.clone());
         assert_eq!(store.len(), 1);
         assert_eq!(store.entries()[0].call, "K1ABC");
@@ -1447,16 +1504,77 @@ mod tests {
         let rig = start(FakeTransport::new(&[ClubLog]));
         rig.shutdown.store(true, Ordering::Release);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!rig.task.is_finished(), "worker waits out the grace window");
+        assert!(
+            !rig.task.is_finished(),
+            "worker keeps taking batches until the subscribers let go"
+        );
         rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
-        tokio::time::timeout(Duration::from_secs(1), rig.task)
-            .await
-            .expect("worker stops within 1s")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING),
+        )
+        .await
+        .expect("worker stops within 1s");
         let (store, _) = OutboxStore::open(rig.path.clone());
         assert_eq!(store.len(), 1);
         assert_eq!(store.entries()[0].call, "K1ABC");
         assert_eq!(rig.transport.calls_to(ClubLog), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_taking_batches_for_a_subscriber_until_stop() {
+        // PAN-232: a subscriber stuck in a slow QRZ lookup enqueues long after
+        // the flag, still holding its handle.
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        let subscriber = rig.handle.clone();
+        tokio::time::sleep(TIMING.shutdown_grace * 3).await;
+        assert!(
+            !subscriber.worker_stopped(),
+            "the queue closed under a subscriber still handling a QSO"
+        );
+        subscriber.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        drop(subscriber);
+        stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING).await;
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_closes_the_queue_at_once_when_the_subscribers_let_go() {
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        let subscriber = rig.handle.clone();
+        let sub = tokio::spawn(async move {
+            subscriber.stop_requested().await;
+            subscriber.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        });
+        let started = Instant::now();
+        stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING).await;
+        assert!(
+            started.elapsed() < TIMING.shutdown_grace,
+            "waited out the backstop"
+        );
+        sub.await.unwrap();
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_backstop_bounds_a_subscriber_that_never_lets_go() {
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        let stuck = rig.handle.clone();
+        let started = Instant::now();
+        stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING).await;
+        let took = started.elapsed();
+        assert!(took >= TIMING.shutdown_grace, "{took:?}");
+        assert!(
+            took < TIMING.shutdown_grace + Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert!(stuck.worker_stopped());
     }
 
     #[tokio::test]
