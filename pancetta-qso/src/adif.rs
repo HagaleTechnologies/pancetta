@@ -1397,8 +1397,10 @@ enum Cut {
 /// lands on a field boundary ([`before_tag`]); otherwise at the length in the
 /// other unit when only that one does, which counts as a vote against `unit`.
 /// When neither does, the value keeps the `unit` cut and ADIF's text between a
-/// value and the next tag is ignored, unless the cut has swallowed a real tag
-/// or the input ends before the length: then the length is a mismatch. ASCII
+/// value and the next tag is ignored, unless the cut ends inside a real tag it
+/// swallowed (or that tag's value), or the input ends before the length: then
+/// the length is a mismatch. A whole tag inside the value, such as a NOTES of
+/// `<EOR>` followed by ignored text, swallowed nothing and reads. ASCII
 /// spans get the same boundary checks, so an overrun in a plain ASCII record
 /// is caught too (PAN-214). Non-UTF-8 input is Latin-1: one byte, one char.
 fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize, unit: LengthUnit) -> Cut {
@@ -1434,7 +1436,7 @@ fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize, unit: L
         (None, Some(end)) => (end, true),
         (None, None) => match preferred.or(other) {
             None => return Cut::Mismatch,
-            Some(end) if swallows_tag(data, start, end) => return Cut::Mismatch,
+            Some(end) if straddles_tag(data, start, end) => return Cut::Mismatch,
             // ADIF ignores text between a value and the next '<'.
             Some(end) => (end, false),
         },
@@ -1447,17 +1449,36 @@ fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize, unit: L
 }
 
 /// True when a real tag (`<EOR>`, `<EOH>` or `<NAME:LEN…>`, as
-/// [`before_tag`] defines one) opens inside `data[start..end]` (PAN-214).
-fn swallows_tag(data: &[u8], start: usize, end: usize) -> bool {
+/// [`before_tag`] defines one) opens inside `data[start..end]` and runs past
+/// `end`: the cut ends inside that tag or inside the value it declares, so the
+/// length overran into the fields after it (PAN-214). A tag that closes, value
+/// and all, inside the span is just tag-shaped text in the value. Its value
+/// length is read in bytes, the shorter extent, so ambiguous text stays in
+/// the value.
+fn straddles_tag(data: &[u8], start: usize, end: usize) -> bool {
     data[start..end]
         .iter()
         .enumerate()
         .filter(|&(_, &b)| b == b'<')
         .any(|(i, _)| {
             let open = start + i;
-            matches!(next_tag(data, open), Some((at, close))
-                if at == open && is_tag_spec(&data[open + 1..close]))
+            match next_tag(data, open) {
+                Some((at, close)) if at == open && is_tag_spec(&data[open + 1..close]) => {
+                    let value_len = tag_value_len(&data[open + 1..close]);
+                    (close + 1).saturating_add(value_len) > end
+                }
+                _ => false,
+            }
         })
+}
+
+/// The declared value length of a tag spec (`NAME:LEN[:TYPE]`), 0 for `EOR`
+/// and `EOH` or a length too large to hold.
+fn tag_value_len(spec: &[u8]) -> usize {
+    spec.split(|&b| b == b':')
+        .nth(1)
+        .and_then(|len| std::str::from_utf8(len).ok()?.parse().ok())
+        .unwrap_or(0)
 }
 
 /// True when a cut at `at` lands on a field boundary, the test both units of
@@ -2387,6 +2408,54 @@ ADIF Export for Test Program
         assert_eq!(
             parsed.records[0].as_ref().unwrap().fields["NOTES"].value,
             "<EOR>"
+        );
+    }
+
+    /// PAN-214 (PR #542 review, Codex): a value that is itself a whole tag,
+    /// followed by ADIF's ignored inter-field text, still reads. The cut lands
+    /// on no field boundary, but the tag it holds ends inside the value, so
+    /// nothing after the value was swallowed.
+    #[test]
+    fn parse_bytes_keeps_a_tag_shaped_value_followed_by_ignored_text() {
+        let adif = "<CALL:4>W1AW <NOTES:5><EOR>ignored text <MODE:3>FT8 <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NOTES"].value, "<EOR>");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+    }
+
+    /// PAN-214: the same holds for a field-shaped tag and its value inside a
+    /// value, and through `parse_string`, the startup replay.
+    #[test]
+    fn parse_string_keeps_a_field_shaped_value_followed_by_ignored_text() {
+        let adif = "<CALL:4>W1AW <NOTES:6><X:1>zignored <MODE:3>FT8 <EOR>";
+
+        let records = AdifProcessor::new()
+            .parse_string(adif)
+            .expect("parses")
+            .records;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fields["NOTES"].value, "<X:1>z");
+        assert_eq!(records[0].fields["MODE"].value, "FT8");
+        assert!(!records[0].fields.contains_key("X"));
+    }
+
+    /// PAN-214: a cut that ends inside a tag it swallowed is still a mismatch.
+    #[test]
+    fn parse_bytes_rejects_a_length_that_ends_inside_a_swallowed_tag() {
+        let adif = "<CALL:4>W1AW <COMMENT:6>x <MODE:3>FT8 <EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(
+            outcomes(&parsed),
+            [Err((
+                length_mismatch("COMMENT:6"),
+                Some("W1AW".to_string())
+            ))]
         );
     }
 

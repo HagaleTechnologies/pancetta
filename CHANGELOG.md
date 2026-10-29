@@ -168,7 +168,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convention, when nothing in the file decides it. A length that runs past
   its record (`<COMMENT:999>`) no longer swallows the contacts after it; that
   record is listed as `Field length does not match its value: COMMENT:999`
-  and the next one imports. `pancetta export` keeps an imported field's type
+  and the next one imports; a value that is itself a whole tag (`<NOTES:5><EOR>`)
+  still reads when ignored text follows it. `pancetta export` keeps an imported field's type
   indicator (`<APP_LOGGER_SCORE:2:N>42`, which it wrote as
   `<APP_LOGGER_SCORE:2>42`). An import and Pancetta's own logging now take
   turns at `qsos.adi` through the lock file `qsos.adi.lock`: an import that
