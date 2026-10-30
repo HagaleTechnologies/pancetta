@@ -323,6 +323,18 @@ impl super::ApplicationCoordinator {
         // Clone our callsign before the tui-relay thread consumes the original
         // via move. The async command-handler task below needs its own copy.
         let cmd_our_callsign = our_callsign_for_relay.clone();
+        let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
+        let (gain_mutation_tx, gain_mutation_handle) = spawn_receive_gain_preset_mutation_worker(
+            self.config.clone(),
+            cmd_config_write_tx.clone(),
+            tui_msg_tx.clone(),
+            self.config_path.clone(),
+            self.config_write_is_toml,
+        );
+        let pending_gain_save = Arc::new(std::sync::Mutex::new(None::<(u64, Instant, u64)>));
+        let relay_pending_gain_save = pending_gain_save.clone();
+        let relay_gain_mutation_tx = gain_mutation_tx.clone();
+        let relay_gain_frequency = self.operating_frequency_hz.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -362,6 +374,12 @@ impl super::ApplicationCoordinator {
             let mut last_grids = RelayCache::default();
             let mut last_rank_inputs = RelayCache::default();
             while !relay_shutdown.load(Ordering::Acquire) {
+                if let Ok(mut pending) = relay_pending_gain_save.lock() {
+                    if pending.is_some_and(|(_, since, _)| since.elapsed() >= Duration::from_secs(10)) {
+                        pending.take();
+                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into()));
+                    }
+                }
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
                         Ok(relayed) => {
@@ -687,6 +705,26 @@ impl super::ApplicationCoordinator {
                                     frequency,
                                 },
                             );
+                        }
+                        MessageType::RigControl(
+                            crate::message_bus::RigControlMessage::ReceiveGainResponse {
+                                frequency, request_id, preamp_db, att_db,
+                            },
+                        ) => {
+                            if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
+                                if relay_gain_frequency.load(Ordering::Acquire) != frequency {
+                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into()));
+                                } else if let Some(band) = pancetta_core::Band::from_frequency(frequency) {
+                                    let _ = relay_gain_mutation_tx.send((band.to_string(), pancetta_config::rig::ReceiveGainPreset { preamp_db, attenuator_db: att_db }));
+                                }
+                            }
+                        }
+                        MessageType::RigControl(
+                            crate::message_bus::RigControlMessage::ReceiveGainError { frequency, request_id, error },
+                        ) => {
+                            if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
+                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error)));
+                            }
                         }
                         MessageType::RigControl(
                             crate::message_bus::RigControlMessage::SignalStrengthResponse {
@@ -1196,7 +1234,6 @@ impl super::ApplicationCoordinator {
         // which reuses the same `<path>.tmp` sibling for every caller. See
         // `spawn_config_file_write_worker`'s doc comment for why a plain
         // shared lock isn't enough here.
-        let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
         // PAN-61 review round 8 (Codex P1): registered so graceful
         // shutdown (`shutdown.rs`) awaits this worker draining any writes
         // already queued, with the same bounded per-task timeout every
@@ -1247,6 +1284,7 @@ impl super::ApplicationCoordinator {
         let cmd_rig_select_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         const TUNE_DURATION_SECS: u32 = 12;
         const TUNE_TONE_HZ: f64 = 1500.0;
+        drop(gain_mutation_tx);
         let cmd_handle = tokio::spawn(async move {
             // Push the available audio devices to the TUI once at startup so
             // the `d` device-selection picker can list them. The coordinator
@@ -3001,6 +3039,68 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::SaveReceiveGainPreset => {
+                            let frequency = cmd_operating_freq_hz.load(Ordering::Acquire);
+                            if super::hamlib::RigConnState::from_u8(
+                                cmd_rig_conn_state.load(Ordering::Acquire),
+                            ) != super::hamlib::RigConnState::Connected
+                            {
+                                let _ = cmd_tui_msg_tx.send(gain_status(
+                                    "Rig not connected — preset not saved".into(),
+                                ));
+                                continue;
+                            }
+                            if pancetta_core::Band::from_frequency(frequency).is_none() {
+                                let _ = cmd_tui_msg_tx.send(gain_status(
+                                    "Could not read rig gain: unknown band — preset not saved"
+                                        .into(),
+                                ));
+                                continue;
+                            }
+                            if !cmd_config_write_is_toml {
+                                let _ = cmd_tui_msg_tx.send(gain_status(
+                                    "Gain presets aren't supported for a non-TOML config file"
+                                        .into(),
+                                ));
+                                continue;
+                            }
+                            static NEXT_GAIN_REQUEST_ID: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(1);
+                            let request_id = NEXT_GAIN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                            let ready = if let Ok(mut pending) = pending_gain_save.lock() {
+                                if pending.is_some_and(|(_, since, _)| {
+                                    since.elapsed() < Duration::from_secs(10)
+                                }) {
+                                    false
+                                } else {
+                                    *pending = Some((frequency, Instant::now(), request_id));
+                                    true
+                                }
+                            } else {
+                                false
+                            };
+                            if !ready {
+                                continue;
+                            }
+                            let request = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Hamlib,
+                                MessageType::RigControl(
+                                    crate::message_bus::RigControlMessage::GetReceiveGain {
+                                        frequency,
+                                        request_id,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(error) = cmd_message_bus.send_message(request).await {
+                                take_pending_gain_save(&pending_gain_save, frequency, request_id);
+                                let _ = cmd_tui_msg_tx.send(gain_status(format!(
+                                    "Could not read rig gain: {} — preset not saved",
+                                    error
+                                )));
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::SaveRigBookmark {
                             name,
                             model,
@@ -3152,6 +3252,9 @@ impl super::ApplicationCoordinator {
         // first lets shutdown close it -- dropping the senders -- before
         // the consumers are awaited, so the workers see channel closure
         // and drain cleanly within their own timeout.
+        // The mutation worker submits to the write worker, so drain it first.
+        self.named_task_handles
+            .push((ComponentId::Tui, gain_mutation_handle));
         self.named_task_handles
             .push((ComponentId::Tui, cmd_config_write_handle));
         self.named_task_handles
@@ -3928,6 +4031,136 @@ fn spawn_config_file_write_worker() -> (
                 ))),
             };
             let _ = req.respond.send(result);
+        }
+        Ok(())
+    });
+    (tx, handle)
+}
+
+fn gain_status(status: String) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+        component: "rig".into(),
+        status,
+    }
+}
+
+fn take_pending_gain_save(
+    pending: &std::sync::Mutex<Option<(u64, Instant, u64)>>,
+    frequency: u64,
+    request_id: u64,
+) -> bool {
+    let Ok(mut pending) = pending.lock() else {
+        return false;
+    };
+    // The age limit only permits retrying a stalled request. An unreplaced
+    // request still owns its reply, even when CAT took longer than 10 s.
+    if pending.is_some_and(|(expected, _, expected_id)| {
+        expected == frequency && expected_id == request_id
+    }) {
+        pending.take();
+        true
+    } else {
+        false
+    }
+}
+
+/// Serializes stage, targeted file mutation, and shared-config commit for gain saves.
+fn spawn_receive_gain_preset_mutation_worker(
+    config: Arc<tokio::sync::RwLock<pancetta_config::Config>>,
+    write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
+    tui_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+    config_path: std::path::PathBuf,
+    config_is_toml: bool,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<(String, pancetta_config::rig::ReceiveGainPreset)>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, pancetta_config::rig::ReceiveGainPreset)>();
+    let handle = tokio::spawn(async move {
+        while let Some((band, preset)) = rx.recv().await {
+            if !config_is_toml {
+                let _ = tui_tx.send(gain_status(
+                    "Gain presets aren't supported for a non-TOML config file".into(),
+                ));
+                continue;
+            }
+            if preset.preamp_db < 0 || preset.attenuator_db < 0 {
+                let _ = tui_tx.send(gain_status(
+                    "Could not save gain preset: negative rig gain".into(),
+                ));
+                continue;
+            }
+            let mut staged = config
+                .read()
+                .await
+                .rig
+                .receive_gain_presets
+                .clone()
+                .unwrap_or_default();
+            staged.insert(band.clone(), preset.clone());
+            let path = config_path.clone();
+            let write_staged = staged.clone();
+            let write_band = band.clone();
+            let write_preset = preset.clone();
+            let (respond, response) = tokio::sync::oneshot::channel();
+            let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+            let sent = write_tx.send(ConfigFileWriteRequest {
+                work: Box::new(move || {
+                    let target = resolve_config_write_target(&path)?;
+                    // A repointed config symlink can have its own presets. Merge the
+                    // single save into that target rather than overwriting its map.
+                    let text = match std::fs::read_to_string(&target) {
+                        Ok(text) => text,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                        Err(error) => {
+                            return Err(pancetta_config::ConfigError::Validation(error.to_string()))
+                        }
+                    };
+                    let doc: toml::Value = toml::from_str(&text)
+                        .map_err(|e| pancetta_config::ConfigError::Validation(e.to_string()))?;
+                    let mut written = match doc
+                        .get("rig")
+                        .and_then(|r| r.get("receive_gain_presets"))
+                    {
+                        Some(value) => value.clone().try_into().map_err(|e: toml::de::Error| {
+                            pancetta_config::ConfigError::Validation(e.to_string())
+                        })?,
+                        None => write_staged,
+                    };
+                    written.insert(write_band, write_preset);
+                    pancetta_config::Config::default()
+                        .set_rig_receive_gain_presets_in_file(&target, &written)?;
+                    let _ = written_tx.send(written);
+                    Ok(())
+                }),
+                respond,
+            });
+            let result = if sent.is_err() {
+                Err("config write worker closed".to_string())
+            } else {
+                match response.await {
+                    Ok(result) => result.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            let status = match result {
+                Err(error) => format!("Could not save gain preset: {}", error),
+                Ok(()) => {
+                    if let Ok(written) = written_rx.await {
+                        staged = written;
+                    }
+                    config.write().await.rig.receive_gain_presets = Some(staged);
+                    format!(
+                        "Saved {} receive-gain preset: preamp {} ({} dB), attenuator {} dB",
+                        band,
+                        super::hamlib::preamp_label(preset.preamp_db),
+                        preset.preamp_db,
+                        preset.attenuator_db
+                    )
+                }
+            };
+            let _ = tui_tx.send(gain_status(status));
         }
         Ok(())
     });
@@ -6509,5 +6742,152 @@ mod tui_relay_tests {
             display_needed_rare, display_plain_common,
             "display scores must be distinct: {display_needed_rare} vs {display_plain_common}"
         );
+    }
+    async fn receive_gain_worker_status(
+        rx: &crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. }) =
+                    rx.try_recv()
+                {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn receive_gain_worker_saves_serially_and_reloads_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n[station]\ncallsign = \"W1AW\"\n",
+        )
+        .unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+        let (write_tx, write_handle) = spawn_config_file_write_worker();
+        let (status_tx, status_rx) = crossbeam_channel::unbounded();
+        let (tx, handle) = spawn_receive_gain_preset_mutation_worker(
+            config.clone(),
+            write_tx,
+            status_tx,
+            path.clone(),
+            true,
+        );
+        tx.send((
+            "15m".into(),
+            pancetta_config::rig::ReceiveGainPreset {
+                preamp_db: 20,
+                attenuator_db: 0,
+            },
+        ))
+        .unwrap();
+        tx.send((
+            "10m".into(),
+            pancetta_config::rig::ReceiveGainPreset {
+                preamp_db: 10,
+                attenuator_db: 6,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            receive_gain_worker_status(&status_rx).await,
+            "Saved 15m receive-gain preset: preamp AMP2 (20 dB), attenuator 0 dB"
+        );
+        assert!(receive_gain_worker_status(&status_rx)
+            .await
+            .starts_with("Saved 10m"));
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        write_handle.await.unwrap().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this comment"));
+        let reloaded: pancetta_config::Config = toml::from_str(&text).unwrap();
+        let presets = reloaded.rig.receive_gain_presets.unwrap();
+        assert_eq!(presets["15m"].preamp_db, 20);
+        assert_eq!(presets["10m"].attenuator_db, 6);
+        assert_eq!(
+            config
+                .read()
+                .await
+                .rig
+                .receive_gain_presets
+                .as_ref()
+                .unwrap(),
+            &presets
+        );
+        // The mutation commits the running config too, so the next band
+        // crossing uses the just-saved preset without a process restart.
+        use pancetta_hamlib::RigControl;
+        let rig = pancetta_hamlib::MockRig::new(pancetta_hamlib::MockRigConfig::default());
+        rig.connect().await.unwrap();
+        let mut last_band = Some(pancetta_core::Band::Band20m);
+        super::super::hamlib::apply_receive_gain_preset(&rig, &config, &mut last_band, 21_074_000)
+            .await;
+        assert_eq!(rig.get_preamp().await.unwrap(), 20);
+        assert_eq!(rig.get_attenuator().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn receive_gain_worker_rejects_non_toml_and_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        for is_toml in [false, true] {
+            let path = dir
+                .path()
+                .join(if is_toml { "bad.toml" } else { "config.json" });
+            std::fs::write(&path, if is_toml { "invalid = [" } else { "{}" }).unwrap();
+            let before = std::fs::read_to_string(&path).unwrap();
+            let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+            let (write_tx, write_handle) = spawn_config_file_write_worker();
+            let (status_tx, status_rx) = crossbeam_channel::unbounded();
+            let (tx, handle) = spawn_receive_gain_preset_mutation_worker(
+                config.clone(),
+                write_tx,
+                status_tx,
+                path.clone(),
+                is_toml,
+            );
+            tx.send((
+                "15m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db: 20,
+                    attenuator_db: 0,
+                },
+            ))
+            .unwrap();
+            let status = receive_gain_worker_status(&status_rx).await;
+            assert!(if is_toml {
+                status.starts_with("Could not save gain preset:")
+            } else {
+                status == "Gain presets aren't supported for a non-TOML config file"
+            });
+            assert!(config.read().await.rig.receive_gain_presets.is_none());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+            drop(tx);
+            handle.await.unwrap().unwrap();
+            write_handle.await.unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn receive_gain_response_requires_matching_pending_request() {
+        let pending = std::sync::Mutex::new(Some((21_074_000, Instant::now(), 2)));
+        assert!(!take_pending_gain_save(&pending, 28_074_000, 2));
+        // The previous request timed out, and a second save on the same
+        // dial is waiting. Its late response cannot complete the new save.
+        assert!(!take_pending_gain_save(&pending, 21_074_000, 1));
+        assert!(take_pending_gain_save(&pending, 21_074_000, 2));
+        assert!(!take_pending_gain_save(&pending, 21_074_000, 2));
+        let slow = std::sync::Mutex::new(Some((
+            21_074_000,
+            Instant::now() - Duration::from_secs(11),
+            3,
+        )));
+        assert!(take_pending_gain_save(&slow, 21_074_000, 3));
     }
 }

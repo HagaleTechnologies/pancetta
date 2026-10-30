@@ -439,6 +439,8 @@ pub enum TuiCommand {
         baud_rate: u32,
         ptt_method: pancetta_config::rig::PttMethod,
     },
+    /// Read the live rig preamp and attenuator and save them for the current band.
+    SaveReceiveGainPreset,
     /// Save the rig picker's current 4 form values as a named bookmark
     /// (PAN-61). Save-as-name semantics: overwrites an existing bookmark
     /// with the same name, else appends. Pure config-list mutation — never
@@ -2171,6 +2173,14 @@ impl TuiRunner {
             // g - cycle Full → RespondOnly → Disabled → Full. Optimistically
             // flip the local banner for instant feedback; the coordinator
             // echoes the authoritative state back via TxPolicyUpdate.
+            KeyCode::Char('G') if !ctrl_or_alt_held => {
+                let frequency = (app.station_info.operating_frequency * 1_000_000.0).round() as u64;
+                let band = pancetta_core::Band::from_frequency(frequency)
+                    .map(|band| band.to_string())
+                    .unwrap_or_else(|| "unknown band".into());
+                app.status_message = format!("Saving {} gain preset…", band);
+                self.message_tx.send(TuiCommand::SaveReceiveGainPreset)?;
+            }
             KeyCode::Char('g') if !ctrl_or_alt_held => {
                 let next = app.tx_policy.cycle();
                 app.tx_policy = next;
@@ -7510,6 +7520,49 @@ mod key_tests {
             "must stay open when no port is selected"
         );
         assert!(cmd_rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn g_saves_receive_gain_preset() {
+        let (mut runner, commands, app) = make_runner().await;
+        app.write().await.station_info.operating_frequency = 21.074;
+        runner.handle_key_event(key('G')).await.unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(TuiCommand::SaveReceiveGainPreset)
+        ));
+        assert_eq!(app.read().await.status_message, "Saving 15m gain preset…");
+        assert!(crate::keymap::KEYBINDINGS
+            .iter()
+            .any(|binding| binding.key == "G" && binding.action.contains("save gain preset")));
+    }
+
+    #[tokio::test]
+    async fn g_does_not_save_while_rig_or_help_overlay_is_open() {
+        let (mut runner, commands, app) = make_runner().await;
+        app.write().await.rig_selection.visible = true;
+        runner.handle_key_event(key('G')).await.unwrap();
+        assert!(!commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, TuiCommand::SaveReceiveGainPreset)));
+        {
+            let mut state = app.write().await;
+            state.rig_selection.naming_bookmark = true;
+        }
+        runner.handle_key_event(key('G')).await.unwrap();
+        assert_eq!(app.read().await.rig_selection.bookmark_name_input, "G");
+        assert!(!commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, TuiCommand::SaveReceiveGainPreset)));
+        {
+            let mut state = app.write().await;
+            state.rig_selection.naming_bookmark = false;
+            state.rig_selection.visible = false;
+            state.help_visible = true;
+        }
+        runner.handle_key_event(key('G')).await.unwrap();
+        assert!(!commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, TuiCommand::SaveReceiveGainPreset)));
     }
 }
 

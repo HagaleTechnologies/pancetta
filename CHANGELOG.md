@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-band preamp and attenuator presets apply on Pancetta-commanded band changes. Press `G` to save the current rig gain for this band (PAN-245).
+
 - Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
   (PAN-57). Each completed QSO's uploads are saved to
   `~/.pancetta/upload_outbox.json` before the first attempt and leave it only
