@@ -2808,6 +2808,7 @@ struct PttGuard {
     /// Mirrors the keyed state for the SWR poll / TUI. Set true on construct,
     /// cleared on drop (RAII — clears on every exit path incl. abort/panic).
     ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_ptt_off_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PttGuard {
@@ -2829,6 +2830,7 @@ impl PttGuard {
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ptt_sync_gate: &std::sync::Arc<tokio::sync::Mutex<()>>,
         last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         {
             let _ptt_sync = ptt_sync_gate.lock().await;
@@ -2839,6 +2841,7 @@ impl PttGuard {
             message_bus,
             armed: true,
             ptt_active,
+            last_ptt_off_ms: last_ptt_off_ms.clone(),
         }
     }
 
@@ -2856,6 +2859,8 @@ impl PttGuard {
             .await
         {
             Ok(true) => {
+                self.last_ptt_off_ms
+                    .store(super::now_epoch_ms(), Ordering::Release);
                 self.ptt_active
                     .store(false, std::sync::atomic::Ordering::Release);
                 self.armed = false;
@@ -6986,6 +6991,10 @@ pub(crate) async fn coalesce_backlog_into(
 impl Drop for PttGuard {
     fn drop(&mut self) {
         // Always clear keyed state, on every exit path (normal / abort / panic).
+        if self.ptt_active.load(Ordering::Acquire) {
+            self.last_ptt_off_ms
+                .store(super::now_epoch_ms(), Ordering::Release);
+        }
         self.ptt_active
             .store(false, std::sync::atomic::Ordering::Release);
         if self.armed {
@@ -7167,6 +7176,7 @@ async fn supersede_and_rekey_or_bundle(
     message_bus: &crate::message_bus::MessageBus,
     ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx_late_max_ms_eff: u64,
     sample_rate: u32,
     slot_ns: i64,
@@ -7198,6 +7208,7 @@ async fn supersede_and_rekey_or_bundle(
     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
         warn!("supersede: PTT OFF failed: {}", e);
     }
+    last_ptt_off_ms.store(super::now_epoch_ms(), Ordering::Release);
     ptt_active.store(false, Ordering::Release);
 
     let MessageType::TransmitRequest {
@@ -7526,6 +7537,7 @@ async fn supersede_multi_reenqueue(
     inbox: &TxInbox,
     ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx_late_max_ms_eff: u64,
     sample_rate: u32,
     slot_ns: i64,
@@ -7569,6 +7581,7 @@ async fn supersede_multi_reenqueue(
         message_bus,
         ptt_active,
         last_ptt_on_ms,
+        last_ptt_off_ms,
         tx_late_max_ms_eff,
         sample_rate,
         slot_ns,
@@ -7948,6 +7961,7 @@ impl super::ApplicationCoordinator {
             // Timestamp of the most recent PTT-on, read by the FT8 decode
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
+            let last_ptt_off_ms = self.last_ptt_off_ms.clone();
             // Active slot period (FT8 = 15e9 ns, FT4 = 7.5e9 ns), set once at
             // startup from `[rig].mode`. The TX scheduler keys against this so
             // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
@@ -9399,6 +9413,7 @@ impl super::ApplicationCoordinator {
                                             ptt_active.clone(),
                                             &ptt_sync_gate,
                                             &last_ptt_on_ms,
+                                            &last_ptt_off_ms,
                                         )
                                         .await;
                                         // TX badge on; guard drop clears it on every
@@ -9442,6 +9457,8 @@ impl super::ApplicationCoordinator {
                                             &relocation_epochs,
                                             &relocation_snapshot,
                                         ) {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             let pivot_replaced =
@@ -9482,6 +9499,8 @@ impl super::ApplicationCoordinator {
                                             final_gate_callsign.as_deref(),
                                             &cross_time_state,
                                         ) {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             // Same tombstone cleanup as the arm-denial branch
@@ -9537,6 +9556,8 @@ impl super::ApplicationCoordinator {
                                             &rig_conn_state,
                                             &audio_output_alive,
                                         ) {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             let pivot_replaced =
@@ -9591,6 +9612,8 @@ impl super::ApplicationCoordinator {
                                                 &band_plan,
                                             )
                                         }) {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             let pivot_replaced =
@@ -9645,6 +9668,8 @@ impl super::ApplicationCoordinator {
                                                 tx_late_max_ms,
                                             ),
                                         ) {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             let pivot_replaced =
@@ -9712,6 +9737,10 @@ impl super::ApplicationCoordinator {
                                                 );
                                             }
                                             SendIfOutcome::Denied => {
+                                                last_ptt_off_ms.store(
+                                                    super::now_epoch_ms(),
+                                                    Ordering::Release,
+                                                );
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
                                                 // Round-6 review (Codex P2): if Step 4c pivoted
@@ -9796,6 +9825,8 @@ impl super::ApplicationCoordinator {
                                                     e
                                                 );
                                             }
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             // Pre-slot abort: nothing reached the air, so a
@@ -9962,6 +9993,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &ptt_active,
                                                     &last_ptt_on_ms,
+                                                    &last_ptt_off_ms,
                                                     tx_late_max_ms_effective(
                                                         active_protocol,
                                                         tx_late_max_ms,
@@ -10462,6 +10494,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &ptt_active,
                                                     &last_ptt_on_ms,
+                                                    &last_ptt_off_ms,
                                                     tx_late_max_ms_effective(
                                                         active_protocol,
                                                         tx_late_max_ms,
@@ -12394,6 +12427,7 @@ impl super::ApplicationCoordinator {
                                         ptt_active.clone(),
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
+                                        &last_ptt_off_ms,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -12460,6 +12494,8 @@ impl super::ApplicationCoordinator {
                                         &relocation_epochs,
                                         &relocation_snapshot,
                                     ) {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -12504,6 +12540,8 @@ impl super::ApplicationCoordinator {
                                             &cross_time_state,
                                         );
                                     if !final_live_mask.iter().all(|&live| live) {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -12569,6 +12607,8 @@ impl super::ApplicationCoordinator {
                                         &rig_conn_state,
                                         &audio_output_alive,
                                     ) {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -12630,6 +12670,8 @@ impl super::ApplicationCoordinator {
                                             )
                                         })
                                     }) {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -12693,6 +12735,8 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         key_time_late_max_ms,
                                     ) {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         let mut bundle_replaced = unwind_bundle_pivots(
@@ -12765,6 +12809,8 @@ impl super::ApplicationCoordinator {
                                             );
                                         }
                                         SendIfOutcome::Denied => {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             // Round-6 review (Codex P2): nothing reached the
@@ -12848,6 +12894,8 @@ impl super::ApplicationCoordinator {
                                                 e
                                             );
                                         }
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         // Pre-slot abort: nothing reached the air yet.
@@ -12988,6 +13036,7 @@ impl super::ApplicationCoordinator {
                                                 &inbox,
                                                 &ptt_active,
                                                 &last_ptt_on_ms,
+                                                &last_ptt_off_ms,
                                                 tx_late_max_ms_effective(
                                                     active_protocol,
                                                     tx_late_max_ms,
@@ -13284,6 +13333,7 @@ impl super::ApplicationCoordinator {
                                                 &inbox,
                                                 &ptt_active,
                                                 &last_ptt_on_ms,
+                                                &last_ptt_off_ms,
                                                 tx_late_max_ms_effective(
                                                     active_protocol,
                                                     tx_late_max_ms,
@@ -13500,6 +13550,7 @@ impl super::ApplicationCoordinator {
                                         ptt_active.clone(),
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
+                                        &last_ptt_off_ms,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -13525,6 +13576,8 @@ impl super::ApplicationCoordinator {
                                     )
                                     .and_then(|rf| tx_band_plan_mute_reason(rf, 0.0, &band_plan))
                                     {
+                                        last_ptt_off_ms
+                                            .store(super::now_epoch_ms(), Ordering::Release);
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         info!(
@@ -16304,6 +16357,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let new_request = MessageType::TransmitRequest {
             attempt_id: None,
@@ -16324,6 +16378,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16415,6 +16470,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         // A genuinely different superseding message B — different text AND
         // frequency, so its encoded waveform is unmistakably distinct from A's.
@@ -16439,6 +16495,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16557,6 +16614,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
             attempt_id: None,
@@ -16585,6 +16643,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16650,6 +16709,7 @@ mod supersede_rekey_tests {
             );
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
             let in_flight = [crate::message_bus::TransmitRequestItem {
                 attempt_id: None,
@@ -16678,6 +16738,7 @@ mod supersede_rekey_tests {
                 &bus,
                 &ptt_active,
                 &last_ptt_on_ms,
+                &last_ptt_off_ms,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -16739,6 +16800,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
             attempt_id: None,
@@ -16767,6 +16829,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16830,6 +16893,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
             attempt_id: None,
@@ -16858,6 +16922,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16939,6 +17004,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         // Two in-flight QSOs; qso-1 is about to hop off 1000.0 Hz.
         let in_flight = [
@@ -16980,6 +17046,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17052,6 +17119,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         // Already 2 distinct in-flight QSOs — the configured cap.
         let in_flight = [
@@ -17092,6 +17160,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17158,6 +17227,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         // One tracked QSO + one manual (untracked) item already in flight.
         let in_flight = [
@@ -17198,6 +17268,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17273,6 +17344,7 @@ mod supersede_rekey_tests {
             );
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
             let new_request = MessageType::TransmitRequest {
                 attempt_id: None,
@@ -17293,6 +17365,7 @@ mod supersede_rekey_tests {
                 &bus,
                 &ptt_active,
                 &last_ptt_on_ms,
+                &last_ptt_off_ms,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -17400,6 +17473,7 @@ mod supersede_rekey_tests {
             );
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
             let in_flight = [crate::message_bus::TransmitRequestItem {
                 attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
@@ -17427,6 +17501,7 @@ mod supersede_rekey_tests {
                 &bus,
                 &ptt_active,
                 &last_ptt_on_ms,
+                &last_ptt_off_ms,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -17479,6 +17554,7 @@ mod supersede_rekey_tests {
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let new_request = MessageType::MultiTransmitRequest {
             items: Vec::new(),
@@ -17495,6 +17571,7 @@ mod supersede_rekey_tests {
             &bus,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             8000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17581,6 +17658,7 @@ mod supersede_rekey_tests {
 
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
@@ -17596,6 +17674,7 @@ mod supersede_rekey_tests {
             &inbox,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17707,6 +17786,7 @@ mod supersede_rekey_tests {
 
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
@@ -17722,6 +17802,7 @@ mod supersede_rekey_tests {
             &inbox,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17845,6 +17926,7 @@ mod supersede_rekey_tests {
 
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
@@ -17860,6 +17942,7 @@ mod supersede_rekey_tests {
             &inbox,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17984,6 +18067,7 @@ mod supersede_rekey_tests {
 
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
@@ -17999,6 +18083,7 @@ mod supersede_rekey_tests {
             &inbox,
             &ptt_active,
             &last_ptt_on_ms,
+            &last_ptt_off_ms,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18172,6 +18257,7 @@ mod supersede_rekey_tests {
             );
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
             outcomes.push(
                 super::supersede_and_rekey_or_bundle(
                     refresh(),
@@ -18181,6 +18267,7 @@ mod supersede_rekey_tests {
                     &bus,
                     &ptt_active,
                     &last_ptt_on_ms,
+                    &last_ptt_off_ms,
                     20_000,
                     12_000,
                     pancetta_core::slot::SLOT_NS,
@@ -18271,6 +18358,7 @@ mod supersede_rekey_tests {
             &mut schedule,
             &bus,
             &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
             &Arc::new(AtomicU64::new(0)),
             20_000,
             12_000,
@@ -24571,6 +24659,7 @@ mod pan135_ptt_release_tests {
             ptt_active.clone(),
             &Arc::new(tokio::sync::Mutex::new(())),
             &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
         )
         .await
     }
@@ -24599,6 +24688,31 @@ mod pan135_ptt_release_tests {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timestamps_cover_release_drop_and_second_key_cycle() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, _rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let active = Arc::new(AtomicBool::new(false));
+        let on = Arc::new(AtomicU64::new(0));
+        let off = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let mut g = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off).await;
+        assert!(on.load(Ordering::Acquire) > 0);
+        assert_eq!(off.load(Ordering::Acquire), 0);
+        assert_eq!(g.release("timestamp test").await, PttRelease::Delivered);
+        assert!(off.load(Ordering::Acquire) >= on.load(Ordering::Acquire));
+        drop(g);
+        let first_on = on.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let g = PttGuard::new(bus, active.clone(), &gate, &on, &off).await;
+        assert!(on.load(Ordering::Acquire) > first_on);
+        assert!(off.load(Ordering::Acquire) < on.load(Ordering::Acquire));
+        drop(g);
+        let_drop_task_run().await;
+        assert!(!active.load(Ordering::Acquire));
+        assert!(off.load(Ordering::Acquire) >= on.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -26602,6 +26716,7 @@ mod pan183_attempt_identity_tests {
             &bus,
             &inbox,
             &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
             &Arc::new(AtomicU64::new(0)),
             20_000,
             12_000,

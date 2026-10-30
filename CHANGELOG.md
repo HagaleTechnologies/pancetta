@@ -161,6 +161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `ft8.desense` warning excludes our own transmit windows, uses a fresh
+  same-band baseline, and requires healthy reception before TX (PAN-212).
+  It no longer doubles as an unintended transmission heartbeat.
+
 - `pancetta import` fixes from the PAN-127 review (PAN-214). Tag-shaped
   text inside a value counted in characters (`<NOTES:9>€€€<X:1>z`) now stays
   in the value instead of becoming a field: the reader decides once per file
