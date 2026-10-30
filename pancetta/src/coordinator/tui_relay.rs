@@ -3183,7 +3183,6 @@ impl super::ApplicationCoordinator {
                 device: Some(tui_config_lock.audio.input_device.clone()),
                 sample_rate: tui_config_lock.audio.sample_rate,
                 buffer_size: tui_config_lock.audio.buffer_size as usize,
-                auto_gain: false,
                 gain_level: tui_config_lock.audio.levels.input_gain_db,
             },
             decoder: pancetta_tui::config::DecoderConfig {

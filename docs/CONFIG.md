@@ -121,8 +121,13 @@ active        = true
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
-compression, AGC). The defaults are tuned for FT8 and most users won't
+compression). The defaults are tuned for FT8 and most users won't
 need to touch them; see `defaults.toml` for the full key list.
+
+The obsolete `[audio.agc]` section is ignored. Loading a legacy config
+returns one warning for the section: "The [audio.agc] automatic-gain setting
+no longer exists and has no effect. Remove this section from your config."
+Fresh generated configs omit it. This setting never applied automatic gain.
 
 `[audio.levels].input_gain_db` applies a fixed gain at the resampler
 input. Negative values attenuate; useful when a hot CODEC saturates the
