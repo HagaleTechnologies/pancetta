@@ -16,7 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<<<<<<< HEAD
 - `pancetta-ft8`: standalone decoder contract for other programs (PAN-176).
   A new cycle-level API — `decode_cycle(samples, protocol)` and the
   reusable `CycleDecoder` — accepts one full 15 s FT8 (180 000 samples) or
@@ -33,9 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries its own explicit version (0.9.6) decoupled from the workspace,
   pinnable via the `pancetta-ft8-v<version>` git tag documented in
   `pancetta-ft8/README.md` and `docs/decoder-crate.md`.
-=======
 - Per-band preamp and attenuator presets apply on Pancetta-commanded band changes. Press `G` to save the current rig gain for this band (PAN-245).
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
 
 - Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
   (PAN-57). Each completed QSO's uploads are saved to

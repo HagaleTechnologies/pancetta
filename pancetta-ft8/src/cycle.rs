@@ -141,8 +141,9 @@ impl CycleDecoder {
         // Pass 2 view: the native decoder's exact window — the message
         // spans the first WINDOW_SAMPLES of a boundary-anchored cycle and
         // the Costas t0 sweep over-costs on longer buffers (decoder.rs
-        // docs), so only this pass stays bounded.
-        let window = fit_to_len(samples, WINDOW_SAMPLES);
+        // docs), so only this pass stays bounded. Derive it from the
+        // selected cycle so FT4 never reads audio from the next slot.
+        let window = fit_to_len(&cycle, WINDOW_SAMPLES);
 
         // Pass 1: ft8_lib C reference decoder (protocol-aware, so the same
         // call covers FT4 cycles).

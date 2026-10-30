@@ -65,10 +65,10 @@ fn station_composition_neutral(samples: &[f32], protocol: Protocol) -> Vec<Decod
         padded.resize(cycle_len, 0.0);
         padded
     };
-    let window: Vec<f32> = if samples.len() >= WINDOW_SAMPLES {
-        samples[..WINDOW_SAMPLES].to_vec()
+    let window: Vec<f32> = if cycle.len() >= WINDOW_SAMPLES {
+        cycle[..WINDOW_SAMPLES].to_vec()
     } else {
-        let mut padded = samples.to_vec();
+        let mut padded = cycle.clone();
         padded.resize(WINDOW_SAMPLES, 0.0);
         padded
     };
@@ -478,4 +478,34 @@ fn cycle_decoder_is_stateless_across_cycles() {
             r.text
         );
     }
+}
+
+/// Audio after the first FT4 cycle must never reach either decoder pass.
+#[cfg(feature = "transmit")]
+#[test]
+fn ft4_cycle_ignores_next_slot_audio() {
+    use pancetta_ft8::{Ft8Encoder, Ft8Modulator, PulseShape, BASE_FREQUENCY};
+
+    let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+    let symbols = encoder
+        .encode_message_protocol("CQ W1ABC FN42", None)
+        .unwrap();
+    let mut modulator =
+        Ft8Modulator::with_pulse_shape(SAMPLE_RATE, BASE_FREQUENCY, 0.5, PulseShape::Rectangular)
+            .unwrap();
+    let signal = modulator
+        .modulate_symbols_protocol(&symbols, 0.0, &ProtocolParams::ft4())
+        .unwrap();
+    assert!(decode_cycle(&signal, Protocol::Ft4)
+        .unwrap()
+        .iter()
+        .any(|m| m.text == "CQ W1ABC FN42"));
+
+    let mut audio = vec![0.0; 90_000];
+    audio.extend(signal);
+    let got = decode_cycle(&audio, Protocol::Ft4).unwrap();
+    assert!(
+        got.is_empty(),
+        "next-slot audio leaked into the first cycle: {got:?}"
+    );
 }
