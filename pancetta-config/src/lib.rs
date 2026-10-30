@@ -871,6 +871,26 @@ impl Config {
         Ok(())
     }
 
+    /// Replace the full per-band receive-gain map, preserving unrelated
+    /// configuration and comments through the secure atomic writer.
+    pub fn set_rig_receive_gain_presets_in_file<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        presets: &std::collections::HashMap<String, crate::rig::ReceiveGainPreset>,
+    ) -> ConfigResult<()> {
+        let path = path.as_ref();
+        let mut doc = Self::read_edit_doc(path)?;
+        let value = toml::Value::try_from(presets).map_err(|e| {
+            ConfigError::Validation(format!("Failed to serialize receive-gain presets: {}", e))
+        })?;
+        let rig = Self::edit_table_at(doc.as_item_mut(), &["rig"], "")?
+            .as_table_like_mut()
+            .expect("table");
+        Self::set_edit_leaf(rig, "receive_gain_presets", &value)?;
+        Self::write_secure_atomic(path, &doc.to_string())?;
+        Ok(())
+    }
+
     /// Get a summary of the current configuration
     pub fn summary(&self) -> String {
         format!(
@@ -1605,6 +1625,57 @@ mod tests {
     }
 
     #[test]
+    fn receive_gain_startup_loader_accepts_documented_config_and_rejects_typo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gain.toml");
+        let contents = "[station]\ncallsign = \"K1ABC\"\ngrid_square = \"FN31\"\n[rig.receive_gain_presets.\"10m\"]\npreamp_db = 10\nattenuator_db = 6\n[rig.receive_gain_presets.\"40m\"]\npreamp_db = 0\nattenuator_db = 12\n";
+        std::fs::write(&path, contents).unwrap();
+        let loaded = Config::load_from_file(&path).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(
+            loaded.rig.receive_gain_presets.unwrap()["40m"].attenuator_db,
+            12
+        );
+        std::fs::write(&path, contents.replace("10m", "11m")).unwrap();
+        assert!(Config::load_from_file(&path)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("11m"));
+    }
+
+    #[test]
+    fn receive_gain_writer_preserves_comments_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        let presets = std::collections::HashMap::from([(
+            "15m".to_string(),
+            crate::rig::ReceiveGainPreset {
+                preamp_db: 20,
+                attenuator_db: 0,
+            },
+        )]);
+        Config::default()
+            .set_rig_receive_gain_presets_in_file(&path, &presets)
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(COMMENTED), "{text}");
+        let loaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(loaded.rig.receive_gain_presets.as_ref(), Some(&presets));
+        Config::default()
+            .set_rig_receive_gain_presets_in_file(&path, &std::collections::HashMap::new())
+            .unwrap();
+        assert!(Config::load_from_file(&path)
+            .unwrap()
+            .rig
+            .receive_gain_presets
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn defaults_toml_matches_checked_in_file() {
         let checked_in =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/defaults.toml")).unwrap();
@@ -1846,16 +1917,22 @@ mod merge_guard {
 
         assert_carries_all::<rig::RigConfig>(
             "RigConfig",
-            &[(
-                "bookmarks",
-                json!([{
-                    "name": "Shack",
-                    "model": "FTdx10",
-                    "port": "/dev/ttyUSB0",
-                    "baud_rate": 38400,
-                    "ptt_method": "cat",
-                }]),
-            )],
+            &[
+                (
+                    "bookmarks",
+                    json!([{
+                        "name": "Shack",
+                        "model": "FTdx10",
+                        "port": "/dev/ttyUSB0",
+                        "baud_rate": 38400,
+                        "ptt_method": "cat",
+                    }]),
+                ),
+                (
+                    "receive_gain_presets",
+                    json!({ "10m": { "preamp_db": 10, "attenuator_db": 6 } }),
+                ),
+            ],
             |a, b| a.merge_with(b),
         );
 

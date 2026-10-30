@@ -1462,6 +1462,9 @@ impl super::ApplicationCoordinator {
         let gain_tx_gate = self.message_bus.gain_tx_gate.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
 
+        let receive_gain_config = self.config.clone();
+        let receive_gain_epoch = self.receive_gain_epoch.clone();
+
         // Read rig config before spawning
         let rig_config = {
             let config = self.config.read().await;
@@ -1783,6 +1786,7 @@ impl super::ApplicationCoordinator {
             let hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
 
             tokio::spawn(async move {
+                let mut last_gain_band = None;
                 // PAN-19 HIGH: the poll + PTT-watchdog child tasks are spawned
                 // and their abort handles published via `children_tx` FIRST,
                 // BEFORE the initial `rig.connect()` / PTT-off / frequency-read
@@ -2327,6 +2331,7 @@ impl super::ApplicationCoordinator {
                         // than assuming 20m.
                         match rig.get_frequency(pancetta_hamlib::Vfo::Current).await {
                             Ok(freq) => {
+                                last_gain_band = pancetta_core::Band::from_frequency(freq);
                                 operating_frequency_hz.store(freq, Ordering::Relaxed);
                                 info!(
                                     "Rig initial frequency: {} Hz ({:.3} MHz)",
@@ -2622,9 +2627,53 @@ impl super::ApplicationCoordinator {
                                                         hamlib_command_in_flight.clone(),
                                                     )
                                                 };
+                                            // A front-panel QSY is observation only, but it
+                                            // changes the old band for this commanded retune.
+                                            if matches!(
+                                                vfo_enum,
+                                                pancetta_hamlib::Vfo::Current
+                                                    | pancetta_hamlib::Vfo::A
+                                            ) {
+                                                last_gain_band = gain_band_before_retune(
+                                                    rig_poll.as_ref(),
+                                                    vfo_enum,
+                                                    last_gain_band,
+                                                )
+                                                .await;
+                                            }
+                                            let gain_crossing = matches!(
+                                                vfo_enum,
+                                                pancetta_hamlib::Vfo::Current
+                                                    | pancetta_hamlib::Vfo::A
+                                            ) && gain_band_crossing(
+                                                last_gain_band,
+                                                pancetta_core::Band::from_frequency(*frequency),
+                                            );
+                                            let _capture_guard = gain_crossing.then(|| {
+                                                ReceiveGainCaptureGuard::new(
+                                                    receive_gain_epoch.clone(),
+                                                )
+                                            });
                                             match rig_poll.set_frequency(vfo_enum, *frequency).await
                                             {
-                                                Ok(()) => true,
+                                                Ok(()) => {
+                                                    // Only the receive VFO changes receive gain. Retry
+                                                    // delivery re-enters this same serialized arm.
+                                                    if matches!(
+                                                        vfo_enum,
+                                                        pancetta_hamlib::Vfo::Current
+                                                            | pancetta_hamlib::Vfo::A
+                                                    ) {
+                                                        apply_receive_gain_preset(
+                                                            rig_poll.as_ref(),
+                                                            &receive_gain_config,
+                                                            &mut last_gain_band,
+                                                            *frequency,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    true
+                                                }
                                                 Err(e) => {
                                                     error!("Failed to set frequency: {}", e);
                                                     false
@@ -2712,6 +2761,26 @@ impl super::ApplicationCoordinator {
                                             }
                                             Err(e) => error!("Failed to set PTT: {}", e),
                                         }
+                                    }
+                                    crate::message_bus::RigControlMessage::GetReceiveGain {
+                                        frequency,
+                                        request_id,
+                                    } => {
+                                        let response = match read_receive_gain(rig_poll.as_ref(), *frequency).await {
+                                            Ok((preamp_db, att_db)) => crate::message_bus::RigControlMessage::ReceiveGainResponse {
+                                                frequency: *frequency, request_id: *request_id, preamp_db, att_db,
+                                            },
+                                            Err(error) => crate::message_bus::RigControlMessage::ReceiveGainError {
+                                                frequency: *frequency, request_id: *request_id, error: error.to_string(),
+                                            },
+                                        };
+                                        let reply = ComponentMessage::new(
+                                            ComponentId::Hamlib,
+                                            message.source,
+                                            MessageType::RigControl(response),
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus_for_connect.send_message(reply).await;
                                     }
                                     crate::message_bus::RigControlMessage::SetSplit {
                                         enabled,
@@ -8302,5 +8371,195 @@ mod pan206_split_poll_tests {
             0,
             "readiness must not be published before the rig's split is observed"
         );
+    }
+}
+
+#[cfg(test)]
+mod receive_gain_tests {
+    use super::*;
+    use pancetta_core::Band;
+
+    #[tokio::test]
+    async fn front_panel_band_is_the_old_band_for_next_command() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl, Vfo};
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        rig.set_frequency(Vfo::Current, 28_074_000).await.unwrap();
+        let observed = gain_band_before_retune(&rig, Vfo::Current, Some(Band::Band20m)).await;
+        assert_eq!(observed, Some(Band::Band10m));
+        assert!(!gain_band_crossing(observed, Some(Band::Band10m)));
+        assert!(gain_band_crossing(observed, Some(Band::Band20m)));
+        rig.disconnect().await.unwrap();
+        assert_eq!(
+            gain_band_before_retune(&rig, Vfo::Current, observed).await,
+            observed
+        );
+    }
+
+    #[tokio::test]
+    async fn read_gain_rejects_disconnected_or_changed_dial() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl, Vfo};
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        assert!(read_receive_gain(&rig, 21_074_000).await.is_err());
+        rig.connect().await.unwrap();
+        rig.set_frequency(Vfo::Current, 21_074_000).await.unwrap();
+        rig.set_preamp(20).await.unwrap();
+        assert_eq!(read_receive_gain(&rig, 21_074_000).await.unwrap(), (20, 0));
+        assert!(read_receive_gain(&rig, 28_074_000).await.is_err());
+    }
+
+    #[test]
+    fn capture_epoch_discards_inflight_and_between_batch_retunes() {
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut seen = 0;
+        assert!(!gain_capture_changed(0, &mut seen));
+        let guard = ReceiveGainCaptureGuard::new(epoch.clone());
+        assert!(gain_capture_changed(
+            epoch.load(Ordering::Acquire),
+            &mut seen
+        ));
+        drop(guard);
+        assert!(gain_capture_changed(
+            epoch.load(Ordering::Acquire),
+            &mut seen
+        ));
+        assert!(!gain_capture_changed(
+            epoch.load(Ordering::Acquire),
+            &mut seen
+        ));
+        drop(ReceiveGainCaptureGuard::new(epoch.clone()));
+        assert!(gain_capture_changed(
+            epoch.load(Ordering::Acquire),
+            &mut seen
+        ));
+    }
+
+    #[test]
+    fn crossing_and_labels() {
+        assert!(gain_band_crossing(Some(Band::Band20m), Some(Band::Band10m)));
+        assert!(!gain_band_crossing(None, Some(Band::Band10m)));
+        assert!(!gain_band_crossing(Some(Band::Band20m), None));
+        assert!(!gain_band_crossing(
+            Some(Band::Band20m),
+            Some(Band::Band20m)
+        ));
+        assert_eq!(preamp_label(0), "IPO");
+        assert_eq!(preamp_label(10), "AMP1");
+        assert_eq!(preamp_label(20), "AMP2");
+        assert_eq!(preamp_label(7), "7 dB");
+    }
+}
+
+/// FTdx10 labels for hamlib PREAMP levels.
+pub(crate) fn preamp_label(db: i32) -> String {
+    match db {
+        0 => "IPO".into(),
+        10 => "AMP1".into(),
+        20 => "AMP2".into(),
+        n => format!("{n} dB"),
+    }
+}
+
+fn gain_band_crossing(old: Option<pancetta_core::Band>, new: Option<pancetta_core::Band>) -> bool {
+    matches!((old, new), (Some(a), Some(b)) if a != b)
+}
+
+/// Apply once per successful receive-band crossing, before releasing the
+/// retune's in-flight guard. Missing presets leave both controls untouched.
+pub async fn apply_receive_gain_preset(
+    rig: &dyn pancetta_hamlib::RigControl,
+    config: &Arc<RwLock<pancetta_config::Config>>,
+    last_band: &mut Option<pancetta_core::Band>,
+    frequency: u64,
+) {
+    let new_band = pancetta_core::Band::from_frequency(frequency);
+    let crossing = gain_band_crossing(*last_band, new_band);
+    *last_band = new_band;
+    if !crossing {
+        return;
+    }
+    let band = new_band.expect("crossing requires known bands");
+    let preset = config
+        .read()
+        .await
+        .rig
+        .receive_gain_presets
+        .as_ref()
+        .and_then(|presets| presets.get(&band.to_string()))
+        .cloned();
+    let Some(preset) = preset else {
+        debug!(target: "rig", "No saved receive-gain preset for {band} — rig gain untouched");
+        return;
+    };
+    let preamp = rig.set_preamp(preset.preamp_db).await;
+    let attenuator = rig.set_attenuator(preset.attenuator_db).await;
+    match (preamp, attenuator) {
+        (Ok(()), Ok(())) => info!(target: "rig",
+            "Band change to {band}: applied receive-gain preset (preamp {}/{} dB, attenuator {} dB)",
+            preamp_label(preset.preamp_db), preset.preamp_db, preset.attenuator_db),
+        (preamp, attenuator) => {
+            warn!(target: "rig", "Band change to {band}: receive-gain preset failed (preamp: {preamp:?}, attenuator: {attenuator:?})")
+        }
+    }
+}
+
+async fn read_receive_gain(
+    rig: &dyn pancetta_hamlib::RigControl,
+    frequency: u64,
+) -> Result<(i32, i32)> {
+    anyhow::ensure!(
+        rig.get_frequency(pancetta_hamlib::Vfo::Current).await? == frequency,
+        "Rig dial changed before gain read"
+    );
+    let preamp = rig.get_preamp().await?;
+    let att = rig.get_attenuator().await?;
+    anyhow::ensure!(
+        rig.get_frequency(pancetta_hamlib::Vfo::Current).await? == frequency,
+        "Rig dial changed during gain read"
+    );
+    anyhow::ensure!(
+        preamp >= 0 && att >= 0,
+        "Rig returned negative receive gain"
+    );
+    Ok((preamp, att))
+}
+
+/// A separate capture epoch lets DSP discard audio even when the entire CAT
+/// transaction finishes between two audio batches. Drop also covers failure.
+struct ReceiveGainCaptureGuard(Arc<std::sync::atomic::AtomicU64>);
+impl ReceiveGainCaptureGuard {
+    fn new(epoch: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        epoch.fetch_add(1, Ordering::AcqRel);
+        Self(epoch)
+    }
+}
+impl Drop for ReceiveGainCaptureGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+pub(super) fn gain_capture_changed(epoch: u64, previous: &mut u64) -> bool {
+    let discard = !epoch.is_multiple_of(2) || epoch != *previous;
+    *previous = epoch;
+    discard
+}
+
+async fn gain_band_before_retune(
+    rig: &dyn pancetta_hamlib::RigControl,
+    vfo: pancetta_hamlib::Vfo,
+    fallback: Option<pancetta_core::Band>,
+) -> Option<pancetta_core::Band> {
+    match rig.get_frequency(vfo).await {
+        Ok(hz) => pancetta_core::Band::from_frequency(hz),
+        Err(_) => fallback,
     }
 }

@@ -221,6 +221,26 @@ pub trait RigControl: Send + Sync {
     /// Get power level
     async fn get_power_level(&self) -> Result<f32>;
 
+    /// Set preamp gain in hamlib PREAMP dB (FTdx10: 0/10/20).
+    async fn set_preamp(&self, _preamp_db: i32) -> Result<()> {
+        Err(HamlibError::not_supported("set_preamp", None, None).into())
+    }
+
+    /// Read preamp gain in dB.
+    async fn get_preamp(&self) -> Result<i32> {
+        Err(HamlibError::not_supported("get_preamp", None, None).into())
+    }
+
+    /// Set attenuation in hamlib ATT dB.
+    async fn set_attenuator(&self, _att_db: i32) -> Result<()> {
+        Err(HamlibError::not_supported("set_attenuator", None, None).into())
+    }
+
+    /// Read attenuation in dB.
+    async fn get_attenuator(&self) -> Result<i32> {
+        Err(HamlibError::not_supported("get_attenuator", None, None).into())
+    }
+
     /// Get S-meter reading
     async fn get_s_meter(&self) -> Result<i32>;
 

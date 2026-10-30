@@ -892,6 +892,40 @@ impl RigControl for RigctldClient {
         Ok(level * 100.0) // Convert to watts (assuming 100W max)
     }
 
+    async fn set_preamp(&self, preamp_db: i32) -> Result<()> {
+        self.send_command_with_retry(&format!("\\set_level PREAMP {}", preamp_db))
+            .await?;
+        Ok(())
+    }
+
+    async fn get_preamp(&self) -> Result<i32> {
+        let response = self.send_command_with_retry("\\get_level PREAMP").await?;
+        response.trim().parse::<i32>().map_err(|error| {
+            anyhow!(
+                "rigctld: could not parse PREAMP from '{}': {}",
+                response.trim(),
+                error
+            )
+        })
+    }
+
+    async fn set_attenuator(&self, att_db: i32) -> Result<()> {
+        self.send_command_with_retry(&format!("\\set_level ATT {}", att_db))
+            .await?;
+        Ok(())
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        let response = self.send_command_with_retry("\\get_level ATT").await?;
+        response.trim().parse::<i32>().map_err(|error| {
+            anyhow!(
+                "rigctld: could not parse ATT from '{}': {}",
+                response.trim(),
+                error
+            )
+        })
+    }
+
     async fn get_swr(&self) -> Result<f32> {
         // Get SWR reading
         let response = self.send_command_with_retry("\\get_level SWR").await?;
@@ -1154,6 +1188,35 @@ mod split_read_tests {
         });
         client.state.write().await.connected = true;
         (client, server_stream)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_gain_level_wire_round_trip_and_bad_response() {
+        let (client, server) = connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in [
+                ("\\set_level PREAMP 10\n", "RPRT 0\n"),
+                ("\\get_level PREAMP\n", "10\n"),
+                ("\\set_level ATT 6\n", "RPRT 0\n"),
+                ("\\get_level ATT\n", "6\n"),
+                ("\\get_level PREAMP\n", "invalid\n"),
+                ("\\get_level ATT\n", "invalid\n"),
+            ] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command, expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        client.set_preamp(10).await.unwrap();
+        assert_eq!(client.get_preamp().await.unwrap(), 10);
+        client.set_attenuator(6).await.unwrap();
+        assert_eq!(client.get_attenuator().await.unwrap(), 6);
+        assert!(client.get_preamp().await.is_err());
+        assert!(client.get_attenuator().await.is_err());
+        server_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

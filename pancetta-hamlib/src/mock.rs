@@ -80,6 +80,8 @@ struct MockRigState {
     ptt_states: HashMap<Vfo, PttState>,
     /// Power level (0.0-1.0)
     power_level: f32,
+    preamp_db: i32,
+    attenuator_db: i32,
     /// Memory channels
     memory_channels: HashMap<i32, (u64, Mode, i32)>,
     /// Current memory channel for each VFO
@@ -124,6 +126,8 @@ impl Default for MockRigState {
             current_vfo: Vfo::A,
             ptt_states,
             power_level: 0.5,
+            preamp_db: 0,
+            attenuator_db: 0,
             memory_channels: HashMap::new(),
             current_memory: HashMap::new(),
             antenna: 1,
@@ -801,6 +805,60 @@ impl RigControl for MockRig {
         Ok(level)
     }
 
+    async fn set_preamp(&self, db: i32) -> Result<()> {
+        self.simulate_failure("set_preamp")?;
+        self.simulate_delay().await;
+        if db < 0 {
+            return Err(anyhow!("Receive gain must not be negative"));
+        }
+        {
+            let mut state = self.state.write();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state.preamp_db = db;
+        }
+        self.update_operation_time();
+        Ok(())
+    }
+
+    async fn get_preamp(&self) -> Result<i32> {
+        self.simulate_failure("get_preamp")?;
+        self.simulate_delay().await;
+        let state = self.state.read();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        Ok(state.preamp_db)
+    }
+
+    async fn set_attenuator(&self, db: i32) -> Result<()> {
+        self.simulate_failure("set_attenuator")?;
+        self.simulate_delay().await;
+        if db < 0 {
+            return Err(anyhow!("Receive gain must not be negative"));
+        }
+        {
+            let mut state = self.state.write();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state.attenuator_db = db;
+        }
+        self.update_operation_time();
+        Ok(())
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        self.simulate_failure("get_attenuator")?;
+        self.simulate_delay().await;
+        let state = self.state.read();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        Ok(state.attenuator_db)
+    }
+
     #[instrument(skip(self))]
     async fn get_s_meter(&self) -> Result<i32> {
         self.simulate_failure("get_s_meter")?;
@@ -975,6 +1033,22 @@ impl RigControl for MockRig {
 // default(); sequential assignment reads clearer than a struct-update splat.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_gain_defaults_and_state_survive_retune() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert_eq!(rig.get_preamp().await.unwrap(), 0);
+        assert_eq!(rig.get_attenuator().await.unwrap(), 0);
+        rig.set_preamp(20).await.unwrap();
+        rig.set_attenuator(12).await.unwrap();
+        rig.set_frequency(Vfo::Current, 28_074_000).await.unwrap();
+        assert_eq!(rig.get_preamp().await.unwrap(), 20);
+        assert_eq!(rig.get_attenuator().await.unwrap(), 12);
+    }
     use super::*;
     use tokio::time::Duration;
 

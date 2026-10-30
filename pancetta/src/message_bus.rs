@@ -714,6 +714,21 @@ pub enum RigControlMessage {
     },
     /// PTT control
     SetPtt { state: bool },
+    /// Read gain only if the rig is still at the requested dial.
+    GetReceiveGain { frequency: u64, request_id: u64 },
+    /// Correlated gain readback for a local preset save.
+    ReceiveGainResponse {
+        request_id: u64,
+        frequency: u64,
+        preamp_db: i32,
+        att_db: i32,
+    },
+    /// A failed read never produces a partial preset.
+    ReceiveGainError {
+        frequency: u64,
+        request_id: u64,
+        error: String,
+    },
     /// Get signal strength
     GetSignalStrength,
     /// Signal strength response from the rig's S-meter. Value follows

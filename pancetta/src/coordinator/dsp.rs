@@ -648,6 +648,7 @@ impl super::ApplicationCoordinator {
         // Read per-window so recordings can be band-stamped. 0 = unknown
         // (no rig / not yet polled) → recording filename omits the band.
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let receive_gain_epoch = self.receive_gain_epoch.clone();
         // Live mode atomic — polled once per audio batch alongside the dial
         // frequency so a runtime FT8/FT4/FT2 switch (Shift+M) resizes the
         // decode window without a restart.
@@ -731,6 +732,7 @@ impl super::ApplicationCoordinator {
             // between two known dials. 0 = not yet established (no rig /
             // pre-first-read); the first nonzero read seeds it.
             let mut last_known_dial_hz: u64 = 0;
+            let mut last_gain_epoch = receive_gain_epoch.load(Ordering::Acquire);
 
             // WAV recorder for decoder validation (PAN-125): present only
             // when `[audio.recording] auto_record = true` resolved to a
@@ -784,6 +786,7 @@ impl super::ApplicationCoordinator {
             while !shutdown.load(Ordering::Acquire) {
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(samples) => {
+<<<<<<< HEAD
                         if audio_rx.len() > 1
                             || last_audio_batch.elapsed() > std::time::Duration::from_millis(250)
                         {
@@ -792,6 +795,19 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         last_audio_batch = std::time::Instant::now();
+=======
+                        // Do not build the first new-band window from audio captured
+                        // before both gain levels finished. Drain queued batches too.
+                        if super::hamlib::gain_capture_changed(
+                            receive_gain_epoch.load(Ordering::Acquire),
+                            &mut last_gain_epoch,
+                        ) {
+                            ft8_buffer.clear();
+                            last_live_wf_samples = 0;
+                            for _ in audio_rx.try_iter() {}
+                            continue;
+                        }
+>>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
                         message_count.fetch_add(1, Ordering::Relaxed);
                         batch_count += 1;
 
@@ -1077,6 +1093,16 @@ impl super::ApplicationCoordinator {
                                 rms,
                                 now.format("%H:%M:%S.%3f")
                             );
+
+                            if super::hamlib::gain_capture_changed(
+                                receive_gain_epoch.load(Ordering::Acquire),
+                                &mut last_gain_epoch,
+                            ) {
+                                ft8_buffer.clear();
+                                last_live_wf_samples = 0;
+                                for _ in audio_rx.try_iter() {}
+                                continue;
+                            }
 
                             // Record window to WAV for decoder validation,
                             // band-stamped with the current rig dial frequency.
