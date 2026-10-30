@@ -123,11 +123,9 @@ impl CycleDecoder {
         // (the plain scoped entry point delegates with
         // `DecodeBudget::unlimited()`, matching the station's quiet-band
         // behaviour with no active QSOs).
-        let native_messages = self.decoder.decode_window_with_ap_scoped(
-            &window,
-            &ApContext::default(),
-            None,
-        )?;
+        let native_messages =
+            self.decoder
+                .decode_window_with_ap_scoped(&window, &ApContext::default(), None)?;
 
         // Pass 3: the production merge — ft8_lib's set first, then any
         // native-only (e.g. AP-injected) decode it missed.

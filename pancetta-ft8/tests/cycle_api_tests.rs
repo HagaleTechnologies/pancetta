@@ -81,12 +81,10 @@ fn assert_parity(label: &str, want: &[DecodedMessage], got: &[DecodedMessage]) {
     );
     for (w, g) in want.iter().zip(got.iter()) {
         assert_eq!(w.text, g.text, "{label}: text mismatch");
-        assert!(
-            (w.frequency_offset - g.frequency_offset).abs() < 0.5,
-            "{label}: frequency mismatch for '{}' ({} vs {})",
-            w.text,
-            w.frequency_offset,
-            g.frequency_offset
+        assert_eq!(
+            w.frequency_offset, g.frequency_offset,
+            "{label}: frequency mismatch for '{}'",
+            w.text
         );
         assert!(
             (w.snr_db - g.snr_db).abs() <= 1.0 + 1e-6,
@@ -116,6 +114,7 @@ fn ft8_cycle_matches_station_composition_on_all_fixtures() {
         "basicft8/170923_082015.wav",
         "basicft8/170923_082030.wav",
         "basicft8/170923_082045.wav",
+        "basicft8/live_now.wav",
         "jtdx/190227_155815.wav",
         "generated/ft8_cq.wav",
     ];
@@ -175,7 +174,10 @@ fn ft8_cycle_golden_sets() {
     let samples = read_wav_file(&fixture("jtdx/190227_155815.wav"));
     let got = decode_cycle(&samples, Protocol::Ft8).expect("decode_cycle");
     let texts: Vec<&str> = got.iter().map(|m| m.text.as_str()).collect();
-    println!("jtdx/190227_155815.wav golden set ({} messages):", texts.len());
+    println!(
+        "jtdx/190227_155815.wav golden set ({} messages):",
+        texts.len()
+    );
     for t in &texts {
         println!("  {t}");
     }
@@ -317,7 +319,10 @@ fn cycle_dt_is_slot_boundary_relative() {
         cycle[start + i] += s;
     }
     let got = decode_cycle(&cycle, Protocol::Ft8).expect("decode_cycle");
-    assert!(!got.is_empty(), "expected at least one decode of the shifted signal");
+    assert!(
+        !got.is_empty(),
+        "expected at least one decode of the shifted signal"
+    );
     let m = got
         .iter()
         .find(|m| m.text == "K1ABC W9XYZ EN37")
@@ -353,7 +358,11 @@ fn cycle_decoder_is_stateless_across_cycles() {
     assert_eq!(texts(&reuse_b), texts(&fresh_b));
     assert_eq!(texts(&reuse_a2), texts(&fresh_a1));
     for (r, f) in reuse_a2.iter().zip(fresh_a1.iter()) {
-        assert_eq!(r.snr_db, f.snr_db, "SNR drift across cycles for '{}'", r.text);
+        assert_eq!(
+            r.snr_db, f.snr_db,
+            "SNR drift across cycles for '{}'",
+            r.text
+        );
         assert_eq!(
             r.time_offset, f.time_offset,
             "DT drift across cycles for '{}'",

@@ -79,13 +79,17 @@ fn crate_names(tree_output: &str) -> Vec<String> {
     tree_output
         .lines()
         .filter_map(|line| {
-            let cleaned = line
-                .trim_start_matches(|c: char| c == ' ' || c == '│' || c == '├' || c == '└'
-                    || c == '─' || c == '┬' || c == '┴' || c == '┼');
-            cleaned
-                .split_whitespace()
-                .next()
-                .map(|s| s.to_string())
+            let cleaned = line.trim_start_matches(|c: char| {
+                c == ' '
+                    || c == '│'
+                    || c == '├'
+                    || c == '└'
+                    || c == '─'
+                    || c == '┬'
+                    || c == '┴'
+                    || c == '┼'
+            });
+            cleaned.split_whitespace().next().map(|s| s.to_string())
         })
         .collect()
 }
