@@ -34,7 +34,9 @@ for m in decode_cycle(&samples, Protocol::Ft8)? {
 FT4 is the same call with `Protocol::Ft4` and a 7.5 s / 90_000-sample cycle.
 Errors return the crate's existing `Ft8Result` (`Ft8Error`) type; short
 input is zero-padded (documented, never a panic), longer input is truncated
-to the decoder window, and empty input is an error. Decoding continuously?
+to the first full cycle, and empty input is an error. The C reference pass
+reads the whole cycle; the native pass reads the first `WINDOW_SAMPLES`
+(12.64 s) samples, its documented window. Decoding continuously?
 Hold a `CycleDecoder::new(Protocol)` and call its `decode_cycle` method to
 reuse buffers across slots.
 
@@ -76,9 +78,13 @@ is the tag/rev.
 ### Parity guarantee and tolerances
 
 `decode_cycle` runs exactly what the station runs with neutral state: the
-ft8_lib C reference pass merged (`merge_ft8lib_first`) with the native AP
-pass under a neutral `ApContext`, no narrow filter and an unlimited decode
-budget. For the same audio, message texts and frequency offsets match the
+ft8_lib C reference pass on the full cycle, merged (`merge_ft8lib_first`)
+with the native AP pass (first `WINDOW_SAMPLES` samples) under a neutral
+`ApContext`, no narrow filter and an unlimited decode budget, then the
+station's post-merge unresolved-hash twin suppression
+(`drop_unresolved_hash_twins`) so one signal never arrives twice — once as
+`<...>`, once resolved. For the same audio, message texts and frequency
+offsets match the
 station exactly; SNR may differ by at most 1.0 dB and DT by at most 0.15 s
 (the live station window carries a 0.5 s lead-in slice the cycle API does
 not). DT is slot-boundary-relative: sample 0 of the cycle is the slot

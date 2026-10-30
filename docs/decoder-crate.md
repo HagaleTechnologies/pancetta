@@ -38,7 +38,8 @@ Default features only. Opt-in features stay off: `transmit` (pulls
 |---|---|---|
 | Sample rate | 12 000 Hz mono (`f32`) | 12 000 Hz mono (`f32`) |
 | Full cycle | 15.0 s / 180 000 samples | 7.5 s / 90 000 samples |
-| Decode window used | first 151 680 samples (12.64 s) | first 151 680 samples (zero-padded past 5.04 s message span) |
+| C reference pass reads | the full cycle (180 000 samples) | the full cycle (90 000 samples) |
+| Native AP pass reads | first 151 680 samples (12.64 s) | first 151 680 samples (zero-padded past the 5.04 s message span) |
 | Anchoring | sample 0 = slot boundary | sample 0 = slot boundary |
 
 ```rust
@@ -47,11 +48,17 @@ use pancetta_ft8::{decode_cycle, Protocol};
 let messages = decode_cycle(&samples, Protocol::Ft8)?; // or Protocol::Ft4
 ```
 
-Input handling (never a panic): input shorter than the decode window is
-zero-padded to `WINDOW_SAMPLES` (151 680); longer input is truncated to the
-first `WINDOW_SAMPLES` samples (the message spans the first 12.64 s of a
-boundary-anchored cycle, and the native decoder over-costs 4–5x on longer
-buffers); empty input returns `Ft8Error::InsufficientData`.
+Input handling (never a panic): input shorter than one cycle is zero-padded
+to the cycle length; longer input is truncated to the first full cycle
+(FT8 180 000 / FT4 90 000 samples); empty input returns
+`Ft8Error::InsufficientData`. The two passes read differently sized views
+of that cycle: the C reference pass — a sliding-frame monitor with no
+fixed-window contract — reads the full cycle so transmissions extending
+past 12.64 s are not truncated before it (on the committed
+`basicft8/live_now.wav` fixture a WINDOW_SAMPLES truncation loses
+`VO1AE KA3KQO FM29`), while the native pass reads the first `WINDOW_SAMPLES`
+(151 680) samples because `decode_window` documents a 4–5x over-cost on
+longer buffers.
 
 `CycleDecoder::new(Protocol)` + `decode_cycle(&mut self, samples)` is the
 reuse form for continuous decoding; the free function constructs a fresh
@@ -74,17 +81,25 @@ Each `DecodedMessage` carries (units and reference points):
 `decode_cycle` returns exactly the composition the station coordinator runs
 with neutral state:
 
-1. C reference pass: `Ft8Decoder::decode_window_ft8lib_protocol(&window, protocol)`
-   (protocol-aware; FT4 cycles pass `Protocol::Ft4`),
+1. C reference pass: `Ft8Decoder::decode_window_ft8lib_protocol(&cycle, protocol)`
+   on the full cycle (protocol-aware; FT4 cycles pass `Protocol::Ft4`),
    from `pancetta-ft8/src/decoder.rs` (the coordinator call site is
    `pancetta/src/coordinator/ft8.rs`, primary decode path, C pass first).
 2. Native AP pass: `decode_window_with_ap_scoped(&window, &ApContext::default(), None)`
-   — the plain entry point delegates with `DecodeBudget::unlimited()`. For
-   FT4 the decoder is built from a config whose `protocol` is `Protocol::Ft4`,
-   mirroring the coordinator's protocol-keyed decoder rebuild.
+   on the first `WINDOW_SAMPLES` samples — the plain entry point delegates
+   with `DecodeBudget::unlimited()`. For FT4 the decoder is built from a
+   config whose `protocol` is `Protocol::Ft4`, mirroring the coordinator's
+   protocol-keyed decoder rebuild.
 3. Merge: `merge_ft8lib_first` (`pancetta-ft8/src/merge.rs`, PAN-110) —
    the C decodes first, then any native-only decode (e.g. from AP
    injection), deduplicated by exact message text.
+4. Unresolved-hash twin suppression: `drop_unresolved_hash_twins`
+   (`pancetta-ft8/src/merge.rs`, PAN-40) — the same pass the coordinator
+   runs on its delivered set. The C pass resolves no hashed callsigns
+   (its FFI hash callbacks are no-ops) while the native pass resolves
+   callsigns its learned table carries (on a reused `CycleDecoder`,
+   including from earlier cycles), so without this pass one physical
+   signal can arrive twice — once as `<...>`, once resolved.
 
 Station-specific context (live `ApContext` from QSO state, hb-229/230
 narrow filter, wall-clock decode budget, cross-sequence A7) is QSO- and
@@ -100,9 +115,10 @@ AP context, narrow filters or exhausted budgets — those are station-state
 effects, not decoder differences.
 
 Pinned by `tests/cycle_api_tests.rs`: parity-by-construction against the
-hand-run composition on committed fixtures, golden decode sets, input
-length contract, DT semantics, `CycleDecoder` statelessness, and an FT4
-round-trip.
+hand-run composition on committed fixtures, golden decode sets, full-cycle
+recall (the C pass must see the whole cycle), input length contract, DT
+semantics, `CycleDecoder` reuse, unresolved-hash twin suppression, and an
+FT4 round-trip.
 
 ## Dependency guarantee
 

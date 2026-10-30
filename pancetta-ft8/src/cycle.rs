@@ -18,7 +18,10 @@
 //! 2. the native AP pass —
 //!    `decode_window_with_ap_scoped_partner_budgeted(&window, &ap_context,
 //!    narrow_filter_bins, partner_freq, decode_budget)`;
-//! 3. the PAN-110 merge — `merge_ft8lib_first`.
+//! 3. the PAN-110 merge — `merge_ft8lib_first`;
+//! 4. the station's post-merge unresolved-hash twin suppression —
+//!    `drop_unresolved_hash_twins` (the coordinator applies the same pass
+//!    to its delivered set, `pancetta/src/coordinator/ft8.rs`).
 //!
 //! Everything station-specific in step 2 (`ApContext` from live QSO state,
 //! the hb-229/230 narrow filter, the wall-clock `DecodeBudget`) is QSO- and
@@ -31,32 +34,55 @@
 //!
 //! # Window geometry
 //!
-//! The message spans the first 12.64 s (FT8) / 5.04 s (FT4) of a
-//! boundary-anchored cycle. The native decoder wants exactly
-//! [`WINDOW_SAMPLES`] samples (`decoder.rs::decode_window` documents a 4–5x
-//! over-cost when fed a full 15 s buffer), so the cycle API trims or zero-pads
-//! to that length before dispatch — the station knowledge an outsider should
-//! not need. `time_offset` in the returned messages is slot-boundary-relative
+//! The two passes read differently sized views of the same cycle:
+//!
+//! * the C reference pass reads the **full cycle** (FT8 180 000 / FT4
+//!   90 000 samples). It is a sliding-frame monitor that handles any
+//!   length, and the tail of the cycle is real signal: a transmission
+//!   starting late in the slot extends past 12.64 s, and the ft8_lib C
+//!   decode of the committed `basicft8/live_now.wav` fixture demonstrably
+//!   loses `VO1AE KA3KQO FM29` when the cycle is truncated at
+//!   [`WINDOW_SAMPLES`] (the station, likewise, retains audio through
+//!   emission time — its `boundary_anchored_slice` window ends at the
+//!   decode trigger, not at the 12.64 s message span);
+//! * the native AP pass reads the first [`WINDOW_SAMPLES`] samples
+//!   (zero-padded when short). `decode_window` documents a 4–5x over-cost
+//!   when fed a longer buffer, so the cycle API keeps that pass bounded.
+//!
+//! `time_offset` in the returned messages is slot-boundary-relative
 //! (sample 0 = boundary), matching the station's lead-corrected DT.
 //!
 //! Input shorter than one cycle is zero-padded (documented, no panic); empty
-//! input is an error; longer input is truncated to the first
-//! [`WINDOW_SAMPLES`] samples.
+//! input is an error; longer input is truncated to the first full cycle.
 
 use crate::ap::ApContext;
 use crate::decoder::{Ft8Config, Ft8Decoder};
-use crate::merge::merge_ft8lib_first;
+use crate::merge::{drop_unresolved_hash_twins, merge_ft8lib_first};
 use crate::message::DecodedMessage;
-use crate::protocol::Protocol;
-use crate::{Ft8Error, Ft8Result, WINDOW_SAMPLES};
+use crate::protocol::{Protocol, ProtocolParams};
+use crate::{Ft8Error, Ft8Result, SAMPLE_RATE, WINDOW_SAMPLES};
+
+/// Trim or zero-pad `samples` to exactly `len` samples.
+fn fit_to_len(samples: &[f32], len: usize) -> Vec<f32> {
+    if samples.len() >= len {
+        samples[..len].to_vec()
+    } else {
+        let mut padded = samples.to_vec();
+        padded.resize(len, 0.0);
+        padded
+    }
+}
 
 /// Reusable cycle decoder: decode consecutive cycles through one instance so
 /// internal buffers are reused across slots.
 ///
-/// Stateless across cycles by construction: every [`Self::decode_cycle`] call
-/// runs the full two-pass composition on the caller's samples alone; nothing
-/// from a previous cycle influences the next (see
-/// `cycle_decoder_is_stateless_across_cycles`).
+/// One cross-cycle carry exists by design: the native pass's callsign-hash
+/// table learns from every decode (`decoder.rs`), so a later cycle through
+/// the same instance can resolve a hashed callsign that a fresh instance
+/// renders as `<...>` — the same learned-table behaviour the station's
+/// long-lived decoder has. The post-merge unresolved-hash twin suppression
+/// (see [`Self::decode_cycle`]) keeps that difference from ever surfacing as
+/// duplicate decodes of one physical signal.
 ///
 /// # Examples
 ///
@@ -93,8 +119,8 @@ impl CycleDecoder {
     ///
     /// `samples[0]` is the slot boundary; the FT8 cycle is 180 000 samples
     /// (15.0 s) and the FT4 cycle 90 000 samples (7.5 s). Shorter input is
-    /// zero-padded to [`WINDOW_SAMPLES`]; longer input is truncated to the
-    /// first [`WINDOW_SAMPLES`] samples; empty input is an error.
+    /// zero-padded to the cycle length; longer input is truncated to the
+    /// first full cycle; empty input is an error.
     pub fn decode_cycle(&mut self, samples: &[f32]) -> Ft8Result<Vec<DecodedMessage>> {
         if samples.is_empty() {
             return Err(Ft8Error::InsufficientData {
@@ -103,20 +129,24 @@ impl CycleDecoder {
             });
         }
 
-        // Trim / zero-pad to the native decoder's exact window: the message
-        // spans the first WINDOW_SAMPLES of a boundary-anchored cycle and the
-        // Costas t0 sweep over-costs on longer buffers (decoder.rs docs).
-        let window: Vec<f32> = if samples.len() >= WINDOW_SAMPLES {
-            samples[..WINDOW_SAMPLES].to_vec()
-        } else {
-            let mut padded = samples.to_vec();
-            padded.resize(WINDOW_SAMPLES, 0.0);
-            padded
-        };
+        // Pass 1 view: the FULL cycle. The ft8_lib C reference decoder is a
+        // sliding-frame monitor with no fixed-window contract, and the tail
+        // of the cycle (samples past WINDOW_SAMPLES) is real signal for
+        // transmissions that start late in the slot — truncating before
+        // this pass loses recall (basicft8/live_now.wav loses
+        // `VO1AE KA3KQO FM29`).
+        let cycle_len = ProtocolParams::from_protocol(self.protocol).window_samples(SAMPLE_RATE);
+        let cycle = fit_to_len(samples, cycle_len);
+
+        // Pass 2 view: the native decoder's exact window — the message
+        // spans the first WINDOW_SAMPLES of a boundary-anchored cycle and
+        // the Costas t0 sweep over-costs on longer buffers (decoder.rs
+        // docs), so only this pass stays bounded.
+        let window = fit_to_len(samples, WINDOW_SAMPLES);
 
         // Pass 1: ft8_lib C reference decoder (protocol-aware, so the same
         // call covers FT4 cycles).
-        let ft8lib_messages = Ft8Decoder::decode_window_ft8lib_protocol(&window, self.protocol);
+        let ft8lib_messages = Ft8Decoder::decode_window_ft8lib_protocol(&cycle, self.protocol);
 
         // Pass 2: native AP decoder with the neutral context —
         // `ApContext::default()`, no narrow filter, and an unlimited budget
@@ -129,7 +159,19 @@ impl CycleDecoder {
 
         // Pass 3: the production merge — ft8_lib's set first, then any
         // native-only (e.g. AP-injected) decode it missed.
-        Ok(merge_ft8lib_first(ft8lib_messages, native_messages).messages)
+        let merged = merge_ft8lib_first(ft8lib_messages, native_messages).messages;
+
+        // Pass 4: the station's post-merge unresolved-hash twin suppression
+        // (the coordinator runs the same pass on its delivered set). The
+        // C pass resolves no hashed callsigns (its FFI hash callbacks are
+        // no-ops), while the native pass resolves callsigns its hash table
+        // has learned — including from earlier cycles on a reused
+        // `CycleDecoder` — so the exact-text merge above can deliver both
+        // the `<...>` and the resolved rendering of one physical signal.
+        // The cycle API has no AP-eval partition, so running directly on
+        // the merged set matches the station's delivered-set semantics.
+        let (kept, _dropped) = drop_unresolved_hash_twins(merged, self.protocol);
+        Ok(kept)
     }
 }
 
