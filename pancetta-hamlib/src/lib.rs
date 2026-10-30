@@ -56,7 +56,10 @@ pub mod mock;
 // Public surface — what the rest of the workspace depends on.
 pub use error::{ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError};
 pub use models::{Band, Mode, RigCapabilities, RigModelType, Vfo};
-pub use rig::{ConnectionState, PttState, RigConfig, RigControl, RigStatus};
+pub use rig::{
+    ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigConfig, RigControl,
+    RigStatus,
+};
 pub use rigctld::{RigctldClient, RigctldConfig};
 
 #[cfg(feature = "mock-rig")]

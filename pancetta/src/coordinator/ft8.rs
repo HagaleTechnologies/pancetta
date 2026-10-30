@@ -564,6 +564,7 @@ impl super::ApplicationCoordinator {
         let scoped_fast_path = self.scoped_fast_path.clone();
 
         let shutdown = self.shutdown_signal.clone();
+        let sweep_capture = self.sweep_capture.clone();
         let last_decode_timestamp = self.last_decode_timestamp.clone();
         let message_bus = self.message_bus.clone();
         // TX-adjacent desense diagnostic input (see `maybe_flag_tx_desense`).
@@ -772,6 +773,7 @@ impl super::ApplicationCoordinator {
                     Ok(super::pipeline::DecodeWindow {
                         samples: window,
                         dial_hz,
+                        sweep,
                     }) => {
                         // Capture receipt time immediately — before any decode
                         // work — so parity tagging is invariant under decode
@@ -1627,6 +1629,31 @@ impl super::ApplicationCoordinator {
                                 "PAN-40: dropped {} unresolved-hash-placeholder twin(s) post AP-partition",
                                 hash_twins_dropped,
                             );
+                        }
+
+                        // Sweep measurements use the immutable source slot and confirmed
+                        // gain epoch carried with these samples. Even an empty decode
+                        // list produces one acknowledgement. Ordinary decoding is unchanged.
+                        if let Some(capture) = sweep {
+                            let frequencies: Vec<f32> = decoded_messages
+                                .iter()
+                                .map(|m| m.frequency_offset as f32)
+                                .collect();
+                            let noise = window
+                                .get(capture.settled_start..)
+                                .ok_or_else(|| "missing settled audio".to_string())
+                                .and_then(|samples| {
+                                    super::gain_sweep::noise_floor(samples, &frequencies)
+                                });
+                            let completion = super::pipeline::GainCaptureCompletion {
+                                metadata: capture.metadata,
+                                noise_dbfs_per_hz: noise.as_ref().ok().copied(),
+                                messages: decoded_messages.clone(),
+                                invalid_reason: noise.err(),
+                            };
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.complete(completion);
+                            }
                         }
 
                         // Update shared cross-slot state (hb-048 / hb-057 /

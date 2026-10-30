@@ -44,6 +44,34 @@ impl super::ApplicationCoordinator {
         self.is_running.store(false, Ordering::Release);
         self.shutdown_signal.store(true, Ordering::Release);
 
+        #[cfg(feature = "pancetta-hamlib")]
+        {
+            let original = *self
+                .gain_sweep_original
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let (Some(original), Some(rig)) = (original, self.rig_handle.as_ref()) {
+                let lead = super::resolve_window_lead_secs(&self.config.read().await.decoder);
+                if super::gain_sweep_runtime::restore(
+                    &**rig,
+                    original,
+                    &self.message_bus.gain_tx_gate,
+                    lead,
+                )
+                .await
+                {
+                    *self
+                        .gain_sweep_original
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                } else {
+                    warn!(
+                        "Original receive gain could not be restored during coordinator shutdown"
+                    );
+                }
+            }
+        }
+
         // Safety: send PTT-off before tearing down components to avoid
         // leaving the rig transmitting if a TX was in progress. We use
         // two parallel paths because each one can fail under shutdown

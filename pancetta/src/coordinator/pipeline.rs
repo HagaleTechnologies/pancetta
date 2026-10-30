@@ -79,6 +79,126 @@ pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) struct DecodeWindow {
     pub(crate) samples: Vec<f32>,
     pub(crate) dial_hz: u64,
+    pub(crate) sweep: Option<GainCapturedWindow>,
+}
+
+/// Immutable source attribution for one admitted receive-gain measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GainCaptureMetadata {
+    pub(crate) generation: u64,
+    pub(crate) epoch: u64,
+    pub(crate) tx_epoch: u64,
+    pub(crate) source_slot: chrono::DateTime<chrono::Utc>,
+    pub(crate) dial_hz: u64,
+    pub(crate) gain: super::gain_sweep::GainSetting,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GainCapturedWindow {
+    pub(crate) metadata: GainCaptureMetadata,
+    /// Samples before UTC slot start belong to decoder lead-in only.
+    pub(crate) settled_start: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct GainCaptureCompletion {
+    pub(crate) metadata: GainCaptureMetadata,
+    pub(crate) noise_dbfs_per_hz: Option<f64>,
+    pub(crate) messages: Vec<pancetta_ft8::DecodedMessage>,
+    pub(crate) invalid_reason: Option<String>,
+}
+
+/// Coordinator owns admission and drains acknowledgements. Worker threads only
+/// claim exact source slots and post completed or explicitly invalid records.
+/// At most an hour of pending/invalid records and four completed decode records
+/// are retained; a slow consumer cannot retain unbounded samples or messages.
+#[derive(Default)]
+pub(crate) struct GainCaptureRegistry {
+    pending: std::collections::BTreeMap<i64, (GainCaptureMetadata, bool)>,
+    completed: std::collections::VecDeque<GainCaptureCompletion>,
+}
+
+impl GainCaptureRegistry {
+    pub(crate) fn admit(&mut self, metadata: GainCaptureMetadata) -> bool {
+        let key = metadata.source_slot.timestamp_millis();
+        if self.pending.len() + self.completed.len() >= 240 || self.pending.contains_key(&key) {
+            return false;
+        }
+        self.pending.insert(key, (metadata, false));
+        true
+    }
+
+    pub(crate) fn claim(
+        &mut self,
+        slot: chrono::DateTime<chrono::Utc>,
+        dial_hz: u64,
+        lead: f64,
+        tx_epoch: u64,
+    ) -> Option<GainCapturedWindow> {
+        let (metadata, claimed) = self.pending.get_mut(&slot.timestamp_millis())?;
+        if *claimed {
+            return None;
+        }
+        *claimed = true;
+        let metadata = metadata.clone();
+        if metadata.tx_epoch != tx_epoch {
+            self.invalidate(&metadata, "transmission overlapped capture");
+            return None;
+        }
+        if metadata.dial_hz != dial_hz {
+            self.invalidate(&metadata, "dial changed before window completion");
+            return None;
+        }
+        Some(GainCapturedWindow {
+            metadata,
+            settled_start: (lead * 12000.0).round() as usize,
+        })
+    }
+
+    pub(crate) fn complete(&mut self, mut completion: GainCaptureCompletion) {
+        let key = completion.metadata.source_slot.timestamp_millis();
+        if !self
+            .pending
+            .get(&key)
+            .is_some_and(|(m, _)| m == &completion.metadata)
+        {
+            // Cancellation/generation replacement already acknowledged this slot.
+            return;
+        }
+        self.pending.remove(&key);
+        if self
+            .completed
+            .iter()
+            .filter(|r| r.invalid_reason.is_none())
+            .count()
+            >= 4
+        {
+            completion.noise_dbfs_per_hz = None;
+            completion.messages.clear();
+            completion.invalid_reason = Some("sweep completion backpressure".into());
+        }
+        self.completed.push_back(completion);
+    }
+
+    pub(crate) fn invalidate(&mut self, metadata: &GainCaptureMetadata, reason: &str) {
+        self.complete(GainCaptureCompletion {
+            metadata: metadata.clone(),
+            noise_dbfs_per_hz: None,
+            messages: Vec::new(),
+            invalid_reason: Some(reason.into()),
+        });
+    }
+
+    pub(crate) fn invalidate_all(&mut self, reason: &str) {
+        let metadata: Vec<_> = self.pending.values().map(|(m, _)| m.clone()).collect();
+        for m in metadata {
+            self.invalidate(&m, reason);
+        }
+    }
+
+    pub(crate) fn take_completed(&mut self) -> Vec<GainCaptureCompletion> {
+        self.completed.drain(..).collect()
+    }
 }
 
 /// A decoded message paired with the dial frequency its SOURCE audio
@@ -420,6 +540,7 @@ mod tests {
             .send(DecodeWindow {
                 samples: vec![0.0; 4],
                 dial_hz: 14_074_000,
+                sweep: None,
             })
             .unwrap();
         assert!(handles.dsp_to_ft8_rx.recv().is_ok());
@@ -444,6 +565,7 @@ mod tests {
             .send(DecodeWindow {
                 samples: vec![0.1; 4],
                 dial_hz: live_dial_hz.load(Ordering::Relaxed),
+                sweep: None,
             })
             .unwrap();
 
@@ -481,5 +603,149 @@ mod tests {
              new band"
         );
         assert_ne!(relayed.dial_hz, live_dial_hz.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod gain_sweep_capture_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn metadata(slot: i64, epoch: u64) -> GainCaptureMetadata {
+        GainCaptureMetadata {
+            generation: 1,
+            epoch,
+            tx_epoch: 0,
+            source_slot: chrono::Utc.timestamp_opt(slot, 0).unwrap(),
+            dial_hz: 14_074_000,
+            gain: super::super::gain_sweep::GainSetting {
+                preamp_db: 10,
+                attenuator_db: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn decode_window_gain_epoch_survives_later_setting_and_band_change() {
+        let mut registry = GainCaptureRegistry::default();
+        let original = metadata(30, 1);
+        assert!(registry.admit(original.clone()));
+        let source = registry
+            .claim(original.source_slot, original.dial_hz, 0.5, 0)
+            .unwrap();
+        assert!(registry.admit(metadata(45, 2)));
+        // A result delayed past another admitted gain keeps its own source slot.
+        registry.complete(GainCaptureCompletion {
+            metadata: source.metadata,
+            noise_dbfs_per_hz: Some(-90.0),
+            messages: Vec::new(),
+            invalid_reason: None,
+        });
+        let complete = registry.take_completed();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].metadata, original);
+        assert_eq!(source.settled_start, 6000);
+        assert!(
+            complete[0].messages.is_empty(),
+            "zero decodes remain a completed window"
+        );
+        // A dial change invalidates pending windows. Late old-band results cannot
+        // turn an explicitly invalidated capture into a valid measurement.
+        registry.invalidate_all("dial changed");
+        registry.complete(GainCaptureCompletion {
+            metadata: metadata(45, 2),
+            noise_dbfs_per_hz: Some(-90.0),
+            messages: Vec::new(),
+            invalid_reason: None,
+        });
+        let complete = registry.take_completed();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].invalid_reason.as_deref(), Some("dial changed"));
+    }
+
+    #[test]
+    fn decode_window_backpressure_is_explicit_and_bounded() {
+        let mut registry = GainCaptureRegistry::default();
+        for slot in 0..5 {
+            let m = metadata(slot * 15, slot as u64);
+            assert!(registry.admit(m.clone()));
+            registry.complete(GainCaptureCompletion {
+                metadata: m,
+                noise_dbfs_per_hz: Some(-90.0),
+                messages: Vec::new(),
+                invalid_reason: None,
+            });
+        }
+        let complete = registry.take_completed();
+        assert_eq!(
+            complete
+                .iter()
+                .filter(|r| r.invalid_reason.is_none())
+                .count(),
+            4
+        );
+        assert_eq!(
+            complete[4].invalid_reason.as_deref(),
+            Some("sweep completion backpressure")
+        );
+        assert!(complete[4].noise_dbfs_per_hz.is_none());
+    }
+
+    #[test]
+    fn decode_window_discontinuity_and_pipeline_loss_never_count_as_silence() {
+        for reason in [
+            "clock discontinuity during capture",
+            "decode pipeline backpressure",
+            "missing audio",
+        ] {
+            let mut registry = GainCaptureRegistry::default();
+            let m = metadata(30, 1);
+            assert!(registry.admit(m.clone()));
+            registry.invalidate(&m, reason);
+            let complete = registry.take_completed();
+            assert_eq!(complete.len(), 1);
+            assert_eq!(complete[0].invalid_reason.as_deref(), Some(reason));
+            assert!(complete[0].noise_dbfs_per_hz.is_none());
+        }
+    }
+
+    #[test]
+    fn decode_window_wrong_dial_or_duplicate_source_is_refused() {
+        let mut registry = GainCaptureRegistry::default();
+        let m = metadata(30, 1);
+        assert!(registry.admit(m.clone()));
+        assert!(!registry.admit(m.clone()));
+        assert!(registry.claim(m.source_slot, 7_074_000, 0.5, 0).is_none());
+        assert!(registry.take_completed()[0].invalid_reason.is_some());
+    }
+}
+
+#[cfg(test)]
+mod gain_sweep_tx_overlap_tests {
+    use super::*;
+    use chrono::TimeZone;
+    #[test]
+    fn decode_window_transmission_after_gain_admission_invalidates_measurement() {
+        let mut registry = GainCaptureRegistry::default();
+        let slot = chrono::Utc.timestamp_opt(30, 0).unwrap();
+        assert!(registry.admit(GainCaptureMetadata {
+            generation: 1,
+            epoch: 1,
+            tx_epoch: 4,
+            source_slot: slot,
+            dial_hz: 14_074_000,
+            gain: super::super::gain_sweep::GainSetting {
+                preamp_db: 0,
+                attenuator_db: 0
+            },
+        }));
+        assert!(registry.claim(slot, 14_074_000, 0.5, 5).is_none());
+        let complete = registry.take_completed();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(
+            complete[0].invalid_reason.as_deref(),
+            Some("transmission overlapped capture")
+        );
+        assert!(complete[0].noise_dbfs_per_hz.is_none());
     }
 }

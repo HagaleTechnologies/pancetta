@@ -172,6 +172,22 @@ contemporaneous-initiation posture), and if you must step away, press `g`
 until the policy reads **Respond-only** — or `Shift+Q` to stop TX
 entirely. The licensee remains responsible either way (§97.103).
 
+### …measure which preamp setting helps on this band?
+
+Stop the station, keep RF gain and AGC fixed, and run a headless experiment:
+
+```sh
+pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain-20m.json
+```
+
+The report compares common stations across alternating receive-gain settings.
+It restores the original controls before reporting a recommendation. Fewer than
+six valid windows per setting or too few matched stations is inconclusive.
+TX windows and pending transmission requests are skipped. Fixed TX parity
+reserves those slots even without a queued frame. The feature has no live rig
+qualification yet.
+See [receive-gain sweep](receive-gain-sweep.md) for timing, setup and cleanup limits.
+
 ### …upload my logs (QRZ / LoTW / ClubLog / eQSL)?
 
 eQSL upload is experimental, and no upload is retried if it fails; see

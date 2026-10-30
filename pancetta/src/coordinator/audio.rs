@@ -273,6 +273,7 @@ impl super::ApplicationCoordinator {
 
             let shutdown = self.shutdown_signal.clone();
             let last_timestamp = self.last_audio_timestamp.clone();
+            let sweep_capture = self.sweep_capture.clone();
 
             let handle = tokio::spawn(async move {
                 let mut phase = 0.0f32;
@@ -307,6 +308,9 @@ impl super::ApplicationCoordinator {
                     {
                         super::pipeline::ForwardOutcome::Sent => {}
                         super::pipeline::ForwardOutcome::Dropped => {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("audio pipeline backpressure");
+                            }
                             warn!("Audio stub: DSP stage not draining -- dropped one batch");
                         }
                         super::pipeline::ForwardOutcome::Disconnected => break,
@@ -390,6 +394,7 @@ impl super::ApplicationCoordinator {
             let audio_output_alive = self.audio_output_alive.clone();
             self.audio_output_alive.store(false, Ordering::Release);
 
+            let sweep_capture_audio = self.sweep_capture.clone();
             std::thread::spawn(move || {
                 // PAN-115: first statement, so every exit (init failure,
                 // `break`, panic) leaves the output marked dead.
@@ -525,6 +530,7 @@ impl super::ApplicationCoordinator {
                     std::time::Instant::now() - std::time::Duration::from_secs(60);
                 let recovery_report_min_gap = std::time::Duration::from_secs(10);
                 let mut last_drop_report = std::time::Instant::now();
+                let mut sweep_last_drop_count = audio_manager.dropped_samples();
                 let drop_report_interval = std::time::Duration::from_secs(30);
                 // PAN-115: output-device liveness for the TX hard mute.
                 let mut output_watch =
@@ -624,6 +630,13 @@ impl super::ApplicationCoordinator {
                     playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
                     match audio_manager.process_audio() {
                         Ok(Some(samples)) => {
+                            let dropped = audio_manager.dropped_samples();
+                            if dropped != sweep_last_drop_count {
+                                if let Ok(mut registry) = sweep_capture_audio.lock() {
+                                    registry.invalidate_all("audio input ring buffer lost samples");
+                                }
+                                sweep_last_drop_count = dropped;
+                            }
                             output_edge = output_watch
                                 .observe(audio_manager.output_callback_count(), Instant::now());
                             if result_tx.blocking_send(samples).is_err() {
@@ -740,6 +753,7 @@ impl super::ApplicationCoordinator {
 
             // Async relay: tokio mpsc -> crossbeam point-to-point
             let health_audio_alive_relay = health_audio_alive.clone();
+            let sweep_capture = self.sweep_capture.clone();
             let handle = tokio::spawn(async move {
                 let mut relay_count: u64 = 0;
                 let mut stale_watchdog = crate::coordinator::audio_recovery::StaleWatchdog::new();
@@ -762,6 +776,11 @@ impl super::ApplicationCoordinator {
                     let samples =
                         match tokio::time::timeout(AUDIO_STALE_TIMEOUT, result_rx.recv()).await {
                             Ok(Some(samples)) => {
+                                if result_rx.len() > 1 {
+                                    if let Ok(mut registry) = sweep_capture.lock() {
+                                        registry.invalidate_all("audio relay backlog");
+                                    }
+                                }
                                 stale_watchdog.on_data();
                                 samples
                             }
@@ -841,6 +860,9 @@ impl super::ApplicationCoordinator {
                     {
                         super::pipeline::ForwardOutcome::Sent => {}
                         super::pipeline::ForwardOutcome::Dropped => {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("audio pipeline backpressure");
+                            }
                             warn!("Audio relay: DSP stage not draining -- dropped one batch");
                             continue;
                         }

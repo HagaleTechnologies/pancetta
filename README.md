@@ -275,6 +275,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |
 | `pancetta --replay <wav-dir>` | Feed a directory of WAVs through the full TUI pipeline. |
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
+| `pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain.json` | Measure per-band receive gain and save an advisory report. [Limits and timing](docs/receive-gain-sweep.md). |
 
 ## Capability status
 
@@ -300,6 +301,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
+| Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
 | Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
 | ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
