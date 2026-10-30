@@ -18,6 +18,9 @@ The two scenarios the ticket states:
 
 ## Dependency line
 
+A Cargo dependency declaration (not pancetta config):
+
+<!-- docs-snippets: skip -->
 ```toml
 [dependencies]
 pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
