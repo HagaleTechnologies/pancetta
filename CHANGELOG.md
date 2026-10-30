@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
+  (PAN-247). Legacy sections still load with one warning that the setting
+  no longer exists and has no effect. Manual `audio.levels.input_gain_db`
+  remains available.
+
 ### Added
 
 - Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
