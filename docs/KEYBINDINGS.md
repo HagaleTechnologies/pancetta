@@ -61,6 +61,7 @@ Press `?` inside the TUI for the same list as an overlay.
 
 | Key | Action |
 |---|---|
+| `G` | save gain preset for this band |
 | `m` | Toggle audio monitoring |
 | `d` | Device picker |
 | `i` | Rig config picker (model/port/baud/PTT) |

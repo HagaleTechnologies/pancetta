@@ -121,8 +121,13 @@ active        = true
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
-compression, AGC). The defaults are tuned for FT8 and most users won't
+compression). The defaults are tuned for FT8 and most users won't
 need to touch them; see `defaults.toml` for the full key list.
+
+The obsolete `[audio.agc]` section is ignored. Loading a legacy config
+returns one warning for the section: "The [audio.agc] automatic-gain setting
+no longer exists and has no effect. Remove this section from your config."
+Fresh generated configs omit it. This setting never applied automatic gain.
 
 `[audio.levels].input_gain_db` applies a fixed gain at the resampler
 input. Negative values attenuate; useful when a hot CODEC saturates the
@@ -193,6 +198,39 @@ baud_rate = 38400
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
+
+### `[rig.receive_gain_presets]` — per-band preamp and attenuator
+
+```toml
+[rig.receive_gain_presets."10m"]
+preamp_db = 10        # dB; FTdx10: 0 = IPO, 10 = AMP1, 20 = AMP2 (hamlib PREAMP)
+attenuator_db = 6     # dB; FTdx10: 0/6/12/18 (hamlib ATT)
+
+[rig.receive_gain_presets."40m"]
+preamp_db = 0
+attenuator_db = 12
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `"<band>"` | table | absent | Canonical band names: `160m`, `80m`, `60m`, `40m`, `30m`, `20m`, `17m`, `15m`, `12m`, `10m`, `6m`, `2m`, `70cm`. Unknown keys fail validation. |
+| `preamp_db` | integer | required | Nonnegative hamlib `PREAMP` value in dB. FTdx10: 0 = IPO, 10 = AMP1, 20 = AMP2. |
+| `attenuator_db` | integer | required | Nonnegative hamlib `ATT` value in dB. FTdx10: 0/6/12/18. |
+
+Pancetta applies a saved preset after a successful commanded band change,
+including automatic band hopping. An absent preset leaves both controls
+untouched. Startup and front-panel band changes do not apply presets. RF gain
+stays manual. Unsupported rig levels produce a warning without undoing the retune.
+
+Press `G` in the main TUI to read the live rig gain and save it for the current
+band. The status line reports success or failure. Saving requires a TOML config
+file. With `--headless`, hand-edit the table instead. Presets survive restart;
+new saves also take effect on the next band change without restarting.
+
+Omitting this table or specifying an empty table means no presets. In layered
+configuration, a layer that mentions this table replaces the entire lower
+layer's map; an absent table keeps it. Both fields are required in each entry,
+and negative values fail validation at config load.
 
 ### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
 

@@ -14,16 +14,6 @@ output_channels = 2
 output_device = "default"
 sample_rate = 48000
 
-[audio.agc]
-attack_time_ms = 1.0
-decay_time_ms = 500.0
-enabled = true
-hang_time_ms = 200.0
-max_gain_db = 30.0
-mode = "medium"
-target_level_db = -20.0
-threshold_db = -60.0
-
 [audio.device_parameters]
 
 [audio.levels]
