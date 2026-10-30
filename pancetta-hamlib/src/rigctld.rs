@@ -7,8 +7,9 @@ use crate::models::{Mode, Vfo};
 use crate::rig::{ConnectionState, PttState, RigControl, RigStatus};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{timeout, Duration};
@@ -70,6 +71,7 @@ struct RigctldConnection {
 pub struct RigctldClient {
     /// Configuration
     config: RigctldConfig,
+    generation: AtomicU64,
     /// Persistent connection (reader + writer)
     conn: Arc<Mutex<Option<RigctldConnection>>>,
     /// Internal state
@@ -81,6 +83,7 @@ impl RigctldClient {
     pub fn new(config: RigctldConfig) -> Self {
         Self {
             config,
+            generation: AtomicU64::new(0),
             conn: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(RigctldState {
                 connected: false,
@@ -102,6 +105,10 @@ impl RigctldClient {
 
     /// Send a command and get response
     async fn send_command(&self, command: &str) -> Result<String> {
+        self.send_command_inner(command, false).await
+    }
+
+    async fn send_command_inner(&self, command: &str, require_ack: bool) -> Result<String> {
         let mut conn_guard = self.conn.lock().await;
 
         if let Some(conn) = conn_guard.as_mut() {
@@ -127,6 +134,12 @@ impl RigctldClient {
                 }
                 Ok(Ok(_)) => {
                     response = response.trim().to_string();
+
+                    if require_ack && response != "RPRT 0" {
+                        return Err(anyhow!(
+                            "Missing successful rigctld acknowledgement: {response}"
+                        ));
+                    }
 
                     // Check for RPRT error/success codes
                     if response.starts_with("RPRT") {
@@ -456,6 +469,105 @@ impl RigctldClient {
     }
 }
 
+// Positional protocol-1 prefix. Never infer ATT from arbitrary numeric lines.
+fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
+    if body.len() > 65536 || body.lines().count() > 2048 {
+        return Err(anyhow!("Oversize attenuator capabilities"));
+    }
+    let mut lines = body.lines().map(str::trim);
+    if lines.next() != Some("dump_state:") || lines.next() != Some("1") {
+        return Err(anyhow!("Unknown dump_state header or protocol"));
+    }
+    for _ in 0..2 {
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_state identity"))?
+            .parse::<i32>()?;
+    }
+    for width in [7, 7, 2, 2] {
+        loop {
+            let row = lines
+                .next()
+                .ok_or_else(|| anyhow!("Missing dump_state section terminator"))?;
+            let values: Vec<_> = row.split_whitespace().collect();
+            if values.len() != width {
+                return Err(anyhow!("Malformed dump_state section"));
+            }
+            let mut all_zero = true;
+            for value in values {
+                let number = if let Some(hex) = value.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16)? as f64
+                } else {
+                    value.parse::<f64>()?
+                };
+                if !number.is_finite() {
+                    return Err(anyhow!("Invalid dump_state section value"));
+                }
+                all_zero &= number == 0.0;
+            }
+            if all_zero {
+                break;
+            }
+        }
+    }
+    for _ in 0..4 {
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_state limit"))?
+            .parse::<i64>()?;
+    }
+    // Preamp is a separate list, never an ATT fallback.
+    let parse_list = |line: &str| -> Result<Vec<i32>> {
+        line.split_whitespace()
+            .map(|v| {
+                let db = v.parse::<i32>()?;
+                if db < 0 {
+                    return Err(anyhow!("Negative gain capability"));
+                }
+                Ok(db)
+            })
+            .collect()
+    };
+    parse_list(lines.next().ok_or_else(|| anyhow!("Missing preamp list"))?)?;
+    let mut steps = parse_list(
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing attenuator list"))?,
+    )?;
+    let mut masks = Vec::new();
+    for _ in 0..6 {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing operation mask"))?;
+        let hex = line
+            .strip_prefix("0x")
+            .ok_or_else(|| anyhow!("Malformed operation mask"))?;
+        masks.push(u64::from_str_radix(hex, 16)?);
+    }
+    if masks[2] & 2 == 0 || masks[3] & 2 == 0 || !steps.iter().any(|&v| v > 0) {
+        return Err(anyhow!("Attenuator get/set unsupported"));
+    }
+    // Optional protocol-1 key/value extensions precede the terminal response.
+    loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing terminal RPRT"))?;
+        if line == "RPRT 0" {
+            if lines.next().is_some() {
+                return Err(anyhow!("Trailing dump_state data"));
+            }
+            break;
+        }
+        if !line.contains('=') {
+            return Err(anyhow!("Invalid dump_state extension or terminal error"));
+        }
+    }
+    steps.push(0);
+    steps.sort_unstable();
+    steps.dedup();
+    Ok(steps)
+}
+
 #[async_trait]
 impl RigControl for RigctldClient {
     #[instrument(skip(self))]
@@ -487,6 +599,7 @@ impl RigControl for RigctldClient {
                 // Update state
                 let mut state = self.state.write().await;
                 state.connected = true;
+                self.generation.fetch_add(1, Ordering::SeqCst);
 
                 info!("Successfully connected to rigctld");
 
@@ -670,8 +783,11 @@ impl RigControl for RigctldClient {
         let response = self.send_command_with_retry(&cmd).await?;
 
         let ptt = match response.trim() {
+            "0" => PttState::Off,
             "1" => PttState::On,
-            _ => PttState::Off,
+            "2" => PttState::OnMic,
+            "3" => PttState::OnData,
+            _ => return Err(anyhow!("Invalid PTT response: {response}")),
         };
 
         // Update cached value
@@ -722,6 +838,62 @@ impl RigControl for RigctldClient {
         };
 
         Ok(vfo)
+    }
+
+    fn connection_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        let response = self.send_command("l ATT").await?;
+        let db = response
+            .parse::<i32>()
+            .map_err(|_| anyhow!("Invalid integer attenuator response: {response}"))?;
+        if db < 0 {
+            return Err(anyhow!("Negative attenuator response"));
+        }
+        Ok(db)
+    }
+
+    async fn set_attenuator(&self, db: i32) -> Result<()> {
+        if db < 0 {
+            return Err(anyhow!("Attenuation must be nonnegative"));
+        }
+        // A gain change is never retried: a lost acknowledgement is ambiguous.
+        let response = self
+            .send_command_inner(&format!("L ATT {db}"), true)
+            .await?;
+        if !response.is_empty() {
+            return Err(anyhow!("Missing attenuator acknowledgement"));
+        }
+        Ok(())
+    }
+
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        timeout(Duration::from_secs(2), async {
+            let mut stream =
+                TcpStream::connect((self.config.host.as_str(), self.config.port)).await?;
+            stream.write_all(b"+\\dump_state\n").await?;
+            // Limit the read itself, including a peer that never sends a newline.
+            let mut reader = BufReader::new(stream.take(65537));
+            let mut body = String::new();
+            for _ in 0..2048 {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await? == 0 {
+                    return Err(anyhow!("Truncated attenuator capabilities"));
+                }
+                body.push_str(&line);
+                if body.len() > 65536 {
+                    return Err(anyhow!("Oversize attenuator capabilities"));
+                }
+                if line.trim().starts_with("RPRT") {
+                    return parse_attenuator_steps(&body);
+                }
+            }
+            Err(anyhow!("Too many attenuator capability lines"))
+        })
+        .await
+        .map_err(|_| anyhow!("Attenuator capability discovery timeout"))?
     }
 
     async fn set_power_level(&self, watts: f32) -> Result<()> {
@@ -952,7 +1124,7 @@ mod split_tests {
 mod split_read_tests {
     use super::*;
 
-    async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
+    pub(super) async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -1070,5 +1242,166 @@ mod split_read_tests {
         for response in ["abc", "", "0", "-1"] {
             assert!(RigctldClient::parse_split_freq_response(response).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod attenuator_tests {
+    use super::*;
+
+    // Protocol shape checked against Hamlib tests/rigctl_parse.c dump_state,
+    // protocol 1, and include/hamlib/rig.h RIG_LEVEL_ATT bit 1 (2026-10-30).
+    const STATE: &str = "dump_state:\n1\n1\n0\n1800000 30000000 0x4 -1 -1 0x1 0x1\n0 0 0 0 0 0 0\n0 0 0 0 0 0 0\n0x4 1\n0 0\n0x4 2400\n0 0\n0\n0\n0\n0\n10 20\n20 10 10\n0x0\n0x0\n0x2\n0x2\n0x0\n0x0\nRPRT 0\n";
+
+    #[test]
+    fn supported_attenuator_protocol_one() {
+        assert_eq!(parse_attenuator_steps(STATE).unwrap(), vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_capabilities() {
+        for invalid in [
+            STATE.replacen("\n1\n", "\n2\n", 1),
+            STATE.replace("0x2", "0x0"),
+            STATE.replace("20 10 10", ""),
+            STATE.replace("20 10 10", "-6 10"),
+            STATE.replacen("0 0 0 0 0 0 0", "0 0", 1),
+            STATE.replace("RPRT 0", "RPRT -11"),
+            STATE.replace("RPRT 0\n", ""),
+            STATE.replace("0x2", "garbage"),
+            "x".repeat(65537),
+        ] {
+            assert!(parse_attenuator_steps(&invalid).is_err(), "{invalid}");
+        }
+        assert!(!RigctldClient::raw_command_allowed("+\\dump_state"));
+        assert!(!RigctldClient::raw_command_allowed("\\dump_state"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attenuator_integer_commands_and_readback() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in [
+                ("L ATT 10\n", "RPRT 0\n"),
+                ("l ATT\n", "10\n"),
+                ("L ATT 20\n", "RPRT -11\n"),
+                ("l ATT\n", "-1\n"),
+                ("l ATT\n", "1.0\n"),
+                ("L ATT 10\n", "\n"),
+                ("L ATT 10\n", "RPRT 0 garbage\n"),
+            ] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command, expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        assert!(client.set_attenuator(-1).await.is_err());
+        client.set_attenuator(10).await.unwrap();
+        assert_eq!(client.get_attenuator().await.unwrap(), 10);
+        assert!(client.set_attenuator(20).await.is_err());
+        assert!(client.get_attenuator().await.is_err());
+        assert!(client.get_attenuator().await.is_err());
+        assert!(client.set_attenuator(10).await.is_err());
+        assert!(client.set_attenuator(10).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ptt_readback_never_treats_transmitting_or_malformed_states_as_off() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for reply in ["0\n", "1\n", "2\n", "3\n", "garbage\n", "RPRT 0\n"] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert!(command.starts_with("\\get_ptt "));
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        for expected in [
+            PttState::Off,
+            PttState::On,
+            PttState::OnMic,
+            PttState::OnData,
+        ] {
+            assert_eq!(client.get_ptt(Vfo::Current).await.unwrap(), expected);
+        }
+        assert!(client.get_ptt(Vfo::Current).await.is_err());
+        assert!(client.get_ptt(Vfo::Current).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_uses_separate_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "+\\dump_state\n");
+            writer.write_all(STATE.as_bytes()).await.unwrap();
+        });
+        assert_eq!(
+            client.supported_attenuator_steps().await.unwrap(),
+            vec![0, 10, 20]
+        );
+        assert!(client.conn.lock().await.is_none());
+        server.await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_rejects_truncation_oversize_and_timeout() {
+        for body in [
+            Some(STATE.replace("RPRT 0\n", "")),
+            Some("x".repeat(65537)),
+            Some("\n".repeat(2049)),
+            None,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = RigctldClient::new(RigctldConfig {
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            });
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                if let Some(body) = body {
+                    let _ = writer.write_all(body.as_bytes()).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(2100)).await;
+                }
+            });
+            assert!(client.supported_attenuator_steps().await.is_err());
+            assert!(client.conn.lock().await.is_none());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attenuator_timeout_disconnects_without_retry() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "L ATT 10\n");
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        });
+        assert!(client.set_attenuator(10).await.is_err());
+        assert!(client.conn.lock().await.is_none());
+        assert!(!client.state.read().await.connected);
+        server_task.await.unwrap();
     }
 }

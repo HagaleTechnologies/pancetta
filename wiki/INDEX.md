@@ -19,3 +19,5 @@
 - [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — Four-tier round schedule per reviewer: rounds 1-5 fix everything, 6-15 ticket new P2-or-lower, 16-25 ticket P1 too unless critical/blocking, round 25 is a hard stop — so PRs converge instead of oscillating.
 
 - [What can invalidate a timing-history experiment?](pages/timing-history.md) — fresh slot clocks, native timing coordinates, and missing baseline truth.
+
+- [What will bite you about receive overload attenuation?](pages/receive-overload-guard.md) - raw capture provenance, confirmed PTT-off and gain reservations.

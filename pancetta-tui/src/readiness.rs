@@ -32,18 +32,20 @@ pub enum TxMuteCause {
     AudioOutputDead,
     RigStatePending,
     RigCommandInFlight,
+    ReceiveGainUnconfirmed,
     PolicyDisabled,
 }
 
 impl TxMuteCause {
     /// Every cause, in the gate's priority order.
-    pub const ALL: [TxMuteCause; 7] = [
+    pub const ALL: [TxMuteCause; 8] = [
         TxMuteCause::RigRestarting,
         TxMuteCause::RigNotReady,
         TxMuteCause::RigDisconnected,
         TxMuteCause::AudioOutputDead,
         TxMuteCause::RigStatePending,
         TxMuteCause::RigCommandInFlight,
+        TxMuteCause::ReceiveGainUnconfirmed,
         TxMuteCause::PolicyDisabled,
     ];
 
@@ -54,6 +56,7 @@ impl TxMuteCause {
             TxMuteCause::RigRestarting
                 | TxMuteCause::RigDisconnected
                 | TxMuteCause::AudioOutputDead
+                | TxMuteCause::ReceiveGainUnconfirmed
         )
     }
 }
@@ -165,6 +168,7 @@ pub enum ReadinessKey {
     RigNotReady,
     RigCmdQueued,
     RigCmdApplying,
+    ReceiveGainUnconfirmed,
     /// A logbook-upload warning, keyed by service and kind (not count), so
     /// an ack survives a count change (PAN-57).
     Upload(String, UploadIssueKind),
@@ -443,6 +447,12 @@ fn cause_items(
                 "◌ RIG APPLYING CMD",
                 "Rig applying command — waiting for the rig to confirm frequency/split.",
             )),
+            TxMuteCause::ReceiveGainUnconfirmed => blockers.push(item(
+                ReadinessKey::ReceiveGainUnconfirmed,
+                Severity::Blocker,
+                "receive gain change is in progress or unconfirmed",
+                "receive gain change is in progress or unconfirmed",
+            )),
             // The verdict chip (`■ RX ONLY`) already says it; no item.
             TxMuteCause::PolicyDisabled => {}
         }
@@ -711,6 +721,23 @@ mod tests {
         let mut app = app().await;
         app.station_readiness = Some(snapshot(&[TxMuteCause::PolicyDisabled]));
         assert_eq!(verdict(&app), Verdict::RxOnly);
+        assert!(readiness_items(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn receive_gain_transition_is_a_typed_tx_blocker() {
+        let mut app = app().await;
+        app.station_readiness = Some(snapshot(&[TxMuteCause::ReceiveGainUnconfirmed]));
+        assert_eq!(verdict(&app), Verdict::Held);
+        let items = readiness_items(&app);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Blocker);
+        assert_eq!(
+            items[0].label,
+            "receive gain change is in progress or unconfirmed"
+        );
+        app.station_readiness = Some(StationReadiness::default());
+        assert_eq!(verdict(&app), Verdict::Ready);
         assert!(readiness_items(&app).is_empty());
     }
 

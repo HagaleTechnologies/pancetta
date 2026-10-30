@@ -1539,6 +1539,7 @@ impl DurableInbox {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    pub(crate) receive_gain: Arc<crate::coordinator::receive_overload::GainSafety>,
     /// Shared only by split-command producers and the split poll. PTT routing
     /// never takes this lock (PAN-202).
     pub(crate) split_observation_fence: Arc<SplitObservationFence>,
@@ -1574,6 +1575,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
@@ -1590,6 +1592,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),

@@ -115,6 +115,9 @@ pub struct RigConfig {
     /// Timing and polling configuration
     pub timing: TimingConfig,
 
+    /// Opt-in automatic receive overload attenuation. Requires restart.
+    pub receive_overload_guard: ReceiveOverloadGuardConfig,
+
     /// Rig-specific parameters
     pub rig_parameters: RigParametersConfig,
 
@@ -131,6 +134,14 @@ pub struct RigConfig {
     /// field directly.
     #[serde(default)]
     pub bookmarks: Option<Vec<RigBookmark>>,
+}
+
+/// Automatic receive overload protection. Never restores attenuation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReceiveOverloadGuardConfig {
+    /// Enable live FT8 overload detection and rig-supported ATT steps.
+    pub enabled: bool,
 }
 
 /// CAT (Computer Aided Transceiver) interface configuration
@@ -836,6 +847,7 @@ impl Default for RigConfig {
             power_control: PowerControlConfig::default(),
             modes: ModeConfig::default(),
             timing: TimingConfig::default(),
+            receive_overload_guard: ReceiveOverloadGuardConfig::default(),
             rig_parameters: RigParametersConfig::default(),
             custom_commands: HashMap::new(),
             bookmarks: None,
@@ -1132,6 +1144,7 @@ impl ConfigSection for RigConfig {
         self.power_control.merge_with(other.power_control);
         self.modes.merge_with(other.modes);
         self.timing.merge_with(other.timing);
+        self.receive_overload_guard = other.receive_overload_guard;
         self.rig_parameters.merge_with(other.rig_parameters);
 
         // Merge custom commands
@@ -1232,6 +1245,39 @@ impl RigParametersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_overload_defaults_and_partial_tables() {
+        for source in [
+            "",
+            "[receive_overload_guard]",
+            "[receive_overload_guard]\nenabled = false",
+        ] {
+            let config: RigConfig = toml::from_str(source).unwrap();
+            assert!(!config.receive_overload_guard.enabled);
+            config.validate_section().unwrap();
+        }
+        let config: RigConfig = toml::from_str("[receive_overload_guard]\nenabled = true").unwrap();
+        assert!(config.receive_overload_guard.enabled);
+        let round_trip: RigConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(round_trip.receive_overload_guard.enabled);
+        assert!(
+            toml::from_str::<RigConfig>("[receive_overload_guard]\nenabled = \"yes\"").is_err()
+        );
+    }
+
+    #[test]
+    fn receive_overload_merge_carries_enable_and_disable() {
+        let mut base = RigConfig::default();
+        let enabled: RigConfig =
+            toml::from_str("[receive_overload_guard]\nenabled = true").unwrap();
+        base.merge_with(enabled);
+        assert!(base.receive_overload_guard.enabled);
+        let disabled: RigConfig =
+            toml::from_str("[receive_overload_guard]\nenabled = false").unwrap();
+        base.merge_with(disabled);
+        assert!(!base.receive_overload_guard.enabled);
+    }
 
     #[test]
     fn test_default_rig_config() {
