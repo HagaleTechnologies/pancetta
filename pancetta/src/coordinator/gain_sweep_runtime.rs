@@ -463,6 +463,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gain_sweep_shutdown_unkeys_before_restoring_gain() {
+        use crate::message_bus::{ComponentId, MessageType, RigControlMessage};
+        use pancetta_hamlib::{PttState, Vfo};
+        for join_sweep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (coordinator, rig) = coordinator(dir.path().join("shutdown.json")).await;
+            // Exercise the bus fallback without contacting a real rigctld endpoint.
+            coordinator.config.write().await.rig.interface.enabled = false;
+            *coordinator.gain_sweep_original.lock().unwrap() =
+                Some(rig.get_receive_gain().await.unwrap());
+            let original = rig.get_receive_gain().await.unwrap();
+            rig.set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+            let (_, rx) = coordinator
+                .message_bus
+                .create_channel(ComponentId::Hamlib)
+                .await
+                .unwrap();
+            let (unkeyed_tx, unkeyed_rx) = tokio::sync::oneshot::channel();
+            let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+            let worker_rig = rig.clone();
+            let worker = tokio::spawn(async move {
+                let message = loop {
+                    if let Ok(message) = rx.try_recv() {
+                        break message;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                };
+                assert!(matches!(
+                    message.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+                ));
+                worker_rig
+                    .set_ptt(Vfo::Current, PttState::Off)
+                    .await
+                    .unwrap();
+                unkeyed_tx.send(()).unwrap();
+                let _ = cleanup_tx.send(());
+            });
+            // A sweep cleanup task cannot finish until physical PTT is released.
+            // Its error must still allow the fallback restoration to run.
+            let sweep_handle = join_sweep.then(|| {
+                tokio::spawn(async move {
+                    cleanup_rx.await.unwrap();
+                    anyhow::bail!("sweep cleanup failed")
+                })
+            });
+            let shutdown = tokio::spawn(async move {
+                if join_sweep {
+                    coordinator.shutdown_with_gain_sweep(sweep_handle).await
+                } else {
+                    coordinator.shutdown().await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), unkeyed_rx)
+                .await
+                .expect("shutdown must unkey before waiting for gain restoration")
+                .unwrap();
+            let result = shutdown.await.unwrap();
+            if join_sweep {
+                assert_eq!(result.unwrap_err().to_string(), "sweep cleanup failed");
+            } else {
+                result.unwrap();
+            }
+            worker.await.unwrap();
+            assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+            assert_eq!(rig.get_receive_gain().await.unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
     async fn gain_sweep_coordinator_completion_restores_before_saved_report() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.json");

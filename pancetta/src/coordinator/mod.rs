@@ -2816,15 +2816,6 @@ impl ApplicationCoordinator {
             }
         };
         let main_loop_result = self.run_main_loop().await;
-        let sweep_result = if let Some(handle) = sweep_handle {
-            handle
-                .await
-                .context("Receive-gain sweep task failed")
-                .and_then(|result| result)
-        } else {
-            Ok(())
-        };
-
         // The clock-skew monitor is advisory and holds no resources; stop it
         // before the component teardown (or an early error return) rather
         // than waiting out its tick.
@@ -2834,7 +2825,7 @@ impl ApplicationCoordinator {
         // Cleanup runs even if either the main loop or experiment failed.
 
         // Graceful shutdown
-        self.shutdown().await?;
+        let sweep_result = self.shutdown_with_gain_sweep(sweep_handle).await;
         main_loop_result?;
         sweep_result?;
 

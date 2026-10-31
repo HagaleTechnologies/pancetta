@@ -22,7 +22,8 @@ A dropped pipeline window is missing evidence, never a zero-decode window.
 
 Keep original PREAMP and ATT state with the coordinator-owned cleanup task.
 An abortable worker future cannot own the only restoration copy. The coordinator
-joins cleanup before Hamlib shutdown. Both control readbacks must confirm
+attempts PTT-off through the bus and direct rigctld safety paths before joining
+cleanup, then restores gain before Hamlib teardown. Both control readbacks must confirm
 restoration before a report can recommend a setting.
 
 Fixed TX parity reserves those slots even without queued frames. Pending
