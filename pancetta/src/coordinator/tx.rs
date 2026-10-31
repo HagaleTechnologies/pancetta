@@ -5599,13 +5599,42 @@ fn tx_send_authorized(
 /// last pre-PTT gate's verdict still holds when the command reaches Hamlib's
 /// queue, even while another component registers a bus channel.
 /// `authorize` follows `send_message_if`'s synchronous-leaf rule.
+struct GainTxIntent(std::sync::Arc<std::sync::atomic::AtomicU32>);
+impl GainTxIntent {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for GainTxIntent {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub(crate) fn send_ptt_command(
     message_bus: &MessageBus,
     source: ComponentId,
     state: bool,
     authorize: impl FnOnce() -> bool,
 ) -> SendIfOutcome {
-    message_bus.send_rig_command_if(
+    // One CAS arbitrates gain admission and every key-down enqueue, without
+    // introducing a lock or await into the last-gate-to-enqueue path.
+    if state {
+        match message_bus
+            .gain_tx_gate
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                if value & 1 == 0 {
+                    value.checked_add(4)
+                } else {
+                    None
+                }
+            }) {
+            Ok(_) => (),
+            Err(_) => return SendIfOutcome::Denied,
+        }
+    }
+    let outcome = message_bus.send_rig_command_if(
         ComponentMessage::new(
             source,
             ComponentId::Hamlib,
@@ -5613,7 +5642,17 @@ pub(crate) fn send_ptt_command(
             Instant::now(),
         ),
         authorize,
-    )
+    );
+    if state {
+        if outcome == SendIfOutcome::Enqueued {
+            message_bus.gain_tx_gate.fetch_or(2, Ordering::AcqRel);
+            message_bus.gain_tx_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        // Bits 2+ count synchronous enqueue attempts, bit 1 persists until
+        // Hamlib acknowledges PTT-off, and bit 0 belongs to gain transitions.
+        message_bus.gain_tx_gate.fetch_sub(4, Ordering::AcqRel);
+    }
+    outcome
 }
 
 /// PAN-202 test seam: when armed, parks the worker once between its last
@@ -8089,6 +8128,13 @@ impl super::ApplicationCoordinator {
 
                     match inbox.try_recv() {
                         Ok(mut message) => {
+                            let _gain_tx_intent = matches!(
+                                &message.message_type,
+                                MessageType::TransmitRequest { .. }
+                                    | MessageType::MultiTransmitRequest { .. }
+                                    | MessageType::TuneRequest { .. }
+                            )
+                            .then(|| GainTxIntent::new(message_bus.gain_tx_intents.clone()));
                             // 2026-07-18 operator finding: the emit_event(MessageToSend)
                             // trace added in pancetta-qso proved the QSO state machine
                             // sends a QSO's final 73 exactly once, yet PTT keys twice

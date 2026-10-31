@@ -4,7 +4,9 @@
 //! that connects to rigctld (Hamlib's TCP daemon) for radio control.
 
 use crate::models::{Mode, Vfo};
-use crate::rig::{ConnectionState, PttState, RigControl, RigStatus};
+use crate::rig::{
+    ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigControl, RigStatus,
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -196,6 +198,82 @@ impl RigctldClient {
         } else {
             Err(anyhow!("Not connected to rigctld"))
         }
+    }
+
+    // Keep the socket out of the shared slot while awaiting I/O. Cancellation
+    // drops it, so a delayed response cannot be consumed by a later operation.
+    async fn gain_request(
+        &self,
+        commands: &[String],
+        deadline: tokio::time::Instant,
+        extended: bool,
+    ) -> Result<Vec<String>> {
+        let mut guard = tokio::time::timeout_at(deadline, self.conn.lock())
+            .await
+            .map_err(|_| anyhow!("Gain transaction deadline expired waiting for transport"))?;
+        let mut conn = guard
+            .take()
+            .ok_or_else(|| anyhow!("Not connected to rigctld"))?;
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut replies = Vec::new();
+            for command in commands {
+                // No command is initiated at or beyond the absolute deadline.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!("Gain transaction deadline expired"));
+                }
+                conn.writer
+                    .write_all(format!("{command}\n").as_bytes())
+                    .await?;
+                conn.writer.flush().await?;
+                let mut response = String::new();
+                loop {
+                    let mut line = String::new();
+                    let bytes = conn.reader.read_line(&mut line).await?;
+                    if bytes == 0 || !line.ends_with('\n') {
+                        return Err(anyhow!("Incomplete rigctld gain response"));
+                    }
+                    let line = line.trim();
+                    if line.starts_with("RPRT") {
+                        if line != "RPRT 0" {
+                            return Err(anyhow!("Rigctld gain error: {line}"));
+                        }
+                        if !extended && command.starts_with("l ") {
+                            return Err(anyhow!("Missing integer gain readback"));
+                        }
+                        break;
+                    }
+                    if extended {
+                        response.push_str(line);
+                        response.push('\n');
+                        if response.len() > 131072 {
+                            return Err(anyhow!("Oversized rigctld capabilities response"));
+                        }
+                    } else if command.starts_with("l ") {
+                        let value = line
+                            .parse::<i32>()
+                            .map_err(|_| anyhow!("Invalid integer gain: {line}"))?;
+                        if !(0..=120).contains(&value) {
+                            return Err(anyhow!("Invalid gain range: {line}"));
+                        }
+                        response.push_str(line);
+                        break;
+                    } else {
+                        return Err(anyhow!("Missing gain command acknowledgement"));
+                    }
+                }
+                replies.push(response);
+            }
+            Ok(replies)
+        })
+        .await
+        .map_err(|_| anyhow!("Gain transaction timeout"))
+        .and_then(|value| value);
+        if result.is_ok() {
+            *guard = Some(conn);
+        } else {
+            self.state.write().await.connected = false;
+        }
+        result
     }
 
     /// Read an additional line from the connection (for multi-line responses).
@@ -458,6 +536,72 @@ impl RigctldClient {
 
 #[async_trait]
 impl RigControl for RigctldClient {
+    async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        let replies = self
+            .gain_request(
+                &["+\\dump_caps".to_owned()],
+                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
+                true,
+            )
+            .await?;
+        parse_gain_capabilities(&replies[0])
+    }
+
+    async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        let replies = self
+            .gain_request(
+                &["l PREAMP".to_owned(), "l ATT".to_owned()],
+                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
+                false,
+            )
+            .await?;
+        Ok(ReceiveGain {
+            preamp_db: replies[0].parse()?,
+            attenuator_db: replies[1].parse()?,
+        })
+    }
+
+    async fn set_receive_gain(
+        &self,
+        gain: ReceiveGain,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        if !(0..=120).contains(&gain.preamp_db) || !(0..=120).contains(&gain.attenuator_db) {
+            return Err(anyhow!("Receive gain outside integer dB range"));
+        }
+        let preamp = format!("L PREAMP {}", gain.preamp_db);
+        let attenuator = format!("L ATT {}", gain.attenuator_db);
+        // Remove the opposite gain first. Both controls are always written,
+        // including during restoration after a partially applied pair.
+        let writes = if gain.attenuator_db > 0 {
+            [preamp, attenuator]
+        } else {
+            [attenuator, preamp]
+        };
+        let replies = self
+            .gain_request(
+                &[
+                    writes[0].clone(),
+                    writes[1].clone(),
+                    "l PREAMP".to_owned(),
+                    "l ATT".to_owned(),
+                ],
+                deadline,
+                false,
+            )
+            .await?;
+        let actual = ReceiveGain {
+            preamp_db: replies[2].parse()?,
+            attenuator_db: replies[3].parse()?,
+        };
+        if actual != gain {
+            return Err(anyhow!(
+                "Receive-gain readback mismatch: requested {gain:?}, got {actual:?}"
+            ));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
         info!(
@@ -872,6 +1016,47 @@ impl RigControl for RigctldClient {
     }
 }
 
+// Hamlib dumpcaps.c emits dB-suffixed integer steps and named level lists.
+// Unknown or malformed formats fail closed rather than guessing model values.
+fn parse_gain_capabilities(response: &str) -> Result<ReceiveGainCapabilities> {
+    fn field<'a>(response: &'a str, name: &str) -> Result<&'a str> {
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or_else(|| anyhow!("Missing gain capability field {name}"))
+    }
+    for name in ["Get level:", "Set level:"] {
+        let levels = field(response, name)?;
+        if !["PREAMP", "ATT"].iter().all(|level| {
+            levels
+                .split_whitespace()
+                .any(|token| token.split('(').next() == Some(*level))
+        }) {
+            return Err(anyhow!("Backend cannot read and set PREAMP and ATT"));
+        }
+    }
+    fn steps(value: &str) -> Result<Vec<i32>> {
+        let mut result = vec![0];
+        for token in value.split_whitespace() {
+            if token == "None" {
+                continue;
+            }
+            let number = token.strip_suffix("dB").unwrap_or(token).parse::<i32>()?;
+            if !(0..=120).contains(&number) {
+                return Err(anyhow!("Invalid gain step"));
+            }
+            result.push(number);
+        }
+        result.sort_unstable();
+        result.dedup();
+        Ok(result)
+    }
+    Ok(ReceiveGainCapabilities {
+        preamp_db: steps(field(response, "Preamp:")?)?,
+        attenuator_db: steps(field(response, "Attenuator:")?)?,
+    })
+}
+
 #[cfg(test)]
 mod allow_list_tests {
     use super::*;
@@ -986,7 +1171,7 @@ mod split_tests {
 mod split_read_tests {
     use super::*;
 
-    async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
+    pub(super) async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -1132,6 +1317,214 @@ mod split_read_tests {
         );
         for response in ["abc", "", "0", "-1"] {
             assert!(RigctldClient::parse_split_freq_response(response).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod receive_gain_tests {
+    use super::*;
+
+    async fn fixture(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (RigctldClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let client = RigctldClient::default();
+        let (reader, writer) = tokio::io::split(stream);
+        *client.conn.lock().await = Some(RigctldConnection {
+            reader: BufReader::new(reader),
+            writer,
+        });
+        let task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in script {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command.trim(), expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (client, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_capabilities_read_complete_extended_reply() {
+        let (client, task) = fixture(vec![("+\\dump_caps", "dump_caps:\nPreamp: 10dB 20dB\nAttenuator: 6dB 12dB\nGet level: PREAMP(0..0/0) ATT(0..0/0) STRENGTH(-54..50/1)\nSet level: PREAMP(0..0/0) ATT(0..0/0)\nRPRT 0\n"), ("l PREAMP", "10\n"), ("l ATT", "0\n")]).await;
+        let caps = client.receive_gain_capabilities().await.unwrap();
+        assert_eq!(caps.preamp_db, vec![0, 10, 20]);
+        assert_eq!(caps.attenuator_db, vec![0, 6, 12]);
+        assert_eq!(client.get_receive_gain().await.unwrap().preamp_db, 10);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_pair_disables_other_control_and_confirms_readback() {
+        let (client, task) = fixture(vec![
+            ("L PREAMP 0", "RPRT 0\n"),
+            ("L ATT 6", "RPRT 0\n"),
+            ("l PREAMP", "0\n"),
+            ("l ATT", "6\n"),
+        ])
+        .await;
+        client
+            .set_receive_gain(
+                crate::ReceiveGain {
+                    preamp_db: 0,
+                    attenuator_db: 6,
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_readback_mismatch_never_succeeds() {
+        let (client, task) = fixture(vec![
+            ("L ATT 0", "RPRT 0\n"),
+            ("L PREAMP 10", "RPRT 0\n"),
+            ("l PREAMP", "0\n"),
+            ("l ATT", "0\n"),
+        ])
+        .await;
+        assert!(client
+            .set_receive_gain(
+                crate::ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_invalid_integer_discards_connection() {
+        let (client, task) = fixture(vec![("l PREAMP", "10.5\n")]).await;
+        assert!(client.get_receive_gain().await.is_err());
+        assert!(client.conn.lock().await.is_none());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_partial_reply_and_error_discard_connection() {
+        for reply in ["RPRT -11\n", "10"] {
+            let (client, task) = fixture(vec![("l PREAMP", reply)]).await;
+            assert!(client.get_receive_gain().await.is_err());
+            assert!(client.conn.lock().await.is_none());
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_partial_pair_still_restores_both_original_controls() {
+        let (client, task) =
+            fixture(vec![("L ATT 0", "RPRT 0\n"), ("L PREAMP 20", "RPRT -1\n")]).await;
+        assert!(client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 20,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        task.await.unwrap();
+        // A failed transport is discarded; reconnect supplies a fresh stream.
+        let (restored_client, restore_task) = fixture(vec![
+            ("L ATT 0", "RPRT 0\n"),
+            ("L PREAMP 10", "RPRT 0\n"),
+            ("l PREAMP", "10\n"),
+            ("l ATT", "0\n"),
+        ])
+        .await;
+        *client.conn.lock().await = restored_client.conn.lock().await.take();
+        client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        restore_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_deadline_and_cancellation_discard_pending_reply() {
+        for cancel in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let client = RigctldClient::default();
+            let (reader, writer) = tokio::io::split(stream);
+            *client.conn.lock().await = Some(RigctldConnection {
+                reader: BufReader::new(reader),
+                writer,
+            });
+            let mut server = BufReader::new(server);
+            let transaction = client.set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+                tokio::time::Instant::now() + Duration::from_millis(30),
+            );
+            if cancel {
+                tokio::pin!(transaction);
+                let mut command = String::new();
+                tokio::select! {
+                    _ = &mut transaction => panic!("server has not acknowledged"),
+                    _ = server.read_line(&mut command) => assert_eq!(command, "L ATT 0\n"),
+                }
+            } else {
+                assert!(transaction.await.is_err());
+            }
+            // In either case an unfinished protocol exchange is quarantined.
+            assert!(client.conn.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_expired_deadline_never_writes() {
+        let (client, mut server) = split_read_tests::connected_client().await;
+        assert!(client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err());
+        let mut byte = [0];
+        use tokio::io::AsyncReadExt;
+        let read = timeout(Duration::from_millis(20), server.read(&mut byte)).await;
+        assert!(read.is_err() || matches!(read, Ok(Ok(0))));
+    }
+
+    #[test]
+    fn gain_capabilities_fail_closed() {
+        for text in [
+            "",
+            "Preamp: 10dB\nAttenuator: 6dB\n",
+            "Preamp: bogus\nAttenuator: 6dB\nGet level: PREAMP ATT\nSet level: PREAMP ATT\n",
+        ] {
+            assert!(parse_gain_capabilities(text).is_err());
         }
     }
 }

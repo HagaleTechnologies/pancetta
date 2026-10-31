@@ -641,6 +641,8 @@ impl super::ApplicationCoordinator {
         info!("Starting DSP component");
 
         let shutdown = self.shutdown_signal.clone();
+        let sweep_capture = self.sweep_capture.clone();
+        let gain_tx_epoch = self.message_bus.gain_tx_epoch.clone();
         let message_count = self.message_count.clone();
         // Current rig dial frequency (Hz), updated by hamlib FrequencyResponse.
         // Read per-window so recordings can be band-stamped. 0 = unknown
@@ -780,9 +782,18 @@ impl super::ApplicationCoordinator {
                 next_window_time.format("%H:%M:%S")
             );
 
+            let mut last_audio_batch = std::time::Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(samples) => {
+                        if audio_rx.len() > 1
+                            || last_audio_batch.elapsed() > std::time::Duration::from_millis(250)
+                        {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("missing audio or delayed DSP capture");
+                            }
+                        }
+                        last_audio_batch = std::time::Instant::now();
                         // Do not build the first new-band window from audio captured
                         // before both gain levels finished. Drain queued batches too.
                         if super::hamlib::gain_capture_changed(
@@ -849,6 +860,9 @@ impl super::ApplicationCoordinator {
                             &mut last_live_wf_samples,
                             &mut bin_history,
                         ) {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("dial changed during capture");
+                            }
                             if flush.band_changed {
                                 info!(
                                     target: "operator.override",
@@ -876,6 +890,9 @@ impl super::ApplicationCoordinator {
                         // immediately above.
                         let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
                         if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("mode changed during capture");
+                            }
                             let new_protocol = super::protocol_from_mode(
                                 pancetta_config::OperatingMode::from_u8(cur_mode_u8),
                             );
@@ -1024,6 +1041,9 @@ impl super::ApplicationCoordinator {
                             dsp_slot_ns,
                         );
                         if let Some(jump) = jump {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("clock discontinuity during capture");
+                            }
                             next_window_time = reanchored;
                             if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
                             {
@@ -1088,6 +1108,15 @@ impl super::ApplicationCoordinator {
                                 recorder.write_window(&window, &now, dial_hz);
                             }
 
+                            let sweep = sweep_capture.lock().ok().and_then(|mut registry| {
+                                registry.claim(
+                                    slot_boundary,
+                                    cur_dial_hz,
+                                    window_lead_secs,
+                                    gain_tx_epoch.load(Ordering::Acquire),
+                                )
+                            });
+                            let sweep_metadata = sweep.as_ref().map(|s| s.metadata.clone());
                             match super::pipeline::forward_or_drop(
                                 &dsp_to_ft8_tx,
                                 super::pipeline::DecodeWindow {
@@ -1100,11 +1129,20 @@ impl super::ApplicationCoordinator {
                                     // was appended while the DSP read a different
                                     // known dial. 0 still means unknown.
                                     dial_hz: cur_dial_hz,
+                                    sweep,
                                 },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
                             ) {
                                 super::pipeline::ForwardOutcome::Sent => {}
                                 super::pipeline::ForwardOutcome::Dropped => {
+                                    if let Some(metadata) = &sweep_metadata {
+                                        if let Ok(mut registry) = sweep_capture.lock() {
+                                            registry.invalidate(
+                                                metadata,
+                                                "decode pipeline backpressure",
+                                            );
+                                        }
+                                    }
                                     // A restarted/slow decoder must not wedge the DSP stage:
                                     // bounded backpressure intentionally sacrifices this slot,
                                     // then the next slot is still eligible for decoding.
@@ -1112,7 +1150,17 @@ impl super::ApplicationCoordinator {
                                         "DSP: FT8 stage not draining -- dropped one decode window"
                                     );
                                 }
-                                super::pipeline::ForwardOutcome::Disconnected => return Ok(()),
+                                super::pipeline::ForwardOutcome::Disconnected => {
+                                    if let Some(metadata) = &sweep_metadata {
+                                        if let Ok(mut registry) = sweep_capture.lock() {
+                                            registry.invalidate(
+                                                metadata,
+                                                "decode pipeline disconnected",
+                                            );
+                                        }
+                                    }
+                                    return Ok(());
+                                }
                             }
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
@@ -1628,6 +1676,7 @@ mod dial_change_signal_tests {
             let window = DecodeWindow {
                 samples: self.ft8_buffer[start..start + len].to_vec(),
                 dial_hz: cur_dial_hz,
+                sweep: None,
             };
             if self.ft8_buffer.len() > timing.overlap_samples {
                 let excess = self.ft8_buffer.len() - timing.overlap_samples;

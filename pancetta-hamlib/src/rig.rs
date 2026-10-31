@@ -141,9 +141,47 @@ pub struct RigOperationResult<T> {
     pub reconnected: bool,
 }
 
+/// A confirmed pair of receive-gain controls in integer dB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiveGain {
+    /// Preamp gain, with zero meaning bypass.
+    pub preamp_db: i32,
+    /// Attenuation, with zero meaning bypass.
+    pub attenuator_db: i32,
+}
+
+/// Gain steps advertised by the connected backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveGainCapabilities {
+    /// Supported preamp settings, including bypass.
+    pub preamp_db: Vec<i32>,
+    /// Supported attenuation settings, including bypass.
+    pub attenuator_db: Vec<i32>,
+}
+
 /// Trait for rig control operations
 #[async_trait]
 pub trait RigControl: Send + Sync {
+    /// Discover gain support; unsupported backends never invent settings.
+    async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        Err(HamlibError::not_supported("receive_gain_capabilities", None, None).into())
+    }
+
+    /// Read both receive controls without inventing bypass on failure.
+    async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        Err(HamlibError::not_supported("get_receive_gain", None, None).into())
+    }
+
+    /// Apply both controls and confirm readback before an absolute deadline.
+    /// A partial update or timeout is an error and still requires restoration.
+    async fn set_receive_gain(
+        &self,
+        _gain: ReceiveGain,
+        _deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        Err(HamlibError::not_supported("set_receive_gain", None, None).into())
+    }
+
     /// Connect to the rig
     async fn connect(&self) -> Result<()>;
 
@@ -310,6 +348,22 @@ mod split_default_tests {
         async fn get_info(&self) -> Result<String> {
             unimplemented!()
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_receive_gain_is_unsupported() {
+        assert!(DefaultOnlyRig.receive_gain_capabilities().await.is_err());
+        assert!(DefaultOnlyRig.get_receive_gain().await.is_err());
+        assert!(DefaultOnlyRig
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 0,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now()
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

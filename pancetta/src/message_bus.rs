@@ -1554,6 +1554,10 @@ impl DurableInbox {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    /// Atomic receive-gain transition and pending key-down reservation (PAN-244).
+    pub(crate) gain_tx_intents: Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) gain_tx_epoch: Arc<AtomicU64>,
+    pub(crate) gain_tx_gate: Arc<std::sync::atomic::AtomicU64>,
     /// Shared only by split-command producers and the split poll. PTT routing
     /// never takes this lock (PAN-202).
     pub(crate) split_observation_fence: Arc<SplitObservationFence>,
@@ -1589,6 +1593,9 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gain_tx_epoch: Arc::new(AtomicU64::new(0)),
+            gain_tx_intents: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
@@ -1605,6 +1612,9 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gain_tx_epoch: Arc::new(AtomicU64::new(0)),
+            gain_tx_intents: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),

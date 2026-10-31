@@ -1467,6 +1467,7 @@ impl super::ApplicationCoordinator {
             .get_or_create_channel(ComponentId::Hamlib)
             .await?;
         let message_bus = self.message_bus.clone();
+        let gain_tx_gate = self.message_bus.gain_tx_gate.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
 
         let receive_gain_config = self.config.clone();
@@ -2696,6 +2697,29 @@ impl super::ApplicationCoordinator {
                                         );
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
+                                        // Revalidate queued key-downs at the rig owner too.
+                                        // An acknowledged earlier unkey may have retired the
+                                        // producer's reservation while this command waited.
+                                        if *state
+                                            && gain_tx_gate
+                                                .fetch_update(
+                                                    Ordering::AcqRel,
+                                                    Ordering::Acquire,
+                                                    |value| {
+                                                        if value & 1 == 0 {
+                                                            Some(value | 2)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    },
+                                                )
+                                                .is_err()
+                                        {
+                                            warn!(
+                                                "Discarding PTT-on during receive-gain transition"
+                                            );
+                                            continue;
+                                        }
                                         if *state && tx_restart_inhibit.load(Ordering::Acquire) != 0
                                         {
                                             warn!(
@@ -2735,6 +2759,7 @@ impl super::ApplicationCoordinator {
                                                     if *state { "ON" } else { "OFF" }
                                                 );
                                                 if !*state {
+                                                    gain_tx_gate.fetch_and(!2, Ordering::AcqRel);
                                                     confirm_ptt_off(
                                                         &ptt_off_unconfirmed,
                                                         &ptt_off_confirmations,
