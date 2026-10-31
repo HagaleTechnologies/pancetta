@@ -786,7 +786,6 @@ impl super::ApplicationCoordinator {
             while !shutdown.load(Ordering::Acquire) {
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(samples) => {
-<<<<<<< HEAD
                         if audio_rx.len() > 1
                             || last_audio_batch.elapsed() > std::time::Duration::from_millis(250)
                         {
@@ -795,7 +794,6 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         last_audio_batch = std::time::Instant::now();
-=======
                         // Do not build the first new-band window from audio captured
                         // before both gain levels finished. Drain queued batches too.
                         if super::hamlib::gain_capture_changed(
@@ -807,7 +805,6 @@ impl super::ApplicationCoordinator {
                             for _ in audio_rx.try_iter() {}
                             continue;
                         }
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
                         message_count.fetch_add(1, Ordering::Relaxed);
                         batch_count += 1;
 
