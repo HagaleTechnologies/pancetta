@@ -33,6 +33,7 @@ mod psk_reporter;
 mod qso;
 mod qso_filter;
 mod readiness;
+pub mod receive_overload;
 mod remote_gateway;
 mod replay;
 mod restart_budget;
@@ -1197,6 +1198,12 @@ pub struct ApplicationCoordinator {
     /// permanently muting an otherwise healthy restart, since nothing else
     /// ever sets it back. Comparing against this generation counter at
     /// drop time makes a stale prior-generation guard a no-op instead.
+    pub(crate) overload_measurements: (
+        crossbeam_channel::Sender<receive_overload::Measurement>,
+        crossbeam_channel::Receiver<receive_overload::Measurement>,
+    ),
+    pub(crate) overload_capture_epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) overload_connection: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) hamlib_generation: Arc<std::sync::atomic::AtomicU64>,
 
     /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
@@ -2319,6 +2326,9 @@ impl ApplicationCoordinator {
             hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overload_measurements: crossbeam_channel::bounded(4),
+            overload_connection: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overload_capture_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             receive_gain_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is

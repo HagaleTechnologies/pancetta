@@ -36,6 +36,8 @@ pub struct MockRigConfig {
     pub frequency_range: (u64, u64),
     /// Whether the rig can report its split state.
     pub split_read_supported: bool,
+    /// Discrete supported attenuation settings in integer dB.
+    pub attenuator_steps: Vec<i32>,
     /// Memory channel count
     pub memory_channels: u32,
 }
@@ -53,6 +55,7 @@ impl Default for MockRigConfig {
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
             split_read_supported: true,
+            attenuator_steps: vec![0, 6, 10, 12, 20],
         }
     }
 }
@@ -698,6 +701,50 @@ impl RigControl for MockRig {
         Ok(ptt)
     }
 
+    fn connection_generation(&self) -> u64 {
+        1
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        self.simulate_failure("get_attenuator")?;
+        self.simulate_delay().await;
+        let state = self.state.read();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        Ok(state.attenuator_db)
+    }
+
+    async fn set_attenuator(&self, db: i32) -> Result<()> {
+        self.simulate_failure("set_attenuator")?;
+        self.simulate_delay().await;
+        if db < 0 || !self.config.attenuator_steps.contains(&db) {
+            return Err(anyhow!("Unsupported attenuation"));
+        }
+        let mut state = self.state.write();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        state.attenuator_db = db;
+        Ok(())
+    }
+
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        self.simulate_failure("supported_attenuator_steps")?;
+        self.simulate_delay().await;
+        if !self.state.read().connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        let mut steps = self.config.attenuator_steps.clone();
+        if steps.iter().any(|&db| db < 0) || !steps.iter().any(|&db| db > 0) {
+            return Err(anyhow!("Unsupported attenuation"));
+        }
+        steps.push(0);
+        steps.sort_unstable();
+        steps.dedup();
+        Ok(steps)
+    }
+
     #[instrument(skip(self))]
     async fn set_power_level(&self, level: f32) -> Result<()> {
         self.simulate_failure("set_power_level")?;
@@ -767,33 +814,6 @@ impl RigControl for MockRig {
             return Err(anyhow!("Mock rig not connected"));
         }
         Ok(state.preamp_db)
-    }
-
-    async fn set_attenuator(&self, db: i32) -> Result<()> {
-        self.simulate_failure("set_attenuator")?;
-        self.simulate_delay().await;
-        if db < 0 {
-            return Err(anyhow!("Receive gain must not be negative"));
-        }
-        {
-            let mut state = self.state.write();
-            if !state.connected {
-                return Err(anyhow!("Mock rig not connected"));
-            }
-            state.attenuator_db = db;
-        }
-        self.update_operation_time();
-        Ok(())
-    }
-
-    async fn get_attenuator(&self) -> Result<i32> {
-        self.simulate_failure("get_attenuator")?;
-        self.simulate_delay().await;
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
-        Ok(state.attenuator_db)
     }
 
     #[instrument(skip(self))]
@@ -1264,5 +1284,31 @@ mod split_read_tests {
         assert_eq!(rig.get_split().await.unwrap(), (true, Vfo::B));
         assert_eq!(rig.get_split_freq().await.unwrap(), 15_000_000);
         assert_eq!(rig.get_operation_count(), before);
+    }
+}
+
+#[cfg(test)]
+mod attenuator_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integer_attenuator_round_trip_and_nonuniform_steps() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            attenuator_steps: vec![20, 0, 10, 10],
+            ..Default::default()
+        });
+        assert!(rig.get_attenuator().await.is_err());
+        rig.connect().await.unwrap();
+        assert_eq!(
+            rig.supported_attenuator_steps().await.unwrap(),
+            vec![0, 10, 20]
+        );
+        assert_eq!(rig.get_attenuator().await.unwrap(), 0);
+        assert!(rig.set_attenuator(-1).await.is_err());
+        assert!(rig.set_attenuator(6).await.is_err());
+        rig.set_attenuator(10).await.unwrap();
+        assert_eq!(rig.get_attenuator().await.unwrap(), 10);
     }
 }

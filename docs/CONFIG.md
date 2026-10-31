@@ -199,6 +199,62 @@ baud_rate = 38400
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
 
+### `[rig.receive_overload_guard]` receive overload protection
+
+```toml
+[rig.receive_overload_guard]
+enabled = true  # default false; restart required
+```
+
+This opt-in guard applies only to live FT8 receive audio with a connected rig.
+Omitting the table, using an empty table, or setting `enabled = false` disables
+both automatic ATT writes and the feature's capability probes. `enabled` must
+be a TOML boolean. Existing audio-level configuration is unchanged.
+
+Three consecutive eligible receive windows with raw 12 kHz sample peaks at or
+above -1 dBFS request one higher supported attenuator setting at the next safe
+receive capture boundary. The peak is measured before software gain. The normal
+0.25 to 0.28 full-scale reference is below the trigger. Three consecutive windows
+strictly below -6 dBFS cancel a pending step. A confirmed step requires three new
+hot windows before another step. Silence counts as cool audio; incomplete,
+nonfinite, stale, mixed-gain or TX-contaminated windows cannot advance a streak.
+Retunes, mode changes, audio gaps and reconnects clear pending work.
+
+The guard discovers discrete integer-dB ATT settings from Hamlib. It reads the
+current setting at execution time and selects the smallest supported setting
+above it. There is no model-specific fallback and no configurable step list.
+Discovery failure disables automatic attenuation for that connection. An already
+maximum setting produces a warning without a write. Replay, WAV input, no-audio
+and FT4/FT2 operation do not generate automatic changes.
+
+Gain changes reserve the radio before CAT I/O. All PTT-on paths refuse while a
+change is in progress or unconfirmed; PTT-off remains available. ATT changes
+require confirmed receive state, including acknowledgement of queued unkey
+commands. Missed capture boundaries are skipped. A command failure or mismatching
+readback stops automatic writes and inhibits TX until reconnection confirms PTT
+off and a stable ATT setting. Closing a timed-out socket cannot cancel a command
+the hardware already received.
+
+Diagnostics and headless logs use the target `rig.rx_overload`. A successful
+notice is emitted only after acknowledgement and matching readback, for example:
+
+```text
+Receive overload on 40m: peak -0.5 dBFS; attenuator increased from 0 dB to 6 dB.
+```
+
+Unavailable, maximum and failure warnings are retained in Diagnostics without
+per-window logging. The readiness blocker is `receive gain change is in progress
+or unconfirmed`. The guard never restores attenuation, even after cool audio,
+disabling the feature or restarting. The operator or a per-band preset owns
+resetting it. It does not change PREAMP, RF gain, AGC or audio output gain.
+
+Hardware qualification is pending, including FTdx10 supported-step discovery,
+ATT acknowledgement/readback, physical overload response, TX deferral and
+settling time. Container tests do not establish on-air qualification. Before
+station use, with TX disabled, compare discovered ATT steps with the rig manual
+and use a controlled source to check a three-window trip and cool-window hold.
+Use the station's approved procedure for any later on-air checks.
+
 ### `[rig.receive_gain_presets]` — per-band preamp and attenuator
 
 ```toml

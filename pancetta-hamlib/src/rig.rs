@@ -177,6 +177,27 @@ pub trait RigControl: Send + Sync {
     /// Get PTT state
     async fn get_ptt(&self, vfo: Vfo) -> Result<PttState>;
 
+    /// Identity of the current transport connection, changed on reconnect.
+    fn connection_generation(&self) -> u64 {
+        0
+    }
+
+    /// Read the current attenuator in integer dB. Unsupported is never bypass.
+    async fn get_attenuator(&self) -> Result<i32> {
+        Err(HamlibError::not_supported("get_attenuator", None, None).into())
+    }
+
+    /// Set attenuation in integer dB. Backends must reject negative values.
+    async fn set_attenuator(&self, _db: i32) -> Result<()> {
+        Err(HamlibError::not_supported("set_attenuator", None, None).into())
+    }
+
+    /// Query supported attenuator settings, including bypass zero on success.
+    /// Callers cache the result for their current connection generation.
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        Err(HamlibError::not_supported("supported_attenuator_steps", None, None).into())
+    }
+
     /// Set power level (0.0-1.0)
     async fn set_power_level(&self, level: f32) -> Result<()>;
 
@@ -191,16 +212,6 @@ pub trait RigControl: Send + Sync {
     /// Read preamp gain in dB.
     async fn get_preamp(&self) -> Result<i32> {
         Err(HamlibError::not_supported("get_preamp", None, None).into())
-    }
-
-    /// Set attenuation in hamlib ATT dB.
-    async fn set_attenuator(&self, _att_db: i32) -> Result<()> {
-        Err(HamlibError::not_supported("set_attenuator", None, None).into())
-    }
-
-    /// Read attenuation in dB.
-    async fn get_attenuator(&self) -> Result<i32> {
-        Err(HamlibError::not_supported("get_attenuator", None, None).into())
     }
 
     /// Get S-meter reading
@@ -314,6 +325,9 @@ mod split_default_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn default_split_read_fails_closed() {
+        assert!(DefaultOnlyRig.get_attenuator().await.is_err());
+        assert!(DefaultOnlyRig.set_attenuator(0).await.is_err());
+        assert!(DefaultOnlyRig.supported_attenuator_steps().await.is_err());
         assert!(DefaultOnlyRig
             .get_split()
             .await

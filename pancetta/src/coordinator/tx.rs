@@ -2832,6 +2832,9 @@ impl PttGuard {
     ) -> Self {
         {
             let _ptt_sync = ptt_sync_gate.lock().await;
+            // Reserve the relocation interlock even if gain currently blocks
+            // hardware key-down. Gain may recover during status publication;
+            // send_ptt_command still refuses key-down while gain is blocked.
             ptt_active.store(true, std::sync::atomic::Ordering::Release);
         }
         last_ptt_on_ms.store(super::now_epoch_ms(), std::sync::atomic::Ordering::Release);
@@ -3555,6 +3558,7 @@ pub(crate) fn tx_hard_mute_reason(
     hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     rig_conn_state: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     audio_output_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    receive_gain: &std::sync::Arc<super::receive_overload::GainSafety>,
 ) -> Option<&'static str> {
     if restart_inhibit.load(Ordering::Acquire) != 0 {
         Some("rig control is restarting")
@@ -3570,6 +3574,8 @@ pub(crate) fn tx_hard_mute_reason(
         Some("pending rig frequency/split state has not been delivered yet")
     } else if hamlib_command_in_flight.load(Ordering::Acquire) > 0 {
         Some("a rig frequency/split command is still being applied")
+    } else if receive_gain.blocked() {
+        Some("receive gain change is in progress or unconfirmed")
     } else if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
         Some("TX policy is Disabled")
     } else {
@@ -4107,6 +4113,7 @@ pub(crate) enum TxMuteCause {
     AudioOutputDead,
     RigStatePending,
     RigCommandInFlight,
+    ReceiveGainUnconfirmed,
     PolicyDisabled,
 }
 
@@ -4123,6 +4130,9 @@ impl TxMuteCause {
             }
             TxMuteCause::RigCommandInFlight => {
                 "a rig frequency/split command is still being applied"
+            }
+            TxMuteCause::ReceiveGainUnconfirmed => {
+                "receive gain change is in progress or unconfirmed"
             }
             TxMuteCause::PolicyDisabled => "TX policy is Disabled",
         }
@@ -4147,6 +4157,7 @@ pub(crate) fn tx_mute_causes(
     hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     rig_conn_state: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     audio_output_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    receive_gain: &std::sync::Arc<super::receive_overload::GainSafety>,
 ) -> Vec<TxMuteCause> {
     let mut causes = Vec::new();
     if restart_inhibit.load(Ordering::Acquire) != 0 {
@@ -4168,6 +4179,9 @@ pub(crate) fn tx_mute_causes(
     }
     if hamlib_command_in_flight.load(Ordering::Acquire) > 0 {
         causes.push(TxMuteCause::RigCommandInFlight);
+    }
+    if receive_gain.blocked() {
+        causes.push(TxMuteCause::ReceiveGainUnconfirmed);
     }
     if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
         causes.push(TxMuteCause::PolicyDisabled);
@@ -4241,6 +4255,11 @@ mod tx_hard_mute_reason_tests {
                 &not_in_flight(),
                 &rig(RigConnState::Connected),
                 &audio_alive(true),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             ),
             None
         );
@@ -4260,6 +4279,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             &rig(RigConnState::Connected),
             &audio_alive(true),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         )
         .is_some());
     }
@@ -4293,6 +4317,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             &rig(RigConnState::Connected),
             &audio_alive(true),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         );
         assert!(
             reason.is_some(),
@@ -4327,6 +4356,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             &rig(RigConnState::Connected),
             &audio_alive(true),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         );
         assert!(
             reason.is_some(),
@@ -4348,6 +4382,11 @@ mod tx_hard_mute_reason_tests {
                 &not_in_flight(),
                 &rig(RigConnState::Connected),
                 &audio_alive(true),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
@@ -4385,6 +4424,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             &rig(RigConnState::Connected),
             &audio_alive(true),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         )
         .is_some());
     }
@@ -4427,6 +4471,11 @@ mod tx_hard_mute_reason_tests {
                     &not_in_flight(),
                     &rig(RigConnState::Connected),
                     &audio_alive(true),
+                    &{
+                        let gain = super::super::receive_overload::GainSafety::default();
+                        gain.confirmed_off(0);
+                        std::sync::Arc::new(gain)
+                    },
                 )
                 .is_some(),
                 "a pending command for {vfo:?} alone must still mute TX"
@@ -4449,6 +4498,11 @@ mod tx_hard_mute_reason_tests {
                 &not_in_flight(),
                 &rig(RigConnState::Connected),
                 &audio_alive(true),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             ),
             Some("TX policy is Disabled")
         );
@@ -4480,6 +4534,11 @@ mod tx_hard_mute_reason_tests {
                 &not_in_flight(),
                 &rig(RigConnState::Connected),
                 &audio_alive(true),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             )
             .is_some(),
             "a poisoned pending-slot lock must fail closed (still muted), not be treated as \
@@ -4512,6 +4571,11 @@ mod tx_hard_mute_reason_tests {
             &in_flight,
             &rig(RigConnState::Connected),
             &audio_alive(true),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         );
         assert!(
             reason.is_some(),
@@ -4533,6 +4597,11 @@ mod tx_hard_mute_reason_tests {
                 &in_flight,
                 &rig(RigConnState::Connected),
                 &audio_alive(true),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             ),
             None,
             "PTT-on must be permitted again once the in-flight CAT call has resolved"
@@ -4556,6 +4625,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             rig_state,
             audio,
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         )
     }
 
@@ -4722,6 +4796,13 @@ mod tx_hard_mute_reason_tests {
                                         &command_in_flight,
                                         &rig_conn,
                                         &output_alive,
+                                        &{
+                                            let gain =
+                                                super::super::receive_overload::GainSafety::default(
+                                                );
+                                            gain.confirmed_off(0);
+                                            std::sync::Arc::new(gain)
+                                        },
                                     );
                                     let causes = tx_mute_causes(
                                         &tx_policy,
@@ -4732,6 +4813,13 @@ mod tx_hard_mute_reason_tests {
                                         &command_in_flight,
                                         &rig_conn,
                                         &output_alive,
+                                        &{
+                                            let gain =
+                                                super::super::receive_overload::GainSafety::default(
+                                                );
+                                            gain.confirmed_off(0);
+                                            std::sync::Arc::new(gain)
+                                        },
                                     );
                                     let case = format!(
                                         "inhibit={inhibit} loop_ready={loop_ready} conn={conn:?} \
@@ -4756,6 +4844,50 @@ mod tx_hard_mute_reason_tests {
     }
 
     #[test]
+    fn receive_gain_mute_matches_readiness_for_stable_and_unconfirmed_gain() {
+        let gain = Arc::new(super::super::receive_overload::GainSafety::default());
+        gain.confirmed_off(0);
+        for blocked in [false, true] {
+            if blocked {
+                gain.fail_gain();
+            }
+            let verdict = tx_hard_mute_reason(
+                &policy(pancetta_core::TxPolicy::Full),
+                &Arc::new(AtomicU32::new(0)),
+                &Arc::new(AtomicBool::new(true)),
+                &no_pending_frequency(),
+                &no_pending(),
+                &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
+                &gain,
+            );
+            let causes = tx_mute_causes(
+                &policy(pancetta_core::TxPolicy::Full),
+                &Arc::new(AtomicU32::new(0)),
+                &Arc::new(AtomicBool::new(true)),
+                &no_pending_frequency(),
+                &no_pending(),
+                &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
+                &gain,
+            );
+            assert_eq!(verdict, causes.first().map(|cause| cause.as_reason()));
+            assert_eq!(
+                causes.contains(&TxMuteCause::ReceiveGainUnconfirmed),
+                blocked
+            );
+            if blocked {
+                assert_eq!(
+                    verdict,
+                    Some("receive gain change is in progress or unconfirmed")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tx_mute_causes_lists_every_active_cause_in_gate_priority_order() {
         let causes = tx_mute_causes(
             &policy(pancetta_core::TxPolicy::Disabled),
@@ -4766,6 +4898,11 @@ mod tx_hard_mute_reason_tests {
             &not_in_flight(),
             &rig(RigConnState::PollingFailed),
             &audio_alive(false),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         );
         assert_eq!(
             causes,
@@ -4788,6 +4925,11 @@ mod tx_hard_mute_reason_tests {
             &Arc::new(AtomicU32::new(2)),
             &rig(RigConnState::PollingFailed),
             &audio_alive(false),
+            &{
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                std::sync::Arc::new(gain)
+            },
         );
         assert_eq!(
             causes,
@@ -4847,6 +4989,11 @@ mod tx_hard_mute_reason_tests {
                 &Arc::new(AtomicU32::new(in_flight)),
                 &rig(conn),
                 &audio_alive(alive),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             )
         };
         let full = pancetta_core::TxPolicy::Full;
@@ -5600,15 +5747,31 @@ pub(crate) fn send_ptt_command(
     state: bool,
     authorize: impl FnOnce() -> bool,
 ) -> SendIfOutcome {
-    message_bus.send_rig_command_if(
+    let mut admitted = false;
+    let outcome = message_bus.send_rig_command_if(
         ComponentMessage::new(
             source,
             ComponentId::Hamlib,
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
             Instant::now(),
         ),
-        authorize,
-    )
+        || {
+            if !authorize() {
+                return false;
+            }
+            if !state {
+                return true;
+            }
+            admitted = message_bus
+                .receive_gain
+                .admit_ptt(chrono::Utc::now().timestamp_millis());
+            admitted
+        },
+    );
+    if admitted && outcome != SendIfOutcome::Enqueued {
+        message_bus.receive_gain.ptt_command_consumed();
+    }
+    outcome
 }
 
 /// PAN-202 test seam: when armed, parks the worker once between its last
@@ -8399,6 +8562,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_in_flight,
                                         &rig_conn_state,
                                         &audio_output_alive,
+                                        &message_bus.receive_gain,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -9058,6 +9222,7 @@ impl super::ApplicationCoordinator {
                                             &hamlib_command_in_flight,
                                             &rig_conn_state,
                                             &audio_output_alive,
+                                            &message_bus.receive_gain,
                                         ) {
                                             emit_diagnostic(
                                                 &message_bus,
@@ -9536,6 +9701,7 @@ impl super::ApplicationCoordinator {
                                             &hamlib_command_in_flight,
                                             &rig_conn_state,
                                             &audio_output_alive,
+                                            &message_bus.receive_gain,
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
@@ -10854,6 +11020,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_in_flight,
                                         &rig_conn_state,
                                         &audio_output_alive,
+                                        &message_bus.receive_gain,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -12200,6 +12367,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_in_flight,
                                         &rig_conn_state,
                                         &audio_output_alive,
+                                        &message_bus.receive_gain,
                                     ) {
                                         emit_diagnostic(
                                             &message_bus,
@@ -12568,6 +12736,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_in_flight,
                                         &rig_conn_state,
                                         &audio_output_alive,
+                                        &message_bus.receive_gain,
                                     ) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
@@ -13426,6 +13595,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_in_flight,
                                         &rig_conn_state,
                                         &audio_output_alive,
+                                        &message_bus.receive_gain,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -24574,6 +24744,34 @@ mod pan135_ptt_release_tests {
         )
         .await
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_recovery_before_key_keeps_relocation_interlock_active() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        bus.receive_gain.confirmed_off(100);
+        assert!(bus.receive_gain.reserve());
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+
+        // ATT finishes while the worker yields to publish TX status.
+        tokio::task::yield_now().await;
+        bus.receive_gain.finish_gain(101);
+        assert_eq!(
+            send_ptt_command(&bus, ComponentId::Ft8Transmitter, true, || true),
+            SendIfOutcome::Enqueued
+        );
+        assert!(rx.try_iter().any(|m| matches!(
+            m.message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        )));
+        assert!(
+            ptt_active.load(Ordering::Acquire),
+            "keyed TX must block relocation even if gain was blocked at guard construction"
+        );
+        assert_eq!(g.release("gain recovery test").await, PttRelease::Delivered);
+        assert!(!ptt_active.load(Ordering::Acquire));
+    }
+
     async fn backlog(bus: &MessageBus) -> bool {
         bus.send_message_checked(ComponentMessage::new(
             ComponentId::Hamlib,
@@ -27094,5 +27292,44 @@ mod pan71_playback_start_tests {
             "the queued record lands once the disk responds"
         );
         assert_eq!(lines[0].text, TEXT);
+    }
+}
+
+#[cfg(test)]
+mod receive_overload_ptt_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn gain_reservation_refuses_every_ptt_origin_but_always_allows_unkey() {
+        let bus = MessageBus::new(8).unwrap();
+        let (_, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        bus.receive_gain.confirmed_off(0);
+        assert!(bus.receive_gain.reserve());
+        for source in [ComponentId::Ft8Transmitter, ComponentId::Tui] {
+            assert_eq!(
+                send_ptt_command(&bus, source, true, || true),
+                SendIfOutcome::Denied
+            );
+            assert_eq!(
+                send_ptt_command(&bus, source, false, || true),
+                SendIfOutcome::Enqueued
+            );
+            assert!(matches!(
+                rx.try_recv().unwrap().message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false
+                })
+            ));
+        }
+        assert!(rx.try_recv().is_err());
+        bus.receive_gain.fail_gain();
+        assert_eq!(
+            send_ptt_command(&bus, ComponentId::Tui, true, || true),
+            SendIfOutcome::Denied
+        );
+        assert_eq!(
+            send_ptt_command(&bus, ComponentId::Tui, false, || true),
+            SendIfOutcome::Enqueued
+        );
     }
 }
