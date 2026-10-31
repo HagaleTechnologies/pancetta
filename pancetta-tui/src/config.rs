@@ -59,7 +59,6 @@ pub struct AudioConfig {
     pub device: Option<String>,
     pub sample_rate: u32,
     pub buffer_size: usize,
-    pub auto_gain: bool,
     pub gain_level: f32,
 }
 
@@ -135,7 +134,6 @@ impl Default for Config {
                 device: None,
                 sample_rate: 48000,
                 buffer_size: 1024,
-                auto_gain: true,
                 gain_level: 1.0,
             },
             decoder: DecoderConfig {

@@ -176,6 +176,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         false,
     ),
     kb(
+        "G",
+        "save gain preset for this band",
+        Category::AudioDevices,
+        false,
+    ),
+    kb(
         "g",
         "Cycle TX policy: Full → Respond-only → Disabled",
         Category::TxControl,

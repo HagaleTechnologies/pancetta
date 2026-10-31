@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
+  (PAN-247). Legacy sections still load with one warning that the setting
+  no longer exists and has no effect. Manual `audio.levels.input_gain_db`
+  remains available.
+
 ### Added
+
+- Per-band preamp and attenuator presets apply on Pancetta-commanded band changes. Press `G` to save the current rig gain for this band (PAN-245).
 
 - Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
   (PAN-57). Each completed QSO's uploads are saved to

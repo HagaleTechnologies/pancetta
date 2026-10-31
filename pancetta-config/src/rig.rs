@@ -76,6 +76,15 @@ pub struct RigBookmark {
     pub ptt_method: PttMethod,
 }
 
+/// Per-band receive-gain preset (PAN-245), in hamlib level dB.
+/// On FTdx10, PREAMP 0/10/20 means IPO/AMP1/AMP2; ATT is 0/6/12/18.
+/// RF gain remains manual.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReceiveGainPreset {
+    pub preamp_db: i32,
+    pub attenuator_db: i32,
+}
+
 /// Rig control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: omitted fields fall back to defaults rather
@@ -134,6 +143,11 @@ pub struct RigConfig {
     /// field directly.
     #[serde(default)]
     pub bookmarks: Option<Vec<RigBookmark>>,
+
+    /// Band Display-name keys mapped to preamp and attenuator dB.
+    /// An absent layer preserves lower-layer presets; an explicit map replaces them.
+    #[serde(default)]
+    pub receive_gain_presets: Option<HashMap<String, ReceiveGainPreset>>,
 }
 
 /// Automatic receive overload protection. Never restores attenuation.
@@ -851,6 +865,7 @@ impl Default for RigConfig {
             rig_parameters: RigParametersConfig::default(),
             custom_commands: HashMap::new(),
             bookmarks: None,
+            receive_gain_presets: None,
         }
     }
 }
@@ -1068,6 +1083,34 @@ impl ConfigSection for RigConfig {
         // Reject an unrecognized operating mode at config-load time.
         self.operating_mode()?;
 
+        if let Some(presets) = &self.receive_gain_presets {
+            // Keep canonical band Display names at this config boundary; the
+            // config crate is independent of the runtime/core types.
+            const BANDS: &[&str] = &[
+                "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m",
+                "70cm",
+            ];
+            for (band, preset) in presets {
+                if !BANDS.contains(&band.as_str()) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "rig.receive_gain_presets".into(),
+                        value: band.clone(),
+                    });
+                }
+                for (field, value) in [
+                    ("preamp_db", preset.preamp_db),
+                    ("attenuator_db", preset.attenuator_db),
+                ] {
+                    if value < 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("rig.receive_gain_presets.{band}.{field}"),
+                            value: value.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Validate CAT interface settings
         if self.interface.enabled {
             if self.interface.baud_rate == 0 {
@@ -1133,6 +1176,10 @@ impl ConfigSection for RigConfig {
         // it showing through).
         if let Some(bookmarks) = other.bookmarks {
             self.bookmarks = Some(bookmarks);
+        }
+
+        if other.receive_gain_presets.is_some() {
+            self.receive_gain_presets = other.receive_gain_presets;
         }
 
         // Merge complex configurations
@@ -1247,6 +1294,7 @@ mod tests {
     use super::*;
 
     #[test]
+<<<<<<< HEAD
     fn receive_overload_defaults_and_partial_tables() {
         for source in [
             "",
@@ -1263,10 +1311,80 @@ mod tests {
         assert!(round_trip.receive_overload_guard.enabled);
         assert!(
             toml::from_str::<RigConfig>("[receive_overload_guard]\nenabled = \"yes\"").is_err()
+=======
+    fn receive_gain_parse_validate_and_merge() {
+        assert!(RigConfig::default().receive_gain_presets.is_none());
+        let mut cfg: RigConfig = toml::from_str(
+            r#"[receive_gain_presets."10m"]
+preamp_db = 10
+attenuator_db = 6
+[receive_gain_presets."40m"]
+preamp_db = 0
+attenuator_db = 12
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.receive_gain_presets.as_ref().unwrap()["10m"].preamp_db,
+            10
+        );
+        assert!(cfg.validate_section().is_ok());
+        let roundtrip: RigConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg.receive_gain_presets, roundtrip.receive_gain_presets);
+        cfg.merge_with(RigConfig::default());
+        assert_eq!(cfg.receive_gain_presets.as_ref().unwrap().len(), 2);
+        cfg.merge_with(RigConfig {
+            receive_gain_presets: Some(HashMap::from([(
+                "15m".to_owned(),
+                ReceiveGainPreset {
+                    preamp_db: 20,
+                    attenuator_db: 0,
+                },
+            )])),
+            ..Default::default()
+        });
+        assert_eq!(cfg.receive_gain_presets.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            cfg.receive_gain_presets.as_ref().unwrap()["15m"].preamp_db,
+            20
+        );
+        cfg.merge_with(RigConfig {
+            receive_gain_presets: Some(HashMap::new()),
+            ..Default::default()
+        });
+        assert!(cfg.receive_gain_presets.unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_gain_rejects_invalid_entries() {
+        for (band, preamp, att, expected) in [
+            ("11m", 0, 0, "11m"),
+            ("10m", -1, 0, "preamp_db"),
+            ("40m", 0, -6, "attenuator_db"),
+        ] {
+            let cfg: RigConfig = toml::from_str(&format!(
+                "[receive_gain_presets.\"{band}\"]\npreamp_db = {preamp}\nattenuator_db = {att}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_section().unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains(if preamp < 0 {
+                "-1"
+            } else if att < 0 {
+                "-6"
+            } else {
+                band
+            }));
+        }
+        assert!(
+            toml::from_str::<RigConfig>("[receive_gain_presets.\"10m\"]\npreamp_db = 10\n")
+                .is_err()
+>>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
         );
     }
 
     #[test]
+<<<<<<< HEAD
     fn receive_overload_merge_carries_enable_and_disable() {
         let mut base = RigConfig::default();
         let enabled: RigConfig =
@@ -1280,6 +1398,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
     fn test_default_rig_config() {
         let config = RigConfig::default();
         assert_eq!(config.model, "Generic");

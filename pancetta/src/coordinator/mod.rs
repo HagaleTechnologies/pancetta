@@ -26,6 +26,7 @@ mod dx_cluster;
 mod effort;
 mod ft8;
 mod hamlib;
+pub use hamlib::apply_receive_gain_preset;
 mod health;
 mod pipeline;
 mod psk_reporter;
@@ -1248,6 +1249,9 @@ pub struct ApplicationCoordinator {
     /// above.
     pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
 
+    /// Even when receive gain is settled; odd during a receive-band retune.
+    pub(crate) receive_gain_epoch: Arc<std::sync::atomic::AtomicU64>,
+
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the adaptive stall
     /// detector's `TxOffsetActionNeeded` emission) and the autonomous operator
@@ -2322,9 +2326,13 @@ impl ApplicationCoordinator {
             hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+<<<<<<< HEAD
             overload_measurements: crossbeam_channel::bounded(4),
             overload_connection: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             overload_capture_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+=======
+            receive_gain_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+>>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches

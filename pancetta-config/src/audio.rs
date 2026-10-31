@@ -38,9 +38,6 @@ pub struct AudioConfig {
     /// Audio processing chain configuration
     pub processing: AudioProcessingConfig,
 
-    /// AGC (Automatic Gain Control) settings
-    pub agc: AgcConfig,
-
     /// Noise reduction settings
     pub noise_reduction: NoiseReductionConfig,
 
@@ -215,58 +212,6 @@ pub struct EmphasisConfig {
 
     /// Time constant in microseconds (75us for FM, 50us for some systems)
     pub time_constant_us: f32,
-}
-
-/// AGC (Automatic Gain Control) configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgcConfig {
-    /// Enable AGC
-    pub enabled: bool,
-
-    /// AGC mode
-    pub mode: AgcMode,
-
-    /// Target level in dB
-    pub target_level_db: f32,
-
-    /// Maximum gain in dB
-    pub max_gain_db: f32,
-
-    /// Attack time in milliseconds
-    pub attack_time_ms: f32,
-
-    /// Decay time in milliseconds
-    pub decay_time_ms: f32,
-
-    /// Hang time in milliseconds
-    pub hang_time_ms: f32,
-
-    /// Threshold in dB
-    pub threshold_db: f32,
-}
-
-/// AGC modes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgcMode {
-    /// Fast AGC response
-    Fast,
-
-    /// Medium AGC response
-    Medium,
-
-    /// Slow AGC response
-    Slow,
-
-    /// Manual gain control
-    Manual,
-
-    /// Peak AGC
-    Peak,
-
-    /// RMS AGC
-    Rms,
 }
 
 /// Noise reduction configuration
@@ -549,7 +494,6 @@ impl Default for AudioConfig {
             output_channels: 2,
             bit_depth: BitDepth::Float32,
             processing: AudioProcessingConfig::default(),
-            agc: AgcConfig::default(),
             noise_reduction: NoiseReductionConfig::default(),
             routing: AudioRoutingConfig::default(),
             recording: RecordingConfig::default(),
@@ -628,21 +572,6 @@ impl Default for EmphasisConfig {
             pre_emphasis_enabled: false,
             de_emphasis_enabled: false,
             time_constant_us: 75.0,
-        }
-    }
-}
-
-impl Default for AgcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            mode: AgcMode::Medium,
-            target_level_db: -20.0,
-            max_gain_db: 30.0,
-            attack_time_ms: 1.0,
-            decay_time_ms: 500.0,
-            hang_time_ms: 200.0,
-            threshold_db: -60.0,
         }
     }
 }
@@ -789,14 +718,6 @@ impl ConfigSection for AudioConfig {
             });
         }
 
-        // Validate AGC settings
-        if self.agc.enabled && (self.agc.max_gain_db < 0.0 || self.agc.max_gain_db > 60.0) {
-            return Err(ConfigError::InvalidValue {
-                field: "agc.max_gain_db".to_string(),
-                value: self.agc.max_gain_db.to_string(),
-            });
-        }
-
         Ok(())
     }
 
@@ -831,7 +752,6 @@ impl ConfigSection for AudioConfig {
 
         // Merge complex structures
         self.processing.merge_with(other.processing);
-        self.agc.merge_with(other.agc);
         self.noise_reduction.merge_with(other.noise_reduction);
         self.routing.merge_with(other.routing);
         self.recording.merge_with(other.recording);
@@ -846,12 +766,6 @@ impl ConfigSection for AudioConfig {
 impl AudioProcessingConfig {
     fn merge_with(&mut self, other: Self) {
         // Always take the other value for all fields
-        *self = other;
-    }
-}
-
-impl AgcConfig {
-    fn merge_with(&mut self, other: Self) {
         *self = other;
     }
 }
@@ -937,13 +851,5 @@ mod tests {
         assert_eq!(compression.ratio, 3.0);
         assert_eq!(compression.threshold_db, -20.0);
         assert!(!compression.enabled);
-    }
-
-    #[test]
-    fn test_agc_config() {
-        let agc = AgcConfig::default();
-        assert!(agc.enabled);
-        assert_eq!(agc.target_level_db, -20.0);
-        assert_eq!(agc.max_gain_db, 30.0);
     }
 }

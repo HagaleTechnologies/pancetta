@@ -776,6 +776,9 @@ impl ConfigLoader {
     fn warn_unknown_nested(&self, raw: &toml::Table, known: &serde_json::Value, table: &str) {
         for (key, value) in raw {
             match known.get(key) {
+                None if table == "audio" && key == "agc" => self.push_load_warning(
+                    "The [audio.agc] automatic-gain setting no longer exists and has no effect. Remove this section from your config.".to_string(),
+                ),
                 None => self.push_load_warning(format!(
                     "Unknown config key `{key}` in [{table}] — ignored (check spelling; see docs/CONFIG.md)"
                 )),
@@ -1901,6 +1904,61 @@ gainn         = 2.0
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("`qrz`"), "{warnings:?}");
         assert!(warnings[0].contains("[network]"), "{warnings:?}");
+    }
+
+    const REMOVED_AGC_WARNING: &str = "The [audio.agc] automatic-gain setting no longer exists and has no effect. Remove this section from your config.";
+
+    #[test]
+    fn removed_audio_agc_toml_loads_with_one_warning() {
+        for agc in [
+            "enabled = true\nmode = \"fast\"\ntarget_level_db = -20.0\nmax_gain_db = 30.0\nattack_time_ms = 1.0\ndecay_time_ms = 500.0\nhang_time_ms = 200.0\nthreshold_db = -60.0",
+            "enabled = false\nmode = \"obsolete-mode\"\nmax_gain_db = -999.0",
+        ] {
+            let loader = ConfigLoader::new().unwrap();
+            let config = loader.parse_toml(&format!(
+                "[station]\ncallsign = \"W1AW\"\ngrid_square = \"FN31\"\n[audio.levels]\ninput_gain_db = 3.0\n[audio.agc]\n{agc}\n"
+            )).unwrap();
+            config.validate().unwrap();
+            assert_eq!(loader.load_warnings(), vec![REMOVED_AGC_WARNING]);
+            assert_eq!(config.audio.levels.input_gain_db, 3.0);
+            assert!(serde_json::to_value(&config).unwrap()["audio"].get("agc").is_none());
+            assert!(!toml::to_string(&config).unwrap().contains("[audio.agc]"));
+        }
+    }
+
+    #[test]
+    fn removed_audio_agc_json_loads_with_one_warning() {
+        let loader = ConfigLoader::new().unwrap();
+        let config = loader
+            .parse_json(
+                r#"{
+            "station": {"callsign": "W1AW", "grid_square": "FN31"},
+            "audio": {
+                "levels": {"input_gain_db": 3.0},
+                "agc": {"enabled": true, "mode": "obsolete-mode", "max_gain_db": -999.0}
+            }
+        }"#,
+            )
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(loader.load_warnings(), vec![REMOVED_AGC_WARNING]);
+        assert_eq!(config.audio.levels.input_gain_db, 3.0);
+        assert!(serde_json::to_value(&config).unwrap()["audio"]
+            .get("agc")
+            .is_none());
+    }
+
+    #[test]
+    fn absent_audio_agc_has_no_warning() {
+        for json in [false, true] {
+            let loader = ConfigLoader::new().unwrap();
+            if json {
+                loader.parse_json("{}").unwrap();
+            } else {
+                loader.parse_toml("").unwrap();
+            }
+            assert!(loader.load_warnings().is_empty());
+        }
     }
 
     #[test]
