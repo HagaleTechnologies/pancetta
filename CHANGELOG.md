@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pancetta-ft8`: standalone decoder contract for other programs (PAN-176).
+  A new cycle-level API — `decode_cycle(samples, protocol)` and the
+  reusable `CycleDecoder` — accepts one full 15 s FT8 (180 000 samples) or
+  7.5 s FT4 (90 000 samples) 12 kHz mono cycle, sample 0 at the slot
+  boundary, and returns the same decode set the station gets for that
+  audio: the ft8_lib C reference pass merged with the native AP pass under
+  a neutral `ApContext` and an unlimited budget (`merge_ft8lib_first`).
+  Message texts and frequencies match the station exactly; SNR within
+  1.0 dB and DT within 0.15 s, with DT slot-boundary-relative. A CI gate
+  (`tests/standalone_deps_test.rs`) now fails the build if any
+  audio-device, rig-control or network crate (cpal, alsa, serialport,
+  rppal, hamlib, tokio, reqwest, …) enters the default dependency tree,
+  and `examples/decode_cycle.rs` is the runnable usage doc. The crate
+  carries its own explicit version (0.9.6) decoupled from the workspace,
+  pinnable via the `pancetta-ft8-v<version>` git tag documented in
+  `pancetta-ft8/README.md` and `docs/decoder-crate.md`.
 - Per-band preamp and attenuator presets apply on Pancetta-commanded band changes. Press `G` to save the current rig gain for this band (PAN-245).
 
 - Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads

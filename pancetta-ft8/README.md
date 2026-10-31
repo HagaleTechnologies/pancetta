@@ -4,6 +4,94 @@ A Rust implementation of FT8 digital-mode encoding, decoding, and
 modulation, optimized for real-time use inside Pancetta's autonomous
 station pipeline.
 
+## Using the decoder from another program
+
+Other programs can depend on this crate alone to decode FT8 and FT4 — no
+station, audio-device, rig-control or network code comes with it. Pass one
+full cycle of 12 kHz mono audio to `decode_cycle` and you get the same
+decodes Pancetta's own station gets for that audio.
+
+```toml
+[dependencies]
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
+```
+
+Default features only. `transmit` (which alone pulls `cpal`, `serialport`,
+`tokio`), `gpio`, `benchmark` and `ft2` stay opt-in and off.
+
+```rust
+use pancetta_ft8::{decode_cycle, Protocol};
+
+// One 15-second FT8 cycle: 180_000 mono f32 samples at 12 kHz,
+// sample 0 at the slot boundary.
+let samples: Vec<f32> = read_cycle_wav("190227_155815.wav"); // 12 kHz mono
+for m in decode_cycle(&samples, Protocol::Ft8)? {
+    println!("[{:>5.1} dB] {} ({} Hz, dt {:.2}s)",
+             m.snr_db, m.text, m.frequency_offset, m.time_offset);
+}
+```
+
+FT4 is the same call with `Protocol::Ft4` and a 7.5 s / 90_000-sample cycle.
+Errors return the crate's existing `Ft8Result` (`Ft8Error`) type; short
+input is zero-padded (documented, never a panic), longer input is truncated
+to the first full cycle, and empty input is an error. The C reference pass
+reads the whole cycle; the native pass reads the first `WINDOW_SAMPLES`
+(12.64 s) samples, its documented window. Decoding continuously?
+Hold a `CycleDecoder::new(Protocol)` and call its `decode_cycle` method to
+reuse buffers across slots.
+
+A runnable version of the above ships as an example:
+
+```console
+cargo run -p pancetta-ft8 --example decode_cycle -- pancetta-ft8/tests/fixtures/wav/jtdx/190227_155815.wav
+```
+
+### The no-station-dependencies guarantee
+
+The default dependency tree contains no audio-device, rig-control or
+network crate:
+
+```console
+$ cargo tree -p pancetta-ft8 --edges normal | grep -iE "cpal|alsa|serialport|rppal|hamlib|tokio|mio|reqwest|hyper"
+(no output)
+```
+
+This check is CI-enforced (`tests/standalone_deps_test.rs`), not a
+convention.
+
+### Submodule note
+
+The reference C decoder lives in the `vendor/ft8_lib` git submodule. Cargo
+1.98 (verified 2026-10-30) fetches git-dependency submodules automatically;
+on older cargo versions run `git submodule update --init` in the source
+checkout. Without the submodule the crate still builds, with reduced decode
+recall (the build script warns loudly).
+
+### Versioning and pinning
+
+The crate carries its own `version` in its `Cargo.toml`, bumped
+independently of the workspace. Pin it with the matching
+`pancetta-ft8-v<version>` git tag (release process cuts the tag on the
+merge commit). Registry publication stays off (`publish = false`); the pin
+is the tag/rev.
+
+### Parity guarantee and tolerances
+
+`decode_cycle` runs exactly what the station runs with neutral state: the
+ft8_lib C reference pass on the full cycle, merged (`merge_ft8lib_first`)
+with the native AP pass (first `WINDOW_SAMPLES` samples) under a neutral
+`ApContext`, no narrow filter and an unlimited decode budget, then the
+station's post-merge unresolved-hash twin suppression
+(`drop_unresolved_hash_twins`) so one signal never arrives twice — once as
+`<...>`, once resolved. For the same audio, message texts and frequency
+offsets match the
+station exactly; SNR may differ by at most 1.0 dB and DT by at most 0.15 s
+(the live station window carries a 0.5 s lead-in slice the cycle API does
+not). DT is slot-boundary-relative: sample 0 of the cycle is the slot
+boundary, so no lead subtraction is needed. The full contract, including
+window geometry and the feature table, is
+[`docs/decoder-crate.md`](../docs/decoder-crate.md).
+
 ## Implementation Provenance
 
 This crate is part `ft8_lib` (via FFI), part Rust re-implementation of the
