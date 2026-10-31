@@ -845,7 +845,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_attenuator(&self) -> Result<i32> {
-        let response = self.send_command("l ATT").await?;
+        let response = self.send_command("\\get_level ATT").await?;
         let db = response
             .parse::<i32>()
             .map_err(|_| anyhow!("Invalid integer attenuator response: {response}"))?;
@@ -861,7 +861,7 @@ impl RigControl for RigctldClient {
         }
         // A gain change is never retried: a lost acknowledgement is ambiguous.
         let response = self
-            .send_command_inner(&format!("L ATT {db}"), true)
+            .send_command_inner(&format!("\\set_level ATT {db}"), true)
             .await?;
         if !response.is_empty() {
             return Err(anyhow!("Missing attenuator acknowledgement"));
@@ -931,23 +931,6 @@ impl RigControl for RigctldClient {
         response.trim().parse::<i32>().map_err(|error| {
             anyhow!(
                 "rigctld: could not parse PREAMP from '{}': {}",
-                response.trim(),
-                error
-            )
-        })
-    }
-
-    async fn set_attenuator(&self, att_db: i32) -> Result<()> {
-        self.send_command_with_retry(&format!("\\set_level ATT {}", att_db))
-            .await?;
-        Ok(())
-    }
-
-    async fn get_attenuator(&self) -> Result<i32> {
-        let response = self.send_command_with_retry("\\get_level ATT").await?;
-        response.trim().parse::<i32>().map_err(|error| {
-            anyhow!(
-                "rigctld: could not parse ATT from '{}': {}",
                 response.trim(),
                 error
             )
@@ -1347,13 +1330,13 @@ mod attenuator_tests {
             let (reader, mut writer) = tokio::io::split(server);
             let mut reader = BufReader::new(reader);
             for (expected, reply) in [
-                ("L ATT 10\n", "RPRT 0\n"),
-                ("l ATT\n", "10\n"),
-                ("L ATT 20\n", "RPRT -11\n"),
-                ("l ATT\n", "-1\n"),
-                ("l ATT\n", "1.0\n"),
-                ("L ATT 10\n", "\n"),
-                ("L ATT 10\n", "RPRT 0 garbage\n"),
+                ("\\set_level ATT 10\n", "RPRT 0\n"),
+                ("\\get_level ATT\n", "10\n"),
+                ("\\set_level ATT 20\n", "RPRT -11\n"),
+                ("\\get_level ATT\n", "-1\n"),
+                ("\\get_level ATT\n", "1.0\n"),
+                ("\\set_level ATT 10\n", "\n"),
+                ("\\set_level ATT 10\n", "RPRT 0 garbage\n"),
             ] {
                 let mut command = String::new();
                 reader.read_line(&mut command).await.unwrap();
@@ -1459,7 +1442,7 @@ mod attenuator_tests {
             let mut reader = BufReader::new(server);
             let mut command = String::new();
             reader.read_line(&mut command).await.unwrap();
-            assert_eq!(command, "L ATT 10\n");
+            assert_eq!(command, "\\set_level ATT 10\n");
             tokio::time::sleep(Duration::from_millis(1100)).await;
         });
         assert!(client.set_attenuator(10).await.is_err());

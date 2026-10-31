@@ -2832,9 +2832,10 @@ impl PttGuard {
     ) -> Self {
         {
             let _ptt_sync = ptt_sync_gate.lock().await;
-            if !message_bus.receive_gain.blocked() {
-                ptt_active.store(true, std::sync::atomic::Ordering::Release);
-            }
+            // Reserve the relocation interlock even if gain currently blocks
+            // hardware key-down. Gain may recover during status publication;
+            // send_ptt_command still refuses key-down while gain is blocked.
+            ptt_active.store(true, std::sync::atomic::Ordering::Release);
         }
         last_ptt_on_ms.store(super::now_epoch_ms(), std::sync::atomic::Ordering::Release);
         Self {
@@ -24743,6 +24744,34 @@ mod pan135_ptt_release_tests {
         )
         .await
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_recovery_before_key_keeps_relocation_interlock_active() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        bus.receive_gain.confirmed_off(100);
+        assert!(bus.receive_gain.reserve());
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+
+        // ATT finishes while the worker yields to publish TX status.
+        tokio::task::yield_now().await;
+        bus.receive_gain.finish_gain(101);
+        assert_eq!(
+            send_ptt_command(&bus, ComponentId::Ft8Transmitter, true, || true),
+            SendIfOutcome::Enqueued
+        );
+        assert!(rx.try_iter().any(|m| matches!(
+            m.message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        )));
+        assert!(
+            ptt_active.load(Ordering::Acquire),
+            "keyed TX must block relocation even if gain was blocked at guard construction"
+        );
+        assert_eq!(g.release("gain recovery test").await, PttRelease::Delivered);
+        assert!(!ptt_active.load(Ordering::Acquire));
+    }
+
     async fn backlog(bus: &MessageBus) -> bool {
         bus.send_message_checked(ComponentMessage::new(
             ComponentId::Hamlib,

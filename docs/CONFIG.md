@@ -199,7 +199,6 @@ baud_rate = 38400
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
 
-<<<<<<< HEAD
 ### `[rig.receive_overload_guard]` receive overload protection
 
 ```toml
@@ -255,7 +254,7 @@ settling time. Container tests do not establish on-air qualification. Before
 station use, with TX disabled, compare discovered ATT steps with the rig manual
 and use a controlled source to check a three-window trip and cool-window hold.
 Use the station's approved procedure for any later on-air checks.
-=======
+
 ### `[rig.receive_gain_presets]` — per-band preamp and attenuator
 
 ```toml
@@ -288,7 +287,6 @@ Omitting this table or specifying an empty table means no presets. In layered
 configuration, a layer that mentions this table replaces the entire lower
 layer's map; an absent table keeps it. Both fields are required in each entry,
 and negative values fail validation at config load.
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
 
 ### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
 

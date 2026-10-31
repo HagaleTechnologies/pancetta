@@ -55,7 +55,7 @@ impl Default for MockRigConfig {
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
             split_read_supported: true,
-            attenuator_steps: vec![0, 10, 20],
+            attenuator_steps: vec![0, 6, 10, 12, 20],
         }
     }
 }
@@ -75,10 +75,7 @@ struct MockRigState {
     ptt_states: HashMap<Vfo, PttState>,
     /// Power level (0.0-1.0)
     power_level: f32,
-<<<<<<< HEAD
-=======
     preamp_db: i32,
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
     attenuator_db: i32,
     /// Memory channels
     memory_channels: HashMap<i32, (u64, Mode, i32)>,
@@ -123,10 +120,7 @@ impl Default for MockRigState {
             current_vfo: Vfo::A,
             ptt_states,
             power_level: 0.5,
-<<<<<<< HEAD
-=======
             preamp_db: 0,
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
             attenuator_db: 0,
             memory_channels: HashMap::new(),
             current_memory: HashMap::new(),
@@ -820,33 +814,6 @@ impl RigControl for MockRig {
             return Err(anyhow!("Mock rig not connected"));
         }
         Ok(state.preamp_db)
-    }
-
-    async fn set_attenuator(&self, db: i32) -> Result<()> {
-        self.simulate_failure("set_attenuator")?;
-        self.simulate_delay().await;
-        if db < 0 {
-            return Err(anyhow!("Receive gain must not be negative"));
-        }
-        {
-            let mut state = self.state.write();
-            if !state.connected {
-                return Err(anyhow!("Mock rig not connected"));
-            }
-            state.attenuator_db = db;
-        }
-        self.update_operation_time();
-        Ok(())
-    }
-
-    async fn get_attenuator(&self) -> Result<i32> {
-        self.simulate_failure("get_attenuator")?;
-        self.simulate_delay().await;
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
-        Ok(state.attenuator_db)
     }
 
     #[instrument(skip(self))]

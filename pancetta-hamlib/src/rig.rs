@@ -214,16 +214,6 @@ pub trait RigControl: Send + Sync {
         Err(HamlibError::not_supported("get_preamp", None, None).into())
     }
 
-    /// Set attenuation in hamlib ATT dB.
-    async fn set_attenuator(&self, _att_db: i32) -> Result<()> {
-        Err(HamlibError::not_supported("set_attenuator", None, None).into())
-    }
-
-    /// Read attenuation in dB.
-    async fn get_attenuator(&self) -> Result<i32> {
-        Err(HamlibError::not_supported("get_attenuator", None, None).into())
-    }
-
     /// Get S-meter reading
     async fn get_s_meter(&self) -> Result<i32>;
 

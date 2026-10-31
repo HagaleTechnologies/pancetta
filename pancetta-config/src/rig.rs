@@ -1294,7 +1294,6 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn receive_overload_defaults_and_partial_tables() {
         for source in [
             "",
@@ -1311,7 +1310,10 @@ mod tests {
         assert!(round_trip.receive_overload_guard.enabled);
         assert!(
             toml::from_str::<RigConfig>("[receive_overload_guard]\nenabled = \"yes\"").is_err()
-=======
+        );
+    }
+
+    #[test]
     fn receive_gain_parse_validate_and_merge() {
         assert!(RigConfig::default().receive_gain_presets.is_none());
         let mut cfg: RigConfig = toml::from_str(
@@ -1379,12 +1381,10 @@ attenuator_db = 12
         assert!(
             toml::from_str::<RigConfig>("[receive_gain_presets.\"10m\"]\npreamp_db = 10\n")
                 .is_err()
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
         );
     }
 
     #[test]
-<<<<<<< HEAD
     fn receive_overload_merge_carries_enable_and_disable() {
         let mut base = RigConfig::default();
         let enabled: RigConfig =
@@ -1398,8 +1398,6 @@ attenuator_db = 12
     }
 
     #[test]
-=======
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
     fn test_default_rig_config() {
         let config = RigConfig::default();
         assert_eq!(config.model, "Generic");

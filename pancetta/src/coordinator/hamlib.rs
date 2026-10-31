@@ -8688,7 +8688,6 @@ mod pan206_split_poll_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod receive_overload_notice_tests {
     use super::{overload_notice, ReceiveOverloadRuntime};
     use crate::message_bus::{ComponentId, MessageBus, MessageType};
@@ -8860,7 +8859,9 @@ mod receive_overload_notice_tests {
             "unknown startup PTT recovers after confirmed unkey"
         );
     }
-=======
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
     use pancetta_core::Band;
@@ -9048,5 +9049,4 @@ async fn gain_band_before_retune(
         Ok(hz) => pancetta_core::Band::from_frequency(hz),
         Err(_) => fallback,
     }
->>>>>>> 510ef4916e3de49e98d6d83813de363a5b853e6f
 }
