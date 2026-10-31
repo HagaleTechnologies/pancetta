@@ -52,6 +52,9 @@ fn cargo_tree(extra_args: &[&str]) -> String {
     let mut cmd = Command::new(&cargo);
     cmd.current_dir(manifest_dir)
         .arg("tree")
+        // The parser below expects plain tree glyphs, including when CI
+        // sets CARGO_TERM_COLOR=always for human-readable build logs.
+        .args(["--color", "never"])
         .arg("-p")
         .arg("pancetta-ft8")
         .arg("--edges")
@@ -148,6 +151,26 @@ fn transmit_feature_is_opt_in_and_does_pull_audio_deps_only_when_enabled() {
             "`{banned}` must be opt-in only; it appears in the default tree"
         );
     }
+}
+
+#[test]
+fn dependency_gate_handles_forced_color() {
+    // CI forces color globally. Run the real gate in a child process so
+    // this regression does not mutate the other tests' environment.
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "transmit_feature_is_opt_in_and_does_pull_audio_deps_only_when_enabled",
+        ])
+        .env("CARGO_TERM_COLOR", "always")
+        .output()
+        .expect("run dependency gate with CI's color setting");
+    assert!(
+        output.status.success(),
+        "dependency gate failed with forced color:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
