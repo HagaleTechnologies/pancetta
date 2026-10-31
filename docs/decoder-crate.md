@@ -73,8 +73,11 @@ Each `DecodedMessage` carries (units and reference points):
 - `time_offset: f64` — DT in seconds, **slot-boundary-relative**: 0.0 means
   the signal started at the cycle's first sample.
 - `snr_db: f32` — SNR in dB, WSJT-X 2500 Hz reference.
-- `confidence: f32`, `ldpc_errors: i32`, `slot_parity`, `acceptance` — as
-  elsewhere in the crate.
+- `error_corrections: u8` is the reported number of error corrections.
+  The C decoder constructor clamps its LDPC error count to 0–255; the native
+  constructor initializes this field to 0.
+- `confidence: f32`, `slot_parity`, `acceptance` follow the crate's existing
+  metadata conventions.
 
 ## Parity definition
 
