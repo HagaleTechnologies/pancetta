@@ -1019,6 +1019,10 @@ impl super::ApplicationCoordinator {
                 {
                     Ok(()) => {
                         ptt_off = true;
+                        if self.ptt_active.load(Ordering::Acquire) {
+                            self.last_ptt_off_ms
+                                .store(super::now_epoch_ms(), Ordering::Release);
+                        }
                         self.ptt_active.store(false, Ordering::Release);
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
@@ -1244,6 +1248,10 @@ impl super::ApplicationCoordinator {
                     .await
                 {
                     Ok(()) => {
+                        if self.ptt_active.load(Ordering::Acquire) {
+                            self.last_ptt_off_ms
+                                .store(super::now_epoch_ms(), Ordering::Release);
+                        }
                         self.ptt_active.store(false, Ordering::Release);
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(

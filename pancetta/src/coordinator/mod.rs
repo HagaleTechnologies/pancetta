@@ -21,6 +21,7 @@ mod audio_recovery;
 mod autonomous;
 mod clock_monitor;
 mod config_reload;
+mod desense;
 mod dsp;
 mod dx_cluster;
 mod effort;
@@ -1592,8 +1593,10 @@ pub struct ApplicationCoordinator {
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
     /// the one right after we stop transmitting, not just the window
     /// during which PTT was actually keyed — when checking for
-    /// TX-correlated desense (`ft8.rs`'s `maybe_flag_tx_desense`).
+    /// TX-correlated desense (`desense.rs`).
     pub(crate) last_ptt_on_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Enqueue-time PTT-off, paired with clearing ptt_active; not hardware confirmation.
+    pub(crate) last_ptt_off_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -2408,6 +2411,7 @@ impl ApplicationCoordinator {
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
