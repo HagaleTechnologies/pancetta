@@ -127,12 +127,14 @@ jobs:
     # required name: since the rename above, a job skipped by `if:` publishes its native
     # "skipped" check only under "Codex review request (producer)", and ci.yml's label gate
     # only polls. GitHub withholds Actions secrets from Dependabot runs on push/pull_request,
-    # not on pull_request_target: this repo's own Dependabot Auto-Merge run on PR #525
-    # (40276929798) logged "Secret source: Actions" with write scopes, and coppa's producer
-    # minted hagale-agent in its codex-review environment for Dependabot runs 40302227401
-    # and 40302291006. create-check's IS_DEPENDABOT branch then publishes a completed
-    # success and "Request a review" is skipped. If the mint ever fails here, the failsafe
-    # job below publishes a red check rather than leaving the gate absent. Full record:
+    # not on pull_request_target into main (GitHub's pull_request_target exception covers
+    # only a base ref Dependabot created): this repo's own Dependabot Auto-Merge run on PR
+    # #525 (40276929798) logged "Secret source: Actions" with write scopes, and coppa's
+    # producer minted hagale-agent in its codex-review environment for Dependabot runs
+    # 40302227401 and 40302291006. create-check's IS_DEPENDABOT branch then publishes a
+    # completed success and "Request a review" is skipped. If the mint ever fails here, the
+    # failsafe job below tries its own mint, then github.token, to publish a red check
+    # rather than leave the gate absent. Full record:
     # docs/DECISIONS/config-and-platform.md, "Dependabot pass-through publishes the
     # required Codex check (PAN-249, 2026-11-01)".
     # merge_group is no longer handled here (Q-0068; see codex-review-merge-group-passthrough).
@@ -272,7 +274,8 @@ jobs:
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
           # PAN-249: a genuine Dependabot update only -- Dependabot's own event, on a PR
           # Dependabot opened, from this repo's own branch. A human push to a Dependabot
-          # branch (human actor) takes the ordinary review path.
+          # branch (human actor) takes the ordinary review path. A re-run keeps
+          # github.actor, so re-running a Dependabot-triggered run passes through again.
           IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -o pipefail

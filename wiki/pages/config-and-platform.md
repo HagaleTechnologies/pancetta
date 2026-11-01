@@ -67,9 +67,10 @@ check-run only under its own job name**, so since `wait-for-codex.yml`'s
 producer was renamed away from the required `Codex review clean` name, a
 skipped producer leaves that required check missing. Dependabot PRs therefore
 go through the producer, which publishes the managed check as a completed
-success with the `hagale-agent` App token. A `pull_request_target` run gets
-Actions secrets even when Dependabot triggers it; `pull_request` and `push`
-runs do not. The pass-through applies no `codex-clean:<sha12>` label, so
+success with the `hagale-agent` App token. A `pull_request_target` run for a
+PR into `main` gets Actions secrets even when Dependabot triggers it;
+`pull_request` and `push` runs do not, and neither does a `pull_request_target`
+run whose base branch Dependabot created. The pass-through applies no `codex-clean:<sha12>` label, so
 `ci.yml`'s label gate still skips Dependabot. Publishing the check does not
 admit Dependabot PRs to automatic merge. See
 [Dependabot pass-through publishes the required Codex check](../../docs/DECISIONS/config-and-platform.md#dependabot-pass-through-publishes-the-required-codex-check-pan-249-2026-11-01).
