@@ -217,6 +217,14 @@ pub struct QsoHistoryItem {
     pub completed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// PAN-121: the QSO a bare `k` targeted, held until the operator confirms
+/// or cancels the abort-confirm modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQsoAbort {
+    pub qso_id: String,
+    pub callsign: String,
+}
+
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
 /// state machine is the source of truth; this struct is a flattened
 /// snapshot pushed to the TUI whenever the state changes (QsoEvent
@@ -1586,6 +1594,13 @@ pub struct App {
     /// dismisses. Modal blocks all other keys while visible.
     pub quit_confirm_visible: bool,
 
+    /// PAN-121: the QSO a bare `k` asked to abort, awaiting `y` in the
+    /// abort-confirm modal. Captured when the modal opens so a snapshot
+    /// that re-pins the selection can never retarget the abort; session
+    /// only, cleared by confirm, cancel, Shift+Q, a required out-of-band
+    /// acknowledgment, or the QSO leaving the active list.
+    pub pending_qso_abort: Option<PendingQsoAbort>,
+
     /// Frequency-entry modal (Shift+F). See `FreqModalState`.
     pub freq_modal: FreqModalState,
     /// TX-audio-offset modal (`o` key). See `OffsetModalState`.
@@ -1862,6 +1877,7 @@ impl App {
             help_visible: false,
             help_scroll: 0,
             quit_confirm_visible: false,
+            pending_qso_abort: None,
             freq_modal: FreqModalState::default(),
             offset_modal: OffsetModalState::default(),
             tx_offset_hold_hz: None,
@@ -3103,6 +3119,22 @@ impl App {
         // selection tracks the SAME QSO across snapshots (the emit order is now
         // stable, but a QSO can still appear/disappear, shifting positions).
         self.clamp_qso_selection();
+        // PAN-121: a pending abort whose QSO left the active list is
+        // cancelled, never moved onto whatever is selected now.
+        if let Some(pending) = &self.pending_qso_abort {
+            if !self.qso_is_active(&pending.qso_id) {
+                self.status_message = format!(
+                    "QSO with {} is no longer active; abort cancelled",
+                    pending.callsign
+                );
+                self.pending_qso_abort = None;
+            }
+        }
+    }
+
+    /// True while `qso_id` is in the latest active-QSO snapshot.
+    pub fn qso_is_active(&self, qso_id: &str) -> bool {
+        self.active_qsos.iter().any(|q| q.qso_id == qso_id)
     }
 
     /// Every active QSO's authoritative assigned TX offset, in spectrum order.
