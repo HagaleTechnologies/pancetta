@@ -1416,6 +1416,16 @@ impl super::ApplicationCoordinator {
     }
 
     #[cfg(feature = "pancetta-hamlib")]
+    /// The rig used while rig control is off: `MockRig::default()`, or the
+    /// PAN-251 test seam's injected rig.
+    fn rig_control_disabled_rig(&self) -> Arc<dyn pancetta_hamlib::RigControl + Send + Sync> {
+        #[cfg(test)]
+        if let Some(rig) = self.test_mock_rig.clone() {
+            return rig;
+        }
+        Arc::new(pancetta_hamlib::MockRig::default())
+    }
+
     pub(crate) async fn start_hamlib_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_hamlib");
         let _enter = span.enter();
@@ -1628,11 +1638,7 @@ impl super::ApplicationCoordinator {
 
         let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
             info!("Rig control disabled, using mock rig");
-            #[cfg(test)]
-            let injected = self.test_mock_rig.clone();
-            #[cfg(not(test))]
-            let injected: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>> = None;
-            injected.unwrap_or_else(|| Arc::new(pancetta_hamlib::MockRig::default()))
+            self.rig_control_disabled_rig()
         } else {
             info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
             Arc::new(pancetta_hamlib::RigctldClient::new(
