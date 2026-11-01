@@ -170,6 +170,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SWR protection now works (PAN-251). `[rig.power_control.protection]
+  swr_protection` (on by default) and `max_swr` (default 3.0) were read by
+  nothing. A reading above the limit while transmitting now halts all TX
+  like Shift+Q and shows `⚠ High SWR …` on the readiness strip. A rig that
+  cannot report SWR shows `⚠ SWR protection is unavailable on this rig`. A
+  `max_swr` that is not a number above 1.0 now fails config validation
+  while protection is on.
+
 - The `ft8.desense` warning excludes our own transmit windows, uses a fresh
   same-band baseline, and requires healthy reception before TX (PAN-212).
   It no longer doubles as an unintended transmission heartbeat.
@@ -578,6 +586,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- The rigctld client no longer reports SWR 1.0:1 for an unreadable meter,
+  and reads SWR once per poll instead of retrying three times.
 
 - The live station's FT8 decodes now down-weight the soft bits of any
   symbol whose total tone power jumps above 6 times the candidate's median,

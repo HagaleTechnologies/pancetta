@@ -41,9 +41,11 @@ mod replay;
 mod restart_budget;
 mod shutdown;
 pub mod station_agent;
+mod swr_guard;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_halt;
 mod tx_log;
 pub(crate) mod upload_outbox;
 mod util;
@@ -975,6 +977,10 @@ pub struct ApplicationCoordinator {
     rigctld_process: Option<std::process::Child>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-251 test seam: when set, `start_hamlib_component` uses this rig
+    /// instead of `MockRig::default()` on the rig-control-disabled path.
+    #[cfg(all(test, feature = "pancetta-hamlib"))]
+    pub(crate) test_mock_rig: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
     /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
     /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
     /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
@@ -2430,6 +2436,8 @@ impl ApplicationCoordinator {
             rigctld_process: None,
             #[cfg(feature = "pancetta-hamlib")]
             rig_handle: None,
+            #[cfg(all(test, feature = "pancetta-hamlib"))]
+            test_mock_rig: None,
             #[cfg(feature = "pancetta-hamlib")]
             rig_handle_is_real: false,
             #[cfg(feature = "pancetta-hamlib")]
@@ -2929,6 +2937,16 @@ impl ApplicationCoordinator {
 
     /// Shared split-TX dial atomic (0 = simplex). Written by the TUI SetSplit
     /// relay, read by the QSO RF stamp.
+    /// PAN-251: the atomics a station-wide halt stores (Shift+Q and the
+    /// SWR trip share `tx_halt::TxHaltHandles::halt`).
+    pub(crate) fn tx_halt_handles(&self) -> tx_halt::TxHaltHandles {
+        tx_halt::TxHaltHandles {
+            abort_current_tx: self.abort_current_tx.clone(),
+            autonomous_enabled: self.autonomous_enabled_runtime.clone(),
+            tx_policy: self.tx_policy.clone(),
+        }
+    }
+
     pub(crate) fn split_tx_frequency_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.split_tx_frequency_hz.clone()
     }

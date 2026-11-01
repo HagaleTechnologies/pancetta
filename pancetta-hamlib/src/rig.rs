@@ -247,6 +247,12 @@ pub trait RigControl: Send + Sync {
     /// Get SWR reading
     async fn get_swr(&self) -> Result<f32>;
 
+    /// Whether the backend can read the SWR meter (`get_swr`). A backend that
+    /// cannot tell must return an error, never assume a meter exists (PAN-251).
+    async fn reports_swr(&self) -> Result<bool> {
+        Err(HamlibError::not_supported("reports_swr", None, None).into())
+    }
+
     /// Set memory channel
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()>;
 
@@ -380,5 +386,6 @@ mod split_default_tests {
             .unwrap_err()
             .to_string()
             .contains("Feature not supported"));
+        assert!(DefaultOnlyRig.reports_swr().await.is_err());
     }
 }

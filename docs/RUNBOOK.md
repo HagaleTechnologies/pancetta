@@ -167,7 +167,12 @@ operator-supervised.
 8. **Switch to antenna.** Disconnect dummy load, connect antenna,
    confirm SWR is sane on a brief tune-up tone. (Don't tune through
    pancetta — use the rig's tune button.) Pancetta does not currently
-   tune the rig.
+   tune the rig. With `swr_protection` on (the default), pancetta also
+   reads the rig's SWR meter while keyed and halts all TX on a reading
+   above `max_swr`. The strip then shows `■ RX ONLY` and
+   `⚠ High SWR …`. Fix the antenna, then press `g`. If the strip shows
+   `⚠ SWR protection is unavailable on this rig`, your rig or Hamlib
+   build does not report SWR, so keep watching an external meter.
 
 9. **One real manual QSO.** Repeat steps 6–7 against an actual on-air
    CQ. Watch PSKReporter (within ~30s of TX) to confirm we got out.
