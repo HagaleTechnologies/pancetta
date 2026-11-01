@@ -978,6 +978,10 @@ To revoke a suspect remote client step by step, see
 
 All persistent state lives under `~/.pancetta/`.
 
+Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
+Automatic database backups do not cover configuration, the complete logbook or
+external keys. Preserve the whole stopped installation and data directory.
+
 ### QSO log files
 
 | File | Role | Recoverable? |
