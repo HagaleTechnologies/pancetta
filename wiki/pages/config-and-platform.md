@@ -62,6 +62,18 @@ human pauses remain in force. See
 [Interrupted native queue recovery](../../docs/DECISIONS/config-and-platform.md#interrupted-native-queue-recovery-pan-150-2026-10-20)
 for ownership checks and recovery limits.
 
+Codex gate gotcha (PAN-249): **a job skipped by its `if:` publishes a `skipped`
+check-run only under its own job name**, so since `wait-for-codex.yml`'s
+producer was renamed away from the required `Codex review clean` name, a
+skipped producer leaves that required check missing. Dependabot PRs therefore
+go through the producer, which publishes the managed check as a completed
+success with the `hagale-agent` App token. A `pull_request_target` run gets
+Actions secrets even when Dependabot triggers it; `pull_request` and `push`
+runs do not. The pass-through applies no `codex-clean:<sha12>` label, so
+`ci.yml`'s label gate still skips Dependabot. Publishing the check does not
+admit Dependabot PRs to automatic merge. See
+[Dependabot pass-through publishes the required Codex check](../../docs/DECISIONS/config-and-platform.md#dependabot-pass-through-publishes-the-required-codex-check-pan-249-2026-11-01).
+
 Toolchain gotcha (PAN-56): **`rust-toolchain.toml` pins an exact Rust release
 (`1.98.0`, matching the Catalyst runner image), and the `dtolnay/rust-toolchain`
 steps in `ci.yml`, `docs.yml`, `demo-assets.yml` and `release.yml` pass the same
