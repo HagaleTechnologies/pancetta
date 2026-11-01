@@ -225,6 +225,16 @@ pub struct PendingQsoAbort {
     pub callsign: String,
 }
 
+impl PendingQsoAbort {
+    /// Status line when the target left the active list before `y`.
+    pub fn target_gone_message(&self) -> String {
+        format!(
+            "QSO with {} is no longer active; abort cancelled",
+            self.callsign
+        )
+    }
+}
+
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
 /// state machine is the source of truth; this struct is a flattened
 /// snapshot pushed to the TUI whenever the state changes (QsoEvent
@@ -2071,6 +2081,11 @@ impl App {
         mouse: MouseEvent,
     ) -> Result<Option<crate::tui_runner::TuiCommand>> {
         use crossterm::event::{MouseButton, MouseEventKind};
+        // PAN-121: the abort-confirm modal swallows the mouse as well as the
+        // keyboard, so a click can't park TX or move the selection under it.
+        if self.pending_qso_abort.is_some() {
+            return Ok(None);
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_up();
@@ -3123,10 +3138,7 @@ impl App {
         // cancelled, never moved onto whatever is selected now.
         if let Some(pending) = &self.pending_qso_abort {
             if !self.qso_is_active(&pending.qso_id) {
-                self.status_message = format!(
-                    "QSO with {} is no longer active; abort cancelled",
-                    pending.callsign
-                );
+                self.status_message = pending.target_gone_message();
                 self.pending_qso_abort = None;
             }
         }
@@ -9751,6 +9763,36 @@ mod tests {
             Some("K1AAA"),
             "click must pin via the SAME pin_band_activity_selection Up/Down uses"
         );
+    }
+
+    /// PAN-121: while the abort-confirm modal is open a click is swallowed:
+    /// the same click that would focus and pin Band Activity does nothing.
+    #[tokio::test]
+    async fn click_is_ignored_while_abort_confirm_is_open() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -5))
+            .await
+            .unwrap();
+        app.pending_qso_abort = Some(PendingQsoAbort {
+            qso_id: "qso-1".into(),
+            callsign: "W1AW".into(),
+        });
+
+        let rect = operate_panel_rect(&app, ActivePanel::BandActivity);
+        let cmd = app
+            .handle_mouse_event(left_click(rect.x + 2, rect.y + 3))
+            .await
+            .unwrap();
+        assert!(cmd.is_none());
+        assert_eq!(app.active_panel, ActivePanel::DxHunter, "focus unchanged");
+        assert_eq!(app.band_activity_scroll, 0);
+        assert!(app.band_activity_pinned_call.is_none());
+        assert!(app.pending_qso_abort.is_some(), "modal stays open");
     }
 
     #[tokio::test]

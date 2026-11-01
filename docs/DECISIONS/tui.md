@@ -117,14 +117,15 @@ nothing. The modal names the QSO (`App::pending_qso_abort` holds its id and call
 the modal opens). `y` or Shift+Y sends one `AbortQso` for that id, only if it is still in the latest
 active list. A snapshot that reorders the list or re-pins the selection never retargets the abort.
 `n`, Shift+N, Esc and Enter cancel ("QSO abort cancelled"). Enter is deliberately the safe key,
-unlike the quit modal. Every other key, Ctrl/Alt+y, and repeat or release events are swallowed.
-If the QSO leaves the active list before `y`, the abort is cancelled with "QSO with CALL is no
-longer active; abort cancelled". Shift+Q still stops the station at once and clears the pending
-abort. A required out-of-band acknowledgment outranks the modal: it cancels the pending abort and
+unlike the quit modal. Every other key, Ctrl/Alt+y, repeat or release events, and mouse clicks
+and scrolls are swallowed. If the QSO leaves the active list before `y`, the abort is cancelled
+with "QSO with CALL is no longer active; abort cancelled". Shift+Q still stops the station at once
+and clears the pending abort. A required out-of-band acknowledgment outranks the modal: it cancels the pending abort and
 is drawn instead of it, so dismissing it never reveals a stale prompt. The modal draws after every
 read-only overlay so it sits on top of them. No abort-success acknowledgment was added; the
 existing command-send error path is unchanged. Tests: `tui_runner::key_tests::abort_confirm_*`,
-`shift_q_during_abort_confirm_stops_and_clears_pending` and `out_of_band_ack_cancels_pending_abort`.
+`shift_q_during_abort_confirm_stops_and_clears_pending`, `out_of_band_ack_cancels_pending_abort` and
+`app::tests::click_is_ignored_while_abort_confirm_is_open`.
 
 ## Clock-skew alarm chip (PAN-114, 2026-10-10)
 

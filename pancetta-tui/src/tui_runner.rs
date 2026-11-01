@@ -1077,10 +1077,7 @@ impl TuiRunner {
             })?;
             app.status_message = format!("Aborting QSO with {}", pending.callsign);
         } else {
-            app.status_message = format!(
-                "QSO with {} is no longer active; abort cancelled",
-                pending.callsign
-            );
+            app.status_message = pending.target_gone_message();
         }
         Ok(())
     }
@@ -1105,7 +1102,8 @@ impl TuiRunner {
         // lowercase `q` (quit-confirm). Checked before every modal and
         // overlay below, because each of those ends in `_ => {}` +
         // `return Ok(true)` and would otherwise swallow it (PAN-113). Any
-        // modifiers are accepted, and the open dialog is left as it is. In
+        // modifiers are accepted, and the open dialog is left as it is,
+        // except a pending QSO abort, which is cleared (PAN-121). In
         // the text-entry modals (compose, rig model, bookmark name) this
         // means Shift+Q stops the station instead of typing `Q`.
         // The coordinator handles the event: aborts in-flight TX, disables
@@ -3049,6 +3047,19 @@ impl TuiRunner {
         }
     }
 
+    /// A `width`×`height` rect centered in `area`, kept 2 cells inside each
+    /// edge. Shared by the quit- and abort-confirm modals.
+    fn confirm_modal_rect(area: Rect, width: u16, height: u16) -> Rect {
+        let width = width.min(area.width.saturating_sub(4));
+        let height = height.min(area.height.saturating_sub(4));
+        Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        }
+    }
+
     /// PAN-121: render the abort-confirm modal for `callsign` as a bounded
     /// centered modal, same shape as the quit-confirm modal.
     fn render_abort_confirm_overlay(f: &mut Frame, area: Rect, callsign: &str) {
@@ -3072,16 +3083,7 @@ impl TuiRunner {
             )),
         ];
 
-        let modal_width: u16 = 48;
-        let modal_height: u16 = lines.len() as u16 + 2;
-        let modal_width = modal_width.min(area.width.saturating_sub(4));
-        let modal_height = modal_height.min(area.height.saturating_sub(4));
-        let modal_area = Rect {
-            x: area.x + (area.width.saturating_sub(modal_width)) / 2,
-            y: area.y + (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
+        let modal_area = Self::confirm_modal_rect(area, 48, lines.len() as u16 + 2);
 
         f.render_widget(ratatui::widgets::Clear, modal_area);
 
@@ -3114,16 +3116,7 @@ impl TuiRunner {
             )),
         ];
 
-        let modal_width: u16 = 50;
-        let modal_height: u16 = lines.len() as u16 + 2;
-        let modal_width = modal_width.min(area.width.saturating_sub(4));
-        let modal_height = modal_height.min(area.height.saturating_sub(4));
-        let modal_area = Rect {
-            x: (area.width.saturating_sub(modal_width)) / 2,
-            y: (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
+        let modal_area = Self::confirm_modal_rect(area, 50, lines.len() as u16 + 2);
 
         f.render_widget(ratatui::widgets::Clear, modal_area);
 

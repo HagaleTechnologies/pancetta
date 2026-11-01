@@ -1046,8 +1046,10 @@ An audit, not a behavior change. `[rig.ptt].method` is `pancetta_config::rig::Pt
 There is no `Cm108` variant and no CM108-specific runtime method. `Usb` is not evidence of CM108
 support. The separate `pancetta_ft8::transmit::PttMethod` enum is not fed by this setting.
 
-- **Configuration and picker.** The rig picker offers None, Cat, Serial and Vox
-  (`pancetta-tui/src/app.rs:899`). The relay stores the choice in the live config
+- **Configuration and picker.** `pancetta setup` asks for it (`setup_ptt`,
+  `pancetta/src/main.rs:2678`), rig bookmarks store it (`RigBookmark::ptt_method`,
+  `pancetta-config/src/rig.rs:76`), and the setup summary and `test-rig` header print it. The rig
+  picker offers None, Cat, Serial and Vox (`pancetta-tui/src/app.rs:909`). The relay stores the choice in the live config
   (`pancetta/src/coordinator/tui_relay.rs:2849`), and `Config::set_rig_in_file`
   (`pancetta-config/src/lib.rs:809`) writes it to the config file.
 - **Normal runtime PTT is CAT through rigctld whatever the method says.** Every `SetPtt` reaches
