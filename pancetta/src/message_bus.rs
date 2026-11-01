@@ -310,11 +310,9 @@ pub enum MessageType {
         timestamp: chrono::DateTime<chrono::Utc>,
     },
 
-    /// TX-policy state echo for the TUI banner. Sent by the coordinator's
-    /// command relay whenever the operator changes the global TX policy
-    /// (cycle key) or triggers an emergency stop (Shift+Q → Disabled).
-    /// The TUI mirrors this into its bold, color-coded TX banner.
-    /// Observation only.
+    /// TX-policy state echo for the TUI banner. Sent by the Hamlib poll
+    /// loop's SWR trip (PAN-251) when it sets the policy to Disabled. The
+    /// TUI relay mirrors it into the TX banner. Observation only.
     TxPolicyStatus {
         /// Current global TX policy.
         policy: pancetta_core::TxPolicy,
