@@ -21,10 +21,13 @@ mod audio_recovery;
 mod autonomous;
 mod clock_monitor;
 mod config_reload;
+mod desense;
 mod dsp;
 mod dx_cluster;
 mod effort;
 mod ft8;
+pub mod gain_sweep;
+mod gain_sweep_runtime;
 mod hamlib;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
@@ -924,7 +927,7 @@ pub(crate) fn operator_present_now(last_input_ms: &std::sync::atomic::AtomicU64)
     now_ms.saturating_sub(last) < OPERATOR_PRESENCE_WINDOW.as_millis() as u64
 }
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pancetta_config::Config;
 use pancetta_ft8::Ft8Config;
 use std::collections::{HashMap, HashSet};
@@ -943,6 +946,10 @@ use util::resample_linear;
 
 /// Application coordinator that manages all Pancetta components
 pub struct ApplicationCoordinator {
+    #[cfg(feature = "pancetta-hamlib")]
+    gain_sweep_original: Arc<std::sync::Mutex<Option<pancetta_hamlib::ReceiveGain>>>,
+    gain_sweep_options: Option<gain_sweep_runtime::GainSweepOptions>,
+    pub(crate) sweep_capture: Arc<std::sync::Mutex<pipeline::GainCaptureRegistry>>,
     /// Unique instance identifier
     id: uuid::Uuid,
 
@@ -1599,8 +1606,10 @@ pub struct ApplicationCoordinator {
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
     /// the one right after we stop transmitting, not just the window
     /// during which PTT was actually keyed — when checking for
-    /// TX-correlated desense (`ft8.rs`'s `maybe_flag_tx_desense`).
+    /// TX-correlated desense (`desense.rs`).
     pub(crate) last_ptt_on_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Enqueue-time PTT-off, paired with clearing ptt_active; not hardware confirmation.
+    pub(crate) last_ptt_off_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -2323,6 +2332,12 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            gain_sweep_options: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            gain_sweep_original: Arc::new(std::sync::Mutex::new(None)),
+            sweep_capture: Arc::new(std::sync::Mutex::new(
+                pipeline::GainCaptureRegistry::default(),
+            )),
             hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2418,6 +2433,7 @@ impl ApplicationCoordinator {
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
@@ -2806,18 +2822,26 @@ impl ApplicationCoordinator {
         );
 
         // Main application loop
+        let sweep_handle = match self.start_gain_sweep().await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.shutdown().await?;
+                return Err(error);
+            }
+        };
         let main_loop_result = self.run_main_loop().await;
-
         // The clock-skew monitor is advisory and holds no resources; stop it
         // before the component teardown (or an early error return) rather
         // than waiting out its tick.
         if let Some(handle) = self.clock_monitor_handle.take() {
             handle.abort();
         }
-        main_loop_result?;
+        // Cleanup runs even if either the main loop or experiment failed.
 
         // Graceful shutdown
-        self.shutdown().await?;
+        let sweep_result = self.shutdown_with_gain_sweep(sweep_handle).await;
+        main_loop_result?;
+        sweep_result?;
 
         Ok(())
     }

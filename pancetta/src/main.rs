@@ -77,6 +77,17 @@ struct Cli {
     #[arg(long, global = true)]
     headless: bool,
 
+    /// Measure receive gain for 1..3600 seconds (600 when omitted).
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "600",
+        value_parser = clap::value_parser!(u64).range(1..=3600),
+        requires_all = ["headless", "gain_sweep_report"],
+        conflicts_with_all = ["wav", "replay", "no_audio", "test_tx"])]
+    gain_sweep_seconds: Option<u64>,
+
+    /// New JSON destination for the receive-gain report; existing files are refused.
+    #[arg(long, global = true, requires_all = ["gain_sweep_seconds", "headless"])]
+    gain_sweep_report: Option<PathBuf>,
+
     /// WAV file to decode (enables playback mode — decodes and exits)
     #[arg(long, global = true)]
     wav: Option<PathBuf>,
@@ -361,6 +372,18 @@ impl std::fmt::Display for LogFormat {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.gain_sweep_seconds.is_some()
+        && cli
+            .command
+            .as_ref()
+            .is_some_and(|command| !matches!(command, Commands::Run(_)))
+    {
+        clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "gain sweep flags require the receiving service, not this subcommand",
+        )
+        .exit();
+    }
 
     // Initialize logging first
     let _log_guard = init_logging(&cli, cli.headless)?;
@@ -382,6 +405,16 @@ async fn main() -> Result<()> {
 }
 
 async fn run_application(cli: Cli) -> Result<()> {
+    if let Some(path) = &cli.gain_sweep_report {
+        if path.symlink_metadata().is_ok() {
+            anyhow::bail!(
+                "Sweep failed: report path already exists: {}",
+                path.display()
+            );
+        }
+    }
+    let sweep_requested = cli.gain_sweep_seconds.is_some();
+    let gain_options = cli.gain_sweep_seconds.zip(cli.gain_sweep_report.clone());
     // Load configuration
     let (config, config_warnings) = load_configuration_with_warnings(&cli).await?;
 
@@ -402,6 +435,8 @@ async fn run_application(cli: Cli) -> Result<()> {
         .context("Failed to listen for SIGTERM")?;
 
     // Route OS signals through the coordinator's shared shutdown flag.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_for_signals = interrupted.clone();
     let shutdown_for_signals = shutdown.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -421,6 +456,7 @@ async fn run_application(cli: Cli) -> Result<()> {
             }
             info!("Received Ctrl+C, initiating graceful shutdown");
         }
+        interrupted_for_signals.store(true, Ordering::Release);
         shutdown_for_signals.store(true, Ordering::Release);
     });
 
@@ -450,6 +486,9 @@ async fn run_application(cli: Cli) -> Result<()> {
         config_write_is_toml,
     )
     .await?;
+    if let Some((seconds, path)) = gain_options {
+        coordinator.configure_gain_sweep(seconds, path)?;
+    }
     coordinator.set_config_watch_path(config_watch_path);
     if cli_config_given.is_none() {
         // PAN-103: without `--config`, startup merged every discovered config
@@ -486,6 +525,10 @@ async fn run_application(cli: Cli) -> Result<()> {
     info!("Performing cleanup...");
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("Pancetta shutdown complete");
+
+    if sweep_requested && interrupted.load(Ordering::Acquire) {
+        std::process::exit(130);
+    }
 
     // Propagate the coordinator's outcome so a genuine application error
     // (e.g. `--replay` pointed at an empty/invalid directory) surfaces as a
@@ -3141,6 +3184,11 @@ fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_block
         Some(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
+                .with_writer(if cli.gain_sweep_seconds.is_some() {
+                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+                } else {
+                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+                })
                 .with_thread_ids(true)
                 .with_file(cli.debug || cli.verbose)
                 .with_line_number(cli.debug || cli.verbose),
