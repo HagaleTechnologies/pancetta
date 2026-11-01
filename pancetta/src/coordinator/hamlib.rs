@@ -12,12 +12,22 @@ use tracing::{debug, error, info, span, warn, Level};
 #[derive(Default)]
 struct ReceiveOverloadRuntime {
     policy: super::receive_overload::OverloadPolicy,
+    sweep_configured: bool,
     generation: Option<u64>,
     steps: Option<Vec<i32>>,
+    discovery: Option<tokio::task::JoinHandle<Result<Vec<i32>>>>,
     stopped: bool,
     last_boundary: Option<i64>,
     failed_generation: Option<u64>,
     recovery_after: Option<Instant>,
+}
+
+impl Drop for ReceiveOverloadRuntime {
+    fn drop(&mut self) {
+        if let Some(discovery) = self.discovery.take() {
+            discovery.abort();
+        }
+    }
 }
 
 async fn overload_notice(bus: &crate::message_bus::MessageBus, warning: bool, text: String) {
@@ -60,7 +70,7 @@ impl ReceiveOverloadRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn tick(
         &mut self,
-        rig: &dyn pancetta_hamlib::RigControl,
+        rig: &Arc<dyn pancetta_hamlib::RigControl + Send + Sync>,
         bus: &crate::message_bus::MessageBus,
         measurements: &crossbeam_channel::Receiver<super::receive_overload::Measurement>,
         connection: &std::sync::atomic::AtomicU64,
@@ -76,6 +86,13 @@ impl ReceiveOverloadRuntime {
         shutdown: &std::sync::atomic::AtomicBool,
     ) {
         use super::receive_overload::{Identity, StepOutcome};
+        // The sweep owns gain from setup through restoration and then ends the
+        // session. Do not count windows across its different candidate gains.
+        if self.sweep_configured {
+            self.policy.reset();
+            measurements.try_iter().for_each(drop);
+            return;
+        }
         let generation = rig.connection_generation();
         connection.store(generation, Ordering::Release);
         if !bus.receive_gain.receiving()
@@ -119,10 +136,26 @@ impl ReceiveOverloadRuntime {
             self.policy.reset();
             self.steps = None;
             self.stopped = false;
-            // Discovery uses a separate socket and runs once per connection.
-            match rig.supported_attenuator_steps().await {
-                Ok(steps) => self.steps = Some(steps),
-                Err(_) => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
+            if let Some(discovery) = self.discovery.take() {
+                discovery.abort();
+            }
+            // The backend probes on a separate socket. Never await its network
+            // work in the ready command owner, including after reconnection.
+            let rig = rig.clone();
+            self.discovery = Some(tokio::spawn(async move {
+                rig.supported_attenuator_steps().await
+            }));
+            // Let an immediately available result complete without delaying CAT.
+            tokio::task::yield_now().await;
+        }
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            match self.discovery.take().expect("finished discovery").await {
+                Ok(Ok(steps)) => self.steps = Some(steps),
+                _ => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
             }
         }
         // Failed/aborted gain transactions remain inhibited until the rig owner
@@ -210,16 +243,21 @@ impl ReceiveOverloadRuntime {
             return;
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining as u64);
-        let outcome =
-            super::receive_overload::execute_step(rig, &bus.receive_gain, steps, deadline, || {
+        let outcome = super::receive_overload::execute_step(
+            rig.as_ref(),
+            &bus.receive_gain,
+            steps,
+            deadline,
+            || {
                 !shutdown.load(Ordering::Acquire)
                     && dial.load(Ordering::Acquire) == identity.dial_hz
                     && capture_epoch.load(Ordering::Acquire) == identity.capture_epoch
                     && rig.connection_generation() == generation
                     && mode.load(Ordering::Acquire) == pancetta_config::OperatingMode::Ft8.as_u8()
                     && in_flight.load(Ordering::Acquire) == 0
-            })
-            .await;
+            },
+        )
+        .await;
         let band = pancetta_core::Band::from_frequency(identity.dial_hz).expect("validated band");
         match outcome {
             Ok(StepOutcome::Increased { old, new }) => {
@@ -1729,6 +1767,7 @@ impl super::ApplicationCoordinator {
         let overload_gate = self.ptt_sync_gate.clone();
         let overload_mode = self.active_protocol_mode();
         let overload_tx_policy = self.tx_policy.clone();
+        let overload_sweep_configured = self.gain_sweep_options.is_some();
         let overload_config = self.config.read().await;
         let overload_enabled = overload_config.rig.receive_overload_guard.enabled
             && !self.no_audio
@@ -2802,6 +2841,7 @@ impl super::ApplicationCoordinator {
                         .confirmed_off(chrono::Utc::now().timestamp_millis());
                 }
                 let mut overload = ReceiveOverloadRuntime::default();
+                overload.sweep_configured = overload_sweep_configured;
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
                     if child_task_crashed(
@@ -3229,7 +3269,7 @@ impl super::ApplicationCoordinator {
                             {
                                 overload
                                     .tick(
-                                        rig_poll.as_ref(),
+                                        &rig_poll,
                                         &message_bus_for_connect,
                                         &overload_measurements,
                                         &overload_connection,
@@ -8762,6 +8802,91 @@ mod receive_overload_notice_tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_discovery_does_not_delay_command_owner_on_start_or_reconnect() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 200,
+            ..Default::default()
+        }));
+        let bus = MessageBus::new(8).unwrap();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        // MockRig has a fixed generation. Seed a stale cached generation to
+        // exercise the same invalidation path as a real reconnect.
+        for previous_generation in [None, Some(u64::MAX)] {
+            runtime.generation = previous_generation;
+            rig.connect().await.unwrap();
+            bus.receive_gain
+                .confirmed_off(chrono::Utc::now().timestamp_millis());
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                runtime.tick(
+                    &rig,
+                    &bus,
+                    &measurements,
+                    &AtomicU64::new(0),
+                    &AtomicU64::new(0),
+                    &AtomicU64::new(7_074_000),
+                    &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                    &AtomicBool::new(false),
+                    &tokio::sync::Mutex::new(()),
+                    &AtomicU32::new(0),
+                    &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                    pancetta_config::station::TxSelfParity::Auto,
+                    500,
+                    &AtomicBool::new(false),
+                ),
+            )
+            .await
+            .expect("slow discovery must leave the command owner available");
+            assert!(runtime.steps.is_none(), "discovery is still pending");
+            rig.disconnect().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_sweep_excludes_overload_guard_through_restoration() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 200,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        bus.receive_gain
+            .confirmed_off(chrono::Utc::now().timestamp_millis());
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime.sweep_configured = true;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            ),
+        )
+        .await
+        .expect("sweep must exclude all automatic gain CAT work");
+        assert!(runtime.discovery.is_none());
+        assert!(runtime.generation.is_none());
+        assert!(!bus.receive_gain.gain_reserved());
+    }
+
     const SUCCESS: &str =
         "Receive overload on 40m: peak -0.5 dBFS; attenuator increased from 0 dB to 10 dB.";
     const UNAVAILABLE: &str = "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.";
@@ -8859,12 +8984,12 @@ mod receive_overload_notice_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn receive_overload_unavailable_is_warned_once_per_connection_generation() {
         use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
-        let rig = MockRig::new(MockRigConfig {
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
             connection_delay_ms: 0,
             operation_delay_ms: 0,
             attenuator_steps: Vec::new(),
             ..Default::default()
-        });
+        }));
         rig.connect().await.unwrap();
         let bus = MessageBus::new(8).unwrap();
         let (_, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
