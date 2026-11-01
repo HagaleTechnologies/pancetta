@@ -136,6 +136,22 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// also service future per-tick work (Task 6's read-stream drain).
 const RECV_TICK: Duration = Duration::from_millis(200);
 
+/// Live station state refreshed across QSO-component restarts.
+struct StationActivity {
+    ptt_active: Arc<std::sync::atomic::AtomicBool>,
+    qso_manager: tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+}
+
+#[cfg(test)]
+impl StationActivity {
+    fn idle() -> Self {
+        Self {
+            ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qso_manager: tokio::sync::watch::channel(None).1,
+        }
+    }
+}
+
 /// Everything the dispatch loop needs to act on a decrypted control action:
 /// the shared arm, the capability verifier, the client's device verifying key,
 /// the station-local TX-allow-list, the session replay set, and the audit log.
@@ -143,6 +159,7 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 /// Held on the blocking session task; the arm is the coordinator's shared
 /// `remote_tx_arm`, so arming here is visible to the TX worker immediately.
 struct ArmContext {
+    station_activity: StationActivity,
     arm: Arc<Mutex<ArmState>>,
     /// The coordinator's shared split-TX dial (0 = simplex) — the source the
     /// TX band-plan gate (`tx::tx_rf_for_gate`) and the QSO RF stamp read. A
@@ -851,6 +868,38 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
     }
 }
 
+async fn remote_qsy_refusal(ctx: &ArmContext) -> Option<&'static str> {
+    if ctx.station_activity.ptt_active.load(Ordering::Acquire) {
+        return Some("the rig is transmitting");
+    }
+    // Drop watch::Ref before awaiting the manager, allowing restart publication.
+    let manager = ctx.station_activity.qso_manager.borrow().clone();
+    if let Some(manager) = manager {
+        if manager
+            .get_active_qsos()
+            .await
+            .iter()
+            .any(|(_, qso)| qso.metadata.remote_client_key_id.is_none())
+        {
+            return Some("the station is running a local or autonomous QSO");
+        }
+    }
+    None
+}
+
+fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
+    warn!(target: "agent.control", peer = %peer, reason, command, "remote frequency change refused");
+    DispatchOutcome::cont_with(vec![PeerSend {
+        to: SendTarget::One(peer.to_string()),
+        frame: pancetta_protocol::ServerFrame::Event {
+            event: pancetta_protocol::ServerEvent::Error {
+                component: "stationAgent".into(),
+                message: format!("{command} refused — {reason}"),
+            },
+        },
+    }])
+}
+
 /// Dispatch one decrypted control action against the arm + coordinator bus.
 ///
 /// Pure with respect to timing (takes an [`ArmTime`] sample); side effects are the arm
@@ -1011,6 +1060,9 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            if let Some(reason) = remote_qsy_refusal(ctx).await {
+                return qsy_refused(peer, "setFrequency", reason);
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1030,6 +1082,9 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
+            if let Some(reason) = remote_qsy_refusal(ctx).await {
+                return qsy_refused(peer, "setSplit", reason);
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -2002,6 +2057,10 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz();
+        let station_activity = StationActivity {
+            ptt_active: self.ptt_active.clone(),
+            qso_manager: self.qso_manager_watch.subscribe(),
+        };
         // Round-1 review fix (PR #261): shared with `poll_authorizations_loop`
         // so a poll-driven disarm can flag the session loop to broadcast the
         // updated control state (see `ArmContext::revocation_pending`).
@@ -2080,6 +2139,7 @@ impl super::ApplicationCoordinator {
 
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
+                station_activity,
                 relay_url,
                 identity,
                 verifier,
@@ -2343,6 +2403,7 @@ async fn poll_authorizations_loop(
 
 /// Everything the session loop owns.
 struct RunConfig {
+    station_activity: StationActivity,
     relay_url: String,
     identity: AgentIdentity,
     verifier: CapabilityVerifier,
@@ -2385,6 +2446,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
+        station_activity: cfg.station_activity,
         arm: cfg.arm.clone(),
         split_tx_frequency_hz: cfg.split_tx_frequency_hz.clone(),
         verifier: cfg.verifier,
@@ -2968,6 +3030,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -5062,6 +5125,117 @@ mod tests {
     /// refused peer receives an `Error` frame (targeted at just it). B is given
     /// qsy scope so the refusal is proven at the CONTROLLER layer, not the scope
     /// layer.
+
+    async fn check_station_activity_qsy(
+        keyed: bool,
+        qso: Option<(bool, Option<String>)>,
+        split: bool,
+        allowed: bool,
+    ) {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.into(),
+            PeerCtx::authorized_until(vec!["qsy".into()], NOW + 600_000),
+        );
+        ctx.station_activity
+            .ptt_active
+            .store(keyed, Ordering::Release);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1AW".into(),
+            ..Default::default()
+        });
+        if let Some((remote, client)) = qso {
+            manager
+                .start_cq(1500.0, None, remote, client)
+                .await
+                .unwrap();
+        }
+        let (_watch_tx, watch_rx) = tokio::sync::watch::channel(Some(manager));
+        ctx.station_activity.qso_manager = watch_rx;
+        ctx.split_tx_frequency_hz
+            .store(14_090_000, Ordering::Release);
+        let bus = MessageBus::new(64).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let action = if split {
+            ControlAction::SetSplit {
+                enabled: true,
+                tx_frequency_hz: 14_080_000.0,
+            }
+        } else {
+            ControlAction::Qsy {
+                vfo: 1,
+                frequency_hz: 14_080_000.0,
+            }
+        };
+        let out = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+        if allowed {
+            assert!(matches!(
+                hamlib_rx.try_recv().unwrap().message_type,
+                MessageType::RigControl(RigControlMessage::SetFrequency {
+                    frequency: 14_080_000,
+                    ..
+                })
+            ));
+            assert!(!out.sends.iter().any(|s| matches!(
+                s.frame,
+                pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::Error { .. }
+                }
+            )));
+        } else {
+            assert!(hamlib_rx.try_recv().is_err());
+            assert!(ctx.controller.is_none());
+            assert!(ctx.qso_cleanup_owed.is_none());
+            assert_eq!(
+                ctx.split_tx_frequency_hz.load(Ordering::Acquire),
+                14_090_000
+            );
+            assert_eq!(out.sends.len(), 1);
+            let reason = if keyed {
+                "the rig is transmitting"
+            } else {
+                "the station is running a local or autonomous QSO"
+            };
+            let command = if split { "setSplit" } else { "setFrequency" };
+            assert!(matches!((&out.sends[0].to, &out.sends[0].frame),
+                (SendTarget::One(peer), pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::Error { component, message }
+                }) if peer == CLIENT_KEY_ID && component == "stationAgent"
+                    && message == &format!("{command} refused — {reason}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_rig_is_keyed() {
+        check_station_activity_qsy(true, None, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_a_local_qso_is_active() {
+        check_station_activity_qsy(false, Some((false, None)), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_a_wsjtx_bridge_qso_is_active() {
+        check_station_activity_qsy(false, Some((true, None)), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_allowed_while_only_a_cloud_client_qso_is_active() {
+        check_station_activity_qsy(false, Some((true, Some(CLIENT_KEY_ID.into()))), false, true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_rig_is_keyed() {
+        check_station_activity_qsy(true, None, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_a_local_qso_is_active() {
+        check_station_activity_qsy(false, Some((false, None)), true, false).await;
+    }
+
     #[tokio::test]
     async fn non_controller_qsy_refused_with_error_frame() {
         let mut ctx = ctx_with(true, true);
@@ -5959,6 +6133,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         let mut ctx = ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -6064,6 +6239,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -7100,6 +7276,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -10806,6 +10983,7 @@ mod tests {
         *arm.lock().unwrap() = armed_state();
         let hello = Duration::from_millis(300);
         let cfg = RunConfig {
+            station_activity: StationActivity::idle(),
             relay_url,
             identity: AgentIdentity::generate(),
             verifier,

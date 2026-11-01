@@ -84,6 +84,7 @@ Rules, in order of precedence:
    `SetSplit`, `TxRequest`, `StopCq`) from peer P when `controller == None` sets
    `controller = Some(P)` and then proceeds. Today's panino never sends `takeControl`; a single
    client connecting and arming works byte-for-byte as it does now.
+   Qsy/SetSplit first pass the PAN-252 station-activity check: keyed rigs and active QSOs without a remote_client_key_id refuse the command with a peer-targeted error. A refusal does not grab control.
 4. **Exclusivity:** a control-mutating action from a non-controller while a controller is
    assigned is refused — `warn!`, audited, and answered with an error frame to that peer (so
    its UI can render "take control first"). It does NOT implicitly grab.

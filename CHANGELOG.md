@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Remote clients can no longer retune the rig while it transmits, or move a local or autonomous QSO; the client receives an error saying why (PAN-252).
+
+
 ### Removed
 
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field

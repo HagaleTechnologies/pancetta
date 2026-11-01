@@ -2574,6 +2574,23 @@ impl super::ApplicationCoordinator {
                                             );
                                             continue;
                                         }
+                                        // PAN-252: recheck at the serialized CAT consumer,
+                                        // including manual PTT not held by the TX worker.
+                                        if message.source == ComponentId::StationAgent
+                                            && (ptt_active.load(Ordering::Acquire)
+                                                || ptt_on_since.read().await.is_some())
+                                        {
+                                            if take_frequency_producer_mark_if_matching(
+                                                &message,
+                                                vfo_enum,
+                                                &producer_marked_frequency_id,
+                                            ) {
+                                                hamlib_command_in_flight
+                                                    .fetch_sub(1, Ordering::AcqRel);
+                                            }
+                                            warn!(target: "rig", "Discarding a remote SetFrequency while the rig is keyed (PAN-252)");
+                                            continue;
+                                        }
                                         // PAN-19 round-15 review (Codex P1):
                                         // "keep TX muted until restored rig
                                         // state is applied". Only record
@@ -7406,6 +7423,100 @@ mod pan_59_reconnect_tests {
         )
         .await
         .expect("coordinator creation should succeed")
+    }
+
+    async fn check_remote_frequency_while_keyed(bus_key: bool, worker_key: bool) {
+        use pancetta_hamlib::{PttState, RigControl, Vfo};
+        let mut coordinator = test_coordinator().await;
+        coordinator.start_hamlib_component().await.unwrap();
+        let rig = coordinator.rig_handle.clone().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire)
+                || rig.get_frequency(Vfo::Current).await.unwrap_or(0) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock rig and command loop ready");
+        let before = rig.get_frequency(Vfo::Current).await.unwrap();
+        let send = |message| {
+            ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Hamlib,
+                MessageType::RigControl(message),
+                Instant::now(),
+            )
+        };
+        if bus_key {
+            coordinator
+                .message_bus
+                .send_message(send(crate::message_bus::RigControlMessage::SetPtt {
+                    state: true,
+                }))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while rig.get_ptt(Vfo::Current).await.unwrap() != PttState::On {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("bus PTT keyed");
+        }
+        coordinator.ptt_active.store(worker_key, Ordering::Release);
+        coordinator
+            .message_bus
+            .send_message(send(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: before + 6_000,
+            }))
+            .await
+            .unwrap();
+        // A following split command provides a FIFO fence. Its applied state
+        // proves that the command loop handled the preceding QSY.
+        coordinator
+            .message_bus
+            .send_message(send(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: before + 10_000,
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !rig.get_split().await.unwrap().0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("following split command consumed");
+        assert_eq!(
+            rig.get_frequency(Vfo::Current).await.unwrap(),
+            if bus_key || worker_key {
+                before
+            } else {
+                before + 6_000
+            }
+        );
+        coordinator.ptt_active.store(false, Ordering::Release);
+        coordinator.teardown_hamlib().await;
+    }
+
+    #[tokio::test]
+    async fn station_agent_set_frequency_dropped_while_keyed() {
+        check_remote_frequency_while_keyed(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn station_agent_set_frequency_dropped_while_tx_worker_holds_ptt_active() {
+        check_remote_frequency_while_keyed(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn station_agent_set_frequency_applies_when_unkeyed() {
+        check_remote_frequency_while_keyed(false, false).await;
     }
 
     #[tokio::test]
