@@ -13,13 +13,14 @@ h1 = 'a' * 40
 h2 = 'b' * 40
 finding = 'c' * 40
 ids = %w[T1 T2 T3 T4 T5]
-body = step.fetch('run')
-%w[baseline_pure baseline_initiated].each do |name|
-  expr = "'${{ steps.baseline.outputs.#{name} }}'"
-  raise "missing #{expr}" unless body.include?(expr)
-  body = body.sub(expr, "'#{JSON.generate(ids)}'")
+template = step.fetch('run')
+exprs = %w[baseline_pure baseline_initiated].map { |name| "'${{ steps.baseline.outputs.#{name} }}'" }
+exprs.each { |expr| raise "missing #{expr}" unless template.include?(expr) }
+body_for = lambda do |thread_ids|
+  body = exprs.reduce(template) { |acc, expr| acc.sub(expr, "'#{JSON.generate(thread_ids)}'") }
+  raise 'unresolved expression' if body.include?('${{')
+  body
 end
-raise 'unresolved expression' if body.include?('${{')
 # freshness-check is not run: its retry loop sleeps 15 s when lookups fail, and
 # compute-verdict is the step that mutates threads.
 
@@ -60,7 +61,9 @@ mock = <<~'MOCK'
   elsif args == ['api', 'repos/test/repo/pulls/17', '--jq', '.head.sha']
     log.call('pulls')
     if s['lookup_fails']
-      $stderr.puts 'HTTP 502'
+      # Real `gh api` prints a JSON error body on stdout, even with --jq.
+      $stdout.puts '{"message":"Server Error","status":"502"}'
+      $stderr.puts 'gh: Server Error (HTTP 502)'
       code = 1
     else
       out = s['head']
@@ -126,9 +129,6 @@ Dir.mktmpdir('pan254-auto-resolve-') do |dir|
   state_path = File.join(dir, 'state.json')
   output_path = File.join(dir, 'output')
   script = File.join(dir, 'compute-verdict.sh')
-  File.write(script, body)
-  _, err, syntax = Open3.capture3('bash', '-n', script)
-  raise "syntax: #{err}" unless syntax.success?
   env = {'PATH' => "#{dir}:#{ENV.fetch('PATH')}", 'MOCK_STATE' => state_path,
          'GH_TOKEN' => 'github-token', 'RESOLVE_TOKEN' => 'resolve-token',
          'REPO' => 'test/repo', 'PR' => '17', 'HEAD_SHA' => h1,
@@ -136,9 +136,16 @@ Dir.mktmpdir('pan254-auto-resolve-') do |dir|
          'TRUSTED_LOGIN' => 'trusted', 'GITHUB_OUTPUT' => output_path}
   # Runs compute-verdict under GitHub's default `bash -e {0}` and returns the
   # mock's final state plus the step's combined output.
+  # `count` and `long_paths` size the thread list; every other key seeds the mock.
   run = lambda do |scenario|
-    threads = ids.each_with_index.map do |id, n|
-      {'id' => id, 'path' => "src/f#{n}.rs", 'resolved' => false, 'replies' => [],
+    scenario = scenario.dup
+    thread_ids = (1..(scenario.delete('count') || ids.length)).map { |n| "T#{n}" }
+    dir_name = scenario.delete('long_paths') ? 'd' * 390 : 'src'
+    File.write(script, body_for.call(thread_ids))
+    _, err, syntax = Open3.capture3('bash', '-n', script)
+    raise "syntax: #{err}" unless syntax.success?
+    threads = thread_ids.each_with_index.map do |id, n|
+      {'id' => id, 'path' => "#{dir_name}/f#{n}.rs", 'resolved' => false, 'replies' => [],
        'comments' => [{'author' => {'login' => 'chatgpt-codex-connector'},
                        'createdAt' => '2026-11-01T10:00:00Z', 'originalCommit' => {'oid' => finding}}]}
     end
@@ -210,6 +217,14 @@ Dir.mktmpdir('pan254-auto-resolve-') do |dir|
     warnings = lines.call(r, '::warning::').select { |l| l.include?('mid-loop') }
     raise "expected 5 mid-loop warnings, got #{warnings.length}" unless warnings.length == 5
     raise 'notice on a failed lookup' unless lines.call(r, '::notice::').empty?
+  end
+
+  # 160 threads with 400-character paths give more TSV than a 64 KiB pipe buffer
+  # holds, so the loop's input must not be a pipe the `break` closes on a writer.
+  check.call('head moves with more threads than a pipe buffer holds: the step still exits 0') do
+    r = run.call('count' => 160, 'long_paths' => true, 'move_after_resolve' => 1)
+    got = resolved.call(r)
+    raise "resolved #{got.length}/160 (#{got.first(3).join(',')}), expected T1" unless got == %w[T1]
   end
 end
 puts "PASS: #{count} codex auto-resolve head cases"
