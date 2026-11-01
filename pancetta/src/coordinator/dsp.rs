@@ -1078,14 +1078,12 @@ impl super::ApplicationCoordinator {
                             dsp_slot_ns,
                         );
                         if let Some(jump) = jump {
-<<<<<<< HEAD
                             if overload_enabled {
                                 overload_valid_since = now.timestamp_millis();
                                 overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
-=======
+                            }
                             if let Ok(mut registry) = sweep_capture.lock() {
                                 registry.invalidate_all("clock discontinuity during capture");
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
                             }
                             next_window_time = reanchored;
                             if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
@@ -1134,7 +1132,8 @@ impl super::ApplicationCoordinator {
                                 let validity = if !valid {
                                     WindowValidity::Invalid
                                 } else {
-                                    gain_safety.window_validity(capture_start)
+                                    gain_safety
+                                        .window_validity(capture_start, now.timestamp_millis())
                                 };
                                 let measurement = Measurement {
                                     slot: slot_boundary.timestamp().div_euclid(15),

@@ -172,6 +172,12 @@ pub fn next_attenuator(current: i32, steps: &[i32]) -> Option<i32> {
         .min()
 }
 
+/// Longest receive interval without a hardware PTT observation (a poll that
+/// read Off, or a PTT/gain transition) that still counts as receive. The
+/// Hamlib poll loop reads PTT every 500 ms while receiving, so an external key
+/// held for less than about one poll interval can still go unseen.
+pub const PTT_OBSERVATION_GAP_MS: i64 = 2_000;
+
 /// Shared radio gain/PTT admission. CAT operations must run after releasing the
 /// coordinator's synchronous PTT gate. Unknown hardware state starts inhibited.
 #[derive(Debug)]
@@ -181,6 +187,8 @@ pub struct GainSafety {
     epoch: std::sync::atomic::AtomicU64,
     last_activity_ms: std::sync::atomic::AtomicI64,
     last_gain_ms: std::sync::atomic::AtomicI64,
+    ptt_seen_ms: std::sync::atomic::AtomicI64,
+    ptt_unverified_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Default for GainSafety {
@@ -191,6 +199,8 @@ impl Default for GainSafety {
             epoch: std::sync::atomic::AtomicU64::new(0),
             last_activity_ms: std::sync::atomic::AtomicI64::new(i64::MAX),
             last_gain_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
+            ptt_seen_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
+            ptt_unverified_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
         }
     }
 }
@@ -298,6 +308,34 @@ impl GainSafety {
     fn touch(&self, now_ms: i64) {
         use std::sync::atomic::Ordering::SeqCst;
         self.last_activity_ms.store(now_ms, SeqCst);
+        self.ptt_seen_ms.store(now_ms, SeqCst);
+    }
+
+    /// A hardware poll read PTT keyed while Pancetta was receiving. The new
+    /// epoch makes queued windows and pending work from before it stale; the
+    /// owner's recovery path re-establishes receive after a confirmed unkey.
+    pub fn observed_ptt_on(&self, now_ms: i64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.state.compare_exchange(0, 1, SeqCst, SeqCst) {
+            Ok(_) => {
+                self.epoch.fetch_add(1, SeqCst);
+                self.touch(now_ms);
+            }
+            Err(1) => self.touch(now_ms),
+            Err(_) => {}
+        }
+    }
+
+    /// A hardware poll read PTT Off while receiving. Front-panel MOX or another
+    /// CAT client can key the rig without a Pancetta command, so a gap longer
+    /// than `PTT_OBSERVATION_GAP_MS` since the previous observation leaves
+    /// that interval's receive state unestablished.
+    pub fn observed_ptt_off(&self, now_ms: i64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let previous = self.ptt_seen_ms.swap(now_ms, SeqCst);
+        if now_ms.saturating_sub(previous) > PTT_OBSERVATION_GAP_MS {
+            self.ptt_unverified_ms.fetch_max(now_ms, SeqCst);
+        }
     }
 
     /// The serialized CAT owner checks even commands from internal/raw callers.
@@ -314,13 +352,19 @@ impl GainSafety {
 
     /// Classify the entire capture interval, including pre-roll. A confirmed
     /// unkey after capture began still contaminates the window, even if the
-    /// rig is receiving by the time DSP emits it.
-    pub fn window_validity(&self, capture_start_ms: i64) -> WindowValidity {
+    /// rig is receiving by the time DSP emits it. A receive interval without
+    /// hardware PTT observation, before `now_ms` or at the capture's tail,
+    /// is invalid.
+    pub fn window_validity(&self, capture_start_ms: i64, now_ms: i64) -> WindowValidity {
         use std::sync::atomic::Ordering::SeqCst;
         let activity = self.last_activity_ms();
+        let unobserved = self.ptt_unverified_ms.load(SeqCst) >= capture_start_ms
+            || (self.receiving()
+                && now_ms.saturating_sub(self.ptt_seen_ms.load(SeqCst)) > PTT_OBSERVATION_GAP_MS);
         if self.blocked()
             || activity == i64::MAX
             || self.last_gain_ms.load(SeqCst) >= capture_start_ms
+            || unobserved
         {
             WindowValidity::Invalid
         } else if !self.receiving() || activity >= capture_start_ms {
@@ -796,20 +840,47 @@ mod tests {
     #[test]
     fn capture_overlap_includes_preroll_and_acknowledged_unkey() {
         let safety = GainSafety::default();
-        assert_eq!(safety.window_validity(100), WindowValidity::Invalid);
+        assert_eq!(safety.window_validity(100, 100), WindowValidity::Invalid);
         safety.confirmed_off(0);
-        assert_eq!(safety.window_validity(100), WindowValidity::Receive);
+        assert_eq!(safety.window_validity(100, 100), WindowValidity::Receive);
         assert!(safety.admit_ptt(90));
         safety.ptt_command_consumed();
         // Enqueuing an unkey has not acknowledged it.
-        assert_eq!(safety.window_validity(100), WindowValidity::KnownTx);
+        assert_eq!(safety.window_validity(100, 100), WindowValidity::KnownTx);
         safety.confirmed_off(101);
         // Even though emission is later, TX overlapped pre-roll.
-        assert_eq!(safety.window_validity(100), WindowValidity::KnownTx);
-        assert_eq!(safety.window_validity(102), WindowValidity::Receive);
+        assert_eq!(safety.window_validity(100, 100), WindowValidity::KnownTx);
+        assert_eq!(safety.window_validity(102, 102), WindowValidity::Receive);
         assert!(safety.reserve());
         safety.finish_gain(105);
-        assert_eq!(safety.window_validity(102), WindowValidity::Invalid);
-        assert_eq!(safety.window_validity(106), WindowValidity::Receive);
+        assert_eq!(safety.window_validity(102, 102), WindowValidity::Invalid);
+        assert_eq!(safety.window_validity(106, 106), WindowValidity::Receive);
+    }
+
+    #[test]
+    fn receive_without_hardware_ptt_observation_is_invalid() {
+        let safety = GainSafety::default();
+        safety.confirmed_off(0);
+        safety.observed_ptt_off(500);
+        assert_eq!(safety.window_validity(100, 1_000), WindowValidity::Receive);
+        // Polling stopped: the capture's tail has no PTT observation.
+        assert_eq!(safety.window_validity(100, 3_000), WindowValidity::Invalid);
+        // A late observation cannot vouch for the gap a capture spanned.
+        safety.observed_ptt_off(4_000);
+        assert_eq!(safety.window_validity(100, 4_000), WindowValidity::Invalid);
+        assert_eq!(
+            safety.window_validity(4_001, 4_100),
+            WindowValidity::Receive
+        );
+        // An externally keyed rig seen by a poll is known TX, not receive.
+        safety.observed_ptt_on(4_500);
+        assert_eq!(
+            safety.window_validity(4_001, 4_600),
+            WindowValidity::KnownTx
+        );
+        assert_eq!(
+            safety.window_validity(4_600, 4_700),
+            WindowValidity::KnownTx
+        );
     }
 }

@@ -1477,7 +1477,6 @@ mod split_read_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod attenuator_tests {
     use super::*;
 
@@ -1618,7 +1617,27 @@ mod attenuator_tests {
             assert!(client.supported_attenuator_steps().await.is_err());
             assert!(client.conn.lock().await.is_none());
             server.await.unwrap();
-=======
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attenuator_timeout_disconnects_without_retry() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "\\set_level ATT 10\n");
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        });
+        assert!(client.set_attenuator(10).await.is_err());
+        assert!(client.conn.lock().await.is_none());
+        assert!(!client.state.read().await.connected);
+        server_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
 
@@ -1718,26 +1737,10 @@ mod receive_gain_tests {
             assert!(client.get_receive_gain().await.is_err());
             assert!(client.conn.lock().await.is_none());
             task.await.unwrap();
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
-<<<<<<< HEAD
-    async fn attenuator_timeout_disconnects_without_retry() {
-        let (client, server) = super::split_read_tests::connected_client().await;
-        let server_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(server);
-            let mut command = String::new();
-            reader.read_line(&mut command).await.unwrap();
-            assert_eq!(command, "\\set_level ATT 10\n");
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-        });
-        assert!(client.set_attenuator(10).await.is_err());
-        assert!(client.conn.lock().await.is_none());
-        assert!(!client.state.read().await.connected);
-        server_task.await.unwrap();
-=======
     async fn gain_partial_pair_still_restores_both_original_controls() {
         let (client, task) =
             fixture(vec![("L ATT 0", "RPRT 0\n"), ("L PREAMP 20", "RPRT -1\n")]).await;
@@ -1839,6 +1842,5 @@ mod receive_gain_tests {
         ] {
             assert!(parse_gain_capabilities(text).is_err());
         }
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
     }
 }

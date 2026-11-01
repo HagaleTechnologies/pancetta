@@ -219,6 +219,12 @@ strictly below -6 dBFS cancel a pending step. A confirmed step requires three ne
 hot windows before another step. Silence counts as cool audio; incomplete,
 nonfinite, stale, mixed-gain or TX-contaminated windows cannot advance a streak.
 Retunes, mode changes, audio gaps and reconnects clear pending work.
+While receiving, the guard reads the rig's PTT every 500 ms. A window in which
+the rig was keyed outside Pancetta (front-panel MOX or another CAT client) does
+not count as receive and discards earlier pending work, and a window with more
+than 2 s without an Off reading is invalid. A key shorter than about one poll
+interval can go unseen. If PTT cannot be read, the guard warns once and counts
+no receive windows until a read succeeds.
 
 The guard discovers discrete integer-dB ATT settings from Hamlib. It reads the
 current setting at execution time and selects the smallest supported setting

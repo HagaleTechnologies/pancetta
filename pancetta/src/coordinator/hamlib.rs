@@ -40,6 +40,22 @@ async fn overload_notice(bus: &crate::message_bus::MessageBus, warning: bool, te
     .await;
 }
 
+/// Front-panel MOX or another CAT client can key the rig without a Pancetta
+/// command. The poll loop calls this while the overload guard is receiving; a
+/// failed read records nothing, so window_validity rejects the gap.
+async fn observe_hardware_ptt(
+    rig: &dyn pancetta_hamlib::RigControl,
+    safety: &super::receive_overload::GainSafety,
+) -> Result<()> {
+    let asked_ms = chrono::Utc::now().timestamp_millis();
+    if rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off {
+        safety.observed_ptt_off(asked_ms);
+    } else {
+        safety.observed_ptt_on(chrono::Utc::now().timestamp_millis());
+    }
+    Ok(())
+}
+
 impl ReceiveOverloadRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn tick(
@@ -2129,6 +2145,7 @@ impl super::ApplicationCoordinator {
                     // PollingFailed; redial 2 s backing off to 30 s).
                     let mut poll_health = RigPollHealth::new();
                     let mut split_read_health = SplitReadHealth::default();
+                    let mut overload_ptt_read_failing = false;
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -2370,6 +2387,23 @@ impl super::ApplicationCoordinator {
                                     }
                                     if let SplitPollOutcome::Changed(tx_hz) = outcome {
                                         emit_split_status(&message_bus, &display_feed_enabled_poll, tx_hz).await;
+                                    }
+                                    // PAN-246: observe hardware PTT outside the
+                                    // command loop, so no key-down waits on it.
+                                    if overload_enabled
+                                        && message_bus.receive_gain.receiving()
+                                        && !ptt_active_poll.load(Ordering::Acquire)
+                                    {
+                                        let failing = observe_hardware_ptt(
+                                            rig_for_polling.as_ref(),
+                                            &message_bus.receive_gain,
+                                        )
+                                        .await
+                                        .is_err();
+                                        if failing && !overload_ptt_read_failing {
+                                            overload_notice(&message_bus, true, "Receive overload guard paused: rig PTT state could not be read; receive windows are not counted until it can.".into()).await;
+                                        }
+                                        overload_ptt_read_failing = failing;
                                     }
                                     outcome.keeps_poll_ok()
                                 } else {
@@ -2957,22 +2991,11 @@ impl super::ApplicationCoordinator {
                                         );
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
-<<<<<<< HEAD
                                         if *state {
                                             message_bus_for_connect
                                                 .receive_gain
                                                 .ptt_command_consumed();
-                                            if !message_bus_for_connect
-                                                .receive_gain
-                                                .hardware_ptt_on(
-                                                    chrono::Utc::now().timestamp_millis(),
-                                                )
-                                            {
-                                                continue;
-                                            }
                                         }
-
-=======
                                         // Revalidate queued key-downs at the rig owner too.
                                         // An acknowledged earlier unkey may have retired the
                                         // producer's reservation while this command waited.
@@ -2996,12 +3019,20 @@ impl super::ApplicationCoordinator {
                                             );
                                             continue;
                                         }
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
                                         if *state && tx_restart_inhibit.load(Ordering::Acquire) != 0
                                         {
                                             warn!(
                                                 "Discarding PTT-on while Hamlib restart inhibit is active"
                                             );
+                                            continue;
+                                        }
+                                        if *state
+                                            && !message_bus_for_connect
+                                                .receive_gain
+                                                .hardware_ptt_on(
+                                                    chrono::Utc::now().timestamp_millis(),
+                                                )
+                                        {
                                             continue;
                                         }
                                         // Update PTT watchdog tracker
@@ -3036,15 +3067,12 @@ impl super::ApplicationCoordinator {
                                                     if *state { "ON" } else { "OFF" }
                                                 );
                                                 if !*state {
-<<<<<<< HEAD
                                                     message_bus_for_connect
                                                         .receive_gain
                                                         .confirmed_off(
                                                             chrono::Utc::now().timestamp_millis(),
                                                         );
-=======
                                                     gain_tx_gate.fetch_and(!2, Ordering::AcqRel);
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
                                                     confirm_ptt_off(
                                                         &ptt_off_unconfirmed,
                                                         &ptt_off_confirmations,
@@ -8897,6 +8925,40 @@ mod receive_overload_notice_tests {
             bus.receive_gain.receiving(),
             "unknown startup PTT recovers after confirmed unkey"
         );
+    }
+
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_observes_external_ptt_and_discards_earlier_overload_work() {
+        use crate::coordinator::receive_overload::{GainSafety, WindowValidity};
+        use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        let safety = GainSafety::default();
+        safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+        super::observe_hardware_ptt(&rig, &safety).await.unwrap();
+        assert!(safety.receiving());
+        let epoch = safety.epoch();
+        // Front-panel MOX or another CAT client, not a Pancetta command.
+        rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        super::observe_hardware_ptt(&rig, &safety).await.unwrap();
+        assert!(!safety.receiving());
+        assert_ne!(
+            safety.epoch(),
+            epoch,
+            "queued windows from before the key are stale"
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            safety.window_validity(now + 1, now + 1),
+            WindowValidity::KnownTx
+        );
+        rig.disconnect().await.unwrap();
+        assert!(super::observe_hardware_ptt(&rig, &safety).await.is_err());
     }
 }
 

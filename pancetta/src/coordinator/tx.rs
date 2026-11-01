@@ -5765,9 +5765,6 @@ pub(crate) fn send_ptt_command(
     state: bool,
     authorize: impl FnOnce() -> bool,
 ) -> SendIfOutcome {
-<<<<<<< HEAD
-    let mut admitted = false;
-=======
     // One CAS arbitrates gain admission and every key-down enqueue, without
     // introducing a lock or await into the last-gate-to-enqueue path.
     if state {
@@ -5784,7 +5781,7 @@ pub(crate) fn send_ptt_command(
             Err(_) => return SendIfOutcome::Denied,
         }
     }
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
+    let mut admitted = false;
     let outcome = message_bus.send_rig_command_if(
         ComponentMessage::new(
             source,
@@ -5792,7 +5789,6 @@ pub(crate) fn send_ptt_command(
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
             Instant::now(),
         ),
-<<<<<<< HEAD
         || {
             if !authorize() {
                 return false;
@@ -5808,9 +5804,7 @@ pub(crate) fn send_ptt_command(
     );
     if admitted && outcome != SendIfOutcome::Enqueued {
         message_bus.receive_gain.ptt_command_consumed();
-=======
-        authorize,
-    );
+    }
     if state {
         if outcome == SendIfOutcome::Enqueued {
             message_bus.gain_tx_gate.fetch_or(2, Ordering::AcqRel);
@@ -5819,7 +5813,6 @@ pub(crate) fn send_ptt_command(
         // Bits 2+ count synchronous enqueue attempts, bit 1 persists until
         // Hamlib acknowledges PTT-off, and bit 0 belongs to gain transitions.
         message_bus.gain_tx_gate.fetch_sub(4, Ordering::AcqRel);
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
     }
     outcome
 }

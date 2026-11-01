@@ -60,11 +60,8 @@ impl Default for MockRigConfig {
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
             split_read_supported: true,
-<<<<<<< HEAD
             attenuator_steps: vec![0, 6, 10, 12, 20],
-=======
             receive_gain: None,
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
         }
     }
 }
@@ -1354,7 +1351,6 @@ mod split_read_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod attenuator_tests {
     use super::*;
 
@@ -1377,7 +1373,10 @@ mod attenuator_tests {
         assert!(rig.set_attenuator(6).await.is_err());
         rig.set_attenuator(10).await.unwrap();
         assert_eq!(rig.get_attenuator().await.unwrap(), 10);
-=======
+    }
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
 
@@ -1422,6 +1421,5 @@ mod receive_gain_tests {
         .await
         .unwrap();
         assert_eq!(rig.get_receive_gain().await.unwrap(), desired);
->>>>>>> 7fa8389602c06fd000ce57b4a783c464ed0e7914
     }
 }
