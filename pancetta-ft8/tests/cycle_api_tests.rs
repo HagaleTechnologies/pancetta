@@ -189,21 +189,33 @@ const JTDX_190227_155815: [&str; 25] = [
 
 #[test]
 fn ft8_cycle_golden_sets() {
-    // jtdx fixture: exact text list (order as returned).
+    // jtdx fixture: exact text set, compared order-insensitively. The
+    // decoder contract documents no return order, and the order is not
+    // stable across machines: CI run 41160625438 returned this exact set
+    // with `GD3YUM BG4QNE PM01` and `CQ RT4S LO36` swapped. Both are
+    // native-pass additions after the 22 C-pass decodes, ranked by the
+    // native decoder. Sorting both sides keeps the count, every text and
+    // any duplicate exact (the `wav_decode_tests` decode-set precedent
+    // compares sets too). Merge order stays covered: the parity test above
+    // compares in order against a hand-run `merge_ft8lib_first`, and
+    // `merge.rs` unit-tests that order directly.
     let samples = read_wav_file(&fixture("jtdx/190227_155815.wav"));
     let got = decode_cycle(&samples, Protocol::Ft8).expect("decode_cycle");
-    let texts: Vec<&str> = got.iter().map(|m| m.text.as_str()).collect();
+    let mut texts: Vec<&str> = got.iter().map(|m| m.text.as_str()).collect();
     println!(
-        "jtdx/190227_155815.wav golden set ({} messages):",
+        "jtdx/190227_155815.wav golden set ({} messages, order as returned):",
         texts.len()
     );
     for t in &texts {
         println!("  {t}");
     }
-    assert_eq!(texts.len(), JTDX_190227_155815.len());
-    for (want, got_text) in JTDX_190227_155815.iter().zip(texts.iter()) {
-        assert_eq!(*want, *got_text);
-    }
+    let mut want: Vec<&str> = JTDX_190227_155815.to_vec();
+    want.sort_unstable();
+    texts.sort_unstable();
+    assert_eq!(
+        texts, want,
+        "jtdx/190227_155815.wav: golden decode set changed"
+    );
 
     // Generated fixtures: each carries exactly its encoded message.
     for (sub, text) in [
@@ -244,7 +256,7 @@ fn ft8_cycle_keeps_full_cycle_recall_on_live_now() {
         "decode_cycle lost a full-cycle-only decode (C pass truncated at \
          WINDOW_SAMPLES?); got {} messages:\n{:?}",
         texts.len(),
-        &texts
+        texts
     );
 }
 
