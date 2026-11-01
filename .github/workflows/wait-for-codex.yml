@@ -881,6 +881,8 @@ jobs:
         # concurrency group -- cancel-in-progress: false on the response job is deliberate
         # (an in-flight thread-resolution loop must finish cleanly, not be killed
         # mid-mutation), so a shared cancellation domain isn't the right fix here.
+        # This is not the only guard: compute-verdict's auto-resolve loop re-reads the
+        # live head before every thread and stops as soon as it has moved (PAN-254).
         if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.verdict.outputs.codex_errored != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1057,8 +1059,32 @@ jobs:
             exit 0
           fi
 
-          echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv' | while IFS=$'\t' read -r thread_id path finding_sha; do
+          # PAN-254: the loop reads a captured string, not a pipe. The head check's
+          # `break` below would otherwise close the pipe on a jq still writing a list
+          # longer than the pipe buffer, and under pipefail that SIGPIPE (exit 141)
+          # fails the step after outcome=success was written.
+          resolvable_tsv=$(echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv')
+          while IFS=$'\t' read -r thread_id path finding_sha; do
             [ -z "$thread_id" ] && continue
+            # PAN-254 (ported from propagation f8e1243): freshness-check above reads the
+            # head once, before this loop starts. Each iteration makes about five API
+            # calls, so a push that lands mid-loop would otherwise go unnoticed and the
+            # remaining threads would be resolved with a reply naming a commit that is no
+            # longer the PR head (threads are PR-global, so that can resolve a finding the
+            # new head reintroduced). The live re-reads below check the thread's state,
+            # never the head. `break`, not `continue`: once the head has moved, every
+            # remaining thread is equally stale. A failed lookup fails open, the stance
+            # freshness-check states, and the next iteration checks again. gh's exit status
+            # decides a failed lookup, not empty output: on an HTTP error `gh api` still
+            # prints the JSON error body on stdout, even with --jq, and that body must
+            # not read as a moved head (upstream's `|| echo ""` lets it).
+            LIVE_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/loop-freshness-err.log) || LIVE_HEAD_SHA=""
+            if [ -z "$LIVE_HEAD_SHA" ]; then
+              echo "::warning::Could not re-verify PR #$PR's live head mid-loop -- continuing with the originally captured head rather than aborting a partially-completed auto-resolve pass: $(cat /tmp/loop-freshness-err.log 2>/dev/null)"
+            elif [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::notice::PR #$PR's head advanced from $HEAD_SHA to $LIVE_HEAD_SHA mid-loop -- stopping auto-resolve here. Remaining threads stay unresolved for the new head's own request/response cycle to re-evaluate."
+              break
+            fi
             if [ -z "$finding_sha" ]; then
               echo "::warning::Thread $thread_id has no recorded originating commit — leaving unresolved."
               continue
@@ -1141,7 +1167,7 @@ jobs:
               continue
             fi
             echo "Auto-resolved thread $thread_id"
-          done
+          done <<< "$resolvable_tsv"
 
       - name: Update the check-run
         # freshness-check's own `stale` output must also gate this step (not just
