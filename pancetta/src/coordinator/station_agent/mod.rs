@@ -888,7 +888,11 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
 ///   arm never keys TX directly (no bypass).
 /// - `TakeControl` moves control, disarms a displaced controller and owes the
 ///   PAN-137 QSO cleanup. `ReleaseControl` disarms and releases control.
-/// - `StopCq` / `Unsupported` are otherwise logged no-ops in v1.
+/// - `StopCq` is controller-gated like `TxRequest` and forwards the
+///   station-wide `QsoMessage::StopCq` to the QSO engine (PAN-250). It flushes
+///   an owed PAN-137 cleanup first but never waits on it, and returns a retry
+///   `error` when the QSO inbox does not accept the stop.
+/// - `Unsupported` is a logged no-op.
 async fn dispatch_action(
     action: ControlAction,
     peer: &str,
@@ -1164,16 +1168,34 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(grab)
         }
         ControlAction::StopCq => {
-            // A control-mutating action (rules 3/4) that is otherwise a no-op in
-            // v1: still gate on the controller (implicit grab / refuse) so it
-            // can't be driven by a non-controller.
-            match controller_gate(ctx, peer, now) {
-                ControllerGate::Proceed(sends) => {
-                    debug!(target: "agent.control", "stopCq accepted (not wired in v1)");
-                    DispatchOutcome::cont_with(sends)
-                }
-                ControllerGate::Refused(sends) => DispatchOutcome::cont_with(sends),
+            // PAN-250: a control-mutating action (rules 3/4: implicit grab /
+            // refuse a non-controller) routed to the same station-wide
+            // `QsoMessage::StopCq` the TUI `s` key and WSJT-X HaltTx send.
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
+            // Stopping only reduces TX, so it never waits on an owed PAN-137
+            // cleanup; flushing first keeps the cleanup ahead of it when both fit.
+            flush_qso_cleanup(ctx, bus).await;
+            if !send_qso(bus, crate::message_bus::QsoMessage::StopCq).await {
+                warn!(target: "agent.tx", peer = %peer, "stopCq not enqueued on the QSO inbox; asking the client to retry");
+                let mut sends = grab;
+                sends.push(PeerSend {
+                    to: SendTarget::One(peer.to_string()),
+                    frame: pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::Error {
+                            component: "stationAgent".into(),
+                            message: "stop CQ not delivered; retry stopCq".into(),
+                        },
+                    },
+                });
+                return DispatchOutcome::cont_with(sends);
             }
+            // The client learns the CQ stopped from the QSO engine's next
+            // `activeQsos` snapshot, published after the CQ left TX liveness.
+            info!(target: "agent.tx", peer = %peer, "routed remote stopCq to the QSO engine");
+            DispatchOutcome::cont_with(grab)
         }
         ControlAction::TakeControl => {
             // Rule 1: free grab from ANY established peer always succeeds. If it
@@ -1534,7 +1556,8 @@ async fn send_rig(bus: &MessageBus, msg: RigControlMessage) {
 }
 
 /// Forward a QSO-control message to the QSO component. Used to route a remote
-/// operator's TX-initiation into the real QSO engine. The messages carry
+/// operator's TX-initiation into the real QSO engine, plus the PAN-137
+/// controller change and the PAN-250 `StopCq`. TX-initiation messages carry
 /// `remote_origin = true`, so the QSO's TransmitRequests are `TxOrigin::Remote`
 /// and armed-TX gated downstream (this call itself keys nothing). Returns
 /// whether the QSO inbox actually accepted the message.
@@ -4602,6 +4625,9 @@ mod tests {
                     remote_client_key_id,
                     ..
                 }) => format!("start:{callsign}:{}", remote_client_key_id.unwrap()),
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq) => {
+                    "stopCq".to_string()
+                }
                 other => panic!("unexpected QSO inbox message: {other:?}"),
             })
             .collect()
@@ -4819,8 +4845,86 @@ mod tests {
         )
         .await;
         assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        // PAN-250: the stop flushes the owed cleanup itself, ahead of the stop.
+        assert!(ctx.qso_cleanup_owed.is_none());
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("changed:{PEER_B}"), "stopCq".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_stop_cq_reaches_the_qso_engine() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
         flush_qso_cleanup(&mut ctx, &bus).await;
-        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{PEER_B}")]);
+        assert_eq!(qso_inbox_tags(&rx).len(), 1);
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(qso_inbox_tags(&rx), ["stopCq"]);
+        assert!(
+            out.sends.is_empty(),
+            "a delivered stop is reported by the QSO engine's activeQsos snapshot"
+        );
+        // A non-controller is still refused and enqueues nothing.
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(qso_inbox_tags(&rx).is_empty());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { message, .. } }
+                if message == "another client holds control — takeControl first"
+        )), "a non-controller's stopCq must be refused");
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_stop_cq_tells_the_client_to_retry() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(1).unwrap();
+        let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        tx.try_send(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        grab_a(&mut ctx, &bus).await;
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { component, message } }
+                if component == "stationAgent" && message == "stop CQ not delivered; retry stopCq"
+        ) && matches!(&s.to, SendTarget::One(p) if p == CLIENT_KEY_ID)),
+            "an undelivered stop must ask the client to retry");
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(
+            rx.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos)
+        ));
     }
 
     #[tokio::test]

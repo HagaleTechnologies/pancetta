@@ -170,6 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A remote client's Stop CQ now stops the station calling CQ. It previously
+  did nothing (PAN-250).
+
 - The `ft8.desense` warning excludes our own transmit windows, uses a fresh
   same-band baseline, and requires healthy reception before TX (PAN-212).
   It no longer doubles as an unintended transmission heartbeat.

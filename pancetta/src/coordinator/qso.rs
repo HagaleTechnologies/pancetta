@@ -15748,6 +15748,55 @@ mod remote_controller_change_tests {
         assert!(h.manager.has_active_qso_with("K4LOC").await);
         assert!(!h.manager.has_active_qso_with("K3CCC").await);
     }
+
+    /// PAN-250: the station agent forwards a remote `stopCq` as
+    /// `QsoMessage::StopCq`. By the time the gateway sees the snapshot without
+    /// the CQ, the CQ has left TX liveness, so the TX worker drops its next frame.
+    #[tokio::test]
+    async fn remote_stop_cq_cancels_the_cq_before_its_next_tx() {
+        let h = harness(4, true).await;
+        h.send(QsoMessage::StartCq {
+            frequency: 1200,
+            tx_parity: None,
+            remote_origin: true,
+            remote_client_key_id: Some("client-a".to_string()),
+        })
+        .await;
+        let tx = collect_until(&h.tx, |m| {
+            tx_text(m).is_some_and(|t| t.starts_with("CQ K1TEST"))
+        })
+        .await;
+        assert!(tx
+            .iter()
+            .filter_map(tx_text)
+            .any(|t| t.starts_with("CQ K1TEST")));
+        let active = h.manager.get_active_qsos().await;
+        assert_eq!(active.len(), 1, "exactly the remote CQ is active");
+        let id = active[0].0.to_string();
+        assert!(super::super::tx_qso_is_live(
+            Some(&id),
+            &h.coordinator.active_tx_qsos.read().unwrap()
+        ));
+        let _ = collect_quiet(&h.gateway, 100).await;
+        h.send(QsoMessage::StopCq).await;
+        let gateway = collect_until(&h.gateway, |m| {
+            matches!(&m.message_type, MessageType::ActiveQsosSnapshot { qsos, .. } if qsos.is_empty())
+        })
+        .await;
+        assert!(
+            gateway.iter().any(|m| matches!(&m.message_type,
+                MessageType::ActiveQsosSnapshot { qsos, .. } if qsos.is_empty()
+            )),
+            "the stop must reach the display feed: {gateway:?}"
+        );
+        assert!(!super::super::tx_qso_is_live(
+            Some(&id),
+            &h.coordinator.active_tx_qsos.read().unwrap()
+        ));
+        assert_eq!(h.manager.active_qso_count().await, 0);
+        let tx = collect_quiet(&h.tx, 500).await;
+        assert!(!any_tx_containing(&tx, "CQ K1TEST"));
+    }
 }
 
 // ------------------------------------------------------------------
