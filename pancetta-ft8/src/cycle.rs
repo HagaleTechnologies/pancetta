@@ -50,7 +50,12 @@
 //!   when fed a longer buffer, so the cycle API keeps that pass bounded.
 //!
 //! `time_offset` in the returned messages is slot-boundary-relative
-//! (sample 0 = boundary), matching the station's lead-corrected DT.
+//! (sample 0 = boundary) for every decode. ft8_lib reports its raw DT one
+//! symbol period late relative to the native decoder (see
+//! `merge.rs::normalized_time_offset`), so C-pass decodes are shifted onto
+//! the native convention after twin suppression, which still needs the raw
+//! values. This is the one deliberate difference from the station's
+//! delivered set, whose C-pass decodes keep the raw DT.
 //!
 //! Input shorter than one cycle is zero-padded (documented, no panic); empty
 //! input is an error; longer input is truncated to the first full cycle.
@@ -61,6 +66,7 @@ use crate::merge::{drop_unresolved_hash_twins, merge_ft8lib_first};
 use crate::message::DecodedMessage;
 use crate::protocol::{Protocol, ProtocolParams};
 use crate::{Ft8Error, Ft8Result, SAMPLE_RATE, WINDOW_SAMPLES};
+use std::collections::HashSet;
 
 /// Trim or zero-pad `samples` to exactly `len` samples.
 fn fit_to_len(samples: &[f32], len: usize) -> Vec<f32> {
@@ -158,6 +164,13 @@ impl CycleDecoder {
             self.decoder
                 .decode_window_with_ap_scoped(&window, &ApContext::default(), None)?;
 
+        // Message texts are unique after the merge, and it prefers ft8_lib,
+        // so a surviving text in this set identifies a C-pass decode exactly.
+        // Template-derived native decodes also lack confidence features, so
+        // `is_ft8lib_origin_decode` is not precise enough to move timestamps.
+        let ft8lib_texts: HashSet<String> =
+            ft8lib_messages.iter().map(|m| m.text.clone()).collect();
+
         // Pass 3: the production merge — ft8_lib's set first, then any
         // native-only (e.g. AP-injected) decode it missed.
         let merged = merge_ft8lib_first(ft8lib_messages, native_messages).messages;
@@ -171,7 +184,16 @@ impl CycleDecoder {
         // the `<...>` and the resolved rendering of one physical signal.
         // The cycle API has no AP-eval partition, so running directly on
         // the merged set matches the station's delivered-set semantics.
-        let (kept, _dropped) = drop_unresolved_hash_twins(merged, self.protocol);
+        let (mut kept, _dropped) = drop_unresolved_hash_twins(merged, self.protocol);
+
+        // Pass 5: put C-pass timing on the documented signal-start-relative
+        // convention. Must follow pass 4, whose DT gate expects the raw value.
+        let symbol_period = ProtocolParams::from_protocol(self.protocol).symbol_period;
+        for message in &mut kept {
+            if ft8lib_texts.contains(&message.text) {
+                message.time_offset -= symbol_period;
+            }
+        }
         Ok(kept)
     }
 }

@@ -71,7 +71,9 @@ Each `DecodedMessage` carries (units and reference points):
 - `text: String` — the decoded message text (WSJT-X rendering).
 - `frequency_offset: f64` — audio frequency in Hz.
 - `time_offset: f64` — DT in seconds, **slot-boundary-relative**: 0.0 means
-  the signal started at the cycle's first sample.
+  the signal started at the cycle's first sample. Decodes from the C pass are
+  normalized onto this convention, so `decode_cycle` DT can read one symbol
+  period earlier than the station's raw ft8_lib DT for the same audio.
 - `snr_db: f32` — SNR in dB, WSJT-X 2500 Hz reference.
 - `error_corrections: u8` is the reported number of error corrections.
   The C decoder constructor clamps its LDPC error count to 0–255; the native

@@ -82,8 +82,19 @@ fn station_composition_neutral(samples: &[f32], protocol: Protocol) -> Vec<Decod
     let native = decoder
         .decode_window_with_ap_scoped(&window, &ApContext::default(), None)
         .expect("native decode");
+    let ft8lib_texts: std::collections::HashSet<String> =
+        ft8lib.iter().map(|m| m.text.clone()).collect();
     let merged = merge_ft8lib_first(ft8lib, native).messages;
-    drop_unresolved_hash_twins(merged, protocol).0
+    let mut kept = drop_unresolved_hash_twins(merged, protocol).0;
+    // decode_cycle's documented DT contract: C-pass decodes move one symbol
+    // earlier, onto the native convention, after twin suppression.
+    let symbol_period = ProtocolParams::from_protocol(protocol).symbol_period;
+    for message in &mut kept {
+        if ft8lib_texts.contains(&message.text) {
+            message.time_offset -= symbol_period;
+        }
+    }
+    kept
 }
 
 /// Assert `got` matches `want` under the parity contract: text and frequency
@@ -384,8 +395,10 @@ fn cycle_dt_is_slot_boundary_relative() {
         .iter()
         .find(|m| m.text == "K1ABC W9XYZ EN37")
         .expect("shifted message decoded");
+    // Half a symbol: a C-pass decode left on ft8_lib's raw convention reads
+    // one full symbol (0.16 s) late and must fail here.
     assert!(
-        (m.time_offset - dt_secs).abs() <= 0.15,
+        (m.time_offset - dt_secs).abs() <= 0.08,
         "DT {:.3} not slot-boundary-relative (expected ≈{dt_secs})",
         m.time_offset
     );
