@@ -105,6 +105,7 @@ mod tests {
                 &in_flight,
                 &rig_conn_state,
                 &audio_alive,
+                &Arc::default(),
             )
         };
         assert_eq!(reason(), None);

@@ -636,6 +636,7 @@ mod tests {
                 super::super::hamlib::RigConnState::Connected.as_u8(),
             )),
             &Arc::new(AtomicBool::new(true)),
+            &Arc::default(),
         )
     }
 

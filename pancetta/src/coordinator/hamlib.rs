@@ -7,6 +7,297 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+// The command owner alone executes gain transactions. In particular, polling
+// and the watchdog may unkey, but never issue an attenuator setter.
+#[derive(Default)]
+struct ReceiveOverloadRuntime {
+    policy: super::receive_overload::OverloadPolicy,
+    sweep_configured: bool,
+    generation: Option<u64>,
+    steps: Option<Vec<i32>>,
+    discovery: Option<tokio::task::JoinHandle<Result<Vec<i32>>>>,
+    stopped: bool,
+    last_boundary: Option<i64>,
+    failed_generation: Option<u64>,
+    recovery_after: Option<Instant>,
+}
+
+impl Drop for ReceiveOverloadRuntime {
+    fn drop(&mut self) {
+        if let Some(discovery) = self.discovery.take() {
+            discovery.abort();
+        }
+    }
+}
+
+async fn overload_notice(bus: &crate::message_bus::MessageBus, warning: bool, text: String) {
+    let level = if warning {
+        warn!(target: "rig.rx_overload", "{text}");
+        pancetta_core::DiagnosticLevel::Warn
+    } else {
+        info!(target: "rig.rx_overload", "{text}");
+        pancetta_core::DiagnosticLevel::Info
+    };
+    super::tx::emit_diagnostic_full(
+        bus,
+        crate::message_bus::ComponentId::Hamlib,
+        "rig.rx_overload",
+        level,
+        text,
+        None,
+        None,
+    )
+    .await;
+}
+
+/// Front-panel MOX or another CAT client can key the rig without a Pancetta
+/// command. The poll loop calls this while the overload guard is receiving; a
+/// failed read records nothing, so window_validity rejects the gap.
+async fn observe_hardware_ptt(
+    rig: &dyn pancetta_hamlib::RigControl,
+    safety: &super::receive_overload::GainSafety,
+) -> Result<()> {
+    let asked_ms = chrono::Utc::now().timestamp_millis();
+    if rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off {
+        safety.observed_ptt_off(asked_ms);
+    } else {
+        safety.observed_ptt_on(chrono::Utc::now().timestamp_millis());
+    }
+    Ok(())
+}
+
+impl ReceiveOverloadRuntime {
+    #[allow(clippy::too_many_arguments)]
+    async fn tick(
+        &mut self,
+        rig: &Arc<dyn pancetta_hamlib::RigControl + Send + Sync>,
+        bus: &crate::message_bus::MessageBus,
+        measurements: &crossbeam_channel::Receiver<super::receive_overload::Measurement>,
+        connection: &std::sync::atomic::AtomicU64,
+        capture_epoch: &std::sync::atomic::AtomicU64,
+        dial: &std::sync::atomic::AtomicU64,
+        mode: &std::sync::atomic::AtomicU8,
+        ptt_active: &std::sync::atomic::AtomicBool,
+        gate: &tokio::sync::Mutex<()>,
+        in_flight: &std::sync::atomic::AtomicU32,
+        tx_policy: &std::sync::atomic::AtomicU8,
+        configured_parity: pancetta_config::station::TxSelfParity,
+        lead_ms: i64,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) {
+        use super::receive_overload::{Identity, StepOutcome};
+        // The sweep owns gain from setup through restoration and then ends the
+        // session. Do not count windows across its different candidate gains.
+        if self.sweep_configured {
+            self.policy.reset();
+            measurements.try_iter().for_each(drop);
+            return;
+        }
+        let generation = rig.connection_generation();
+        connection.store(generation, Ordering::Release);
+        // Failed/aborted gain transactions remain inhibited until the rig owner
+        // has confirmed fresh stable state on a new connection.
+        if bus.receive_gain.blocked()
+            && !bus.receive_gain.gain_reserved()
+            && self
+                .recovery_after
+                .is_none_or(|next| Instant::now() >= next)
+        {
+            self.recovery_after = Some(Instant::now() + Duration::from_millis(500));
+            if rig.get_ptt(pancetta_hamlib::Vfo::Current).await.ok()
+                == Some(pancetta_hamlib::PttState::Off)
+            {
+                if let (Ok(a), Ok(b)) = (rig.get_attenuator().await, rig.get_attenuator().await) {
+                    if a == b {
+                        bus.receive_gain
+                            .recover_gain(chrono::Utc::now().timestamp_millis());
+                    }
+                }
+            }
+            self.stopped = self.failed_generation == Some(generation);
+            self.policy.reset();
+        }
+        // Only recovery of an existing failure runs outside FT8: measurement,
+        // discovery and ATT changes are FT8-only.
+        if mode.load(Ordering::Acquire) != pancetta_config::OperatingMode::Ft8.as_u8() {
+            self.policy.reset();
+            measurements.try_iter().for_each(drop);
+            return;
+        }
+        if !bus.receive_gain.receiving()
+            && !bus.receive_gain.blocked()
+            && !ptt_active.load(Ordering::Acquire)
+            && self
+                .recovery_after
+                .is_none_or(|next| Instant::now() >= next)
+        {
+            self.recovery_after = Some(Instant::now() + Duration::from_millis(500));
+            let reserved = gate.try_lock().is_ok_and(|_guard| {
+                !ptt_active.load(Ordering::Acquire)
+                    && bus.gain_tx_intents.load(Ordering::Acquire) == 0
+                    && bus.receive_gain.reserve_recovery()
+            });
+            if reserved {
+                // Unknown startup/reconnect state cannot count as receive.
+                // Confirm Off and acknowledge an unkey once, rather than
+                // touching every ordinary receive capture with a timestamp.
+                let confirmation = tokio::time::timeout(Duration::from_millis(500), async {
+                    let off = rig.get_ptt(pancetta_hamlib::Vfo::Current).await?
+                        == pancetta_hamlib::PttState::Off;
+                    if off {
+                        rig.set_ptt(
+                            pancetta_hamlib::Vfo::Current,
+                            pancetta_hamlib::PttState::Off,
+                        )
+                        .await?;
+                    }
+                    anyhow::Ok(off)
+                })
+                .await;
+                if confirmation.is_err() {
+                    let _ = rig.disconnect().await;
+                }
+                bus.receive_gain.end_recovery(
+                    matches!(confirmation, Ok(Ok(true)))
+                        .then(|| chrono::Utc::now().timestamp_millis()),
+                );
+            }
+        }
+        if self.generation != Some(generation) {
+            // Never delay queued key-off behind a capability probe while keyed.
+            if ptt_active.load(Ordering::Acquire)
+                || (!bus.receive_gain.receiving() && !bus.receive_gain.blocked())
+            {
+                return;
+            }
+            self.generation = Some(generation);
+            self.policy.reset();
+            self.steps = None;
+            self.stopped = false;
+            if let Some(discovery) = self.discovery.take() {
+                discovery.abort();
+            }
+            // The backend probes on a separate socket. Never await its network
+            // work in the ready command owner, including after reconnection.
+            let rig = rig.clone();
+            self.discovery = Some(tokio::spawn(async move {
+                rig.supported_attenuator_steps().await
+            }));
+            // Let an immediately available result complete without delaying CAT.
+            tokio::task::yield_now().await;
+        }
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            match self.discovery.take().expect("finished discovery").await {
+                Ok(Ok(steps)) => self.steps = Some(steps),
+                _ => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        for measurement in measurements.try_iter() {
+            if measurement.slot >= now.div_euclid(15000) - 1 {
+                self.policy.observe(measurement);
+            } else {
+                self.policy.reset();
+            }
+        }
+        let Some(pending) = self.policy.pending() else {
+            return;
+        };
+        let identity = Identity {
+            dial_hz: dial.load(Ordering::Acquire),
+            connection_generation: generation,
+            gain_epoch: bus.receive_gain.epoch(),
+            capture_epoch: capture_epoch.load(Ordering::Acquire),
+        };
+        if pending.identity != identity
+            || shutdown.load(Ordering::Acquire)
+            || mode.load(Ordering::Acquire) != pancetta_config::OperatingMode::Ft8.as_u8()
+            || pancetta_core::Band::from_frequency(identity.dial_hz).is_none()
+        {
+            self.policy.reset();
+            return;
+        }
+        if self.stopped {
+            return;
+        }
+        let Some(steps) = self.steps.as_ref() else {
+            return;
+        };
+        let Some((slot, _)) = super::receive_overload::boundary_opportunity(now, lead_ms) else {
+            return;
+        };
+        if self.last_boundary == Some(slot) {
+            return;
+        }
+        self.last_boundary = Some(slot);
+        let tx_enabled = pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire))
+            != pancetta_core::TxPolicy::Disabled;
+        let tx_slot = match configured_parity {
+            pancetta_config::station::TxSelfParity::Even => slot.rem_euclid(2) == 0,
+            pancetta_config::station::TxSelfParity::Odd => slot.rem_euclid(2) == 1,
+            pancetta_config::station::TxSelfParity::Auto => false,
+        };
+        let reserved = {
+            let Ok(_guard) = gate.try_lock() else {
+                return;
+            };
+            !ptt_active.load(Ordering::Acquire)
+                && !(tx_enabled && tx_slot)
+                && in_flight.load(Ordering::Acquire) == 0
+                && bus.gain_tx_intents.load(Ordering::Acquire) == 0
+                && bus.receive_gain.reserve()
+        };
+        if !reserved {
+            return;
+        }
+        let remaining = slot * 15000 - 250 - chrono::Utc::now().timestamp_millis();
+        if remaining <= 0 {
+            bus.receive_gain.cancel_gain();
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining as u64);
+        let outcome = super::receive_overload::execute_step(
+            rig.as_ref(),
+            &bus.receive_gain,
+            steps,
+            deadline,
+            || {
+                !shutdown.load(Ordering::Acquire)
+                    && dial.load(Ordering::Acquire) == identity.dial_hz
+                    && capture_epoch.load(Ordering::Acquire) == identity.capture_epoch
+                    && rig.connection_generation() == generation
+                    && mode.load(Ordering::Acquire) == pancetta_config::OperatingMode::Ft8.as_u8()
+                    && in_flight.load(Ordering::Acquire) == 0
+            },
+        )
+        .await;
+        let band = pancetta_core::Band::from_frequency(identity.dial_hz).expect("validated band");
+        match outcome {
+            Ok(StepOutcome::Increased { old, new }) => {
+                self.policy.applied();
+                overload_notice(bus, false, format!("Receive overload on {band}: peak {:.1} dBFS; attenuator increased from {old} dB to {new} dB.", pending.peak_dbfs)).await;
+            }
+            Ok(StepOutcome::Maximum { current }) => {
+                if self.policy.at_maximum() {
+                    overload_notice(bus, true, format!("Receive overload on {band}: peak {:.1} dBFS; attenuator is already at its maximum of {current} dB.", pending.peak_dbfs)).await;
+                }
+            }
+            Ok(StepOutcome::Deferred) => {}
+            Err(error) => {
+                self.failed_generation = Some(generation);
+                self.stopped = true;
+                self.policy.reset();
+                warn!(target: "rig.rx_overload", %error, "ATT transaction failed");
+                overload_notice(bus, true, format!("Receive overload guard stopped on {band}: attenuator command failed; rig gain must be checked before automatic changes resume.")).await;
+            }
+        }
+    }
+}
+
 /// Maximum time to wait for the rig's initial connect + frequency read before
 /// proceeding with startup.  A QSO takes ≥ 15 s (one FT8 slot) to complete,
 /// so anything under that is safe.  If the rig misses this window the poll
@@ -1024,6 +1315,9 @@ impl super::ApplicationCoordinator {
                                 .store(super::now_epoch_ms(), Ordering::Release);
                         }
                         self.ptt_active.store(false, Ordering::Release);
+                        self.message_bus
+                            .receive_gain
+                            .confirmed_off(chrono::Utc::now().timestamp_millis());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -1137,7 +1431,14 @@ impl super::ApplicationCoordinator {
                     })
                 ) {
                     safe_messages.push(message);
+                } else {
+                    self.message_bus.receive_gain.ptt_command_consumed();
                 }
+            }
+            if ptt_off {
+                self.message_bus
+                    .receive_gain
+                    .confirmed_off(chrono::Utc::now().timestamp_millis());
             }
             for message in safe_messages {
                 self.replay_or_fallback(&sender, message).await;
@@ -1253,6 +1554,9 @@ impl super::ApplicationCoordinator {
                                 .store(super::now_epoch_ms(), Ordering::Release);
                         }
                         self.ptt_active.store(false, Ordering::Release);
+                        self.message_bus
+                            .receive_gain
+                            .confirmed_off(chrono::Utc::now().timestamp_millis());
                         // PAN-89: the rig accepted PTT off.
                         confirm_ptt_off(
                             &self.ptt_off_unconfirmed,
@@ -1484,6 +1788,21 @@ impl super::ApplicationCoordinator {
         let receive_gain_epoch = self.receive_gain_epoch.clone();
 
         // Read rig config before spawning
+        let overload_measurements = self.overload_measurements.1.clone();
+        let overload_connection = self.overload_connection.clone();
+        let overload_capture_epoch = self.overload_capture_epoch.clone();
+        let overload_gate = self.ptt_sync_gate.clone();
+        let overload_mode = self.active_protocol_mode();
+        let overload_tx_policy = self.tx_policy.clone();
+        let overload_sweep_configured = self.gain_sweep_options.is_some();
+        let overload_config = self.config.read().await;
+        let overload_enabled = overload_config.rig.receive_overload_guard.enabled
+            && !self.no_audio
+            && !self.replay_mode();
+        let overload_lead_ms =
+            (super::resolve_window_lead_secs(&overload_config.decoder) * 1000.0) as i64;
+        let overload_parity = overload_config.station.tx_self_parity;
+        drop(overload_config);
         let rig_config = {
             let config = self.config.read().await;
             config.rig.clone()
@@ -1914,6 +2233,7 @@ impl super::ApplicationCoordinator {
                     // PollingFailed; redial 2 s backing off to 30 s).
                     let mut poll_health = RigPollHealth::new();
                     let mut split_read_health = SplitReadHealth::default();
+                    let mut overload_ptt_read_failing = false;
                     // PAN-251: one SWR guard per Hamlib session.
                     let mut swr_guard =
                         super::swr_guard::SwrGuard::new(&swr_protection, rig_enabled);
@@ -2171,6 +2491,23 @@ impl super::ApplicationCoordinator {
                                     if let SplitPollOutcome::Changed(tx_hz) = outcome {
                                         emit_split_status(&message_bus, &display_feed_enabled_poll, tx_hz).await;
                                     }
+                                    // PAN-246: observe hardware PTT outside the
+                                    // command loop, so no key-down waits on it.
+                                    if overload_enabled
+                                        && message_bus.receive_gain.receiving()
+                                        && !ptt_active_poll.load(Ordering::Acquire)
+                                    {
+                                        let failing = observe_hardware_ptt(
+                                            rig_for_polling.as_ref(),
+                                            &message_bus.receive_gain,
+                                        )
+                                        .await
+                                        .is_err();
+                                        if failing && !overload_ptt_read_failing {
+                                            overload_notice(&message_bus, true, "Receive overload guard paused: rig PTT state could not be read; receive windows are not counted until it can.".into()).await;
+                                        }
+                                        overload_ptt_read_failing = failing;
+                                    }
                                     outcome.keeps_poll_ok()
                                 } else {
                                     false
@@ -2251,6 +2588,7 @@ impl super::ApplicationCoordinator {
                 // Spawn the PTT watchdog as a background task
                 let rig_for_watchdog = Arc::clone(&rig_poll);
                 let ptt_watchdog_tracker = ptt_on_since.clone();
+                let overload_watchdog_safety = message_bus_for_connect.receive_gain.clone();
                 let shutdown_for_watchdog = shutdown.clone();
                 let ptt_active_watchdog = ptt_active.clone();
                 let ptt_off_unconfirmed_watchdog = ptt_off_unconfirmed.clone();
@@ -2302,6 +2640,7 @@ impl super::ApplicationCoordinator {
                                 {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
+                                        overload_watchdog_safety.confirmed_off(chrono::Utc::now().timestamp_millis());
                                         ptt_active_watchdog.store(false, Ordering::Release);
                                         confirm_ptt_off(
                                             &ptt_off_unconfirmed_watchdog,
@@ -2545,6 +2884,17 @@ impl super::ApplicationCoordinator {
                         None
                     };
 
+                if message_bus_for_connect.receive_gain.gain_reserved() {
+                    // An aborted earlier owner cannot finish its reservation.
+                    message_bus_for_connect.receive_gain.fail_gain();
+                }
+                if startup_ptt_off_succeeded {
+                    message_bus_for_connect
+                        .receive_gain
+                        .confirmed_off(chrono::Utc::now().timestamp_millis());
+                }
+                let mut overload = ReceiveOverloadRuntime::default();
+                overload.sweep_configured = overload_sweep_configured;
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
                     if child_task_crashed(
@@ -2561,6 +2911,7 @@ impl super::ApplicationCoordinator {
                                         vfo,
                                         frequency,
                                     } => {
+                                        overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
                                         // PAN-35: which VFO this specific
                                         // command targets -- every
                                         // supersession/in-flight-mark check
@@ -2750,6 +3101,11 @@ impl super::ApplicationCoordinator {
                                         );
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
+                                        if *state {
+                                            message_bus_for_connect
+                                                .receive_gain
+                                                .ptt_command_consumed();
+                                        }
                                         // Revalidate queued key-downs at the rig owner too.
                                         // An acknowledged earlier unkey may have retired the
                                         // producer's reservation while this command waited.
@@ -2778,6 +3134,15 @@ impl super::ApplicationCoordinator {
                                             warn!(
                                                 "Discarding PTT-on while Hamlib restart inhibit is active"
                                             );
+                                            continue;
+                                        }
+                                        if *state
+                                            && !message_bus_for_connect
+                                                .receive_gain
+                                                .hardware_ptt_on(
+                                                    chrono::Utc::now().timestamp_millis(),
+                                                )
+                                        {
                                             continue;
                                         }
                                         // Update PTT watchdog tracker
@@ -2812,6 +3177,11 @@ impl super::ApplicationCoordinator {
                                                     if *state { "ON" } else { "OFF" }
                                                 );
                                                 if !*state {
+                                                    message_bus_for_connect
+                                                        .receive_gain
+                                                        .confirmed_off(
+                                                            chrono::Utc::now().timestamp_millis(),
+                                                        );
                                                     gain_tx_gate.fetch_and(!2, Ordering::AcqRel);
                                                     confirm_ptt_off(
                                                         &ptt_off_unconfirmed,
@@ -2847,6 +3217,7 @@ impl super::ApplicationCoordinator {
                                         enabled,
                                         tx_frequency,
                                     } => {
+                                        overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
                                         // PAN-19 round-11/12 review (Codex
                                         // P1): same consumption-time
                                         // supersession re-check as
@@ -2961,6 +3332,26 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
+                            if overload_enabled && rig_enabled {
+                                overload
+                                    .tick(
+                                        &rig_poll,
+                                        &message_bus_for_connect,
+                                        &overload_measurements,
+                                        &overload_connection,
+                                        &overload_capture_epoch,
+                                        &operating_frequency_hz,
+                                        &overload_mode,
+                                        &ptt_active,
+                                        &overload_gate,
+                                        &hamlib_command_in_flight,
+                                        &overload_tx_policy,
+                                        overload_parity,
+                                        overload_lead_ms,
+                                        &shutdown,
+                                    )
+                                    .await;
+                            }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
@@ -5624,6 +6015,35 @@ mod teardown_replay_tests {
     /// never itself overflow the channel it just emptied -- see the module
     /// doc comment above).
     #[tokio::test]
+    async fn teardown_retires_queued_key_intents_before_confirming_receive() {
+        use pancetta_hamlib::RigControl;
+        let mut coordinator = test_coordinator().await;
+        let rig = Arc::new(pancetta_hamlib::MockRig::default());
+        rig.connect().await.unwrap();
+        coordinator.rig_handle = Some(rig);
+        coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                super::super::tx::send_ptt_command(
+                    &coordinator.message_bus,
+                    ComponentId::Ft8Transmitter,
+                    true,
+                    || true
+                ),
+                crate::message_bus::SendIfOutcome::Enqueued
+            );
+        }
+        assert!(!coordinator.message_bus.receive_gain.receiving());
+        coordinator.teardown_hamlib().await;
+        assert!(coordinator.message_bus.receive_gain.receiving());
+        assert!(coordinator.message_bus.receive_gain.reserve());
+    }
+
+    #[tokio::test]
     async fn teardown_replays_a_safe_message_and_completes_quickly() {
         let mut coordinator = test_coordinator().await;
         coordinator.rig_handle = None; // skip the PTT-off retry loop entirely
@@ -6940,6 +7360,11 @@ mod teardown_replay_tests {
                     RigConnState::Connected.as_u8()
                 )),
                 &Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                &{
+                    let gain = super::super::receive_overload::GainSafety::default();
+                    gain.confirmed_off(0);
+                    std::sync::Arc::new(gain)
+                },
             )
             .is_some(),
             "PTT must stay refused while the pending slot a failed CAT command repopulated is \
@@ -8530,6 +8955,426 @@ mod pan206_split_poll_tests {
 }
 
 #[cfg(test)]
+mod receive_overload_notice_tests {
+    use super::{overload_notice, ReceiveOverloadRuntime};
+    use crate::message_bus::{ComponentId, MessageBus, MessageType};
+    use pancetta_core::DiagnosticLevel;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_discovery_does_not_delay_command_owner_on_start_or_reconnect() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 200,
+            ..Default::default()
+        }));
+        let bus = MessageBus::new(8).unwrap();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        // MockRig has a fixed generation. Seed a stale cached generation to
+        // exercise the same invalidation path as a real reconnect.
+        for previous_generation in [None, Some(u64::MAX)] {
+            runtime.generation = previous_generation;
+            rig.connect().await.unwrap();
+            bus.receive_gain
+                .confirmed_off(chrono::Utc::now().timestamp_millis());
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                runtime.tick(
+                    &rig,
+                    &bus,
+                    &measurements,
+                    &AtomicU64::new(0),
+                    &AtomicU64::new(0),
+                    &AtomicU64::new(7_074_000),
+                    &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                    &AtomicBool::new(false),
+                    &tokio::sync::Mutex::new(()),
+                    &AtomicU32::new(0),
+                    &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                    pancetta_config::station::TxSelfParity::Auto,
+                    500,
+                    &AtomicBool::new(false),
+                ),
+            )
+            .await
+            .expect("slow discovery must leave the command owner available");
+            assert!(runtime.steps.is_none(), "discovery is still pending");
+            rig.disconnect().await.unwrap();
+        }
+    }
+
+    /// PTT-on cannot be admitted while recovery holds the command owner: the
+    /// queued key would run late, behind the probe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_probe_inhibits_key_down_until_it_finishes() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 40,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        assert!(!bus.receive_gain.receiving() && !bus.receive_gain.blocked());
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        // Stay out of discovery: only the recovery probe is under test.
+        runtime.generation = Some(rig.connection_generation());
+        let gate = tokio::sync::Mutex::new(());
+        let (connection, capture) = (AtomicU64::new(0), AtomicU64::new(0));
+        let dial = AtomicU64::new(7_074_000);
+        let mode = AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8());
+        let (ptt, shutdown) = (AtomicBool::new(false), AtomicBool::new(false));
+        let in_flight = AtomicU32::new(0);
+        let tx_policy = AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8);
+        let admit_during_probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            bus.receive_gain.admit_ptt(0)
+        };
+        let (_, admitted) = tokio::join!(
+            runtime.tick(
+                &rig,
+                &bus,
+                &measurements,
+                &connection,
+                &capture,
+                &dial,
+                &mode,
+                &ptt,
+                &gate,
+                &in_flight,
+                &tx_policy,
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &shutdown,
+            ),
+            admit_during_probe,
+        );
+        assert!(!admitted, "key-down must wait for recovery to finish");
+        assert!(bus.receive_gain.receiving(), "confirmed Off ends recovery");
+        assert!(bus.receive_gain.admit_ptt(0));
+    }
+
+    /// A failed recovery returns to unknown state rather than stranding TX.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keyed_recovery_probe_releases_its_inhibition() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime.generation = Some(rig.connection_generation());
+        runtime
+            .tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+        assert!(!bus.receive_gain.blocked() && !bus.receive_gain.receiving());
+        assert!(bus.receive_gain.admit_ptt(0));
+    }
+
+    /// An operator who leaves FT8 after a failed ATT transaction must not stay
+    /// TX-muted, and the other modes must run no measurement or discovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_failure_recovers_outside_ft8_without_guard_work() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        bus.receive_gain.fail_gain();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime
+            .tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft4.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert!(!bus.receive_gain.blocked(), "FT4 must clear the inhibit");
+        assert!(runtime.discovery.is_none() && runtime.generation.is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_sweep_excludes_overload_guard_through_restoration() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 200,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        bus.receive_gain
+            .confirmed_off(chrono::Utc::now().timestamp_millis());
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime.sweep_configured = true;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            ),
+        )
+        .await
+        .expect("sweep must exclude all automatic gain CAT work");
+        assert!(runtime.discovery.is_none());
+        assert!(runtime.generation.is_none());
+        assert!(!bus.receive_gain.gain_reserved());
+    }
+
+    const SUCCESS: &str =
+        "Receive overload on 40m: peak -0.5 dBFS; attenuator increased from 0 dB to 10 dB.";
+    const UNAVAILABLE: &str = "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.";
+    const MAXIMUM: &str =
+        "Receive overload on 40m: peak -0.5 dBFS; attenuator is already at its maximum of 20 dB.";
+    const FAILURE: &str = "Receive overload guard stopped on 40m: attenuator command failed; rig gain must be checked before automatic changes resume.";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_overload_notice_forwards_severity_target_and_exact_text() {
+        let bus = MessageBus::new(8).unwrap();
+        let (_, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        for (warning, expected_level, expected_text) in [
+            (false, DiagnosticLevel::Info, SUCCESS),
+            (true, DiagnosticLevel::Warn, UNAVAILABLE),
+            (true, DiagnosticLevel::Warn, MAXIMUM),
+            (true, DiagnosticLevel::Warn, FAILURE),
+        ] {
+            overload_notice(&bus, warning, expected_text.into()).await;
+            let message = receiver.try_recv().unwrap();
+            match message.message_type {
+                MessageType::DiagnosticEvent {
+                    target,
+                    level,
+                    text,
+                    qso_id,
+                    callsign,
+                } => {
+                    assert_eq!(target, "rig.rx_overload");
+                    assert_eq!(level, expected_level);
+                    assert_eq!(text, expected_text);
+                    assert!(qso_id.is_none());
+                    assert!(callsign.is_none());
+                }
+                other => panic!("expected retained diagnostic, got {other:?}"),
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_overload_notice_logs_in_headless_mode_without_tui_receiver() {
+        // Tracing callsite interest is process-global. Isolate the subscriber
+        // from parallel tests that emit through the same callsites without it.
+        const CHILD: &str = "PAN246_HEADLESS_NOTICE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "coordinator::hamlib::receive_overload_notice_tests::receive_overload_notice_logs_in_headless_mode_without_tui_receiver", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let bus = MessageBus::new(8).unwrap();
+        let output = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        overload_notice(&bus, false, SUCCESS.into()).await;
+        overload_notice(&bus, true, FAILURE.into()).await;
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains(&format!("INFO rig.rx_overload: {SUCCESS}")),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(&format!("WARN rig.rx_overload: {FAILURE}")),
+            "{logs}"
+        );
+    }
+
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_overload_unavailable_is_warned_once_per_connection_generation() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            attenuator_steps: Vec::new(),
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        let (_, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (_measurements_tx, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        let connection = AtomicU64::new(0);
+        let capture = AtomicU64::new(0);
+        let dial = AtomicU64::new(7_074_000);
+        let mode = AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8());
+        let ptt = AtomicBool::new(false);
+        let gate = tokio::sync::Mutex::new(());
+        let in_flight = AtomicU32::new(0);
+        let tx_policy = AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8);
+        let shutdown = AtomicBool::new(false);
+        for attempt in 0..3 {
+            runtime
+                .tick(
+                    &rig,
+                    &bus,
+                    &measurements,
+                    &connection,
+                    &capture,
+                    &dial,
+                    &mode,
+                    &ptt,
+                    &gate,
+                    &in_flight,
+                    &tx_policy,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    500,
+                    &shutdown,
+                )
+                .await;
+            if attempt == 0 {
+                match receiver.try_recv().unwrap().message_type {
+                    MessageType::DiagnosticEvent {
+                        target,
+                        level,
+                        text,
+                        ..
+                    } => {
+                        assert_eq!(target, "rig.rx_overload");
+                        assert_eq!(level, DiagnosticLevel::Warn);
+                        assert_eq!(text, UNAVAILABLE);
+                    }
+                    other => panic!("expected unavailable diagnostic, got {other:?}"),
+                }
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "no duplicate unavailable or success notice"
+            );
+            assert!(runtime.steps.is_none());
+            assert!(runtime.policy.pending().is_none());
+        }
+        assert_eq!(rig.get_attenuator().await.unwrap(), 0);
+        assert!(
+            bus.receive_gain.receiving(),
+            "unknown startup PTT recovers after confirmed unkey"
+        );
+    }
+
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_observes_external_ptt_and_discards_earlier_overload_work() {
+        use crate::coordinator::receive_overload::{GainSafety, WindowValidity};
+        use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        let safety = GainSafety::default();
+        safety.confirmed_off(chrono::Utc::now().timestamp_millis());
+        super::observe_hardware_ptt(&rig, &safety).await.unwrap();
+        assert!(safety.receiving());
+        let epoch = safety.epoch();
+        // Front-panel MOX or another CAT client, not a Pancetta command.
+        rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        super::observe_hardware_ptt(&rig, &safety).await.unwrap();
+        assert!(!safety.receiving());
+        assert_ne!(
+            safety.epoch(),
+            epoch,
+            "queued windows from before the key are stale"
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            safety.window_validity(now + 1, now + 1),
+            WindowValidity::KnownTx
+        );
+        rig.disconnect().await.unwrap();
+        assert!(super::observe_hardware_ptt(&rig, &safety).await.is_err());
+    }
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
     use pancetta_core::Band;
@@ -8830,6 +9675,7 @@ mod pan251_swr_protection_tests {
             &c.hamlib_command_in_flight,
             &c.rig_conn_state,
             &c.audio_output_alive,
+            &c.message_bus.receive_gain,
         )
     }
 

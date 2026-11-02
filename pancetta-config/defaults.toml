@@ -554,6 +554,9 @@ enabled = false
 gain = 0.5
 threshold_db = -30.0
 
+[rig.receive_overload_guard]
+enabled = false
+
 [rig.rig_parameters]
 extended_features = []
 
