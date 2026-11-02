@@ -201,9 +201,11 @@ jobs:
       # step's `gh api .../issues/$PR/labels` GET requires issues: read,
       # not pull-requests: read, even though the target is a PR.
       issues: read
-    # exclude_dependabot + draft-PR skip, mirroring wait-for-codex.yml's own
-    # eligibility check -- belt-and-suspenders against that producer-side
-    # skip logic ever drifting from this consumer-side one.
+    # Draft PRs skip, as wait-for-codex.yml's producer does. Dependabot also
+    # skips: the producer's automated Dependabot pass-through (PAN-249)
+    # publishes the required "Codex review clean" check as a completed
+    # success but applies no codex-clean:<sha12> label, so polling for one
+    # here would wait out the full timeout on every Dependabot rebase.
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false
     steps:
       - name: "Bootstrap check: does the base branch have wait-for-codex.yml's label mechanism yet?"

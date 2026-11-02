@@ -817,3 +817,77 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   last error body in `CURRENT_HEAD_SHA` after 3 failed lookups, so it marks the
   run stale instead of failing open as its warning says. Same root cause as the
   upstream lookup above; it needs its own ticket and test.
+
+## Dependabot pass-through publishes the required Codex check (PAN-249, 2026-11-01)
+
+PR #399 renamed `wait-for-codex.yml`'s producer job to `Codex review request (producer)` so its
+native check-run never shares the name of the managed check, `Codex review clean (gate before
+expensive downstream jobs)`. Before the rename, a job skipped by its `if:` published a native
+`skipped` check-run under the required name, and Dependabot PRs #353 and #376 merged that way.
+After it, the producer's `github.actor != 'dependabot[bot]'` exclusion meant nothing wrote the
+managed check for a Dependabot PR. Run 40276929857 (Dependabot PR #525) shows every job skipped,
+and ruleset 18627441 kept waiting for the context.
+
+The exclusion's premise was that GitHub withholds Actions secrets from Dependabot runs. GitHub's
+[Dependabot on Actions troubleshooting reference](https://docs.github.com/en/code-security/reference/supply-chain-security/troubleshoot-dependabot/dependabot-on-actions)
+limits that to `push`, `pull_request`, `pull_request_review` and `pull_request_review_comment`,
+and names `pull_request_target` as the way around it. Its one `pull_request_target` exception, a
+base ref that Dependabot created, cannot apply here because the producer only runs for PRs into
+`main`. Pancetta's own runs for PR #525 agree. CI
+run 40276931889 (`pull_request`) logged `Secret source: Dependabot` with `Contents: read`. The
+Dependabot Auto-Merge run 40276929798 (`pull_request_target`, same actor) logged
+`Secret source: Actions` with `Contents: write` and `PullRequests: write`. The round-8 claim on
+PR #399 that the App-token mint fails for Dependabot was a review comment and was never
+reproduced in a run.
+
+Decision. The producer admits every non-draft `pull_request_target` event, Dependabot included.
+It mints the `hagale-agent` token in the main-only `codex-review` environment, as for any PR.
+`create-check` classifies an event as a Dependabot update only when the actor is
+`dependabot[bot]`, the PR author is `dependabot[bot]`, and the head repository is this
+repository. For that event it upserts the managed check as `completed`/`success` with the run's
+numeric `external_id`, and the `Request a review` step skips. A maintainer's push to a
+Dependabot branch has a human actor, so it gets an ordinary Codex round. A re-run keeps the
+original `github.actor`, so re-running a Dependabot-triggered producer run passes through again,
+even if a Codex reply has since failed the check. That follows the bypass policy, and a re-run
+needs write access. The check has one
+writer, the App, so `codex-review-response` can still find and PATCH it if a later Codex reply
+reports findings. The pass-through applies no `codex-clean:<sha12>` label. That is why `ci.yml`'s
+`codex-clean` label gate keeps its Dependabot exclusion: polling for a label nobody applies would
+wait out its timeout on every Dependabot rebase.
+
+Rejected. A `workflow_run` relay off a `pull_request` no-op: the existing event already has
+Actions secrets, the relay's own secret access for a Dependabot-originated chain is unproven
+(pancetta's `workflow_run` runs carry `actor: dependabot[bot]`), and it needs separate PR-head
+resolution because a `workflow_run`'s `github.sha` is the default-branch tip. A second writer
+using `github.token`: `hagale-agent` cannot PATCH a check another app created, so a later Codex
+round would post a duplicate. Naming the producer after the managed check: that restores the
+native-plus-managed duplicate PR #399 removed.
+
+This is not a secret-free path, and it does not merge Dependabot PRs automatically.
+`auto-merge-trigger.yml` still admits only its author allowlist; admission is the separate
+policy question in [General auto-merge for trusted-author PRs](#general-auto-merge-for-trusted-author-prs-2026-07-18).
+Catalyst automation may still post `@codex review` on a Dependabot PR, and the response job
+handles that reply as for any PR.
+
+Evidence status:
+
+- Verified offline here. `scripts/ci/test-ci-codex-gate-dependabot.sh` evaluates the shipped
+  `if:` and `env:` expressions and runs the shipped `create-check` script against a stub `gh`.
+  It covers admission, the three-part classification, the POST and PATCH writes, the
+  `Request a review` skip, stale-head gating and `ci.yml`'s exclusion. Against the pre-PAN-249
+  workflow it fails the admission, classification and completed-success cases.
+- Sibling evidence. Coppa's producer, with no Dependabot exclusion, minted `hagale-agent` in its
+  `codex-review` environment for Dependabot runs 40302227401 and 40302291006, and both heads
+  carry a `completed`/`success` managed check. Propagation merged the same design as PRO-18.
+- Awaiting rollout. No Dependabot run in pancetta has yet executed a job in the `codex-review`
+  environment. On the first Dependabot PR after merge, check the producer's `Set up job` log
+  for `Secret source: Actions`, confirm the current PR head carries one `hagale-agent`-owned
+  managed check with the producer's numeric run ID, and confirm `Request a review` skipped. If
+  the mint fails, the failsafe job tries its own mint and then `github.token` to publish a red
+  `Codex review request setup failed` check. A failure caused by missing secrets would also fail
+  the failsafe's mint, and `hagale-agent` cannot PATCH the resulting `github.token` check, so
+  only a new head clears it. Diagnose that failure before trying another design.
+
+Cross-repo scope: pancetta only. The workflow interface is unchanged, so no `dispensa` contract
+applies; `dispensa` was not available to scan from the implementing session. Credenza's template
+was not inspected.
