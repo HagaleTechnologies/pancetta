@@ -90,6 +90,7 @@ Rules, in order of precedence:
    client connecting and arming works byte-for-byte as it does now. `StopCq` first needs a
    currently-valid hello capability of any scope (PAN-250); without one it is refused (`warn!`,
    no frame) before it can grab.
+   Qsy/SetSplit first pass the PAN-252 station-activity check: keyed rigs and active QSOs without a remote_client_key_id refuse the command with a peer-targeted error. A refusal does not grab control.
 4. **Exclusivity:** a control-mutating action from a non-controller while a controller is
    assigned is refused — `warn!`, audited, and answered with an error frame to that peer (so
    its UI can render "take control first"). It does NOT implicitly grab.
