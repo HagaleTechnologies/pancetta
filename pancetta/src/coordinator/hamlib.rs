@@ -95,6 +95,35 @@ impl ReceiveOverloadRuntime {
         }
         let generation = rig.connection_generation();
         connection.store(generation, Ordering::Release);
+        // Failed/aborted gain transactions remain inhibited until the rig owner
+        // has confirmed fresh stable state on a new connection.
+        if bus.receive_gain.blocked()
+            && !bus.receive_gain.gain_reserved()
+            && self
+                .recovery_after
+                .is_none_or(|next| Instant::now() >= next)
+        {
+            self.recovery_after = Some(Instant::now() + Duration::from_millis(500));
+            if rig.get_ptt(pancetta_hamlib::Vfo::Current).await.ok()
+                == Some(pancetta_hamlib::PttState::Off)
+            {
+                if let (Ok(a), Ok(b)) = (rig.get_attenuator().await, rig.get_attenuator().await) {
+                    if a == b {
+                        bus.receive_gain
+                            .recover_gain(chrono::Utc::now().timestamp_millis());
+                    }
+                }
+            }
+            self.stopped = self.failed_generation == Some(generation);
+            self.policy.reset();
+        }
+        // Only recovery of an existing failure runs outside FT8: measurement,
+        // discovery and ATT changes are FT8-only.
+        if mode.load(Ordering::Acquire) != pancetta_config::OperatingMode::Ft8.as_u8() {
+            self.policy.reset();
+            measurements.try_iter().for_each(drop);
+            return;
+        }
         if !bus.receive_gain.receiving()
             && !bus.receive_gain.blocked()
             && !ptt_active.load(Ordering::Acquire)
@@ -103,26 +132,35 @@ impl ReceiveOverloadRuntime {
                 .is_none_or(|next| Instant::now() >= next)
         {
             self.recovery_after = Some(Instant::now() + Duration::from_millis(500));
-            // Unknown startup/reconnect state cannot count as receive. Confirm
-            // Off and acknowledge an unkey once, rather than touching every
-            // ordinary receive capture with a polling timestamp.
-            let confirmation = tokio::time::timeout(Duration::from_millis(500), async {
-                if rig.get_ptt(pancetta_hamlib::Vfo::Current).await?
-                    == pancetta_hamlib::PttState::Off
-                {
-                    rig.set_ptt(
-                        pancetta_hamlib::Vfo::Current,
-                        pancetta_hamlib::PttState::Off,
-                    )
-                    .await?;
-                    bus.receive_gain
-                        .confirmed_off(chrono::Utc::now().timestamp_millis());
+            let reserved = gate.try_lock().is_ok_and(|_guard| {
+                !ptt_active.load(Ordering::Acquire)
+                    && bus.gain_tx_intents.load(Ordering::Acquire) == 0
+                    && bus.receive_gain.reserve_recovery()
+            });
+            if reserved {
+                // Unknown startup/reconnect state cannot count as receive.
+                // Confirm Off and acknowledge an unkey once, rather than
+                // touching every ordinary receive capture with a timestamp.
+                let confirmation = tokio::time::timeout(Duration::from_millis(500), async {
+                    let off = rig.get_ptt(pancetta_hamlib::Vfo::Current).await?
+                        == pancetta_hamlib::PttState::Off;
+                    if off {
+                        rig.set_ptt(
+                            pancetta_hamlib::Vfo::Current,
+                            pancetta_hamlib::PttState::Off,
+                        )
+                        .await?;
+                    }
+                    anyhow::Ok(off)
+                })
+                .await;
+                if confirmation.is_err() {
+                    let _ = rig.disconnect().await;
                 }
-                anyhow::Ok(())
-            })
-            .await;
-            if confirmation.is_err() {
-                let _ = rig.disconnect().await;
+                bus.receive_gain.end_recovery(
+                    matches!(confirmation, Ok(Ok(true)))
+                        .then(|| chrono::Utc::now().timestamp_millis()),
+                );
             }
         }
         if self.generation != Some(generation) {
@@ -157,28 +195,6 @@ impl ReceiveOverloadRuntime {
                 Ok(Ok(steps)) => self.steps = Some(steps),
                 _ => overload_notice(bus, true, "Receive overload guard unavailable: supported attenuator steps could not be read; no automatic attenuation will be applied.".into()).await,
             }
-        }
-        // Failed/aborted gain transactions remain inhibited until the rig owner
-        // has confirmed fresh stable state on a new connection.
-        if bus.receive_gain.blocked()
-            && !bus.receive_gain.gain_reserved()
-            && self
-                .recovery_after
-                .is_none_or(|next| Instant::now() >= next)
-        {
-            self.recovery_after = Some(Instant::now() + Duration::from_millis(500));
-            if rig.get_ptt(pancetta_hamlib::Vfo::Current).await.ok()
-                == Some(pancetta_hamlib::PttState::Off)
-            {
-                if let (Ok(a), Ok(b)) = (rig.get_attenuator().await, rig.get_attenuator().await) {
-                    if a == b {
-                        bus.receive_gain
-                            .recover_gain(chrono::Utc::now().timestamp_millis());
-                    }
-                }
-            }
-            self.stopped = self.failed_generation == Some(generation);
-            self.policy.reset();
         }
         let now = chrono::Utc::now().timestamp_millis();
         for measurement in measurements.try_iter() {
@@ -232,6 +248,7 @@ impl ReceiveOverloadRuntime {
             !ptt_active.load(Ordering::Acquire)
                 && !(tx_enabled && tx_slot)
                 && in_flight.load(Ordering::Acquire) == 0
+                && bus.gain_tx_intents.load(Ordering::Acquire) == 0
                 && bus.receive_gain.reserve()
         };
         if !reserved {
@@ -3315,11 +3332,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
-                            if overload_enabled
-                                && rig_enabled
-                                && overload_mode.load(Ordering::Acquire)
-                                    == pancetta_config::OperatingMode::Ft8.as_u8()
-                            {
+                            if overload_enabled && rig_enabled {
                                 overload
                                     .tick(
                                         &rig_poll,
@@ -8991,6 +9004,133 @@ mod receive_overload_notice_tests {
             assert!(runtime.steps.is_none(), "discovery is still pending");
             rig.disconnect().await.unwrap();
         }
+    }
+
+    /// PTT-on cannot be admitted while recovery holds the command owner: the
+    /// queued key would run late, behind the probe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_probe_inhibits_key_down_until_it_finishes() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 40,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        assert!(!bus.receive_gain.receiving() && !bus.receive_gain.blocked());
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        // Stay out of discovery: only the recovery probe is under test.
+        runtime.generation = Some(rig.connection_generation());
+        let gate = tokio::sync::Mutex::new(());
+        let (connection, capture) = (AtomicU64::new(0), AtomicU64::new(0));
+        let dial = AtomicU64::new(7_074_000);
+        let mode = AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8());
+        let (ptt, shutdown) = (AtomicBool::new(false), AtomicBool::new(false));
+        let in_flight = AtomicU32::new(0);
+        let tx_policy = AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8);
+        let admit_during_probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            bus.receive_gain.admit_ptt(0)
+        };
+        let (_, admitted) = tokio::join!(
+            runtime.tick(
+                &rig,
+                &bus,
+                &measurements,
+                &connection,
+                &capture,
+                &dial,
+                &mode,
+                &ptt,
+                &gate,
+                &in_flight,
+                &tx_policy,
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &shutdown,
+            ),
+            admit_during_probe,
+        );
+        assert!(!admitted, "key-down must wait for recovery to finish");
+        assert!(bus.receive_gain.receiving(), "confirmed Off ends recovery");
+        assert!(bus.receive_gain.admit_ptt(0));
+    }
+
+    /// A failed recovery returns to unknown state rather than stranding TX.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keyed_recovery_probe_releases_its_inhibition() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime.generation = Some(rig.connection_generation());
+        runtime
+            .tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+        assert!(!bus.receive_gain.blocked() && !bus.receive_gain.receiving());
+        assert!(bus.receive_gain.admit_ptt(0));
+    }
+
+    /// An operator who leaves FT8 after a failed ATT transaction must not stay
+    /// TX-muted, and the other modes must run no measurement or discovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_failure_recovers_outside_ft8_without_guard_work() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let rig: Arc<dyn RigControl + Send + Sync> = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }));
+        rig.connect().await.unwrap();
+        let bus = MessageBus::new(8).unwrap();
+        bus.receive_gain.fail_gain();
+        let (_sender, measurements) = crossbeam_channel::bounded(2);
+        let mut runtime = ReceiveOverloadRuntime::default();
+        runtime
+            .tick(
+                &rig,
+                &bus,
+                &measurements,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                &AtomicU64::new(7_074_000),
+                &AtomicU8::new(pancetta_config::OperatingMode::Ft4.as_u8()),
+                &AtomicBool::new(false),
+                &tokio::sync::Mutex::new(()),
+                &AtomicU32::new(0),
+                &AtomicU8::new(pancetta_core::TxPolicy::Disabled as u8),
+                pancetta_config::station::TxSelfParity::Auto,
+                500,
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert!(!bus.receive_gain.blocked(), "FT4 must clear the inhibit");
+        assert!(runtime.discovery.is_none() && runtime.generation.is_none());
     }
 
     #[tokio::test]

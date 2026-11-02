@@ -255,6 +255,37 @@ impl GainSafety {
         true
     }
 
+    /// Hold key-down off while the CAT owner probes unknown hardware state. A
+    /// key admitted during the probe would queue behind it and key late.
+    /// Acquire under the coordinator PTT gate; an owner aborted mid-probe
+    /// is failed by its successor like any other reservation.
+    pub fn reserve_recovery(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.pending_on.load(SeqCst) != 0
+            || self.state.compare_exchange(1, 2, SeqCst, SeqCst).is_err()
+        {
+            return false;
+        }
+        if self.pending_on.load(SeqCst) != 0 {
+            let _ = self.state.compare_exchange(2, 1, SeqCst, SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// `confirmed_off_ms` is the acknowledged unkey time. None leaves hardware
+    /// state unknown, which admits key-down as it did before the probe.
+    pub fn end_recovery(&self, confirmed_off_ms: Option<i64>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let next = if let Some(now_ms) = confirmed_off_ms {
+            self.touch(now_ms);
+            0
+        } else {
+            1
+        };
+        let _ = self.state.compare_exchange(2, next, SeqCst, SeqCst);
+    }
+
     /// No setter was sent, so captured audio retains its gain identity.
     pub fn cancel_gain(&self) {
         use std::sync::atomic::Ordering::SeqCst;

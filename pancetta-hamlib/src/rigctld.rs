@@ -642,6 +642,8 @@ fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
         return Err(anyhow!("Attenuator get/set unsupported"));
     }
     // Optional protocol-1 key/value extensions precede the terminal response.
+    // Hamlib prints them, closed by a bare `done`, once any client ran chk_vfo.
+    let mut done = false;
     loop {
         let line = lines
             .next()
@@ -652,7 +654,9 @@ fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
             }
             break;
         }
-        if !line.contains('=') {
+        if !done && line == "done" {
+            done = true;
+        } else if done || !line.contains('=') {
             return Err(anyhow!("Invalid dump_state extension or terminal error"));
         }
     }
@@ -1508,6 +1512,29 @@ mod attenuator_tests {
     #[test]
     fn supported_attenuator_protocol_one() {
         assert_eq!(parse_attenuator_steps(STATE).unwrap(), vec![0, 10, 20]);
+    }
+
+    /// After any Hamlib client ran `chk_vfo`, upstream dump_state appends a
+    /// key/value block closed by a bare `done` line (tests/rigctl_parse.c).
+    #[test]
+    fn accepts_the_extended_block_closed_by_done() {
+        let extended = STATE.replace(
+            "RPRT 0\n",
+            "vfo_ops=0x0\nptt_type=0x1\nrigctld_version=Hamlib 4.6\nlevel_gran=0=0,1,0;\nparm_gran=\nrig_model=1\nhamlib_version=Hamlib 4.6\ndone\nRPRT 0\n",
+        );
+        assert_eq!(parse_attenuator_steps(&extended).unwrap(), vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn done_must_be_the_last_line_before_the_terminal_response() {
+        for invalid in [
+            STATE.replace("RPRT 0\n", "done\nrig_model=1\nRPRT 0\n"),
+            STATE.replace("RPRT 0\n", "done\ndone\nRPRT 0\n"),
+            STATE.replace("RPRT 0\n", "done\n"),
+            STATE.replace("RPRT 0\n", "done\nRPRT -11\n"),
+        ] {
+            assert!(parse_attenuator_steps(&invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
