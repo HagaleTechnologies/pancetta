@@ -174,12 +174,16 @@ jobs:
             cp "target/${{ matrix.target }}/release/pancetta" "$NAME/"
           fi
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "$NAME/"
+          mkdir "$NAME/docs"
+          cp docs/UPGRADING.md docs/CONFIG.md "$NAME/docs/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "${NAME}.zip" "$NAME"
             ARCHIVE="${NAME}.zip"
+            7z l "$ARCHIVE" | tr '\\' '/' | grep -F "$NAME/docs/UPGRADING.md"
           else
             tar czf "${NAME}.tar.gz" "$NAME"
             ARCHIVE="${NAME}.tar.gz"
+            tar tzf "$ARCHIVE" | grep -Fx "$NAME/docs/UPGRADING.md"
           fi
           # sha256sum on Linux + Git-Bash/Windows; shasum on macOS.
           if command -v sha256sum >/dev/null 2>&1; then
@@ -214,25 +218,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Test release notes generator
+        run: bash scripts/ci/test-release-notes.sh
+
       - name: Extract release notes from CHANGELOG
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          awk -v ver="$VERSION" \
-            'index($0, "## [" ver "]") == 1 {flag=1; next} /^## /{flag=0} flag' \
-            CHANGELOG.md > notes.md
-          test -s notes.md || { echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
-          {
-            echo ""
-            echo "---"
-            echo "Tagged at \`${GITHUB_SHA}\`. Prebuilt binaries: macOS (Apple Silicon),"
-            echo "Linux x86_64 (gnu), Linux aarch64/Raspberry Pi (gnu — needs glibc >= 2.35,"
-            echo "i.e. Raspberry Pi OS Bookworm/2023-10 or newer; Bullseye-era images can't"
-            echo "load it), Windows x86_64 (MinGW). Every binary is CI-verified to embed the"
-            echo "real \`ft8_lib\` C decoder (\`pancetta info\`); the Linux aarch64 build is"
-            echo "additionally verified against a real off-air decode fixture, not just"
-            echo "linkage."
-          } >> notes.md
+        run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" CHANGELOG.md notes.md
 
       - name: Create draft release (operator publishes)
         env:

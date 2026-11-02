@@ -143,8 +143,9 @@ all with clean reviews (no Critical/Important findings):
    actual demuxed `src` of the frame that carried its capability token, never a session-global
    value or another peer's identity).
 5. **One-controller-at-a-time, free grab** — `ArmContext::controller: Option<String>`. Rules:
-   `takeControl` from any admitted peer always succeeds, disarming a displaced controller's live
-   arm first (arms never transfer — the new controller must re-arm through the full grant
+   `takeControl` from any admitted peer holding a currently-valid `qsy`-or-higher hello capability
+   always succeeds (a status-only or unauthorized peer is refused with no state change, PAN-253),
+   disarming a displaced controller's live arm first (arms never transfer — the new controller must re-arm through the full grant
    verification); `releaseControl` from the controller clears it (disarms if armed); a
    control-mutating action from `controller == None` implicitly grabs it (so a legacy client that
    never sends `takeControl` still arms exactly as it always has); the same action from a
@@ -328,8 +329,9 @@ on `PeerAuth`, `PeerCtx::grants` and `sweep_expired_peer_auth` rather than add a
 mechanism. PAN-95 already makes `qsy`/`setSplit` check expiry. PAN-96 still owns evicting or
 de-authorizing established peers when an authorization poll revokes them.
 
-Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
-`status`+ capability. That is an inbound control-rule change left for a separate ticket.
+Follow-up: implicit control grabs do not yet require a currently-valid `status`+ capability.
+That is an inbound control-rule change left for a separate ticket. Explicit `takeControl` now
+requires a currently-valid `qsy`-or-higher capability (PAN-253, below).
 
 ## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
 
@@ -1039,6 +1041,7 @@ No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
 needed.
 
+<<<<<<< HEAD
 ## PAN-250: remote stopCq stops calling CQ
 
 Before 2026-11-01 the station agent accepted a controller's `stopCq`, logged
@@ -1064,3 +1067,25 @@ and then sends the stop whether or not the flush succeeded. Both messages
 reduce TX, so their order does not matter. A frame already on the air
 finishes, as with the local `s` key; `Disarm` remains the immediate TX-off
 control. No wire, protocol or config change is involved.
+=======
+## Explicit takeover needs qsy scope (PAN-253, 2026-11-01)
+
+A station-agent viewer whose verified hello granted only `status` could send
+`takeControl`, displace the current controller, disarm it and retire its
+QSOs. dispensa Q-0080 (approved 2026-10-31) says status-only access must not
+reach that. `dispatch_action` now refuses `TakeControl` unless
+`peer_grants(ctx, peer, "qsy", now)` holds: admitted, unexpired, not
+revoked, and scoped `qsy` or `tx`. `qsy` is the lowest tier that controls
+the rig, so a tuning operator can still hold control without TX permission.
+Taking control still never arms the new controller.
+
+The check runs before the displacement test, so a refused takeover changes
+nothing: the controller keeps control and its arm, no PAN-137 cleanup is
+owed, and no frame is sent. It logs a `warn!` like the QSY and split scope
+refusals. `controller_gate` is not consulted first because it can mutate
+ownership. No wire, schema or config change was needed.
+
+Implicit grabs through Arm/QSY/split/StopCq/TX requests, Disarm and
+ReleaseControl keep their existing rules. The local WebSocket gateway does
+not dispatch `takeControl` and is unchanged.
+>>>>>>> 87c03404e9119253269b3e62ccac854c464b2ffa
