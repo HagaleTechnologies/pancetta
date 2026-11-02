@@ -1108,6 +1108,8 @@ impl super::ApplicationCoordinator {
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
         let cmd_autonomous_enabled = self.autonomous_enabled_runtime.clone();
+        // PAN-251: Shift+Q and the SWR trip share one halt.
+        let cmd_tx_halt = self.tx_halt_handles();
         // Global tri-state TX policy (Full/RespondOnly/Disabled). The
         // command handler updates this on CycleTxPolicy and Shift+Q, gates
         // initiation commands (StartCq, CallStation) on it, and echoes the
@@ -1843,36 +1845,34 @@ impl super::ApplicationCoordinator {
                             // hb-161: Phase 5 emergency stop. Operator
                             // pressed Shift+Q. Halt every TX path the
                             // station can drive:
-                            //   1. Abort the in-flight TX (PTT-off in
-                            //      ~50ms via the existing F8 path).
-                            //   2. Disable autonomous mode at runtime
-                            //      (the autonomous loop reads this flag
-                            //      every slot before submitting TX).
-                            //   3. Stop the repeating-CQ loop.
-                            //   4. Cancel any active tune tone.
+                            //   1. `tx_halt::halt()` (PAN-251, shared with
+                            //      the SWR trip), with no await before the
+                            //      policy store: abort the in-flight TX
+                            //      (PTT-off in ~50ms via the existing F8
+                            //      path), disable autonomous mode at
+                            //      runtime (the autonomous loop reads this
+                            //      flag every slot before submitting TX),
+                            //      and set the global policy to Disabled
+                            //      (RX-only).
+                            //   2. Stop the repeating-CQ loop.
+                            //   3. Cancel any active tune tone.
+                            //   4. Echo Disabled to the TUI banner.
+                            //   5. Cancel every active QSO.
                             // Logged at WARN with target=operator.override
                             // so it stands out in the journal. The
                             // operator re-enables autonomous explicitly:
                             // the TUI `a` key sends ToggleAutonomous,
                             // which re-sets this same runtime gate
-                            // (Batch 93). We don't auto-restore.
+                            // (Batch 93), and restores TX with the policy
+                            // cycle key (`g`). We don't auto-restore.
                             warn!(
                                 target: "operator.override",
                                 "Operator emergency stop (Shift+Q): aborting TX, disabling \
                                  autonomous, stopping CQ + tune"
                             );
-                            cmd_abort_current_tx.store(true, Ordering::Release);
-                            cmd_autonomous_enabled.store(false, Ordering::Release);
+                            cmd_tx_halt.halt();
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
-                            // Emergency stop also hard-mutes all TX: set the
-                            // global policy to Disabled (RX-only) and echo it
-                            // to the TUI banner. The operator restores TX with
-                            // the policy cycle key (`g`).
-                            cmd_tx_policy.store(
-                                pancetta_core::TxPolicy::Disabled.as_u8(),
-                                Ordering::Release,
-                            );
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
                                     policy: pancetta_core::TxPolicy::Disabled,
@@ -1884,16 +1884,13 @@ impl super::ApplicationCoordinator {
                             // Without this, returning the policy to Full would
                             // resume the runaway. This is the real fix for
                             // "h + k didn't stop it; only restart did."
-                            let cancel_all = ComponentMessage::new(
-                                ComponentId::Tui,
-                                ComponentId::Qso,
-                                MessageType::QsoMessage(
-                                    crate::message_bus::QsoMessage::CancelAllQsos,
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(cancel_all).await {
-                                warn!("Emergency stop: failed to send CancelAllQsos: {}", e);
+                            // Durable (PAN-251): a full QSO channel parks the
+                            // cancel instead of dropping it.
+                            if super::tx_halt::cancel_all_qsos(&cmd_message_bus, ComponentId::Tui)
+                                .await
+                                == crate::message_bus::DurableDelivery::Dropped
+                            {
+                                warn!("Emergency stop: failed to send CancelAllQsos");
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {

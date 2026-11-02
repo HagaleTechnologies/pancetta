@@ -232,6 +232,53 @@ configuration, a layer that mentions this table replaces the entire lower
 layer's map; an absent table keeps it. Both fields are required in each entry,
 and negative values fail validation at config load.
 
+### `[rig.power_control.protection]`: SWR protection
+
+```toml
+[rig.power_control.protection]
+swr_protection = true   # default true; needs CAT rig control ([rig.interface].enabled = true)
+max_swr = 3.0           # default 3.0; halt on any reading above this; must be a number above 1.0
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
+| `max_swr` | float | `3.0` | Trip when a reading is above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
+
+`[rig.power_control].enabled` (default false) controls rig power setting
+only. SWR protection does not depend on it.
+
+While the rig is keyed, pancetta reads its SWR meter every poll tick. One
+reading above `max_swr` halts the station the same way Shift+Q does. The
+readiness strip shows `■ RX ONLY` and an alert such as
+`⚠ High SWR 4.20:1 (limit 3:1): TX halted. Check the antenna, then press g to re-enable TX`,
+and Shift+D keeps an entry under `rig.swr`. To recover, fix the antenna,
+press `g` to re-enable TX and `a` to resume autonomous. With `--headless`
+there are no keys: the trip is logged at `error` (target `rig.swr`) and the
+station stays RX-only until pancetta restarts.
+
+A rig that cannot report SWR keeps transmitting; pancetta warns once and
+never blocks TX for it. The strip shows one of:
+
+- `⚠ SWR protection is unavailable on this rig (it does not report SWR over CAT)`
+  when the startup check finds the rig has no SWR reading over CAT.
+- `⚠ SWR protection is unavailable on this rig (no SWR reading during the last transmission)`
+  when a transmission of at least 2 s brought no valid reading.
+
+Headless, the same text is logged at `warn` (target `rig.swr`). Set
+`swr_protection = false` to silence it. With rig control off (mock rig) no
+such alert appears.
+
+Readings of 0, or anything else below 1.0, are ignored rather than treated
+as a perfect match. A bad `max_swr` stops config validation:
+
+```text
+Error: Invalid configuration value: power_control.protection.max_swr = 0.5 (must be a number above 1.0 while swr_protection = true)
+```
+
+Changes apply on restart. `max_power_watts`, `temperature_protection` and
+`max_temperature_c` in this table are not read by anything yet.
+
 ### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
 
 ```toml
@@ -977,6 +1024,10 @@ To revoke a suspect remote client step by step, see
 ## Pancetta data files
 
 All persistent state lives under `~/.pancetta/`.
+
+Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
+Automatic database backups do not cover configuration, the complete logbook or
+external keys. Preserve the whole stopped installation and data directory.
 
 ### QSO log files
 
