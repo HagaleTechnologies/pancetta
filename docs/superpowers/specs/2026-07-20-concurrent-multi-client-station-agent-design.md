@@ -87,7 +87,9 @@ Rules, in order of precedence:
 3. **Implicit grab (backward compatibility):** a control-mutating action (`Arm`, `Qsy`,
    `SetSplit`, `TxRequest`, `StopCq`) from peer P when `controller == None` sets
    `controller = Some(P)` and then proceeds. Today's panino never sends `takeControl`; a single
-   client connecting and arming works byte-for-byte as it does now.
+   client connecting and arming works byte-for-byte as it does now. `StopCq` first needs a
+   currently-valid hello capability of any scope (PAN-250); without one it is refused (`warn!`,
+   no frame) before it can grab.
 4. **Exclusivity:** a control-mutating action from a non-controller while a controller is
    assigned is refused — `warn!`, audited, and answered with an error frame to that peer (so
    its UI can render "take control first"). It does NOT implicitly grab.

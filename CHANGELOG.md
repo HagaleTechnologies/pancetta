@@ -170,10 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - A remote client's Stop CQ now stops the station calling CQ. It previously
   did nothing (PAN-250).
-=======
+
 - SWR protection now works (PAN-251). `[rig.power_control.protection]
   swr_protection` (on by default) and `max_swr` (default 3.0) were read by
   nothing. A reading above the limit while transmitting now halts all TX
@@ -181,7 +180,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot report SWR shows `⚠ SWR protection is unavailable on this rig`. A
   `max_swr` that is not a number above 1.0 now fails config validation
   while protection is on.
->>>>>>> 87c03404e9119253269b3e62ccac854c464b2ffa
 
 - The `ft8.desense` warning excludes our own transmit windows, uses a fresh
   same-band baseline, and requires healthy reception before TX (PAN-212).

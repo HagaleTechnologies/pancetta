@@ -1041,33 +1041,6 @@ No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
 needed.
 
-<<<<<<< HEAD
-## PAN-250: remote stopCq stops calling CQ
-
-Before 2026-11-01 the station agent accepted a controller's `stopCq`, logged
-it and did nothing, so a remote operator who pressed Stop CQ kept
-transmitting. The agent now forwards the same station-wide
-`QsoMessage::StopCq` that the TUI `s` key and WSJT-X `HaltTx` send. It cancels
-every un-answered `CallingCq` QSO, including a local `c` CQ, because the
-operator was told the station stopped and stopping TX is the safe direction.
-Answered exchanges still finish. The controller gate (implicit grab, refusal
-of a non-controller) is unchanged.
-
-The client learns of the stop from the QSO engine's next `activeQsos`
-snapshot. That snapshot is published only after the CQ has left
-`active_tx_qsos`, so it reports the cancellation itself and the TX worker
-already refuses the CQ's next frame at key time. No `status` acknowledgement
-is sent at enqueue time. If the QSO inbox refuses the stop, the requesting
-peer gets `error {component: "stationAgent", message: "stop CQ not
-delivered; retry stopCq"}`.
-
-The stop never waits on an owed PAN-137 controller-change cleanup. The agent
-flushes the cleanup first, which keeps it ahead of the stop when both fit,
-and then sends the stop whether or not the flush succeeded. Both messages
-reduce TX, so their order does not matter. A frame already on the air
-finishes, as with the local `s` key; `Disarm` remains the immediate TX-off
-control. No wire, protocol or config change is involved.
-=======
 ## Explicit takeover needs qsy scope (PAN-253, 2026-11-01)
 
 A station-agent viewer whose verified hello granted only `status` could send
@@ -1088,4 +1061,38 @@ ownership. No wire, schema or config change was needed.
 Implicit grabs through Arm/QSY/split/StopCq/TX requests, Disarm and
 ReleaseControl keep their existing rules. The local WebSocket gateway does
 not dispatch `takeControl` and is unchanged.
->>>>>>> 87c03404e9119253269b3e62ccac854c464b2ffa
+
+## PAN-250: remote stopCq stops calling CQ
+
+Before 2026-11-01 the station agent accepted a controller's `stopCq`, logged
+it and did nothing, so a remote operator who pressed Stop CQ kept
+transmitting. The agent now forwards the same station-wide
+`QsoMessage::StopCq` that the TUI `s` key and WSJT-X `HaltTx` send. It cancels
+every un-answered `CallingCq` QSO, including a local `c` CQ, because the
+operator was told the station stopped and stopping TX is the safe direction.
+Answered exchanges still finish. The controller gate (implicit grab, refusal
+of a non-controller) is unchanged for a peer with a live hello.
+
+Because the stop can end a local CQ, it re-checks the peer's authority like
+every other action. `dispatch_action` refuses `StopCq` unless
+`peer_grants(ctx, peer, "status", now)` holds: admitted, unexpired, not
+revoked, any scope. Stopping needs no control tier, so a status-only viewer
+that holds control can still stop. The check runs before the controller gate,
+so a peer with no hello, or an expired or revoked one, grabs no control, owes
+no PAN-137 cleanup and is sent nothing. This narrows the closing note of the
+PAN-253 section: an implicit grab through `StopCq` now needs that live hello.
+
+The client learns of the stop from the QSO engine's next `activeQsos`
+snapshot. That snapshot is published only after the CQ has left
+`active_tx_qsos`, so it reports the cancellation itself and the TX worker
+already refuses the CQ's next frame at key time. No `status` acknowledgement
+is sent at enqueue time. If the QSO inbox refuses the stop, the requesting
+peer gets `error {component: "stationAgent", message: "stop CQ not
+delivered; retry stopCq"}`.
+
+The stop never waits on an owed PAN-137 controller-change cleanup. The agent
+flushes the cleanup first, which keeps it ahead of the stop when both fit,
+and then sends the stop whether or not the flush succeeded. Both messages
+reduce TX, so their order does not matter. A frame already on the air
+finishes, as with the local `s` key; `Disarm` remains the immediate TX-off
+control. No wire, protocol or config change is involved.

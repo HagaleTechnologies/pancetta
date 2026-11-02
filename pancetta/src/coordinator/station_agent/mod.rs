@@ -893,7 +893,9 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
 ///   peer holds a currently-valid `qsy`-or-higher hello capability (PAN-253);
 ///   otherwise moves control, disarms a displaced controller and owes the
 ///   PAN-137 QSO cleanup. `ReleaseControl` disarms and releases control.
-/// - `StopCq` is controller-gated like `TxRequest` and forwards the
+/// - `StopCq` is refused (logged, no frame, no state change) unless the peer
+///   holds a currently-valid hello capability of any scope. It is then
+///   controller-gated like `TxRequest` and forwards the
 ///   station-wide `QsoMessage::StopCq` to the QSO engine (PAN-250). It flushes
 ///   an owed PAN-137 cleanup first but never waits on it, and returns a retry
 ///   `error` when the QSO inbox does not accept the stop.
@@ -1176,6 +1178,13 @@ async fn dispatch_action(
             // PAN-250: a control-mutating action (rules 3/4: implicit grab /
             // refuse a non-controller) routed to the same station-wide
             // `QsoMessage::StopCq` the TUI `s` key and WSJT-X HaltTx send.
+            // The stop also cancels a local CQ, so it needs a currently-valid
+            // hello capability; any scope will do, stopping needs no tier.
+            // Checked before the gate so a refused stop grabs nothing.
+            if !peer_grants(ctx, peer, "status", now.unix_ms) {
+                warn!(target: "agent.control", peer = %peer, "stopCq refused — no currently-valid hello capability for this peer");
+                return DispatchOutcome::cont();
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -4878,6 +4887,11 @@ mod tests {
     #[tokio::test]
     async fn a_controller_stop_cq_reaches_the_qso_engine() {
         let mut ctx = controller_change_ctx();
+        // PAN-250: a stop needs a live hello; status scope is enough.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
         let bus = MessageBus::new(64).unwrap();
         let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         grab_a(&mut ctx, &bus).await;
@@ -4918,6 +4932,11 @@ mod tests {
     #[tokio::test]
     async fn an_undelivered_stop_cq_tells_the_client_to_retry() {
         let mut ctx = controller_change_ctx();
+        // PAN-250: a stop needs a live hello; status scope is enough.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
         let bus = MessageBus::new(1).unwrap();
         let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         tx.try_send(ComponentMessage::new(
@@ -4947,6 +4966,89 @@ mod tests {
             rx.try_recv().unwrap().message_type,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos)
         ));
+    }
+
+    /// PAN-250: a stop cancels every un-answered CQ, a local one included, so
+    /// it needs the peer's live authority: a currently-valid hello capability
+    /// of any scope. B with no hello, a hello expired at or before `now`, or a
+    /// revoked hello is refused before the controller gate, with or without
+    /// control: nothing is enqueued, control does not move, no cleanup is owed
+    /// and no frame is sent. A status-only hello is enough to stop.
+    #[tokio::test]
+    async fn stop_cq_needs_a_live_hello_capability_of_any_scope() {
+        let cases: [(&str, Option<i64>, bool); 4] = [
+            ("no hello", None, false),
+            ("expires at now", Some(NOW), false),
+            ("expired", Some(NOW - 1), false),
+            ("revoked", Some(NOW + 600_000), true),
+        ];
+        for b_controls in [false, true] {
+            for (label, exp, revoke) in cases {
+                let mut ctx = controller_change_ctx();
+                let bus = MessageBus::new(64).unwrap();
+                let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                ctx.peers.insert(
+                    PEER_B.to_string(),
+                    exp.map_or_else(PeerCtx::unauthorized, |exp| {
+                        PeerCtx::authorized_until(vec!["status".to_string()], exp)
+                    }),
+                );
+                if revoke {
+                    // `authorized_until`'s fixture jti.
+                    ctx.revoked_jtis.insert("test-jti".to_string());
+                }
+                if b_controls {
+                    ctx.controller = Some(PEER_B.to_string());
+                }
+                let controller_before = ctx.controller.clone();
+                let out = dispatch_action(
+                    ControlAction::StopCq,
+                    PEER_B,
+                    &mut ctx,
+                    &bus,
+                    SESSION_ID,
+                    at(NOW),
+                )
+                .await;
+                assert!(
+                    out.sends.is_empty(),
+                    "{label} (controls={b_controls}): no frame"
+                );
+                assert!(
+                    qso_inbox_tags(&rx).is_empty(),
+                    "{label} (controls={b_controls}): no stop enqueued"
+                );
+                assert_eq!(
+                    ctx.controller, controller_before,
+                    "{label} (controls={b_controls}): control unchanged"
+                );
+                assert!(
+                    ctx.qso_cleanup_owed.is_none(),
+                    "{label} (controls={b_controls}): no cleanup owed"
+                );
+            }
+        }
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        dispatch_action(
+            ControlAction::StopCq,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("changed:{PEER_B}"), "stopCq".to_string()]
+        );
     }
 
     #[tokio::test]
