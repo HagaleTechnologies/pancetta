@@ -26,7 +26,8 @@ frames by keyId (`relay.v1`, Q-0021 #1); `presence` frames carry the affected `p
 Decisions made during design review:
 
 - **Control model: explicit controller, free grab.** One controller at a time; any admitted
-  client can take control at any moment (single-operator assumption). Chosen over
+  client with a currently-valid `qsy`-or-higher capability can take control at any moment
+  (single-operator assumption; status-only viewers cannot since PAN-253). Chosen over
   "last-action-wins" (no way for UIs to show who's driving; stale tabs can act by accident) and
   over "locked until release" (recreates the walk-to-the-other-device annoyance).
 - **Architecture: `MultiPeerSession` in `pancetta-agent`.** Library-level demux next to
@@ -74,7 +75,10 @@ per-peer (moved into or keyed by the peer map); new `controller: Option<String>`
 Rules, in order of precedence:
 
 1. **`takeControl`** (existing reserved verb, currently a no-op) from any admitted,
-   transport-established peer **always succeeds** — free grab. If it displaces a different
+   transport-established peer holding a currently-valid `qsy`-or-higher hello capability
+   **always succeeds** — free grab. From a status-only or unauthorized peer it is refused
+   (`warn!`, no frame) before any state changes: the current controller keeps control and its
+   arm, and no QSO cleanup is owed (PAN-253, dispensa Q-0080). If it displaces a different
    controller whose arm is live, the arm is **disarmed first** (audited). Arms never transfer:
    the new controller must arm fresh through the full capabilityToken + clientSig grant
    verification.
@@ -83,7 +87,9 @@ Rules, in order of precedence:
 3. **Implicit grab (backward compatibility):** a control-mutating action (`Arm`, `Qsy`,
    `SetSplit`, `TxRequest`, `StopCq`) from peer P when `controller == None` sets
    `controller = Some(P)` and then proceeds. Today's panino never sends `takeControl`; a single
-   client connecting and arming works byte-for-byte as it does now.
+   client connecting and arming works byte-for-byte as it does now. `StopCq` first needs a
+   currently-valid hello capability of any scope (PAN-250); without one it is refused (`warn!`,
+   no frame) before it can grab.
 4. **Exclusivity:** a control-mutating action from a non-controller while a controller is
    assigned is refused — `warn!`, audited, and answered with an error frame to that peer (so
    its UI can render "take control first"). It does NOT implicitly grab.

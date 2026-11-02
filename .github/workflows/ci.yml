@@ -340,7 +340,8 @@ jobs:
           for test in scripts/ci/test-ci-*.sh scripts/ci/research-scan-shepherd/test*.sh; do
             bash "$test"
           done
-          shellcheck -s bash scripts/ci/*.sh scripts/ci/research-scan-shepherd/*.sh scripts/ci/research-scan-shepherd/stub/gh scripts/ci/research-scan-shepherd/stub/date
+          bash scripts/ci/test-release-notes.sh
+          shellcheck -s bash scripts/release-notes.sh scripts/ci/*.sh scripts/ci/research-scan-shepherd/*.sh scripts/ci/research-scan-shepherd/stub/gh scripts/ci/research-scan-shepherd/stub/date
 
   # Fast checks — run on every push and PR (~2 min)
   clippy:

@@ -53,7 +53,9 @@ pub enum ClientCommand {
     },
     /// Stop an unanswered manual CQ.
     StopCq,
-    /// Request the control role (one control operator at a time).
+    /// Request the control role (one control operator at a time). The station
+    /// agent grants it only to a peer holding a currently-valid `qsy` or `tx`
+    /// capability; a status-only request is refused without a reply.
     TakeControl,
     /// Release the control role.
     ReleaseControl,

@@ -1416,6 +1416,16 @@ impl super::ApplicationCoordinator {
     }
 
     #[cfg(feature = "pancetta-hamlib")]
+    /// The rig used while rig control is off: `MockRig::default()`, or the
+    /// PAN-251 test seam's injected rig.
+    fn rig_control_disabled_rig(&self) -> Arc<dyn pancetta_hamlib::RigControl + Send + Sync> {
+        #[cfg(test)]
+        if let Some(rig) = self.test_mock_rig.clone() {
+            return rig;
+        }
+        Arc::new(pancetta_hamlib::MockRig::default())
+    }
+
     pub(crate) async fn start_hamlib_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_hamlib");
         let _enter = span.enter();
@@ -1628,7 +1638,7 @@ impl super::ApplicationCoordinator {
 
         let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
             info!("Rig control disabled, using mock rig");
-            Arc::new(pancetta_hamlib::MockRig::default())
+            self.rig_control_disabled_rig()
         } else {
             info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
             Arc::new(pancetta_hamlib::RigctldClient::new(
@@ -1645,6 +1655,10 @@ impl super::ApplicationCoordinator {
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let ptt_active = self.ptt_active.clone();
         let last_ptt_on_ms = self.last_ptt_on_ms.clone();
+        // PAN-251: SWR protection. The trip runs the same station-wide halt
+        // as Shift+Q. Rig settings apply on restart, so snapshot them here.
+        let swr_halt = self.tx_halt_handles();
+        let swr_protection = rig_config.power_control.protection.clone();
         let tx_restart_inhibit = self.tx_restart_inhibit.clone();
         let rig_conn_state = self.rig_conn_state.clone();
         // PAN-89: cleared (via `confirm_ptt_off`) wherever this generation's
@@ -1829,6 +1843,24 @@ impl super::ApplicationCoordinator {
                 // (it's used there directly, not via a separately-named
                 // clone); the connect sequence -- now running AFTER that
                 // spawn -- needs its own clone to report a connect failure.
+                // The Hamlib-side "PTT is on" tracker: set by every accepted
+                // `SetPtt(true)` from any source (manual PTT included) and read
+                // by the PTT watchdog below. Created before the poll task is
+                // spawned so SWR protection (PAN-251) can see it too.
+                let initial_ptt_on = if ptt_active.load(Ordering::Acquire) {
+                    let last_ms = super::now_epoch_ms()
+                        .saturating_sub(last_ptt_on_ms.load(Ordering::Acquire));
+                    let now = Instant::now();
+                    Some(
+                        now.checked_sub(Duration::from_millis(last_ms))
+                            .unwrap_or(now),
+                    )
+                } else {
+                    None
+                };
+                let ptt_on_since: Arc<RwLock<Option<Instant>>> =
+                    Arc::new(RwLock::new(initial_ptt_on));
+                let ptt_on_since_poll = ptt_on_since.clone();
                 let message_bus_for_connect = message_bus.clone();
                 let rig_poll = Arc::clone(&rig);
                 let rig_for_polling = Arc::clone(&rig_poll);
@@ -1882,6 +1914,9 @@ impl super::ApplicationCoordinator {
                     // PollingFailed; redial 2 s backing off to 30 s).
                     let mut poll_health = RigPollHealth::new();
                     let mut split_read_health = SplitReadHealth::default();
+                    // PAN-251: one SWR guard per Hamlib session.
+                    let mut swr_guard =
+                        super::swr_guard::SwrGuard::new(&swr_protection, rig_enabled);
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -2079,23 +2114,35 @@ impl super::ApplicationCoordinator {
                                     // SWR — only meaningful while keyed (needs
                                     // forward power). Poll every tick during TX so
                                     // the status bar tracks across the ~12.6s
-                                    // burst; skipped entirely on RX. Best-effort,
-                                    // like the S-meter read.
-                                    if ptt_active_poll.load(Ordering::Acquire) {
-                                        if let Ok(swr) = rig_for_polling.get_swr().await {
-                                            let swr_msg = ComponentMessage::new(
-                                                ComponentId::Hamlib,
-                                                ComponentId::Tui,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SwrResponse {
-                                                        swr,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(swr_msg).await;
-                                        }
+                                    // burst; skipped entirely on RX.
+                                    // PAN-251: SWR protection. Best-effort like the
+                                    // S-meter read: never affects poll_ok. The
+                                    // capability probe runs once per Hamlib session.
+                                    if swr_guard.needs_capability_probe() {
+                                        let cap = super::swr_guard::probe_swr_capability(
+                                            rig_for_polling.as_ref(),
+                                        )
+                                        .await;
+                                        super::swr_guard::act(
+                                            swr_guard.note_capability(cap),
+                                            &message_bus,
+                                            &swr_halt,
+                                        )
+                                        .await;
                                     }
+                                    let keyed = super::swr_guard::poll_sees_keyed(
+                                        &ptt_active_poll,
+                                        &ptt_on_since_poll,
+                                    )
+                                    .await;
+                                    super::swr_guard::swr_poll_step(
+                                        rig_for_polling.as_ref(),
+                                        &mut swr_guard,
+                                        keyed,
+                                        &message_bus,
+                                        &swr_halt,
+                                    )
+                                    .await;
                                     // PAN-206: every successful frequency poll also
                                     // observes split. An unsupported read does not
                                     // affect poll_ok or the CAT-link hard mute; a
@@ -2198,19 +2245,8 @@ impl super::ApplicationCoordinator {
                 // legitimate FT8 TX, short enough to never bleed into the
                 // next slot. Catches stuck/crashed pipelines.
                 const PTT_SAFETY_TIMEOUT_SECS: u64 = 14;
-                let initial_ptt_on = if ptt_active.load(Ordering::Acquire) {
-                    let last_ms = super::now_epoch_ms()
-                        .saturating_sub(last_ptt_on_ms.load(Ordering::Acquire));
-                    let now = Instant::now();
-                    Some(
-                        now.checked_sub(Duration::from_millis(last_ms))
-                            .unwrap_or(now),
-                    )
-                } else {
-                    None
-                };
-                let ptt_on_since: Arc<RwLock<Option<Instant>>> =
-                    Arc::new(RwLock::new(initial_ptt_on));
+                // `initial_ptt_on`/`ptt_on_since` are created above the poll
+                // task spawn (PAN-251) so the SWR guard sees manual PTT too.
 
                 // Spawn the PTT watchdog as a background task
                 let rig_for_watchdog = Arc::clone(&rig_poll);
@@ -8569,5 +8605,213 @@ async fn gain_band_before_retune(
     match rig.get_frequency(vfo).await {
         Ok(hz) => pancetta_core::Band::from_frequency(hz),
         Err(_) => fallback,
+    }
+}
+
+#[cfg(test)]
+mod pan251_swr_protection_tests {
+    //! PAN-251: SWR protection end to end through the real
+    //! `start_hamlib_component` poll loop, with an injected mock rig that
+    //! reports SWR above the default 3.0 limit.
+    use super::*;
+    use crate::message_bus::{QsoMessage, SendIfOutcome};
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+    use std::sync::atomic::AtomicBool;
+
+    async fn test_coordinator(config: Config) -> super::super::ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    fn high_swr_rig() -> Arc<MockRig> {
+        Arc::new(MockRig::new(MockRigConfig {
+            swr_override: Some(4.2),
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }))
+    }
+
+    struct Started {
+        coordinator: super::super::ApplicationCoordinator,
+        rig: Arc<MockRig>,
+        qso: crossbeam_channel::Receiver<ComponentMessage>,
+        tui: crossbeam_channel::Receiver<ComponentMessage>,
+    }
+
+    async fn start(config: Config) -> Started {
+        let mut coordinator = test_coordinator(config).await;
+        let rig = high_swr_rig();
+        coordinator.test_mock_rig = Some(rig.clone());
+        let (_, qso) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await
+            .unwrap();
+        let (_, tui) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+        for _ in 0..250 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire));
+        Started {
+            coordinator,
+            rig,
+            qso,
+            tui,
+        }
+    }
+
+    fn policy(coordinator: &super::super::ApplicationCoordinator) -> pancetta_core::TxPolicy {
+        pancetta_core::TxPolicy::from_u8(coordinator.tx_policy.load(Ordering::Acquire))
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..150 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        done()
+    }
+
+    fn hard_mute_reason(c: &super::super::ApplicationCoordinator) -> Option<&'static str> {
+        super::super::tx::tx_hard_mute_reason(
+            &c.tx_policy,
+            &c.tx_restart_inhibit,
+            &c.hamlib_command_loop_ready,
+            &c.hamlib_pending_frequency,
+            &c.hamlib_pending_split,
+            &c.hamlib_command_in_flight,
+            &c.rig_conn_state,
+            &c.audio_output_alive,
+        )
+    }
+
+    #[tokio::test]
+    async fn high_swr_on_a_manually_keyed_rig_halts_the_station() {
+        let s = start(Config::default()).await;
+        let c = &s.coordinator;
+        assert_eq!(policy(c), pancetta_core::TxPolicy::Full);
+        assert!(c.autonomous_enabled_runtime.load(Ordering::Acquire));
+
+        // Manual PTT: a bus key only, `ptt_active` stays false.
+        assert_eq!(
+            super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, true, || true),
+            SendIfOutcome::Enqueued
+        );
+        assert!(!c.ptt_active.load(Ordering::Acquire));
+
+        assert!(
+            wait_for(|| policy(c) == pancetta_core::TxPolicy::Disabled).await,
+            "a 4.2:1 reading above max_swr 3.0 must set the policy to Disabled"
+        );
+        assert!(c.abort_current_tx.load(Ordering::Acquire));
+        assert!(!c.autonomous_enabled_runtime.load(Ordering::Acquire));
+        let mut unkeyed = false;
+        for _ in 0..150 {
+            if s.rig.get_ptt(Vfo::Current).await.unwrap() == PttState::Off {
+                unkeyed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(unkeyed, "the trip must unkey the rig");
+
+        let qso: Vec<_> = s.qso.try_iter().map(|m| m.message_type).collect();
+        assert!(
+            qso.iter()
+                .any(|m| matches!(m, MessageType::QsoMessage(QsoMessage::CancelAllQsos))),
+            "{qso:?}"
+        );
+        let tui: Vec<_> = s.tui.try_iter().map(|m| m.message_type).collect();
+        let trip = super::super::swr_guard::trip_alert(4.2, 3.0);
+        assert!(
+            tui.iter().any(
+                |m| matches!(m, MessageType::Error { error_message, .. } if *error_message == trip)
+            ),
+            "{tui:?}"
+        );
+
+        // The next key-down is refused by the hard mute.
+        c.audio_output_alive.store(true, Ordering::Release);
+        assert_eq!(hard_mute_reason(c), Some("TX policy is Disabled"));
+        assert_eq!(
+            super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, true, || {
+                hard_mute_reason(c).is_none()
+            }),
+            SendIfOutcome::Denied
+        );
+
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn high_swr_with_protection_off_keeps_transmitting() {
+        let mut config = Config::default();
+        config.rig.power_control.protection.swr_protection = false;
+        let s = start(config).await;
+        let c = &s.coordinator;
+
+        assert_eq!(
+            super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, true, || true),
+            SendIfOutcome::Enqueued
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(policy(c), pancetta_core::TxPolicy::Full);
+        assert!(!c.abort_current_tx.load(Ordering::Acquire));
+        assert_eq!(s.rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+
+        let _ =
+            super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, false, || true);
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn tx_worker_keying_is_sampled_too() {
+        let s = start(Config::default()).await;
+        let c = &s.coordinator;
+        // The TX worker's PttGuard, without a bus key.
+        c.ptt_active.store(true, Ordering::Release);
+        assert!(
+            wait_for(|| policy(c) == pancetta_core::TxPolicy::Disabled).await,
+            "a keyed TX worker must be sampled and tripped"
+        );
+        c.ptt_active.store(false, Ordering::Release);
+        c.shutdown_signal.store(true, Ordering::Release);
     }
 }

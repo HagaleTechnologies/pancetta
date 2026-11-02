@@ -30,10 +30,12 @@ pub struct MockRigConfig {
     pub simulate_s_meter: bool,
     /// S-meter noise level
     pub s_meter_noise: i32,
-    /// Whether to simulate SWR readings
+    /// Whether the rig has an SWR meter. When false, `get_swr` errors and status reports no SWR.
     pub simulate_swr: bool,
     /// Base SWR value
     pub base_swr: f32,
+    /// Fixed SWR reading while `simulate_swr` is on, returned unclamped (PAN-251 tests)
+    pub swr_override: Option<f32>,
     /// Supported frequency range
     pub frequency_range: (u64, u64),
     /// Whether the rig can report its split state.
@@ -55,6 +57,7 @@ impl Default for MockRigConfig {
             s_meter_noise: 10,
             simulate_swr: true,
             base_swr: 1.2,
+            swr_override: None,
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
             split_read_supported: true,
@@ -295,10 +298,14 @@ impl MockRig {
         base_level + noise + strong_signal
     }
 
-    /// Simulate SWR reading based on frequency and other factors
-    fn simulate_swr(&self, frequency: u64) -> f32 {
+    /// Simulate SWR reading based on frequency and other factors. `None` when
+    /// the rig has no SWR meter; `swr_override` is returned unclamped.
+    fn simulated_swr(&self, frequency: u64) -> Option<f32> {
         if !self.config.simulate_swr {
-            return 1.0;
+            return None;
+        }
+        if let Some(swr) = self.config.swr_override {
+            return Some(swr);
         }
 
         let count = self.operation_count.load(Ordering::Relaxed);
@@ -309,7 +316,7 @@ impl MockRig {
         // Add some random variation
         let random_variation = ((count % 100) as f32 / 1000.0) - 0.05;
 
-        (self.config.base_swr + freq_variation + random_variation).clamp(1.0, 3.0)
+        Some((self.config.base_swr + freq_variation + random_variation).clamp(1.0, 3.0))
     }
 
     /// Update last operation time and increment operation counter
@@ -492,7 +499,7 @@ impl RigControl for MockRig {
             swr: state
                 .frequencies
                 .get(&state.current_vfo)
-                .map(|&freq| self.simulate_swr(freq)),
+                .and_then(|&freq| self.simulated_swr(freq)),
             memory_channel: state.current_memory.get(&state.current_vfo).copied(),
             last_update: state.last_operation,
             last_error: None,
@@ -899,10 +906,16 @@ impl RigControl for MockRig {
                 .unwrap_or(14_200_000)
         };
 
-        let swr = self.simulate_swr(frequency);
+        let swr = self
+            .simulated_swr(frequency)
+            .ok_or_else(|| HamlibError::not_supported("get_swr", None, None))?;
         self.update_operation_time();
         debug!("Mock rig get SWR: {:.2}:1", swr);
         Ok(swr)
+    }
+
+    async fn reports_swr(&self) -> Result<bool> {
+        Ok(self.config.simulate_swr)
     }
 
     #[instrument(skip(self))]
@@ -1275,6 +1288,39 @@ mod tests {
         // Reset count
         rig.reset_operation_count();
         assert_eq!(rig.get_operation_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_swr_override_reports_above_three() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            swr_override: Some(4.2),
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert_eq!(rig.get_swr().await.unwrap(), 4.2);
+        assert_eq!(rig.get_status().await.unwrap().swr, Some(4.2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_without_swr_meter_errors_and_reports_none() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            simulate_swr: false,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert!(rig.get_swr().await.is_err());
+        assert_eq!(rig.get_status().await.unwrap().swr, None);
+        assert!(!rig.reports_swr().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_with_swr_meter_reports_swr() {
+        let rig = MockRig::default();
+        assert!(rig.reports_swr().await.unwrap());
     }
 }
 
