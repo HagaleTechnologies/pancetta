@@ -170,6 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A remote client's Stop CQ now stops the station calling CQ. It previously
+  did nothing (PAN-250).
+
 - SWR protection now works (PAN-251). `[rig.power_control.protection]
   swr_protection` (on by default) and `max_swr` (default 3.0) were read by
   nothing. A reading above the limit while transmitting now halts all TX
