@@ -21,10 +21,13 @@ mod audio_recovery;
 mod autonomous;
 mod clock_monitor;
 mod config_reload;
+mod desense;
 mod dsp;
 mod dx_cluster;
 mod effort;
 mod ft8;
+pub mod gain_sweep;
+mod gain_sweep_runtime;
 mod hamlib;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
@@ -33,14 +36,17 @@ mod psk_reporter;
 mod qso;
 mod qso_filter;
 mod readiness;
+pub mod receive_overload;
 mod remote_gateway;
 mod replay;
 mod restart_budget;
 mod shutdown;
 pub mod station_agent;
+mod swr_guard;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_halt;
 mod tx_log;
 pub(crate) mod upload_outbox;
 mod util;
@@ -923,7 +929,7 @@ pub(crate) fn operator_present_now(last_input_ms: &std::sync::atomic::AtomicU64)
     now_ms.saturating_sub(last) < OPERATOR_PRESENCE_WINDOW.as_millis() as u64
 }
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pancetta_config::Config;
 use pancetta_ft8::Ft8Config;
 use std::collections::{HashMap, HashSet};
@@ -942,6 +948,10 @@ use util::resample_linear;
 
 /// Application coordinator that manages all Pancetta components
 pub struct ApplicationCoordinator {
+    #[cfg(feature = "pancetta-hamlib")]
+    gain_sweep_original: Arc<std::sync::Mutex<Option<pancetta_hamlib::ReceiveGain>>>,
+    gain_sweep_options: Option<gain_sweep_runtime::GainSweepOptions>,
+    pub(crate) sweep_capture: Arc<std::sync::Mutex<pipeline::GainCaptureRegistry>>,
     /// Unique instance identifier
     id: uuid::Uuid,
 
@@ -968,6 +978,10 @@ pub struct ApplicationCoordinator {
     rigctld_process: Option<std::process::Child>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-251 test seam: when set, `start_hamlib_component` uses this rig
+    /// instead of `MockRig::default()` on the rig-control-disabled path.
+    #[cfg(all(test, feature = "pancetta-hamlib"))]
+    pub(crate) test_mock_rig: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
     /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
     /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
     /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
@@ -1197,6 +1211,12 @@ pub struct ApplicationCoordinator {
     /// permanently muting an otherwise healthy restart, since nothing else
     /// ever sets it back. Comparing against this generation counter at
     /// drop time makes a stale prior-generation guard a no-op instead.
+    pub(crate) overload_measurements: (
+        crossbeam_channel::Sender<receive_overload::Measurement>,
+        crossbeam_channel::Receiver<receive_overload::Measurement>,
+    ),
+    pub(crate) overload_capture_epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) overload_connection: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) hamlib_generation: Arc<std::sync::atomic::AtomicU64>,
 
     /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
@@ -1592,8 +1612,10 @@ pub struct ApplicationCoordinator {
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
     /// the one right after we stop transmitting, not just the window
     /// during which PTT was actually keyed — when checking for
-    /// TX-correlated desense (`ft8.rs`'s `maybe_flag_tx_desense`).
+    /// TX-correlated desense (`desense.rs`).
     pub(crate) last_ptt_on_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Enqueue-time PTT-off, paired with clearing ptt_active; not hardware confirmation.
+    pub(crate) last_ptt_off_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -2316,9 +2338,18 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            gain_sweep_options: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            gain_sweep_original: Arc::new(std::sync::Mutex::new(None)),
+            sweep_capture: Arc::new(std::sync::Mutex::new(
+                pipeline::GainCaptureRegistry::default(),
+            )),
             hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overload_measurements: crossbeam_channel::bounded(4),
+            overload_connection: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overload_capture_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             receive_gain_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
@@ -2408,12 +2439,15 @@ impl ApplicationCoordinator {
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             #[cfg(feature = "pancetta-hamlib")]
             rig_handle: None,
+            #[cfg(all(test, feature = "pancetta-hamlib"))]
+            test_mock_rig: None,
             #[cfg(feature = "pancetta-hamlib")]
             rig_handle_is_real: false,
             #[cfg(feature = "pancetta-hamlib")]
@@ -2796,18 +2830,26 @@ impl ApplicationCoordinator {
         );
 
         // Main application loop
+        let sweep_handle = match self.start_gain_sweep().await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.shutdown().await?;
+                return Err(error);
+            }
+        };
         let main_loop_result = self.run_main_loop().await;
-
         // The clock-skew monitor is advisory and holds no resources; stop it
         // before the component teardown (or an early error return) rather
         // than waiting out its tick.
         if let Some(handle) = self.clock_monitor_handle.take() {
             handle.abort();
         }
-        main_loop_result?;
+        // Cleanup runs even if either the main loop or experiment failed.
 
         // Graceful shutdown
-        self.shutdown().await?;
+        let sweep_result = self.shutdown_with_gain_sweep(sweep_handle).await;
+        main_loop_result?;
+        sweep_result?;
 
         Ok(())
     }
@@ -2905,6 +2947,16 @@ impl ApplicationCoordinator {
 
     /// Shared split-TX dial atomic (0 = simplex). Written by the TUI SetSplit
     /// relay, read by the QSO RF stamp.
+    /// PAN-251: the atomics a station-wide halt stores (Shift+Q and the
+    /// SWR trip share `tx_halt::TxHaltHandles::halt`).
+    pub(crate) fn tx_halt_handles(&self) -> tx_halt::TxHaltHandles {
+        tx_halt::TxHaltHandles {
+            abort_current_tx: self.abort_current_tx.clone(),
+            autonomous_enabled: self.autonomous_enabled_runtime.clone(),
+            tx_policy: self.tx_policy.clone(),
+        }
+    }
+
     pub(crate) fn split_tx_frequency_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.split_tx_frequency_hz.clone()
     }

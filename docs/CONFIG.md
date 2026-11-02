@@ -199,6 +199,68 @@ baud_rate = 38400
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
 
+### `[rig.receive_overload_guard]` receive overload protection
+
+```toml
+[rig.receive_overload_guard]
+enabled = true  # default false; restart required
+```
+
+This opt-in guard applies only to live FT8 receive audio with a connected rig.
+Omitting the table, using an empty table, or setting `enabled = false` disables
+both automatic ATT writes and the feature's capability probes. `enabled` must
+be a TOML boolean. Existing audio-level configuration is unchanged.
+
+Three consecutive eligible receive windows with raw 12 kHz sample peaks at or
+above -1 dBFS request one higher supported attenuator setting at the next safe
+receive capture boundary. The peak is measured before software gain. The normal
+0.25 to 0.28 full-scale reference is below the trigger. Three consecutive windows
+strictly below -6 dBFS cancel a pending step. A confirmed step requires three new
+hot windows before another step. Silence counts as cool audio; incomplete,
+nonfinite, stale, mixed-gain or TX-contaminated windows cannot advance a streak.
+Retunes, mode changes, audio gaps and reconnects clear pending work.
+While receiving, the guard reads the rig's PTT every 500 ms. A window in which
+the rig was keyed outside Pancetta (front-panel MOX or another CAT client) does
+not count as receive and discards earlier pending work, and a window with more
+than 2 s without an Off reading is invalid. A key shorter than about one poll
+interval can go unseen. If PTT cannot be read, the guard warns once and counts
+no receive windows until a read succeeds.
+
+The guard discovers discrete integer-dB ATT settings from Hamlib. It reads the
+current setting at execution time and selects the smallest supported setting
+above it. There is no model-specific fallback and no configurable step list.
+Discovery failure disables automatic attenuation for that connection. An already
+maximum setting produces a warning without a write. Replay, WAV input, no-audio
+and FT4/FT2 operation do not generate automatic changes.
+
+Gain changes reserve the radio before CAT I/O. All PTT-on paths refuse while a
+change is in progress or unconfirmed; PTT-off remains available. ATT changes
+require confirmed receive state, including acknowledgement of queued unkey
+commands. Missed capture boundaries are skipped. A command failure or mismatching
+readback stops automatic writes and inhibits TX until reconnection confirms PTT
+off and a stable ATT setting. Closing a timed-out socket cannot cancel a command
+the hardware already received.
+
+Diagnostics and headless logs use the target `rig.rx_overload`. A successful
+notice is emitted only after acknowledgement and matching readback, for example:
+
+```text
+Receive overload on 40m: peak -0.5 dBFS; attenuator increased from 0 dB to 6 dB.
+```
+
+Unavailable, maximum and failure warnings are retained in Diagnostics without
+per-window logging. The readiness blocker is `receive gain change is in progress
+or unconfirmed`. The guard never restores attenuation, even after cool audio,
+disabling the feature or restarting. The operator or a per-band preset owns
+resetting it. It does not change PREAMP, RF gain, AGC or audio output gain.
+
+Hardware qualification is pending, including FTdx10 supported-step discovery,
+ATT acknowledgement/readback, physical overload response, TX deferral and
+settling time. Container tests do not establish on-air qualification. Before
+station use, with TX disabled, compare discovered ATT steps with the rig manual
+and use a controlled source to check a three-window trip and cool-window hold.
+Use the station's approved procedure for any later on-air checks.
+
 ### `[rig.receive_gain_presets]` — per-band preamp and attenuator
 
 ```toml
@@ -231,6 +293,53 @@ Omitting this table or specifying an empty table means no presets. In layered
 configuration, a layer that mentions this table replaces the entire lower
 layer's map; an absent table keeps it. Both fields are required in each entry,
 and negative values fail validation at config load.
+
+### `[rig.power_control.protection]`: SWR protection
+
+```toml
+[rig.power_control.protection]
+swr_protection = true   # default true; needs CAT rig control ([rig.interface].enabled = true)
+max_swr = 3.0           # default 3.0; halt on any reading above this; must be a number above 1.0
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
+| `max_swr` | float | `3.0` | Trip when a reading is above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
+
+`[rig.power_control].enabled` (default false) controls rig power setting
+only. SWR protection does not depend on it.
+
+While the rig is keyed, pancetta reads its SWR meter every poll tick. One
+reading above `max_swr` halts the station the same way Shift+Q does. The
+readiness strip shows `■ RX ONLY` and an alert such as
+`⚠ High SWR 4.20:1 (limit 3:1): TX halted. Check the antenna, then press g to re-enable TX`,
+and Shift+D keeps an entry under `rig.swr`. To recover, fix the antenna,
+press `g` to re-enable TX and `a` to resume autonomous. With `--headless`
+there are no keys: the trip is logged at `error` (target `rig.swr`) and the
+station stays RX-only until pancetta restarts.
+
+A rig that cannot report SWR keeps transmitting; pancetta warns once and
+never blocks TX for it. The strip shows one of:
+
+- `⚠ SWR protection is unavailable on this rig (it does not report SWR over CAT)`
+  when the startup check finds the rig has no SWR reading over CAT.
+- `⚠ SWR protection is unavailable on this rig (no SWR reading during the last transmission)`
+  when a transmission of at least 2 s brought no valid reading.
+
+Headless, the same text is logged at `warn` (target `rig.swr`). Set
+`swr_protection = false` to silence it. With rig control off (mock rig) no
+such alert appears.
+
+Readings of 0, or anything else below 1.0, are ignored rather than treated
+as a perfect match. A bad `max_swr` stops config validation:
+
+```text
+Error: Invalid configuration value: power_control.protection.max_swr = 0.5 (must be a number above 1.0 while swr_protection = true)
+```
+
+Changes apply on restart. `max_power_watts`, `temperature_protection` and
+`max_temperature_c` in this table are not read by anything yet.
 
 ### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
 
@@ -977,6 +1086,10 @@ To revoke a suspect remote client step by step, see
 ## Pancetta data files
 
 All persistent state lives under `~/.pancetta/`.
+
+Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
+Automatic database backups do not cover configuration, the complete logbook or
+external keys. Preserve the whole stopped installation and data directory.
 
 ### QSO log files
 

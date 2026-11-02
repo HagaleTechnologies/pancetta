@@ -124,6 +124,9 @@ pub struct RigConfig {
     /// Timing and polling configuration
     pub timing: TimingConfig,
 
+    /// Opt-in automatic receive overload attenuation. Requires restart.
+    pub receive_overload_guard: ReceiveOverloadGuardConfig,
+
     /// Rig-specific parameters
     pub rig_parameters: RigParametersConfig,
 
@@ -145,6 +148,14 @@ pub struct RigConfig {
     /// An absent layer preserves lower-layer presets; an explicit map replaces them.
     #[serde(default)]
     pub receive_gain_presets: Option<HashMap<String, ReceiveGainPreset>>,
+}
+
+/// Automatic receive overload protection. Never restores attenuation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReceiveOverloadGuardConfig {
+    /// Enable live FT8 overload detection and rig-supported ATT steps.
+    pub enabled: bool,
 }
 
 /// CAT (Computer Aided Transceiver) interface configuration
@@ -674,10 +685,10 @@ pub struct PowerProtectionConfig {
     /// Maximum power limit (watts)
     pub max_power_watts: u16,
 
-    /// Enable SWR protection
+    /// Halt all TX on a high SWR reading while keyed (PAN-251). Needs CAT rig control.
     pub swr_protection: bool,
 
-    /// Maximum SWR threshold
+    /// Halt when a reading is above this. Must be finite and above 1.0 while swr_protection is on.
     pub max_swr: f32,
 
     /// Temperature protection
@@ -850,6 +861,7 @@ impl Default for RigConfig {
             power_control: PowerControlConfig::default(),
             modes: ModeConfig::default(),
             timing: TimingConfig::default(),
+            receive_overload_guard: ReceiveOverloadGuardConfig::default(),
             rig_parameters: RigParametersConfig::default(),
             custom_commands: HashMap::new(),
             bookmarks: None,
@@ -1132,6 +1144,21 @@ impl ConfigSection for RigConfig {
             });
         }
 
+        // PAN-251: SWR protection compares each reading with max_swr. NaN never
+        // trips, and a limit at or below 1.0:1 trips on every valid reading.
+        let protection = &self.power_control.protection;
+        if protection.swr_protection
+            && !(protection.max_swr.is_finite() && protection.max_swr > 1.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "power_control.protection.max_swr".to_string(),
+                value: format!(
+                    "{} (must be a number above 1.0 while swr_protection = true)",
+                    protection.max_swr
+                ),
+            });
+        }
+
         // Validate frequency limits
         if self.frequency.limits.min_frequency >= self.frequency.limits.max_frequency {
             return Err(ConfigError::InvalidValue {
@@ -1179,6 +1206,7 @@ impl ConfigSection for RigConfig {
         self.power_control.merge_with(other.power_control);
         self.modes.merge_with(other.modes);
         self.timing.merge_with(other.timing);
+        self.receive_overload_guard = other.receive_overload_guard;
         self.rig_parameters.merge_with(other.rig_parameters);
 
         // Merge custom commands
@@ -1281,6 +1309,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receive_overload_defaults_and_partial_tables() {
+        for source in [
+            "",
+            "[receive_overload_guard]",
+            "[receive_overload_guard]\nenabled = false",
+        ] {
+            let config: RigConfig = toml::from_str(source).unwrap();
+            assert!(!config.receive_overload_guard.enabled);
+            config.validate_section().unwrap();
+        }
+        let config: RigConfig = toml::from_str("[receive_overload_guard]\nenabled = true").unwrap();
+        assert!(config.receive_overload_guard.enabled);
+        let round_trip: RigConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(round_trip.receive_overload_guard.enabled);
+        assert!(
+            toml::from_str::<RigConfig>("[receive_overload_guard]\nenabled = \"yes\"").is_err()
+        );
+    }
+
+    #[test]
+    fn swr_protection_rejects_a_threshold_that_never_or_always_trips() {
+        for bad in [f32::NAN, f32::INFINITY, 1.0, 0.5, 0.0, -3.0] {
+            let mut cfg = RigConfig::default();
+            cfg.power_control.protection.max_swr = bad;
+            let err = cfg.validate_section().unwrap_err().to_string();
+            assert!(
+                err.contains("power_control.protection.max_swr"),
+                "{bad}: {err}"
+            );
+            assert!(err.contains("must be a number above 1.0"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn swr_protection_off_accepts_any_threshold_and_defaults_validate() {
+        assert!(RigConfig::default().validate_section().is_ok());
+        let mut cfg = RigConfig::default();
+        cfg.power_control.protection.swr_protection = false;
+        cfg.power_control.protection.max_swr = 0.5;
+        assert!(cfg.validate_section().is_ok());
+        cfg.power_control.protection.swr_protection = true;
+        cfg.power_control.protection.max_swr = 1.01;
+        assert!(cfg.validate_section().is_ok());
+    }
+
+    #[test]
+    fn partial_protection_table_keeps_swr_defaults() {
+        let cfg: RigConfig = toml::from_str("[power_control.protection]\nmax_swr = 2.0\n").unwrap();
+        assert!(cfg.power_control.protection.swr_protection);
+        assert_eq!(cfg.power_control.protection.max_swr, 2.0);
+    }
+
+    #[test]
     fn receive_gain_parse_validate_and_merge() {
         assert!(RigConfig::default().receive_gain_presets.is_none());
         let mut cfg: RigConfig = toml::from_str(
@@ -1349,6 +1430,19 @@ attenuator_db = 12
             toml::from_str::<RigConfig>("[receive_gain_presets.\"10m\"]\npreamp_db = 10\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn receive_overload_merge_carries_enable_and_disable() {
+        let mut base = RigConfig::default();
+        let enabled: RigConfig =
+            toml::from_str("[receive_overload_guard]\nenabled = true").unwrap();
+        base.merge_with(enabled);
+        assert!(base.receive_overload_guard.enabled);
+        let disabled: RigConfig =
+            toml::from_str("[receive_overload_guard]\nenabled = false").unwrap();
+        base.merge_with(disabled);
+        assert!(!base.receive_overload_guard.enabled);
     }
 
     #[test]

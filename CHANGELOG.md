@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Remote clients can no longer retune the rig while it transmits, or move a local or autonomous QSO; the client receives an error saying why (PAN-252).
+
+
 ### Removed
 
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
@@ -185,6 +189,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- A remote client's Stop CQ now stops the station calling CQ. It previously
+  did nothing (PAN-250).
+
+- SWR protection now works (PAN-251). `[rig.power_control.protection]
+  swr_protection` (on by default) and `max_swr` (default 3.0) were read by
+  nothing. A reading above the limit while transmitting now halts all TX
+  like Shift+Q and shows `⚠ High SWR …` on the readiness strip. A rig that
+  cannot report SWR shows `⚠ SWR protection is unavailable on this rig`. A
+  `max_swr` that is not a number above 1.0 now fails config validation
+  while protection is on.
+
+- The `ft8.desense` warning excludes our own transmit windows, uses a fresh
+  same-band baseline, and requires healthy reception before TX (PAN-212).
+  It no longer doubles as an unintended transmission heartbeat.
 
 - `pancetta import` fixes from the PAN-127 review (PAN-214). Tag-shaped
   text inside a value counted in characters (`<NOTES:9>€€€<X:1>z`) now stays
@@ -591,6 +610,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The rigctld client no longer reports SWR 1.0:1 for an unreadable meter,
+  and reads SWR once per poll instead of retrying three times.
+
 - The live station's FT8 decodes now down-weight the soft bits of any
   symbol whose total tone power jumps above 6 times the candidate's median,
   as a lightning-static crash does (hb-256's impulse-robust LLR knee,
@@ -696,6 +718,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local gateway: clients must now authenticate with the configured `[network.remote_gateway].auth_token` (sent as `hello.gatewayToken`) before receiving any station data; browser origins must be listed in `allowed_origins`, and a non-loopback `bind_addr` requires `allow_network_exposure = true`. Enabling the gateway now requires `auth_token` (PAN-99).
 - Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
 - Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
+- Station agent: `takeControl` now requires a currently-valid `qsy` or `tx` capability. A status-only viewer's request is refused and the current controller keeps control and stays armed (PAN-253).
 - Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
 - Network errors from the QRZ XML lookup and LoTW clients no longer carry account credentials or session keys into log lines or error messages (PAN-100).
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).

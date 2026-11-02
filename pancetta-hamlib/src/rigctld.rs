@@ -4,11 +4,14 @@
 //! that connects to rigctld (Hamlib's TCP daemon) for radio control.
 
 use crate::models::{Mode, Vfo};
-use crate::rig::{ConnectionState, PttState, RigControl, RigStatus};
+use crate::rig::{
+    ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigControl, RigStatus,
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{timeout, Duration};
@@ -70,6 +73,7 @@ struct RigctldConnection {
 pub struct RigctldClient {
     /// Configuration
     config: RigctldConfig,
+    generation: AtomicU64,
     /// Persistent connection (reader + writer)
     conn: Arc<Mutex<Option<RigctldConnection>>>,
     /// Internal state
@@ -81,6 +85,7 @@ impl RigctldClient {
     pub fn new(config: RigctldConfig) -> Self {
         Self {
             config,
+            generation: AtomicU64::new(0),
             conn: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(RigctldState {
                 connected: false,
@@ -102,6 +107,10 @@ impl RigctldClient {
 
     /// Send a command and get response
     async fn send_command(&self, command: &str) -> Result<String> {
+        self.send_command_inner(command, false).await
+    }
+
+    async fn send_command_inner(&self, command: &str, require_ack: bool) -> Result<String> {
         let mut conn_guard = self.conn.lock().await;
 
         if let Some(conn) = conn_guard.as_mut() {
@@ -127,6 +136,12 @@ impl RigctldClient {
                 }
                 Ok(Ok(_)) => {
                     response = response.trim().to_string();
+
+                    if require_ack && response != "RPRT 0" {
+                        return Err(anyhow!(
+                            "Missing successful rigctld acknowledgement: {response}"
+                        ));
+                    }
 
                     // Check for RPRT error/success codes
                     if response.starts_with("RPRT") {
@@ -196,6 +211,98 @@ impl RigctldClient {
         } else {
             Err(anyhow!("Not connected to rigctld"))
         }
+    }
+
+    // Keep the socket out of the shared slot while awaiting I/O. Cancellation
+    // drops it, so a delayed response cannot be consumed by a later operation.
+    async fn gain_request(
+        &self,
+        commands: &[String],
+        deadline: tokio::time::Instant,
+        extended: bool,
+    ) -> Result<Vec<String>> {
+        let mut guard = tokio::time::timeout_at(deadline, self.conn.lock())
+            .await
+            .map_err(|_| anyhow!("Gain transaction deadline expired waiting for transport"))?;
+        let mut conn = guard
+            .take()
+            .ok_or_else(|| anyhow!("Not connected to rigctld"))?;
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut replies = Vec::new();
+            for command in commands {
+                // No command is initiated at or beyond the absolute deadline.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!("Gain transaction deadline expired"));
+                }
+                conn.writer
+                    .write_all(format!("{command}\n").as_bytes())
+                    .await?;
+                conn.writer.flush().await?;
+                let mut response = String::new();
+                loop {
+                    let mut line = String::new();
+                    let bytes = conn.reader.read_line(&mut line).await?;
+                    if bytes == 0 || !line.ends_with('\n') {
+                        return Err(anyhow!("Incomplete rigctld gain response"));
+                    }
+                    let line = line.trim();
+                    if line.starts_with("RPRT") {
+                        if line != "RPRT 0" {
+                            return Err(anyhow!("Rigctld gain error: {line}"));
+                        }
+                        if !extended && command.starts_with("l ") {
+                            return Err(anyhow!("Missing integer gain readback"));
+                        }
+                        break;
+                    }
+                    if extended {
+                        response.push_str(line);
+                        response.push('\n');
+                        if response.len() > 131072 {
+                            return Err(anyhow!("Oversized rigctld capabilities response"));
+                        }
+                    } else if command.starts_with("l ") {
+                        let value = line
+                            .parse::<i32>()
+                            .map_err(|_| anyhow!("Invalid integer gain: {line}"))?;
+                        if !(0..=120).contains(&value) {
+                            return Err(anyhow!("Invalid gain range: {line}"));
+                        }
+                        response.push_str(line);
+                        break;
+                    } else {
+                        return Err(anyhow!("Missing gain command acknowledgement"));
+                    }
+                }
+                replies.push(response);
+            }
+            Ok(replies)
+        })
+        .await
+        .map_err(|_| anyhow!("Gain transaction timeout"))
+        .and_then(|value| value);
+        if result.is_ok() {
+            *guard = Some(conn);
+        } else {
+            self.state.write().await.connected = false;
+        }
+        result
+    }
+
+    /// One `+\dump_caps` transaction. A failure drops the link like any gain
+    /// transaction; the coordinator's poll loop redials it.
+    async fn dump_caps(&self) -> Result<String> {
+        let replies = self
+            .gain_request(
+                &["+\\dump_caps".to_owned()],
+                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
+                true,
+            )
+            .await?;
+        replies
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_caps reply"))
     }
 
     /// Read an additional line from the connection (for multi-line responses).
@@ -456,8 +563,174 @@ impl RigctldClient {
     }
 }
 
+// Positional protocol-1 prefix. Never infer ATT from arbitrary numeric lines.
+fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
+    if body.len() > 65536 || body.lines().count() > 2048 {
+        return Err(anyhow!("Oversize attenuator capabilities"));
+    }
+    let mut lines = body.lines().map(str::trim);
+    if lines.next() != Some("dump_state:") || lines.next() != Some("1") {
+        return Err(anyhow!("Unknown dump_state header or protocol"));
+    }
+    for _ in 0..2 {
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_state identity"))?
+            .parse::<i32>()?;
+    }
+    for width in [7, 7, 2, 2] {
+        loop {
+            let row = lines
+                .next()
+                .ok_or_else(|| anyhow!("Missing dump_state section terminator"))?;
+            let values: Vec<_> = row.split_whitespace().collect();
+            if values.len() != width {
+                return Err(anyhow!("Malformed dump_state section"));
+            }
+            let mut all_zero = true;
+            for value in values {
+                let number = if let Some(hex) = value.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16)? as f64
+                } else {
+                    value.parse::<f64>()?
+                };
+                if !number.is_finite() {
+                    return Err(anyhow!("Invalid dump_state section value"));
+                }
+                all_zero &= number == 0.0;
+            }
+            if all_zero {
+                break;
+            }
+        }
+    }
+    for _ in 0..4 {
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_state limit"))?
+            .parse::<i64>()?;
+    }
+    // Preamp is a separate list, never an ATT fallback.
+    let parse_list = |line: &str| -> Result<Vec<i32>> {
+        line.split_whitespace()
+            .map(|v| {
+                let db = v.parse::<i32>()?;
+                if db < 0 {
+                    return Err(anyhow!("Negative gain capability"));
+                }
+                Ok(db)
+            })
+            .collect()
+    };
+    parse_list(lines.next().ok_or_else(|| anyhow!("Missing preamp list"))?)?;
+    let mut steps = parse_list(
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing attenuator list"))?,
+    )?;
+    let mut masks = Vec::new();
+    for _ in 0..6 {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing operation mask"))?;
+        let hex = line
+            .strip_prefix("0x")
+            .ok_or_else(|| anyhow!("Malformed operation mask"))?;
+        masks.push(u64::from_str_radix(hex, 16)?);
+    }
+    if masks[2] & 2 == 0 || masks[3] & 2 == 0 || !steps.iter().any(|&v| v > 0) {
+        return Err(anyhow!("Attenuator get/set unsupported"));
+    }
+    // Optional protocol-1 key/value extensions precede the terminal response.
+    // Hamlib prints them, closed by a bare `done`, once any client ran chk_vfo.
+    let mut done = false;
+    loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("Missing terminal RPRT"))?;
+        if line == "RPRT 0" {
+            if lines.next().is_some() {
+                return Err(anyhow!("Trailing dump_state data"));
+            }
+            break;
+        }
+        if !done && line == "done" {
+            done = true;
+        } else if done || !line.contains('=') {
+            return Err(anyhow!("Invalid dump_state extension or terminal error"));
+        }
+    }
+    steps.push(0);
+    steps.sort_unstable();
+    steps.dedup();
+    Ok(steps)
+}
+
 #[async_trait]
 impl RigControl for RigctldClient {
+    async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        parse_gain_capabilities(&self.dump_caps().await?)
+    }
+
+    async fn reports_swr(&self) -> Result<bool> {
+        parse_reports_swr(&self.dump_caps().await?)
+    }
+
+    async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        let replies = self
+            .gain_request(
+                &["l PREAMP".to_owned(), "l ATT".to_owned()],
+                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
+                false,
+            )
+            .await?;
+        Ok(ReceiveGain {
+            preamp_db: replies[0].parse()?,
+            attenuator_db: replies[1].parse()?,
+        })
+    }
+
+    async fn set_receive_gain(
+        &self,
+        gain: ReceiveGain,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        if !(0..=120).contains(&gain.preamp_db) || !(0..=120).contains(&gain.attenuator_db) {
+            return Err(anyhow!("Receive gain outside integer dB range"));
+        }
+        let preamp = format!("L PREAMP {}", gain.preamp_db);
+        let attenuator = format!("L ATT {}", gain.attenuator_db);
+        // Remove the opposite gain first. Both controls are always written,
+        // including during restoration after a partially applied pair.
+        let writes = if gain.attenuator_db > 0 {
+            [preamp, attenuator]
+        } else {
+            [attenuator, preamp]
+        };
+        let replies = self
+            .gain_request(
+                &[
+                    writes[0].clone(),
+                    writes[1].clone(),
+                    "l PREAMP".to_owned(),
+                    "l ATT".to_owned(),
+                ],
+                deadline,
+                false,
+            )
+            .await?;
+        let actual = ReceiveGain {
+            preamp_db: replies[2].parse()?,
+            attenuator_db: replies[3].parse()?,
+        };
+        if actual != gain {
+            return Err(anyhow!(
+                "Receive-gain readback mismatch: requested {gain:?}, got {actual:?}"
+            ));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
         info!(
@@ -487,6 +760,7 @@ impl RigControl for RigctldClient {
                 // Update state
                 let mut state = self.state.write().await;
                 state.connected = true;
+                self.generation.fetch_add(1, Ordering::SeqCst);
 
                 info!("Successfully connected to rigctld");
 
@@ -546,7 +820,7 @@ impl RigControl for RigctldClient {
             ptt: Some(state.last_ptt),
             power_level: None,
             s_meter: Some(state.last_signal_strength),
-            swr: Some(1.0), // TODO: Get real SWR
+            swr: None, // PAN-251: read live with get_swr; never invented
             memory_channel: None,
             last_update: std::time::Instant::now(),
             last_error: None,
@@ -670,8 +944,11 @@ impl RigControl for RigctldClient {
         let response = self.send_command_with_retry(&cmd).await?;
 
         let ptt = match response.trim() {
+            "0" => PttState::Off,
             "1" => PttState::On,
-            _ => PttState::Off,
+            "2" => PttState::OnMic,
+            "3" => PttState::OnData,
+            _ => return Err(anyhow!("Invalid PTT response: {response}")),
         };
 
         // Update cached value
@@ -724,6 +1001,62 @@ impl RigControl for RigctldClient {
         Ok(vfo)
     }
 
+    fn connection_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        let response = self.send_command("\\get_level ATT").await?;
+        let db = response
+            .parse::<i32>()
+            .map_err(|_| anyhow!("Invalid integer attenuator response: {response}"))?;
+        if db < 0 {
+            return Err(anyhow!("Negative attenuator response"));
+        }
+        Ok(db)
+    }
+
+    async fn set_attenuator(&self, db: i32) -> Result<()> {
+        if db < 0 {
+            return Err(anyhow!("Attenuation must be nonnegative"));
+        }
+        // A gain change is never retried: a lost acknowledgement is ambiguous.
+        let response = self
+            .send_command_inner(&format!("\\set_level ATT {db}"), true)
+            .await?;
+        if !response.is_empty() {
+            return Err(anyhow!("Missing attenuator acknowledgement"));
+        }
+        Ok(())
+    }
+
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        timeout(Duration::from_secs(2), async {
+            let mut stream =
+                TcpStream::connect((self.config.host.as_str(), self.config.port)).await?;
+            stream.write_all(b"+\\dump_state\n").await?;
+            // Limit the read itself, including a peer that never sends a newline.
+            let mut reader = BufReader::new(stream.take(65537));
+            let mut body = String::new();
+            for _ in 0..2048 {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await? == 0 {
+                    return Err(anyhow!("Truncated attenuator capabilities"));
+                }
+                body.push_str(&line);
+                if body.len() > 65536 {
+                    return Err(anyhow!("Oversize attenuator capabilities"));
+                }
+                if line.trim().starts_with("RPRT") {
+                    return parse_attenuator_steps(&body);
+                }
+            }
+            Err(anyhow!("Too many attenuator capability lines"))
+        })
+        .await
+        .map_err(|_| anyhow!("Attenuator capability discovery timeout"))?
+    }
+
     async fn set_power_level(&self, watts: f32) -> Result<()> {
         // Convert watts to percentage (0.0 - 1.0)
         // Assuming 100W max for now (should be configurable)
@@ -765,38 +1098,18 @@ impl RigControl for RigctldClient {
         })
     }
 
-    async fn set_attenuator(&self, att_db: i32) -> Result<()> {
-        self.send_command_with_retry(&format!("\\set_level ATT {}", att_db))
-            .await?;
-        Ok(())
-    }
-
-    async fn get_attenuator(&self) -> Result<i32> {
-        let response = self.send_command_with_retry("\\get_level ATT").await?;
-        response.trim().parse::<i32>().map_err(|error| {
+    async fn get_swr(&self) -> Result<f32> {
+        // PAN-251: read once, without retry warnings. The coordinator samples
+        // every 500 ms while keyed and redials a dropped link itself. Never
+        // invent a reading: an unparseable reply is an error, not 1.0:1.
+        let response = self.send_command("\\get_level SWR").await?;
+        response.trim().parse::<f32>().map_err(|e| {
             anyhow!(
-                "rigctld: could not parse ATT from '{}': {}",
+                "rigctld: could not parse SWR from '{}': {}",
                 response.trim(),
-                error
+                e
             )
         })
-    }
-
-    async fn get_swr(&self) -> Result<f32> {
-        // Get SWR reading
-        let response = self.send_command_with_retry("\\get_level SWR").await?;
-
-        // Parse as SWR value. 1.0 is a perfect-match fallback that masks
-        // a real high-SWR reading; warn so this is visible in logs.
-        let swr = response.trim().parse::<f32>().unwrap_or_else(|_| {
-            tracing::warn!(
-                "rigctld: could not parse SWR from '{}', using 1.0",
-                response.trim()
-            );
-            1.0
-        });
-
-        Ok(swr)
     }
 
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()> {
@@ -870,6 +1183,58 @@ impl RigControl for RigctldClient {
             .await?;
         Ok(())
     }
+}
+
+// Hamlib dumpcaps.c emits dB-suffixed integer steps and named level lists.
+// Unknown or malformed formats fail closed rather than guessing model values.
+fn parse_gain_capabilities(response: &str) -> Result<ReceiveGainCapabilities> {
+    fn field<'a>(response: &'a str, name: &str) -> Result<&'a str> {
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or_else(|| anyhow!("Missing gain capability field {name}"))
+    }
+    for name in ["Get level:", "Set level:"] {
+        let levels = field(response, name)?;
+        if !["PREAMP", "ATT"].iter().all(|level| {
+            levels
+                .split_whitespace()
+                .any(|token| token.split('(').next() == Some(*level))
+        }) {
+            return Err(anyhow!("Backend cannot read and set PREAMP and ATT"));
+        }
+    }
+    fn steps(value: &str) -> Result<Vec<i32>> {
+        let mut result = vec![0];
+        for token in value.split_whitespace() {
+            if token == "None" {
+                continue;
+            }
+            let number = token.strip_suffix("dB").unwrap_or(token).parse::<i32>()?;
+            if !(0..=120).contains(&number) {
+                return Err(anyhow!("Invalid gain step"));
+            }
+            result.push(number);
+        }
+        result.sort_unstable();
+        result.dedup();
+        Ok(result)
+    }
+    Ok(ReceiveGainCapabilities {
+        preamp_db: steps(field(response, "Preamp:")?)?,
+        attenuator_db: steps(field(response, "Attenuator:")?)?,
+    })
+}
+
+/// `true` when Hamlib's dump_caps `Get level:` list names SWR.
+fn parse_reports_swr(response: &str) -> Result<bool> {
+    let levels = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Get level:"))
+        .ok_or_else(|| anyhow!("Missing Get level capability field"))?;
+    Ok(levels
+        .split_whitespace()
+        .any(|token| token.split('(').next() == Some("SWR")))
 }
 
 #[cfg(test)]
@@ -986,7 +1351,7 @@ mod split_tests {
 mod split_read_tests {
     use super::*;
 
-    async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
+    pub(super) async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -1132,6 +1497,521 @@ mod split_read_tests {
         );
         for response in ["abc", "", "0", "-1"] {
             assert!(RigctldClient::parse_split_freq_response(response).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod attenuator_tests {
+    use super::*;
+
+    // Protocol shape checked against Hamlib tests/rigctl_parse.c dump_state,
+    // protocol 1, and include/hamlib/rig.h RIG_LEVEL_ATT bit 1 (2026-10-30).
+    const STATE: &str = "dump_state:\n1\n1\n0\n1800000 30000000 0x4 -1 -1 0x1 0x1\n0 0 0 0 0 0 0\n0 0 0 0 0 0 0\n0x4 1\n0 0\n0x4 2400\n0 0\n0\n0\n0\n0\n10 20\n20 10 10\n0x0\n0x0\n0x2\n0x2\n0x0\n0x0\nRPRT 0\n";
+
+    #[test]
+    fn supported_attenuator_protocol_one() {
+        assert_eq!(parse_attenuator_steps(STATE).unwrap(), vec![0, 10, 20]);
+    }
+
+    /// After any Hamlib client ran `chk_vfo`, upstream dump_state appends a
+    /// key/value block closed by a bare `done` line (tests/rigctl_parse.c).
+    #[test]
+    fn accepts_the_extended_block_closed_by_done() {
+        let extended = STATE.replace(
+            "RPRT 0\n",
+            "vfo_ops=0x0\nptt_type=0x1\nrigctld_version=Hamlib 4.6\nlevel_gran=0=0,1,0;\nparm_gran=\nrig_model=1\nhamlib_version=Hamlib 4.6\ndone\nRPRT 0\n",
+        );
+        assert_eq!(parse_attenuator_steps(&extended).unwrap(), vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn done_must_be_the_last_line_before_the_terminal_response() {
+        for invalid in [
+            STATE.replace("RPRT 0\n", "done\nrig_model=1\nRPRT 0\n"),
+            STATE.replace("RPRT 0\n", "done\ndone\nRPRT 0\n"),
+            STATE.replace("RPRT 0\n", "done\n"),
+            STATE.replace("RPRT 0\n", "done\nRPRT -11\n"),
+        ] {
+            assert!(parse_attenuator_steps(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_capabilities() {
+        for invalid in [
+            STATE.replacen("\n1\n", "\n2\n", 1),
+            STATE.replace("0x2", "0x0"),
+            STATE.replace("20 10 10", ""),
+            STATE.replace("20 10 10", "-6 10"),
+            STATE.replacen("0 0 0 0 0 0 0", "0 0", 1),
+            STATE.replace("RPRT 0", "RPRT -11"),
+            STATE.replace("RPRT 0\n", ""),
+            STATE.replace("0x2", "garbage"),
+            "x".repeat(65537),
+        ] {
+            assert!(parse_attenuator_steps(&invalid).is_err(), "{invalid}");
+        }
+        assert!(!RigctldClient::raw_command_allowed("+\\dump_state"));
+        assert!(!RigctldClient::raw_command_allowed("\\dump_state"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attenuator_integer_commands_and_readback() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in [
+                ("\\set_level ATT 10\n", "RPRT 0\n"),
+                ("\\get_level ATT\n", "10\n"),
+                ("\\set_level ATT 20\n", "RPRT -11\n"),
+                ("\\get_level ATT\n", "-1\n"),
+                ("\\get_level ATT\n", "1.0\n"),
+                ("\\set_level ATT 10\n", "\n"),
+                ("\\set_level ATT 10\n", "RPRT 0 garbage\n"),
+            ] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command, expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        assert!(client.set_attenuator(-1).await.is_err());
+        client.set_attenuator(10).await.unwrap();
+        assert_eq!(client.get_attenuator().await.unwrap(), 10);
+        assert!(client.set_attenuator(20).await.is_err());
+        assert!(client.get_attenuator().await.is_err());
+        assert!(client.get_attenuator().await.is_err());
+        assert!(client.set_attenuator(10).await.is_err());
+        assert!(client.set_attenuator(10).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ptt_readback_never_treats_transmitting_or_malformed_states_as_off() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for reply in ["0\n", "1\n", "2\n", "3\n", "garbage\n", "RPRT 0\n"] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert!(command.starts_with("\\get_ptt "));
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        for expected in [
+            PttState::Off,
+            PttState::On,
+            PttState::OnMic,
+            PttState::OnData,
+        ] {
+            assert_eq!(client.get_ptt(Vfo::Current).await.unwrap(), expected);
+        }
+        assert!(client.get_ptt(Vfo::Current).await.is_err());
+        assert!(client.get_ptt(Vfo::Current).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_uses_separate_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "+\\dump_state\n");
+            writer.write_all(STATE.as_bytes()).await.unwrap();
+        });
+        assert_eq!(
+            client.supported_attenuator_steps().await.unwrap(),
+            vec![0, 10, 20]
+        );
+        assert!(client.conn.lock().await.is_none());
+        server.await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_rejects_truncation_oversize_and_timeout() {
+        for body in [
+            Some(STATE.replace("RPRT 0\n", "")),
+            Some("x".repeat(65537)),
+            Some("\n".repeat(2049)),
+            None,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = RigctldClient::new(RigctldConfig {
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            });
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                if let Some(body) = body {
+                    let _ = writer.write_all(body.as_bytes()).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(2100)).await;
+                }
+            });
+            assert!(client.supported_attenuator_steps().await.is_err());
+            assert!(client.conn.lock().await.is_none());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attenuator_timeout_disconnects_without_retry() {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "\\set_level ATT 10\n");
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        });
+        assert!(client.set_attenuator(10).await.is_err());
+        assert!(client.conn.lock().await.is_none());
+        assert!(!client.state.read().await.connected);
+        server_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod swr_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fake rigctld: answers every `\get_level SWR` with `reply` and counts
+    /// those requests until the client hangs up. Any other command fails the
+    /// test.
+    async fn swr_fixture(
+        reply: &'static str,
+    ) -> (
+        Arc<RigctldClient>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                assert_eq!(command, "\\get_level SWR\n");
+                counted.fetch_add(1, Ordering::SeqCst);
+                if writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (client, requests, task)
+    }
+
+    /// Hang up, let the fake server drain, and return how many SWR reads it saw.
+    async fn requests_after_hangup(
+        client: Arc<RigctldClient>,
+        requests: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> usize {
+        drop(client);
+        task.await.unwrap();
+        requests.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_returns_a_numeric_reply_unchanged() {
+        let (client, requests, task) = swr_fixture("4.2").await;
+        assert_eq!(client.get_swr().await.unwrap(), 4.2);
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_returns_zero_as_read() {
+        let (client, requests, task) = swr_fixture("0.000000").await;
+        assert_eq!(client.get_swr().await.unwrap(), 0.0);
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_unparseable_reply_is_an_error_not_a_perfect_match() {
+        for reply in ["N/A", ""] {
+            let (client, requests, task) = swr_fixture(reply).await;
+            let result = client.get_swr().await;
+            assert!(result.is_err(), "{reply:?} must not read as {result:?}");
+            assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_rprt_error_is_read_once() {
+        let (client, requests, task) = swr_fixture("RPRT -11").await;
+        assert!(client.get_swr().await.is_err());
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_status_does_not_invent_swr() {
+        let (client, requests, task) = swr_fixture("1.0").await;
+        assert_eq!(client.get_status().await.unwrap().swr, None);
+        // get_status reports cached state only; it sends nothing to the rig.
+        assert_eq!(requests_after_hangup(client, requests, task).await, 0);
+    }
+
+    #[test]
+    fn parse_reports_swr_reads_the_get_level_line() {
+        for (response, expected) in [
+            (
+                "Get level: PREAMP(0..0/0) ATT(0..0/0) SWR(0..0/0) ALC(0..1/0)\n",
+                true,
+            ),
+            // Older Hamlib lists bare level names.
+            ("Get level: PREAMP ATT SWR STRENGTH\n", true),
+            (
+                "Get level: PREAMP(0..0/0) ATT(0..0/0) STRENGTH(-54..50/1)\n",
+                false,
+            ),
+            // Exact token match: SWRX is not SWR.
+            ("Get level: SWRX(0..0/0)\n", false),
+        ] {
+            assert_eq!(parse_reports_swr(response).unwrap(), expected, "{response}");
+        }
+        assert!(parse_reports_swr("dump_caps:\nSet level: SWR(0..0/0)\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod receive_gain_tests {
+    use super::*;
+
+    async fn fixture(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (RigctldClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let client = RigctldClient::default();
+        let (reader, writer) = tokio::io::split(stream);
+        *client.conn.lock().await = Some(RigctldConnection {
+            reader: BufReader::new(reader),
+            writer,
+        });
+        let task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in script {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command.trim(), expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (client, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_capabilities_read_complete_extended_reply() {
+        let (client, task) = fixture(vec![("+\\dump_caps", "dump_caps:\nPreamp: 10dB 20dB\nAttenuator: 6dB 12dB\nGet level: PREAMP(0..0/0) ATT(0..0/0) STRENGTH(-54..50/1)\nSet level: PREAMP(0..0/0) ATT(0..0/0)\nRPRT 0\n"), ("l PREAMP", "10\n"), ("l ATT", "0\n")]).await;
+        let caps = client.receive_gain_capabilities().await.unwrap();
+        assert_eq!(caps.preamp_db, vec![0, 10, 20]);
+        assert_eq!(caps.attenuator_db, vec![0, 6, 12]);
+        assert_eq!(client.get_receive_gain().await.unwrap().preamp_db, 10);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_swr_round_trips_dump_caps() {
+        let (client, task) = fixture(vec![(
+            "+\\dump_caps",
+            "dump_caps:\nGet level: PREAMP(0..0/0) SWR(0..0/0)\nSet level: PREAMP(0..0/0)\nRPRT 0\n",
+        )])
+        .await;
+        assert!(client.reports_swr().await.unwrap());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_pair_disables_other_control_and_confirms_readback() {
+        let (client, task) = fixture(vec![
+            ("L PREAMP 0", "RPRT 0\n"),
+            ("L ATT 6", "RPRT 0\n"),
+            ("l PREAMP", "0\n"),
+            ("l ATT", "6\n"),
+        ])
+        .await;
+        client
+            .set_receive_gain(
+                crate::ReceiveGain {
+                    preamp_db: 0,
+                    attenuator_db: 6,
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_readback_mismatch_never_succeeds() {
+        let (client, task) = fixture(vec![
+            ("L ATT 0", "RPRT 0\n"),
+            ("L PREAMP 10", "RPRT 0\n"),
+            ("l PREAMP", "0\n"),
+            ("l ATT", "0\n"),
+        ])
+        .await;
+        assert!(client
+            .set_receive_gain(
+                crate::ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_invalid_integer_discards_connection() {
+        let (client, task) = fixture(vec![("l PREAMP", "10.5\n")]).await;
+        assert!(client.get_receive_gain().await.is_err());
+        assert!(client.conn.lock().await.is_none());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_partial_reply_and_error_discard_connection() {
+        for reply in ["RPRT -11\n", "10"] {
+            let (client, task) = fixture(vec![("l PREAMP", reply)]).await;
+            assert!(client.get_receive_gain().await.is_err());
+            assert!(client.conn.lock().await.is_none());
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_partial_pair_still_restores_both_original_controls() {
+        let (client, task) =
+            fixture(vec![("L ATT 0", "RPRT 0\n"), ("L PREAMP 20", "RPRT -1\n")]).await;
+        assert!(client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 20,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        task.await.unwrap();
+        // A failed transport is discarded; reconnect supplies a fresh stream.
+        let (restored_client, restore_task) = fixture(vec![
+            ("L ATT 0", "RPRT 0\n"),
+            ("L PREAMP 10", "RPRT 0\n"),
+            ("l PREAMP", "10\n"),
+            ("l ATT", "0\n"),
+        ])
+        .await;
+        *client.conn.lock().await = restored_client.conn.lock().await.take();
+        client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        restore_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_deadline_and_cancellation_discard_pending_reply() {
+        for cancel in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let client = RigctldClient::default();
+            let (reader, writer) = tokio::io::split(stream);
+            *client.conn.lock().await = Some(RigctldConnection {
+                reader: BufReader::new(reader),
+                writer,
+            });
+            let mut server = BufReader::new(server);
+            let transaction = client.set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+                tokio::time::Instant::now() + Duration::from_millis(30),
+            );
+            if cancel {
+                tokio::pin!(transaction);
+                let mut command = String::new();
+                tokio::select! {
+                    _ = &mut transaction => panic!("server has not acknowledged"),
+                    _ = server.read_line(&mut command) => assert_eq!(command, "L ATT 0\n"),
+                }
+            } else {
+                assert!(transaction.await.is_err());
+            }
+            // In either case an unfinished protocol exchange is quarantined.
+            assert!(client.conn.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gain_expired_deadline_never_writes() {
+        let (client, mut server) = split_read_tests::connected_client().await;
+        assert!(client
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 10,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err());
+        let mut byte = [0];
+        use tokio::io::AsyncReadExt;
+        let read = timeout(Duration::from_millis(20), server.read(&mut byte)).await;
+        assert!(read.is_err() || matches!(read, Ok(Ok(0))));
+    }
+
+    #[test]
+    fn gain_capabilities_fail_closed() {
+        for text in [
+            "",
+            "Preamp: 10dB\nAttenuator: 6dB\n",
+            "Preamp: bogus\nAttenuator: 6dB\nGet level: PREAMP ATT\nSet level: PREAMP ATT\n",
+        ] {
+            assert!(parse_gain_capabilities(text).is_err());
         }
     }
 }

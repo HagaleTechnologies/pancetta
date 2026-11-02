@@ -310,11 +310,9 @@ pub enum MessageType {
         timestamp: chrono::DateTime<chrono::Utc>,
     },
 
-    /// TX-policy state echo for the TUI banner. Sent by the coordinator's
-    /// command relay whenever the operator changes the global TX policy
-    /// (cycle key) or triggers an emergency stop (Shift+Q → Disabled).
-    /// The TUI mirrors this into its bold, color-coded TX banner.
-    /// Observation only.
+    /// TX-policy state echo for the TUI banner. Sent by the Hamlib poll
+    /// loop's SWR trip (PAN-251) when it sets the policy to Disabled. The
+    /// TUI relay mirrors it into the TX banner. Observation only.
     TxPolicyStatus {
         /// Current global TX policy.
         policy: pancetta_core::TxPolicy,
@@ -1554,6 +1552,11 @@ impl DurableInbox {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    pub(crate) receive_gain: Arc<crate::coordinator::receive_overload::GainSafety>,
+    /// Atomic receive-gain transition and pending key-down reservation (PAN-244).
+    pub(crate) gain_tx_intents: Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) gain_tx_epoch: Arc<AtomicU64>,
+    pub(crate) gain_tx_gate: Arc<std::sync::atomic::AtomicU64>,
     /// Shared only by split-command producers and the split poll. PTT routing
     /// never takes this lock (PAN-202).
     pub(crate) split_observation_fence: Arc<SplitObservationFence>,
@@ -1589,6 +1592,10 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
+            gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gain_tx_epoch: Arc::new(AtomicU64::new(0)),
+            gain_tx_intents: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
@@ -1605,6 +1612,10 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
+            gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gain_tx_epoch: Arc::new(AtomicU64::new(0)),
+            gain_tx_intents: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),

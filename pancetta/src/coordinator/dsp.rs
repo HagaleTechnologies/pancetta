@@ -641,6 +641,8 @@ impl super::ApplicationCoordinator {
         info!("Starting DSP component");
 
         let shutdown = self.shutdown_signal.clone();
+        let sweep_capture = self.sweep_capture.clone();
+        let gain_tx_epoch = self.message_bus.gain_tx_epoch.clone();
         let message_count = self.message_count.clone();
         // Current rig dial frequency (Hz), updated by hamlib FrequencyResponse.
         // Read per-window so recordings can be band-stamped. 0 = unknown
@@ -653,6 +655,12 @@ impl super::ApplicationCoordinator {
         let active_protocol_mode = self.active_protocol_mode();
 
         let config = self.config.read().await;
+        let overload_enabled =
+            config.rig.receive_overload_guard.enabled && !self.no_audio && !self.replay_mode();
+        let overload_tx = self.overload_measurements.0.clone();
+        let overload_connection = self.overload_connection.clone();
+        let overload_capture_epoch = self.overload_capture_epoch.clone();
+        let gain_safety = self.message_bus.receive_gain.clone();
         let input_rate = config.audio.sample_rate;
         let _input_channels = config.audio.input_channels as u16;
         // Derive the active protocol's DSP timing once at startup. mode=FT8
@@ -716,6 +724,13 @@ impl super::ApplicationCoordinator {
             let mut ft8_buffer: Vec<f32> = Vec::with_capacity(ft8_window_samples * 2);
             let mut window_count: u64 = 0;
             let mut batch_count: u64 = 0;
+            let mut overload_valid_since = chrono::Utc::now().timestamp_millis();
+            let mut overload_last_batch = std::time::Instant::now();
+            let mut overload_last_dial = 0;
+            let mut overload_last_mode = seed_mode_u8;
+            let mut overload_last_connection = 0;
+            let mut overload_seen_capture_epoch = 0;
+
             let _waiting_for_boundary = true;
 
             // Dial-change guard (PAN-70): the last nonzero dial reading, i.e.
@@ -780,9 +795,18 @@ impl super::ApplicationCoordinator {
                 next_window_time.format("%H:%M:%S")
             );
 
+            let mut last_audio_batch = std::time::Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(samples) => {
+                        if audio_rx.len() > 1
+                            || last_audio_batch.elapsed() > std::time::Duration::from_millis(250)
+                        {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("missing audio or delayed DSP capture");
+                            }
+                        }
+                        last_audio_batch = std::time::Instant::now();
                         // Do not build the first new-band window from audio captured
                         // before both gain levels finished. Drain queued batches too.
                         if super::hamlib::gain_capture_changed(
@@ -796,6 +820,30 @@ impl super::ApplicationCoordinator {
                         }
                         message_count.fetch_add(1, Ordering::Relaxed);
                         batch_count += 1;
+                        if overload_enabled {
+                            let dial = operating_frequency_hz.load(Ordering::Acquire);
+                            let mode = active_protocol_mode.load(Ordering::Acquire);
+                            let connection = overload_connection.load(Ordering::Acquire);
+                            if overload_capture_epoch.load(Ordering::Acquire)
+                                != overload_seen_capture_epoch
+                            {
+                                overload_valid_since = chrono::Utc::now().timestamp_millis();
+                            }
+                            if overload_last_batch.elapsed() > std::time::Duration::from_millis(500)
+                                || dial != overload_last_dial
+                                || mode != overload_last_mode
+                                || connection != overload_last_connection
+                            {
+                                overload_valid_since = chrono::Utc::now().timestamp_millis();
+                                overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
+                            }
+                            overload_last_dial = dial;
+                            overload_last_mode = mode;
+                            overload_last_connection = connection;
+                            overload_last_batch = std::time::Instant::now();
+                            overload_seen_capture_epoch =
+                                overload_capture_epoch.load(Ordering::Acquire);
+                        }
 
                         // Extract left channel from interleaved stereo.
                         // cpal delivers interleaved [L, R, L, R, ...] where
@@ -849,6 +897,9 @@ impl super::ApplicationCoordinator {
                             &mut last_live_wf_samples,
                             &mut bin_history,
                         ) {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("dial changed during capture");
+                            }
                             if flush.band_changed {
                                 info!(
                                     target: "operator.override",
@@ -876,6 +927,9 @@ impl super::ApplicationCoordinator {
                         // immediately above.
                         let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
                         if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("mode changed during capture");
+                            }
                             let new_protocol = super::protocol_from_mode(
                                 pancetta_config::OperatingMode::from_u8(cur_mode_u8),
                             );
@@ -1024,6 +1078,13 @@ impl super::ApplicationCoordinator {
                             dsp_slot_ns,
                         );
                         if let Some(jump) = jump {
+                            if overload_enabled {
+                                overload_valid_since = now.timestamp_millis();
+                                overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
+                            }
+                            if let Ok(mut registry) = sweep_capture.lock() {
+                                registry.invalidate_all("clock discontinuity during capture");
+                            }
                             next_window_time = reanchored;
                             if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
                             {
@@ -1053,6 +1114,44 @@ impl super::ApplicationCoordinator {
                                 window_lead_secs,
                             );
                             let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
+                            if overload_enabled {
+                                use super::receive_overload::{
+                                    raw_peak_dbfs, Identity, Measurement, WindowValidity,
+                                };
+                                let capture_start = slot_boundary.timestamp_millis()
+                                    - (window_lead_secs * 1000.0) as i64;
+                                let full_len = ((now.timestamp_millis() - capture_start) as f64
+                                    * 12.0)
+                                    .round()
+                                    as usize;
+                                let valid = cached_mode_u8
+                                    == pancetta_config::OperatingMode::Ft8.as_u8()
+                                    && cur_dial_hz != 0
+                                    && overload_valid_since <= capture_start
+                                    && send_len + 12 >= full_len;
+                                let validity = if !valid {
+                                    WindowValidity::Invalid
+                                } else {
+                                    gain_safety
+                                        .window_validity(capture_start, now.timestamp_millis())
+                                };
+                                let measurement = Measurement {
+                                    slot: slot_boundary.timestamp().div_euclid(15),
+                                    identity: Identity {
+                                        dial_hz: cur_dial_hz,
+                                        connection_generation: overload_connection
+                                            .load(Ordering::Acquire),
+                                        gain_epoch: gain_safety.epoch(),
+                                        capture_epoch: overload_capture_epoch
+                                            .load(Ordering::Acquire),
+                                    },
+                                    peak_dbfs: raw_peak_dbfs(&window),
+                                    validity,
+                                };
+                                if overload_tx.try_send(measurement).is_err() {
+                                    overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
+                                }
+                            }
                             // Keep overlap for next window — retain enough for the
                             // full cycle's ideal window at the next boundary
                             let keep = ideal_samples;
@@ -1088,6 +1187,15 @@ impl super::ApplicationCoordinator {
                                 recorder.write_window(&window, &now, dial_hz);
                             }
 
+                            let sweep = sweep_capture.lock().ok().and_then(|mut registry| {
+                                registry.claim(
+                                    slot_boundary,
+                                    cur_dial_hz,
+                                    window_lead_secs,
+                                    gain_tx_epoch.load(Ordering::Acquire),
+                                )
+                            });
+                            let sweep_metadata = sweep.as_ref().map(|s| s.metadata.clone());
                             match super::pipeline::forward_or_drop(
                                 &dsp_to_ft8_tx,
                                 super::pipeline::DecodeWindow {
@@ -1100,11 +1208,20 @@ impl super::ApplicationCoordinator {
                                     // was appended while the DSP read a different
                                     // known dial. 0 still means unknown.
                                     dial_hz: cur_dial_hz,
+                                    sweep,
                                 },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
                             ) {
                                 super::pipeline::ForwardOutcome::Sent => {}
                                 super::pipeline::ForwardOutcome::Dropped => {
+                                    if let Some(metadata) = &sweep_metadata {
+                                        if let Ok(mut registry) = sweep_capture.lock() {
+                                            registry.invalidate(
+                                                metadata,
+                                                "decode pipeline backpressure",
+                                            );
+                                        }
+                                    }
                                     // A restarted/slow decoder must not wedge the DSP stage:
                                     // bounded backpressure intentionally sacrifices this slot,
                                     // then the next slot is still eligible for decoding.
@@ -1112,7 +1229,17 @@ impl super::ApplicationCoordinator {
                                         "DSP: FT8 stage not draining -- dropped one decode window"
                                     );
                                 }
-                                super::pipeline::ForwardOutcome::Disconnected => return Ok(()),
+                                super::pipeline::ForwardOutcome::Disconnected => {
+                                    if let Some(metadata) = &sweep_metadata {
+                                        if let Ok(mut registry) = sweep_capture.lock() {
+                                            registry.invalidate(
+                                                metadata,
+                                                "decode pipeline disconnected",
+                                            );
+                                        }
+                                    }
+                                    return Ok(());
+                                }
                             }
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
@@ -1125,7 +1252,14 @@ impl super::ApplicationCoordinator {
                             );
                         }
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if overload_enabled
+                            && overload_last_batch.elapsed() > std::time::Duration::from_millis(500)
+                        {
+                            overload_valid_since = chrono::Utc::now().timestamp_millis();
+                            overload_capture_epoch.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         info!(
                             "DSP: audio channel disconnected after {} batches",
@@ -1628,6 +1762,7 @@ mod dial_change_signal_tests {
             let window = DecodeWindow {
                 samples: self.ft8_buffer[start..start + len].to_vec(),
                 dial_hz: cur_dial_hz,
+                sweep: None,
             };
             if self.ft8_buffer.len() > timing.overlap_samples {
                 let excess = self.ft8_buffer.len() - timing.overlap_samples;

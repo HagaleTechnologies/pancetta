@@ -25,11 +25,14 @@
 //!   published, and is evicted from the demux (transport dropped, hello token
 //!   deny-listed) on the session's next tick; a newly listed peer may connect
 //!   without a reconnect.
-//! - **Controller model — one controller at a time, free grab:** at most one
+//! - **Controller model — one controller at a time, scoped grab:** at most one
 //!   established peer holds `controller` (arm/QSY/split/TX-initiation)
 //!   at a time; every other connected peer is a live read-only viewer.
-//!   `takeControl` from any admitted peer always succeeds (single-operator
-//!   assumption) — if it displaces a different controller whose arm is live,
+//!   `takeControl` succeeds for any admitted peer holding a currently-valid
+//!   `qsy`-or-higher hello capability (single-operator assumption); from a
+//!   status-only or unauthorized peer it is refused (`warn!`, no frame) and
+//!   changes nothing (PAN-253). If an authorized takeover displaces a
+//!   different controller whose arm is live,
 //!   that arm is **disarmed first** (audited); arms never transfer, the new
 //!   controller must arm fresh through the full capabilityToken + clientSig
 //!   grant. `releaseControl` from the current controller clears it (and
@@ -136,6 +139,22 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// also service future per-tick work (Task 6's read-stream drain).
 const RECV_TICK: Duration = Duration::from_millis(200);
 
+/// Live station state refreshed across QSO-component restarts.
+struct StationActivity {
+    ptt_active: Arc<std::sync::atomic::AtomicBool>,
+    qso_manager: tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+}
+
+#[cfg(test)]
+impl StationActivity {
+    fn idle() -> Self {
+        Self {
+            ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qso_manager: tokio::sync::watch::channel(None).1,
+        }
+    }
+}
+
 /// Everything the dispatch loop needs to act on a decrypted control action:
 /// the shared arm, the capability verifier, the client's device verifying key,
 /// the station-local TX-allow-list, the session replay set, and the audit log.
@@ -143,6 +162,7 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 /// Held on the blocking session task; the arm is the coordinator's shared
 /// `remote_tx_arm`, so arming here is visible to the TX worker immediately.
 struct ArmContext {
+    station_activity: StationActivity,
     arm: Arc<Mutex<ArmState>>,
     /// The coordinator's shared split-TX dial (0 = simplex) — the source the
     /// TX band-plan gate (`tx::tx_rf_for_gate`) and the QSO RF stamp read. A
@@ -851,6 +871,44 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
     }
 }
 
+async fn remote_qsy_refusal(ctx: &ArmContext, bus: &MessageBus) -> Option<&'static str> {
+    // `ptt_active` is the TX worker's flag. Manual PTT and tune key through
+    // `tx::send_ptt_command`, which sets bit 1 of `gain_tx_gate` once a key-down
+    // is enqueued; Hamlib clears it on an acknowledged bus PTT-off. Bits 2+
+    // count key-downs mid-enqueue. Bit 0 is the receive-gain transition.
+    if ctx.station_activity.ptt_active.load(Ordering::Acquire)
+        || bus.gain_tx_gate.load(Ordering::Acquire) & !1 != 0
+    {
+        return Some("the rig is transmitting");
+    }
+    // Drop watch::Ref before awaiting the manager, allowing restart publication.
+    let manager = ctx.station_activity.qso_manager.borrow().clone();
+    if let Some(manager) = manager {
+        if manager
+            .get_active_qsos()
+            .await
+            .iter()
+            .any(|(_, qso)| qso.metadata.remote_client_key_id.is_none())
+        {
+            return Some("the station is running a local or autonomous QSO");
+        }
+    }
+    None
+}
+
+fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
+    warn!(target: "agent.control", peer = %peer, reason, command, "remote frequency change refused");
+    DispatchOutcome::cont_with(vec![PeerSend {
+        to: SendTarget::One(peer.to_string()),
+        frame: pancetta_protocol::ServerFrame::Event {
+            event: pancetta_protocol::ServerEvent::Error {
+                component: "stationAgent".into(),
+                message: format!("{command} refused — {reason}"),
+            },
+        },
+    }])
+}
+
 /// Dispatch one decrypted control action against the arm + coordinator bus.
 ///
 /// Pure with respect to timing (takes an [`ArmTime`] sample); side effects are the arm
@@ -886,9 +944,17 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
 ///   TransmitRequest the QSO emits is `TxOrigin::Remote` and dropped by the
 ///   armed-TX gate unless armed. This
 ///   arm never keys TX directly (no bypass).
-/// - `TakeControl` moves control, disarms a displaced controller and owes the
+/// - `TakeControl` → refused (logged, no frame, no state change) unless the
+///   peer holds a currently-valid `qsy`-or-higher hello capability (PAN-253);
+///   otherwise moves control, disarms a displaced controller and owes the
 ///   PAN-137 QSO cleanup. `ReleaseControl` disarms and releases control.
-/// - `StopCq` / `Unsupported` are otherwise logged no-ops in v1.
+/// - `StopCq` is refused (logged, no frame, no state change) unless the peer
+///   holds a currently-valid hello capability of any scope. It is then
+///   controller-gated like `TxRequest` and forwards the
+///   station-wide `QsoMessage::StopCq` to the QSO engine (PAN-250). It flushes
+///   an owed PAN-137 cleanup first but never waits on it, and returns a retry
+///   `error` when the QSO inbox does not accept the stop.
+/// - `Unsupported` is a logged no-op.
 async fn dispatch_action(
     action: ControlAction,
     peer: &str,
@@ -1011,6 +1077,9 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
+                return qsy_refused(peer, "setFrequency", reason);
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1030,6 +1099,9 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
+            if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
+                return qsy_refused(peer, "setSplit", reason);
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1164,21 +1236,54 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(grab)
         }
         ControlAction::StopCq => {
-            // A control-mutating action (rules 3/4) that is otherwise a no-op in
-            // v1: still gate on the controller (implicit grab / refuse) so it
-            // can't be driven by a non-controller.
-            match controller_gate(ctx, peer, now) {
-                ControllerGate::Proceed(sends) => {
-                    debug!(target: "agent.control", "stopCq accepted (not wired in v1)");
-                    DispatchOutcome::cont_with(sends)
-                }
-                ControllerGate::Refused(sends) => DispatchOutcome::cont_with(sends),
+            // PAN-250: a control-mutating action (rules 3/4: implicit grab /
+            // refuse a non-controller) routed to the same station-wide
+            // `QsoMessage::StopCq` the TUI `s` key and WSJT-X HaltTx send.
+            // The stop also cancels a local CQ, so it needs a currently-valid
+            // hello capability; any scope will do, stopping needs no tier.
+            // Checked before the gate so a refused stop grabs nothing.
+            if !peer_grants(ctx, peer, "status", now.unix_ms) {
+                warn!(target: "agent.control", peer = %peer, "stopCq refused — no currently-valid hello capability for this peer");
+                return DispatchOutcome::cont();
             }
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
+            // Stopping only reduces TX, so it never waits on an owed PAN-137
+            // cleanup; flushing first keeps the cleanup ahead of it when both fit.
+            flush_qso_cleanup(ctx, bus).await;
+            if !send_qso(bus, crate::message_bus::QsoMessage::StopCq).await {
+                warn!(target: "agent.tx", peer = %peer, "stopCq not enqueued on the QSO inbox; asking the client to retry");
+                let mut sends = grab;
+                sends.push(PeerSend {
+                    to: SendTarget::One(peer.to_string()),
+                    frame: pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::Error {
+                            component: "stationAgent".into(),
+                            message: "stop CQ not delivered; retry stopCq".into(),
+                        },
+                    },
+                });
+                return DispatchOutcome::cont_with(sends);
+            }
+            // The client learns the CQ stopped from the QSO engine's next
+            // `activeQsos` snapshot, published after the CQ left TX liveness.
+            info!(target: "agent.tx", peer = %peer, "routed remote stopCq to the QSO engine");
+            DispatchOutcome::cont_with(grab)
         }
         ControlAction::TakeControl => {
-            // Rule 1: free grab from ANY established peer always succeeds. If it
-            // displaces a DIFFERENT controller, disarm that controller's arm
-            // FIRST (arms never transfer — the new controller must arm fresh).
+            // Rule 1 (PAN-253): taking control can disarm another operator and
+            // end its QSOs, so it needs a currently-valid qsy-or-higher hello
+            // capability. Checked before any side effect: a refused takeover
+            // leaves the controller, its arm and any owed cleanup untouched.
+            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
+                warn!(target: "agent.control", peer = %peer, "takeControl refused — no currently-valid qsy-scoped hello capability for this peer");
+                return DispatchOutcome::cont();
+            }
+            // An authorized grab always succeeds. If it displaces a DIFFERENT
+            // controller, disarm that controller's arm FIRST (arms never
+            // transfer — the new controller must arm fresh).
             let displacing_other =
                 ctx.controller.is_some() && ctx.controller.as_deref() != Some(peer);
             if displacing_other {
@@ -1196,7 +1301,7 @@ async fn dispatch_action(
                 owe_qso_cleanup(ctx, peer);
             }
             ctx.controller = Some(peer.to_string());
-            info!(target: "agent.control", peer = %peer, "control taken (free grab)");
+            info!(target: "agent.control", peer = %peer, "control taken");
             DispatchOutcome::cont_with(control_state_sends(ctx, now, None))
         }
         ControlAction::ReleaseControl => {
@@ -1534,7 +1639,8 @@ async fn send_rig(bus: &MessageBus, msg: RigControlMessage) {
 }
 
 /// Forward a QSO-control message to the QSO component. Used to route a remote
-/// operator's TX-initiation into the real QSO engine. The messages carry
+/// operator's TX-initiation into the real QSO engine, plus the PAN-137
+/// controller change and the PAN-250 `StopCq`. TX-initiation messages carry
 /// `remote_origin = true`, so the QSO's TransmitRequests are `TxOrigin::Remote`
 /// and armed-TX gated downstream (this call itself keys nothing). Returns
 /// whether the QSO inbox actually accepted the message.
@@ -2002,6 +2108,10 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz();
+        let station_activity = StationActivity {
+            ptt_active: self.ptt_active.clone(),
+            qso_manager: self.qso_manager_watch.subscribe(),
+        };
         // Round-1 review fix (PR #261): shared with `poll_authorizations_loop`
         // so a poll-driven disarm can flag the session loop to broadcast the
         // updated control state (see `ArmContext::revocation_pending`).
@@ -2080,6 +2190,7 @@ impl super::ApplicationCoordinator {
 
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
+                station_activity,
                 relay_url,
                 identity,
                 verifier,
@@ -2343,6 +2454,7 @@ async fn poll_authorizations_loop(
 
 /// Everything the session loop owns.
 struct RunConfig {
+    station_activity: StationActivity,
     relay_url: String,
     identity: AgentIdentity,
     verifier: CapabilityVerifier,
@@ -2385,6 +2497,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
+        station_activity: cfg.station_activity,
         arm: cfg.arm.clone(),
         split_tx_frequency_hz: cfg.split_tx_frequency_hz.clone(),
         verifier: cfg.verifier,
@@ -2968,6 +3081,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -4579,6 +4693,7 @@ mod tests {
     }
 
     // PAN-137: controller cleanup uses the same ordered inbox as QSO intents.
+    // B holds a qsy hello so its explicit takeover is authorized (PAN-253).
     fn controller_change_ctx() -> ArmContext {
         let mut ctx = ctx_with(true, true);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -4586,8 +4701,10 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
-        ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
         ctx
     }
 
@@ -4602,6 +4719,9 @@ mod tests {
                     remote_client_key_id,
                     ..
                 }) => format!("start:{callsign}:{}", remote_client_key_id.unwrap()),
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq) => {
+                    "stopCq".to_string()
+                }
                 other => panic!("unexpected QSO inbox message: {other:?}"),
             })
             .collect()
@@ -4661,6 +4781,12 @@ mod tests {
     #[tokio::test]
     async fn take_control_by_the_current_controller_sends_nothing() {
         let mut ctx = controller_change_ctx();
+        // An AUTHORIZED repeat, so the no-op is the same-peer rule, not a
+        // PAN-253 scope refusal.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
         let bus = MessageBus::new(64).unwrap();
         let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         grab_a(&mut ctx, &bus).await;
@@ -4819,8 +4945,179 @@ mod tests {
         )
         .await;
         assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        // PAN-250: the stop flushes the owed cleanup itself, ahead of the stop.
+        assert!(ctx.qso_cleanup_owed.is_none());
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("changed:{PEER_B}"), "stopCq".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_stop_cq_reaches_the_qso_engine() {
+        let mut ctx = controller_change_ctx();
+        // PAN-250: a stop needs a live hello; status scope is enough.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
         flush_qso_cleanup(&mut ctx, &bus).await;
-        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{PEER_B}")]);
+        assert_eq!(qso_inbox_tags(&rx).len(), 1);
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(qso_inbox_tags(&rx), ["stopCq"]);
+        assert!(
+            out.sends.is_empty(),
+            "a delivered stop is reported by the QSO engine's activeQsos snapshot"
+        );
+        // A non-controller is still refused and enqueues nothing.
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(qso_inbox_tags(&rx).is_empty());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { message, .. } }
+                if message == "another client holds control — takeControl first"
+        )), "a non-controller's stopCq must be refused");
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_stop_cq_tells_the_client_to_retry() {
+        let mut ctx = controller_change_ctx();
+        // PAN-250: a stop needs a live hello; status scope is enough.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        let bus = MessageBus::new(1).unwrap();
+        let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        tx.try_send(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        grab_a(&mut ctx, &bus).await;
+        let out = dispatch_action(
+            ControlAction::StopCq,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { component, message } }
+                if component == "stationAgent" && message == "stop CQ not delivered; retry stopCq"
+        ) && matches!(&s.to, SendTarget::One(p) if p == CLIENT_KEY_ID)),
+            "an undelivered stop must ask the client to retry");
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(
+            rx.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos)
+        ));
+    }
+
+    /// PAN-250: a stop cancels every un-answered CQ, a local one included, so
+    /// it needs the peer's live authority: a currently-valid hello capability
+    /// of any scope. B with no hello, a hello expired at or before `now`, or a
+    /// revoked hello is refused before the controller gate, with or without
+    /// control: nothing is enqueued, control does not move, no cleanup is owed
+    /// and no frame is sent. A status-only hello is enough to stop.
+    #[tokio::test]
+    async fn stop_cq_needs_a_live_hello_capability_of_any_scope() {
+        let cases: [(&str, Option<i64>, bool); 4] = [
+            ("no hello", None, false),
+            ("expires at now", Some(NOW), false),
+            ("expired", Some(NOW - 1), false),
+            ("revoked", Some(NOW + 600_000), true),
+        ];
+        for b_controls in [false, true] {
+            for (label, exp, revoke) in cases {
+                let mut ctx = controller_change_ctx();
+                let bus = MessageBus::new(64).unwrap();
+                let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                ctx.peers.insert(
+                    PEER_B.to_string(),
+                    exp.map_or_else(PeerCtx::unauthorized, |exp| {
+                        PeerCtx::authorized_until(vec!["status".to_string()], exp)
+                    }),
+                );
+                if revoke {
+                    // `authorized_until`'s fixture jti.
+                    ctx.revoked_jtis.insert("test-jti".to_string());
+                }
+                if b_controls {
+                    ctx.controller = Some(PEER_B.to_string());
+                }
+                let controller_before = ctx.controller.clone();
+                let out = dispatch_action(
+                    ControlAction::StopCq,
+                    PEER_B,
+                    &mut ctx,
+                    &bus,
+                    SESSION_ID,
+                    at(NOW),
+                )
+                .await;
+                assert!(
+                    out.sends.is_empty(),
+                    "{label} (controls={b_controls}): no frame"
+                );
+                assert!(
+                    qso_inbox_tags(&rx).is_empty(),
+                    "{label} (controls={b_controls}): no stop enqueued"
+                );
+                assert_eq!(
+                    ctx.controller, controller_before,
+                    "{label} (controls={b_controls}): control unchanged"
+                );
+                assert!(
+                    ctx.qso_cleanup_owed.is_none(),
+                    "{label} (controls={b_controls}): no cleanup owed"
+                );
+            }
+        }
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        dispatch_action(
+            ControlAction::StopCq,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("changed:{PEER_B}"), "stopCq".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -5016,7 +5313,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Task 5: one-controller-at-a-time (free grab, exclusivity, controlState).
+    // Task 5: one-controller-at-a-time (scoped grab, exclusivity, controlState).
     // ========================================================================
 
     /// A second established peer keyId used by the controller tests (distinct
@@ -5057,11 +5354,152 @@ mod tests {
         );
     }
 
+    async fn check_station_activity_qsy(
+        keyed: bool,
+        manual_ptt: bool,
+        qso: Option<(bool, Option<String>)>,
+        split: bool,
+        allowed: bool,
+    ) {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.into(),
+            PeerCtx::authorized_until(vec!["qsy".into()], NOW + 600_000),
+        );
+        ctx.station_activity
+            .ptt_active
+            .store(keyed, Ordering::Release);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1AW".into(),
+            ..Default::default()
+        });
+        if let Some((remote, client)) = qso {
+            manager
+                .start_cq(1500.0, None, remote, client)
+                .await
+                .unwrap();
+        }
+        let (_watch_tx, watch_rx) = tokio::sync::watch::channel(Some(manager));
+        ctx.station_activity.qso_manager = watch_rx;
+        ctx.split_tx_frequency_hz
+            .store(14_090_000, Ordering::Release);
+        let bus = MessageBus::new(64).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        if manual_ptt {
+            // A TUI manual key-down: the worker's `ptt_active` stays false.
+            assert_eq!(
+                crate::coordinator::tx::send_ptt_command(&bus, ComponentId::Tui, true, || true),
+                crate::message_bus::SendIfOutcome::Enqueued
+            );
+            assert!(matches!(
+                hamlib_rx.try_recv().unwrap().message_type,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+            ));
+        }
+        let action = if split {
+            ControlAction::SetSplit {
+                enabled: true,
+                tx_frequency_hz: 14_080_000.0,
+            }
+        } else {
+            ControlAction::Qsy {
+                vfo: 1,
+                frequency_hz: 14_080_000.0,
+            }
+        };
+        let out = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+        if allowed {
+            assert!(matches!(
+                hamlib_rx.try_recv().unwrap().message_type,
+                MessageType::RigControl(RigControlMessage::SetFrequency {
+                    frequency: 14_080_000,
+                    ..
+                })
+            ));
+            assert!(!out.sends.iter().any(|s| matches!(
+                s.frame,
+                pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::Error { .. }
+                }
+            )));
+        } else {
+            assert!(hamlib_rx.try_recv().is_err());
+            assert!(ctx.controller.is_none());
+            assert!(ctx.qso_cleanup_owed.is_none());
+            assert_eq!(
+                ctx.split_tx_frequency_hz.load(Ordering::Acquire),
+                14_090_000
+            );
+            assert_eq!(out.sends.len(), 1);
+            let reason = if keyed || manual_ptt {
+                "the rig is transmitting"
+            } else {
+                "the station is running a local or autonomous QSO"
+            };
+            let command = if split { "setSplit" } else { "setFrequency" };
+            assert!(matches!((&out.sends[0].to, &out.sends[0].frame),
+                (SendTarget::One(peer), pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::Error { component, message }
+                }) if peer == CLIENT_KEY_ID && component == "stationAgent"
+                    && message == &format!("{command} refused — {reason}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_rig_is_keyed() {
+        check_station_activity_qsy(true, false, None, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_a_local_qso_is_active() {
+        check_station_activity_qsy(false, false, Some((false, None)), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_while_a_wsjtx_bridge_qso_is_active() {
+        check_station_activity_qsy(false, false, Some((true, None)), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn qsy_allowed_while_only_a_cloud_client_qso_is_active() {
+        check_station_activity_qsy(
+            false,
+            false,
+            Some((true, Some(CLIENT_KEY_ID.into()))),
+            false,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_rig_is_keyed() {
+        check_station_activity_qsy(true, false, None, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_a_local_qso_is_active() {
+        check_station_activity_qsy(false, false, Some((false, None)), true, false).await;
+    }
+
+    /// Manual PTT with no QSO: the worker flag is false, so only the bus
+    /// key-down reservation shows the rig keyed.
+    #[tokio::test]
+    async fn qsy_refused_while_manual_ptt_is_keyed() {
+        check_station_activity_qsy(false, true, None, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_manual_ptt_is_keyed() {
+        check_station_activity_qsy(false, true, None, true, false).await;
+    }
+
     /// Rule 4: a control-mutating action from a peer that is NOT the controller
     /// is refused — it never reaches the rig, never implicitly grabs, and the
     /// refused peer receives an `Error` frame (targeted at just it). B is given
     /// qsy scope so the refusal is proven at the CONTROLLER layer, not the scope
-    /// layer.
+    /// layer; A gets qsy scope too so its explicit takeover is authorized
+    /// (PAN-253).
     #[tokio::test]
     async fn non_controller_qsy_refused_with_error_frame() {
         let mut ctx = ctx_with(true, true);
@@ -5069,6 +5507,10 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
         ctx.peers.insert(
             PEER_B.to_string(),
             PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
@@ -5207,35 +5649,73 @@ mod tests {
         );
     }
 
-    /// Rule 1: `takeControl` is a free grab from any established peer. When it
-    /// displaces a DIFFERENT controller whose arm is live, that arm is disarmed
-    /// FIRST (arms never transfer), THEN control moves — and a per-receiver
-    /// `controlState` goes to every peer (new controller held=true, old
-    /// held=false; transmit_armed=false for both).
-    #[tokio::test]
-    async fn take_control_disarms_previous_controllers_arm() {
+    /// PAN-253 fixture: A (`CLIENT_KEY_ID`) has armed and so implicitly holds
+    /// control; B (`PEER_B`) is admitted, established, and holds `b_auth`.
+    /// B's admission is asserted so a later refusal can only be the scope gate.
+    async fn armed_a_and_admitted_b(b_auth: PeerCtx, bus: &MessageBus) -> ArmContext {
         let mut ctx = ctx_with(true, true);
         ctx.tx_allow_list
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
-        ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        ctx.peers.insert(PEER_B.to_string(), b_auth);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
-        let bus = MessageBus::new(64).unwrap();
-        // A arms (implicit grab → controller=A, armed).
         dispatch_action(
             arm_action("arm-jti-1"),
             CLIENT_KEY_ID,
             &mut ctx,
-            &bus,
+            bus,
             SESSION_ID,
             at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().is_armed());
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(at(NOW), ConsentChannel::StationAgent));
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
-        // B takes control.
+        assert!(peer_admitted(&ctx, PEER_B), "setup: B is admitted");
+        ctx
+    }
+
+    /// The owed PAN-137 cleanup, as comparable data.
+    fn owed_cleanup(ctx: &ArmContext) -> Option<(String, u32)> {
+        ctx.qso_cleanup_owed
+            .as_ref()
+            .map(|o| (o.controller.clone(), o.failed_attempts))
+    }
+
+    /// `(controlHeldByMe, transmitArmed)` of the `controlState` sent to `peer`.
+    fn control_state_for(sends: &[PeerSend], peer: &str) -> Option<(bool, bool)> {
+        sends.iter().find_map(|s| match (&s.to, &s.frame) {
+            (
+                SendTarget::One(p),
+                pancetta_protocol::ServerFrame::Event {
+                    event:
+                        pancetta_protocol::ServerEvent::ControlState {
+                            control_held_by_me,
+                            transmit_armed,
+                        },
+                },
+            ) if p == peer => Some((*control_held_by_me, *transmit_armed)),
+            _ => None,
+        })
+    }
+
+    /// PAN-253 (dispensa Q-0080): a viewer whose verified hello grants only
+    /// `status` sends `takeControl` while A controls the station and is armed.
+    /// It is refused before any side effect: A stays controller with the same
+    /// live arm, no QSO cleanup is owed, and no frame goes to anyone.
+    #[tokio::test]
+    async fn status_only_take_control_is_refused_and_the_controller_stays_armed() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = armed_a_and_admitted_b(
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+            &bus,
+        )
+        .await;
+        let cleanup_before = owed_cleanup(&ctx);
         let out = dispatch_action(
             ControlAction::TakeControl,
             PEER_B,
@@ -5246,37 +5726,181 @@ mod tests {
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
+        assert!(out.sends.is_empty(), "a refused takeover sends no frame");
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
         assert!(
-            !ctx.arm.lock().unwrap().is_armed(),
-            "takeControl must disarm the displaced controller's live arm first"
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(at(NOW), ConsentChannel::StationAgent),
+            "a status-only takeControl must not disarm the controller"
         );
+        assert_eq!(
+            ctx.arm.lock().unwrap().current_arm_jti(),
+            Some("arm-jti-1"),
+            "the controller keeps the same arm"
+        );
+        assert_eq!(owed_cleanup(&ctx), cleanup_before, "no QSO cleanup owed");
+    }
+
+    /// PAN-253: every other B without a currently-valid qsy capability is
+    /// refused the same way — no hello, a qsy hello expired exactly at `now`
+    /// or before it, and a qsy hello whose jti is revoked.
+    #[tokio::test]
+    async fn take_control_without_a_live_qsy_capability_is_refused() {
+        let cases = [
+            ("no hello", PeerCtx::unauthorized(), false),
+            (
+                "expires at now",
+                PeerCtx::authorized_until(vec!["qsy".to_string()], NOW),
+                false,
+            ),
+            (
+                "expired",
+                PeerCtx::authorized_until(vec!["qsy".to_string()], NOW - 1),
+                false,
+            ),
+            (
+                "revoked",
+                PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+                true,
+            ),
+        ];
+        for (label, b_auth, revoke) in cases {
+            let bus = MessageBus::new(64).unwrap();
+            let mut ctx = armed_a_and_admitted_b(b_auth, &bus).await;
+            if revoke {
+                // `authorized_until`'s fixture jti.
+                ctx.revoked_jtis.insert("test-jti".to_string());
+            }
+            let cleanup_before = owed_cleanup(&ctx);
+            let out = dispatch_action(
+                ControlAction::TakeControl,
+                PEER_B,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                at(NOW),
+            )
+            .await;
+            assert!(out.sends.is_empty(), "{label}: no frame");
+            assert_eq!(
+                ctx.controller.as_deref(),
+                Some(CLIENT_KEY_ID),
+                "{label}: controller unchanged"
+            );
+            assert!(
+                ctx.arm
+                    .lock()
+                    .unwrap()
+                    .tx_permitted(at(NOW), ConsentChannel::StationAgent),
+                "{label}: controller stays armed"
+            );
+            assert_eq!(
+                ctx.arm.lock().unwrap().current_arm_jti(),
+                Some("arm-jti-1"),
+                "{label}: same arm"
+            );
+            assert_eq!(
+                owed_cleanup(&ctx),
+                cleanup_before,
+                "{label}: no QSO cleanup owed"
+            );
+        }
+    }
+
+    /// PAN-253: with no controller at all, a status-only `takeControl` still
+    /// takes nothing and owes no cleanup; a qsy-scoped one takes the role.
+    #[tokio::test]
+    async fn take_control_with_no_controller_needs_qsy_scope() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        let out = dispatch_action(
+            ControlAction::TakeControl,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(out.sends.is_empty());
+        assert!(ctx.controller.is_none(), "status-only takes no control");
+        assert!(owed_cleanup(&ctx).is_none(), "and owes no cleanup");
+
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
+        let out = dispatch_action(
+            ControlAction::TakeControl,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
         assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
-        // A per-receiver controlState to BOTH peers.
-        let held = |peer: &str| {
-            out.sends.iter().find_map(|s| match (&s.to, &s.frame) {
-                (
-                    SendTarget::One(p),
-                    pancetta_protocol::ServerFrame::Event {
-                        event:
-                            pancetta_protocol::ServerEvent::ControlState {
-                                control_held_by_me,
-                                transmit_armed,
-                            },
-                    },
-                ) if p == peer => Some((*control_held_by_me, *transmit_armed)),
-                _ => None,
-            })
-        };
-        assert_eq!(
-            held(PEER_B),
-            Some((true, false)),
-            "new controller B: holds control, not armed"
-        );
-        assert_eq!(
-            held(CLIENT_KEY_ID),
-            Some((false, false)),
-            "displaced controller A: no longer holds control, not armed"
-        );
+        assert_eq!(owed_cleanup(&ctx), Some((PEER_B.to_string(), 0)));
+        assert_eq!(control_state_for(&out.sends, PEER_B), Some((true, false)));
+    }
+
+    /// Rule 1: `takeControl` from a peer holding `qsy` or `tx` scope (PAN-253)
+    /// always succeeds. When it displaces a DIFFERENT controller whose arm is
+    /// live, that arm is disarmed FIRST (arms never transfer), THEN control
+    /// moves — and a per-receiver `controlState` goes to every peer (new
+    /// controller held=true, old held=false; transmit_armed=false for both).
+    #[tokio::test]
+    async fn take_control_disarms_previous_controllers_arm() {
+        for scope in ["qsy", "tx"] {
+            let bus = MessageBus::new(64).unwrap();
+            let mut ctx = armed_a_and_admitted_b(
+                PeerCtx::authorized_until(vec![scope.to_string()], NOW + 600_000),
+                &bus,
+            )
+            .await;
+            // B takes control.
+            let out = dispatch_action(
+                ControlAction::TakeControl,
+                PEER_B,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                at(NOW),
+            )
+            .await;
+            assert_eq!(out.flow, Dispatch::Continue);
+            assert!(
+                !ctx.arm.lock().unwrap().is_armed(),
+                "{scope}: takeControl must disarm the displaced controller's live arm first"
+            );
+            assert_eq!(ctx.controller.as_deref(), Some(PEER_B), "{scope}");
+            assert_eq!(
+                owed_cleanup(&ctx),
+                Some((PEER_B.to_string(), 0)),
+                "{scope}: the new controller owes the PAN-137 cleanup"
+            );
+            // A per-receiver controlState to BOTH peers.
+            assert_eq!(
+                control_state_for(&out.sends, PEER_B),
+                Some((true, false)),
+                "{scope}: new controller B: holds control, not armed"
+            );
+            assert_eq!(
+                control_state_for(&out.sends, CLIENT_KEY_ID),
+                Some((false, false)),
+                "{scope}: displaced controller A: no longer holds control, not armed"
+            );
+        }
     }
 
     /// Rule 5: `Disarm` is accepted from ANY established peer — even one that is
@@ -5959,6 +6583,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         let mut ctx = ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -6064,6 +6689,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -7100,6 +7726,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let audit_tmp = audit_tmp();
         ArmContext {
+            station_activity: StationActivity::idle(),
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
@@ -10806,6 +11433,7 @@ mod tests {
         *arm.lock().unwrap() = armed_state();
         let hello = Duration::from_millis(300);
         let cfg = RunConfig {
+            station_activity: StationActivity::idle(),
             relay_url,
             identity: AgentIdentity::generate(),
             verifier,

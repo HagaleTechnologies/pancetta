@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -36,7 +36,15 @@ impl super::ApplicationCoordinator {
     }
 
     /// Graceful shutdown of all components
-    pub(crate) async fn shutdown(mut self) -> Result<()> {
+    pub(crate) async fn shutdown(self) -> Result<()> {
+        self.shutdown_with_gain_sweep(None).await
+    }
+
+    /// Unkey before joining sweep cleanup, but retain the rig until restoration ends.
+    pub(crate) async fn shutdown_with_gain_sweep(
+        mut self,
+        sweep_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    ) -> Result<()> {
         let span = tracing::span!(tracing::Level::INFO, "coordinator_shutdown");
         let _enter = span.enter();
 
@@ -120,6 +128,47 @@ impl super::ApplicationCoordinator {
             );
         }
 
+        // Hamlib may already have stopped on the shared shutdown flag. Complete
+        // the independent PTT-off attempt above before waiting for cleanup that
+        // requires physical PTT-off. Keep the rig connection alive for both the
+        // sweep's restoration and the fallback after a failed/panicked task.
+        let sweep_result = if let Some(handle) = sweep_handle {
+            handle
+                .await
+                .context("Receive-gain sweep task failed")
+                .and_then(|result| result)
+        } else {
+            Ok(())
+        };
+
+        #[cfg(feature = "pancetta-hamlib")]
+        {
+            let original = *self
+                .gain_sweep_original
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let (Some(original), Some(rig)) = (original, self.rig_handle.as_ref()) {
+                let lead = super::resolve_window_lead_secs(&self.config.read().await.decoder);
+                if super::gain_sweep_runtime::restore(
+                    &**rig,
+                    original,
+                    &self.message_bus.gain_tx_gate,
+                    lead,
+                )
+                .await
+                {
+                    *self
+                        .gain_sweep_original
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                } else {
+                    warn!(
+                        "Original receive gain could not be restored during coordinator shutdown"
+                    );
+                }
+            }
+        }
+
         let per_task_timeout = Duration::from_secs(1);
 
         for (index, (component_id, handle)) in std::mem::take(&mut self.named_task_handles)
@@ -183,6 +232,6 @@ impl super::ApplicationCoordinator {
 
         info!("Graceful shutdown completed");
 
-        Ok(())
+        sweep_result
     }
 }

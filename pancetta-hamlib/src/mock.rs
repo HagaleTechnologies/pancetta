@@ -5,7 +5,9 @@
 
 use crate::error::HamlibError;
 use crate::models::{Band, Mode, RigCapabilities, Vfo};
-use crate::rig::{ConnectionState, PttState, RigControl, RigStatus};
+use crate::rig::{
+    ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigControl, RigStatus,
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -28,16 +30,23 @@ pub struct MockRigConfig {
     pub simulate_s_meter: bool,
     /// S-meter noise level
     pub s_meter_noise: i32,
-    /// Whether to simulate SWR readings
+    /// Whether the rig has an SWR meter. When false, `get_swr` errors and status reports no SWR.
     pub simulate_swr: bool,
     /// Base SWR value
     pub base_swr: f32,
+    /// Fixed SWR reading while `simulate_swr` is on, returned unclamped (PAN-251 tests)
+    pub swr_override: Option<f32>,
     /// Supported frequency range
     pub frequency_range: (u64, u64),
     /// Whether the rig can report its split state.
     pub split_read_supported: bool,
+    /// Discrete supported attenuation settings in integer dB.
+    pub attenuator_steps: Vec<i32>,
     /// Memory channel count
     pub memory_channels: u32,
+    /// Optional explicit gain simulation: backend steps and original pair.
+    /// Invalid original settings leave gain simulation unsupported.
+    pub receive_gain: Option<(ReceiveGainCapabilities, ReceiveGain)>,
 }
 
 impl Default for MockRigConfig {
@@ -50,9 +59,12 @@ impl Default for MockRigConfig {
             s_meter_noise: 10,
             simulate_swr: true,
             base_swr: 1.2,
+            swr_override: None,
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
             split_read_supported: true,
+            attenuator_steps: vec![0, 6, 10, 12, 20],
+            receive_gain: None,
         }
     }
 }
@@ -60,6 +72,8 @@ impl Default for MockRigConfig {
 /// Mock rig state
 #[derive(Debug, Clone)]
 struct MockRigState {
+    /// Explicitly enabled gain simulation and its current controls.
+    receive_gain: Option<(ReceiveGainCapabilities, ReceiveGain)>,
     /// Connection state
     connected: bool,
     /// Current frequency for each VFO
@@ -111,6 +125,7 @@ impl Default for MockRigState {
         ptt_states.insert(Vfo::Current, PttState::Off);
 
         Self {
+            receive_gain: None,
             connected: false,
             frequencies,
             modes,
@@ -193,6 +208,10 @@ impl MockRig {
 
         // Initialize some memory channels
         let mut state = MockRigState::default();
+        state.receive_gain = config.receive_gain.clone().filter(|(caps, gain)| {
+            caps.preamp_db.contains(&gain.preamp_db)
+                && caps.attenuator_db.contains(&gain.attenuator_db)
+        });
         state
             .memory_channels
             .insert(1, (14_200_000, Mode::USB, 2400));
@@ -282,10 +301,14 @@ impl MockRig {
         base_level + noise + strong_signal
     }
 
-    /// Simulate SWR reading based on frequency and other factors
-    fn simulate_swr(&self, frequency: u64) -> f32 {
+    /// Simulate SWR reading based on frequency and other factors. `None` when
+    /// the rig has no SWR meter; `swr_override` is returned unclamped.
+    fn simulated_swr(&self, frequency: u64) -> Option<f32> {
         if !self.config.simulate_swr {
-            return 1.0;
+            return None;
+        }
+        if let Some(swr) = self.config.swr_override {
+            return Some(swr);
         }
 
         let count = self.operation_count.load(Ordering::Relaxed);
@@ -296,7 +319,7 @@ impl MockRig {
         // Add some random variation
         let random_variation = ((count % 100) as f32 / 1000.0) - 0.05;
 
-        (self.config.base_swr + freq_variation + random_variation).clamp(1.0, 3.0)
+        Some((self.config.base_swr + freq_variation + random_variation).clamp(1.0, 3.0))
     }
 
     /// Update last operation time and increment operation counter
@@ -370,6 +393,56 @@ impl MockRig {
 
 #[async_trait]
 impl RigControl for MockRig {
+    async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        self.state
+            .read()
+            .receive_gain
+            .as_ref()
+            .map(|(caps, _)| caps.clone())
+            .ok_or_else(|| anyhow!("Mock receive gain is unsupported"))
+    }
+
+    async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        let state = self.state.read();
+        if !state.connected {
+            return Err(anyhow!("Mock rig is disconnected"));
+        }
+        state
+            .receive_gain
+            .as_ref()
+            .map(|(_, gain)| *gain)
+            .ok_or_else(|| anyhow!("Mock receive gain is unsupported"))
+    }
+
+    async fn set_receive_gain(
+        &self,
+        gain: ReceiveGain,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.simulate_failure("set_receive_gain")?;
+        tokio::time::timeout_at(deadline, self.simulate_delay())
+            .await
+            .map_err(|_| anyhow!("Mock gain deadline expired"))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("Mock gain deadline expired"));
+        }
+        let mut state = self.state.write();
+        if !state.connected {
+            return Err(anyhow!("Mock rig is disconnected"));
+        }
+        let (caps, current) = state
+            .receive_gain
+            .as_mut()
+            .ok_or_else(|| anyhow!("Mock receive gain is unsupported"))?;
+        if !caps.preamp_db.contains(&gain.preamp_db)
+            || !caps.attenuator_db.contains(&gain.attenuator_db)
+        {
+            return Err(anyhow!("Unsupported mock gain step"));
+        }
+        *current = gain;
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
         self.simulate_failure("connect")?;
@@ -429,7 +502,7 @@ impl RigControl for MockRig {
             swr: state
                 .frequencies
                 .get(&state.current_vfo)
-                .map(|&freq| self.simulate_swr(freq)),
+                .and_then(|&freq| self.simulated_swr(freq)),
             memory_channel: state.current_memory.get(&state.current_vfo).copied(),
             last_update: state.last_operation,
             last_error: None,
@@ -698,6 +771,50 @@ impl RigControl for MockRig {
         Ok(ptt)
     }
 
+    fn connection_generation(&self) -> u64 {
+        1
+    }
+
+    async fn get_attenuator(&self) -> Result<i32> {
+        self.simulate_failure("get_attenuator")?;
+        self.simulate_delay().await;
+        let state = self.state.read();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        Ok(state.attenuator_db)
+    }
+
+    async fn set_attenuator(&self, db: i32) -> Result<()> {
+        self.simulate_failure("set_attenuator")?;
+        self.simulate_delay().await;
+        if db < 0 || !self.config.attenuator_steps.contains(&db) {
+            return Err(anyhow!("Unsupported attenuation"));
+        }
+        let mut state = self.state.write();
+        if !state.connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        state.attenuator_db = db;
+        Ok(())
+    }
+
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        self.simulate_failure("supported_attenuator_steps")?;
+        self.simulate_delay().await;
+        if !self.state.read().connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        let mut steps = self.config.attenuator_steps.clone();
+        if steps.iter().any(|&db| db < 0) || !steps.iter().any(|&db| db > 0) {
+            return Err(anyhow!("Unsupported attenuation"));
+        }
+        steps.push(0);
+        steps.sort_unstable();
+        steps.dedup();
+        Ok(steps)
+    }
+
     #[instrument(skip(self))]
     async fn set_power_level(&self, level: f32) -> Result<()> {
         self.simulate_failure("set_power_level")?;
@@ -769,33 +886,6 @@ impl RigControl for MockRig {
         Ok(state.preamp_db)
     }
 
-    async fn set_attenuator(&self, db: i32) -> Result<()> {
-        self.simulate_failure("set_attenuator")?;
-        self.simulate_delay().await;
-        if db < 0 {
-            return Err(anyhow!("Receive gain must not be negative"));
-        }
-        {
-            let mut state = self.state.write();
-            if !state.connected {
-                return Err(anyhow!("Mock rig not connected"));
-            }
-            state.attenuator_db = db;
-        }
-        self.update_operation_time();
-        Ok(())
-    }
-
-    async fn get_attenuator(&self) -> Result<i32> {
-        self.simulate_failure("get_attenuator")?;
-        self.simulate_delay().await;
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
-        Ok(state.attenuator_db)
-    }
-
     #[instrument(skip(self))]
     async fn get_s_meter(&self) -> Result<i32> {
         self.simulate_failure("get_s_meter")?;
@@ -836,10 +926,16 @@ impl RigControl for MockRig {
                 .unwrap_or(14_200_000)
         };
 
-        let swr = self.simulate_swr(frequency);
+        let swr = self
+            .simulated_swr(frequency)
+            .ok_or_else(|| HamlibError::not_supported("get_swr", None, None))?;
         self.update_operation_time();
         debug!("Mock rig get SWR: {:.2}:1", swr);
         Ok(swr)
+    }
+
+    async fn reports_swr(&self) -> Result<bool> {
+        Ok(self.config.simulate_swr)
     }
 
     #[instrument(skip(self))]
@@ -1213,6 +1309,39 @@ mod tests {
         rig.reset_operation_count();
         assert_eq!(rig.get_operation_count(), 0);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_swr_override_reports_above_three() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            swr_override: Some(4.2),
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert_eq!(rig.get_swr().await.unwrap(), 4.2);
+        assert_eq!(rig.get_status().await.unwrap().swr, Some(4.2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_without_swr_meter_errors_and_reports_none() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            simulate_swr: false,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert!(rig.get_swr().await.is_err());
+        assert_eq!(rig.get_status().await.unwrap().swr, None);
+        assert!(!rig.reports_swr().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_with_swr_meter_reports_swr() {
+        let rig = MockRig::default();
+        assert!(rig.reports_swr().await.unwrap());
+    }
 }
 
 #[cfg(test)]
@@ -1264,5 +1393,79 @@ mod split_read_tests {
         assert_eq!(rig.get_split().await.unwrap(), (true, Vfo::B));
         assert_eq!(rig.get_split_freq().await.unwrap(), 15_000_000);
         assert_eq!(rig.get_operation_count(), before);
+    }
+}
+
+#[cfg(test)]
+mod attenuator_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integer_attenuator_round_trip_and_nonuniform_steps() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            attenuator_steps: vec![20, 0, 10, 10],
+            ..Default::default()
+        });
+        assert!(rig.get_attenuator().await.is_err());
+        rig.connect().await.unwrap();
+        assert_eq!(
+            rig.supported_attenuator_steps().await.unwrap(),
+            vec![0, 10, 20]
+        );
+        assert_eq!(rig.get_attenuator().await.unwrap(), 0);
+        assert!(rig.set_attenuator(-1).await.is_err());
+        assert!(rig.set_attenuator(6).await.is_err());
+        rig.set_attenuator(10).await.unwrap();
+        assert_eq!(rig.get_attenuator().await.unwrap(), 10);
+    }
+}
+
+#[cfg(test)]
+mod receive_gain_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_gain_is_opt_in_and_deadlines_do_not_mutate() {
+        let unsupported = MockRig::default();
+        assert!(unsupported.receive_gain_capabilities().await.is_err());
+        let original = ReceiveGain {
+            preamp_db: 0,
+            attenuator_db: 0,
+        };
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            failure_rate: 0.0,
+            receive_gain: Some((
+                ReceiveGainCapabilities {
+                    preamp_db: vec![0, 10, 20],
+                    attenuator_db: vec![0, 6],
+                },
+                original,
+            )),
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        let desired = ReceiveGain {
+            preamp_db: 10,
+            attenuator_db: 0,
+        };
+        assert!(rig
+            .set_receive_gain(
+                desired,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err());
+        assert_eq!(rig.get_receive_gain().await.unwrap(), original);
+        rig.set_receive_gain(
+            desired,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rig.get_receive_gain().await.unwrap(), desired);
     }
 }

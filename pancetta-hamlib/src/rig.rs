@@ -141,9 +141,47 @@ pub struct RigOperationResult<T> {
     pub reconnected: bool,
 }
 
+/// A confirmed pair of receive-gain controls in integer dB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiveGain {
+    /// Preamp gain, with zero meaning bypass.
+    pub preamp_db: i32,
+    /// Attenuation, with zero meaning bypass.
+    pub attenuator_db: i32,
+}
+
+/// Gain steps advertised by the connected backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveGainCapabilities {
+    /// Supported preamp settings, including bypass.
+    pub preamp_db: Vec<i32>,
+    /// Supported attenuation settings, including bypass.
+    pub attenuator_db: Vec<i32>,
+}
+
 /// Trait for rig control operations
 #[async_trait]
 pub trait RigControl: Send + Sync {
+    /// Discover gain support; unsupported backends never invent settings.
+    async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        Err(HamlibError::not_supported("receive_gain_capabilities", None, None).into())
+    }
+
+    /// Read both receive controls without inventing bypass on failure.
+    async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        Err(HamlibError::not_supported("get_receive_gain", None, None).into())
+    }
+
+    /// Apply both controls and confirm readback before an absolute deadline.
+    /// A partial update or timeout is an error and still requires restoration.
+    async fn set_receive_gain(
+        &self,
+        _gain: ReceiveGain,
+        _deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        Err(HamlibError::not_supported("set_receive_gain", None, None).into())
+    }
+
     /// Connect to the rig
     async fn connect(&self) -> Result<()>;
 
@@ -177,6 +215,27 @@ pub trait RigControl: Send + Sync {
     /// Get PTT state
     async fn get_ptt(&self, vfo: Vfo) -> Result<PttState>;
 
+    /// Identity of the current transport connection, changed on reconnect.
+    fn connection_generation(&self) -> u64 {
+        0
+    }
+
+    /// Read the current attenuator in integer dB. Unsupported is never bypass.
+    async fn get_attenuator(&self) -> Result<i32> {
+        Err(HamlibError::not_supported("get_attenuator", None, None).into())
+    }
+
+    /// Set attenuation in integer dB. Backends must reject negative values.
+    async fn set_attenuator(&self, _db: i32) -> Result<()> {
+        Err(HamlibError::not_supported("set_attenuator", None, None).into())
+    }
+
+    /// Query supported attenuator settings, including bypass zero on success.
+    /// Callers cache the result for their current connection generation.
+    async fn supported_attenuator_steps(&self) -> Result<Vec<i32>> {
+        Err(HamlibError::not_supported("supported_attenuator_steps", None, None).into())
+    }
+
     /// Set power level (0.0-1.0)
     async fn set_power_level(&self, level: f32) -> Result<()>;
 
@@ -193,21 +252,17 @@ pub trait RigControl: Send + Sync {
         Err(HamlibError::not_supported("get_preamp", None, None).into())
     }
 
-    /// Set attenuation in hamlib ATT dB.
-    async fn set_attenuator(&self, _att_db: i32) -> Result<()> {
-        Err(HamlibError::not_supported("set_attenuator", None, None).into())
-    }
-
-    /// Read attenuation in dB.
-    async fn get_attenuator(&self) -> Result<i32> {
-        Err(HamlibError::not_supported("get_attenuator", None, None).into())
-    }
-
     /// Get S-meter reading
     async fn get_s_meter(&self) -> Result<i32>;
 
     /// Get SWR reading
     async fn get_swr(&self) -> Result<f32>;
+
+    /// Whether the backend can read the SWR meter (`get_swr`). A backend that
+    /// cannot tell must return an error, never assume a meter exists (PAN-251).
+    async fn reports_swr(&self) -> Result<bool> {
+        Err(HamlibError::not_supported("reports_swr", None, None).into())
+    }
 
     /// Set memory channel
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()>;
@@ -313,7 +368,26 @@ mod split_default_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn default_receive_gain_is_unsupported() {
+        assert!(DefaultOnlyRig.receive_gain_capabilities().await.is_err());
+        assert!(DefaultOnlyRig.get_receive_gain().await.is_err());
+        assert!(DefaultOnlyRig
+            .set_receive_gain(
+                ReceiveGain {
+                    preamp_db: 0,
+                    attenuator_db: 0
+                },
+                tokio::time::Instant::now()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn default_split_read_fails_closed() {
+        assert!(DefaultOnlyRig.get_attenuator().await.is_err());
+        assert!(DefaultOnlyRig.set_attenuator(0).await.is_err());
+        assert!(DefaultOnlyRig.supported_attenuator_steps().await.is_err());
         assert!(DefaultOnlyRig
             .get_split()
             .await
@@ -326,5 +400,6 @@ mod split_default_tests {
             .unwrap_err()
             .to_string()
             .contains("Feature not supported"));
+        assert!(DefaultOnlyRig.reports_swr().await.is_err());
     }
 }

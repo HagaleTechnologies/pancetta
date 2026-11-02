@@ -35,6 +35,7 @@ pub(crate) struct ReadinessSources {
     hamlib_command_in_flight: Arc<AtomicU32>,
     rig_conn_state: Arc<AtomicU8>,
     audio_output_alive: Arc<AtomicBool>,
+    receive_gain: Arc<super::receive_overload::GainSafety>,
     ptt_off_unconfirmed: Arc<AtomicBool>,
     clock_skew: ClockSkewShared,
     degraded_summary: Arc<Mutex<Option<String>>>,
@@ -61,6 +62,7 @@ impl ReadinessSources {
             hamlib_command_in_flight: c.hamlib_command_in_flight.clone(),
             rig_conn_state: c.rig_conn_state.clone(),
             audio_output_alive: c.audio_output_alive.clone(),
+            receive_gain: c.message_bus.receive_gain.clone(),
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
             clock_skew: c.clock_skew.clone(),
             degraded_summary: c.degraded_summary.clone(),
@@ -83,6 +85,7 @@ impl ReadinessSources {
             &self.hamlib_command_in_flight,
             &self.rig_conn_state,
             &self.audio_output_alive,
+            &self.receive_gain,
         );
         let mut last = self.last_tx_mute_causes.borrow_mut();
         if last.as_ref() != Some(&causes) {
@@ -213,6 +216,7 @@ fn tui_tx_mute_cause(cause: TxMuteCause) -> TuiTxMuteCause {
         TxMuteCause::AudioOutputDead => TuiTxMuteCause::AudioOutputDead,
         TxMuteCause::RigStatePending => TuiTxMuteCause::RigStatePending,
         TxMuteCause::RigCommandInFlight => TuiTxMuteCause::RigCommandInFlight,
+        TxMuteCause::ReceiveGainUnconfirmed => TuiTxMuteCause::ReceiveGainUnconfirmed,
         TxMuteCause::PolicyDisabled => TuiTxMuteCause::PolicyDisabled,
     }
 }
@@ -269,6 +273,11 @@ mod tests {
             hamlib_command_in_flight: Arc::new(AtomicU32::new(0)),
             rig_conn_state: Arc::new(AtomicU8::new(RigConnState::Connected.as_u8())),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
+            receive_gain: {
+                let gain = super::super::receive_overload::GainSafety::default();
+                gain.confirmed_off(0);
+                Arc::new(gain)
+            },
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             clock_skew: ClockSkewShared::new(),
             degraded_summary: Arc::new(Mutex::new(None)),
@@ -557,6 +566,7 @@ mod tests {
             std::time::Instant::now(),
         ));
         s.hamlib_command_in_flight.store(1, Ordering::Release);
+        s.receive_gain.fail_gain();
 
         assert_eq!(
             s.snapshot(false, false).tx_mute_causes,
