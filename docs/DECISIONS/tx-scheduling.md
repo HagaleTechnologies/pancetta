@@ -1107,3 +1107,32 @@ The guard lives in `pancetta/src/coordinator/swr_guard.rs`; the halt it shares w
   such a rig behaves as it did before. Keeping the 3x retry in `get_swr`: the coordinator
   already samples every 500 ms while keyed and the poll loop redials a dropped link, so the
   retry only added warnings.
+
+## What the configured PTT method actually controls (PAN-121, 2026-11-01)
+
+An audit, not a behavior change. `[rig.ptt].method` is `pancetta_config::rig::PttMethod`
+(`pancetta-config/src/rig.rs:274`): None, Cat, Serial, Parallel, Usb, SoundCard, Vox and Network.
+There is no `Cm108` variant and no CM108-specific runtime method. `Usb` is not evidence of CM108
+support. The separate `pancetta_ft8::transmit::PttMethod` enum is not fed by this setting.
+
+- **Configuration and picker.** `pancetta setup` asks for it (`setup_ptt`,
+  `pancetta/src/main.rs:2678`), rig bookmarks store it (`RigBookmark::ptt_method`,
+  `pancetta-config/src/rig.rs:76`), and the setup summary and `test-rig` header print it. The rig
+  picker offers None, Cat, Serial and Vox (`pancetta-tui/src/app.rs:909`). The relay stores the choice in the live config
+  (`pancetta/src/coordinator/tui_relay.rs:2846`), and `Config::set_rig_in_file`
+  (`pancetta-config/src/lib.rs:809`) writes it to the config file.
+- **Normal runtime PTT is CAT through rigctld whatever the method says.** Every `SetPtt` reaches
+  `rig.set_ptt` in the Hamlib task (`pancetta/src/coordinator/hamlib.rs:2752`, `:2805`), and
+  `pancetta-hamlib/src/rigctld.rs:805` sends `T 1` or `T 0`. No code on that path reads the method.
+- **Managed rigctld gets no PTT selection.** The spawn at `pancetta/src/coordinator/hamlib.rs:1580`
+  passes model, port, baud rate and listen address only. An externally configured rigctld may still
+  drive serial, CM108 or other hardware PTT on its own, independent of Pancetta's setting. That is
+  rigctld's configuration, not Pancetta's.
+- **The diagnostic exception.** `pancetta test-rig --ptt` does branch on the method
+  (`pancetta/src/main.rs:3065`): Serial pulses RTS for one second, Vox prints guidance, Cat reports
+  that its test is not implemented, and None skips. So the setting is not wholly cosmetic across
+  the executable, but it never selects how a real transmission is keyed.
+
+Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime path, is separate
+work that needs hardware validation. Existing config values, picker choices and runtime behavior
+stay as they are. Nothing here was checked against a physical rig or on the air.

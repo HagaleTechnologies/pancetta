@@ -8,7 +8,8 @@ use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -1040,22 +1041,43 @@ impl TuiRunner {
         Ok(())
     }
 
-    /// Abort the currently selected/pinned QSO (`App::selected_qso_id`),
-    /// echoing the target callsign, or fall back to the standard "nothing to
-    /// abort" hint when no QSO is active. Shared by `k`'s global handler (any
-    /// panel) and the Diagnostics/Recent-QSOs/station-health/Help overlays,
-    /// which all let `k` fall through to this even while open (PAN-21;
-    /// Help added PAN-24) since they're read-only informational views, not
-    /// modals the operator is editing.
-    fn abort_selected_qso(&self, app: &mut App) -> Result<()> {
+    /// Open the abort-confirm modal for the currently selected/pinned QSO
+    /// (`App::selected_qso_id`), or fall back to the standard "nothing to
+    /// abort" hint when no QSO is active. Sends nothing: `y` in the modal
+    /// does (PAN-121). Shared by `k`'s global handler (any panel) and the
+    /// Diagnostics/Recent-QSOs/station-health/Help/Why overlays, which all
+    /// let `k` fall through to this even while open (PAN-21; Help added
+    /// PAN-24) since they're read-only informational views, not modals the
+    /// operator is editing. Only a fresh press opens it; repeat and release
+    /// events are ignored.
+    fn request_qso_abort(app: &mut App, key: &KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
         match (app.selected_qso_id(), app.selected_qso_callsign()) {
-            (Some(qso_id), Some(call)) => {
-                self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
-                app.status_message = format!("Aborting QSO with {}", call);
+            (Some(qso_id), Some(callsign)) => {
+                app.pending_qso_abort = Some(crate::app::PendingQsoAbort { qso_id, callsign });
             }
             _ => {
                 app.status_message = "No active QSO to abort".to_string();
             }
+        }
+    }
+
+    /// `y` in the abort-confirm modal: send one `AbortQso` for the QSO
+    /// captured when the modal opened, if it is still in the latest active
+    /// list. Never substitutes the QSO selected now (PAN-121).
+    fn confirm_pending_qso_abort(&self, app: &mut App) -> Result<()> {
+        let Some(pending) = app.pending_qso_abort.take() else {
+            return Ok(());
+        };
+        if app.qso_is_active(&pending.qso_id) {
+            self.message_tx.send(TuiCommand::AbortQso {
+                qso_id: pending.qso_id,
+            })?;
+            app.status_message = format!("Aborting QSO with {}", pending.callsign);
+        } else {
+            app.status_message = pending.target_gone_message();
         }
         Ok(())
     }
@@ -1080,7 +1102,8 @@ impl TuiRunner {
         // lowercase `q` (quit-confirm). Checked before every modal and
         // overlay below, because each of those ends in `_ => {}` +
         // `return Ok(true)` and would otherwise swallow it (PAN-113). Any
-        // modifiers are accepted, and the open dialog is left as it is. In
+        // modifiers are accepted, and the open dialog is left as it is,
+        // except a pending QSO abort, which is cleared (PAN-121). In
         // the text-entry modals (compose, rig model, bookmark name) this
         // means Shift+Q stops the station instead of typing `Q`.
         // The coordinator handles the event: aborts in-flight TX, disables
@@ -1090,6 +1113,7 @@ impl TuiRunner {
         // visual signal.
         if key.code == KeyCode::Char('Q') {
             app.stopped_by_operator = true;
+            app.pending_qso_abort = None;
             // Emergency stop hard-mutes TX: reflect Disabled in the local
             // banner immediately; the coordinator confirms via
             // TxPolicyUpdate.
@@ -1106,11 +1130,38 @@ impl TuiRunner {
         }
 
         // Required out-of-band acknowledgment modal — must be dismissed first.
+        // It outranks a pending QSO abort, which it cancels, so dismissing
+        // it can never reveal a stale abort prompt (PAN-121).
         if app.out_of_band_ack_visible {
+            app.pending_qso_abort = None;
             match key.code {
                 KeyCode::Enter | KeyCode::Esc => {
                     app.out_of_band_ack_visible = false;
                     app.status_message = "Out-of-band TX acknowledged".to_string();
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
+        // PAN-121: abort-confirm modal opened by a bare `k`. Only a fresh
+        // press of y/Y confirms; n/N/Esc/Enter cancel (Enter is the safe
+        // default); every other key, including repeat and release events,
+        // is swallowed so nothing underneath acts while it is open.
+        if app.pending_qso_abort.is_some() {
+            if key.kind != KeyEventKind::Press {
+                return Ok(true);
+            }
+            let ctrl_or_alt = key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl_or_alt => {
+                    self.confirm_pending_qso_abort(&mut app)?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    app.pending_qso_abort = None;
+                    app.status_message = "QSO abort cancelled".to_string();
                 }
                 _ => {}
             }
@@ -1137,9 +1188,10 @@ impl TuiRunner {
         // If help overlay is visible, route keys to help handler. Same
         // read-only-overlay rationale as the Diagnostics/Recent-QSOs/
         // station-health overlays below: `k` falls through to the global
-        // QSO-abort even while help is open (PAN-24) — otherwise the help
-        // text's own "k — abort QSO (any panel)" line would be false while
-        // the panel advertising it is on screen.
+        // QSO-abort confirmation even while help is open (PAN-24, PAN-121)
+        // — otherwise the help text's own "k — confirm abort of selected
+        // QSO (any panel)" line would be false while the panel advertising
+        // it is on screen.
         if app.help_visible {
             // PAN-88: scroll keys, clamped against the real terminal size so
             // no press is wasted after overshooting (80×24 in unit tests,
@@ -1172,7 +1224,7 @@ impl TuiRunner {
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
+                    Self::request_qso_abort(&mut app, &key);
                 }
                 _ => {} // swallow all other keys while help is open
             }
@@ -1451,6 +1503,7 @@ impl TuiRunner {
                             {
                                 app.out_of_band_warned = true;
                                 app.out_of_band_ack_visible = true;
+                                app.pending_qso_abort = None;
                                 app.out_of_band_rf_hz = tx_rf;
                             }
                             app.status_message = if split_enabled {
@@ -1589,7 +1642,7 @@ impl TuiRunner {
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
+                    Self::request_qso_abort(&mut app, &key);
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1630,7 +1683,7 @@ impl TuiRunner {
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
+                    Self::request_qso_abort(&mut app, &key);
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1657,7 +1710,7 @@ impl TuiRunner {
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
+                    Self::request_qso_abort(&mut app, &key);
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1670,7 +1723,7 @@ impl TuiRunner {
                 KeyCode::Up => app.why_scroll = app.why_scroll.saturating_sub(1),
                 KeyCode::Down => app.why_scroll = app.why_scroll.saturating_add(1),
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?
+                    Self::request_qso_abort(&mut app, &key)
                 }
                 _ => {}
             }
@@ -2076,7 +2129,7 @@ impl TuiRunner {
             // local view state, retune or re-pick the TX offset without
             // re-keying, or stop TX (`s`, `h`).
             KeyCode::Char('k') if key.modifiers.is_empty() => {
-                self.abort_selected_qso(&mut app)?;
+                Self::request_qso_abort(&mut app, &key);
             }
             // r pressed outside the QSO Status panel: hint, don't act.
             KeyCode::Char('r') if !ctrl_or_alt_held => {
@@ -2418,60 +2471,7 @@ impl TuiRunner {
             // Headless mode (unit tests) — nothing to render.
             return Ok(());
         };
-        terminal.draw(|f| {
-            // Use the rich ui::draw for the full frame
-            if let Err(e) = crate::ui::draw(f, &app) {
-                // Fallback: render a minimal error message
-                let error_text = format!("Render error: {}", e);
-                let paragraph = Paragraph::new(error_text).style(Style::default().fg(Color::Red));
-                f.render_widget(paragraph, f.area());
-            }
-
-            // Render device selection modal overlay if visible
-            if app.device_selection.visible {
-                TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
-            }
-
-            // Render rig config picker modal overlay if visible (PAN-59)
-            if app.rig_selection.visible {
-                TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
-            }
-
-            // Render help overlay if visible
-            if app.help_visible {
-                TuiRunner::render_help_overlay(f, f.area(), app.help_scroll);
-            }
-
-            // Render operator-stop banner if active. Drawn before the
-            // quit-confirm overlay so the latter sits on top — Q-press
-            // then q-press should still let the operator quit.
-            if app.stopped_by_operator {
-                TuiRunner::render_stopped_by_operator_banner(f, f.area());
-            }
-
-            // Render quit-confirm overlay if visible (drawn last so it sits on top)
-            if app.quit_confirm_visible {
-                TuiRunner::render_quit_confirm_overlay(f, f.area());
-            }
-
-            // Render freq/split/offset modals (out-of-band ack has priority;
-            // then freq modal; then offset modal — only one visible at a time).
-            if app.out_of_band_ack_visible {
-                crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
-            } else if app.freq_modal.visible {
-                crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
-            } else if app.offset_modal.visible {
-                crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
-            } else if app.show_diagnostics {
-                crate::ui::render_diagnostics_overlay(f, f.area(), &app);
-            } else if app.show_health {
-                crate::ui::render_health_panel(f, f.area(), &app);
-            } else if app.show_recent_qsos {
-                crate::ui::render_recent_qsos_panel(f, f.area(), &app);
-            } else if app.show_why {
-                crate::ui::why::render_why_overlay(f, f.area(), &mut app);
-            }
-        })?;
+        terminal.draw(|f| Self::draw_frame(f, &mut app))?;
 
         self.metrics.frames_rendered += 1;
         Ok(())
@@ -2981,6 +2981,122 @@ impl TuiRunner {
         f.render_widget(para, banner_area);
     }
 
+    /// Draw one full frame: the main UI, then every modal/overlay in
+    /// stacking order (later draws sit on top).
+    fn draw_frame(f: &mut Frame, app: &mut App) {
+        // Use the rich ui::draw for the full frame
+        if let Err(e) = crate::ui::draw(f, app) {
+            // Fallback: render a minimal error message
+            let error_text = format!("Render error: {}", e);
+            let paragraph = Paragraph::new(error_text).style(Style::default().fg(Color::Red));
+            f.render_widget(paragraph, f.area());
+        }
+
+        // Render device selection modal overlay if visible
+        if app.device_selection.visible {
+            TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
+        }
+
+        // Render rig config picker modal overlay if visible (PAN-59)
+        if app.rig_selection.visible {
+            TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
+        }
+
+        // Render help overlay if visible
+        if app.help_visible {
+            TuiRunner::render_help_overlay(f, f.area(), app.help_scroll);
+        }
+
+        // Render operator-stop banner if active. Drawn before the
+        // quit-confirm overlay so the latter sits on top — Q-press
+        // then q-press should still let the operator quit.
+        if app.stopped_by_operator {
+            TuiRunner::render_stopped_by_operator_banner(f, f.area());
+        }
+
+        // Render quit-confirm overlay if visible (drawn last so it sits on top)
+        if app.quit_confirm_visible {
+            TuiRunner::render_quit_confirm_overlay(f, f.area());
+        }
+
+        // Render freq/split/offset modals (out-of-band ack has priority;
+        // then freq modal; then offset modal — only one visible at a time).
+        if app.out_of_band_ack_visible {
+            crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
+        } else if app.freq_modal.visible {
+            crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
+        } else if app.offset_modal.visible {
+            crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
+        } else if app.show_diagnostics {
+            crate::ui::render_diagnostics_overlay(f, f.area(), app);
+        } else if app.show_health {
+            crate::ui::render_health_panel(f, f.area(), app);
+        } else if app.show_recent_qsos {
+            crate::ui::render_recent_qsos_panel(f, f.area(), app);
+        } else if app.show_why {
+            crate::ui::why::render_why_overlay(f, f.area(), app);
+        }
+
+        // PAN-121 abort-confirm modal: drawn after every read-only overlay
+        // so it sits on top of Help/Diagnostics/Recent/Why/station-health,
+        // and suppressed under the required out-of-band acknowledgment.
+        if !app.out_of_band_ack_visible {
+            if let Some(pending) = &app.pending_qso_abort {
+                TuiRunner::render_abort_confirm_overlay(f, f.area(), &pending.callsign);
+            }
+        }
+    }
+
+    /// A `width`×`height` rect centered in `area`, kept 2 cells inside each
+    /// edge. Shared by the quit- and abort-confirm modals.
+    fn confirm_modal_rect(area: Rect, width: u16, height: u16) -> Rect {
+        let width = width.min(area.width.saturating_sub(4));
+        let height = height.min(area.height.saturating_sub(4));
+        Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        }
+    }
+
+    /// PAN-121: render the abort-confirm modal for `callsign` as a bounded
+    /// centered modal, same shape as the quit-confirm modal.
+    fn render_abort_confirm_overlay(f: &mut Frame, area: Rect, callsign: &str) {
+        use ratatui::text::{Line, Span};
+
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("  Abort QSO with {}?", callsign),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  y = abort    n / Esc / Enter = cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  Shift+Q = EMERGENCY STOP",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let modal_area = Self::confirm_modal_rect(area, 48, lines.len() as u16 + 2);
+
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let block = Block::default()
+            .title(" Confirm abort ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(Color::Black).fg(Color::Red));
+
+        let para = Paragraph::new(lines).block(block);
+        f.render_widget(para, modal_area);
+    }
+
     /// Render quit-confirm overlay as a centered modal
     fn render_quit_confirm_overlay(f: &mut Frame, area: Rect) {
         use ratatui::text::{Line, Span};
@@ -3000,16 +3116,7 @@ impl TuiRunner {
             )),
         ];
 
-        let modal_width: u16 = 50;
-        let modal_height: u16 = lines.len() as u16 + 2;
-        let modal_width = modal_width.min(area.width.saturating_sub(4));
-        let modal_height = modal_height.min(area.height.saturating_sub(4));
-        let modal_area = Rect {
-            x: (area.width.saturating_sub(modal_width)) / 2,
-            y: (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
+        let modal_area = Self::confirm_modal_rect(area, 50, lines.len() as u16 + 2);
 
         f.render_widget(ratatui::widgets::Clear, modal_area);
 
@@ -3238,7 +3345,7 @@ mod key_tests {
     use crate::app::App;
     use crate::config::Config;
     use crossbeam_channel::unbounded;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -5266,6 +5373,22 @@ mod key_tests {
 
     // === PAN-21: global `k` abort ===================================
 
+    /// PAN-121: a bare `k` only opens the abort-confirm modal for `qso_id`
+    /// and sends nothing; the caller's `y` then sends the abort.
+    async fn assert_k_opened_confirm(
+        cmd_rx: &crossbeam_channel::Receiver<TuiCommand>,
+        app: &Arc<RwLock<App>>,
+        qso_id: &str,
+    ) {
+        assert!(cmd_rx.try_recv().is_err(), "k alone must send nothing");
+        let pending = app.read().await.pending_qso_abort.clone();
+        assert_eq!(
+            pending.map(|p| p.qso_id).as_deref(),
+            Some(qso_id),
+            "k must open the confirm modal for the selected QSO"
+        );
+    }
+
     /// Acceptance scenario 1: pressing `k` from the DX Hunter panel (not
     /// QSO Status) aborts the selected/pinned QSO, echoes the callsign, and
     /// leaves focus exactly where it was — no forced panel switch.
@@ -5278,6 +5401,8 @@ mod key_tests {
             a.active_panel = crate::app::ActivePanel::DxHunter;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
@@ -5306,6 +5431,8 @@ mod key_tests {
                 a.active_panel = panel;
             }
             r.handle_key_event(key('k')).await.unwrap();
+            assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+            r.handle_key_event(key('y')).await.unwrap();
             assert!(
                 matches!(
                     cmd_rx.try_recv(),
@@ -5327,6 +5454,8 @@ mod key_tests {
             a.active_panel = crate::app::ActivePanel::QsoStatus;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
@@ -5357,6 +5486,10 @@ mod key_tests {
                 !app.read().await.status_message.contains("Aborting"),
                 "{modified_key:?} must not even attempt an abort status update"
             );
+            assert!(
+                app.read().await.pending_qso_abort.is_none(),
+                "{modified_key:?} must not open the abort confirmation"
+            );
         }
 
         // A bare, unmodified k in the same setup still aborts — proves the
@@ -5368,6 +5501,8 @@ mod key_tests {
             a.active_panel = crate::app::ActivePanel::QsoStatus;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
@@ -5415,6 +5550,8 @@ mod key_tests {
             a.show_why = true;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1")
         );
@@ -5441,6 +5578,10 @@ mod key_tests {
                 assert!(
                     cmd_rx.try_recv().is_err(),
                     "{modified_key:?} must not abort through an overlay"
+                );
+                assert!(
+                    app.read().await.pending_qso_abort.is_none(),
+                    "{modified_key:?} must not open the abort confirmation"
                 );
             }
         }
@@ -5469,6 +5610,10 @@ mod key_tests {
                     .status_message
                     .contains("No active QSO to abort"),
                 "expected the no-active-QSO hint from {panel:?}"
+            );
+            assert!(
+                app.read().await.pending_qso_abort.is_none(),
+                "no modal opens with no active QSO ({panel:?})"
             );
         }
     }
@@ -5505,6 +5650,8 @@ mod key_tests {
         // `k` no longer scrolls either — it falls through to abort, and the
         // overlay stays open (k is not its dismiss key).
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert_eq!(
             app.read().await.diagnostics_scroll,
             4,
@@ -5538,6 +5685,8 @@ mod key_tests {
         assert_eq!(app.read().await.recent_qsos_scroll, 0);
 
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
@@ -5559,6 +5708,8 @@ mod key_tests {
             a.show_health = true;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
@@ -5635,11 +5786,369 @@ mod key_tests {
             a.help_visible = true;
         }
         r.handle_key_event(key('k')).await.unwrap();
+        assert_k_opened_confirm(&cmd_rx, &app, "qso-1").await;
+        r.handle_key_event(key('y')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         assert!(app.read().await.help_visible, "overlay stays open");
+    }
+
+    // ---- PAN-121: `k` asks before aborting ----
+
+    fn key_kind(c: char, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::NONE, kind)
+    }
+
+    fn special_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Runner with W1AW (`qso-1`) selected, and K1ABC (`qso-2`) also active
+    /// when `two` is set.
+    async fn abort_runner(
+        two: bool,
+    ) -> (
+        TuiRunner,
+        crossbeam_channel::Receiver<TuiCommand>,
+        Arc<RwLock<App>>,
+    ) {
+        let (r, cmd_rx, app) = make_runner().await;
+        let mut qsos = vec![banner("W1AW", "qso-1")];
+        if two {
+            qsos.push(banner("K1ABC", "qso-2"));
+        }
+        app.write().await.apply_active_qsos(qsos, Vec::new());
+        (r, cmd_rx, app)
+    }
+
+    /// First `k` emits nothing from every everyday panel and read-only
+    /// overlay; `y` then emits exactly one abort for the captured QSO and
+    /// leaves the underlying view as it was.
+    #[tokio::test]
+    async fn abort_confirm_from_every_panel_and_read_only_overlay() {
+        type Setup = fn(&mut App);
+        type Check = fn(&App) -> bool;
+        let views: [(&str, Setup, Check); 9] = [
+            (
+                "BandActivity",
+                |a| a.active_panel = crate::app::ActivePanel::BandActivity,
+                |a| a.active_panel == crate::app::ActivePanel::BandActivity,
+            ),
+            (
+                "DxHunter",
+                |a| a.active_panel = crate::app::ActivePanel::DxHunter,
+                |a| a.active_panel == crate::app::ActivePanel::DxHunter,
+            ),
+            (
+                "Callers",
+                |a| a.active_panel = crate::app::ActivePanel::Callers,
+                |a| a.active_panel == crate::app::ActivePanel::Callers,
+            ),
+            (
+                "QsoStatus",
+                |a| a.active_panel = crate::app::ActivePanel::QsoStatus,
+                |a| a.active_panel == crate::app::ActivePanel::QsoStatus,
+            ),
+            ("Help", |a| a.help_visible = true, |a| a.help_visible),
+            (
+                "Diagnostics",
+                |a| a.show_diagnostics = true,
+                |a| a.show_diagnostics,
+            ),
+            (
+                "RecentQsos",
+                |a| a.show_recent_qsos = true,
+                |a| a.show_recent_qsos,
+            ),
+            ("Why", |a| a.show_why = true, |a| a.show_why),
+            ("StationHealth", |a| a.show_health = true, |a| a.show_health),
+        ];
+        for (name, setup, still_there) in views {
+            let (mut r, cmd_rx, app) = abort_runner(false).await;
+            setup(&mut *app.write().await);
+            r.handle_key_event(key('k')).await.unwrap();
+            assert!(cmd_rx.try_recv().is_err(), "{name}: k alone sends nothing");
+            assert_eq!(
+                app.read().await.pending_qso_abort,
+                Some(crate::app::PendingQsoAbort {
+                    qso_id: "qso-1".into(),
+                    callsign: "W1AW".into(),
+                }),
+                "{name}: k opens the confirm modal"
+            );
+            r.handle_key_event(key('y')).await.unwrap();
+            assert!(
+                matches!(
+                    cmd_rx.try_recv(),
+                    Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+                ),
+                "{name}: y sends the abort"
+            );
+            assert!(cmd_rx.try_recv().is_err(), "{name}: exactly one command");
+            let a = app.read().await;
+            assert!(a.pending_qso_abort.is_none(), "{name}");
+            assert_eq!(a.status_message, "Aborting QSO with W1AW", "{name}");
+            assert!(still_there(&a), "{name}: underlying view preserved");
+        }
+    }
+
+    /// Shift+Y confirms like `y`.
+    #[tokio::test]
+    async fn abort_confirm_accepts_shift_y() {
+        let (mut r, cmd_rx, _app) = abort_runner(false).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        r.handle_key_event(key_shift('Y')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+    }
+
+    /// n, N, Esc and Enter cancel; Enter is the safe default. A later `y`
+    /// does nothing.
+    #[tokio::test]
+    async fn abort_confirm_cancel_keys_send_nothing() {
+        for cancel in [
+            key('n'),
+            key_shift('N'),
+            special_key(KeyCode::Esc),
+            special_key(KeyCode::Enter),
+        ] {
+            let (mut r, cmd_rx, app) = abort_runner(false).await;
+            r.handle_key_event(key('k')).await.unwrap();
+            r.handle_key_event(cancel).await.unwrap();
+            {
+                let a = app.read().await;
+                assert!(a.pending_qso_abort.is_none(), "{cancel:?} cancels");
+                assert_eq!(a.status_message, "QSO abort cancelled", "{cancel:?}");
+            }
+            r.handle_key_event(key('y')).await.unwrap();
+            assert!(cmd_rx.try_recv().is_err(), "{cancel:?}: nothing sent");
+        }
+    }
+
+    /// While the modal is open, a repeated `k`, Ctrl/Alt+y and keys that
+    /// would otherwise act (CQ, PTT, tune) are swallowed: nothing is sent
+    /// and the original target stays pending.
+    #[tokio::test]
+    async fn abort_confirm_swallows_other_keys_and_repeated_k() {
+        let (mut r, cmd_rx, app) = abort_runner(false).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        for other in [
+            key('k'),
+            key('k'),
+            key('c'),
+            key('p'),
+            key_shift('T'),
+            key_ctrl('y'),
+            key_alt('y'),
+            key('q'),
+        ] {
+            r.handle_key_event(other).await.unwrap();
+            assert!(cmd_rx.try_recv().is_err(), "{other:?} must send nothing");
+            let a = app.read().await;
+            assert_eq!(
+                a.pending_qso_abort.as_ref().map(|p| p.qso_id.as_str()),
+                Some("qso-1"),
+                "{other:?} must leave the confirmation pending"
+            );
+            assert!(!a.quit_confirm_visible, "{other:?}");
+        }
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// Key-repeat and release events can neither open the modal nor
+    /// confirm it.
+    #[tokio::test]
+    async fn abort_confirm_ignores_held_and_released_keys() {
+        let (mut r, cmd_rx, app) = abort_runner(false).await;
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            r.handle_key_event(key_kind('k', kind)).await.unwrap();
+            assert!(
+                app.read().await.pending_qso_abort.is_none(),
+                "{kind:?} k must not open the modal"
+            );
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            r.handle_key_event(key_kind('y', kind)).await.unwrap();
+            assert!(cmd_rx.try_recv().is_err(), "{kind:?} y must not confirm");
+            assert!(app.read().await.pending_qso_abort.is_some());
+        }
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+    }
+
+    /// Confirming twice sends one abort; the second `y` does nothing.
+    #[tokio::test]
+    async fn abort_confirm_twice_sends_one_abort() {
+        let (mut r, cmd_rx, _app) = abort_runner(false).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        r.handle_key_event(key('y')).await.unwrap();
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(cmd_rx.try_recv().is_err(), "second y sends nothing");
+    }
+
+    /// A snapshot that reorders the active list keeps the captured target.
+    #[tokio::test]
+    async fn abort_confirm_survives_snapshot_reorder() {
+        let (mut r, cmd_rx, app) = abort_runner(true).await;
+        assert_eq!(app.read().await.selected_qso_id().as_deref(), Some("qso-1"));
+        r.handle_key_event(key('k')).await.unwrap();
+        app.write().await.apply_active_qsos(
+            vec![banner("K1ABC", "qso-2"), banner("W1AW", "qso-1")],
+            Vec::new(),
+        );
+        assert!(app.read().await.pending_qso_abort.is_some());
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// The target leaving the active list cancels the abort, even though
+    /// another QSO is now selected; that QSO is never aborted instead.
+    #[tokio::test]
+    async fn abort_confirm_cancels_when_target_vanishes() {
+        let (mut r, cmd_rx, app) = abort_runner(true).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        app.write()
+            .await
+            .apply_active_qsos(vec![banner("K1ABC", "qso-2")], Vec::new());
+        {
+            let a = app.read().await;
+            assert_eq!(a.selected_qso_id().as_deref(), Some("qso-2"));
+            assert!(a.pending_qso_abort.is_none());
+            assert_eq!(
+                a.status_message,
+                "QSO with W1AW is no longer active; abort cancelled"
+            );
+        }
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "K1ABC must not be aborted");
+    }
+
+    /// Confirm re-checks the captured id against the latest active list,
+    /// so a target that vanished without a snapshot pass is still refused.
+    #[tokio::test]
+    async fn abort_confirm_rechecks_target_at_confirm_time() {
+        let (mut r, cmd_rx, app) = abort_runner(true).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        app.write()
+            .await
+            .active_qsos
+            .retain(|q| q.qso_id != "qso-1");
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "nothing aborted");
+        let a = app.read().await;
+        assert!(a.pending_qso_abort.is_none());
+        assert_eq!(
+            a.status_message,
+            "QSO with W1AW is no longer active; abort cancelled"
+        );
+    }
+
+    /// Shift+Q still stops the station at once while the modal is open,
+    /// and leaves no pending abort behind.
+    #[tokio::test]
+    async fn shift_q_during_abort_confirm_stops_and_clears_pending() {
+        let (mut r, cmd_rx, app) = abort_runner(false).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        assert!(app.read().await.pending_qso_abort.is_none());
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "no stale abort after Shift+Q");
+    }
+
+    /// A required out-of-band acknowledgment outranks a pending abort and
+    /// cancels it: acknowledging never reveals the stale prompt.
+    #[tokio::test]
+    async fn out_of_band_ack_cancels_pending_abort() {
+        let (mut r, cmd_rx, app) = abort_runner(false).await;
+        r.handle_key_event(key('k')).await.unwrap();
+        app.write().await.out_of_band_ack_visible = true;
+        let rows = render_rows(&mut *app.write().await, 80, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains("Abort QSO with")),
+            "the abort prompt never draws over the acknowledgment"
+        );
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "y can't confirm under the ack");
+        r.handle_key_event(special_key(KeyCode::Enter))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(!a.out_of_band_ack_visible);
+        assert!(a.pending_qso_abort.is_none(), "no stale prompt afterward");
+        drop(a);
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    fn render_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| TuiRunner::draw_frame(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h).map(|y| cells_text(&buf, y, 0..w)).collect()
+    }
+
+    /// The modal draws its exact text on top of Help and the Diagnostics
+    /// overlay at the 80×20 floor and at 80×24.
+    #[tokio::test]
+    async fn abort_confirm_renders_above_read_only_overlays() {
+        type Setup = fn(&mut App);
+        let overlays: [(&str, Setup); 2] = [
+            ("Help", |a| a.help_visible = true),
+            ("Diagnostics", |a| a.show_diagnostics = true),
+        ];
+        for (w, h) in [(80, 20), (80, 24)] {
+            for (name, setup) in overlays {
+                let (mut r, _cmd_rx, app) = abort_runner(false).await;
+                setup(&mut *app.write().await);
+                let before = render_rows(&mut *app.write().await, w, h);
+                assert!(
+                    !before
+                        .iter()
+                        .any(|row| row.contains("Abort QSO with W1AW?")),
+                    "{name} {w}x{h}: no modal before k"
+                );
+                r.handle_key_event(key('k')).await.unwrap();
+                let rows = render_rows(&mut *app.write().await, w, h);
+                for want in [
+                    " Confirm abort ",
+                    "Abort QSO with W1AW?",
+                    "y = abort    n / Esc / Enter = cancel",
+                    "Shift+Q = EMERGENCY STOP",
+                ] {
+                    assert!(
+                        rows.iter().any(|row| row.contains(want)),
+                        "{name} {w}x{h}: missing {want:?} in\n{}",
+                        rows.join("\n")
+                    );
+                }
+            }
+        }
     }
 
     // ---- PAN-88: scrollable `?` overlay ----

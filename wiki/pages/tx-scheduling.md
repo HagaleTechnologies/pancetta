@@ -136,3 +136,10 @@ dial, and releases the mutex before awaiting completion. Queue status alone
 does not hold the worker before its final band-plan check. Keep these event
 boundaries when changing the tests; a settling sleep cannot establish either
 ordering.
+
+PTT-method gotcha (PAN-121): `[rig.ptt].method` does not choose how TX is keyed.
+Normal PTT always goes to rigctld as `T 1`/`T 0`, and managed rigctld is spawned
+without a PTT option. Setup, the rig picker and bookmarks only store or print the
+method; only `test-rig --ptt` acts on it (Serial pulses RTS).
+There is no CM108 variant. See
+[the audit](../../docs/DECISIONS/tx-scheduling.md#what-the-configured-ptt-method-actually-controls-pan-121-2026-11-01).
