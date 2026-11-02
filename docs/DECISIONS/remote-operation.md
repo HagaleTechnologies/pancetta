@@ -1041,43 +1041,6 @@ No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
 needed.
 
-<<<<<<< HEAD
-
-## PAN-252: a remote QSY never retunes a keyed rig or moves a station-run QSO
-
-Every station-agent peer arrives over the cloud relay and has no local trust.
-The TUI and WSJT-X command paths remain unchanged. Before controller or scope
-checks, `Qsy` and `SetSplit` refuse when `ptt_active` is set, then when any
-active QSO has no `metadata.remote_client_key_id`. This includes local,
-autonomous and WSJT-X bridge QSOs, including CallingCq. A cloud-bound QSO
-does not block an unkeyed QSY. Autonomous enabled but idle does not block it.
-
-Each refusal logs on `agent.control` and sends only the requesting peer a
-`ServerEvent::Error` with component `stationAgent`. It neither grabs control
-nor creates QSO cleanup work, changes the split atomic, echoes split status,
-or writes an audit event. The messages are:
-
-- `setFrequency refused — the rig is transmitting`
-- `setFrequency refused — the station is running a local or autonomous QSO`
-- `setSplit refused — the rig is transmitting`
-- `setSplit refused — the station is running a local or autonomous QSO`
-
-The activity check applies to both VFOs because VFO B can carry TX in split
-operation. It borrows the QSO-manager watch afresh and clones the manager before
-awaiting, so a QSO-component restart publishes the replacement to the guard.
-An unpublished manager means there is no QSO block; PTT still blocks.
-
-The Hamlib command loop also discards only StationAgent-sourced SetFrequency
-while `ptt_active || ptt_on_since.is_some()`, covering manual PTT and a command
-queued before key-down. It retires any matching producer mark without marking
-the command applied or pending. Local frequency commands keep their behavior.
-SetSplit deliberately has no Hamlib drop. Once forwarded, its atomic reflects
-the accepted command, and dropping it later could make the band-plan gate read
-a split the rig never applied. The dispatch-time guard covers split changes.
-
-No new wire shape is introduced. Replace the Error response with commandAck
-when that contract exists; this ticket does not wait for it.
-=======
 ## Explicit takeover needs qsy scope (PAN-253, 2026-11-01)
 
 A station-agent viewer whose verified hello granted only `status` could send
@@ -1133,4 +1096,54 @@ and then sends the stop whether or not the flush succeeded. Both messages
 reduce TX, so their order does not matter. A frame already on the air
 finishes, as with the local `s` key; `Disarm` remains the immediate TX-off
 control. No wire, protocol or config change is involved.
->>>>>>> 419a1557f549df99fef549d203622da57d63c4dd
+
+## PAN-252: a remote QSY never retunes a keyed rig or moves a station-run QSO
+
+Every station-agent peer arrives over the cloud relay and has no local trust.
+The TUI and WSJT-X command paths remain unchanged. Before controller or scope
+checks, `Qsy` and `SetSplit` refuse when the rig is keyed, then when any
+active QSO has no `metadata.remote_client_key_id`. That QSO check covers local,
+autonomous and WSJT-X bridge QSOs, including CallingCq. A cloud-bound QSO
+does not block an unkeyed QSY. Autonomous enabled but idle does not block it.
+
+Keyed means the TX worker's `ptt_active` is set, or the bus `gain_tx_gate`
+holds a key-down reservation. `tx::send_ptt_command` sets that reservation for
+every PTT-on path, including manual PTT and tune with no QSO, as soon as the
+key-down is enqueued. Hamlib clears it when it acknowledges a bus PTT-off, and
+a receive-gain restore clears it after reading PTT off. The bounds:
+
+- An acknowledged unkey also clears the reservation of a key-down queued behind
+  it. Until Hamlib takes that key-down, the check does not see it.
+- A PTT-off that fails, or an unkey forced outside the bus (the PTT watchdog,
+  Hamlib teardown), leaves the reservation set. Remote QSY stays refused until
+  the next acknowledged bus PTT-off.
+- PTT keyed outside pancetta (front-panel MOX, a foot switch, VOX, another CAT
+  client) is not detected.
+
+Each refusal logs on `agent.control` and sends only the requesting peer a
+`ServerEvent::Error` with component `stationAgent`. It neither grabs control
+nor creates QSO cleanup work, changes the split atomic, echoes split status,
+or writes an audit event. The messages are:
+
+- `setFrequency refused — the rig is transmitting`
+- `setFrequency refused — the station is running a local or autonomous QSO`
+- `setSplit refused — the rig is transmitting`
+- `setSplit refused — the station is running a local or autonomous QSO`
+
+The activity check applies to both VFOs because VFO B can carry TX in split
+operation. It borrows the QSO-manager watch afresh and clones the manager before
+awaiting, so a QSO-component restart publishes the replacement to the guard.
+An unpublished manager means there is no QSO block; PTT still blocks.
+
+The Hamlib command loop also discards only StationAgent-sourced SetFrequency
+while `ptt_active || ptt_on_since.is_some()`, covering manual PTT and a command
+queued before key-down. It retires any matching producer mark without marking
+the command applied or pending. Local frequency commands keep their behavior.
+SetSplit deliberately has no Hamlib drop. Once forwarded, its atomic reflects
+the accepted command, and dropping it later could make the band-plan gate read
+a split the rig never applied. The dispatch-time guard covers split changes,
+including while a manual key-down is held. A key-down that starts after the
+guard passes, while dispatch is still awaiting, is not re-checked.
+
+No new wire shape is introduced. Replace the Error response with commandAck
+when that contract exists; this ticket does not wait for it.

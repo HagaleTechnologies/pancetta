@@ -871,8 +871,14 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
     }
 }
 
-async fn remote_qsy_refusal(ctx: &ArmContext) -> Option<&'static str> {
-    if ctx.station_activity.ptt_active.load(Ordering::Acquire) {
+async fn remote_qsy_refusal(ctx: &ArmContext, bus: &MessageBus) -> Option<&'static str> {
+    // `ptt_active` is the TX worker's flag. Manual PTT and tune key through
+    // `tx::send_ptt_command`, which sets bit 1 of `gain_tx_gate` once a key-down
+    // is enqueued; Hamlib clears it on an acknowledged bus PTT-off. Bits 2+
+    // count key-downs mid-enqueue. Bit 0 is the receive-gain transition.
+    if ctx.station_activity.ptt_active.load(Ordering::Acquire)
+        || bus.gain_tx_gate.load(Ordering::Acquire) & !1 != 0
+    {
         return Some("the rig is transmitting");
     }
     // Drop watch::Ref before awaiting the manager, allowing restart publication.
@@ -1071,7 +1077,7 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
-            if let Some(reason) = remote_qsy_refusal(ctx).await {
+            if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setFrequency", reason);
             }
             let grab = match controller_gate(ctx, peer, now) {
@@ -1093,7 +1099,7 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
-            if let Some(reason) = remote_qsy_refusal(ctx).await {
+            if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setSplit", reason);
             }
             let grab = match controller_gate(ctx, peer, now) {
@@ -5348,15 +5354,9 @@ mod tests {
         );
     }
 
-    /// Rule 4: a control-mutating action from a peer that is NOT the controller
-    /// is refused — it never reaches the rig, never implicitly grabs, and the
-    /// refused peer receives an `Error` frame (targeted at just it). B is given
-    /// qsy scope so the refusal is proven at the CONTROLLER layer, not the scope
-<<<<<<< HEAD
-    /// layer.
-
     async fn check_station_activity_qsy(
         keyed: bool,
+        manual_ptt: bool,
         qso: Option<(bool, Option<String>)>,
         split: bool,
         allowed: bool,
@@ -5385,6 +5385,17 @@ mod tests {
             .store(14_090_000, Ordering::Release);
         let bus = MessageBus::new(64).unwrap();
         let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        if manual_ptt {
+            // A TUI manual key-down: the worker's `ptt_active` stays false.
+            assert_eq!(
+                crate::coordinator::tx::send_ptt_command(&bus, ComponentId::Tui, true, || true),
+                crate::message_bus::SendIfOutcome::Enqueued
+            );
+            assert!(matches!(
+                hamlib_rx.try_recv().unwrap().message_type,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+            ));
+        }
         let action = if split {
             ControlAction::SetSplit {
                 enabled: true,
@@ -5420,7 +5431,7 @@ mod tests {
                 14_090_000
             );
             assert_eq!(out.sends.len(), 1);
-            let reason = if keyed {
+            let reason = if keyed || manual_ptt {
                 "the rig is transmitting"
             } else {
                 "the station is running a local or autonomous QSO"
@@ -5436,39 +5447,59 @@ mod tests {
 
     #[tokio::test]
     async fn qsy_refused_while_rig_is_keyed() {
-        check_station_activity_qsy(true, None, false, false).await;
+        check_station_activity_qsy(true, false, None, false, false).await;
     }
 
     #[tokio::test]
     async fn qsy_refused_while_a_local_qso_is_active() {
-        check_station_activity_qsy(false, Some((false, None)), false, false).await;
+        check_station_activity_qsy(false, false, Some((false, None)), false, false).await;
     }
 
     #[tokio::test]
     async fn qsy_refused_while_a_wsjtx_bridge_qso_is_active() {
-        check_station_activity_qsy(false, Some((true, None)), false, false).await;
+        check_station_activity_qsy(false, false, Some((true, None)), false, false).await;
     }
 
     #[tokio::test]
     async fn qsy_allowed_while_only_a_cloud_client_qso_is_active() {
-        check_station_activity_qsy(false, Some((true, Some(CLIENT_KEY_ID.into()))), false, true)
-            .await;
+        check_station_activity_qsy(
+            false,
+            false,
+            Some((true, Some(CLIENT_KEY_ID.into()))),
+            false,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn set_split_refused_while_rig_is_keyed() {
-        check_station_activity_qsy(true, None, true, false).await;
+        check_station_activity_qsy(true, false, None, true, false).await;
     }
 
     #[tokio::test]
     async fn set_split_refused_while_a_local_qso_is_active() {
-        check_station_activity_qsy(false, Some((false, None)), true, false).await;
+        check_station_activity_qsy(false, false, Some((false, None)), true, false).await;
     }
 
-=======
+    /// Manual PTT with no QSO: the worker flag is false, so only the bus
+    /// key-down reservation shows the rig keyed.
+    #[tokio::test]
+    async fn qsy_refused_while_manual_ptt_is_keyed() {
+        check_station_activity_qsy(false, true, None, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_while_manual_ptt_is_keyed() {
+        check_station_activity_qsy(false, true, None, true, false).await;
+    }
+
+    /// Rule 4: a control-mutating action from a peer that is NOT the controller
+    /// is refused — it never reaches the rig, never implicitly grabs, and the
+    /// refused peer receives an `Error` frame (targeted at just it). B is given
+    /// qsy scope so the refusal is proven at the CONTROLLER layer, not the scope
     /// layer; A gets qsy scope too so its explicit takeover is authorized
     /// (PAN-253).
->>>>>>> 419a1557f549df99fef549d203622da57d63c4dd
     #[tokio::test]
     async fn non_controller_qsy_refused_with_error_frame() {
         let mut ctx = ctx_with(true, true);
