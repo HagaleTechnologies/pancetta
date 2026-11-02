@@ -1039,6 +1039,7 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
   helper is tested directly.
 
+<<<<<<< HEAD
 ## What the configured PTT method actually controls (PAN-121, 2026-11-01)
 
 An audit, not a behavior change. `[rig.ptt].method` is `pancetta_config::rig::PttMethod`
@@ -1067,3 +1068,73 @@ support. The separate `pancetta_ft8::transmit::PttMethod` enum is not fed by thi
 Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime path, is separate
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
+=======
+## High SWR halts the station (PAN-251), 2026-11-01
+
+`[rig.power_control.protection] swr_protection` (default on) and `max_swr` (default 3.0) were
+read by nothing. `RigctldClient::get_swr` turned an unparseable reply into `Ok(1.0)`, and the
+mock rig could not report above 3.0:1, so a rig with a bad antenna looked protected and was not.
+The guard lives in `pancetta/src/coordinator/swr_guard.rs`; the halt it shares with Shift+Q is
+`pancetta/src/coordinator/tx_halt.rs`.
+
+- **Gate on `swr_protection` alone.** `[rig.power_control].enabled` defaults to false and means
+  "set rig power". Gating on it would leave the default-on protection off.
+- **Trip on one valid reading strictly above `max_swr`.** A valid reading is finite and at least
+  1.0. `0.0`, which Hamlib may report with no RF, is "no reading", never "perfect"; anything
+  below 1.0 is ignored the same way. One reading is enough (`SWR_TRIP_CONSECUTIVE_READINGS = 1`),
+  as the ticket's scenario reads. Whether key-down transients need two is a question for the
+  real-rig step, which can raise the constant without a redesign.
+- **Keyed means `ptt_active || ptt_on_since.is_some()`.** `ptt_active` is the TX worker's
+  `PttGuard` (single, bundle, tune). `ptt_on_since` is the Hamlib loop's record of any accepted
+  `SetPtt(true)`, so manual PTT counts. Before this change manual PTT got no SWR samples at all.
+- **A trip is the Shift+Q halt plus an explicit PTT-off.** `TxHaltHandles::halt()` is
+  synchronous and stores abort, autonomous off and `TxPolicy::Disabled` with no await in
+  between. `cancel_all_qsos()` sends `CancelAllQsos` through `send_message_durable`, so a full
+  QSO channel parks it instead of dropping it; Shift+Q now gets that durability too. The trip
+  also enqueues `send_ptt_command(.., false, || true)`, so a manual-PTT carrier and a stuck
+  worker unkey, and on every later keyed tick before unkey it re-asserts abort and PTT-off. The
+  14 s PTT watchdog stays the last backstop.
+- **The latch lives in `TxPolicy`, not in a health mute.** The PAN-5 restart window and the
+  PAN-115 CAT-link and audio-output mutes clear on their own because the fault can be seen
+  clearing while receiving. SWR can only be read under forward power, so a self-clearing gate
+  could never see the fault clear without keying into it. The trip latches until a person
+  acts: `g` re-enables TX after the antenna is fixed and `a` resumes autonomous. Headless
+  stations stay RX-only until restart, because both are TUI keys.
+- **Unavailable is warned about, never blocked.** On a real CAT rig with protection on, the
+  first connected poll tick calls `reports_swr()` (rigctld `+\dump_caps`, `Get level:` contains
+  `SWR`) with a 3 s timeout (`SWR_PROBE_TIMEOUT`). `Ok(false)` is Unsupported and alerts at once:
+  `SWR protection is unavailable on this rig (it does not report SWR over CAT)`. An error or
+  timeout is Unknown and is not alerted at startup, so a rigctld without the `+` protocol never
+  raises a false alarm. The runtime check covers that case: a keyed period of at least
+  `SWR_UNAVAILABLE_MIN_ATTEMPTS = 4` poll ticks (500 ms each) with no valid reading alerts once:
+  `SWR protection is unavailable on this rig (no SWR reading during the last transmission)`.
+  Both alerts share one latch per Hamlib session, and a valid reading re-arms it. With rig
+  control off (mock rig) there are no availability alerts, because the strip already says
+  `rig: no CAT`. The trip itself acts on whatever rig is in use, the mock included.
+- **The rig layer stops inventing readings.** `RigctldClient::get_swr` reads once through
+  `send_command` (like `get_split`) and returns `Err` on an unparseable reply; `RigStatus.swr`
+  from rigctld is `None`. `MockRig` with `simulate_swr: false` returns `Err(not_supported)` and
+  `swr: None`, and `swr_override: Option<f32>` returns a fixed, unclamped reading. The poll loop
+  already redials a dropped link, so dropping the old 3x retry loses nothing.
+- **The threshold is validated at load.** With protection on, `max_swr` must be finite and
+  above 1.0, or config validation fails with `Invalid configuration value:
+  power_control.protection.max_swr = 0.5 (must be a number above 1.0 while swr_protection =
+  true)`. The guard also replaces an invalid in-code value with 3.0 and logs a warning.
+- **Only valid readings reach the status-bar chip**, so an `Ok(0.0)` no longer shows as
+  `SWR 0.0:1`.
+- **Alert strings are fixed.** The trip alert is `High SWR {swr:.2}:1 (limit {max_swr}:1): TX
+  halted. Check the antenna, then press g to re-enable TX`, with a retained Shift+D entry under
+  target `rig.swr`. The reading uses two decimals so 3.04 never shows as "3.0" next to a 3.0
+  limit; the limit uses `f32` Display, so it shows as `3`.
+- **Test seam.** One `#[cfg(test)]` coordinator field, `test_mock_rig`, which
+  `start_hamlib_component` uses instead of `MockRig::default()` on the rig-disabled path.
+  Production code paths do not change.
+- **Alternatives rejected.** A new `TxMuteCause::HighSwr` with its own clear key: about 30
+  `tx_hard_mute_reason`/`tx_mute_causes` sites across two crates plus `pancetta-tui`, for no
+  behavior the ticket asks for. Gating on `power_control.enabled`: leaves the default-on
+  protection off. A per-frame abort: the QSO engine re-keys the same frame next slot. Blocking
+  TX on a rig that cannot report SWR: the ticket asks for a warning, not a block, and TX on
+  such a rig behaves as it did before. Keeping the 3x retry in `get_swr`: the coordinator
+  already samples every 500 ms while keyed and the poll loop redials a dropped link, so the
+  retry only added warnings.
+>>>>>>> e9f5803f735f324e54dc81db5b7e2ede4aaec834
