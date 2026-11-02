@@ -169,6 +169,11 @@ current status.
 
 ## Quick start
 
+Upgrading an existing station? Stop Pancetta and all logbook writers, then
+complete the verified backup in [Upgrade and rollback](docs/UPGRADING.md)
+before replacing or starting a binary. Keep the prior version directory.
+Automatic database backups do not include your complete logbook or configuration.
+
 **Prebuilt binaries.** No Rust toolchain needed. Starting with the first
 tagged release after this note was added, every
 [release](https://github.com/HagaleTechnologies/pancetta/releases/latest)
@@ -302,6 +307,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
+| SWR protection | Integration-tested, *Unreleased* | Halts all TX on one SWR reading above `max_swr` (default 3.0) while keyed; needs CAT. Mock rig and fake `rigctld` only; no real-rig trip recorded | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
 | Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
 | ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
@@ -314,6 +320,22 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
+
+### Platform archive evidence
+
+| Platform archive | Build-tested | Replay-tested | Radio-qualified |
+|---|---|---|---|
+| macOS Apple Silicon | Release CI build and native-C linkage smoke | Not established by this release workflow | No recorded platform qualification |
+| Linux x86_64 GNU | Release CI build and native-C linkage smoke | Not established by this release workflow | No recorded platform qualification |
+| Linux ARM64 GNU | Release CI build and native-C linkage smoke | Decoder fixture replay only, nine off-air recordings on cloud ARM64 | No Raspberry Pi or other physical ARM station qualification |
+| Windows x86_64 MinGW | Release CI build and native-C linkage smoke | Not established by this release workflow | Historical Windows 11 / Yaesu FTdx10 station evidence; not a radio test of each release |
+
+Build-tested means the archive binary built and passed the release's native decoder linkage check. Replay-tested identifies the exact recorded-input test and runner; decoder fixture replay does not establish full-application replay. Radio-qualified requires a named physical station and environment. Historical station use does not qualify every new release or every radio.
+
+Linux ARM64 archives require glibc >= 2.35, such as Raspberry Pi OS Bookworm
+or newer. Bullseye-era images cannot load them. Cloud ARM decoder replay
+does not qualify Raspberry Pi hardware. macOS binaries remain unnotarized;
+see README's quarantine-removal instructions.
 
 ## Why not (yet)
 

@@ -92,12 +92,12 @@ permissions:
 
 jobs:
   # ============================================================================================
-  # Producer half: fires on every pull_request_target action. Creates/
+  # Producer half: fires on every non-draft pull_request_target action. Creates/
   # upserts the "Codex review clean (gate before expensive downstream jobs)" check-run and
   # asks Codex to look -- never waits for a response itself. Either an immediate
-  # pass-through (applies the codex-clean label directly, no Codex round to wait on) or
-  # leaves the check-run in_progress for codex-review-response below to complete once Codex
-  # actually replies.
+  # pass-through (a completed, successful check-run and no review request; it applies no
+  # codex-clean label) or leaves the check-run in_progress for codex-review-response below
+  # to complete once Codex actually replies.
   # ============================================================================================
   codex-review-request:
     # Codex P1, this PR's own round 8 (redesign after rounds 2/6/7 each patched a
@@ -122,20 +122,24 @@ jobs:
     # handles -- merge_group calls it directly (mirroring the real-round path below), rather
     # than depending on native job-skip/job-success attribution.
     #
-    # Codex P1, this PR's own round 14: round 8 ALSO moved Dependabot into this same
-    # explicit-upsert bucket (removing it from this job-level exclusion) -- but GitHub
-    # withholds Actions secrets for Dependabot-triggered pull_request_target events (the
-    # EXACT reason pancetta's own pre-migration file excluded Dependabot at the job level in
-    # the first place, per that file's own header comment), so the App-token mint step below
-    # fails before ever reaching the IS_DEPENDABOT success branch -- blocking every
-    # Dependabot PR instead of passing it through. Reverted: Dependabot is excluded at the
-    # job level again, exactly like Draft, both for the same underlying reason (this job's
-    # steps -- App-token mint included -- must never run for either). merge_group is
-    # unaffected by this revert: merge_group events are NOT Dependabot-triggered and have
-    # normal secret access, so its own explicit-upsert fix from round 8 stays correct.
+    # PAN-249: Dependabot goes through this same explicit-upsert path. A job-level
+    # exclusion here (PR #399 round 14) left a Dependabot PR with NO check-run under the
+    # required name: since the rename above, a job skipped by `if:` publishes its native
+    # "skipped" check only under "Codex review request (producer)", and ci.yml's label gate
+    # only polls. GitHub withholds Actions secrets from Dependabot runs on push/pull_request,
+    # not on pull_request_target into main (GitHub's pull_request_target exception covers
+    # only a base ref Dependabot created): this repo's own Dependabot Auto-Merge run on PR
+    # #525 (40276929798) logged "Secret source: Actions" with write scopes, and coppa's
+    # producer minted hagale-agent in its codex-review environment for Dependabot runs
+    # 40302227401 and 40302291006. create-check's IS_DEPENDABOT branch then publishes a
+    # completed success and "Request a review" is skipped. If the mint ever fails here, the
+    # failsafe job below tries its own mint, then github.token, to publish a red check
+    # rather than leave the gate absent. Full record:
+    # docs/DECISIONS/config-and-platform.md, "Dependabot pass-through publishes the
+    # required Codex check (PAN-249, 2026-11-01)".
     # merge_group is no longer handled here (Q-0068; see codex-review-merge-group-passthrough).
     name: Codex review request (producer)
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false
     # Q-0068: secrets come from the main-only codex-review environment (pull_request_target
     # runs at main).
     environment:
@@ -268,6 +272,11 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean || 'false' }}
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
+          # PAN-249: a genuine Dependabot update only -- Dependabot's own event, on a PR
+          # Dependabot opened, from this repo's own branch. A human push to a Dependabot
+          # branch (human actor) takes the ordinary review path. A re-run keeps
+          # github.actor, so re-running a Dependabot-triggered run passes through again.
+          IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -o pipefail
 
@@ -330,12 +339,14 @@ jobs:
             fi
           }
 
-          # Bootstrap not live yet, OR the label already exists: pass through
-          # immediately with a completed, successful check-run. Dependabot never reaches
-          # this step at all -- excluded at the job level (see the job's own header
-          # comment), since GitHub withholds secrets from Dependabot-triggered runs and this
-          # step needs the minted App token.
-          if [ "$BOOTSTRAP_STATUS" != "ready" ]; then
+          # A genuine Dependabot update, bootstrap not live yet, OR the label already
+          # exists: pass through immediately with a completed, successful check-run.
+          # Dependabot updates do not wait for a Codex round (PAN-249, see the job's header
+          # comment); this pass-through applies no codex-clean label, which is why ci.yml's
+          # label gate still skips Dependabot.
+          if [ "$IS_DEPENDABOT" = "true" ]; then
+            conclusion="success"
+          elif [ "$BOOTSTRAP_STATUS" != "ready" ]; then
             conclusion="success"
           elif [ "$ALREADY_CLEAN" = "true" ]; then
             conclusion="success"
@@ -881,6 +892,8 @@ jobs:
         # concurrency group -- cancel-in-progress: false on the response job is deliberate
         # (an in-flight thread-resolution loop must finish cleanly, not be killed
         # mid-mutation), so a shared cancellation domain isn't the right fix here.
+        # This is not the only guard: compute-verdict's auto-resolve loop re-reads the
+        # live head before every thread and stops as soon as it has moved (PAN-254).
         if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.verdict.outputs.codex_errored != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1057,8 +1070,32 @@ jobs:
             exit 0
           fi
 
-          echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv' | while IFS=$'\t' read -r thread_id path finding_sha; do
+          # PAN-254: the loop reads a captured string, not a pipe. The head check's
+          # `break` below would otherwise close the pipe on a jq still writing a list
+          # longer than the pipe buffer, and under pipefail that SIGPIPE (exit 141)
+          # fails the step after outcome=success was written.
+          resolvable_tsv=$(echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv')
+          while IFS=$'\t' read -r thread_id path finding_sha; do
             [ -z "$thread_id" ] && continue
+            # PAN-254 (ported from propagation f8e1243): freshness-check above reads the
+            # head once, before this loop starts. Each iteration makes about five API
+            # calls, so a push that lands mid-loop would otherwise go unnoticed and the
+            # remaining threads would be resolved with a reply naming a commit that is no
+            # longer the PR head (threads are PR-global, so that can resolve a finding the
+            # new head reintroduced). The live re-reads below check the thread's state,
+            # never the head. `break`, not `continue`: once the head has moved, every
+            # remaining thread is equally stale. A failed lookup fails open, the stance
+            # freshness-check states, and the next iteration checks again. gh's exit status
+            # decides a failed lookup, not empty output: on an HTTP error `gh api` still
+            # prints the JSON error body on stdout, even with --jq, and that body must
+            # not read as a moved head (upstream's `|| echo ""` lets it).
+            LIVE_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/loop-freshness-err.log) || LIVE_HEAD_SHA=""
+            if [ -z "$LIVE_HEAD_SHA" ]; then
+              echo "::warning::Could not re-verify PR #$PR's live head mid-loop -- continuing with the originally captured head rather than aborting a partially-completed auto-resolve pass: $(cat /tmp/loop-freshness-err.log 2>/dev/null)"
+            elif [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::notice::PR #$PR's head advanced from $HEAD_SHA to $LIVE_HEAD_SHA mid-loop -- stopping auto-resolve here. Remaining threads stay unresolved for the new head's own request/response cycle to re-evaluate."
+              break
+            fi
             if [ -z "$finding_sha" ]; then
               echo "::warning::Thread $thread_id has no recorded originating commit — leaving unresolved."
               continue
@@ -1141,7 +1178,7 @@ jobs:
               continue
             fi
             echo "Auto-resolved thread $thread_id"
-          done
+          done <<< "$resolvable_tsv"
 
       - name: Update the check-run
         # freshness-check's own `stale` output must also gate this step (not just

@@ -289,6 +289,22 @@ impl RigctldClient {
         result
     }
 
+    /// One `+\dump_caps` transaction. A failure drops the link like any gain
+    /// transaction; the coordinator's poll loop redials it.
+    async fn dump_caps(&self) -> Result<String> {
+        let replies = self
+            .gain_request(
+                &["+\\dump_caps".to_owned()],
+                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
+                true,
+            )
+            .await?;
+        replies
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Missing dump_caps reply"))
+    }
+
     /// Read an additional line from the connection (for multi-line responses).
     /// Must be called while the connection is still valid.
     async fn read_extra_line(&self) -> Result<String> {
@@ -649,14 +665,11 @@ fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
 #[async_trait]
 impl RigControl for RigctldClient {
     async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
-        let replies = self
-            .gain_request(
-                &["+\\dump_caps".to_owned()],
-                tokio::time::Instant::now() + Duration::from_millis(self.config.command_timeout_ms),
-                true,
-            )
-            .await?;
-        parse_gain_capabilities(&replies[0])
+        parse_gain_capabilities(&self.dump_caps().await?)
+    }
+
+    async fn reports_swr(&self) -> Result<bool> {
+        parse_reports_swr(&self.dump_caps().await?)
     }
 
     async fn get_receive_gain(&self) -> Result<ReceiveGain> {
@@ -803,7 +816,7 @@ impl RigControl for RigctldClient {
             ptt: Some(state.last_ptt),
             power_level: None,
             s_meter: Some(state.last_signal_strength),
-            swr: Some(1.0), // TODO: Get real SWR
+            swr: None, // PAN-251: read live with get_swr; never invented
             memory_channel: None,
             last_update: std::time::Instant::now(),
             last_error: None,
@@ -1082,20 +1095,17 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_swr(&self) -> Result<f32> {
-        // Get SWR reading
-        let response = self.send_command_with_retry("\\get_level SWR").await?;
-
-        // Parse as SWR value. 1.0 is a perfect-match fallback that masks
-        // a real high-SWR reading; warn so this is visible in logs.
-        let swr = response.trim().parse::<f32>().unwrap_or_else(|_| {
-            tracing::warn!(
-                "rigctld: could not parse SWR from '{}', using 1.0",
-                response.trim()
-            );
-            1.0
-        });
-
-        Ok(swr)
+        // PAN-251: read once, without retry warnings. The coordinator samples
+        // every 500 ms while keyed and redials a dropped link itself. Never
+        // invent a reading: an unparseable reply is an error, not 1.0:1.
+        let response = self.send_command("\\get_level SWR").await?;
+        response.trim().parse::<f32>().map_err(|e| {
+            anyhow!(
+                "rigctld: could not parse SWR from '{}': {}",
+                response.trim(),
+                e
+            )
+        })
     }
 
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()> {
@@ -1210,6 +1220,17 @@ fn parse_gain_capabilities(response: &str) -> Result<ReceiveGainCapabilities> {
         preamp_db: steps(field(response, "Preamp:")?)?,
         attenuator_db: steps(field(response, "Attenuator:")?)?,
     })
+}
+
+/// `true` when Hamlib's dump_caps `Get level:` list names SWR.
+fn parse_reports_swr(response: &str) -> Result<bool> {
+    let levels = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Get level:"))
+        .ok_or_else(|| anyhow!("Missing Get level capability field"))?;
+    Ok(levels
+        .split_whitespace()
+        .any(|token| token.split('(').next() == Some("SWR")))
 }
 
 #[cfg(test)]
@@ -1638,6 +1659,118 @@ mod attenuator_tests {
 }
 
 #[cfg(test)]
+mod swr_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fake rigctld: answers every `\get_level SWR` with `reply` and counts
+    /// those requests until the client hangs up. Any other command fails the
+    /// test.
+    async fn swr_fixture(
+        reply: &'static str,
+    ) -> (
+        Arc<RigctldClient>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                assert_eq!(command, "\\get_level SWR\n");
+                counted.fetch_add(1, Ordering::SeqCst);
+                if writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (client, requests, task)
+    }
+
+    /// Hang up, let the fake server drain, and return how many SWR reads it saw.
+    async fn requests_after_hangup(
+        client: Arc<RigctldClient>,
+        requests: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> usize {
+        drop(client);
+        task.await.unwrap();
+        requests.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_returns_a_numeric_reply_unchanged() {
+        let (client, requests, task) = swr_fixture("4.2").await;
+        assert_eq!(client.get_swr().await.unwrap(), 4.2);
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_returns_zero_as_read() {
+        let (client, requests, task) = swr_fixture("0.000000").await;
+        assert_eq!(client.get_swr().await.unwrap(), 0.0);
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_unparseable_reply_is_an_error_not_a_perfect_match() {
+        for reply in ["N/A", ""] {
+            let (client, requests, task) = swr_fixture(reply).await;
+            let result = client.get_swr().await;
+            assert!(result.is_err(), "{reply:?} must not read as {result:?}");
+            assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_swr_rprt_error_is_read_once() {
+        let (client, requests, task) = swr_fixture("RPRT -11").await;
+        assert!(client.get_swr().await.is_err());
+        assert_eq!(requests_after_hangup(client, requests, task).await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_status_does_not_invent_swr() {
+        let (client, requests, task) = swr_fixture("1.0").await;
+        assert_eq!(client.get_status().await.unwrap().swr, None);
+        // get_status reports cached state only; it sends nothing to the rig.
+        assert_eq!(requests_after_hangup(client, requests, task).await, 0);
+    }
+
+    #[test]
+    fn parse_reports_swr_reads_the_get_level_line() {
+        for (response, expected) in [
+            (
+                "Get level: PREAMP(0..0/0) ATT(0..0/0) SWR(0..0/0) ALC(0..1/0)\n",
+                true,
+            ),
+            // Older Hamlib lists bare level names.
+            ("Get level: PREAMP ATT SWR STRENGTH\n", true),
+            (
+                "Get level: PREAMP(0..0/0) ATT(0..0/0) STRENGTH(-54..50/1)\n",
+                false,
+            ),
+            // Exact token match: SWRX is not SWR.
+            ("Get level: SWRX(0..0/0)\n", false),
+        ] {
+            assert_eq!(parse_reports_swr(response).unwrap(), expected, "{response}");
+        }
+        assert!(parse_reports_swr("dump_caps:\nSet level: SWR(0..0/0)\n").is_err());
+    }
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
 
@@ -1675,6 +1808,17 @@ mod receive_gain_tests {
         assert_eq!(caps.preamp_db, vec![0, 10, 20]);
         assert_eq!(caps.attenuator_db, vec![0, 6, 12]);
         assert_eq!(client.get_receive_gain().await.unwrap().preamp_db, 10);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_swr_round_trips_dump_caps() {
+        let (client, task) = fixture(vec![(
+            "+\\dump_caps",
+            "dump_caps:\nGet level: PREAMP(0..0/0) SWR(0..0/0)\nSet level: PREAMP(0..0/0)\nRPRT 0\n",
+        )])
+        .await;
+        assert!(client.reports_swr().await.unwrap());
         task.await.unwrap();
     }
 

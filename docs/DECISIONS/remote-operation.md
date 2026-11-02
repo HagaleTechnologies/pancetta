@@ -143,8 +143,9 @@ all with clean reviews (no Critical/Important findings):
    actual demuxed `src` of the frame that carried its capability token, never a session-global
    value or another peer's identity).
 5. **One-controller-at-a-time, free grab** — `ArmContext::controller: Option<String>`. Rules:
-   `takeControl` from any admitted peer always succeeds, disarming a displaced controller's live
-   arm first (arms never transfer — the new controller must re-arm through the full grant
+   `takeControl` from any admitted peer holding a currently-valid `qsy`-or-higher hello capability
+   always succeeds (a status-only or unauthorized peer is refused with no state change, PAN-253),
+   disarming a displaced controller's live arm first (arms never transfer — the new controller must re-arm through the full grant
    verification); `releaseControl` from the controller clears it (disarms if armed); a
    control-mutating action from `controller == None` implicitly grabs it (so a legacy client that
    never sends `takeControl` still arms exactly as it always has); the same action from a
@@ -328,8 +329,9 @@ on `PeerAuth`, `PeerCtx::grants` and `sweep_expired_peer_auth` rather than add a
 mechanism. PAN-95 already makes `qsy`/`setSplit` check expiry. PAN-96 still owns evicting or
 de-authorizing established peers when an authorization poll revokes them.
 
-Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
-`status`+ capability. That is an inbound control-rule change left for a separate ticket.
+Follow-up: implicit control grabs do not yet require a currently-valid `status`+ capability.
+That is an inbound control-rule change left for a separate ticket. Explicit `takeControl` now
+requires a currently-valid `qsy`-or-higher capability (PAN-253, below).
 
 ## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
 
@@ -1038,3 +1040,110 @@ are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
 No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
 needed.
+
+## Explicit takeover needs qsy scope (PAN-253, 2026-11-01)
+
+A station-agent viewer whose verified hello granted only `status` could send
+`takeControl`, displace the current controller, disarm it and retire its
+QSOs. dispensa Q-0080 (approved 2026-10-31) says status-only access must not
+reach that. `dispatch_action` now refuses `TakeControl` unless
+`peer_grants(ctx, peer, "qsy", now)` holds: admitted, unexpired, not
+revoked, and scoped `qsy` or `tx`. `qsy` is the lowest tier that controls
+the rig, so a tuning operator can still hold control without TX permission.
+Taking control still never arms the new controller.
+
+The check runs before the displacement test, so a refused takeover changes
+nothing: the controller keeps control and its arm, no PAN-137 cleanup is
+owed, and no frame is sent. It logs a `warn!` like the QSY and split scope
+refusals. `controller_gate` is not consulted first because it can mutate
+ownership. No wire, schema or config change was needed.
+
+Implicit grabs through Arm/QSY/split/StopCq/TX requests, Disarm and
+ReleaseControl keep their existing rules. The local WebSocket gateway does
+not dispatch `takeControl` and is unchanged.
+
+## PAN-250: remote stopCq stops calling CQ
+
+Before 2026-11-01 the station agent accepted a controller's `stopCq`, logged
+it and did nothing, so a remote operator who pressed Stop CQ kept
+transmitting. The agent now forwards the same station-wide
+`QsoMessage::StopCq` that the TUI `s` key and WSJT-X `HaltTx` send. It cancels
+every un-answered `CallingCq` QSO, including a local `c` CQ, because the
+operator was told the station stopped and stopping TX is the safe direction.
+Answered exchanges still finish. The controller gate (implicit grab, refusal
+of a non-controller) is unchanged for a peer with a live hello.
+
+Because the stop can end a local CQ, it re-checks the peer's authority like
+every other action. `dispatch_action` refuses `StopCq` unless
+`peer_grants(ctx, peer, "status", now)` holds: admitted, unexpired, not
+revoked, any scope. Stopping needs no control tier, so a status-only viewer
+that holds control can still stop. The check runs before the controller gate,
+so a peer with no hello, or an expired or revoked one, grabs no control, owes
+no PAN-137 cleanup and is sent nothing. This narrows the closing note of the
+PAN-253 section: an implicit grab through `StopCq` now needs that live hello.
+
+The client learns of the stop from the QSO engine's next `activeQsos`
+snapshot. That snapshot is published only after the CQ has left
+`active_tx_qsos`, so it reports the cancellation itself and the TX worker
+already refuses the CQ's next frame at key time. No `status` acknowledgement
+is sent at enqueue time. If the QSO inbox refuses the stop, the requesting
+peer gets `error {component: "stationAgent", message: "stop CQ not
+delivered; retry stopCq"}`.
+
+The stop never waits on an owed PAN-137 controller-change cleanup. The agent
+flushes the cleanup first, which keeps it ahead of the stop when both fit,
+and then sends the stop whether or not the flush succeeded. Both messages
+reduce TX, so their order does not matter. A frame already on the air
+finishes, as with the local `s` key; `Disarm` remains the immediate TX-off
+control. No wire, protocol or config change is involved.
+
+## PAN-252: a remote QSY never retunes a keyed rig or moves a station-run QSO
+
+Every station-agent peer arrives over the cloud relay and has no local trust.
+The TUI and WSJT-X command paths remain unchanged. Before controller or scope
+checks, `Qsy` and `SetSplit` refuse when the rig is keyed, then when any
+active QSO has no `metadata.remote_client_key_id`. That QSO check covers local,
+autonomous and WSJT-X bridge QSOs, including CallingCq. A cloud-bound QSO
+does not block an unkeyed QSY. Autonomous enabled but idle does not block it.
+
+Keyed means the TX worker's `ptt_active` is set, or the bus `gain_tx_gate`
+holds a key-down reservation. `tx::send_ptt_command` sets that reservation for
+every PTT-on path, including manual PTT and tune with no QSO, as soon as the
+key-down is enqueued. Hamlib clears it when it acknowledges a bus PTT-off, and
+a receive-gain restore clears it after reading PTT off. The bounds:
+
+- An acknowledged unkey also clears the reservation of a key-down queued behind
+  it. Until Hamlib takes that key-down, the check does not see it.
+- A PTT-off that fails, or an unkey forced outside the bus (the PTT watchdog,
+  Hamlib teardown), leaves the reservation set. Remote QSY stays refused until
+  the next acknowledged bus PTT-off.
+- PTT keyed outside pancetta (front-panel MOX, a foot switch, VOX, another CAT
+  client) is not detected.
+
+Each refusal logs on `agent.control` and sends only the requesting peer a
+`ServerEvent::Error` with component `stationAgent`. It neither grabs control
+nor creates QSO cleanup work, changes the split atomic, echoes split status,
+or writes an audit event. The messages are:
+
+- `setFrequency refused — the rig is transmitting`
+- `setFrequency refused — the station is running a local or autonomous QSO`
+- `setSplit refused — the rig is transmitting`
+- `setSplit refused — the station is running a local or autonomous QSO`
+
+The activity check applies to both VFOs because VFO B can carry TX in split
+operation. It borrows the QSO-manager watch afresh and clones the manager before
+awaiting, so a QSO-component restart publishes the replacement to the guard.
+An unpublished manager means there is no QSO block; PTT still blocks.
+
+The Hamlib command loop also discards only StationAgent-sourced SetFrequency
+while `ptt_active || ptt_on_since.is_some()`, covering manual PTT and a command
+queued before key-down. It retires any matching producer mark without marking
+the command applied or pending. Local frequency commands keep their behavior.
+SetSplit deliberately has no Hamlib drop. Once forwarded, its atomic reflects
+the accepted command, and dropping it later could make the band-plan gate read
+a split the rig never applied. The dispatch-time guard covers split changes,
+including while a manual key-down is held. A key-down that starts after the
+guard passes, while dispatch is still awaiting, is not re-checked.
+
+No new wire shape is introduced. Replace the Error response with commandAck
+when that contract exists; this ticket does not wait for it.
