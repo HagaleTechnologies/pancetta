@@ -31,6 +31,34 @@
 //! - Receives from: `pancetta-dsp` (processed audio windows)
 //! - Sends to: `pancetta` coordinator (decoded messages, TX audio)
 //!
+//! ## Decoding a full cycle
+//!
+//! Other programs depend on this crate alone and call [`decode_cycle`] with
+//! one full protocol cycle of 12 kHz mono audio (FT8: 180 000 samples / 15 s,
+//! FT4: 90 000 samples / 7.5 s, sample 0 at the slot boundary); the returned
+//! [`DecodedMessage`] set is what pancetta's own station decodes for that
+//! audio. The default dependency tree carries no audio-device, rig-control
+//! or network crate (CI-enforced — see the README's "Using the decoder from
+//! another program" section for the pin line and the guarantee command).
+//!
+//! ```toml
+//! [dependencies]
+//! pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
+//! ```
+//!
+//! ```rust
+//! use pancetta_ft8::{decode_cycle, Protocol};
+//!
+//! // one 15-second FT8 cycle: 180_000 mono f32 samples at 12 kHz,
+//! // sample 0 at the slot boundary
+//! let samples: Vec<f32> = vec![0.0; 180_000];
+//! for m in decode_cycle(&samples, Protocol::Ft8)? {
+//!     println!("[{:>5.1} dB] {} ({} Hz, dt {:.2}s)",
+//!              m.snr_db, m.text, m.frequency_offset, m.time_offset);
+//! }
+//! # Ok::<(), pancetta_ft8::Ft8Error>(())
+//! ```
+//!
 //! ## Decoding Example
 //!
 //! ```rust
@@ -112,6 +140,11 @@ pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
 // the decoder-speed-overhaul plan). Inert today — nothing consults it yet.
 pub mod budget;
 pub use budget::{DecodeBudget, DecodeBudgetReport};
+
+// Cycle-level standalone decode API (PAN-176): one full FT8/FT4 cycle in,
+// the station-equivalent decode set out, with no station dependency.
+pub mod cycle;
+pub use cycle::{decode_cycle, CycleDecoder};
 
 // Core FT8 decoding modules
 pub mod bp_trajectory_capture;

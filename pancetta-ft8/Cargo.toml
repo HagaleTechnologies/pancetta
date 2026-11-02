@@ -1,7 +1,11 @@
 [package]
 name = "pancetta-ft8"
 description = "High-performance FT8 digital mode decoder for Pancetta"
-version.workspace = true
+# PAN-176: explicit crate version, decoupled from the workspace so external
+# consumers (manta) can pin by the `pancetta-ft8-v<version>` git tag. Bump
+# this independently of the workspace from now on; the release process cuts
+# the matching tag on the merge commit.
+version = "0.9.6"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
