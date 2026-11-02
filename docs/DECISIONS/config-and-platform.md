@@ -778,7 +778,46 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   `dependabot-auto-merge.yml`, and moving `supply-chain.yml`'s `dtolnay/rust-toolchain` pin
   (`4360b525…`, 2026-08-05) to `686976e1…`.
 
-<<<<<<< HEAD
+## Codex gate auto-resolve re-checks the head per thread (PAN-254, 2026-11-01)
+
+- `compute-verdict` in `wait-for-codex.yml` reads `repos/$REPO/pulls/$PR`
+  `.head.sha` at the top of every auto-resolve iteration, before the thread's
+  `compare` call. A head that differs from the captured `HEAD_SHA` prints one
+  `::notice::… mid-loop -- stopping auto-resolve here.` and `break`s, so no later
+  thread gets a reply or a resolve. A failed lookup prints a `::warning::` and
+  carries on with the captured head, the same fail-open stance as
+  `freshness-check`; the next iteration checks again. `freshness-check` still
+  runs once before the loop. Both messages are ported verbatim from propagation
+  `f8e1243`, so the two files stay diffable. Two lines differ from upstream on
+  purpose. The lookup is `LIVE_HEAD_SHA=$(gh api …) || LIVE_HEAD_SHA=""`, not
+  upstream's `$(gh api … || echo "")`: on an HTTP error `gh api` still prints
+  the JSON error body on stdout, even with `--jq`, so upstream's form reads a
+  404 or 502 as a moved head and stops instead of failing open. The loop also
+  reads a captured `resolvable_tsv` string through `<<<`, not a pipe from jq:
+  with the pipe, `break` hit SIGPIPE (exit 141) under `pipefail` once the TSV
+  outgrew the 64 KiB pipe buffer, which failed the step after
+  `outcome=success` was written.
+- `outcome=success` is written before the loop, so a stop changes no outcome:
+  the check-run for the old head is still concluded, and threads left
+  unresolved are baseline threads for the new head's own response run.
+- Residual window: a push that lands after a thread's check can still let that
+  one thread resolve with a reply naming the old head. GitHub has no
+  compare-and-set on thread mutations, so a second check before the reply would
+  only narrow the window, not close it; not added.
+- Offline test: `scripts/ci/test-ci-codex-auto-resolve-head.sh` runs the real
+  step body against a mock `gh` (head moves mid-loop, before the first thread,
+  never, every lookup failing with a JSON error body, and a head move with 160
+  long-path threads). `research-scan-tests` in `ci.yml` picks it
+  up by glob. The workflow runs on `issue_comment` from main's copy, so a PR
+  cannot exercise its own change to this step.
+- Not ported: the other hunk of `f8e1243`, a retry on the request-marker POST
+  in the request job. It is a different failure and needs its own ticket and
+  test.
+- Known gap, not changed here: `freshness-check`'s own retry loop keeps the
+  last error body in `CURRENT_HEAD_SHA` after 3 failed lookups, so it marks the
+  run stale instead of failing open as its warning says. Same root cause as the
+  upstream lookup above; it needs its own ticket and test.
+
 ## Dependabot pass-through publishes the required Codex check (PAN-249, 2026-11-01)
 
 PR #399 renamed `wait-for-codex.yml`'s producer job to `Codex review request (producer)` so its
@@ -852,44 +891,3 @@ Evidence status:
 Cross-repo scope: pancetta only. The workflow interface is unchanged, so no `dispensa` contract
 applies; `dispensa` was not available to scan from the implementing session. Credenza's template
 was not inspected.
-=======
-## Codex gate auto-resolve re-checks the head per thread (PAN-254, 2026-11-01)
-
-- `compute-verdict` in `wait-for-codex.yml` reads `repos/$REPO/pulls/$PR`
-  `.head.sha` at the top of every auto-resolve iteration, before the thread's
-  `compare` call. A head that differs from the captured `HEAD_SHA` prints one
-  `::notice::… mid-loop -- stopping auto-resolve here.` and `break`s, so no later
-  thread gets a reply or a resolve. A failed lookup prints a `::warning::` and
-  carries on with the captured head, the same fail-open stance as
-  `freshness-check`; the next iteration checks again. `freshness-check` still
-  runs once before the loop. Both messages are ported verbatim from propagation
-  `f8e1243`, so the two files stay diffable. Two lines differ from upstream on
-  purpose. The lookup is `LIVE_HEAD_SHA=$(gh api …) || LIVE_HEAD_SHA=""`, not
-  upstream's `$(gh api … || echo "")`: on an HTTP error `gh api` still prints
-  the JSON error body on stdout, even with `--jq`, so upstream's form reads a
-  404 or 502 as a moved head and stops instead of failing open. The loop also
-  reads a captured `resolvable_tsv` string through `<<<`, not a pipe from jq:
-  with the pipe, `break` hit SIGPIPE (exit 141) under `pipefail` once the TSV
-  outgrew the 64 KiB pipe buffer, which failed the step after
-  `outcome=success` was written.
-- `outcome=success` is written before the loop, so a stop changes no outcome:
-  the check-run for the old head is still concluded, and threads left
-  unresolved are baseline threads for the new head's own response run.
-- Residual window: a push that lands after a thread's check can still let that
-  one thread resolve with a reply naming the old head. GitHub has no
-  compare-and-set on thread mutations, so a second check before the reply would
-  only narrow the window, not close it; not added.
-- Offline test: `scripts/ci/test-ci-codex-auto-resolve-head.sh` runs the real
-  step body against a mock `gh` (head moves mid-loop, before the first thread,
-  never, every lookup failing with a JSON error body, and a head move with 160
-  long-path threads). `research-scan-tests` in `ci.yml` picks it
-  up by glob. The workflow runs on `issue_comment` from main's copy, so a PR
-  cannot exercise its own change to this step.
-- Not ported: the other hunk of `f8e1243`, a retry on the request-marker POST
-  in the request job. It is a different failure and needs its own ticket and
-  test.
-- Known gap, not changed here: `freshness-check`'s own retry loop keeps the
-  last error body in `CURRENT_HEAD_SHA` after 3 failed lookups, so it marks the
-  run stale instead of failing open as its warning says. Same root cause as the
-  upstream lookup above; it needs its own ticket and test.
->>>>>>> 419a1557f549df99fef549d203622da57d63c4dd
