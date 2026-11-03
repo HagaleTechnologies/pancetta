@@ -46,4 +46,6 @@ the TX worker directly through `TxFrameLog` (`coordinator/tx_log.rs`), never
 via the message bus, and only once a frame's audio is `Enqueued`. The worker
 waits at most 250 ms for the fsync, so a stalled disk never holds PTT, and
 `--replay` writes nothing. Don't route it through `TxFrameLogged`: that event
-is best-effort and is dropped headless.
+is best-effort and is dropped headless. A test that bounds the time until
+`TxFrameLogged` also times that fsync, so time it on a worker harness built
+with `TxFrameLog::disabled()` (PAN-248).
