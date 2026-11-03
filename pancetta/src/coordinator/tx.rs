@@ -27030,23 +27030,59 @@ mod pan71_playback_start_tests {
         assert_eq!(lines[1].utc, second);
     }
 
-    async fn assert_fallback(behaviour: Behaviour) {
-        let h = worker_harness().await;
-        let audio = spawn_fake_audio_thread(&h, behaviour).await;
-        request(&h, TEXT).await;
-        let at = await_event(&h, TEXT).await;
+    /// One frame through `h`: `(stamp, when the event was observed, what audio saw)`.
+    async fn fallback_event(
+        h: &Harness,
+        behaviour: Behaviour,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        Seen,
+    ) {
+        let audio = spawn_fake_audio_thread(h, behaviour).await;
+        request(h, TEXT).await;
+        let at = await_event(h, TEXT).await;
         let observed = chrono::Utc::now();
         let seen = audio.seen.lock().unwrap()[0].clone();
-        assert!(at <= seen.received_at + chrono::Duration::milliseconds(5));
+        // The enqueue instant, not the timeout instant a bound later.
+        assert!(
+            at <= seen.received_at
+                + chrono::Duration::from_std(TX_PLAYBACK_START_WAIT / 2).unwrap()
+        );
+        (at, observed, seen)
+    }
+
+    /// `h`'s one TX-log record. `TX_LOG_ACK_WAIT` caps how long the worker
+    /// waits for the append, not the write, so the record can land after
+    /// `TxFrameLogged` (PAN-248).
+    async fn await_record(h: &Harness) -> TxFrameRecord {
+        let lines = await_tx_log_lines(h, 1, Duration::from_secs(5)).await;
+        lines.into_iter().next().expect("the frame's TX-log record")
+    }
+
+    async fn assert_fallback(behaviour: Behaviour) {
+        let h = worker_harness().await;
         if matches!(behaviour, Behaviour::Hold) {
+            let (at, observed, _) = fallback_event(&h, behaviour).await;
             assert!(observed - at >= chrono::Duration::milliseconds(98));
-        } else {
-            assert!(
-                observed - seen.received_at
-                    < chrono::Duration::from_std(TX_PLAYBACK_START_WAIT).unwrap()
-            );
+            assert_eq!(await_record(&h).await.utc, at);
+            return;
         }
-        assert_eq!(tx_log_lines(&h)[0].utc, at);
+        // PAN-248: the durable append (up to TX_LOG_ACK_WAIT) runs between the
+        // wait and TxFrameLogged, so time the settled ack on a harness without it.
+        let timed = worker_harness_with(Config::default(), |c| {
+            c.tx_frame_log = Some(Arc::new(TxFrameLog::disabled()))
+        })
+        .await;
+        let ((at, _, _), (_, observed, seen)) = tokio::join!(
+            fallback_event(&h, behaviour),
+            fallback_event(&timed, behaviour)
+        );
+        assert!(
+            observed - seen.received_at
+                < chrono::Duration::from_std(TX_PLAYBACK_START_WAIT).unwrap()
+        );
+        assert_eq!(await_record(&h).await.utc, at);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
