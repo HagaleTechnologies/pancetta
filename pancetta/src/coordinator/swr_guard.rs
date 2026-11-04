@@ -17,6 +17,10 @@ use crate::message_bus::{
     ComponentId, ComponentMessage, DurableDelivery, MessageBus, MessageType, SendIfOutcome,
 };
 
+/// PAN-262: high-SWR time from earlier transmissions stops counting after
+/// this long without a high reading, so one bad frame an hour ago doesn't
+/// shorten today's tuner-settle allowance.
+pub(crate) const SWR_HIGH_STALE_AFTER: Duration = Duration::from_secs(120);
 /// Keyed poll ticks (500 ms each) with no valid reading before the
 /// runtime "unavailable" alert.
 pub(crate) const SWR_UNAVAILABLE_MIN_ATTEMPTS: u32 = 4;
@@ -78,9 +82,15 @@ pub(crate) struct SwrGuard {
     tripped: bool,
     /// PAN-262: how long valid readings must stay above `max_swr`.
     trip_delay: Duration,
-    /// When the current run of high valid readings began. A valid reading
-    /// at or below the limit clears it; a missing reading leaves it alone.
-    high_since: Option<Instant>,
+    /// Keyed time spent above the limit, summed across transmissions so
+    /// short frames (FT4, FT2) still trip. A valid reading at or below the
+    /// limit clears it, as does a gap longer than [`SWR_HIGH_STALE_AFTER`].
+    high_keyed: Duration,
+    /// The last high reading in the current keyed episode; unkey clears it
+    /// so time spent unkeyed never counts.
+    last_high_keyed: Option<Instant>,
+    /// The last high reading in any episode, for the stale-gap reset.
+    last_high_seen: Option<Instant>,
     /// Keyed ticks in this episode.
     attempts: u32,
     /// Valid readings in this episode.
@@ -117,7 +127,9 @@ impl SwrGuard {
                     .swr_trip_delay_ms
                     .min(pancetta_config::MAX_SWR_TRIP_DELAY_MS),
             )),
-            high_since: None,
+            high_keyed: Duration::ZERO,
+            last_high_keyed: None,
+            last_high_seen: None,
             attempts: 0,
             valid: 0,
             unavailable_reported: false,
@@ -171,7 +183,7 @@ impl SwrGuard {
             }
             self.keyed = false;
             self.tripped = false;
-            self.high_since = None;
+            self.last_high_keyed = None;
             self.attempts = 0;
             self.valid = 0;
             return action;
@@ -190,16 +202,31 @@ impl SwrGuard {
         }
         match reading {
             Some(swr) if swr > self.max_swr => {
-                let since = *self.high_since.get_or_insert(now);
-                if now.saturating_duration_since(since) >= self.trip_delay {
+                if self
+                    .last_high_seen
+                    .is_some_and(|seen| now.saturating_duration_since(seen) > SWR_HIGH_STALE_AFTER)
+                {
+                    self.high_keyed = Duration::ZERO;
+                }
+                if let Some(prev) = self.last_high_keyed {
+                    self.high_keyed += now.saturating_duration_since(prev);
+                }
+                self.last_high_keyed = Some(now);
+                self.last_high_seen = Some(now);
+                if self.high_keyed >= self.trip_delay {
                     self.tripped = true;
+                    self.high_keyed = Duration::ZERO;
                     return SwrAction::Trip {
                         swr,
                         max_swr: self.max_swr,
                     };
                 }
             }
-            Some(_) => self.high_since = None,
+            Some(_) => {
+                self.high_keyed = Duration::ZERO;
+                self.last_high_keyed = None;
+                self.last_high_seen = None;
+            }
             None => {}
         }
         SwrAction::None
@@ -500,7 +527,58 @@ mod tests {
     }
 
     #[test]
-    fn unkeying_clears_the_high_swr_window() {
+    fn high_swr_in_short_frames_adds_up_across_transmissions() {
+        // FT2 frames are ~3.16 s: no single frame reaches the 5 s delay, so
+        // keyed high time must carry from one frame to the next.
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        let mut tripped_at = None;
+        'frames: for frame in 0..4u64 {
+            let start = frame * 7_500;
+            for tick in 0..7u64 {
+                let action = g.observe_at(true, Some(4.2), ms(t0, start + tick * 500));
+                if action == trip_at(4.2) {
+                    tripped_at = Some(frame);
+                    break 'frames;
+                }
+                assert_eq!(action, SwrAction::None, "frame {frame} tick {tick}");
+            }
+            assert_eq!(
+                g.observe_at(false, None, ms(t0, start + 3_500)),
+                SwrAction::None
+            );
+        }
+        assert_eq!(
+            tripped_at,
+            Some(1),
+            "3 s of keyed high SWR per frame trips in the second frame"
+        );
+    }
+
+    #[test]
+    fn a_long_quiet_gap_forgets_earlier_high_swr() {
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        for tick in 0..8 {
+            assert_eq!(
+                g.observe_at(true, Some(4.2), ms(t0, tick * 500)),
+                SwrAction::None
+            );
+        }
+        assert_eq!(g.observe_at(false, None, ms(t0, 4_000)), SwrAction::None);
+        // Three minutes later the earlier 3.5 s no longer counts.
+        let later = 4_000 + 180_000;
+        for tick in 0..8 {
+            assert_eq!(
+                g.observe_at(true, Some(4.2), ms(t0, later + tick * 500)),
+                SwrAction::None,
+                "tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn unkeyed_time_does_not_count_toward_the_delay() {
         let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
         let t0 = Instant::now();
         assert_eq!(g.observe_at(true, Some(4.2), t0), SwrAction::None);
