@@ -217,24 +217,6 @@ pub struct QsoHistoryItem {
     pub completed_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// PAN-121: the QSO a bare `k` targeted, held until the operator confirms
-/// or cancels the abort-confirm modal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingQsoAbort {
-    pub qso_id: String,
-    pub callsign: String,
-}
-
-impl PendingQsoAbort {
-    /// Status line when the target left the active list before `y`.
-    pub fn target_gone_message(&self) -> String {
-        format!(
-            "QSO with {} is no longer active; abort cancelled",
-            self.callsign
-        )
-    }
-}
-
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
 /// state machine is the source of truth; this struct is a flattened
 /// snapshot pushed to the TUI whenever the state changes (QsoEvent
@@ -1604,13 +1586,6 @@ pub struct App {
     /// dismisses. Modal blocks all other keys while visible.
     pub quit_confirm_visible: bool,
 
-    /// PAN-121: the QSO a bare `k` asked to abort, awaiting `y` in the
-    /// abort-confirm modal. Captured when the modal opens so a snapshot
-    /// that re-pins the selection can never retarget the abort; session
-    /// only, cleared by confirm, cancel, Shift+Q, a required out-of-band
-    /// acknowledgment, or the QSO leaving the active list.
-    pub pending_qso_abort: Option<PendingQsoAbort>,
-
     /// Frequency-entry modal (Shift+F). See `FreqModalState`.
     pub freq_modal: FreqModalState,
     /// TX-audio-offset modal (`o` key). See `OffsetModalState`.
@@ -1887,7 +1862,6 @@ impl App {
             help_visible: false,
             help_scroll: 0,
             quit_confirm_visible: false,
-            pending_qso_abort: None,
             freq_modal: FreqModalState::default(),
             offset_modal: OffsetModalState::default(),
             tx_offset_hold_hz: None,
@@ -2081,11 +2055,6 @@ impl App {
         mouse: MouseEvent,
     ) -> Result<Option<crate::tui_runner::TuiCommand>> {
         use crossterm::event::{MouseButton, MouseEventKind};
-        // PAN-121: the abort-confirm modal swallows the mouse as well as the
-        // keyboard, so a click can't park TX or move the selection under it.
-        if self.pending_qso_abort.is_some() {
-            return Ok(None);
-        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_up();
@@ -3134,19 +3103,6 @@ impl App {
         // selection tracks the SAME QSO across snapshots (the emit order is now
         // stable, but a QSO can still appear/disappear, shifting positions).
         self.clamp_qso_selection();
-        // PAN-121: a pending abort whose QSO left the active list is
-        // cancelled, never moved onto whatever is selected now.
-        if let Some(pending) = &self.pending_qso_abort {
-            if !self.qso_is_active(&pending.qso_id) {
-                self.status_message = pending.target_gone_message();
-                self.pending_qso_abort = None;
-            }
-        }
-    }
-
-    /// True while `qso_id` is in the latest active-QSO snapshot.
-    pub fn qso_is_active(&self, qso_id: &str) -> bool {
-        self.active_qsos.iter().any(|q| q.qso_id == qso_id)
     }
 
     /// Every active QSO's authoritative assigned TX offset, in spectrum order.
@@ -9763,36 +9719,6 @@ mod tests {
             Some("K1AAA"),
             "click must pin via the SAME pin_band_activity_selection Up/Down uses"
         );
-    }
-
-    /// PAN-121: while the abort-confirm modal is open a click is swallowed:
-    /// the same click that would focus and pin Band Activity does nothing.
-    #[tokio::test]
-    async fn click_is_ignored_while_abort_confirm_is_open() {
-        let mut app = fixture_app().await;
-        app.terminal_size = (120, 40);
-        app.active_panel = ActivePanel::DxHunter;
-        app.add_decoded_message(fixture_view("K1AAA", -10))
-            .await
-            .unwrap();
-        app.add_decoded_message(fixture_view("K2BBB", -5))
-            .await
-            .unwrap();
-        app.pending_qso_abort = Some(PendingQsoAbort {
-            qso_id: "qso-1".into(),
-            callsign: "W1AW".into(),
-        });
-
-        let rect = operate_panel_rect(&app, ActivePanel::BandActivity);
-        let cmd = app
-            .handle_mouse_event(left_click(rect.x + 2, rect.y + 3))
-            .await
-            .unwrap();
-        assert!(cmd.is_none());
-        assert_eq!(app.active_panel, ActivePanel::DxHunter, "focus unchanged");
-        assert_eq!(app.band_activity_scroll, 0);
-        assert!(app.band_activity_pinned_call.is_none());
-        assert!(app.pending_qso_abort.is_some(), "modal stays open");
     }
 
     #[tokio::test]

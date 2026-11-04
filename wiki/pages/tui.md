@@ -31,10 +31,9 @@ that autonomously writes a live TX atomic (opt-in auto-repark) is gated by a
 5-case safety contract and fails closed. Constants and the full key map are
 normative in the digest — not restated here.
 
-A bare `k` opens a "Confirm abort" modal for the QSO selected at that moment;
-only `y` sends the abort, and only while that QSO is still active (PAN-121).
-Enter cancels. See
-[the PAN-121 decision](../../docs/DECISIONS/tui.md#bare-k-asks-before-aborting-a-qso-pan-121-2026-11-01).
+A bare `k` aborts the selected QSO at once, with no confirmation (PAN-263,
+which removed the PAN-121 confirm modal). See
+[the PAN-263 decision](../../docs/DECISIONS/tui.md#bare-k-aborts-at-once-no-confirmation-pan-263-2026-11-03).
 
 DX Hunter's `+` on Grid means unworked on the current operating band; `+` on a
 known US state/territory means unworked across bands. A pre-frame refresh reads

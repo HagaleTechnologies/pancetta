@@ -183,10 +183,10 @@ time_window_hours = 24
 max_streams = 5
 
 [hound]
-call_max_hz = 900.0
-call_min_hz = 300.0
-response_max_hz = 2700.0
-response_min_hz = 1000.0
+call_max_hz = 2700.0
+call_min_hz = 1000.0
+response_max_hz = 900.0
+response_min_hz = 300.0
 
 [network.clublog]
 api_key = ""

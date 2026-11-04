@@ -6081,17 +6081,18 @@ mod drain_pending_qso_offset_requests_tests {
         );
     }
 
-    /// PAN-72 (Codex round 2 on PR #350, finding 1): a post-QSY Hound's stall
-    /// switch is resolved by the SAME general allocator every other switch
-    /// uses, which knows nothing about the Hound response region. A pick below
-    /// `response_min_hz` puts our R+report back in the calling region, where
-    /// the Fox is not listening — the "rescue" would kill the QSO.
+    /// PAN-72 (Codex round 2 on PR #350, finding 1), updated for PAN-259: a
+    /// post-report Hound's stall switch is resolved by the SAME general
+    /// allocator every other switch uses, which knows nothing about the Fox.
+    /// Any pick off the Fox's own offset puts our R+report where the Fox is
+    /// not listening, so the shared constraint pins the window to that offset
+    /// and the switch resolves to a no-op.
     ///
     /// The band here is rigged so the unconstrained allocator genuinely prefers
-    /// the low region (everything at/above ~950 Hz is noisy), which is what
-    /// makes the constraint observable rather than incidentally satisfied.
+    /// another offset, which makes the constraint observable rather than
+    /// incidentally satisfied.
     #[tokio::test]
-    async fn a_hound_switch_stays_inside_the_hound_response_region() {
+    async fn a_post_report_hound_switch_stays_on_the_fox_offset() {
         let mut op = operator_with_live_allocator();
         // Hot above ~950 Hz, quiet below: without the region constraint the
         // allocator's noise/neighbor terms (35 points combined) dominate the
@@ -6116,7 +6117,7 @@ mod drain_pending_qso_offset_requests_tests {
         });
 
         let qso_manager = manager();
-        let fox_rx_hz = 300.0;
+        let fox_rx_hz = 600.0;
         let qso_id = qso_manager
             .engage_hound("D2UY", fox_rx_hz, None, None)
             .await
@@ -6142,15 +6143,13 @@ mod drain_pending_qso_offset_requests_tests {
             "precondition: the Fox's report must trigger the Hound QSY"
         );
         let qsyed_hz = after.metadata.frequency;
-        let regions = &qso_manager.config().hound;
-        assert!(
-            qsyed_hz >= regions.response_min_hz,
-            "precondition: the QSY must land in the response region, got {qsyed_hz}"
+        assert_eq!(
+            qsyed_hz, fox_rx_hz,
+            "precondition: the Hound sits on the Fox offset"
         );
         assert!(
-            op.allocate_smart_frequency(None, None, Some(qsyed_hz)) < regions.response_min_hz,
-            "test premise broken: the UNCONSTRAINED allocator must prefer the \
-             low calling region on this rigged band"
+            (op.allocate_smart_frequency(None, None, Some(qsyed_hz)) - qsyed_hz).abs() > 1.0,
+            "test premise broken: the UNCONSTRAINED allocator must prefer another offset"
         );
 
         let pending = std::sync::Mutex::new(vec![
@@ -6175,12 +6174,9 @@ mod drain_pending_qso_offset_requests_tests {
             .unwrap()
             .metadata
             .frequency;
-        assert!(
-            moved_to >= regions.response_min_hz && moved_to <= regions.response_max_hz,
-            "a post-QSY Hound switch must stay inside the Hound response region \
-             ({}-{} Hz), got {moved_to}",
-            regions.response_min_hz,
-            regions.response_max_hz
+        assert_eq!(
+            moved_to, fox_rx_hz,
+            "PAN-259: a post-report Hound switch must stay on the Fox's own offset"
         );
     }
 
@@ -6438,17 +6434,18 @@ mod drain_pending_qso_offset_requests_tests {
         );
     }
 
-    /// PAN-130 (Codex round 12 on PR #350, P2): an operator `u` nudge carries
-    /// its `avoid_hz` from the `active_tx_offsets` mirror, which still holds
-    /// the Hound's low calling offset after the calling→response QSY (the QSY
+    /// PAN-130 (Codex round 12 on PR #350, P2), updated for PAN-259: an
+    /// operator `u` nudge carries its `avoid_hz` from the `active_tx_offsets`
+    /// mirror, which still holds the Hound's calling offset after the
+    /// report-driven move to the Fox offset (the QSY
     /// moves `metadata.frequency` after its `StateChanged` already went out).
     /// Excluding that stale value instead of the QSO's live offset let the
     /// allocator pick the QSO's own post-QSY offset, or a spot a few Hz from
     /// it, so the nudge did not really move it.
     #[tokio::test]
-    async fn a_post_qsy_hound_nudge_avoids_the_live_offset_not_the_stale_mirror() {
+    async fn a_post_qsy_hound_nudge_never_commits_the_stale_mirror_offset() {
         let qso_manager = manager();
-        let fox_rx_hz = 300.0;
+        let fox_rx_hz = 600.0;
         let qso_id = qso_manager
             .engage_hound("D2UY", fox_rx_hz, None, None)
             .await
@@ -6480,39 +6477,11 @@ mod drain_pending_qso_offset_requests_tests {
             "precondition: the Fox's report must trigger the Hound QSY"
         );
         let qsyed_hz = after.metadata.frequency;
-        let regions = &qso_manager.config().hound;
-        let response = (regions.response_min_hz, regions.response_max_hz);
-
-        // Quiet only right around the QSY'd offset, noisy everywhere else: the
-        // best candidate in the response region is the QSO's own live offset.
-        let mut op = operator_with_live_allocator();
-        let bins = 140usize;
-        let (fmin, fmax) = (200.0f64, 2800.0f64);
-        let width = (fmax - fmin) / bins as f64;
-        let power: Vec<f32> = (0..bins)
-            .map(|i| {
-                let f = fmin + (i as f64 + 0.5) * width;
-                if (f - qsyed_hz).abs() <= 30.0 {
-                    0.0
-                } else {
-                    1.0
-                }
-            })
-            .collect();
-        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
-            power_bins: power,
-            freq_min_hz: fmin,
-            freq_max_hz: fmax,
-        });
-        let separation = op.min_own_separation_hz();
-        let stale_pick =
-            op.allocate_smart_frequency_in_range(None, None, Some(calling_hz), &[], Some(response));
-        assert!(
-            (stale_pick - qsyed_hz).abs() < separation,
-            "test premise broken: excluding only the stale {calling_hz} Hz calling \
-             offset must leave the QSO's live {qsyed_hz} Hz as the allocator's \
-             pick, got {stale_pick}"
+        assert_eq!(
+            qsyed_hz, fox_rx_hz,
+            "precondition: the Hound sits on the Fox offset"
         );
+        let mut op = operator_with_live_allocator();
 
         // The mirror never saw the QSY: it still says the calling offset.
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
@@ -6542,17 +6511,10 @@ mod drain_pending_qso_offset_requests_tests {
             .unwrap()
             .metadata
             .frequency;
-        assert!(
-            (moved_to - qsyed_hz).abs() >= separation,
-            "the nudge must move at least {separation} Hz off the QSO's real \
-             {qsyed_hz} Hz offset, got {moved_to}"
-        );
-        assert!(
-            moved_to >= response.0 && moved_to <= response.1,
-            "a post-QSY Hound nudge must stay inside the Hound response region \
-             ({}-{} Hz), got {moved_to}",
-            response.0,
-            response.1
+        assert_eq!(
+            moved_to, fox_rx_hz,
+            "PAN-259: the nudge must neither commit the stale {calling_hz} Hz mirror \
+             offset nor move the Hound off the Fox's {fox_rx_hz} Hz offset"
         );
     }
 

@@ -122,7 +122,7 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
     kb("c / s", "Start / stop CQ", Category::QsoOperation, true),
     kb(
         "k",
-        "Confirm abort of selected QSO (any panel)",
+        "Abort selected QSO now, no confirm (any panel)",
         Category::QsoOperation,
         false,
     ),

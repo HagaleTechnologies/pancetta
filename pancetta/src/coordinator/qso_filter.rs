@@ -19,21 +19,32 @@
 //! collapse and the main decode runs at full bandwidth. Any other value
 //! (or the env var unset) leaves the filter on.
 //!
-//! **Hound-mode band-collapse wiring** (Task 3 status): The *relevance gate*
-//! in `pancetta_qso::QsoManager::is_message_relevant` now keys on
-//! `QsoMetadata::partner_freq` when set — Fox frames are matched against
-//! the Fox's RX offset, not our TX offset. The band-collapse *here*, however,
-//! is a pure observer that receives `Option<f64>` from the coordinator's
-//! `active_qso_freq_hz` shared state; that shared state is currently
-//! populated with `new_state.frequency()` (our TX offset) in `coordinator/qso.rs`.
-//! For Hound, it should instead use `metadata.partner_freq` (the Fox's RX
-//! offset) so the ±60 Hz collapse window centres on the Fox's reply —
-//! the ±290 Hz Hound-mode window described in the spec is a future
-//! refinement of that wiring, not a change to this module itself.
+//! Active Hounds widen this ordinary-QSO mask to the complete configured
+//! Fox response envelope. They use the standard sync threshold so a new
+//! stream is not disadvantaged relative to the previous stream.
 
 use std::ops::RangeInclusive;
 
 use pancetta_ft8::TONE_SPACING;
+
+/// Include the complete Fox envelope without removing any ordinary QSO range.
+/// A full-band search stays full-band; invalid configuration also fails open.
+pub fn include_hound_response_region(
+    ordinary: Option<RangeInclusive<usize>>,
+    response: Option<(f64, f64)>,
+) -> Option<RangeInclusive<usize>> {
+    let range = ordinary?;
+    let Some((lo, hi)) = response else {
+        return Some(range);
+    };
+    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || lo > hi {
+        return None;
+    }
+    Some(
+        (*range.start()).min((lo / TONE_SPACING).floor() as usize)
+            ..=(*range.end()).max((hi / TONE_SPACING).ceil() as usize),
+    )
+}
 
 /// Default half-window applied around the partner audio frequency. Per
 /// `spec-jtdx-qso-partner-filter.md` the JTDX HF default is 60 Hz; this
@@ -626,5 +637,26 @@ mod tests {
         assert!(partner_freq_for_relaxed_sync(Some(f64::INFINITY), false).is_none());
         assert!(partner_freq_for_relaxed_sync(Some(0.0), false).is_none());
         assert!(partner_freq_for_relaxed_sync(Some(-100.0), false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod dxpedition_tests {
+    use super::*;
+    #[test]
+    fn dxpedition_mask_includes_new_fox_stream_and_ordinary_qso() {
+        let ordinary = compute_narrow_filter_bins_default(Some(1500.0), false);
+        let wide = include_hound_response_region(ordinary.clone(), Some((300.0, 900.0))).unwrap();
+        for hz in [300.0, 600.0, 780.0, 900.0, 1500.0] {
+            assert!(wide.contains(&((hz / TONE_SPACING).round() as usize)));
+        }
+        assert_eq!(
+            include_hound_response_region(ordinary.clone(), None),
+            ordinary
+        );
+        assert_eq!(
+            include_hound_response_region(None, Some((300.0, 900.0))),
+            None
+        );
     }
 }

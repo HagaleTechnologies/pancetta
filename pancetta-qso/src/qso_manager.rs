@@ -76,13 +76,15 @@ const TX_OFFSET_NOOP_TOLERANCE_HZ: f64 = 1.0;
 /// PAST the cap -- see that block's doc comment.
 const AUTO_RESEND_MAX_CALLS: u32 = 2;
 
-/// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
-const HOUND_CALL_MIN_HZ: f64 = 300.0;
-const HOUND_CALL_MAX_HZ: f64 = 900.0;
-/// Hound response region (post-QSY): after the Fox answers, the Hound moves up
-/// to 1000–2700 Hz to send its R-report.
-const HOUND_RESPONSE_MIN_HZ: f64 = 1000.0;
-const HOUND_RESPONSE_MAX_HZ: f64 = 2700.0;
+/// Hound calling region: Hounds call the Fox in 1000–2700 Hz, where a WSJT-X
+/// Fox listens (PAN-259).
+const HOUND_CALL_MIN_HZ: f64 = 1000.0;
+const HOUND_CALL_MAX_HZ: f64 = 2700.0;
+/// Hound response envelope: a Fox transmits in 300–900 Hz, and when it sends
+/// us a report we answer at the Fox's own offset. The envelope only admits
+/// that offset; it is never a pool to pick another frequency from (PAN-259).
+const HOUND_RESPONSE_MIN_HZ: f64 = 300.0;
+const HOUND_RESPONSE_MAX_HZ: f64 = 900.0;
 
 /// Audio-offset boundaries for FT8 Hound (DXpedition chaser) mode.
 ///
@@ -91,16 +93,17 @@ const HOUND_RESPONSE_MAX_HZ: f64 = 2700.0;
 /// without introducing a cross-crate dependency (pancetta-qso is a lower crate
 /// and must not depend on pancetta-config).
 ///
-/// The defaults match the module-level `HOUND_*` constants (300/900/1000/2700).
+/// The defaults match the module-level `HOUND_*` constants (calling
+/// 1000/2700, response envelope 300/900).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoundRegions {
-    /// Low calling-region minimum audio offset (Hz). Default 300.
+    /// Calling-region minimum audio offset (Hz). Default 1000.
     pub call_min_hz: f64,
-    /// Low calling-region maximum audio offset (Hz). Default 900.
+    /// Calling-region maximum audio offset (Hz). Default 2700.
     pub call_max_hz: f64,
-    /// Post-QSY response-region minimum audio offset (Hz). Default 1000.
+    /// Fox response-envelope minimum audio offset (Hz). Default 300.
     pub response_min_hz: f64,
-    /// Post-QSY response-region maximum audio offset (Hz). Default 2700.
+    /// Fox response-envelope maximum audio offset (Hz). Default 900.
     pub response_max_hz: f64,
 }
 
@@ -208,6 +211,27 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
     let raw = lo + frac * span;
     // snap to 5 Hz, clamp inside [lo, hi]
     ((raw / 5.0).round() * 5.0).clamp(lo, hi)
+}
+
+/// PAN-259: whether a Hound drops this auto-sequenced reply. The only reply a
+/// Hound never sends is the terminal 73 after the Fox's RR73.
+pub fn hound_suppresses_reply(reply: Option<&MessageType>) -> bool {
+    matches!(reply, Some(MessageType::SeventyThree { .. }))
+}
+
+/// PAN-259: the offset a Hound answers a Fox report at. It is exactly the
+/// Fox's decoded audio offset, never a rounded or hashed pick, and it is
+/// admitted only when it is finite, inside the configured Hound response
+/// envelope and inside the transmittable TX range. `None` means the report is
+/// ignored: no state advance and no R-report anywhere else.
+pub(crate) fn hound_report_offset(fox_hz: f64, regions: &HoundRegions) -> Option<f64> {
+    let (lo, hi) = (regions.response_min_hz, regions.response_max_hz);
+    (fox_hz.is_finite()
+        && lo.is_finite()
+        && hi.is_finite()
+        && (lo..=hi).contains(&fox_hz)
+        && (ACTIVE_QSO_TX_OFFSET_MIN_HZ..=ACTIVE_QSO_TX_OFFSET_MAX_HZ).contains(&fox_hz))
+    .then_some(fox_hz)
 }
 
 /// Minimum TX audio separation (Hz) between concurrent QSOs to avoid
@@ -706,8 +730,8 @@ impl QsoManagerError {
 /// [`QsoMetadata::hound_qsyed`](crate::states::QsoMetadata::hound_qsyed) is the
 /// discriminator rather than the QSO's state, because it is exactly the flag
 /// the QSY itself sets (`process_message_for_qso`'s Hound block): before it
-/// flips we are calling low, after it flips we are answering high. Non-Hound
-/// QSOs are unconstrained.
+/// flips we are calling in the calling region, after it flips we are pinned to
+/// the Fox's own offset (PAN-259). Non-Hound QSOs are unconstrained.
 ///
 /// Lives in this crate, not in the coordinator, so the constraint the
 /// coordinator *resolves* against and the one
@@ -736,7 +760,14 @@ fn hound_switch_range_for(
         return None;
     }
     let (lo, hi) = if metadata.hound_qsyed {
-        (config.hound.response_min_hz, config.hound.response_max_hz)
+        // PAN-259: once the Fox has sent us a report we answer at the Fox's
+        // own offset and nowhere else, so the post-report window is a single
+        // point. Every stall switch, revert or `u` nudge then resolves to the
+        // allocator's exhaustion tail (`avoid_hz` unchanged) and is refused as
+        // a no-op at commit, while the report-driven move itself stays in
+        // `process_message_for_qso`.
+        let fox_hz = metadata.partner_freq.unwrap_or(metadata.frequency);
+        (fox_hz, fox_hz)
     } else {
         (config.hound.call_min_hz, config.hound.call_max_hz)
     };
@@ -4034,6 +4065,17 @@ impl QsoManager {
             .collect()
     }
 
+    /// Selected Fox identities for the next decode window, under one short read.
+    pub async fn active_hound_foxes(&self) -> Vec<String> {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| p.state.is_active() && p.metadata.hound)
+            .filter_map(|p| p.metadata.their_callsign.clone())
+            .collect()
+    }
+
     /// Return the TX audio offsets (Hz) of all currently-active (non-terminal)
     /// QSOs. Used by the coordinator at QSO-open time to de-conflict a new QSO's
     /// TX offset against live concurrent streams so no two QSOs transmit on the
@@ -5381,6 +5423,18 @@ impl QsoManager {
             .get_mut(&qso_id)
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
 
+        // Match the relocation commit lock order: QSO map, then PTT gate.
+        // Hold through epoch invalidation, mutation and reply publication.
+        // Mandatory Hound moves still apply in Hold mode.
+        let hound_ptt_sync = if progress.metadata.hound
+            && matches!(message.message_type, MessageType::SignalReport { .. })
+            && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
+        {
+            Some(self.ptt_sync_gate.lock().await)
+        } else {
+            None
+        };
+
         let old_state = progress.state.clone();
 
         // --- First-decode parity refinement ---
@@ -5426,6 +5480,32 @@ impl QsoManager {
         // logs a contest-shaped exchange the moment its real partner happens
         // to send an "R"+grid/report shape.
         let qso_contest_engaged = progress.metadata.contest_info.is_some();
+
+        // PAN-259: a Hound answers a Fox report at the Fox's own offset. A
+        // report whose offset is outside the response envelope (or not a
+        // finite, transmittable offset) cannot be answered there, so it is
+        // ignored before it changes any exchange state or schedules an
+        // R-report; the QSO keeps waiting for a valid report.
+        if progress.metadata.hound
+            && matches!(message.message_type, MessageType::SignalReport { .. })
+            && matches!(
+                old_state,
+                QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. }
+            )
+            && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
+            && hound_report_offset(message.frequency, &self.config.hound).is_none()
+        {
+            warn!(
+                target: "hound",
+                qso_id = %qso_id,
+                "Hound: ignoring Fox report at {:.0} Hz, outside the response envelope {}–{} Hz",
+                message.frequency,
+                self.config.hound.response_min_hz,
+                self.config.hound.response_max_hz
+            );
+            return Ok(());
+        }
+
         progress.messages.push(message.clone());
 
         // Compound-callsign equivalence (catalog C18 / peer D4): if this frame
@@ -5592,6 +5672,12 @@ impl QsoManager {
                     );
                 }
             }
+        }
+        // PAN-259: in the WSJT-X Fox/Hound procedure the Fox's RR73 ends the
+        // contact. A Hound logs it and sends no 73: the Fox has already moved
+        // on, and a 73 would only add QRM to the Fox's next Hounds.
+        if progress.metadata.hound && hound_suppresses_reply(reply_to_emit.as_ref()) {
+            reply_to_emit = None;
         }
 
         // UX audit Batch 2 #8: latch the DX's grid the moment it arrives in a
@@ -5996,78 +6082,76 @@ impl QsoManager {
                     progress.metadata.advance_generation.saturating_add(1);
             }
 
-            // Hound QSY: when the Fox answers with a signal report
-            // (RespondingToCq → SendingReport), the Hound must move its TX
-            // offset up into the response region (1000–2700 Hz) and send the
-            // R+report (`ReportAck`) there — the defining Hound procedure move.
+            // Hound QSY (PAN-259): when the Fox sends us a signal report
+            // (RespondingToCq → SendingReport), the Hound moves its TX offset
+            // to the Fox's own decoded offset and sends the R+report
+            // (`ReportAck`) there — the WSJT-X Hound procedure. A later
+            // addressed report from the Fox on another admissible stream
+            // re-anchors the Hound onto that stream.
             //
-            // Fires exactly once per QSO (`hound_qsyed` gate). Executes
-            // INDEPENDENT of `TxFreqMode` (procedure-mandated, not an
+            // Executes INDEPENDENT of `TxFreqMode` (procedure-mandated, not an
             // autonomous optimisation — unlike the Auto-gated silence stall
-            // detector above, which only fires in `TxFreqMode::Auto`).
+            // detector above, which only fires in `TxFreqMode::Auto`), so Hold
+            // honours it too. The admissibility check already ran before the
+            // transition (`hound_report_offset`), so the target is exactly the
+            // received offset.
             //
-            // This mutates BOTH `metadata.frequency` (used as `qso_frequency`
-            // on the NEXT process_message call) AND `qso_frequency` (rides the
-            // ReportAck emitted this cycle) directly, inline, here — unlike the
-            // stall detector above, which never mutates frequency itself; it
-            // only emits `QsoEvent::TxOffsetActionNeeded` for the coordinator's
-            // `apply_tx_offset_switch` to resolve. We also
-            // update the frequency field inside the already-set `SendingReport`
-            // state so the subsequent `Completed` state (built from
-            // `SendingReport.frequency` on the Fox RR73 arm) logs our actual
-            // QSY'd TX offset rather than the old low calling offset.
-            if progress.metadata.hound
-                && !progress.metadata.hound_qsyed
-                && was_responding_to_cq
+            // This mutates `metadata.frequency` (used as `qso_frequency` on the
+            // NEXT process_message call), `qso_frequency` (rides the ReportAck
+            // emitted this cycle), `partner_freq` (where we hear the Fox, and
+            // the pin `hound_switch_range_hz` holds us to), the known-good
+            // anchor, and the frequency inside the `SendingReport` state so
+            // the subsequent `Completed` state logs our actual TX offset.
+            let hound_fox_hz = if progress.metadata.hound
                 && advanced_to_sending_report
+                && (was_responding_to_cq || progress.metadata.hound_qsyed)
+                && matches!(message.message_type, MessageType::SignalReport { .. })
+                && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
             {
+                hound_report_offset(message.frequency, &self.config.hound)
+            } else {
+                None
+            };
+            if let Some(fox_hz) = hound_fox_hz {
                 let fox_call = progress.metadata.their_callsign.as_deref().unwrap_or("");
-                let (resp_min, resp_max) = (
-                    self.config.hound.response_min_hz,
-                    self.config.hound.response_max_hz,
-                );
-                let qsy = hound_offset_for(fox_call, resp_min, resp_max);
                 let old_off = progress.metadata.frequency;
-                progress.metadata.frequency = qsy;
+                let moved = !progress.metadata.hound_qsyed
+                    || (fox_hz - old_off).abs() > TX_OFFSET_NOOP_TOLERANCE_HZ;
+                if moved {
+                    // PAN-145: a frame snapshotted at the old offset must not
+                    // key after this move.
+                    self.relocation_epochs.bump(&qso_id.to_string());
+                }
+                progress.metadata.frequency = fox_hz;
+                progress.metadata.partner_freq = Some(fox_hz);
                 progress.metadata.pending_freq_drift = None;
                 progress.metadata.hound_qsyed = true;
                 // PAN-72 (Codex round 1 on PR #350, finding 5): re-anchor the
-                // known-good offset onto the POST-QSY offset. The
+                // known-good offset onto the Fox offset. The
                 // `dx_frame_advanced` block a few lines above just recorded
-                // the pre-QSY LOW CALLING offset as known-good (this QSY is
-                // driven by the very same RespondingToCq -> SendingReport
-                // advance), and this block then moves us into the mandatory
-                // response region. Left as-is, a subsequent `SendingReport`
-                // stall would read `frequency != last_known_good` as "we're
-                // sitting on a previously-switched offset" and emit a
-                // `Revert` back to the low calling offset — undoing the
-                // procedure-mandated QSY and putting our R+report where the
-                // Fox is no longer listening.
-                //
-                // Re-anchoring (rather than exempting Hound from the
-                // mechanism) keeps the stall switch/revert ping-pong working
-                // WITHIN the response region for a merely slow Fox, while
-                // making the QSY'd offset the thing a later revert returns
-                // TO.
-                progress.metadata.last_known_good_offset_hz = Some(qsy);
-                // Keep the ReportAck emitted this cycle on the QSY'd offset.
-                qso_frequency = qsy;
-                // Update the SendingReport state's frequency so the Completed
-                // arm inherits the correct (QSY'd) TX offset.
+                // the calling offset as known-good, so without this a later
+                // `SendingReport` stall would read `frequency !=
+                // last_known_good` and emit a `Revert` back to the calling
+                // offset, where the Fox is no longer listening.
+                progress.metadata.last_known_good_offset_hz = Some(fox_hz);
+                // Keep the ReportAck emitted this cycle on the Fox offset.
+                qso_frequency = fox_hz;
                 if let QsoState::SendingReport {
                     frequency: ref mut state_freq,
                     ..
                 } = progress.state
                 {
-                    *state_freq = qsy;
+                    *state_freq = fox_hz;
                 }
-                info!(
-                    target: "hound",
-                    qso_id = %qso_id,
-                    fox = %fox_call,
-                    "Hound: Fox answered — QSY TX {:.0} Hz -> {:.0} Hz (response region {}–{} Hz), sending R+report on new offset",
-                    old_off, qsy, resp_min, resp_max
-                );
+                if moved {
+                    info!(
+                        target: "hound",
+                        qso_id = %qso_id,
+                        fox = %fox_call,
+                        "Hound: Fox sent our report — QSY TX {:.0} Hz -> {:.0} Hz (Fox offset), sending R+report there",
+                        old_off, fox_hz
+                    );
+                }
             }
         }
 
@@ -6091,6 +6175,24 @@ impl QsoManager {
                 });
             }
         }
+
+        // A Hound relocation publishes while both locks still protect the
+        // binding and frequency. Do not reacquire the QSO map under the gate.
+        if hound_ptt_sync.is_some() {
+            if let Some(reply) = reply_to_emit.take() {
+                self.emit_event(QsoEvent::MessageToSend {
+                    qso_id,
+                    message: reply,
+                    frequency: qso_frequency,
+                    tx_parity: qso_tx_parity,
+                    remote_origin: qso_remote_origin,
+                    remote_client_key_id: qso_remote_client_key_id.clone(),
+                    attempt_id: Some(self.next_attempt_id()),
+                })
+                .await;
+            }
+        }
+        drop(hound_ptt_sync);
 
         // Release the QSO map write lock before emitting the reply so the
         // emission path holds no locks (and a future change to send_message-
@@ -6153,6 +6255,29 @@ impl QsoManager {
     /// displayed call gains or loses a portable prefix/suffix between frames.
     /// Deliberately conservative: genuinely different calls (`K5ARH`/`K5ARG`)
     /// still mismatch — see `callsigns_match` docs.
+    /// PAN-259: whether `message_type` is a report or RR73 addressed to us by
+    /// this Hound QSO's latched Fox. Only such a frame may move a Hound to a
+    /// new Fox stream.
+    fn is_hound_fox_frame(&self, metadata: &QsoMetadata, message_type: &MessageType) -> bool {
+        let (from, to) = match message_type {
+            MessageType::SignalReport {
+                from_station,
+                to_station,
+                ..
+            }
+            | MessageType::FinalConfirmation {
+                from_station,
+                to_station,
+            } => (from_station, to_station),
+            _ => return false,
+        };
+        metadata
+            .their_callsign
+            .as_deref()
+            .is_some_and(|fox| Self::is_partner(from, fox))
+            && self.is_us(to)
+    }
+
     fn is_partner(from: &str, partner: &str) -> bool {
         crate::exchange::callsigns_match(from, partner)
     }
@@ -7625,6 +7750,18 @@ impl QsoManager {
         // is bounded in time, uses the SAME tolerance, and is on top of (never
         // instead of) the current baseline; the callsign/state match above still
         // gates who may use it.
+        // PAN-259: a Fox runs several streams and may answer us on any of
+        // them, more than the established tolerance away from where we last
+        // heard it. For an active Hound, a report or RR73 that is addressed
+        // to us AND sent by the latched Fox (checked here, because some
+        // state/message pairs above fall through to an addressee-only arm)
+        // is relevant anywhere inside the Fox response envelope.
+        if metadata.hound
+            && self.is_hound_fox_frame(metadata, message_type)
+            && hound_report_offset(frequency, &self.config.hound).is_some()
+        {
+            return true;
+        }
         if let Some(qso_freq) = state.frequency() {
             let match_freq = metadata.partner_freq.unwrap_or(qso_freq);
             let tolerance = if state.their_callsign().is_some() {
@@ -16354,7 +16491,7 @@ mod sender_verification_tests {
         let qso_id = manager
             .engage_hound(
                 "D2UY",
-                1800.0,
+                600.0,
                 Some("JI64"),
                 Some(pancetta_core::slot::SlotParity::Even),
             )
@@ -16377,7 +16514,9 @@ mod sender_verification_tests {
                         report: -12,
                     },
                     "K5ARH D2UY -12".into(),
-                    900.0,
+                    // PAN-259: outside the 300-900 Hz Fox envelope, so the
+                    // Hound relevance exception does not apply either.
+                    1800.0,
                     Some(snr),
                 )
                 .await
@@ -16386,7 +16525,7 @@ mod sender_verification_tests {
 
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(progress.metadata.pending_freq_drift, None);
-        assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert_eq!(progress.metadata.partner_freq, Some(600.0));
         assert!(!progress.metadata.hound_qsyed);
         assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
         assert!(
@@ -16402,14 +16541,15 @@ mod sender_verification_tests {
                     report: -12,
                 },
                 "K5ARH D2UY -12".into(),
-                1800.0,
+                600.0,
                 Some(-15.0),
             )
             .await
             .unwrap();
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(progress.metadata.hound_qsyed);
-        assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert_eq!(progress.metadata.partner_freq, Some(600.0));
+        assert_eq!(progress.metadata.frequency, 600.0);
         assert!(matches!(progress.state, QsoState::SendingReport { .. }));
     }
 
@@ -21209,11 +21349,13 @@ mod pan72_stall_detection_tests {
         );
     }
 
-    /// The control: an in-region relocation on a QSY'd Hound still commits.
+    /// PAN-259: after the Fox's report the Hound is pinned to the Fox's own
+    /// offset. Any relocation away from it, even one inside the response
+    /// envelope, is refused, and the pinned window is a single point.
     #[tokio::test]
-    async fn a_hound_switch_inside_the_live_response_region_still_commits() {
+    async fn a_hound_switch_after_the_fox_report_is_pinned_to_the_fox_offset() {
         let manager = manager_auto(test_config());
-        let fox_rx_hz = 300.0;
+        let fox_rx_hz = 600.0;
         let qso_id = manager
             .engage_hound(DX, fox_rx_hz, None, None)
             .await
@@ -21231,20 +21373,30 @@ mod pan72_stall_detection_tests {
             )
             .await
             .unwrap();
-        let regions = HoundRegions::default();
-        let qsyed_hz = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
-        let target = (qsyed_hz + 200.0).min(regions.response_max_hz);
-        assert!(
-            (target - qsyed_hz).abs() > TX_OFFSET_NOOP_TOLERANCE_HZ,
-            "precondition: the target is a real move inside the response region"
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.frequency, 600.0);
+        assert_eq!(
+            hound_switch_range_hz(&progress, manager.config()),
+            Some((600.0, 600.0)),
+            "the post-report window is the Fox offset alone"
         );
 
+        let target = 800.0;
+        let err = manager
+            .apply_tx_offset_switch(qso_id, target, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect_err("a nudge off the Fox offset must not commit");
+        assert!(
+            matches!(
+                err,
+                QsoManagerError::OffsetActionOutsideHoundRegion { qso_id: id, .. } if id == qso_id
+            ),
+            "expected OffsetActionOutsideHoundRegion, got {err:?}"
+        );
         assert_eq!(
-            manager
-                .apply_tx_offset_switch(qso_id, target, OffsetRelocationOrigin::OperatorForced)
-                .await
-                .expect("an in-region relocation must still commit"),
-            target
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            600.0,
+            "the refused nudge must leave the Hound on the Fox offset"
         );
     }
 
@@ -26405,189 +26557,458 @@ mod hound_tests {
             .collect()
     }
 
-    /// T5-1: Full Hound exchange end-to-end.
+    fn fox_report(fox: &str, report: i8) -> MessageType {
+        MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: fox.into(),
+            report,
+        }
+    }
+
+    fn fox_rr73(fox: &str) -> MessageType {
+        MessageType::FinalConfirmation {
+            from_station: fox.into(),
+            to_station: "K5ARH".into(),
+        }
+    }
+
+    fn seventy_threes(events: &[QsoEvent]) -> usize {
+        message_to_sends(events)
+            .iter()
+            .filter(|(_, m)| matches!(m, MessageType::SeventyThree { .. }))
+            .count()
+    }
+
+    /// PAN-259 scenario 1: a Hound chasing a Fox at 600 Hz calls between
+    /// 1000 and 2700 Hz, where a WSJT-X Fox listens.
+    #[tokio::test]
+    async fn hound_calls_a_600_hz_fox_between_1000_and_2700_hz() {
+        let manager = QsoManager::new(hound_test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .engage_hound("D2UY", 600.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound must succeed");
+        let sends = message_to_sends(&drain_events(&mut rx));
+        let (open_freq, open_msg) = sends.first().expect("opening call must be emitted");
+        assert!(
+            (1000.0..=2700.0).contains(open_freq),
+            "opening call at {open_freq} Hz must be in 1000-2700 Hz"
+        );
+        assert!(matches!(open_msg, MessageType::CqResponse { .. }));
+        let freq = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
+        assert!((1000.0..=2700.0).contains(&freq));
+    }
+
+    /// T5-1 / PAN-259 scenarios 1 and 2: full Hound exchange end-to-end.
     ///
-    /// `engage_hound("D2UY", 1800.0, Some("JI64"), Some(Even))`
-    /// → assert opening call is low (300–900 Hz).
-    /// Feed Fox `SignalReport` directed at us, arriving at Fox's freq 1800 Hz
-    /// → assert:
-    ///   - state == `SendingReport`,
-    ///   - `metadata.hound_qsyed == true`,
-    ///   - `metadata.frequency ∈ [1000, 2700]` (QSY'd up),
-    ///   - `metadata.partner_freq` still `Some(1800.0)` (unchanged),
-    ///   - emitted `ReportAck` (`<D2UY> <us> R-NN`) rides the QSY'd offset.
-    /// Then feed Fox `FinalConfirmation` at 1800 Hz
-    /// → assert the QSO reaches `Completed`.
+    /// The Hound calls a 600 Hz Fox in 1000-2700 Hz. The Fox's report moves
+    /// every frequency mirror to exactly 600 Hz and the R-report rides it. The
+    /// Fox's RR73 completes the QSO with no 73, and a duplicate RR73 sends no
+    /// 73 either.
     #[tokio::test]
     async fn hound_qsy_on_fox_report_full_exchange() {
         let manager = QsoManager::new(hound_test_config());
         let mut rx = manager.subscribe();
 
-        // Open Hound QSO targeting D2UY who is on 1800 Hz.
         let qso_id = manager
-            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .engage_hound("D2UY", 600.0, Some("JI64"), Some(SlotParity::Even))
             .await
             .expect("engage_hound must succeed");
 
-        // Check the opening call is in the LOW region.
-        let opening_events = drain_events(&mut rx);
-        let opening_sends = message_to_sends(&opening_events);
+        let opening_sends = message_to_sends(&drain_events(&mut rx));
+        let (open_freq, _) = opening_sends.first().expect("opening call");
         assert!(
-            !opening_sends.is_empty(),
-            "opening MessageToSend must be emitted"
-        );
-        let (open_freq, _) = &opening_sends[0];
-        assert!(
-            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(open_freq),
-            "opening call freq {open_freq} must be in [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
+            (1000.0..=2700.0).contains(open_freq),
+            "opening call freq {open_freq} must be in 1000-2700 Hz"
         );
 
-        // ── Fox answers with a signal report directed at us, at Fox's freq ──
         manager
             .process_message(
-                MessageType::SignalReport {
-                    to_station: "K5ARH".into(),
-                    from_station: "D2UY".into(),
-                    report: -12,
-                },
+                fox_report("D2UY", -12),
                 "K5ARH D2UY -12".into(),
-                1800.0, // Fox's decoded frequency (partner_freq)
+                600.0,
                 Some(-12.0),
             )
             .await
             .expect("process_message for Fox SignalReport must succeed");
 
-        // ── Assert QSY ──
         let after_report_events = drain_events(&mut rx);
         let progress = manager.get_qso(qso_id).await.unwrap();
-
-        // State must have advanced to SendingReport.
-        assert!(
-            matches!(progress.state, QsoState::SendingReport { .. }),
-            "state must be SendingReport after Fox report, got {:?}",
-            progress.state
-        );
-
-        // hound_qsyed must be set (fire-once gate).
-        assert!(
-            progress.metadata.hound_qsyed,
-            "hound_qsyed must be true after the first Fox report"
-        );
-
-        // TX offset must have QSY'd into the response region.
-        let qsy_freq = progress.metadata.frequency;
-        assert!(
-            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(&qsy_freq),
-            "metadata.frequency {qsy_freq} must be in response region [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] after QSY"
-        );
-
-        // partner_freq must be unchanged (Fox's RX offset is fixed).
+        match &progress.state {
+            QsoState::SendingReport { frequency, .. } => assert_eq!(*frequency, 600.0),
+            other => panic!("state must be SendingReport after Fox report, got {other:?}"),
+        }
+        assert!(progress.metadata.hound_qsyed);
         assert_eq!(
-            progress.metadata.partner_freq,
-            Some(1800.0),
-            "partner_freq must remain Some(1800.0) after QSY"
+            progress.metadata.frequency, 600.0,
+            "TX moves to the Fox offset"
         );
+        assert_eq!(progress.metadata.partner_freq, Some(600.0));
+        assert_eq!(progress.metadata.last_known_good_offset_hz, Some(600.0));
 
-        // The emitted ReportAck must ride the QSY'd offset (not the old low one).
         let sends = message_to_sends(&after_report_events);
         let report_acks: Vec<_> = sends
             .iter()
             .filter(|(_, m)| matches!(m, MessageType::ReportAck { .. }))
             .collect();
-        assert!(
-            !report_acks.is_empty(),
-            "a ReportAck must be emitted after the Fox's SignalReport"
-        );
-        let (ack_freq, ack_msg) = &report_acks[0];
-        assert!(
-            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(ack_freq),
-            "ReportAck must be emitted on the QSY'd offset {ack_freq} in [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}]"
-        );
-        // ReportAck must be <D2UY> <us> R-NN.
+        let (ack_freq, ack_msg) = report_acks.first().expect("a ReportAck must be emitted");
+        assert_eq!(*ack_freq, 600.0, "R-report must ride the Fox's own offset");
         match ack_msg {
             MessageType::ReportAck {
                 to_station,
                 from_station,
                 ..
             } => {
-                assert_eq!(to_station, "D2UY", "ReportAck must be addressed to Fox");
-                assert_eq!(from_station, "K5ARH", "ReportAck must be from us");
+                assert_eq!(to_station, "D2UY");
+                assert_eq!(from_station, "K5ARH");
             }
             other => panic!("expected ReportAck, got {:?}", other),
         }
 
-        // ── Fox sends RR73 (at Fox's freq) → QSO completes ──
         manager
             .process_message(
-                MessageType::FinalConfirmation {
-                    from_station: "D2UY".into(),
-                    to_station: "K5ARH".into(),
-                },
+                fox_rr73("D2UY"),
                 "K5ARH D2UY RR73".into(),
-                1800.0, // still at Fox's decoded frequency
+                600.0,
                 Some(-10.0),
             )
             .await
             .expect("process_message for Fox RR73 must succeed");
-
+        let rr73_events = drain_events(&mut rx);
         let final_progress = manager.get_qso(qso_id).await.unwrap();
         assert!(
             matches!(final_progress.state, QsoState::Completed { .. }),
             "QSO must reach Completed after Fox RR73, got {:?}",
             final_progress.state
         );
+        assert_eq!(seventy_threes(&rr73_events), 0, "a Hound sends no 73");
+        let completions = rr73_events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::QsoCompleted { qso_id: id, .. } if *id == qso_id))
+            .count();
+        assert_eq!(completions, 1, "the QSO completes (and logs) exactly once");
+
+        // Duplicate RR73: still no 73 and no second completion.
+        let _ = manager
+            .process_message(
+                fox_rr73("D2UY"),
+                "K5ARH D2UY RR73".into(),
+                600.0,
+                Some(-10.0),
+            )
+            .await;
+        let dup_events = drain_events(&mut rx);
+        assert_eq!(
+            seventy_threes(&dup_events),
+            0,
+            "a duplicate RR73 sends no 73"
+        );
+        assert!(
+            !dup_events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "a duplicate RR73 must not complete the QSO again"
+        );
+    }
+
+    #[tokio::test]
+    async fn hound_later_report_waits_for_ptt_gate_before_relocation_and_publication() {
+        let mut manager = QsoManager::new(hound_test_config());
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(gate.clone());
+        let id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -8),
+                "K5ARH D2UY -08".into(),
+                600.0,
+                Some(-8.0),
+            )
+            .await
+            .unwrap();
+        let mut rx = manager.subscribe();
+        let key = id.to_string();
+        let before = manager.relocation_epochs.epoch(&key);
+        let held = gate.lock().await;
+        let mut moving = Box::pin(manager.process_message(
+            fox_report("D2UY", -8),
+            "K5ARH D2UY -08".into(),
+            780.0,
+            Some(-8.0),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                moving.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        assert_eq!(manager.relocation_epochs.epoch(&key), before);
+        assert!(message_to_sends(&drain_events(&mut rx)).is_empty());
+        drop(held);
+        moving.await.unwrap();
+        assert!(manager.relocation_epochs.epoch(&key) > before);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.frequency, 780.0);
+        assert!(message_to_sends(&drain_events(&mut rx))
+            .iter()
+            .all(|(hz, _)| *hz == 780.0));
+    }
+
+    /// PAN-259 scenario 2: a Hound calling at 1500 Hz answers the Fox's report
+    /// at the Fox's 600 Hz offset.
+    #[tokio::test]
+    async fn hound_calling_at_1500_sends_r_report_at_fox_offset() {
+        let mut config = hound_test_config();
+        config.hound.call_min_hz = 1500.0;
+        config.hound.call_max_hz = 1500.0;
+        let manager = QsoManager::new(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            1500.0
+        );
+        drain_events(&mut rx);
+
+        manager
+            .process_message(
+                fox_report("D2UY", -8),
+                "K5ARH D2UY -08".into(),
+                600.0,
+                Some(-8.0),
+            )
+            .await
+            .unwrap();
+        let sends = message_to_sends(&drain_events(&mut rx));
+        assert!(
+            sends
+                .iter()
+                .any(|(f, m)| *f == 600.0 && matches!(m, MessageType::ReportAck { .. })),
+            "R-report must go out at 600 Hz, got {sends:?}"
+        );
+    }
+
+    /// PAN-259: a later addressed report from the Fox on another admissible
+    /// stream, more than the 100 Hz established tolerance away, re-anchors
+    /// the Hound onto that stream.
+    #[tokio::test]
+    async fn hound_follows_fox_report_to_another_stream_beyond_100_hz() {
+        let manager = QsoManager::new(hound_test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -12),
+                "K5ARH D2UY -12".into(),
+                600.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        drain_events(&mut rx);
+
+        manager
+            .process_message(
+                fox_report("D2UY", -12),
+                "K5ARH D2UY -12".into(),
+                780.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.frequency, 780.0);
+        assert_eq!(progress.metadata.partner_freq, Some(780.0));
+        assert_eq!(progress.metadata.last_known_good_offset_hz, Some(780.0));
+        // A repeated report queues no immediate reply (PAN-129); the
+        // per-slot resend reads `metadata.frequency`, now the new stream. No
+        // R-report may go out on the old stream.
+        let sends = message_to_sends(&drain_events(&mut rx));
+        assert!(
+            sends.iter().all(|(f, _)| *f == 780.0),
+            "nothing may be sent on the Fox's old stream, got {sends:?}"
+        );
+    }
+
+    /// PAN-259 (self-review): a report addressed to us by a station other
+    /// than the Fox, inside the Fox envelope, must not move the Hound.
+    #[tokio::test]
+    async fn hound_ignores_a_non_fox_report_inside_the_envelope() {
+        let manager = QsoManager::new(hound_test_config());
+        let qso_id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -12),
+                "K5ARH D2UY -12".into(),
+                600.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let _ = manager
+            .process_message(
+                fox_report("W1XYZ", -10),
+                "K5ARH W1XYZ -10".into(),
+                820.0,
+                Some(-10.0),
+            )
+            .await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.frequency, 600.0);
+        assert_eq!(progress.metadata.partner_freq, Some(600.0));
+        assert_eq!(progress.metadata.last_known_good_offset_hz, Some(600.0));
+    }
+
+    /// PAN-259: a Fox report outside the response envelope, or at a
+    /// non-finite offset, is ignored: no R-report and no state advance.
+    #[tokio::test]
+    async fn hound_ignores_fox_report_outside_the_response_envelope() {
+        for bad_hz in [1800.0, f64::NAN, 250.0] {
+            let manager = QsoManager::new(hound_test_config());
+            let mut rx = manager.subscribe();
+            let qso_id = manager
+                .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+                .await
+                .unwrap();
+            drain_events(&mut rx);
+            let _ = manager
+                .process_message(
+                    fox_report("D2UY", -12),
+                    "K5ARH D2UY -12".into(),
+                    bad_hz,
+                    Some(-12.0),
+                )
+                .await;
+            let progress = manager.get_qso(qso_id).await.unwrap();
+            assert!(
+                matches!(progress.state, QsoState::RespondingToCq { .. }),
+                "a report at {bad_hz} Hz must not advance the exchange"
+            );
+            assert!(!progress.metadata.hound_qsyed);
+            assert!(
+                !message_to_sends(&drain_events(&mut rx))
+                    .iter()
+                    .any(|(_, m)| matches!(m, MessageType::ReportAck { .. })),
+                "no R-report for a report at {bad_hz} Hz"
+            );
+        }
+    }
+
+    /// PAN-259: the report-driven offset is exactly the Fox offset, admitted
+    /// only inside the envelope and the TX range.
+    #[test]
+    fn hound_report_offset_is_exact_and_bounded() {
+        let regions = HoundRegions::default();
+        assert_eq!(hound_report_offset(600.0, &regions), Some(600.0));
+        assert_eq!(hound_report_offset(612.5, &regions), Some(612.5));
+        assert_eq!(hound_report_offset(300.0, &regions), Some(300.0));
+        assert_eq!(hound_report_offset(900.0, &regions), Some(900.0));
+        assert_eq!(hound_report_offset(1500.0, &regions), None);
+        assert_eq!(hound_report_offset(f64::INFINITY, &regions), None);
+        let wide = HoundRegions {
+            response_min_hz: 100.0,
+            ..HoundRegions::default()
+        };
+        assert_eq!(
+            hound_report_offset(150.0, &wide),
+            None,
+            "below the transmittable TX range"
+        );
+    }
+
+    /// PAN-259: a non-Hound exchange still closes RR73 with its normal 73.
+    #[tokio::test]
+    async fn non_hound_exchange_still_sends_final_73() {
+        let manager = QsoManager::new(hound_test_config());
+        let mut rx = manager.subscribe();
+        manager
+            .respond_to_cq_manual("D2UY".into(), 1500.0, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -9),
+                "K5ARH D2UY -09".into(),
+                1500.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        drain_events(&mut rx);
+        manager
+            .process_message(
+                fox_rr73("D2UY"),
+                "K5ARH D2UY RR73".into(),
+                1500.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seventy_threes(&drain_events(&mut rx)), 1);
+    }
+
+    #[test]
+    fn hound_suppresses_only_the_terminal_73() {
+        let seventy_three = MessageType::SeventyThree {
+            to_station: "D2UY".into(),
+            from_station: "K5ARH".into(),
+        };
+        assert!(hound_suppresses_reply(Some(&seventy_three)));
+        assert!(!hound_suppresses_reply(Some(&fox_rr73("D2UY"))));
+        assert!(!hound_suppresses_reply(None));
     }
 
     /// T5-2: QSY fires even in `TxFreqMode::Hold`.
     ///
     /// The Hound QSY is procedure-mandated — independent of the autonomous
     /// silence-driven stall detector's gate (`TxFreqMode::Auto`). In the
-    /// default Hold mode the operator's TX offset is "sticky" for the stall
-    /// detector, but the Hound QSY MUST still move to the response region on
-    /// the Fox's first report.
+    /// default Hold mode the Hound must still move to the Fox's offset on the
+    /// Fox's first report.
     #[tokio::test]
     async fn hound_qsy_fires_in_hold_mode() {
-        // Default manager uses Hold (the tx_freq_mode default is Hold).
         let manager = QsoManager::new(hound_test_config());
-        // Confirm it is in Hold mode (the stall detector would NOT fire in this mode).
-        // We do NOT set_tx_freq_mode_source to Auto — leave it as Hold.
 
         let qso_id = manager
-            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .engage_hound("D2UY", 600.0, Some("JI64"), Some(SlotParity::Even))
             .await
             .expect("engage_hound must succeed");
 
         let before_freq = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
         assert!(
-            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(&before_freq),
-            "before QSY, offset {before_freq} must be in the low calling region"
+            (1000.0..=2700.0).contains(&before_freq),
+            "before QSY, offset {before_freq} must be in the calling region"
         );
 
-        // Fox answers with a report — QSY must fire regardless of Hold mode.
         manager
             .process_message(
-                MessageType::SignalReport {
-                    to_station: "K5ARH".into(),
-                    from_station: "D2UY".into(),
-                    report: -12,
-                },
+                fox_report("D2UY", -12),
                 "K5ARH D2UY -12".into(),
-                1800.0,
+                600.0,
                 Some(-12.0),
             )
             .await
             .expect("process_message for Fox SignalReport in Hold mode must succeed");
 
         let progress = manager.get_qso(qso_id).await.unwrap();
-        let qsy_freq = progress.metadata.frequency;
-        assert!(
-            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(&qsy_freq),
-            "metadata.frequency {qsy_freq} must QSY into [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] even in Hold mode"
+        assert_eq!(
+            progress.metadata.frequency, 600.0,
+            "the Hound must move to the Fox offset even in Hold mode"
         );
-        assert!(
-            progress.metadata.hound_qsyed,
-            "hound_qsyed must be true after QSY in Hold mode"
-        );
+        assert!(progress.metadata.hound_qsyed);
     }
 
     /// Task 6 (updated): engage_hound must NOT insert a bare "HOUND" key into

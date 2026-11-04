@@ -448,6 +448,20 @@ pub(crate) fn invoke_cross_sequence_consumer(
     }
 }
 
+/// Refresh from the supervisor's current manager, never a startup snapshot.
+async fn refresh_hound_receive_context(
+    decoder: &mut Ft8Decoder,
+    managers: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+) -> bool {
+    let manager = managers.borrow().clone();
+    let foxes = match manager {
+        Some(manager) => manager.active_hound_foxes().await,
+        None => Vec::new(),
+    };
+    decoder.set_hound_foxes(&foxes);
+    !foxes.is_empty()
+}
+
 impl super::ApplicationCoordinator {
     /// Start FT8 decoder with point-to-point channels.
     pub(crate) async fn start_ft8_pipeline(&mut self) -> Result<()> {
@@ -472,6 +486,11 @@ impl super::ApplicationCoordinator {
         // `DecoderRebuildKey` field changed.
         let initial_window = self.decode_window.read().await.clone();
         let mut decoder = Ft8Decoder::new(initial_window.ft8().clone())?;
+        let qso_manager_rx = self.qso_manager_watch.subscribe();
+        let hound_response = {
+            let cfg = self.config.read().await;
+            (cfg.hound.response_min_hz, cfg.hound.response_max_hz)
+        };
         let decode_window_shared = self.decode_window.clone();
 
         // hb-216 S2: scoped fast-path activation flag. Seeded from env at
@@ -779,6 +798,10 @@ impl super::ApplicationCoordinator {
                                 e
                             );
                         }
+                        // Reapply after rebuilds and manager supervisor restarts.
+                        let hound_active = rt
+                            .block_on(refresh_hound_receive_context(&mut decoder, &qso_manager_rx));
+                        let fox_response = hound_active.then_some(hound_response);
                         // The protocol the live decoder was built for.
                         let last_protocol = applied_window.rebuild_key.protocol;
                         // hb-237: cross-sequence A7 enable flag, from the
@@ -968,7 +991,7 @@ impl super::ApplicationCoordinator {
                         const SCOPED_HALF_WIDTH: usize = 5;
                         let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
-                            if scoped_fast_path_enabled {
+                            if scoped_fast_path_enabled && fox_response.is_none() {
                                 // PAN-72 round-8 redesign (fix 2): `.0` is the
                                 // primary hint (this scoped path's original
                                 // single-frequency meaning, unchanged); `.1`
@@ -1111,7 +1134,7 @@ impl super::ApplicationCoordinator {
                         let ft8lib_start = Instant::now();
                         let ft8lib_messages = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
-                                pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(
+                                decoder.decode_window_ft8lib_with_context(
                                     &window,
                                     last_protocol,
                                 )
@@ -1204,10 +1227,14 @@ impl super::ApplicationCoordinator {
                                 chrono::Utc::now(),
                                 qso_filter_override_off,
                             );
+                        let narrow_filter_bins = super::qso_filter::include_hound_response_region(
+                            narrow_filter_bins,
+                            fox_response,
+                        );
                         let partner_freq_for_relaxed_sync =
                             super::qso_filter::partner_freq_for_relaxed_sync(
                                 partner_freq_for_main,
-                                qso_filter_override_off,
+                                qso_filter_override_off || fox_response.is_some(),
                             );
                         if let Some(ref range) = narrow_filter_bins {
                             info!(
@@ -2817,5 +2844,40 @@ mod decode_window_refresh_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dxpedition_context_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dxpedition_context_refreshes_after_manager_restart_and_decoder_rebuild() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let mut decoder = Ft8Decoder::new(pancetta_ft8::Ft8Config::default()).unwrap();
+        assert!(!refresh_hound_receive_context(&mut decoder, &rx).await);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W9XYZ".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .engage_hound("KH1/KH7Z", 600.0, None, None)
+            .await
+            .unwrap();
+        tx.send_replace(Some(manager.clone()));
+        assert!(refresh_hound_receive_context(&mut decoder, &rx).await);
+        assert!(decoder.learned_callsigns().contains(&"KH1/KH7Z".into()));
+        let mut rebuilt = Ft8Decoder::new(pancetta_ft8::Ft8Config::default()).unwrap();
+        for call in decoder.learned_callsigns() {
+            rebuilt.seed_hash_callsign(&call);
+        }
+        assert!(refresh_hound_receive_context(&mut rebuilt, &rx).await);
+        // Replace the published manager while the old one is still active.
+        tx.send_replace(Some(pancetta_qso::QsoManager::new(Default::default())));
+        assert!(!refresh_hound_receive_context(&mut rebuilt, &rx).await);
+        assert_eq!(manager.active_hound_foxes().await, vec!["KH1/KH7Z"]);
+        tx.send_replace(Some(manager.clone()));
+        assert!(refresh_hound_receive_context(&mut rebuilt, &rx).await);
+        manager.cancel_qso(id).await.unwrap();
+        assert!(!refresh_hound_receive_context(&mut rebuilt, &rx).await);
     }
 }
