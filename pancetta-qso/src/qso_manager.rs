@@ -5457,6 +5457,7 @@ impl QsoManager {
                 old_state,
                 QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. }
             )
+            && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
             && hound_report_offset(message.frequency, &self.config.hound).is_none()
         {
             warn!(
@@ -6070,6 +6071,7 @@ impl QsoManager {
                 && advanced_to_sending_report
                 && (was_responding_to_cq || progress.metadata.hound_qsyed)
                 && matches!(message.message_type, MessageType::SignalReport { .. })
+                && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
             {
                 hound_report_offset(message.frequency, &self.config.hound)
             } else {
@@ -6200,6 +6202,29 @@ impl QsoManager {
     /// displayed call gains or loses a portable prefix/suffix between frames.
     /// Deliberately conservative: genuinely different calls (`K5ARH`/`K5ARG`)
     /// still mismatch — see `callsigns_match` docs.
+    /// PAN-259: whether `message_type` is a report or RR73 addressed to us by
+    /// this Hound QSO's latched Fox. Only such a frame may move a Hound to a
+    /// new Fox stream.
+    fn is_hound_fox_frame(&self, metadata: &QsoMetadata, message_type: &MessageType) -> bool {
+        let (from, to) = match message_type {
+            MessageType::SignalReport {
+                from_station,
+                to_station,
+                ..
+            }
+            | MessageType::FinalConfirmation {
+                from_station,
+                to_station,
+            } => (from_station, to_station),
+            _ => return false,
+        };
+        metadata
+            .their_callsign
+            .as_deref()
+            .is_some_and(|fox| Self::is_partner(from, fox))
+            && self.is_us(to)
+    }
+
     fn is_partner(from: &str, partner: &str) -> bool {
         crate::exchange::callsigns_match(from, partner)
     }
@@ -7674,14 +7699,12 @@ impl QsoManager {
         // gates who may use it.
         // PAN-259: a Fox runs several streams and may answer us on any of
         // them, more than the established tolerance away from where we last
-        // heard it. For an active Hound, a report or RR73 from the matched
-        // Fox (the callsign/to/state match above already proved sender and
-        // addressee) is relevant anywhere inside the Fox response envelope.
+        // heard it. For an active Hound, a report or RR73 that is addressed
+        // to us AND sent by the latched Fox (checked here, because some
+        // state/message pairs above fall through to an addressee-only arm)
+        // is relevant anywhere inside the Fox response envelope.
         if metadata.hound
-            && matches!(
-                message_type,
-                MessageType::SignalReport { .. } | MessageType::FinalConfirmation { .. }
-            )
+            && self.is_hound_fox_frame(metadata, message_type)
             && hound_report_offset(frequency, &self.config.hound).is_some()
         {
             return true;
@@ -26666,6 +26689,38 @@ mod hound_tests {
             sends.iter().all(|(f, _)| *f == 780.0),
             "nothing may be sent on the Fox's old stream, got {sends:?}"
         );
+    }
+
+    /// PAN-259 (self-review): a report addressed to us by a station other
+    /// than the Fox, inside the Fox envelope, must not move the Hound.
+    #[tokio::test]
+    async fn hound_ignores_a_non_fox_report_inside_the_envelope() {
+        let manager = QsoManager::new(hound_test_config());
+        let qso_id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -12),
+                "K5ARH D2UY -12".into(),
+                600.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let _ = manager
+            .process_message(
+                fox_report("W1XYZ", -10),
+                "K5ARH W1XYZ -10".into(),
+                820.0,
+                Some(-10.0),
+            )
+            .await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.frequency, 600.0);
+        assert_eq!(progress.metadata.partner_freq, Some(600.0));
+        assert_eq!(progress.metadata.last_known_good_offset_hz, Some(600.0));
     }
 
     /// PAN-259: a Fox report outside the response envelope, or at a

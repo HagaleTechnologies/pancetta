@@ -4646,11 +4646,22 @@ impl super::ApplicationCoordinator {
                                         // PAN-259: a DXpedition (type 0.1) frame
                                         // carries two contacts; each runs through
                                         // the same per-contact processing below.
-                                        let msg_types = ft8_message_to_qso_types(
+                                        let mut msg_types = ft8_message_to_qso_types(
                                             &decoded_msg.message,
                                             &raw_text,
                                             &our_callsign,
                                         );
+                                        // Process the contact addressed to us
+                                        // last, so `record_dx_activity` leaves
+                                        // the Fox shown as working us.
+                                        msg_types.sort_by_key(|m| {
+                                            m.addressee_callsign().is_some_and(|to| {
+                                                pancetta_qso::exchange::callsigns_match(
+                                                    to,
+                                                    &our_callsign,
+                                                )
+                                            })
+                                        });
                                         let is_dxpedition_frame =
                                             decoded_msg.message.dxpedition.is_some();
                                         for msg_type in msg_types {
