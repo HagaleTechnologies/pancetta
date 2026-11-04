@@ -96,6 +96,9 @@ hound = "3.5"
 # FFT for live waterfall
 rustfft = "6.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat"] }
+
 [dev-dependencies]
 async-trait = "0.1"
 ratatui = "0.30"
