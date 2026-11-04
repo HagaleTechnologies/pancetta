@@ -1595,10 +1595,10 @@ impl super::ApplicationCoordinator {
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "TX".to_string(),
-                                    status: format!(
-                                        "Hound: calling {} low @ {} Hz",
-                                        callsign, fox_freq
-                                    ),
+                                    // PAN-259: the Fox offset is where we hear
+                                    // the Fox, not where we call it, so the
+                                    // status claims no call offset here.
+                                    status: format!("Hound: engaging {} as Fox...", callsign),
                                 },
                             );
                             let msg = ComponentMessage::new(

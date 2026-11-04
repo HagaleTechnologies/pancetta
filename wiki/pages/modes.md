@@ -37,8 +37,10 @@ periods, band dial tables, and offset regions are normative in the code and
   refuses while any QSO is active (synchronous lock, zero `.await` in the
   critical section) and only then mutates the shared protocol + timing atomics.
 - **Hound** — a manual `Tx≠Rx` procedure flagged by `QsoMetadata.hound`; mode
-  stays FT8 and is flagged in ADIF. `partner_freq` supplies the Fox's fixed
+  stays FT8 and is flagged in ADIF. `partner_freq` supplies the Fox's
   receive location but is a generic split-TX field, not the Hound discriminator.
+  Since PAN-259 it follows WSJT-X: call at 1000–2700 Hz, send the R-report at
+  the Fox's exact offset (pinned there afterwards), log on RR73 with no 73.
 
 The autonomous `SlotTicker` in `pancetta/src/coordinator/autonomous.rs` remembers
 the previous poll time. When it observes a mode change, a current-mode boundary

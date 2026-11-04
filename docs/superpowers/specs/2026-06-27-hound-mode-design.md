@@ -4,6 +4,12 @@
 **Status:** Proposed (awaiting operator review)
 **Author:** Claude Opus 4.8 (under K5ARH supervision)
 
+> **PAN-259 correction (2026-11-04):** the region layout below is inverted
+> relative to WSJT-X. The Hound calls at 1000–2700 Hz, sends its R-report at
+> the Fox's own offset (300–900 Hz envelope) and sends no 73 after the Fox's
+> RR73. `docs/DECISIONS/modes.md` and `docs/CONFIG.md` describe the current
+> procedure; the text below is kept as the original design record.
+
 ## Goal
 
 Let pancetta work a DXpedition station running **FT8 DXpedition ("Fox/Hound") mode** by acting as

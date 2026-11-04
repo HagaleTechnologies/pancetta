@@ -1,42 +1,48 @@
 //! Hound (DXpedition chaser) configuration module.
 //!
 //! Defines the audio-offset regions used when pancetta operates as a Hound
-//! chasing a Fox station. The Hound transmits in the low "call" region and
-//! QSYs up to the "response" region when the Fox answers.
+//! chasing a Fox station. Following the WSJT-X Fox/Hound convention, the Hound
+//! calls in the high "call" region (1000-2700 Hz) where a Fox listens, and when
+//! the Fox sends it a report it moves to the Fox's own audio offset. The
+//! "response" region (300-900 Hz) is the admissibility envelope for that Fox
+//! offset, never a pool from which another frequency is picked (PAN-259).
 
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 
 fn default_call_min() -> f64 {
-    300.0
-}
-fn default_call_max() -> f64 {
-    900.0
-}
-fn default_response_min() -> f64 {
     1000.0
 }
-fn default_response_max() -> f64 {
+fn default_call_max() -> f64 {
     2700.0
+}
+fn default_response_min() -> f64 {
+    300.0
+}
+fn default_response_max() -> f64 {
+    900.0
 }
 
 /// Audio-offset regions for FT8 Hound (DXpedition chaser) mode. The Hound calls
-/// the Fox low (call region) and QSYs up to the response region when answered.
+/// the Fox in the call region (default 1000-2700 Hz, where a WSJT-X Fox
+/// listens) and, when the Fox sends it a report, answers at the Fox's own
+/// offset, which must lie inside the response region (default 300-900 Hz).
 ///
 /// Corresponds to the `[hound]` section in the TOML config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HoundConfig {
-    /// Low calling-region min audio offset (Hz). Default 300.
+    /// Calling-region min audio offset (Hz). Default 1000.
     #[serde(default = "default_call_min")]
     pub call_min_hz: f64,
-    /// Low calling-region max (Hz). Default 900.
+    /// Calling-region max (Hz). Default 2700.
     #[serde(default = "default_call_max")]
     pub call_max_hz: f64,
-    /// Post-QSY response-region min (Hz). Default 1000.
+    /// Fox response-envelope min (Hz). Default 300. A Fox report outside the
+    /// envelope is ignored rather than answered elsewhere.
     #[serde(default = "default_response_min")]
     pub response_min_hz: f64,
-    /// Post-QSY response-region max (Hz). Default 2700.
+    /// Fox response-envelope max (Hz). Default 900.
     #[serde(default = "default_response_max")]
     pub response_max_hz: f64,
 }
@@ -120,13 +126,16 @@ mod tests {
     use super::*;
     use crate::Config;
 
+    /// PAN-259: a WSJT-X Fox listens for Hound calls at 1000-2700 Hz and
+    /// transmits at 300-900 Hz. Literal values, so a constant swap cannot make
+    /// this tautological.
     #[test]
-    fn defaults_are_300_900_1000_2700() {
+    fn defaults_are_call_1000_2700_response_300_900() {
         let cfg = HoundConfig::default();
-        assert_eq!(cfg.call_min_hz, 300.0);
-        assert_eq!(cfg.call_max_hz, 900.0);
-        assert_eq!(cfg.response_min_hz, 1000.0);
-        assert_eq!(cfg.response_max_hz, 2700.0);
+        assert_eq!(cfg.call_min_hz, 1000.0);
+        assert_eq!(cfg.call_max_hz, 2700.0);
+        assert_eq!(cfg.response_min_hz, 300.0);
+        assert_eq!(cfg.response_max_hz, 900.0);
     }
 
     #[test]
@@ -140,10 +149,10 @@ mod tests {
         // A TOML with NO [hound] section must deserialize to defaults.
         let toml = "[station]\ncallsign = \"K5ARH\"\n";
         let parsed: Config = toml::from_str(toml).expect("partial config must deserialize");
-        assert_eq!(parsed.hound.call_min_hz, 300.0);
-        assert_eq!(parsed.hound.call_max_hz, 900.0);
-        assert_eq!(parsed.hound.response_min_hz, 1000.0);
-        assert_eq!(parsed.hound.response_max_hz, 2700.0);
+        assert_eq!(parsed.hound.call_min_hz, 1000.0);
+        assert_eq!(parsed.hound.call_max_hz, 2700.0);
+        assert_eq!(parsed.hound.response_min_hz, 300.0);
+        assert_eq!(parsed.hound.response_max_hz, 900.0);
     }
 
     #[test]

@@ -150,6 +150,57 @@ pub struct Ft8Message {
     pub crc_valid: bool,
     /// Indicates if callsigns are from hash table
     pub uses_hash_calls: bool,
+    /// Both contacts of a DXpedition (i3=0 n3=1) Fox frame, present only for
+    /// that message type (PAN-259). One physical decode carries two logical
+    /// contacts: RR73 to one Hound and a report to another.
+    pub dxpedition: Option<DxpeditionContacts>,
+}
+
+/// The two contacts a WSJT-X Fox packs into one DXpedition (i3=0 n3=1)
+/// frame, e.g. `K1ABC RR73; W9XYZ <KH1/KH7Z> -08` (PAN-259).
+///
+/// Wire layout (WSJT-X `packjt77.f90` `pack77_01`): `c28 c28 h10 r5 n3 i3`.
+/// The first call receives RR73, the second receives the report, and `h10`
+/// is the Fox's own 10-bit call hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxpeditionContacts {
+    /// Hound that receives RR73 (bits 0..28).
+    pub rr73_to: String,
+    /// Hound that receives the signal report (bits 28..56).
+    pub report_to: String,
+    /// The Fox's raw 10-bit call hash (bits 56..66).
+    pub fox_hash10: u16,
+    /// The Fox's callsign when the hash resolves unambiguously in the
+    /// receiver's hash table; `None` when unknown or collided.
+    pub fox_call: Option<String>,
+    /// Report sent to `report_to`, `2*r5 - 30` dB (bits 66..71).
+    pub report_db: i8,
+}
+
+impl DxpeditionContacts {
+    /// Canonical WSJT-X text, e.g. `K1ABC RR73; W9XYZ <KH1/KH7Z> -08`, or
+    /// `<...>` for the Fox when its hash does not resolve.
+    pub fn text(&self) -> String {
+        format!(
+            "{} RR73; {} <{}> {:+03}",
+            self.rr73_to,
+            self.report_to,
+            self.fox_call.as_deref().unwrap_or("..."),
+            self.report_db
+        )
+    }
+}
+
+/// Quantize a report to the 5-bit DXpedition field the way WSJT-X's
+/// `pack77_01` does: `n5 = (report + 30) / 2` with integer division
+/// truncating toward zero, then clamped to 0..=31.
+pub fn dxpedition_report_to_r5(report_db: i8) -> u8 {
+    ((report_db as i32 + 30) / 2).clamp(0, 31) as u8
+}
+
+/// Decode a 5-bit DXpedition report field: `2*r5 - 30` dB.
+pub fn dxpedition_r5_to_report(r5: u8) -> i8 {
+    (2 * (r5 & 0x1F) as i32 - 30) as i8
 }
 
 impl Default for Ft8Message {
@@ -168,6 +219,7 @@ impl Default for Ft8Message {
             crc: 0,
             crc_valid: false,
             uses_hash_calls: false,
+            dxpedition: None,
         }
     }
 }
@@ -310,6 +362,11 @@ impl fmt::Display for Ft8Message {
                 }
                 if let Some(ref exchange) = self.contest_exchange {
                     write!(f, " {}", exchange)?;
+                }
+            }
+            MessageType::DXpedition if self.dxpedition.is_some() => {
+                if let Some(ref contacts) = self.dxpedition {
+                    write!(f, "{}", contacts.text())?;
                 }
             }
             MessageType::Extended | MessageType::DXpedition | MessageType::RTTYRoundup => {
@@ -1740,6 +1797,13 @@ pub(crate) fn hash12(callsign: &str) -> u32 {
     HashTable::calculate_n22(callsign) >> 10
 }
 
+/// Compute the 10-bit hash of a callsign (WSJT-X `ihashcall(c, 10)`), the
+/// Fox signature carried in DXpedition (i3=0 n3=1) frames — the encode-side
+/// mirror of `HashTable::calculate_hash_10bit` (PAN-259).
+pub(crate) fn hash10(callsign: &str) -> u32 {
+    HashTable::calculate_n22(callsign) >> 12
+}
+
 /// FT8 message parser
 pub struct MessageParser {
     /// Hash table for worked stations (10/12/22-bit hashes)
@@ -1801,7 +1865,7 @@ impl MessageParser {
                         self.parse_telemetry_type0(&payload[0..71], &mut message)?;
                     }
                     1 => {
-                        // DXpedition (Fox/Hound): hash(12) + call(28) + R(1) + rpt(13) + ...
+                        // DXpedition (Fox/Hound): c28 + c28 + h10 + r5 (WSJT-X pack77_01)
                         message.message_type = MessageType::DXpedition;
                         self.parse_dxpedition_type0(&payload[0..71], &mut message)?;
                     }
@@ -2308,60 +2372,50 @@ impl MessageParser {
     // i3=0 sub-type parsers (n3 field determines format)
     // =========================================================================
 
-    /// Parse i3=0 n3=1: DXpedition (Fox/Hound) mode
+    /// Parse i3=0 n3=1: DXpedition (Fox/Hound) mode (PAN-259).
     ///
-    /// Bit layout (71 bits, excluding n3 and i3):
-    ///   Fox sends:   call_fox(28) + call_hound(28) + rpt_fox(1) + rpt(15)
-    ///   Hound sends: call_hound(28) + call_fox(28) + R(1) + rpt(15)
+    /// WSJT-X layout (`packjt77.f90` `pack77_01`, 71 bits excluding n3/i3):
+    ///   c28 (Hound that gets RR73) + c28 (Hound that gets the report)
+    ///   + h10 (the Fox's 10-bit call hash) + r5 (report = 2*r5 - 30 dB)
     ///
-    /// The Fox (DXpedition) station sends reports to hounds.
-    /// rpt field: 0-32767. If rpt < 32400 it's a grid square, else signal report.
+    /// Example text: `K1ABC RR73; W9XYZ <KH1/KH7Z> -08`. The physical sender
+    /// is the Fox, set only when `h10` resolves unambiguously in the hash
+    /// table; an unknown or collided hash renders `<...>` and leaves
+    /// `from_callsign` empty. The second Hound is never the sender. Both
+    /// Hound fields must be standard callsigns (WSJT-X refuses tokens such as
+    /// CQ/DE/QRZ there); anything else is a decode error, so a malformed frame
+    /// yields no message at all.
     fn parse_dxpedition_type0(&self, bits: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
         let n28a = bits_to_u32(&bits[0..28]);
         let n28b = bits_to_u32(&bits[28..56]);
-        let ir = bits[56];
-        let igrid = bits_to_u32(&bits[57..71]);
+        let h10 = bits_to_u32(&bits[56..66]);
+        let r5 = bits_to_u32(&bits[66..71]) as u8;
 
-        let call_a = self.unpack28(n28a);
-        let call_b = self.unpack28(n28b);
+        let hound = |n28: u32, which: &str| -> Ft8Result<String> {
+            match self.unpack28(n28) {
+                CallsignField::Callsign(call) => Ok(call),
+                other => Err(Ft8Error::MessageDecodingError(format!(
+                    "DXpedition {which} Hound is not a standard callsign: {other:?}"
+                ))),
+            }
+        };
+        let rr73_to = hound(n28a, "RR73")?;
+        let report_to = hound(n28b, "report")?;
 
-        message.to_callsign = call_a.to_callsign();
-        message.from_callsign = call_b.to_callsign();
+        let contacts = DxpeditionContacts {
+            rr73_to,
+            report_to,
+            fox_hash10: h10 as u16,
+            fox_call: self.hash_table.lookup_10bit_hash(h10),
+            report_db: dxpedition_r5_to_report(r5),
+        };
 
-        // Decode grid or report (same as standard type 1)
-        if ir {
-            // R+report: signal report = igrid - 35
-            let report = igrid as i32 - 35;
-            message.signal_report = Some(report as i8);
-            let r_prefix = if ir { "R" } else { "" };
-            message.text = Some(format!(
-                "{} {} {}{:+03}",
-                message.to_callsign.as_deref().unwrap_or("?"),
-                message.from_callsign.as_deref().unwrap_or("?"),
-                r_prefix,
-                report
-            ));
-        } else if igrid < 32400 {
-            // Grid square
-            let (grid, _, _) = Self::unpackgrid(igrid as u16, 0);
-            message.grid_square = grid;
-            message.text = Some(format!(
-                "{} {} {}",
-                message.to_callsign.as_deref().unwrap_or("?"),
-                message.from_callsign.as_deref().unwrap_or("?"),
-                message.grid_square.as_deref().unwrap_or("????")
-            ));
-        } else {
-            // Numeric report
-            let report = igrid as i32 - 32768 - 35;
-            message.signal_report = Some(report as i8);
-            message.text = Some(format!(
-                "{} {} {:+03}",
-                message.to_callsign.as_deref().unwrap_or("?"),
-                message.from_callsign.as_deref().unwrap_or("?"),
-                report
-            ));
-        }
+        message.from_callsign = contacts.fox_call.clone();
+        message.to_callsign = None;
+        message.signal_report = Some(contacts.report_db);
+        message.uses_hash_calls = true;
+        message.text = Some(contacts.text());
+        message.dxpedition = Some(contacts);
 
         Ok(())
     }
@@ -3892,6 +3946,153 @@ mod tests {
         // permanent contract for the FFI bridge.
         let d = DecodedMessage::from_ft8lib("CQ K1ABC FN42", 1500.0, -10.0, 0);
         assert!(d.confidence_features.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // PAN-259: DXpedition (i3=0 n3=1) type 0.1, WSJT-X `c28 c28 h10 r5`.
+    // The reference bits come from tests/fixtures/gen_dxpedition_type01.py,
+    // an independent re-implementation of WSJT-X `pack77_01` that shares no
+    // code with pancetta's encoder.
+    // ---------------------------------------------------------------------
+
+    const DXPEDITION_REFERENCE_BITS: &str =
+        "00001001101111011110001101010000110000101001001110111000001100100101011001000";
+
+    fn dxpedition_bits(bits: &str) -> BitVec {
+        bits.chars().map(|c| c == '1').collect()
+    }
+
+    fn dxpedition_payload(n28a: u32, n28b: u32, h10: u32, r5: u32) -> BitVec {
+        let mut bits = String::new();
+        for (value, width) in [(n28a, 28), (n28b, 28), (h10, 10), (r5, 5), (1, 3), (0, 3)] {
+            bits.push_str(&format!("{:0width$b}", value, width = width));
+        }
+        dxpedition_bits(&bits)
+    }
+
+    #[test]
+    fn dxpedition_reference_fields_sit_at_wsjtx_positions() {
+        let bits = dxpedition_bits(DXPEDITION_REFERENCE_BITS);
+        assert_eq!(bits.len(), PAYLOAD_BITS);
+        assert_eq!(bits_to_u32(&bits[0..28]), 10_214_965, "c28 K1ABC");
+        assert_eq!(bits_to_u32(&bits[28..56]), 12_751_800, "c28 W9XYZ");
+        assert_eq!(bits_to_u32(&bits[56..66]), 201, "h10 of KH1/KH7Z");
+        assert_eq!(bits_to_u32(&bits[66..71]), 11, "r5 for -08");
+        assert_eq!(bits_to_u32(&bits[71..74]), 1, "n3");
+        assert_eq!(bits_to_u32(&bits[74..77]), 0, "i3");
+        assert_eq!(hash10("KH1/KH7Z"), 201);
+    }
+
+    #[test]
+    fn dxpedition_reference_decodes_both_contacts_with_resolved_fox() {
+        let mut parser = MessageParser::new();
+        parser.add_callsign("KH1/KH7Z");
+        let msg = parser
+            .parse_payload(&dxpedition_bits(DXPEDITION_REFERENCE_BITS))
+            .unwrap();
+        assert_eq!(msg.message_type, MessageType::DXpedition);
+        let contacts = msg.dxpedition.clone().expect("type 0.1 contacts");
+        assert_eq!(contacts.rr73_to, "K1ABC");
+        assert_eq!(contacts.report_to, "W9XYZ");
+        assert_eq!(contacts.fox_hash10, 201);
+        assert_eq!(contacts.fox_call.as_deref(), Some("KH1/KH7Z"));
+        assert_eq!(contacts.report_db, -8);
+        assert_eq!(msg.from_callsign.as_deref(), Some("KH1/KH7Z"));
+        assert_ne!(msg.from_callsign.as_deref(), Some("W9XYZ"));
+        assert_eq!(msg.signal_report, Some(-8));
+        assert_eq!(
+            msg.text.as_deref(),
+            Some("K1ABC RR73; W9XYZ <KH1/KH7Z> -08")
+        );
+        assert_eq!(msg.to_string(), "K1ABC RR73; W9XYZ <KH1/KH7Z> -08");
+    }
+
+    #[test]
+    fn dxpedition_unknown_fox_hash_stays_unresolved() {
+        let parser = MessageParser::new();
+        let msg = parser
+            .parse_payload(&dxpedition_bits(DXPEDITION_REFERENCE_BITS))
+            .unwrap();
+        let contacts = msg.dxpedition.clone().unwrap();
+        assert_eq!(contacts.fox_call, None);
+        assert_eq!(contacts.fox_hash10, 201);
+        assert_eq!(msg.from_callsign, None, "no invented sender");
+        assert_eq!(msg.text.as_deref(), Some("K1ABC RR73; W9XYZ <...> -08"));
+    }
+
+    #[test]
+    fn dxpedition_collided_fox_hash_stays_unresolved() {
+        // Find a second call that shares KH1/KH7Z's 10-bit hash.
+        let target = hash10("KH1/KH7Z");
+        let other = (0..26u32 * 26 * 10)
+            .map(|i| {
+                format!(
+                    "K{}{}{}",
+                    i % 10,
+                    (b'A' + (i / 10 % 26) as u8) as char,
+                    (b'A' + (i / 260 % 26) as u8) as char
+                )
+            })
+            .chain((0..100_000u32).map(|i| format!("W{}X{}", i % 10, i)))
+            .find(|c| hash10(c) == target && c != "KH1/KH7Z")
+            .expect("a 10-bit collision exists in the search space");
+        let mut parser = MessageParser::new();
+        parser.add_callsign("KH1/KH7Z");
+        parser.add_callsign(&other);
+        let msg = parser
+            .parse_payload(&dxpedition_bits(DXPEDITION_REFERENCE_BITS))
+            .unwrap();
+        assert_eq!(msg.dxpedition.unwrap().fox_call, None);
+        assert_eq!(msg.from_callsign, None);
+    }
+
+    #[test]
+    fn dxpedition_report_extremes_and_quantization() {
+        assert_eq!(dxpedition_r5_to_report(0), -30);
+        assert_eq!(dxpedition_r5_to_report(31), 32);
+        assert_eq!(dxpedition_report_to_r5(-8), 11);
+        assert_eq!(dxpedition_report_to_r5(-7), 11, "odd report quantizes");
+        assert_eq!(dxpedition_report_to_r5(-9), 10);
+        assert_eq!(dxpedition_report_to_r5(1), 15);
+        assert_eq!(dxpedition_report_to_r5(-30), 0);
+        assert_eq!(dxpedition_report_to_r5(-31), 0, "Fortran truncation");
+        assert_eq!(dxpedition_report_to_r5(-50), 0, "saturates low");
+        assert_eq!(dxpedition_report_to_r5(32), 31);
+        assert_eq!(dxpedition_report_to_r5(33), 31, "saturates high");
+        assert_eq!(dxpedition_report_to_r5(i8::MAX), 31);
+        assert_eq!(dxpedition_report_to_r5(i8::MIN), 0);
+
+        let parser = MessageParser::new();
+        for (r5, text) in [(0, "-30"), (15, "+00"), (31, "+32")] {
+            let msg = parser
+                .parse_payload(&dxpedition_payload(10_214_965, 12_751_800, 201, r5))
+                .unwrap();
+            assert!(msg.text.unwrap().ends_with(text), "r5={r5}");
+        }
+    }
+
+    #[test]
+    fn dxpedition_invalid_hound_tokens_are_rejected() {
+        let parser = MessageParser::new();
+        // n28 = 2 is CQ, 0 is DE, 1 is QRZ: never a Hound.
+        for bad in [0u32, 1, 2, 1000] {
+            assert!(parser
+                .parse_payload(&dxpedition_payload(bad, 12_751_800, 201, 11))
+                .is_err());
+            assert!(parser
+                .parse_payload(&dxpedition_payload(10_214_965, bad, 201, 11))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn dxpedition_frames_stay_implausible_without_hound_context() {
+        let mut parser = MessageParser::new();
+        parser.add_callsign("KH1/KH7Z");
+        let msg = parser
+            .parse_payload(&dxpedition_bits(DXPEDITION_REFERENCE_BITS))
+            .unwrap();
+        assert!(!msg.is_plausible());
     }
 }
 
