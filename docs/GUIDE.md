@@ -116,7 +116,7 @@ If someone answers **your** CQ, they appear in the **Callers** panel
 | `h` | **Halt current TX** — drops PTT within ~150 ms |
 | `Shift+Q` | **EMERGENCY STOP** — abort TX, autonomous off, TX policy → Disabled |
 | `g` | Cycle TX policy: **Full → Respond-only → Disabled** |
-| `k` | Abort the selected QSO (any panel) after confirming with `y`; `n`, `Esc` or `Enter` cancels |
+| `k` | Abort the selected QSO immediately, no confirmation (any panel) |
 | `r` | Re-send your last message in the selected QSO (QSO Status panel only) |
 | `Esc` | Clear the stop banner / dismiss any overlay |
 
