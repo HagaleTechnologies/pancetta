@@ -4053,6 +4053,17 @@ impl QsoManager {
             .collect()
     }
 
+    /// Selected Fox identities for the next decode window, under one short read.
+    pub async fn active_hound_foxes(&self) -> Vec<String> {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| p.state.is_active() && p.metadata.hound)
+            .filter_map(|p| p.metadata.their_callsign.clone())
+            .collect()
+    }
+
     /// Return the TX audio offsets (Hz) of all currently-active (non-terminal)
     /// QSOs. Used by the coordinator at QSO-open time to de-conflict a new QSO's
     /// TX offset against live concurrent streams so no two QSOs transmit on the
@@ -5400,6 +5411,18 @@ impl QsoManager {
             .get_mut(&qso_id)
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
 
+        // Match the relocation commit lock order: QSO map, then PTT gate.
+        // Hold through epoch invalidation, mutation and reply publication.
+        // Mandatory Hound moves still apply in Hold mode.
+        let hound_ptt_sync = if progress.metadata.hound
+            && matches!(message.message_type, MessageType::SignalReport { .. })
+            && self.is_hound_fox_frame(&progress.metadata, &message.message_type)
+        {
+            Some(self.ptt_sync_gate.lock().await)
+        } else {
+            None
+        };
+
         let old_state = progress.state.clone();
 
         // --- First-decode parity refinement ---
@@ -6140,6 +6163,24 @@ impl QsoManager {
                 });
             }
         }
+
+        // A Hound relocation publishes while both locks still protect the
+        // binding and frequency. Do not reacquire the QSO map under the gate.
+        if hound_ptt_sync.is_some() {
+            if let Some(reply) = reply_to_emit.take() {
+                self.emit_event(QsoEvent::MessageToSend {
+                    qso_id,
+                    message: reply,
+                    frequency: qso_frequency,
+                    tx_parity: qso_tx_parity,
+                    remote_origin: qso_remote_origin,
+                    remote_client_key_id: qso_remote_client_key_id.clone(),
+                    attempt_id: Some(self.next_attempt_id()),
+                })
+                .await;
+            }
+        }
+        drop(hound_ptt_sync);
 
         // Release the QSO map write lock before emitting the reply so the
         // emission path holds no locks (and a future change to send_message-
@@ -26607,6 +26648,53 @@ mod hound_tests {
                 .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
             "a duplicate RR73 must not complete the QSO again"
         );
+    }
+
+    #[tokio::test]
+    async fn hound_later_report_waits_for_ptt_gate_before_relocation_and_publication() {
+        let mut manager = QsoManager::new(hound_test_config());
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(gate.clone());
+        let id = manager
+            .engage_hound("D2UY", 600.0, None, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                fox_report("D2UY", -8),
+                "K5ARH D2UY -08".into(),
+                600.0,
+                Some(-8.0),
+            )
+            .await
+            .unwrap();
+        let mut rx = manager.subscribe();
+        let key = id.to_string();
+        let before = manager.relocation_epochs.epoch(&key);
+        let held = gate.lock().await;
+        let mut moving = Box::pin(manager.process_message(
+            fox_report("D2UY", -8),
+            "K5ARH D2UY -08".into(),
+            780.0,
+            Some(-8.0),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                moving.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        assert_eq!(manager.relocation_epochs.epoch(&key), before);
+        assert!(message_to_sends(&drain_events(&mut rx)).is_empty());
+        drop(held);
+        moving.await.unwrap();
+        assert!(manager.relocation_epochs.epoch(&key) > before);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.frequency, 780.0);
+        assert!(message_to_sends(&drain_events(&mut rx))
+            .iter()
+            .all(|(hz, _)| *hz == 780.0));
     }
 
     /// PAN-259 scenario 2: a Hound calling at 1500 Hz answers the Fox's report

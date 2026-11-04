@@ -95,3 +95,68 @@ fn dxpedition_encoder_refuses_invalid_calls() {
         .unwrap();
     assert_eq!(symbols.len(), 79);
 }
+
+#[test]
+fn dxpedition_context_accepts_structural_frames_and_clears() {
+    let mut parser = MessageParser::new();
+    let unresolved = parser.parse_payload(&reference_bits()).unwrap();
+    assert!(!parser.is_plausible(&unresolved));
+    parser.set_hound_foxes(&["KH1/KH7Z".into()]);
+    assert!(
+        parser.is_plausible(&unresolved),
+        "unresolved frames are display-only"
+    );
+    let mut malformed = unresolved.clone();
+    malformed.dxpedition.as_mut().unwrap().report_to = "CQ".into();
+    assert!(!parser.is_plausible(&malformed));
+    parser.set_hound_foxes(&[]);
+    assert!(!parser.is_plausible(&unresolved));
+}
+
+#[cfg(feature = "transmit")]
+#[test]
+fn dxpedition_reference_audio_crosses_both_production_decoders() {
+    use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Modulator, Protocol, WINDOW_SAMPLES};
+    let mut symbols = [0u8; 79];
+    // Independent pinned payload -> reference C channel encoder, not our packer.
+    unsafe {
+        pancetta_ft8::ft8_lib_ffi::ft8_encode(REFERENCE_PAYLOAD.as_ptr(), symbols.as_mut_ptr());
+    }
+    let mut audio = Ft8Modulator::new(12_000, 600.0, 0.5)
+        .unwrap()
+        .modulate_symbols(&symbols, 0.0)
+        .unwrap();
+    audio.resize(WINDOW_SAMPLES, 0.0);
+    let mut decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    assert!(decoder
+        .decode_window(&audio)
+        .unwrap()
+        .iter()
+        .all(|m| m.message.dxpedition.is_none()));
+    assert!(decoder
+        .decode_window_ft8lib_with_context(&audio, Protocol::Ft8)
+        .iter()
+        .all(|m| m.message.dxpedition.is_none()));
+    decoder.set_hound_foxes(&["KH1/KH7Z".into()]);
+    let native = decoder.decode_window(&audio).unwrap();
+    let reference = decoder.decode_window_ft8lib_with_context(&audio, Protocol::Ft8);
+    for messages in [&native, &reference] {
+        let frame = messages
+            .iter()
+            .find(|m| m.message.dxpedition.is_some())
+            .expect("real type 0.1 receive");
+        assert_eq!(frame.text, "K1ABC RR73; W9XYZ <KH1/KH7Z> -08");
+        assert_eq!(frame.message.dxpedition.as_ref().unwrap().report_db, -8);
+        assert!((frame.frequency_offset - 600.0).abs() < 4.0);
+    }
+    let merged = pancetta_ft8::merge::merge_ft8lib_first(reference, native);
+    assert_eq!(
+        merged
+            .messages
+            .iter()
+            .filter(|m| m.message.dxpedition.is_some())
+            .count(),
+        1,
+        "one physical display/relay row"
+    );
+}

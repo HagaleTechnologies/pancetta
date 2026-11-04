@@ -43,3 +43,15 @@ Report quantization (`n5 = (n + 30) / 2`, Fortran truncation, clamped to
 | +1   | 15 | +00      |
 | +32  | 31 | +32      |
 | +33  | 31 | +32      |
+
+The production receive-to-QSO test also uses the independently generated
+closing frame with the recipients swapped:
+
+    python3 -I gen_dxpedition_type01.py W9XYZ K1ABC KH1/KH7Z -8
+
+    0x0C, 0x29, 0x3B, 0x80, 0x9B, 0xDE, 0x35, 0x32, 0x56, 0x40
+
+Both pinned payloads pass through ft8_lib's C channel encoder and the audio
+modulator, then through both production receive decoders and their merge.
+The test runs each Hound role separately and checks the QSO completion event.
+It uses no rig or on-air transmission.

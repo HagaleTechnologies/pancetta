@@ -2823,6 +2823,11 @@ impl Ft8Decoder {
         self.message_parser.add_callsign(callsign);
     }
 
+    /// Replace active Hound receive context before decoding a window.
+    pub fn set_hound_foxes(&mut self, foxes: &[String]) {
+        self.message_parser.set_hound_foxes(foxes);
+    }
+
     /// All callsigns this decoder's i3=4 hash table has learned so far
     /// (PAN-27 finding 2) — used to carry accumulated learning into a
     /// freshly-rebuilt decoder rather than discarding it.
@@ -3104,6 +3109,34 @@ impl Ft8Decoder {
                 m
             })
             .collect()
+    }
+
+    /// Reference backend with the same per-window Hound policy as native.
+    /// Preserve raw type 0.1 fields instead of reparsing compound text.
+    pub fn decode_window_ft8lib_with_context(
+        &self,
+        samples: &[f32],
+        protocol: Protocol,
+    ) -> Vec<DecodedMessage> {
+        let protocol = match protocol {
+            Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
+            _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+        };
+        crate::ft8_lib_ffi::ft8lib_decode_audio_protocol_with_parser(
+            samples,
+            protocol,
+            Some(&self.message_parser),
+        )
+        .into_iter()
+        .map(|(text, freq, dt, errors, snr, message)| {
+            let mut decoded = DecodedMessage::from_ft8lib(&text, freq, snr, errors);
+            decoded.time_offset = dt as f64;
+            if let Some(message) = message {
+                decoded.message = message;
+            }
+            decoded
+        })
+        .collect()
     }
 
     /// Decode a 12.64-second window of audio samples with A Priori (AP) context.
@@ -3759,7 +3792,7 @@ impl Ft8Decoder {
                         .min((4000.0 / self.protocol_params.tone_spacing) as usize);
                     let (lo, hi) = match effective_scope {
                         Some(range) => (
-                            MIN_FREQ_BIN.max(*range.start()),
+                            *range.start(),
                             max_freq_bin.min(range.end().saturating_add(1)),
                         ),
                         None => (MIN_FREQ_BIN, max_freq_bin),
@@ -5141,7 +5174,7 @@ impl Ft8Decoder {
                     }
 
                     let ft8_message = crate::message::Ft8Message::from_text(&template_text);
-                    if !ft8_message.is_plausible() {
+                    if !self.message_parser.is_plausible(&ft8_message) {
                         continue;
                     }
 
@@ -6842,7 +6875,7 @@ impl Ft8Decoder {
         // candidates (matches the "scoped out of range" contract).
         let (lo, hi) = match freq_bin_scope {
             Some(range) => (
-                MIN_FREQ_BIN.max(*range.start()),
+                *range.start(),
                 max_freq_bin.min(range.end().saturating_add(1)),
             ),
             None => (MIN_FREQ_BIN, max_freq_bin),
@@ -8058,7 +8091,7 @@ impl Ft8Decoder {
         let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
 
         // Reject CRC false positives
-        if !ft8_message.is_plausible() {
+        if !self.message_parser.is_plausible(&ft8_message) {
             return Ok(None);
         }
 
@@ -8308,7 +8341,7 @@ impl Ft8Decoder {
                 }
                 let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
                 let ft8_message = self.message_parser.parse_payload(&payload_bits).ok()?;
-                if !ft8_message.is_plausible() {
+                if !self.message_parser.is_plausible(&ft8_message) {
                     return None;
                 }
                 let snr_db = par_estimate_snr_spectrogram(pp, &avg_mags);
@@ -9004,7 +9037,7 @@ impl Ft8Decoder {
                     continue;
                 }
             };
-            if !ft8_message.is_plausible() {
+            if !self.message_parser.is_plausible(&ft8_message) {
                 if diagnostic_on {
                     self.residual_snr_records
                         .push((cand.sync_score, pre_snr_db, false));
@@ -9150,7 +9183,7 @@ impl Ft8Decoder {
                 }
                 let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
                 let ft8_message = self.message_parser.parse_payload(&payload_bits).ok()?;
-                if !ft8_message.is_plausible() {
+                if !self.message_parser.is_plausible(&ft8_message) {
                     return None;
                 }
                 let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
@@ -9502,7 +9535,7 @@ impl Ft8Decoder {
                     let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
 
                     let ft8_message = crate::message::Ft8Message::from_text(template_text);
-                    if !ft8_message.is_plausible() {
+                    if !self.message_parser.is_plausible(&ft8_message) {
                         continue;
                     }
                     let mut new_msg = DecodedMessage::new(
@@ -9665,7 +9698,7 @@ impl Ft8Decoder {
                 }
                 let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
                 let ft8_message = self.message_parser.parse_payload(&payload_bits).ok()?;
-                if !ft8_message.is_plausible() {
+                if !self.message_parser.is_plausible(&ft8_message) {
                     return None;
                 }
                 let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
@@ -10960,7 +10993,7 @@ fn par_decode_candidate(
                 }
             };
 
-            if !ft8_message.is_plausible() {
+            if !ctx.message_parser.is_plausible(&ft8_message) {
                 if let Some(unsat) = rescue_unsat {
                     bicm_id_instrument(&format!("reject {unsat}"));
                 }
@@ -11176,7 +11209,7 @@ fn par_decode_candidate(
                 Err(_) => continue,
             };
 
-            if !ft8_message.is_plausible() {
+            if !ctx.message_parser.is_plausible(&ft8_message) {
                 continue;
             }
 
@@ -11634,7 +11667,7 @@ fn matched_demod_try_bp(
 
     let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
     let ft8_message = message_parser.parse_payload(&payload_bits).ok()?;
-    if !ft8_message.is_plausible() {
+    if !message_parser.is_plausible(&ft8_message) {
         return None;
     }
 
@@ -12265,7 +12298,7 @@ fn par_try_ldpc_with_ap(
         Err(_) => return None,
     };
 
-    if !ft8_message.is_plausible() {
+    if !ctx.message_parser.is_plausible(&ft8_message) {
         return None;
     }
 
@@ -12405,7 +12438,7 @@ fn par_try_ldpc_with_cq(
         Err(_) => return None,
     };
 
-    if !ft8_message.is_plausible() {
+    if !ctx.message_parser.is_plausible(&ft8_message) {
         return None;
     }
 
@@ -12503,7 +12536,7 @@ fn par_try_ldpc_with_ap4_full(
         Err(_) => return None,
     };
 
-    if !ft8_message.is_plausible() {
+    if !ctx.message_parser.is_plausible(&ft8_message) {
         return None;
     }
 
@@ -12620,7 +12653,7 @@ fn par_try_ldpc_with_recent_only(
         Ok(m) => m,
         Err(_) => return None,
     };
-    if !ft8_message.is_plausible() {
+    if !ctx.message_parser.is_plausible(&ft8_message) {
         return None;
     }
 
@@ -13999,7 +14032,7 @@ fn spectrogram_step_fractional_remainder(selected_offset_samples: f64, spec_step
 
 #[inline]
 fn tone_parity_sign(tone: usize) -> f64 {
-    if tone % 2 == 0 {
+    if tone.is_multiple_of(2) {
         1.0
     } else {
         -1.0

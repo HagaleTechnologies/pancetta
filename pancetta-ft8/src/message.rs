@@ -1808,6 +1808,7 @@ pub(crate) fn hash10(callsign: &str) -> u32 {
 pub struct MessageParser {
     /// Hash table for worked stations (10/12/22-bit hashes)
     hash_table: HashTable,
+    active_hound: bool,
 }
 
 impl MessageParser {
@@ -1815,7 +1816,34 @@ impl MessageParser {
     pub fn new() -> Self {
         Self {
             hash_table: HashTable::new(),
+            active_hound: false,
         }
+    }
+
+    /// Replace the per-window Hound policy and seed selected Fox identities.
+    /// Hash learning remains collision-safe and is retained when Hound mode ends.
+    pub fn set_hound_foxes(&mut self, foxes: &[String]) {
+        self.active_hound = !foxes.is_empty();
+        for fox in foxes {
+            self.add_callsign(fox);
+        }
+    }
+
+    /// Shared acceptance policy for every native decoder path.
+    /// An unresolved Fox may be displayed, but downstream identity checks
+    /// must not turn it into a QSO action.
+    pub fn is_plausible(&self, message: &Ft8Message) -> bool {
+        if message.message_type != MessageType::DXpedition {
+            return message.is_plausible();
+        }
+        self.active_hound
+            && message.dxpedition.as_ref().is_some_and(|c| {
+                Ft8Message::looks_like_callsign(&c.rr73_to)
+                    && Ft8Message::looks_like_callsign(&c.report_to)
+                    && c.fox_hash10 < 1024
+                    && (-30..=32).contains(&c.report_db)
+                    && c.report_db % 2 == 0
+            })
     }
 
     /// Add callsign to hash table

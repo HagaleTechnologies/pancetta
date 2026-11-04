@@ -41,6 +41,15 @@ periods, band dial tables, and offset regions are normative in the code and
   receive location but is a generic split-TX field, not the Hound discriminator.
   Since PAN-259 it follows WSJT-X: call at 1000–2700 Hz, send the R-report at
   the Fox's exact offset (pinned there afterwards), log on RR73 with no 73.
+  The decoder reads active Fox calls from the supervisor's current QSO manager
+  each window. It seeds hashes again after a decoder rebuild, preserving
+  collision evidence. Both receive backends keep the raw type 0.1 contacts;
+  display and relay feeds still get one compound frame. Unknown or collided
+  Fox hashes cannot advance a QSO. Hounds widen the ordinary receive mask
+  across the configured Fox response envelope and use the standard sync
+  threshold there, so a new stream is not restricted to the old offset.
+  Report-driven moves take the QSO-map lock before the shared PTT gate and
+  retain both through epoch invalidation and reply publication.
 
 The autonomous `SlotTicker` in `pancetta/src/coordinator/autonomous.rs` remembers
 the previous poll time. When it observes a mode change, a current-mode boundary
