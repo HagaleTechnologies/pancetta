@@ -299,6 +299,111 @@ fn capture_rms(cfg: &Config, dur: Duration) -> anyhow::Result<(f32, f32)> {
     Ok(((sum_sq / n as f64).sqrt() as f32, peak))
 }
 
+// Known authorization is diagnostic evidence only when captured audio is silent.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum MicrophoneAuthorization {
+    Authorized,
+    Denied,
+    NotDetermined,
+    Restricted,
+    Unknown,
+}
+
+/// Read the current process's authorization without requesting access or changing it.
+#[cfg(target_os = "macos")]
+fn microphone_authorization() -> MicrophoneAuthorization {
+    use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+
+    // SAFETY: AVMediaTypeAudio is an immutable framework constant. This query
+    // accepts the audio media type, needs no device instance or main thread,
+    // and only reads authorization for the calling process.
+    let status = unsafe {
+        let Some(audio) = AVMediaTypeAudio else {
+            return MicrophoneAuthorization::Unknown;
+        };
+        AVCaptureDevice::authorizationStatusForMediaType(audio)
+    };
+    match status {
+        AVAuthorizationStatus::Authorized => MicrophoneAuthorization::Authorized,
+        AVAuthorizationStatus::Denied => MicrophoneAuthorization::Denied,
+        AVAuthorizationStatus::NotDetermined => MicrophoneAuthorization::NotDetermined,
+        AVAuthorizationStatus::Restricted => MicrophoneAuthorization::Restricted,
+        _ => MicrophoneAuthorization::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn microphone_authorization() -> MicrophoneAuthorization {
+    MicrophoneAuthorization::Unknown
+}
+
+fn audio_level_outcome(
+    result: anyhow::Result<(f32, f32)>,
+    authorization: MicrophoneAuthorization,
+) -> CheckOutcome {
+    match result {
+        Ok((rms, peak)) => {
+            let dbfs = 20.0 * rms.max(1e-9).log10();
+            if peak < 1e-6 {
+                let advice = match authorization {
+                    MicrophoneAuthorization::Denied => Some((
+                        "FLAT LINE: microphone access has not been approved on this Mac",
+                        "open System Settings > Privacy & Security > Microphone; enable access for pancetta \
+                        or the terminal app running it, then restart that app and re-run `pancetta doctor`. \
+                        This approval is normally needed only once.",
+                    )),
+                    MicrophoneAuthorization::NotDetermined => Some((
+                        "FLAT LINE: microphone access has not been approved on this Mac",
+                        "allow microphone access when macOS asks for pancetta or the terminal app running it. \
+                        If already listed, enable it in System Settings > Privacy & Security > Microphone; \
+                        restart that app and re-run `pancetta doctor`. This approval is normally needed only \
+                        once.",
+                    )),
+                    MicrophoneAuthorization::Restricted => Some((
+                        "FLAT LINE: microphone access is restricted on this Mac",
+                        "ask the Mac's administrator to allow microphone access for pancetta or the terminal \
+                        app running it, then re-run `pancetta doctor`.",
+                    )),
+                    MicrophoneAuthorization::Authorized | MicrophoneAuthorization::Unknown => None,
+                };
+                if let Some((detail, fix)) = advice {
+                    return CheckOutcome {
+                        status: CheckStatus::Fail,
+                        detail: detail.to_string(),
+                        fix: Some(fix.to_string()),
+                    };
+                }
+                CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: "FLAT LINE — no signal reaching the input at all".to_string(),
+                    fix: Some(
+                        "wrong input device, OS-muted, or rig AF off — \
+                         `pancetta test-audio --list`, check OS input level, \
+                         turn up the rig's USB audio out"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                CheckOutcome {
+                    status: CheckStatus::Pass,
+                    detail: format!("rms {dbfs:.0} dBFS, peak {peak:.3}"),
+                    fix: None,
+                }
+            }
+        }
+        Err(e) => CheckOutcome {
+            status: CheckStatus::Fail,
+            detail: format!("could not capture: {e}"),
+            fix: Some(
+                "run `pancetta test-audio --list`; close other apps holding the device \
+                 (including a running pancetta)"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
 pub(crate) fn check_audio_level() -> DoctorCheck {
     DoctorCheck {
         name: "audio level (2 s)",
@@ -307,38 +412,13 @@ pub(crate) fn check_audio_level() -> DoctorCheck {
             let Some(cfg) = &ctx.config else {
                 return not_configured();
             };
-            match capture_rms(cfg, Duration::from_secs(2)) {
-                Ok((rms, peak)) => {
-                    let dbfs = 20.0 * rms.max(1e-9).log10();
-                    if peak < 1e-6 {
-                        CheckOutcome {
-                            status: CheckStatus::Fail,
-                            detail: "FLAT LINE — no signal reaching the input at all".to_string(),
-                            fix: Some(
-                                "wrong input device, OS-muted, or rig AF off — \
-                                 `pancetta test-audio --list`, check OS input level, \
-                                 turn up the rig's USB audio out"
-                                    .to_string(),
-                            ),
-                        }
-                    } else {
-                        CheckOutcome {
-                            status: CheckStatus::Pass,
-                            detail: format!("rms {dbfs:.0} dBFS, peak {peak:.3}"),
-                            fix: None,
-                        }
-                    }
-                }
-                Err(e) => CheckOutcome {
-                    status: CheckStatus::Fail,
-                    detail: format!("could not capture: {e}"),
-                    fix: Some(
-                        "run `pancetta test-audio --list`; close other apps holding the device \
-                         (including a running pancetta)"
-                            .to_string(),
-                    ),
-                },
-            }
+            let result = capture_rms(cfg, Duration::from_secs(2));
+            // Read after capture so an approval changed during it is reflected.
+            let authorization = match &result {
+                Ok((_, peak)) if *peak < 1e-6 => microphone_authorization(),
+                _ => MicrophoneAuthorization::Unknown,
+            };
+            audio_level_outcome(result, authorization)
         }),
     }
 }
@@ -492,6 +572,112 @@ pub(crate) fn check_submodule() -> DoctorCheck {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn silent_audio_names_missing_approval() {
+        for state in [
+            MicrophoneAuthorization::Denied,
+            MicrophoneAuthorization::NotDetermined,
+        ] {
+            let outcome = audio_level_outcome(Ok((0.0, 0.0)), state);
+            assert_eq!(outcome.status, CheckStatus::Fail);
+            assert_eq!(
+                outcome.detail,
+                "FLAT LINE: microphone access has not been approved on this Mac"
+            );
+            let fix = outcome.fix.unwrap();
+            assert!(fix.contains("System Settings > Privacy & Security > Microphone"));
+            assert!(fix.contains("pancetta or the terminal app running it"));
+            assert!(fix.contains("restart that app"));
+            assert!(fix.contains("normally needed only once"));
+            assert_eq!(
+                doctor_exit_code(&[(check_audio_level().hard, outcome.status)]),
+                1
+            );
+        }
+        let denied = audio_level_outcome(Ok((0.0, 0.0)), MicrophoneAuthorization::Denied);
+        assert!(denied.fix.unwrap().starts_with("open System Settings"));
+        let undecided = audio_level_outcome(Ok((0.0, 0.0)), MicrophoneAuthorization::NotDetermined);
+        assert!(undecided
+            .fix
+            .unwrap()
+            .starts_with("allow microphone access when macOS asks"));
+    }
+
+    #[test]
+    fn restricted_audio_refers_to_administrator() {
+        let outcome = audio_level_outcome(Ok((0.0, 0.0)), MicrophoneAuthorization::Restricted);
+        assert_eq!(outcome.status, CheckStatus::Fail);
+        assert_eq!(
+            outcome.detail,
+            "FLAT LINE: microphone access is restricted on this Mac"
+        );
+        assert_eq!(outcome.fix.as_deref(), Some("ask the Mac's administrator to allow microphone access for pancetta or the terminal app running it, then re-run `pancetta doctor`."));
+    }
+
+    #[test]
+    fn authorized_and_unknown_silence_keep_generic_advice() {
+        for state in [
+            MicrophoneAuthorization::Authorized,
+            MicrophoneAuthorization::Unknown,
+        ] {
+            let outcome = audio_level_outcome(Ok((0.0, 0.0)), state);
+            assert_eq!(outcome.status, CheckStatus::Fail);
+            assert_eq!(
+                outcome.detail,
+                "FLAT LINE — no signal reaching the input at all"
+            );
+            assert_eq!(outcome.fix.as_deref(), Some("wrong input device, OS-muted, or rig AF off — `pancetta test-audio --list`, check OS input level, turn up the rig's USB audio out"));
+            for text in [&outcome.detail, outcome.fix.as_ref().unwrap()] {
+                assert!(!text.contains("permission"));
+                assert!(!text.contains("microphone"));
+                assert!(!text.contains("approved"));
+            }
+        }
+    }
+
+    #[test]
+    fn audio_threshold_and_signal_ignore_denied_authorization() {
+        let state = MicrophoneAuthorization::Denied;
+        assert_eq!(
+            audio_level_outcome(Ok((0.0, 0.999e-6)), state).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            audio_level_outcome(Ok((0.0, 1e-6)), state).status,
+            CheckStatus::Pass
+        );
+        let signal = audio_level_outcome(Ok((0.01, 0.02)), state);
+        assert_eq!(signal.status, CheckStatus::Pass);
+        assert_eq!(signal.detail, "rms -40 dBFS, peak 0.020");
+        assert!(signal.fix.is_none());
+    }
+
+    #[test]
+    fn audio_capture_errors_are_not_flat_line() {
+        for error in ["no samples captured in 2s", "device unavailable"] {
+            let outcome =
+                audio_level_outcome(Err(anyhow::anyhow!(error)), MicrophoneAuthorization::Denied);
+            assert_eq!(outcome.status, CheckStatus::Fail);
+            assert_eq!(outcome.detail, format!("could not capture: {error}"));
+            assert_eq!(outcome.fix.as_deref(), Some("run `pancetta test-audio --list`; close other apps holding the device (including a running pancetta)"));
+        }
+    }
+
+    #[test]
+    fn audio_without_config_keeps_wizard_advice() {
+        let ctx = build_ctx(Some(PathBuf::from("/nonexistent/dir/pancetta.toml")));
+        let check = check_audio_level();
+        assert_eq!(check.name, "audio level (2 s)");
+        assert!(check.hard);
+        let outcome = (check.run)(&ctx);
+        assert_eq!(outcome.status, CheckStatus::Warn);
+        assert_eq!(outcome.detail, "not configured — run the wizard");
+        assert_eq!(
+            outcome.fix.as_deref(),
+            Some("run `pancetta` (first-run wizard) or `pancetta setup`")
+        );
+    }
 
     #[test]
     fn exit_code_is_nonzero_only_for_hard_failures() {
