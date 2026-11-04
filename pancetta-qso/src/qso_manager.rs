@@ -930,10 +930,10 @@ pub struct DuplicateCheckConfig {
     /// Check duplicates within this time window (hours)
     pub time_window_hours: u32,
 
-    /// Check duplicates on same frequency
+    /// When true, scope duplicates to the same band, regardless of audio offset
     pub check_frequency: bool,
 
-    /// Check duplicates on same band
+    /// Reserved compatibility field; check_frequency controls band scoping.
     pub check_band: bool,
 }
 
@@ -1598,6 +1598,7 @@ pub struct QsoManager {
 
     /// Optional database for persistent duplicate checking
     database: Option<Arc<QsoDatabase>>,
+    require_database: bool,
 
     /// Rig dial frequency in Hz, shared from the coordinator's hamlib poll
     /// (0 if unknown / no rig). `metadata.frequency` holds the *audio offset*;
@@ -2124,6 +2125,7 @@ impl QsoManager {
             next_serial: Arc::new(RwLock::new(next_serial)),
             cleanup_interval: Arc::new(RwLock::new(None)),
             database: None,
+            require_database: false,
             dial_frequency_hz: Arc::new(AtomicU64::new(0)),
             split_tx_frequency_hz: Arc::new(AtomicU64::new(0)),
             // Default Hold: the silence-driven stall detector stays off unless
@@ -2318,6 +2320,16 @@ impl QsoManager {
         let mut manager = Self::new(config);
         manager.database = Some(database);
         manager
+    }
+
+    /// Require persistent history for autonomous admission. Set before admission-capable clones.
+    pub fn require_persistent_history(&mut self) {
+        self.require_database = true;
+    }
+
+    /// Attach the prepared index without replacing subscriptions or the event broadcaster.
+    pub fn attach_database(&mut self, database: Arc<QsoDatabase>) {
+        self.database = Some(database);
     }
 
     /// Get the configuration
@@ -7774,69 +7786,84 @@ impl QsoManager {
         callsign: &str,
         frequency: f64,
     ) -> Result<bool, QsoManagerError> {
-        if !self.config.duplicate_checking.enabled {
+        self.check_duplicate_at(callsign, frequency, Utc::now())
+            .await
+    }
+
+    async fn check_duplicate_at(
+        &self,
+        callsign: &str,
+        frequency: f64,
+        now: DateTime<Utc>,
+    ) -> Result<bool, QsoManagerError> {
+        let config = &self.config.duplicate_checking;
+        if !config.enabled || config.time_window_hours == 0 {
             return Ok(false);
         }
-
-        // Check in-memory active/recent QSOs first (case-insensitive key,
-        // Batch 2 #7, matching add/remove_callsign_mapping).
-        let key = callsign.to_uppercase();
-        let qsos_by_callsign = self.qsos_by_callsign.read().await;
-        if let Some(qso_ids) = qsos_by_callsign.get(&key) {
-            let qsos = self.qsos.read().await;
-            let time_window =
-                Duration::hours(self.config.duplicate_checking.time_window_hours as i64);
-            let cutoff_time = Utc::now() - time_window;
-
-            for &qso_id in qso_ids {
-                if let Some(progress) = qsos.get(&qso_id) {
-                    if progress.metadata.start_time > cutoff_time {
-                        // Check frequency if required
-                        if self.config.duplicate_checking.check_frequency
-                            && (progress.metadata.frequency - frequency).abs() > 50.0
-                        {
-                            continue;
-                        }
-
-                        return Ok(true);
-                    }
-                }
-            }
+        let unavailable = |message: &str| QsoManagerError::Database {
+            source: anyhow::anyhow!("QSO history unavailable: {message}"),
+        };
+        if self.require_database && self.database.is_none() {
+            return Err(unavailable("persistent index is not attached"));
         }
-        drop(qsos_by_callsign);
-
-        // Also check the persistent database (catches duplicates after restart
-        // or after cleanup_completed_qsos has removed them from memory)
-        if let Some(ref db) = self.database {
-            let now = Utc::now();
-            match db
+        let rf = self.current_rf_frequency(frequency);
+        let band = Some(crate::utils::frequency_to_band(rf)).filter(|b| !b.ends_with("MHZ"));
+        // Standalone memory-only managers may have no rig source. Keep their
+        // unknown-band history in memory; persistent checks require a real band.
+        if config.check_frequency
+            && band.is_none()
+            && (self.require_database || self.database.is_some())
+        {
+            return Err(unavailable("TX band is unknown"));
+        }
+        let band = band.map(|b| b.to_uppercase());
+        // Query first: even a memory hit must not hide an unavailable required index.
+        if let Some(db) = &self.database {
+            if db
                 .check_duplicate(
                     callsign,
-                    frequency,
+                    if config.check_frequency {
+                        band.as_deref()
+                    } else {
+                        None
+                    },
                     now,
-                    self.config.duplicate_checking.time_window_hours,
-                    self.config.duplicate_checking.check_frequency,
+                    config.time_window_hours,
                 )
                 .await
+                .map_err(|e| QsoManagerError::Database {
+                    source: anyhow::anyhow!("QSO history unavailable: {e}"),
+                })?
+                .is_some()
             {
-                Ok(Some(_qso_id)) => {
-                    debug!(
-                        "Duplicate QSO for {} found in database (not in memory)",
-                        callsign
-                    );
-                    return Ok(true);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(
-                        "Database duplicate check failed, relying on in-memory only: {}",
-                        e
-                    );
-                }
+                return Ok(true);
             }
         }
-
-        Ok(false)
+        // Reserve an in-flight exchange independently of worked-contact history.
+        if self.has_active_qso_with(callsign).await {
+            return Ok(true);
+        }
+        let cutoff = now - Duration::hours(config.time_window_hours as i64);
+        let qsos = self.qsos.read().await;
+        Ok(qsos.values().any(|p| {
+            matches!(p.state, QsoState::Completed { .. })
+                && p.metadata
+                    .their_callsign
+                    .as_deref()
+                    .is_some_and(|c| c.trim().eq_ignore_ascii_case(callsign.trim()))
+                && p.metadata.start_time > cutoff
+                && p.metadata.start_time <= now
+                && (!config.check_frequency
+                    || p.metadata
+                        .completed_rf_frequency_hz
+                        .or(Some(p.metadata.frequency))
+                        .and_then(|rf| {
+                            Some(crate::utils::frequency_to_band(rf))
+                                .filter(|b| !b.ends_with("MHZ"))
+                        })
+                        .map(|b| b.to_uppercase())
+                        == band)
+        }))
     }
 
     async fn add_callsign_mapping(&self, callsign: &str, qso_id: QsoId) {
@@ -9205,6 +9232,7 @@ impl Clone for QsoManager {
             next_serial: Arc::clone(&self.next_serial),
             cleanup_interval: Arc::clone(&self.cleanup_interval),
             database: self.database.clone(),
+            require_database: self.require_database,
             dial_frequency_hz: Arc::clone(&self.dial_frequency_hz),
             split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
@@ -9668,6 +9696,9 @@ mod tests {
     #[tokio::test]
     async fn pan183_offset_switch_retransmit_carries_id() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let id = manager
             .respond_to_cq("K1DEF".into(), 1500.0, None)
             .await
@@ -9873,6 +9904,9 @@ mod tests {
     #[tokio::test]
     async fn rollback_reverses_offset_switch_retransmit() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let id = manager
             .respond_to_cq("K1DEF".into(), 1500.0, None)
             .await
@@ -9926,6 +9960,9 @@ mod tests {
     #[tokio::test]
     async fn auto_qso_rollback_restores_its_resend() {
         let manager = QsoManager::new(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let id = manager
             .respond_to_cq("K1DEF".into(), 1500.0, None)
             .await
@@ -10152,6 +10189,9 @@ mod tests {
         use pancetta_core::ResponseStep;
         let manager = QsoManager::new(test_config());
         manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        manager
             .respond_to_cq(
                 PAN78_DX.to_string(),
                 PAN78_FREQ,
@@ -10263,6 +10303,9 @@ mod tests {
 
         for &(setup, call, step) in cases {
             let manager = QsoManager::new(test_config());
+            manager
+                .dial_frequency_hz
+                .store(14_074_000, Ordering::Relaxed);
             match setup {
                 Setup::Empty => {}
                 Setup::ActiveManual => {
@@ -13145,6 +13188,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tx_offset_switch_retransmits_cq_response_for_auto_responding_to_cq_past_cap() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut events = manager.subscribe();
         let qso_id = manager
             .respond_to_cq("K1DEF".to_string(), 1500.0, None)
@@ -13210,6 +13256,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tx_offset_switch_retransmits_signal_report_for_auto_sending_report_past_cap() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut events = manager.subscribe();
         let qso_id = manager
             .respond_to_cq("K1DEF".to_string(), 1500.0, None)
@@ -13277,6 +13326,9 @@ mod tests {
     async fn apply_tx_offset_switch_retransmits_report_ack_for_auto_sending_report_with_their_report_past_cap(
     ) {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut events = manager.subscribe();
         let qso_id = manager
             .respond_to_cq("K1DEF".to_string(), 1500.0, None)
@@ -13359,6 +13411,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tx_offset_switch_does_not_retransmit_for_auto_responding_to_cq_below_cap() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut events = manager.subscribe();
         let qso_id = manager
             .respond_to_cq("K1DEF".to_string(), 1500.0, None)
@@ -13429,6 +13484,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tx_offset_switch_does_not_retransmit_for_stall_triggered_auto_past_cap() {
         let manager = auto_manager(test_config());
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut events = manager.subscribe();
         let qso_id = manager
             .respond_to_cq("K1DEF".to_string(), 1500.0, None)
@@ -18009,6 +18067,9 @@ mod reply_emitter_tests {
     #[tokio::test]
     async fn auto_qso_advances_and_auto_replies() {
         let manager = manager();
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut rx = manager.subscribe();
         let qso_id = manager
             .respond_to_cq(DX.into(), FREQ, None) // CallInitiation::Auto
@@ -18098,6 +18159,9 @@ mod reply_emitter_tests {
     #[tokio::test]
     async fn active_tx_offsets_returns_open_qso_offsets() {
         let manager = manager();
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         // Initially empty — no QSOs.
         assert!(
             manager.active_tx_offsets().await.is_empty(),
@@ -18861,6 +18925,9 @@ mod state_regression_tests {
     #[tokio::test]
     async fn auto_qso_does_not_regress() {
         let manager = manager();
+        manager
+            .dial_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
         let mut rx = manager.subscribe();
         // Build an AUTO QSO and drive it forward to WaitingForConfirmation. The
         // auto path does not auto-reply, so we drive the state directly via
@@ -27576,5 +27643,189 @@ mod pan138_outcome_tests {
             (id, ManualCallOutcome::NothingToResend)
         );
         assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod pan260 {
+    use super::*;
+
+    #[tokio::test]
+    async fn standalone_memory_only_admission_does_not_require_a_rig_band() {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq("K1ABC".into(), 1200.0, None)
+            .await
+            .expect("standalone memory-only admission");
+        assert!(
+            manager.check_duplicate("K1ABC", 1800.0).await.unwrap(),
+            "the active exchange remains reserved at another offset"
+        );
+        manager.cancel_qso(id).await.unwrap();
+
+        // Persistent-history operation still refuses an unknown TX band.
+        manager.attach_database(Arc::new(QsoDatabase::new_in_memory().await.unwrap()));
+        assert!(manager
+            .respond_to_cq("K1ABC".into(), 1800.0, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
+        let mut m = QsoManager::new(QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            ..Default::default()
+        });
+        let dial = Arc::new(AtomicU64::new(14_074_000));
+        m.set_dial_frequency_source(dial.clone());
+        let now = DateTime::parse_from_rfc3339("2026-11-04T14:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let id = m.start_cq(1200.0, None, false, None).await.unwrap();
+        m.qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .start_time = now - Duration::minutes(30);
+        for (message, raw) in [
+            (
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".into(),
+                    responding_station: "K1ABC".into(),
+                    grid: Some("FN31".into()),
+                },
+                "W1ABC K1ABC FN31",
+            ),
+            (
+                MessageType::ReportAck {
+                    to_station: "W1ABC".into(),
+                    from_station: "K1ABC".into(),
+                    report: -12,
+                },
+                "W1ABC K1ABC R-12",
+            ),
+            (
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".into(),
+                    from_station: "K1ABC".into(),
+                },
+                "W1ABC K1ABC 73",
+            ),
+        ] {
+            m.process_message(message, raw.into(), 1200.0, Some(-10.0))
+                .await
+                .unwrap();
+        }
+        let p = m.get_qso(id).await.unwrap();
+        assert!(matches!(p.state, QsoState::Completed { .. }));
+        assert_eq!(p.metadata.completed_rf_frequency_hz, Some(14_075_200.0));
+        assert!(m.check_duplicate_at("k1abc", 1800.0, now).await.unwrap());
+
+        for (date, expected) in [
+            (now - Duration::hours(24), false),
+            (now - Duration::hours(24) + Duration::nanoseconds(1), true),
+            (now, true),
+            (now + Duration::nanoseconds(1), false),
+        ] {
+            m.qsos
+                .write()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .metadata
+                .start_time = date;
+            assert_eq!(
+                m.check_duplicate_at("K1ABC", 1800.0, now).await.unwrap(),
+                expected
+            );
+        }
+        m.qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .start_time = p.metadata.start_time;
+
+        dial.store(7_074_000, Ordering::Relaxed);
+        assert!(!m.check_duplicate_at("K1ABC", 1800.0, now).await.unwrap());
+        m.config.duplicate_checking.check_frequency = false;
+        assert!(m.check_duplicate_at("K1ABC", 1800.0, now).await.unwrap());
+        m.config.duplicate_checking.check_frequency = true;
+        let split = Arc::new(AtomicU64::new(14_074_000));
+        m.set_split_tx_frequency_source(split.clone());
+        assert!(m.check_duplicate_at("K1ABC", 1800.0, now).await.unwrap());
+        split.store(0, Ordering::Relaxed);
+        dial.store(14_074_000, Ordering::Relaxed);
+        let db = Arc::new(QsoDatabase::new_in_memory().await.unwrap());
+        let mut logged = p.clone();
+        logged.metadata.frequency = p.metadata.completed_rf_frequency_hz.unwrap();
+        db.insert_qso(&logged).await.unwrap();
+        m.attach_database(db.clone());
+        // Force the normal cleanup age without changing the fixed start-time window.
+        if let QsoState::Completed { completed_at, .. } =
+            &mut m.qsos.write().await.get_mut(&id).unwrap().state
+        {
+            *completed_at = Utc::now() - Duration::hours(2);
+        }
+        m.cleanup_completed_qsos().await;
+        assert!(m.qsos.read().await.is_empty());
+        assert!(m.check_duplicate_at("K1ABC", 1800.0, now).await.unwrap());
+        let mut fresh = QsoManager::with_database(m.config.clone(), db.clone());
+        fresh.set_dial_frequency_source(dial.clone());
+        fresh.require_persistent_history();
+        assert!(fresh
+            .clone()
+            .check_duplicate_at("K1ABC", 1800.0, now)
+            .await
+            .unwrap());
+        assert!(!fresh
+            .check_duplicate_at("K1ABC", 1800.0, now + Duration::hours(24))
+            .await
+            .unwrap());
+        dial.store(0, Ordering::Relaxed);
+        assert!(fresh
+            .check_duplicate_at("K1ABC", 1800.0, now)
+            .await
+            .is_err());
+        fresh.config.duplicate_checking.time_window_hours = 0;
+        assert!(!fresh
+            .check_duplicate_at("K1ABC", 1800.0, now)
+            .await
+            .unwrap());
+        fresh.config.duplicate_checking.time_window_hours = 24;
+        fresh.config.duplicate_checking.enabled = false;
+        assert!(!fresh
+            .check_duplicate_at("K1ABC", 1800.0, now)
+            .await
+            .unwrap());
+        fresh.config.duplicate_checking.enabled = true;
+        dial.store(14_074_000, Ordering::Relaxed);
+        db.close().await;
+        let mut events = fresh.subscribe();
+        assert!(fresh
+            .respond_to_cq("K1ABC".into(), 1800.0, None)
+            .await
+            .is_err());
+        assert!(fresh.get_active_qsos().await.is_empty());
+        assert!(events.try_recv().is_err());
+        assert!(fresh
+            .respond_to_cq_manual("K1ABC".into(), 1800.0, None)
+            .await
+            .is_ok());
+        let mut missing = QsoManager::new(m.config.clone());
+        missing.require_persistent_history();
+        missing.set_dial_frequency_source(dial);
+        missing.qsos.write().await.insert(id, p);
+        assert!(missing
+            .check_duplicate_at("K1ABC", 1800.0, now)
+            .await
+            .is_err());
     }
 }

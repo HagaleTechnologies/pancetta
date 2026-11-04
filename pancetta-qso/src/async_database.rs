@@ -734,64 +734,69 @@ impl QsoDatabase {
         })
     }
 
-    /// Check for duplicate QSOs.
-    ///
-    /// `check_frequency` mirrors `QsoManager`'s in-memory check: when `true`,
-    /// only a re-call within 50 Hz of the same RF frequency counts as a
-    /// duplicate; when `false`, any re-call of the same callsign within the
-    /// time window counts, regardless of frequency. Both paths must apply
-    /// the same semantics — a QSO that ages out of the in-memory working set
-    /// (e.g. after `cleanup_completed_qsos`) falls through to this DB-only
-    /// check, and previously it ignored `check_frequency` entirely (always
-    /// requiring proximity), silently reverting an operator's
-    /// `check_frequency = false` setting once a QSO left memory.
+    /// Check a rolling window by callsign and optional band, independent of audio offset.
+    /// Metadata is serialized from DateTime<Utc> as UTC RFC3339. Pad its optional
+    /// fractional seconds to nine digits for exact comparisons without SQLite's
+    /// millisecond rounding. The startup history read validates stored dates.
     pub async fn check_duplicate(
         &self,
         callsign: &str,
-        frequency: f64,
-        start_time: DateTime<Utc>,
+        band: Option<&str>,
+        now: DateTime<Utc>,
         time_window_hours: u32,
-        check_frequency: bool,
     ) -> Result<Option<QsoId>, AsyncDatabaseError> {
-        let time_threshold = start_time - chrono::Duration::hours(time_window_hours as i64);
+        let cutoff = now - chrono::Duration::hours(time_window_hours as i64);
+        let id: Option<String> = sqlx::query_scalar(
+            "WITH contacts AS (
+                 SELECT qso_id, json_extract(metadata, '$.start_time') AS started FROM qsos
+                 WHERE UPPER(TRIM(json_extract(metadata, '$.their_callsign'))) = ?
+                 AND (? IS NULL OR UPPER(TRIM(json_extract(adif_data, '$.band'))) = ?)
+             ), dated AS (
+                 SELECT qso_id, substr(started, 1, 19) || '.' ||
+                     substr((CASE WHEN substr(started, 20, 1) = '.'
+                         THEN rtrim(substr(started, 21), 'Z') ELSE '' END)
+                         || '000000000', 1, 9) || 'Z' AS stamp FROM contacts
+             ) SELECT qso_id FROM dated WHERE stamp > ? AND stamp <= ? LIMIT 1",
+        )
+        .bind(callsign.trim().to_uppercase())
+        .bind(band.map(|b| b.trim().to_uppercase()))
+        .bind(band.map(|b| b.trim().to_uppercase()))
+        .bind(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .fetch_optional(&self.pool)
+        .await?;
+        id.map(|id| {
+            Uuid::parse_str(&id).map_err(|e| AsyncDatabaseError::InvalidQuery {
+                message: e.to_string(),
+            })
+        })
+        .transpose()
+    }
 
-        let duplicate_id: Option<String> = if check_frequency {
-            sqlx::query_scalar(
-                "SELECT qso_id FROM qsos
-                 WHERE json_extract(metadata, '$.their_callsign') = ?
-                 AND ABS(json_extract(metadata, '$.frequency') - ?) < 50.0
-                 AND datetime(json_extract(metadata, '$.start_time')) > datetime(?)
-                 AND datetime(json_extract(metadata, '$.start_time')) < datetime(?)
-                 LIMIT 1",
-            )
-            .bind(callsign)
-            .bind(frequency)
-            .bind(time_threshold.to_rfc3339())
-            .bind(start_time.to_rfc3339())
-            .fetch_optional(&self.pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                "SELECT qso_id FROM qsos
-                 WHERE json_extract(metadata, '$.their_callsign') = ?
-                 AND datetime(json_extract(metadata, '$.start_time')) > datetime(?)
-                 AND datetime(json_extract(metadata, '$.start_time')) < datetime(?)
-                 LIMIT 1",
-            )
-            .bind(callsign)
-            .bind(time_threshold.to_rfc3339())
-            .bind(start_time.to_rfc3339())
-            .fetch_optional(&self.pool)
-            .await?
-        };
-
-        if let Some(id_str) = duplicate_id {
-            if let Ok(qso_id) = Uuid::parse_str(&id_str) {
-                return Ok(Some(qso_id));
-            }
+    /// All-time worked contacts, reduced to the latest start date per band/callsign.
+    /// Validate every date before returning anything, so a failed refresh cannot erase history.
+    pub async fn worked_history(
+        &self,
+    ) -> Result<Vec<(String, String, DateTime<Utc>)>, AsyncDatabaseError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT json_extract(adif_data, '$.band'), json_extract(metadata, '$.their_callsign'),
+                    json_extract(metadata, '$.start_time') FROM qsos",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut latest = HashMap::new();
+        for (band, call, date) in rows {
+            let date = DateTime::parse_from_rfc3339(&date)
+                .map_err(|e| AsyncDatabaseError::InvalidQuery {
+                    message: format!("Invalid QSO start date {date}: {e}"),
+                })?
+                .with_timezone(&Utc);
+            let entry = latest
+                .entry((band.trim().to_uppercase(), call.trim().to_uppercase()))
+                .or_insert(date);
+            *entry = (*entry).max(date);
         }
-
-        Ok(None)
+        Ok(latest.into_iter().map(|((b, c), d)| (b, c, d)).collect())
     }
 
     /// Search QSOs returning QsoDatabaseRecord format for compatibility
@@ -1710,7 +1715,15 @@ mod tests {
 
     fn duplicate_check_test_progress(callsign: &str, frequency: f64) -> QsoProgress {
         QsoProgress {
-            state: QsoState::Idle,
+            state: QsoState::Completed {
+                their_callsign: callsign.into(),
+                their_report: -10,
+                our_report: -12,
+                frequency,
+                grid_square: None,
+                completed_at: Utc::now(),
+                duration_seconds: 60,
+            },
             state_history: vec![],
             messages: vec![],
             metadata: QsoMetadata {
@@ -1720,12 +1733,6 @@ mod tests {
                 frequency,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
-                // Strictly in the past relative to a check_duplicate call
-                // made moments after insert — the query's upper time bound
-                // is `datetime(existing_start_time) < datetime(query_now)`,
-                // and SQLite's `datetime()` truncates to whole-second
-                // granularity, so `Utc::now()` for both would risk landing
-                // in the same second and failing the strict `<`.
                 start_time: Utc::now() - chrono::Duration::minutes(5),
                 end_time: None,
                 reports: SignalReports::default(),
@@ -1757,78 +1764,101 @@ mod tests {
         }
     }
 
-    // Regression tests for #137: the persistent-DB check_duplicate path used
-    // to unconditionally require frequency proximity (100 Hz), ignoring
-    // check_frequency entirely — so an operator who set check_frequency =
-    // false to get strict one-QSO-per-callsign-per-window behavior would
-    // silently get frequency-gated behavior back the moment the QSO aged out
-    // of the in-memory working set. These three cases mirror QsoManager's
-    // in-memory check_duplicate semantics exactly (50 Hz threshold, same
-    // check_frequency branching).
-
     #[tokio::test]
-    async fn check_duplicate_with_check_frequency_true_requires_proximity() {
+    async fn pan260_band_window_and_history() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
-        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
-        db.insert_qso(&progress).await.unwrap();
-
-        // Same callsign, 200 Hz away, check_frequency=true — not a duplicate.
-        let far = db
-            .check_duplicate("K2DEF", 14074200.0, Utc::now(), 24, true)
+        let now = DateTime::parse_from_rfc3339("2026-11-04T14:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(db.worked_history().await.unwrap().is_empty());
+        for (age_seconds, expected) in [
+            (1800, true),
+            (86400, false),
+            (86401, false),
+            (0, true),
+            (-1, false),
+        ] {
+            let mut p = duplicate_check_test_progress("k1abc", 14_075_200.0);
+            p.metadata.start_time = now - chrono::Duration::seconds(age_seconds);
+            db.insert_qso(&p).await.unwrap();
+            assert_eq!(
+                db.check_duplicate("K1ABC", Some("20M"), now, 24)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                expected
+            );
+            assert!(db
+                .check_duplicate("K1ABC", Some("40m"), now, 24)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                db.check_duplicate("K1ABC", None, now, 24)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                expected
+            );
+            assert!(db
+                .check_duplicate("K1ABC", Some("20m"), now, 0)
+                .await
+                .unwrap()
+                .is_none());
+            db.delete_qso(p.metadata.qso_id).await.unwrap();
+        }
+        for (delta, expected) in [(-1, true), (0, false), (1, false)] {
+            let mut p = duplicate_check_test_progress("K1ABC", 14_075_200.0);
+            p.metadata.start_time =
+                now - chrono::Duration::hours(24) - chrono::Duration::nanoseconds(delta);
+            db.insert_qso(&p).await.unwrap();
+            assert_eq!(
+                db.check_duplicate("k1abc", Some("20m"), now, 24)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                expected
+            );
+            db.delete_qso(p.metadata.qso_id).await.unwrap();
+        }
+        let mut future = duplicate_check_test_progress("K1ABC", 14_075_800.0);
+        future.metadata.start_time = now + chrono::Duration::nanoseconds(1);
+        db.insert_qso(&future).await.unwrap();
+        assert!(db
+            .check_duplicate("k1abc", Some("20m"), now, 24)
+            .await
+            .unwrap()
+            .is_none());
+        db.delete_qso(future.metadata.qso_id).await.unwrap();
+        for (rf, age) in [(14_075_200.0, 60), (14_075_800.0, 30), (7_075_200.0, 10)] {
+            let mut p = duplicate_check_test_progress("k1abc", rf);
+            p.metadata.start_time = now - chrono::Duration::minutes(age);
+            db.insert_qso(&p).await.unwrap();
+        }
+        sqlx::query("UPDATE qsos SET adif_data = json_set(adif_data, '$.band', lower(json_extract(adif_data, '$.band')))").execute(&db.pool).await.unwrap();
+        assert!(db
+            .check_duplicate("K1ABC", Some("20M"), now, 24)
+            .await
+            .unwrap()
+            .is_some());
+        let history = db.worked_history().await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.contains(&(
+            "20M".into(),
+            "K1ABC".into(),
+            now - chrono::Duration::minutes(30)
+        )));
+        sqlx::query("UPDATE qsos SET metadata = json_set(metadata, '$.start_time', 'invalid')")
+            .execute(&db.pool)
             .await
             .unwrap();
-        assert!(
-            far.is_none(),
-            "200 Hz away must not count as a duplicate when check_frequency=true"
-        );
-
-        // Same callsign, 10 Hz away, check_frequency=true — a duplicate.
-        let near = db
-            .check_duplicate("K2DEF", 14074010.0, Utc::now(), 24, true)
+        assert!(db.worked_history().await.is_err());
+        db.pool.close().await;
+        assert!(db.worked_history().await.is_err());
+        assert!(db
+            .check_duplicate("K1ABC", Some("20m"), now, 24)
             .await
-            .unwrap();
-        assert!(
-            near.is_some(),
-            "10 Hz away must count as a duplicate when check_frequency=true"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_duplicate_with_check_frequency_false_ignores_frequency() {
-        let db = QsoDatabase::new_in_memory().await.unwrap();
-        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
-        db.insert_qso(&progress).await.unwrap();
-
-        // Same callsign, 200 Hz away, check_frequency=false — still a
-        // duplicate. This is the exact case #137 reported broken: the old
-        // unconditional 100 Hz SQL filter would have returned None here.
-        let far = db
-            .check_duplicate("K2DEF", 14074200.0, Utc::now(), 24, false)
-            .await
-            .unwrap();
-        assert!(
-            far.is_some(),
-            "200 Hz away must still count as a duplicate when check_frequency=false"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_duplicate_matches_in_memory_50hz_threshold_not_100hz() {
-        let db = QsoDatabase::new_in_memory().await.unwrap();
-        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
-        db.insert_qso(&progress).await.unwrap();
-
-        // 75 Hz away: outside the in-memory path's 50 Hz threshold, so the
-        // DB path must now agree (not a duplicate) rather than using the old
-        // 100 Hz threshold (which would have wrongly said "duplicate").
-        let mid = db
-            .check_duplicate("K2DEF", 14074075.0, Utc::now(), 24, true)
-            .await
-            .unwrap();
-        assert!(
-            mid.is_none(),
-            "75 Hz away must not count as a duplicate — must match the in-memory 50 Hz threshold, not the old 100 Hz one"
-        );
+            .is_err());
     }
 
     #[tokio::test]

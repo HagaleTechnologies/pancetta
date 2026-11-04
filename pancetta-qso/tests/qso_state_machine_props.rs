@@ -103,11 +103,13 @@ proptest! {
             .unwrap();
 
         rt.block_on(async move {
-            let manager = QsoManager::new(QsoManagerConfig {
+            let mut manager = QsoManager::new(QsoManagerConfig {
                 our_callsign: US.to_string(),
                 our_grid: Some("EM10".to_string()),
                 ..Default::default()
             });
+
+            manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)));
 
             // Open an autonomous pounce on PARTNER (the Phase-5 Auto path).
             let qso_id = manager

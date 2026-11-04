@@ -15,7 +15,7 @@ use pancetta_qso::{
 const US: &str = "K5ARH";
 
 fn manager() -> QsoManager {
-    QsoManager::new(QsoManagerConfig {
+    let mut manager = QsoManager::new(QsoManagerConfig {
         our_callsign: US.into(),
         our_grid: Some("EM10".into()),
         timeouts: TimeoutConfig::default(),
@@ -24,7 +24,11 @@ fn manager() -> QsoManager {
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),
         active_mode: "FT8".to_string(),
-    })
+    });
+    manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
+    manager
 }
 
 /// Two concurrent QSOs on well-separated frequencies. QSO A's partner (K9ZZ)

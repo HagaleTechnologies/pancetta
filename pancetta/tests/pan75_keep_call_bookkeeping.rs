@@ -16,7 +16,11 @@ fn manager(max_calls: u32) -> QsoManager {
     config.timeouts.manual_call_max_calls = max_calls;
     config.timeouts.manual_call_watchdog_minutes = 60;
     config.timeouts.repetitive_tx_timeout_secs = 100_000;
-    QsoManager::new(config)
+    let mut manager = QsoManager::new(config);
+    manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
+    manager
 }
 
 async fn open(manager: &QsoManager, call: &str, freq: f64) -> QsoId {

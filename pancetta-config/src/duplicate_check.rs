@@ -19,10 +19,8 @@ pub struct DuplicateCheckingConfig {
     /// A prior QSO only counts as a duplicate if it started within this many
     /// hours.
     pub time_window_hours: u32,
-    /// When true, a prior QSO only blocks a re-call if it was within 50 Hz of
-    /// the same RF frequency (so the same station on another band — or after a
-    /// substantial QSY — can be worked again). When false, any QSO with that
-    /// callsign inside the window blocks.
+    /// When true, restrict duplicate matching to the same band, regardless of
+    /// audio offset. When false, match the callsign across all bands.
     pub check_frequency: bool,
 }
 

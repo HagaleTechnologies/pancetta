@@ -826,7 +826,13 @@ impl Sim {
     /// watchdog caps for the watchdog scenarios).
     pub async fn with_config(config: QsoManagerConfig) -> Self {
         let our_callsign = config.our_callsign.clone();
-        let manager = QsoManager::new(config);
+        let mut manager = QsoManager::new(config);
+        // Sim decodes carry audio offsets. Give the simulated station a real
+        // 20m dial so band-based autonomous admission has the same RF context
+        // as production instead of treating 1500 Hz as an unknown band.
+        manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            14_074_000,
+        )));
         manager
             .start()
             .await
