@@ -955,6 +955,38 @@ exit 0
 
 ---
 
+## `[hound]` — DXpedition (Fox/Hound) chasing
+
+Pancetta follows the WSJT-X Fox/Hound convention when you engage a Fox with
+`Shift+H`. The Hound calls in the call region, where a WSJT-X Fox listens.
+When the Fox sends you a report, pancetta sends its R-report at the Fox's own
+audio offset. After the Fox's RR73 it logs the QSO and sends no 73.
+
+```toml
+[hound]
+call_min_hz = 1000.0
+call_max_hz = 2700.0
+response_min_hz = 300.0
+response_max_hz = 900.0
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `call_min_hz` / `call_max_hz` | float | `1000.0` / `2700.0` | Where the Hound calls the Fox. The opening offset is picked inside this range per Fox call. |
+| `response_min_hz` / `response_max_hz` | float | `300.0` / `900.0` | Admissibility envelope for the Fox's offset. A Fox report outside it is ignored: no R-report, no state change. It is never a pool to pick another frequency from. |
+
+Omitting the section uses these defaults. All four values must lie in
+200-2900 Hz, and each minimum must be below its maximum. After the Fox's
+report the Hound stays on the Fox offset: stall switches, reverts and `u`
+nudges cannot move it. A later report from the Fox on another stream inside
+the envelope moves it there.
+
+**Migrating (PAN-259):** releases before PAN-259 inverted these regions
+(calling at 300-900 Hz). If your config sets the old explicit values
+`call_min_hz = 300`, `call_max_hz = 900`, `response_min_hz = 1000`,
+`response_max_hz = 2700`, replace them with the example above or delete the
+section. With the old values a WSJT-X Fox never sees your call.
+
 ## `[ui]` — TUI behaviour
 
 ```toml

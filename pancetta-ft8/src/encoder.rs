@@ -15,7 +15,9 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::ldpc::{binary_to_gray, binary_to_gray_4fsk, LdpcEncoder};
-use crate::message::{calculate_crc14, hash12, pack58, CRC_BITS, PAYLOAD_BITS};
+use crate::message::{
+    calculate_crc14, dxpedition_report_to_r5, hash10, hash12, pack58, CRC_BITS, PAYLOAD_BITS,
+};
 use crate::protocol::ProtocolParams;
 use crate::{Ft8Error, Ft8Result, NUM_SYMBOLS};
 use bitvec::prelude::*;
@@ -789,28 +791,40 @@ impl Ft8Encoder {
         self.payload_to_symbols(&payload)
     }
 
-    /// Encode a DXpedition message: "<to_call> <from_call> [R] <grid_or_report>"
+    /// Encode a WSJT-X DXpedition Fox frame (i3=0, n3=1):
+    /// `<rr73_to> RR73; <report_to> <fox_call> <report>` (PAN-259).
     ///
-    /// i3=0, n3=1. Same field layout as standard type 1 but uses
-    /// the type-0 container with n3=1.
+    /// One frame carries two contacts: RR73 to `rr73_to` and a report to
+    /// `report_to`, signed by the Fox's 10-bit call hash. See
+    /// [`pack_dxpedition_contacts`] for the layout and report quantization.
+    pub fn encode_dxpedition_contacts(
+        &mut self,
+        rr73_to: &str,
+        report_to: &str,
+        fox_call: &str,
+        report_db: i8,
+    ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        let payload = pack_dxpedition_contacts(rr73_to, report_to, fox_call, report_db)?;
+        self.payload_to_symbols(&payload)
+    }
+
+    /// Former DXpedition encoder. Its `to, from, R, grid_or_report`
+    /// arguments cannot express a real WSJT-X type 0.1 frame, which needs
+    /// two Hounds, the Fox and a report, so it now always fails rather than
+    /// emit a frame no WSJT-X station decodes correctly (PAN-259).
+    #[deprecated(note = "type 0.1 needs both Hounds and the Fox; use encode_dxpedition_contacts")]
     pub fn encode_dxpedition(
         &mut self,
-        to_callsign: &str,
-        from_callsign: &str,
-        r_prefix: bool,
-        grid_or_report: &str,
+        _to_callsign: &str,
+        _from_callsign: &str,
+        _r_prefix: bool,
+        _grid_or_report: &str,
     ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        let (n28a, _) = pack28(to_callsign)?;
-        let (n28b, _) = pack28(from_callsign)?;
-
-        let ir: u8 = if r_prefix { 1 } else { 0 };
-
-        // Pack grid/report into 14-bit field (same logic as standard igrid4 but 14 bits)
-        let igrid14 = pack_grid_14bit(grid_or_report);
-        let n3: u8 = 1;
-
-        let payload = pack_type0(n28a, n28b, ir, igrid14, n3);
-        self.payload_to_symbols(&payload)
+        Err(Ft8Error::MessageDecodingError(
+            "DXpedition (type 0.1) frames need both Hounds and the Fox: use \
+             encode_dxpedition_contacts(rr73_to, report_to, fox_call, report_db)"
+                .to_string(),
+        ))
     }
 
     /// Encode an EU VHF Contest message: "<to_call> <from_call> [R] <grid_or_token>"
@@ -1284,51 +1298,61 @@ fn pack_type0(n28a: u32, n28b: u32, ir: u8, field14: u16, n3: u8) -> [u8; 10] {
     payload
 }
 
-/// Pack a 14-bit grid/report field for DXpedition messages.
+/// Pack a WSJT-X DXpedition (i3=0 n3=1) Fox frame into a 10-byte payload
+/// (PAN-259): `<rr73_to> RR73; <report_to> <fox_call> <report>`.
 ///
-/// Grid: 4-char Maidenhead → standard encoding (0..32399)
-/// Report: signal report → 35+dd (no R prefix in this field; R is the ir bit)
-/// Tokens: RRR=32402, RR73=32403, 73=32404
-fn pack_grid_14bit(exchange: &str) -> u16 {
-    if exchange.is_empty() {
-        return 0;
+/// Layout (`packjt77.f90` `pack77_01`, `format 2b28.28,b10.10,b5.5,2b3.3`):
+/// `c28 c28 h10 r5 n3=1 i3=0`. `rr73_to` and `report_to` must be standard
+/// callsigns without a /P or /R suffix (the field has no room for one);
+/// `fox_call` is carried only as its 10-bit hash. The report is quantized
+/// and saturated as WSJT-X does (see [`dxpedition_report_to_r5`]), so the
+/// receiver renders `2*r5 - 30` dB: -7 goes out as -08, anything above +32
+/// as +32 and anything below -30 as -30.
+pub fn pack_dxpedition_contacts(
+    rr73_to: &str,
+    report_to: &str,
+    fox_call: &str,
+    report_db: i8,
+) -> Ft8Result<[u8; 10]> {
+    let hound = |call: &str| -> Ft8Result<u32> {
+        match pack28(call) {
+            Ok((n28, 0)) if n28 >= NTOKENS + MAX22 => Ok(n28),
+            _ => Err(Ft8Error::MessageDecodingError(format!(
+                "DXpedition Hound must be a standard callsign: '{}'",
+                call
+            ))),
+        }
+    };
+    let n28a = hound(rr73_to)?;
+    let n28b = hound(report_to)?;
+    if fox_call.trim().is_empty() || pack58(fox_call).is_none() {
+        return Err(Ft8Error::MessageDecodingError(format!(
+            "DXpedition Fox callsign cannot be hashed: '{}'",
+            fox_call
+        )));
     }
+    let n10 = hash10(fox_call);
+    let n5 = dxpedition_report_to_r5(report_db) as u32;
 
-    let bytes = exchange.as_bytes();
-
-    // Tokens
-    if exchange == "RRR" {
-        return MAXGRID4 + 2;
+    let mut payload = [0u8; 10];
+    let mut pos = 0usize;
+    for (value, width) in [
+        (n28a, 28),
+        (n28b, 28),
+        (n10, 10),
+        (n5, 5),
+        (1u32, 3), // n3 = 1
+        (0u32, 3), // i3 = 0
+    ] {
+        for bit in (0..width).rev() {
+            if (value >> bit) & 1 != 0 {
+                payload[pos / 8] |= 0x80 >> (pos % 8);
+            }
+            pos += 1;
+        }
     }
-    if exchange == "RR73" {
-        return MAXGRID4 + 3;
-    }
-    if exchange == "73" {
-        return MAXGRID4 + 4;
-    }
-
-    // 4-character grid
-    if bytes.len() == 4
-        && bytes[0] >= b'A'
-        && bytes[0] <= b'R'
-        && bytes[1] >= b'A'
-        && bytes[1] <= b'R'
-        && bytes[2].is_ascii_digit()
-        && bytes[3].is_ascii_digit()
-    {
-        let mut igrid: u16 = (bytes[0] - b'A') as u16;
-        igrid = igrid * 18 + (bytes[1] - b'A') as u16;
-        igrid = igrid * 10 + (bytes[2] - b'0') as u16;
-        igrid = igrid * 10 + (bytes[3] - b'0') as u16;
-        return igrid;
-    }
-
-    // Signal report
-    if let Ok(dd) = exchange.parse::<i32>() {
-        return (35 + dd) as u16;
-    }
-
-    0 // fallback
+    debug_assert_eq!(pos, PAYLOAD_BITS);
+    Ok(payload)
 }
 
 /// Pack EU VHF compressed grid/report into 14-bit field.
@@ -1849,20 +1873,90 @@ mod tests {
             .is_err());
     }
 
+    /// PAN-259: the independent WSJT-X `pack77_01` fixture in
+    /// `tests/fixtures/dxpedition_type01.md` for
+    /// `K1ABC RR73; W9XYZ <KH1/KH7Z> -08`.
+    const DXPEDITION_REFERENCE_PAYLOAD: [u8; 10] =
+        [0x09, 0xBD, 0xE3, 0x50, 0xC2, 0x93, 0xB8, 0x32, 0x56, 0x40];
+
     #[test]
-    fn test_encode_dxpedition() {
+    fn test_encode_dxpedition_contacts() {
         let mut encoder = Ft8Encoder::new();
-        let result = encoder.encode_dxpedition("K1DEF", "W1ABC", false, "FN42");
-        assert!(result.is_ok());
-        let symbols = result.unwrap();
+        let symbols = encoder
+            .encode_dxpedition_contacts("K1ABC", "W9XYZ", "KH1/KH7Z", -8)
+            .unwrap();
         assert_eq!(symbols.len(), NUM_SYMBOLS);
+        assert_eq!(
+            symbols,
+            encoder
+                .payload_to_symbols(&DXPEDITION_REFERENCE_PAYLOAD)
+                .unwrap()
+        );
     }
 
     #[test]
-    fn test_encode_dxpedition_report() {
+    fn test_pack_dxpedition_contacts_matches_independent_fixture() {
+        assert_eq!(
+            pack_dxpedition_contacts("K1ABC", "W9XYZ", "KH1/KH7Z", -8).unwrap(),
+            DXPEDITION_REFERENCE_PAYLOAD
+        );
+        // -7 quantizes to the same r5 as -8 (WSJT-X truncating division).
+        assert_eq!(
+            pack_dxpedition_contacts("K1ABC", "W9XYZ", "KH1/KH7Z", -7).unwrap(),
+            DXPEDITION_REFERENCE_PAYLOAD
+        );
+    }
+
+    /// The symbols for the independent reference payload must match ft8_lib's
+    /// C encoder, not just pancetta's own Rust path.
+    #[cfg(not(ft8lib_stub))]
+    #[test]
+    fn test_encode_dxpedition_contacts_matches_ft8lib_symbols() {
+        let mut reference = [0u8; NUM_SYMBOLS];
+        unsafe {
+            crate::ft8_lib_ffi::ft8_encode(
+                DXPEDITION_REFERENCE_PAYLOAD.as_ptr(),
+                reference.as_mut_ptr(),
+            )
+        };
         let mut encoder = Ft8Encoder::new();
-        let result = encoder.encode_dxpedition("K1DEF", "W1ABC", true, "-12");
-        assert!(result.is_ok());
+        let symbols = encoder
+            .encode_dxpedition_contacts("K1ABC", "W9XYZ", "KH1/KH7Z", -8)
+            .unwrap();
+        assert_eq!(symbols, reference);
+    }
+
+    #[test]
+    fn test_encode_dxpedition_contacts_rejects_invalid_calls() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder
+            .encode_dxpedition_contacts("CQ", "W9XYZ", "KH1/KH7Z", -8)
+            .is_err());
+        assert!(encoder
+            .encode_dxpedition_contacts("K1ABC", "W9XYZ/P", "KH1/KH7Z", -8)
+            .is_err());
+        assert!(encoder
+            .encode_dxpedition_contacts("K1ABC", "NOT A CALL", "KH1/KH7Z", -8)
+            .is_err());
+        assert!(encoder
+            .encode_dxpedition_contacts("K1ABC", "W9XYZ", "", -8)
+            .is_err());
+        assert!(encoder
+            .encode_dxpedition_contacts("K1ABC", "W9XYZ", "KH1#KH7Z", -8)
+            .is_err());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_encode_dxpedition_legacy_refuses() {
+        let mut encoder = Ft8Encoder::new();
+        let err = encoder
+            .encode_dxpedition("K1DEF", "W1ABC", false, "FN42")
+            .unwrap_err();
+        assert!(err.to_string().contains("encode_dxpedition_contacts"));
+        assert!(encoder
+            .encode_dxpedition("K1DEF", "W1ABC", true, "-12")
+            .is_err());
     }
 
     #[test]
@@ -1936,19 +2030,6 @@ mod tests {
         assert_eq!(payload[9] & 0x07, 0, "i3 must be 0 for type-0 messages");
         // n3 should be 3 (bits 71-73 = upper 3 bits of payload[9] >> 3)
         assert_eq!((payload[9] >> 3) & 0x07, 3, "n3 should be 3");
-    }
-
-    #[test]
-    fn test_pack_grid_14bit() {
-        assert_eq!(pack_grid_14bit("RRR"), MAXGRID4 + 2);
-        assert_eq!(pack_grid_14bit("RR73"), MAXGRID4 + 3);
-        assert_eq!(pack_grid_14bit("73"), MAXGRID4 + 4);
-        // FN42 grid
-        let g = pack_grid_14bit("FN42");
-        assert!(g < MAXGRID4);
-        assert_eq!(g, 10342); // Same as packgrid
-                              // Report -12
-        assert_eq!(pack_grid_14bit("-12"), 23);
     }
 
     // ====================================================================

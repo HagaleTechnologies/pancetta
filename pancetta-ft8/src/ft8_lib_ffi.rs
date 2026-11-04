@@ -486,6 +486,20 @@ pub fn ft8lib_decode_audio_protocol(
     samples: &[f32],
     protocol: ftx_protocol_t,
 ) -> Vec<(String, f32, f32, i32, f32)> {
+    ft8lib_decode_audio_protocol_with_parser(samples, protocol, None)
+        .into_iter()
+        .map(|(t, f, dt, e, snr, _)| (t, f, dt, e, snr))
+        .collect()
+}
+
+/// Production wrapper retaining raw type 0.1 payloads for collision-safe
+/// parsing. Other message types keep the reference decoder's text behavior.
+#[cfg(not(ft8lib_stub))]
+pub fn ft8lib_decode_audio_protocol_with_parser(
+    samples: &[f32],
+    protocol: ftx_protocol_t,
+    parser: Option<&crate::message::MessageParser>,
+) -> Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)> {
     let cfg = monitor_config_t {
         f_min: 100.0,
         f_max: 3000.0,
@@ -548,15 +562,37 @@ pub fn ft8lib_decode_audio_protocol(
                 )
             };
 
-            if rc == ftx_message_rc_t::FTX_MESSAGE_RC_OK {
-                let text = match cstr_from_fixed_buf(&text_buf) {
-                    Some(s) => s.trim().to_string(),
-                    None => {
-                        tracing::warn!(
-                            target: "ft8.ffi",
-                            "ft8_lib decode buffer not NUL-terminated within bounds; skipping candidate"
-                        );
-                        continue;
+            let is_dxpedition = ((msg.payload[9] >> 3) & 7) == 0
+                && (((msg.payload[8] & 1) << 2) | (msg.payload[9] >> 6)) == 1;
+            let dxpedition_message = if is_dxpedition {
+                let Some(parser) = parser else {
+                    continue;
+                };
+                let bits: bitvec::vec::BitVec = (0..77)
+                    .map(|i| msg.payload[i / 8] & (0x80 >> (i % 8)) != 0)
+                    .collect();
+                let Ok(decoded) = parser.parse_payload(&bits) else {
+                    continue;
+                };
+                if !parser.is_plausible(&decoded) {
+                    continue;
+                }
+                Some(decoded)
+            } else {
+                None
+            };
+
+            if rc == ftx_message_rc_t::FTX_MESSAGE_RC_OK || dxpedition_message.is_some() {
+                let text = if let Some(message) = &dxpedition_message {
+                    message.to_string()
+                } else {
+                    match cstr_from_fixed_buf(&text_buf) {
+                        Some(s) => s.trim().to_string(),
+                        None => {
+                            tracing::warn!(target: "ft8.ffi",
+                                "ft8_lib decode buffer not NUL-terminated within bounds; skipping candidate");
+                            continue;
+                        }
                     }
                 };
 
@@ -582,11 +618,24 @@ pub fn ft8lib_decode_audio_protocol(
                 let snr_db = estimate_snr_from_waterfall(&mon.wf, cand).unwrap_or(-24.0) as f32;
 
                 // Deduplicate
-                if !messages
-                    .iter()
-                    .any(|(t, _, _, _, _): &(String, f32, f32, i32, f32)| *t == text)
-                {
-                    messages.push((text, freq_hz, time_sec, status.ldpc_errors, snr_db));
+                if !messages.iter().any(
+                    |(t, _, _, _, _, _): &(
+                        String,
+                        f32,
+                        f32,
+                        i32,
+                        f32,
+                        Option<crate::Ft8Message>,
+                    )| *t == text,
+                ) {
+                    messages.push((
+                        text,
+                        freq_hz,
+                        time_sec,
+                        status.ldpc_errors,
+                        snr_db,
+                        dxpedition_message,
+                    ));
                 }
             }
         }
@@ -805,4 +854,13 @@ mod seed_signature_tests {
         assert!(set.seeds.is_empty());
         assert_eq!(set.min_bin, 0);
     }
+}
+
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_decode_audio_protocol_with_parser(
+    _samples: &[f32],
+    _protocol: ftx_protocol_t,
+    _parser: Option<&crate::message::MessageParser>,
+) -> Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)> {
+    Vec::new()
 }

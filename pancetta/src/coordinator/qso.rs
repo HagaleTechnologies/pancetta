@@ -966,6 +966,13 @@ async fn maybe_auto_resend_73(
     }
 }
 
+/// Whether a completed QSO is stashed for `maybe_auto_resend_73`. Only manual
+/// completions are; a Hound completion never is, because in the Fox/Hound
+/// procedure the Fox's RR73 ends the contact and a Hound sends no 73 (PAN-259).
+fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
+    metadata.initiated_by == pancetta_qso::CallInitiation::Manual && !metadata.hound
+}
+
 /// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
 /// frame. Only touches the entry this call committed (same completed QSO,
 /// `last_resend_at` still its own stamp), so a newer completion stashed for
@@ -998,6 +1005,47 @@ struct CallerAnswer {
     step: pancetta_core::ResponseStep,
     /// The signal report they sent us, if this rung carried one.
     their_report: Option<i8>,
+}
+
+/// PAN-259: every logical QSO contact one decoded frame carries.
+///
+/// An ordinary frame carries one, classified by [`ft8_message_to_qso_type`].
+/// A DXpedition (type 0.1) Fox frame carries two: RR73 to its first Hound and
+/// a signal report to its second, both from the Fox whose call travels only
+/// as a 10-bit hash. When that hash did not resolve to exactly one known call
+/// the frame yields no contact at all, so neither Hound's QSO can be advanced
+/// by a sender nobody can name, and nothing falls back to text parsing.
+///
+/// The frame stays ONE physical decode for the TUI, relays and metrics; only
+/// the QSO engine sees it as two contacts.
+pub fn ft8_message_to_qso_types(
+    message: &pancetta_ft8::Ft8Message,
+    rendered_text: &str,
+    our_callsign: &str,
+) -> Vec<pancetta_qso::states::MessageType> {
+    use pancetta_qso::states::MessageType as Mt;
+
+    let Some(contacts) = message.dxpedition.as_ref() else {
+        return vec![ft8_message_to_qso_type(
+            message,
+            rendered_text,
+            our_callsign,
+        )];
+    };
+    let Some(fox) = contacts.fox_call.as_ref() else {
+        return Vec::new();
+    };
+    vec![
+        Mt::FinalConfirmation {
+            to_station: contacts.rr73_to.clone(),
+            from_station: fox.clone(),
+        },
+        Mt::SignalReport {
+            to_station: contacts.report_to.clone(),
+            from_station: fox.clone(),
+            report: contacts.report_db,
+        },
+    ]
 }
 
 /// Classify a decoded FT8 message directly from its already-parsed
@@ -2097,6 +2145,18 @@ mod pan6_diagnostic_tests {
     use super::*;
     use pancetta_core::slot::SlotParity;
     use pancetta_qso::{CallInitiation, QsoMetadata, QsoState};
+
+    /// PAN-259: a Hound completion is never stashed for the auto-73 resend,
+    /// so a duplicate RR73 from the Fox never makes a Hound send 73.
+    #[test]
+    fn hound_completion_is_not_stashed_for_auto_73() {
+        let mut md = metadata(CallInitiation::Manual, 1, 0);
+        assert!(stashes_auto_73(&md));
+        md.hound = true;
+        assert!(!stashes_auto_73(&md));
+        let auto = metadata(CallInitiation::Auto, 1, 0);
+        assert!(!stashes_auto_73(&auto));
+    }
 
     fn metadata(initiated_by: CallInitiation, call_count: u32, age_minutes: i64) -> QsoMetadata {
         let now = chrono::Utc::now();
@@ -4228,8 +4288,9 @@ impl super::ApplicationCoordinator {
                                     // Autonomous completions are deliberately NOT
                                     // stashed — that path has its own dx-busy /
                                     // duplicate gates and shouldn't keep TXing 73s.
-                                    if metadata.initiated_by == pancetta_qso::CallInitiation::Manual
-                                    {
+                                    // PAN-259: neither are Hound completions — a
+                                    // Hound never sends 73 after the Fox's RR73.
+                                    if stashes_auto_73(&metadata) {
                                         let now = chrono::Utc::now();
                                         let entry = RecentManualCompletion {
                                             completed_at: now,
@@ -4581,12 +4642,29 @@ impl super::ApplicationCoordinator {
                                         // typed Ft8Message.standard_type instead of
                                         // re-parsing the rendered text — see
                                         // ft8_message_to_qso_type's doc comment.
-                                        let msg_type = ft8_message_to_qso_type(
+                                        //
+                                        // PAN-259: a DXpedition (type 0.1) frame
+                                        // carries two contacts; each runs through
+                                        // the same per-contact processing below.
+                                        let mut msg_types = ft8_message_to_qso_types(
                                             &decoded_msg.message,
                                             &raw_text,
                                             &our_callsign,
                                         );
-                                        {
+                                        // Process the contact addressed to us
+                                        // last, so `record_dx_activity` leaves
+                                        // the Fox shown as working us.
+                                        msg_types.sort_by_key(|m| {
+                                            m.addressee_callsign().is_some_and(|to| {
+                                                pancetta_qso::exchange::callsigns_match(
+                                                    to,
+                                                    &our_callsign,
+                                                )
+                                            })
+                                        });
+                                        let is_dxpedition_frame =
+                                            decoded_msg.message.dxpedition.is_some();
+                                        for msg_type in msg_types {
                                             // item-2-auto-73: a directed RR73/RRR from
                                             // a station we just MANUALLY completed with
                                             // means they didn't copy our 73 — bounded
@@ -4666,9 +4744,14 @@ impl super::ApplicationCoordinator {
                                             // Skip if we already attempted creation
                                             // for this station in this slot (Part B
                                             // of duplicate-QSO fix).
-                                            let skip_creation = caller_base
-                                                .as_deref()
-                                                .is_some_and(|base| caller_dedup.1.contains(base));
+                                            //
+                                            // PAN-259: a Fox's DXpedition frame never
+                                            // opens a caller QSO; it only advances
+                                            // a Hound QSO that already exists.
+                                            let skip_creation = is_dxpedition_frame
+                                                || caller_base.as_deref().is_some_and(|base| {
+                                                    caller_dedup.1.contains(base)
+                                                });
 
                                             if skip_creation {
                                                 debug!(
@@ -5434,13 +5517,13 @@ impl super::ApplicationCoordinator {
                                                 Ok(qso_id) => {
                                                     info!(
                                                         "Hound QSO started with Fox {}: {} \
-                                                         (calling low, keep-calling under watchdog)",
+                                                         (calling region, keep-calling under watchdog)",
                                                         callsign, qso_id
                                                     );
                                                     emit_status(
                                                         &message_bus,
                                                         format!(
-                                                            "Hound: calling Fox {} low — TX \
+                                                            "Hound: calling Fox {} — TX \
                                                              queued ({} Hz RX)",
                                                             callsign, fox_freq
                                                         ),
@@ -7640,6 +7723,73 @@ mod ft8_message_classification_tests {
             pancetta_qso::states::MessageType::NonStandard {
                 text: "K5ARH <...123> -10".to_string(),
             }
+        );
+    }
+
+    fn dxpedition_reference_message(fox_call: Option<&str>) -> pancetta_ft8::Ft8Message {
+        let contacts = pancetta_ft8::message::DxpeditionContacts {
+            rr73_to: "K1ABC".to_string(),
+            report_to: "W9XYZ".to_string(),
+            fox_hash10: 0,
+            fox_call: fox_call.map(str::to_string),
+            report_db: -8,
+        };
+        pancetta_ft8::Ft8Message {
+            from_callsign: fox_call.map(str::to_string),
+            signal_report: Some(-8),
+            text: Some(contacts.text()),
+            dxpedition: Some(contacts),
+            ..base_message()
+        }
+    }
+
+    /// PAN-259 scenario 3: one resolved type 0.1 frame yields RR73 to its
+    /// first Hound and the -08 report to its second, both from the Fox.
+    #[test]
+    fn dxpedition_frame_yields_both_contacts_from_the_fox() {
+        let msg = dxpedition_reference_message(Some("KH1/KH7Z"));
+        let text = msg.text.clone().unwrap_or_default();
+        assert_eq!(text, "K1ABC RR73; W9XYZ <KH1/KH7Z> -08");
+        let result = ft8_message_to_qso_types(&msg, &text, "W9XYZ");
+        assert_eq!(
+            result,
+            vec![
+                pancetta_qso::states::MessageType::FinalConfirmation {
+                    to_station: "K1ABC".to_string(),
+                    from_station: "KH1/KH7Z".to_string(),
+                },
+                pancetta_qso::states::MessageType::SignalReport {
+                    to_station: "W9XYZ".to_string(),
+                    from_station: "KH1/KH7Z".to_string(),
+                    report: -8,
+                },
+            ]
+        );
+    }
+
+    /// PAN-259: an unknown or collided Fox hash yields no QSO contact, never
+    /// a text-parsed sender.
+    #[test]
+    fn dxpedition_frame_with_unresolved_fox_yields_no_contact() {
+        let msg = dxpedition_reference_message(None);
+        let text = msg.text.clone().unwrap_or_default();
+        assert_eq!(text, "K1ABC RR73; W9XYZ <...> -08");
+        assert!(ft8_message_to_qso_types(&msg, &text, "K1ABC").is_empty());
+    }
+
+    /// PAN-259: ordinary traffic still goes through the single-contact path.
+    #[test]
+    fn dxpedition_plural_helper_delegates_ordinary_frames() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("K5ARH".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            signal_report: Some(-10),
+            ..base_message()
+        };
+        assert_eq!(
+            ft8_message_to_qso_types(&msg, "K5ARH W1ABC -10", "K5ARH"),
+            vec![ft8_message_to_qso_type(&msg, "K5ARH W1ABC -10", "K5ARH")]
         );
     }
 
@@ -16523,6 +16673,212 @@ mod pan120_tests {
                 }
                 assert_eq!(h.manager.active_qso_count().await, 1);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dxpedition_receive_integration_tests {
+    use super::*;
+    use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Modulator, Protocol, WINDOW_SAMPLES};
+    use pancetta_qso::{QsoEvent, QsoManager, QsoManagerConfig, QsoState};
+
+    // Independently packed by gen_dxpedition_type01.py. The second payload
+    // swaps the two Hounds so W9XYZ receives RR73 after its report.
+    const REPORT: [u8; 10] = [0x09, 0xBD, 0xE3, 0x50, 0xC2, 0x93, 0xB8, 0x32, 0x56, 0x40];
+    const CLOSE: [u8; 10] = [0x0C, 0x29, 0x3B, 0x80, 0x9B, 0xDE, 0x35, 0x32, 0x56, 0x40];
+
+    fn receive(
+        decoder: &mut Ft8Decoder,
+        payload: &[u8; 10],
+        hz: f64,
+    ) -> Vec<pancetta_ft8::DecodedMessage> {
+        let mut symbols = [0; 79];
+        unsafe {
+            pancetta_ft8::ft8_lib_ffi::ft8_encode(payload.as_ptr(), symbols.as_mut_ptr());
+        }
+        let mut audio = Ft8Modulator::new(12_000, hz, 0.5)
+            .unwrap()
+            .modulate_symbols(&symbols, 0.0)
+            .unwrap();
+        audio.resize(WINDOW_SAMPLES, 0.0);
+        let native = decoder.decode_window(&audio).unwrap();
+        let reference = decoder.decode_window_ft8lib_with_context(&audio, Protocol::Ft8);
+        let mut merged = pancetta_ft8::merge::merge_ft8lib_first(reference, native).messages;
+        for msg in &mut merged {
+            msg.captured_dial_hz = Some(14_074_000);
+            msg.slot_parity = Some(pancetta_core::slot::SlotParity::Even);
+        }
+        merged
+    }
+
+    fn events(rx: &mut tokio::sync::broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    async fn deliver(
+        manager: &QsoManager,
+        frame: &pancetta_ft8::DecodedMessage,
+        live_dial: u64,
+        call: &str,
+    ) -> usize {
+        // The same pre-expansion band guard and plural adapter as the bus arm.
+        if super::super::is_stale_band_decode(frame.captured_dial_hz, live_dial) {
+            return 0;
+        }
+        let contacts = ft8_message_to_qso_types(&frame.message, &frame.text, call);
+        let count = contacts.len();
+        for contact in contacts {
+            manager
+                .process_message_with_parity(
+                    contact,
+                    frame.text.clone(),
+                    frame.frequency_offset,
+                    Some(frame.snr_db),
+                    frame.slot_parity,
+                )
+                .await
+                .unwrap();
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn dxpedition_unknown_and_collided_fox_audio_yields_no_actions() {
+        let manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "W9XYZ".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .engage_hound("KH1/KH7Z", 600.0, None, None)
+            .await
+            .unwrap();
+        let mut decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        decoder.set_hound_foxes(&["W1ABC".into()]);
+        for collided in [false, true] {
+            if collided {
+                // Independent fixture generator: both hashes are 201.
+                decoder.seed_hash_callsign("W2X93");
+                decoder.set_hound_foxes(&["KH1/KH7Z".into()]);
+            }
+            let frames = receive(&mut decoder, &REPORT, 600.0);
+            let frame = frames
+                .iter()
+                .find(|m| m.message.dxpedition.is_some())
+                .unwrap();
+            assert!(frame
+                .message
+                .dxpedition
+                .as_ref()
+                .unwrap()
+                .fox_call
+                .is_none());
+            assert_eq!(deliver(&manager, frame, 14_074_000, "W9XYZ").await, 0);
+            assert!(!manager.get_qso(id).await.unwrap().metadata.hound_qsyed);
+            if collided {
+                let mut rebuilt = Ft8Decoder::new(Ft8Config::default()).unwrap();
+                for call in decoder.learned_callsigns() {
+                    rebuilt.seed_hash_callsign(&call);
+                }
+                rebuilt.set_hound_foxes(&["KH1/KH7Z".into()]);
+                let frames = receive(&mut rebuilt, &REPORT, 600.0);
+                let frame = frames
+                    .iter()
+                    .find(|m| m.message.dxpedition.is_some())
+                    .unwrap();
+                assert_eq!(deliver(&manager, frame, 14_074_000, "W9XYZ").await, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dxpedition_independent_audio_reaches_hound_qso_and_completes_once_without_73() {
+        for (call, report_payload, close_payload) in
+            [("W9XYZ", REPORT, CLOSE), ("K1ABC", CLOSE, REPORT)]
+        {
+            let manager = QsoManager::new(QsoManagerConfig {
+                our_callsign: call.into(),
+                our_grid: Some("EN50".into()),
+                ..Default::default()
+            });
+            let mut rx = manager.subscribe();
+            let id = manager
+                .engage_hound(
+                    "KH1/KH7Z",
+                    600.0,
+                    None,
+                    Some(pancetta_core::slot::SlotParity::Even),
+                )
+                .await
+                .unwrap();
+            let opening = events(&mut rx);
+            assert!(opening.iter().any(|e| matches!(e,
+            QsoEvent::MessageToSend { frequency, .. } if (1000.0..=2700.0).contains(frequency))));
+            let mut decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+            decoder.set_hound_foxes(&manager.active_hound_foxes().await);
+            let frames = receive(&mut decoder, &report_payload, 600.0);
+            let fox_frames: Vec<_> = frames
+                .iter()
+                .filter(|m| m.message.dxpedition.is_some())
+                .collect();
+            assert_eq!(fox_frames.len(), 1, "one physical relay/display row");
+            let frame = fox_frames[0];
+            assert_eq!(deliver(&manager, frame, 7_074_000, call).await, 0);
+            assert!(events(&mut rx).is_empty());
+            assert!(!manager.get_qso(id).await.unwrap().metadata.hound_qsyed);
+            assert_eq!(deliver(&manager, frame, 14_074_000, call).await, 2);
+            let reports = events(&mut rx);
+            assert!(reports.iter().any(|e| matches!(e,
+            QsoEvent::MessageToSend { frequency, message: pancetta_qso::MessageType::ReportAck { .. }, .. }
+            if *frequency == frame.frequency_offset)));
+            assert_eq!(
+                manager.get_qso(id).await.unwrap().metadata.frequency,
+                frame.frequency_offset
+            );
+            assert_eq!(
+                manager.get_active_qsos().await.len(),
+                1,
+                "no sibling QSO for the other Hound"
+            );
+
+            // A later stream >100 Hz away must survive the production receiver.
+            let moved = receive(&mut decoder, &report_payload, 780.0);
+            let moved = moved
+                .iter()
+                .find(|m| m.message.dxpedition.is_some())
+                .unwrap();
+            deliver(&manager, moved, 14_074_000, call).await;
+            assert_eq!(
+                manager.get_qso(id).await.unwrap().metadata.frequency,
+                moved.frequency_offset
+            );
+            events(&mut rx);
+            let closed = receive(&mut decoder, &close_payload, 780.0);
+            let closed = closed
+                .iter()
+                .find(|m| m.message.dxpedition.is_some())
+                .unwrap();
+            deliver(&manager, closed, 14_074_000, call).await;
+            deliver(&manager, closed, 14_074_000, call).await;
+            let completed = events(&mut rx);
+            assert_eq!(
+                completed
+                    .iter()
+                    .filter(|e| matches!(e, QsoEvent::QsoCompleted { .. }))
+                    .count(),
+                1
+            );
+            assert!(!completed
+                .iter()
+                .any(|e| matches!(e, QsoEvent::MessageToSend { .. })));
+            assert!(matches!(
+                manager.get_qso(id).await.unwrap().state,
+                QsoState::Completed { .. }
+            ));
         }
     }
 }
