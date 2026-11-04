@@ -16643,7 +16643,6 @@ mod pan120_tests {
     }
 }
 
-<<<<<<< HEAD
 /// Attach history only after its dated all-band read succeeds. Keep the manager's broadcaster.
 async fn initialize_qso_history(
     manager: &mut pancetta_qso::QsoManager,
@@ -16795,7 +16794,9 @@ mod pan260 {
             early_subscription.try_recv().is_ok(),
             "history attachment preserves early subscriptions"
         );
-=======
+    }
+}
+
 #[cfg(test)]
 mod dxpedition_receive_integration_tests {
     use super::*;
@@ -16999,6 +17000,5 @@ mod dxpedition_receive_integration_tests {
                 QsoState::Completed { .. }
             ));
         }
->>>>>>> 5d8064b14264829f9cc17fda2767cde3572b7df0
     }
 }

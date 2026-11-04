@@ -7808,7 +7808,12 @@ impl QsoManager {
         }
         let rf = self.current_rf_frequency(frequency);
         let band = Some(crate::utils::frequency_to_band(rf)).filter(|b| !b.ends_with("MHZ"));
-        if config.check_frequency && band.is_none() {
+        // Standalone memory-only managers may have no rig source. Keep their
+        // unknown-band history in memory; persistent checks require a real band.
+        if config.check_frequency
+            && band.is_none()
+            && (self.require_database || self.database.is_some())
+        {
             return Err(unavailable("TX band is unknown"));
         }
         let band = band.map(|b| b.to_uppercase());
@@ -27644,6 +27649,30 @@ mod pan138_outcome_tests {
 #[cfg(test)]
 mod pan260 {
     use super::*;
+
+    #[tokio::test]
+    async fn standalone_memory_only_admission_does_not_require_a_rig_band() {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq("K1ABC".into(), 1200.0, None)
+            .await
+            .expect("standalone memory-only admission");
+        assert!(
+            manager.check_duplicate("K1ABC", 1800.0).await.unwrap(),
+            "the active exchange remains reserved at another offset"
+        );
+        manager.cancel_qso(id).await.unwrap();
+
+        // Persistent-history operation still refuses an unknown TX band.
+        manager.attach_database(Arc::new(QsoDatabase::new_in_memory().await.unwrap()));
+        assert!(manager
+            .respond_to_cq("K1ABC".into(), 1800.0, None)
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn completed_history_survives_offsets_bands_restart_and_cleanup() {
