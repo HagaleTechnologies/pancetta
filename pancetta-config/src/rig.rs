@@ -691,6 +691,10 @@ pub struct PowerProtectionConfig {
     /// Halt when a reading is above this. Must be finite and above 1.0 while swr_protection is on.
     pub max_swr: f32,
 
+    /// PAN-262: how long SWR must stay above max_swr while keyed before TX halts, so an
+    /// antenna tuner can settle after key-down. 0 trips on the first reading. At most 30000.
+    pub swr_trip_delay_ms: u32,
+
     /// Temperature protection
     pub temperature_protection: bool,
 
@@ -997,12 +1001,19 @@ impl Default for PowerRampingConfig {
     }
 }
 
+/// PAN-262: default time SWR must stay high before TX halts.
+pub const DEFAULT_SWR_TRIP_DELAY_MS: u32 = 5_000;
+
+/// PAN-262: longest allowed SWR trip delay.
+pub const MAX_SWR_TRIP_DELAY_MS: u32 = 30_000;
+
 impl Default for PowerProtectionConfig {
     fn default() -> Self {
         Self {
             max_power_watts: 100,
             swr_protection: true,
             max_swr: 3.0,
+            swr_trip_delay_ms: DEFAULT_SWR_TRIP_DELAY_MS,
             temperature_protection: true,
             max_temperature_c: 80.0,
         }
@@ -1155,6 +1166,15 @@ impl ConfigSection for RigConfig {
                 value: format!(
                     "{} (must be a number above 1.0 while swr_protection = true)",
                     protection.max_swr
+                ),
+            });
+        }
+        if protection.swr_trip_delay_ms > MAX_SWR_TRIP_DELAY_MS {
+            return Err(ConfigError::InvalidValue {
+                field: "power_control.protection.swr_trip_delay_ms".to_string(),
+                value: format!(
+                    "{} (must be 0 to {MAX_SWR_TRIP_DELAY_MS})",
+                    protection.swr_trip_delay_ms
                 ),
             });
         }
@@ -1359,6 +1379,29 @@ mod tests {
         let cfg: RigConfig = toml::from_str("[power_control.protection]\nmax_swr = 2.0\n").unwrap();
         assert!(cfg.power_control.protection.swr_protection);
         assert_eq!(cfg.power_control.protection.max_swr, 2.0);
+        assert_eq!(
+            cfg.power_control.protection.swr_trip_delay_ms,
+            DEFAULT_SWR_TRIP_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn swr_trip_delay_accepts_zero_to_thirty_seconds() {
+        let mut cfg = RigConfig::default();
+        assert_eq!(cfg.power_control.protection.swr_trip_delay_ms, 5_000);
+        for ok in [0, 2_000, MAX_SWR_TRIP_DELAY_MS] {
+            cfg.power_control.protection.swr_trip_delay_ms = ok;
+            assert!(cfg.validate_section().is_ok(), "{ok}");
+        }
+        cfg.power_control.protection.swr_trip_delay_ms = MAX_SWR_TRIP_DELAY_MS + 1;
+        let err = cfg.validate_section().unwrap_err().to_string();
+        assert!(
+            err.contains("power_control.protection.swr_trip_delay_ms"),
+            "{err}"
+        );
+        let parsed: RigConfig =
+            toml::from_str("[power_control.protection]\nswr_trip_delay_ms = 2000\n").unwrap();
+        assert_eq!(parsed.power_control.protection.swr_trip_delay_ms, 2_000);
     }
 
     #[test]

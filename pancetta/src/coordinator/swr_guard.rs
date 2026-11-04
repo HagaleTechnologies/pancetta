@@ -1,8 +1,10 @@
 //! PAN-251 SWR protection. While the rig is keyed the Hamlib poll loop reads
-//! the SWR meter every tick. One valid reading above `max_swr` halts the
-//! station (see `tx_halt`). A rig that cannot report SWR is warned about,
-//! never blocked. SWR is only measurable under forward power, so the trip
-//! latches in `TxPolicy::Disabled` until the operator presses `g`.
+//! the SWR meter every tick. Valid readings that stay above `max_swr` for
+//! `swr_trip_delay_ms` (PAN-262: lets an antenna tuner settle after
+//! key-down) halt the station (see `tx_halt`). A rig that cannot report SWR
+//! is warned about, never blocked. SWR is only measurable under forward
+//! power, so the trip latches in `TxPolicy::Disabled` until the operator
+//! presses `g`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,10 +17,6 @@ use crate::message_bus::{
     ComponentId, ComponentMessage, DurableDelivery, MessageBus, MessageType, SendIfOutcome,
 };
 
-/// Valid readings above the limit, in a row, that trip the halt. One, as
-/// the ticket's scenario reads; the real-rig step may raise it if key-down
-/// transients spike on a good load.
-pub(crate) const SWR_TRIP_CONSECUTIVE_READINGS: u32 = 1;
 /// Keyed poll ticks (500 ms each) with no valid reading before the
 /// runtime "unavailable" alert.
 pub(crate) const SWR_UNAVAILABLE_MIN_ATTEMPTS: u32 = 4;
@@ -78,7 +76,11 @@ pub(crate) struct SwrGuard {
     /// A keyed episode is open.
     keyed: bool,
     tripped: bool,
-    high_in_a_row: u32,
+    /// PAN-262: how long valid readings must stay above `max_swr`.
+    trip_delay: Duration,
+    /// When the current run of high valid readings began. A valid reading
+    /// at or below the limit clears it; a missing reading leaves it alone.
+    high_since: Option<Instant>,
     /// Keyed ticks in this episode.
     attempts: u32,
     /// Valid readings in this episode.
@@ -110,7 +112,12 @@ impl SwrGuard {
             capability_checked: false,
             keyed: false,
             tripped: false,
-            high_in_a_row: 0,
+            trip_delay: Duration::from_millis(u64::from(
+                protection
+                    .swr_trip_delay_ms
+                    .min(pancetta_config::MAX_SWR_TRIP_DELAY_MS),
+            )),
+            high_since: None,
             attempts: 0,
             valid: 0,
             unavailable_reported: false,
@@ -137,6 +144,16 @@ impl SwrGuard {
 
     /// One poll tick. `reading` is `Some` only for a valid reading.
     pub(crate) fn observe(&mut self, keyed: bool, reading: Option<f32>) -> SwrAction {
+        self.observe_at(keyed, reading, Instant::now())
+    }
+
+    /// [`Self::observe`] with an explicit clock, for tests.
+    pub(crate) fn observe_at(
+        &mut self,
+        keyed: bool,
+        reading: Option<f32>,
+        now: Instant,
+    ) -> SwrAction {
         if !keyed {
             let mut action = SwrAction::None;
             if self.keyed {
@@ -154,7 +171,7 @@ impl SwrGuard {
             }
             self.keyed = false;
             self.tripped = false;
-            self.high_in_a_row = 0;
+            self.high_since = None;
             self.attempts = 0;
             self.valid = 0;
             return action;
@@ -173,8 +190,8 @@ impl SwrGuard {
         }
         match reading {
             Some(swr) if swr > self.max_swr => {
-                self.high_in_a_row = self.high_in_a_row.saturating_add(1);
-                if self.high_in_a_row >= SWR_TRIP_CONSECUTIVE_READINGS {
+                let since = *self.high_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= self.trip_delay {
                     self.tripped = true;
                     return SwrAction::Trip {
                         swr,
@@ -182,7 +199,8 @@ impl SwrGuard {
                     };
                 }
             }
-            _ => self.high_in_a_row = 0,
+            Some(_) => self.high_since = None,
+            None => {}
         }
         SwrAction::None
     }
@@ -390,8 +408,112 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize};
     use std::sync::Arc;
 
+    /// A guard that trips on the first high reading (delay 0), for the
+    /// state-machine tests that predate PAN-262's settle delay.
     fn guard(real_rig: bool) -> SwrGuard {
-        SwrGuard::new(&PowerProtectionConfig::default(), real_rig)
+        let protection = PowerProtectionConfig {
+            swr_trip_delay_ms: 0,
+            ..Default::default()
+        };
+        SwrGuard::new(&protection, real_rig)
+    }
+
+    fn ms(t0: Instant, millis: u64) -> Instant {
+        t0 + Duration::from_millis(millis)
+    }
+
+    // ---- PAN-262: tuner settle delay ----
+
+    #[test]
+    fn high_swr_while_the_tuner_settles_does_not_trip() {
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        // 6.0:1 for three seconds of 500 ms ticks, then a good match.
+        for tick in 0..6 {
+            assert_eq!(
+                g.observe_at(true, Some(6.0), ms(t0, tick * 500)),
+                SwrAction::None,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            g.observe_at(true, Some(1.4), ms(t0, 3_000)),
+            SwrAction::None
+        );
+        // A later high reading starts a fresh window.
+        assert_eq!(
+            g.observe_at(true, Some(6.0), ms(t0, 3_500)),
+            SwrAction::None
+        );
+        assert_eq!(
+            g.observe_at(true, Some(6.0), ms(t0, 8_000)),
+            SwrAction::None
+        );
+    }
+
+    #[test]
+    fn sustained_high_swr_trips_after_the_default_delay() {
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        for tick in 0..10 {
+            assert_eq!(
+                g.observe_at(true, Some(4.2), ms(t0, tick * 500)),
+                SwrAction::None,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(g.observe_at(true, Some(4.2), ms(t0, 5_000)), trip_at(4.2));
+        assert_eq!(
+            g.observe_at(true, Some(1.2), ms(t0, 5_500)),
+            SwrAction::ReassertUnkey
+        );
+    }
+
+    #[test]
+    fn missing_readings_neither_reset_nor_extend_the_window() {
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        assert_eq!(g.observe_at(true, Some(4.2), t0), SwrAction::None);
+        for tick in 1..10 {
+            assert_eq!(
+                g.observe_at(true, None, ms(t0, tick * 500)),
+                SwrAction::None
+            );
+        }
+        assert_eq!(g.observe_at(true, Some(4.2), ms(t0, 5_000)), trip_at(4.2));
+    }
+
+    #[test]
+    fn the_trip_delay_is_configurable() {
+        let protection = PowerProtectionConfig {
+            swr_trip_delay_ms: 2_000,
+            ..Default::default()
+        };
+        let mut g = SwrGuard::new(&protection, true);
+        let t0 = Instant::now();
+        assert_eq!(g.observe_at(true, Some(4.2), t0), SwrAction::None);
+        assert_eq!(
+            g.observe_at(true, Some(4.2), ms(t0, 1_500)),
+            SwrAction::None
+        );
+        assert_eq!(g.observe_at(true, Some(4.2), ms(t0, 2_000)), trip_at(4.2));
+    }
+
+    #[test]
+    fn unkeying_clears_the_high_swr_window() {
+        let mut g = SwrGuard::new(&PowerProtectionConfig::default(), true);
+        let t0 = Instant::now();
+        assert_eq!(g.observe_at(true, Some(4.2), t0), SwrAction::None);
+        assert_eq!(g.observe_at(false, None, ms(t0, 4_000)), SwrAction::None);
+        assert_eq!(
+            g.observe_at(true, Some(4.2), ms(t0, 4_500)),
+            SwrAction::None
+        );
+        assert_eq!(
+            g.observe_at(true, Some(4.2), ms(t0, 9_000)),
+            SwrAction::None
+        );
+        assert_eq!(g.observe_at(true, Some(4.2), ms(t0, 9_500)), trip_at(4.2));
     }
 
     fn trip_at(swr: f32) -> SwrAction {
@@ -536,6 +658,7 @@ mod tests {
     fn an_invalid_in_code_threshold_falls_back_to_three() {
         let protection = PowerProtectionConfig {
             max_swr: f32::NAN,
+            swr_trip_delay_ms: 0,
             ..Default::default()
         };
         let mut g = SwrGuard::new(&protection, true);

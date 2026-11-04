@@ -532,6 +532,7 @@ max_power_watts = 100
 max_swr = 3.0
 max_temperature_c = 80.0
 swr_protection = true
+swr_trip_delay_ms = 5000
 temperature_protection = true
 
 [rig.power_control.ramping]

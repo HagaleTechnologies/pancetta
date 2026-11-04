@@ -9613,7 +9613,10 @@ mod pan251_swr_protection_tests {
         tui: crossbeam_channel::Receiver<ComponentMessage>,
     }
 
-    async fn start(config: Config) -> Started {
+    async fn start(mut config: Config) -> Started {
+        // PAN-262: these tests check the halt path, not the tuner-settle delay
+        // (covered in swr_guard's unit tests), so trip on the first reading.
+        config.rig.power_control.protection.swr_trip_delay_ms = 0;
         let mut coordinator = test_coordinator(config).await;
         let rig = high_swr_rig();
         coordinator.test_mock_rig = Some(rig.clone());
