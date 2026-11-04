@@ -4,12 +4,26 @@
   KeepAlive restarts pancetta automatically if it exits or crashes (including a
   native ft8_lib C abort that no Rust panic handler can catch).
 
-  Install (per-user LaunchAgent):
-    cp packaging/launchd/net.hagale.pancetta.plist ~/Library/LaunchAgents/
-    # edit the ProgramArguments path to your built binary
-    launchctl load -w ~/Library/LaunchAgents/net.hagale.pancetta.plist
-    # logs: tail -f ~/.pancetta/launchd.{out,err}.log
-    # stop: launchctl unload ~/Library/LaunchAgents/net.hagale.pancetta.plist
+  Install (per-user LaunchAgent), run from the repository root:
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.pancetta/logs"
+    cp packaging/launchd/net.hagale.pancetta.plist "$HOME/Library/LaunchAgents/"
+    # Edit the installed copy before loading it:
+    # set ProgramArguments[0] to the absolute path of your pancetta binary;
+    # replace /Users/YOURNAME in BOTH log paths with your absolute home directory.
+    # Use the actual path, not ~ or $HOME inside the plist.
+    "${EDITOR:-vi}" "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    plutil -lint "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    launchctl load -w "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    # logs: tail -f "$HOME/.pancetta/logs/launchd.out.log" "$HOME/.pancetta/logs/launchd.err.log"
+    # stop: launchctl unload "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+
+  Upgrading an existing installation: launchctl unload the agent first (during a
+  safe idle interval), repeat the install sequence above, and reapply your
+  binary-path customization to the new copy. Old /tmp/pancetta.launchd.*.log
+  files are not moved automatically; copy them out if you still need them.
+  The log files above live in your home directory, so they survive a reboot;
+  a per-user LaunchAgent resumes after user login following a reboot. These two
+  supervisor files are not rotated.
 
   Pancetta runs headless under a supervisor (no TUI).
 -->
@@ -33,8 +47,8 @@
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/tmp/pancetta.launchd.out.log</string>
+    <string>/Users/YOURNAME/.pancetta/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/pancetta.launchd.err.log</string>
+    <string>/Users/YOURNAME/.pancetta/logs/launchd.err.log</string>
 </dict>
 </plist>

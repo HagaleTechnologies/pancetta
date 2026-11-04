@@ -48,7 +48,32 @@ Ship-provided units (edit the binary path inside each):
   `RestartSec=2`, crash-loop rate limit. Install as a `--user` service and
   `loginctl enable-linger`. Watch with `journalctl --user -u pancetta -f`.
 - **macOS:** `packaging/launchd/net.hagale.pancetta.plist` — `KeepAlive` with a
-  `ThrottleInterval`. Install in `~/Library/LaunchAgents`.
+  `ThrottleInterval`. The supervisor's stdout and stderr go to
+  `~/.pancetta/logs/launchd.out.log` and `~/.pancetta/logs/launchd.err.log`,
+  which live in your home directory and so survive a reboot. Install from the
+  repository root:
+
+    ```bash
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.pancetta/logs"
+    cp packaging/launchd/net.hagale.pancetta.plist "$HOME/Library/LaunchAgents/"
+    # Edit the installed copy before loading it:
+    # set ProgramArguments[0] to the absolute path of your pancetta binary;
+    # replace /Users/YOURNAME in BOTH log paths with your absolute home directory.
+    # Use the actual path, not ~ or $HOME inside the plist.
+    "${EDITOR:-vi}" "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    plutil -lint "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    launchctl load -w "$HOME/Library/LaunchAgents/net.hagale.pancetta.plist"
+    tail -f "$HOME/.pancetta/logs/launchd.out.log" "$HOME/.pancetta/logs/launchd.err.log"
+    ```
+
+  Upgrading an existing installation: `launchctl unload` the agent during a safe
+  idle interval, repeat the sequence above, and reapply your binary-path
+  customization to the new copy — the installed plist is a copy, so it keeps
+  the old `/tmp` log paths until you replace it (launchd does not expand `~`,
+  and old `/tmp` logs are not moved automatically; copy any you still need).
+  A per-user LaunchAgent resumes after user login following a reboot. The two
+  supervisor log files are **not** rotated; the 14-file retention below applies
+  only to the daily application logs (`pancetta.log.*`).
 - **Windows:** wrap `pancetta.exe --headless` with
   [NSSM](https://nssm.cc/) (`nssm install Pancetta …`, set *Exit actions →
   Restart*) or a Task Scheduler task with trigger *At startup* and
@@ -270,7 +295,10 @@ operator-supervised.
   ```bash
   grep -E "WARN|ERROR" ~/.pancetta/logs/pancetta.log.$(date -u +%Y-%m-%d) | head -50
   ```
-  Logs rotate daily (UTC) and pancetta keeps the newest 14 files.
+  Logs rotate daily (UTC) and pancetta keeps the newest 14 files — this
+  retention applies only to the daily application logs (`pancetta.log.*`),
+  not to the unrotated launchd supervisor files (`launchd.out.log`,
+  `launchd.err.log`) that may sit in the same directory.
 - Confirm completed QSOs landed in ADIF:
   ```bash
   grep -c "<eor>" ~/.pancetta/qsos.adi
