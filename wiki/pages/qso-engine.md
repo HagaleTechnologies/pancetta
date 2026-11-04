@@ -82,3 +82,7 @@ the half-duplex [[parity-rule]] and the [[tx-scheduling]] gate.
   `first_dx_report_grants_exactly_one_expired_watchdog_reprieve`, and
   `a_repeated_dx_report_is_still_not_forward_progress` cover this distinction
   in `pancetta-qso/src/qso_manager.rs`.
+
+## Persistent duplicate history (PAN-260)
+
+Autonomous admission checks the ADIF-derived index and completed session history by callsign and band within the configured rolling window. Audio offsets do not define duplicate identity. Production requires readable history; errors refuse automatic calls while manual calls remain available. Live and replay startup seed dated worked history for all bands before readiness. The display and ranking keep all-time worked status even outside the admission window. Replay builds its index in memory and does not write the real log directory.

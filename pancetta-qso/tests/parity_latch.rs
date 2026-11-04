@@ -8,11 +8,14 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 #[tokio::test]
 async fn respond_to_cq_latches_opposite_parity() {
-    let mgr = QsoManager::new(QsoManagerConfig {
+    let mut mgr = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".to_string(),
         our_grid: Some("EM10".to_string()),
         ..Default::default()
     });
+    mgr.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
     mgr.start().await.expect("start");
 
     let mut rx = mgr.subscribe();
@@ -56,11 +59,14 @@ async fn respond_to_cq_with_no_dx_parity_latches_provisional_parity() {
     // the first real decode from the partner can refine it — see
     // `qso_manager::tests` for the refinement tests), instead of leaving it
     // `None` forever.
-    let mgr = QsoManager::new(QsoManagerConfig {
+    let mut mgr = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".to_string(),
         our_grid: Some("EM10".to_string()),
         ..Default::default()
     });
+    mgr.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
     mgr.start().await.expect("start");
 
     let qso_id = mgr
@@ -88,11 +94,14 @@ async fn respond_to_cq_with_no_dx_parity_latches_provisional_parity() {
 /// state chain.
 #[tokio::test]
 async fn four_message_qso_parity_latch_holds() {
-    let mgr = QsoManager::new(QsoManagerConfig {
+    let mut mgr = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".to_string(),
         our_grid: Some("EM10".to_string()),
         ..Default::default()
     });
+    mgr.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
     mgr.start().await.expect("start");
 
     let mut rx = mgr.subscribe();

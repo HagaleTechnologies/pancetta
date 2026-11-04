@@ -6688,7 +6688,14 @@ mod tui_relay_tests {
     fn worked_before_matches_scorer_duplicate_semantics() {
         use pancetta_qso::priority::WorkedStationLookup;
         let lookup = crate::priority_evaluator::CachedStationLookup::new();
-        lookup.record_worked("ja1abc", "20m"); // lowercase in, uppercased internally
+        lookup.seed_dated_worked(vec![
+            (
+                "20m".into(),
+                "ja1abc".into(),
+                chrono::Utc::now() - chrono::Duration::days(90),
+            ),
+            ("40m".into(), "JA1XYZ".into(), chrono::Utc::now()),
+        ]);
 
         let cases = [
             ("JA1ABC", 14_074_000.0),   // worked, same band → true
@@ -6696,8 +6703,21 @@ mod tui_relay_tests {
             ("JA1ABC", 7_074_000.0),    // other band → false (band-scoped)
             ("JA1ABC/P", 14_074_000.0), // suffix NOT stripped → false (matches scorer)
             ("DL5XYZ", 14_074_000.0),   // never worked → false
+            ("JA1XYZ", 7_074_000.0),
+            ("JA1XYZ", 14_074_000.0),
         ];
+        let scorer = pancetta_qso::priority::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
         for (call, freq) in cases {
+            assert_eq!(
+                worked_before_for(&lookup, Some(call), freq),
+                scorer
+                    .score_tiered_explained(call, None, -10, freq)
+                    .factors
+                    .worked_on_band
+            );
             assert_eq!(
                 worked_before_for(&lookup, Some(call), freq),
                 lookup.is_duplicate(call, freq),

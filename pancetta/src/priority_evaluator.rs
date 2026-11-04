@@ -171,8 +171,8 @@ impl NeedList {
 #[derive(Debug, Clone)]
 pub struct CachedStationLookup {
     /// Callsigns worked per band.  Key = uppercase band name (e.g. "20M"),
-    /// value = set of uppercased callsigns worked on that band.
-    worked_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// value = latest contact start date per resolved uppercase callsign.
+    worked_on_band: Arc<RwLock<HashMap<String, HashMap<String, DateTime<Utc>>>>>,
     /// DXCC entities worked per band, derived locally from `worked_on_band`
     /// via the offline prefix→entity resolver (`pancetta_tui::dxcc`) — no
     /// cqdx dependency. Key = uppercase band name, value = set of resolved
@@ -298,16 +298,29 @@ impl CachedStationLookup {
     /// (e.g. from the QSO database at startup).  Both the band key and callsigns
     /// are uppercased for consistent comparison.
     pub fn seed_worked_from_list(&self, band: &str, callsigns: Vec<String>) {
-        let mut map = self.worked_on_band.write();
-        let set = map.entry(band.to_uppercase()).or_default();
-        for call in callsigns {
-            set.insert(call.to_uppercase());
-        }
-        tracing::info!(
-            "CachedStationLookup: seeded {} worked station(s) on {} from QSO database",
-            set.len(),
-            band
+        self.seed_dated_worked(
+            callsigns
+                .into_iter()
+                .map(|c| (band.to_string(), c, Utc::now()))
+                .collect(),
         );
+    }
+
+    /// Merge dated history for all bands. Dates never expire the worked-before display.
+    pub fn seed_dated_worked(&self, rows: Vec<(String, String, DateTime<Utc>)>) {
+        for (band, call, date) in rows {
+            self.record_worked_at(&call, &band, date);
+        }
+    }
+
+    /// A failed read leaves the previous successfully seeded cache intact.
+    pub async fn seed_worked_history(
+        &self,
+        db: &pancetta_qso::async_database::QsoDatabase,
+    ) -> Result<(), pancetta_qso::async_database::AsyncDatabaseError> {
+        let rows = db.worked_history().await?;
+        self.seed_dated_worked(rows);
+        Ok(())
     }
 
     /// Seed `worked_dxcc_on_band` from every (band, callsign) pair ever
@@ -324,7 +337,7 @@ impl CachedStationLookup {
         for (band, callsign) in pairs {
             match pancetta_tui::dxcc::entity_for_callsign(&callsign) {
                 Some(entity) => {
-                    map.entry(band.to_uppercase())
+                    map.entry(band.trim().to_uppercase())
                         .or_default()
                         .insert(entity.to_string());
                     resolved += 1;
@@ -353,7 +366,9 @@ impl CachedStationLookup {
                 continue;
             }
             let field = trimmed[..4].to_uppercase();
-            map.entry(band.to_uppercase()).or_default().insert(field);
+            map.entry(band.trim().to_uppercase())
+                .or_default()
+                .insert(field);
             inserted += 1;
         }
         tracing::info!(
@@ -452,7 +467,7 @@ impl CachedStationLookup {
             return;
         };
         let band = pancetta_qso::utils::frequency_to_band(metadata.frequency);
-        self.record_worked(call, &band);
+        self.record_worked_at(call, &band, metadata.start_time);
         if let Some(grid) = metadata.grids.theirs.as_deref() {
             self.record_worked_grid(grid, &band);
         }
@@ -678,6 +693,10 @@ impl CachedStationLookup {
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
+        self.record_worked_at(callsign, band, Utc::now());
+    }
+
+    fn record_worked_at(&self, callsign: &str, band: &str, date: DateTime<Utc>) {
         // PAN-58 round 1 (Codex P1): canonicalize on write, matching
         // `is_duplicate`'s resolved-form read — otherwise a QSO completed
         // with a hash-rendered identity is stored under a key later lookups
@@ -689,16 +708,18 @@ impl CachedStationLookup {
         };
         self.worked_on_band
             .write()
-            .entry(band.to_uppercase())
+            .entry(band.trim().to_uppercase())
             .or_default()
-            .insert(upper.clone());
+            .entry(upper.clone())
+            .and_modify(|old| *old = (*old).max(date))
+            .or_insert(date);
         // Keep worked_dxcc_on_band live-updated as QSOs complete during the
         // session, not just at startup seeding — same resolver, same
         // skip-if-unresolvable behavior as seed_worked_dxcc_from_list.
         if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) {
             self.worked_dxcc_on_band
                 .write()
-                .entry(band.to_uppercase())
+                .entry(band.trim().to_uppercase())
                 .or_default()
                 .insert(entity.to_string());
         }
@@ -714,7 +735,7 @@ impl CachedStationLookup {
         let field = trimmed[..4].to_uppercase();
         self.worked_grids_on_band
             .write()
-            .entry(band.to_uppercase())
+            .entry(band.trim().to_uppercase())
             .or_default()
             .insert(field);
     }
@@ -785,7 +806,9 @@ impl WorkedStationLookup for CachedStationLookup {
         };
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
         let worked = self.worked_on_band.read();
-        worked.get(&band).is_some_and(|set| set.contains(&upper))
+        worked
+            .get(&band)
+            .is_some_and(|set| set.contains_key(&upper))
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
@@ -2050,5 +2073,48 @@ mod tests {
         l.record_state("<...>", "AR");
         assert_eq!(l.state_for("<...>"), None);
         assert!(l.station_states.read().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pan260 {
+    use super::*;
+    #[tokio::test]
+    async fn dated_all_band_history_preserves_latest_and_survives_failed_refresh() {
+        let l = CachedStationLookup::new();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(90);
+        l.seed_dated_worked(vec![
+            ("40m".into(), "ja1xyz".into(), old),
+            ("20m".into(), "k1abc".into(), now),
+        ]);
+        assert!(l.is_duplicate("JA1XYZ", 7_074_000.0));
+        assert!(!l.is_duplicate("JA1XYZ", 14_074_000.0));
+        assert!(l.is_duplicate("K1ABC", 14_074_000.0));
+        l.seed_dated_worked(vec![("20M".into(), "K1ABC".into(), old)]);
+        assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], now);
+        l.record_worked_at("<K1ABC>", "20m", old);
+        assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], now);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 14_074_000.0, None)
+            .await
+            .unwrap();
+        let mut metadata = manager.get_qso(id).await.unwrap().metadata;
+        metadata.start_time = old;
+        l.record_completed_contact(&metadata);
+        assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], now);
+        metadata.start_time = now + chrono::Duration::seconds(1);
+        l.record_completed_contact(&metadata);
+        assert_eq!(l.worked_on_band.read()["20M"]["K1ABC"], metadata.start_time);
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        db.close().await;
+        assert!(l.seed_worked_history(&db).await.is_err());
+        assert!(l.is_duplicate("JA1XYZ", 7_074_000.0));
     }
 }

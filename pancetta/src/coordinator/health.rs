@@ -1516,7 +1516,17 @@ mod supervisor_tests {
         // whatever `QsoManager` is running inside the (about to be killed)
         // Qso-component task -- inserting an active QSO through it is
         // equivalent to the real task having opened one.
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // This read-only production handle initiates calls only in this fixture.
+        // Supply the history and RF context required of an admission-capable manager.
+        manager.attach_database(std::sync::Arc::new(
+            pancetta_qso::async_database::QsoDatabase::new_in_memory()
+                .await
+                .unwrap(),
+        ));
+        manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            14_074_000,
+        )));
         let qso_id = manager
             .respond_to_cq("K1ABC".to_string(), 1500.0, None)
             .await
@@ -1581,7 +1591,17 @@ mod supervisor_tests {
         if matches!(component, ComponentId::Dsp | ComponentId::Ft8Decoder) {
             coordinator.init_decode_handles();
         }
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // This read-only production handle initiates calls only in this fixture.
+        // Supply the history and RF context required of an admission-capable manager.
+        manager.attach_database(std::sync::Arc::new(
+            pancetta_qso::async_database::QsoDatabase::new_in_memory()
+                .await
+                .unwrap(),
+        ));
+        manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            14_074_000,
+        )));
         let qso_id = manager
             .respond_to_cq("K1ABC".to_string(), 1500.0, None)
             .await
@@ -1693,7 +1713,17 @@ mod supervisor_tests {
 
         coordinator.start_qso_component().await.unwrap();
 
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // This read-only production handle initiates calls only in this fixture.
+        // Supply the history and RF context required of an admission-capable manager.
+        manager.attach_database(std::sync::Arc::new(
+            pancetta_qso::async_database::QsoDatabase::new_in_memory()
+                .await
+                .unwrap(),
+        ));
+        manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            14_074_000,
+        )));
 
         async fn poll_for(
             rx: &crossbeam_channel::Receiver<ComponentMessage>,

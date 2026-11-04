@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- PAN-260: Preserve autonomous duplicate protection across restarts and audio-offset changes. Load dated worked history for every band so band switches show and rank prior contacts correctly. Refuse automatic calls when required history is unavailable.
 - Remote clients can no longer retune the rig while it transmits, or move a local or autonomous QSO; the client receives an error saying why (PAN-252).
 
 

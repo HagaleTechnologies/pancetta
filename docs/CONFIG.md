@@ -485,27 +485,10 @@ Defaults for all three live in `Config::default()`; see
 [duplicate_checking]
 enabled = true
 time_window_hours = 24
-check_frequency = true
+check_frequency = true # Same band, regardless of audio offset or dial movement within that band
 ```
 
-The duplicate check is what makes Space-to-call return `Call X failed:
-duplicate QSO ...` for stations you've already worked. With the default
-`check_frequency = true`, a prior QSO only blocks a re-call when it was
-within 50 Hz of the same RF frequency — so the same station on a
-different band can be worked again. Set `check_frequency = false` for
-strict one-QSO-per-callsign inside the window, or `enabled = false` to
-turn duplicate checking off entirely.
-
-`time_window_hours` is a rolling window from each prior QSO's start
-time (not a UTC-day boundary): a QSO started 23 hours ago still blocks;
-one started 25 hours ago does not.
-
-Note: this 50 Hz frequency scoping applies to the in-memory recent-QSO
-check. The persistent-database fallback (used after a restart, once a
-completed QSO has aged out of memory) always frequency-scopes at a
-wider ±100 Hz regardless of `check_frequency` — a corner case, not
-something an operator normally needs to think about, but noted here
-for completeness.
+Duplicate checking blocks autonomous calls to a callsign worked within the rolling window. With `check_frequency = true`, a prior contact blocks another call on the same band, regardless of audio offset. With `check_frequency = false`, a prior contact blocks another call on any band. Manual calls remain an explicit operator choice and bypass this duplicate gate. `enabled = false` disables the gate. A zero-hour window blocks no calls. The window uses the contact's start time and applies equally to memory and the persistent log index. If duplicate checking is enabled and required history cannot be read, autonomous calls are refused until history is available.
 
 ---
 

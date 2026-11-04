@@ -373,6 +373,9 @@ async fn denied_new_close_step_open_creates_no_qso_and_no_false_completion() {
 #[tokio::test]
 async fn denied_close_step_open_never_supersedes_an_unrelated_active_qso() {
     let mut manager = QsoManager::new(config());
+    manager.set_dial_frequency_source(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        14_074_000,
+    )));
     manager.set_remote_tx_permitted_source(std::sync::Arc::new(|_: Option<&str>| false));
     let mut rx = manager.subscribe();
 
