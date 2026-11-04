@@ -1548,6 +1548,18 @@ impl AutonomousOperator {
         evaluator: &dyn DxEvaluator,
         now: DateTime<Utc>,
     ) {
+        self.feed_decoded_messages_on_dial_at(messages, evaluator, 0, now);
+    }
+
+    /// Feed a slot with a live RF dial fallback for decodes without a captured dial.
+    /// Zero means unknown; audio offsets remain reserved for frequency allocation.
+    pub fn feed_decoded_messages_on_dial_at(
+        &mut self,
+        messages: &[DecodedMessageInfo],
+        evaluator: &dyn DxEvaluator,
+        live_dial_hz: u64,
+        now: DateTime<Utc>,
+    ) {
         // Auto-parity detection. FQ-F2: stamp each message's activity under
         // its OWN decoded slot parity (`m.slot_parity`) rather than the
         // wall-clock parity at feed time — a decode completed just before a
@@ -1668,7 +1680,17 @@ impl AutonomousOperator {
 
                     let grid = extract_grid_from_cq(&msg.message_text);
                     let snr = msg.snr.clamp(-128, 127) as i8;
-                    let score = evaluator.evaluate_cq(call, grid.as_deref(), snr, msg.frequency_hz);
+                    let dial_hz = msg
+                        .captured_dial_hz
+                        .filter(|hz| *hz != 0)
+                        .unwrap_or(live_dial_hz) as f64;
+                    // Preserve legacy numeric admission when tier gating is unset.
+                    let score_hz = if self.config.pounce_min_tier.is_some() {
+                        dial_hz
+                    } else {
+                        msg.frequency_hz
+                    };
+                    let score = evaluator.evaluate_cq(call, grid.as_deref(), snr, score_hz);
 
                     // DX watchlist (#197): remember PerBandDxccNew+/Atno CQs
                     // heard this cycle regardless of what decide_at() goes on
@@ -1676,8 +1698,7 @@ impl AutonomousOperator {
                     // capacity" and "lost this cycle's single pounce slot"
                     // gaps. Never triggers a transmission by itself; see
                     // pancetta_qso::watchlist module docs.
-                    let tiered =
-                        evaluator.evaluate_cq_tiered(call, grid.as_deref(), snr, msg.frequency_hz);
+                    let tiered = evaluator.evaluate_cq_tiered(call, grid.as_deref(), snr, dial_hz);
                     let tier = tiered.map(|s| s.tier).unwrap_or(PriorityTier::Standard);
                     if let Some(tiered) = tiered {
                         if tiered.tier >= PriorityTier::PerBandDxccNew {
@@ -6963,6 +6984,65 @@ mod tests {
 
     fn pounced_on(actions: &[OperatorAction], call: &str) -> bool {
         actions.iter().any(|a| matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.starts_with(call)))
+    }
+
+    #[test]
+    fn tier_pounce_uses_rf_dial_and_preserves_audio_offset() {
+        struct BandLookup;
+        impl crate::priority::WorkedStationLookup for BandLookup {
+            fn is_duplicate(&self, _: &str, _: f64) -> bool {
+                false
+            }
+            fn is_recent_failure(&self, _: &str) -> bool {
+                false
+            }
+            fn is_needed_dxcc(&self, _: &str) -> bool {
+                false
+            }
+            fn is_needed_grid(&self, _: &str) -> bool {
+                false
+            }
+            fn is_dxcc_needed_on_band(&self, _: &str, hz: f64) -> bool {
+                hz > 0.0 && !(14_000_000.0..14_350_000.0).contains(&hz)
+            }
+            fn is_grid_needed_on_band(&self, _: &str, hz: f64) -> bool {
+                self.is_dxcc_needed_on_band("JA1ABC", hz)
+            }
+        }
+        let scorer = crate::priority::PriorityScorer::new(
+            crate::priority::PriorityWeights::default(),
+            Box::new(BandLookup),
+        );
+        for (captured, live, expected) in [
+            (Some(14_074_000), 7_074_000, PriorityTier::Standard),
+            (Some(7_074_000), 14_074_000, PriorityTier::PerBandDxccNew),
+            (None, 14_074_000, PriorityTier::Standard),
+            (Some(0), 14_074_000, PriorityTier::Standard),
+            (None, 7_074_000, PriorityTier::PerBandDxccNew),
+            (None, 0, PriorityTier::Standard),
+        ] {
+            let mut op = tier_pounce_operator(Some(PriorityTier::PerBandDxccNew), 0, &[]);
+            let mut msg = cq_message("JA1ABC", "PM95");
+            msg.frequency_hz = 1500.0;
+            msg.captured_dial_hz = captured;
+            op.feed_decoded_messages_on_dial_at(
+                &[msg],
+                &scorer,
+                live,
+                DateTime::from_timestamp(0, 0).unwrap(),
+            );
+            assert_eq!(op.pending_cqs[0].tier, expected, "{captured:?}/{live}");
+            assert_eq!(op.pending_cqs[0].frequency_hz, 1500.0);
+            let dial = captured.filter(|hz| *hz != 0).unwrap_or(live) as f64;
+            assert_eq!(
+                op.pending_cqs[0].dx_score,
+                scorer.evaluate_cq("JA1ABC", Some("PM95"), -10, dial)
+            );
+            assert_eq!(
+                pounced_on(&op.decide_at(0), "JA1ABC"),
+                expected == PriorityTier::PerBandDxccNew
+            );
+        }
     }
 
     #[test]

@@ -2411,7 +2411,12 @@ impl super::ApplicationCoordinator {
                                 op.update_live_spots(&spot_freqs);
                             }
 
-                            op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+                            op.feed_decoded_messages_on_dial_at(
+                                &slot_messages,
+                                evaluator.as_ref(),
+                                operating_frequency_hz.load(Ordering::Relaxed),
+                                chrono::Utc::now(),
+                            );
 
                             // PAN-72: resolve and commit any mid-QSO
                             // TX-offset actions the QSO event-forwarder

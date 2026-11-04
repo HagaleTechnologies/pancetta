@@ -93,7 +93,6 @@ Retuning can cost a decode window. Don't add a deadband without measured CAT
 jitter. See
 [Dial-change in-flight-window flush](../../docs/DECISIONS/config-and-platform.md#dial-change-in-flight-window-flush-pan-70-2026-10-24).
 
-<<<<<<< HEAD
 PAN-261 adds top-level `[alerts]` and `[watchlist]` sections and optional
 `[autonomous].pounce_min_tier`. Defaults leave tier admission unset and all
 alert channels disabled. `Config::set_watchlist_pinned_in_file` replaces only
@@ -101,7 +100,7 @@ the pin array through the secure atomic, comment-preserving writer. The relay
 persists changed snapshots, including completion removal; do not write from
 the TUI render loop. These settings require restart. See
 [tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).
-=======
+
 Microphone diagnosis gotcha (PAN-266): `doctor` queries the running process's
 AVFoundation audio authorization only after a successful silent capture.
 Silence alone does not prove missing permission. Authorized or unknown status
@@ -109,4 +108,3 @@ keeps the generic FLAT LINE advice; zero captured samples remain a capture error
 macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
->>>>>>> 71f9c849b828b37729f911953fd07151a4c5d2be
