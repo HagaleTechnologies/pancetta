@@ -3987,6 +3987,19 @@ impl super::ApplicationCoordinator {
                             Ok(pancetta_qso::QsoEvent::QsoCompleted {
                                 qso_id, metadata, ..
                             }) => {
+                                if let Some(callsign) = &metadata.their_callsign {
+                                    let _ = snapshot_bus
+                                        .send_message_durable(ComponentMessage::new(
+                                            ComponentId::Qso,
+                                            ComponentId::Autonomous,
+                                            MessageType::WatchlistEdit {
+                                                callsign: callsign.clone(),
+                                                action: crate::message_bus::WatchlistAction::Unpin,
+                                            },
+                                            Instant::now(),
+                                        ))
+                                        .await;
+                                }
                                 opening_self_cqs_for_events
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -85,6 +85,13 @@ impl std::fmt::Display for ComponentId {
     }
 }
 
+/// Explicit edits allow completion removal to be idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchlistAction {
+    Pin,
+    Unpin,
+}
+
 /// Where a transmit request originated.
 ///
 /// This is a **safety-relevant** discriminator: the coordinator's TX worker
@@ -199,7 +206,18 @@ pub enum MessageType {
     /// cadence. A full resync each tick (not a diff), matching this
     /// codebase's existing "bulk replace, self-healing" convention (see
     /// `FrequencyAllocator::set_own_frequencies`).
-    DxWatchlistUpdate { callsigns: Vec<String> },
+    DxWatchlistUpdate {
+        callsigns: Vec<String>,
+        pinned: Vec<String>,
+    },
+
+    /// Operator watchlist edits, owned and applied by Autonomous.
+    WatchlistEdit {
+        callsign: String,
+        action: WatchlistAction,
+    },
+    /// Terminal BEL, emitted only when a TUI is attached.
+    AlertBell,
 
     /// Hamlib rig control messages
     RigControl(RigControlMessage),

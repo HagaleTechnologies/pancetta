@@ -368,6 +368,7 @@ pub struct CqCandidate {
     pub snr: i8,
     pub frequency_hz: f64,
     pub dx_score: f64,
+    pub tier: PriorityTier,
     /// The parity of the slot in which this CQ was heard.
     /// Used to derive `tx_parity = slot_parity.opposite()` for our response.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
@@ -448,6 +449,7 @@ pub enum SkipReason {
     AtCapacity { active: u32, cap: u32 },
     DxBusy { window_secs: u64 },
     RecentlyResponded,
+    BelowPounceTier,
     CallsignContinuity { dx_score: f64 },
     ContentScore { score: f64, threshold: f64 },
     FrequencyClash,
@@ -560,6 +562,9 @@ pub struct AutonomousConfig {
     /// Minimum DX score required to open an additional QSO slot (0.0–1.0).
     /// Only applies to second+ concurrent QSOs. First QSO uses min_dx_score.
     pub min_multi_slot_score: f64,
+    /// Optional tier admission; weighted score breaks ties within a tier.
+    #[serde(default)]
+    pub pounce_min_tier: Option<PriorityTier>,
     /// Directed CQ text (e.g. "DX", "NA", or empty).
     pub cq_direction: String,
     pub listen_cycle: ListenCycleConfig,
@@ -589,6 +594,7 @@ impl Default for AutonomousConfig {
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
             min_multi_slot_score: 0.7,
+            pounce_min_tier: None,
             cq_direction: String::new(),
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
@@ -1670,9 +1676,10 @@ impl AutonomousOperator {
                     // capacity" and "lost this cycle's single pounce slot"
                     // gaps. Never triggers a transmission by itself; see
                     // pancetta_qso::watchlist module docs.
-                    if let Some(tiered) =
-                        evaluator.evaluate_cq_tiered(call, grid.as_deref(), snr, msg.frequency_hz)
-                    {
+                    let tiered =
+                        evaluator.evaluate_cq_tiered(call, grid.as_deref(), snr, msg.frequency_hz);
+                    let tier = tiered.map(|s| s.tier).unwrap_or(PriorityTier::Standard);
+                    if let Some(tiered) = tiered {
                         if tiered.tier >= PriorityTier::PerBandDxccNew {
                             self.watchlist
                                 .refresh(call, grid.as_deref(), tiered.tier, now);
@@ -1685,6 +1692,7 @@ impl AutonomousOperator {
                         snr,
                         frequency_hz: msg.frequency_hz,
                         dx_score: score,
+                        tier,
                         slot_parity: msg.slot_parity,
                         message_text: msg.message_text.clone(),
                         confidence: msg.confidence,
@@ -1696,11 +1704,19 @@ impl AutonomousOperator {
         }
         self.watchlist.prune(now);
 
-        // Sort: best score first.
+        // Optional tier admission orders rarer candidates first, then weighted score.
+        let tier_gated = self.config.pounce_min_tier.is_some();
         self.pending_cqs.sort_by(|a, b| {
-            b.dx_score
-                .partial_cmp(&a.dx_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let tier_order = if tier_gated {
+                b.tier.cmp(&a.tier)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            tier_order.then_with(|| {
+                b.dx_score
+                    .partial_cmp(&a.dx_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
     }
 
@@ -2153,6 +2169,18 @@ impl AutonomousOperator {
         self.watchlist.callsigns()
     }
 
+    pub fn pin_watchlist(&mut self, callsign: &str) {
+        self.watchlist.pin(callsign);
+    }
+
+    pub fn unpin_watchlist(&mut self, callsign: &str) {
+        self.watchlist.unpin(callsign);
+    }
+
+    pub fn pinned_watchlist_callsigns(&self) -> Vec<String> {
+        self.watchlist.pinned_callsigns()
+    }
+
     pub fn pause(&mut self) {
         self.paused = true;
         self.state = OperatingState::Paused;
@@ -2331,7 +2359,7 @@ impl AutonomousOperator {
 
                 // Step 2: emit all pending sequencer messages (active QSOs).
                 if !self.pending_sequencer_messages.is_empty() {
-                    let messages: Vec<_> = self.pending_sequencer_messages.drain(..).collect();
+                    let messages: Vec<_> = std::mem::take(&mut self.pending_sequencer_messages);
                     for (msg, freq, qso_id) in messages {
                         actions.push(OperatorAction::Transmit {
                             message_text: msg,
@@ -2395,10 +2423,21 @@ impl AutonomousOperator {
                     // first one before the rolling window populated).
                     let fp = self.fp_filter.clone();
                     let slot_skips = std::cell::RefCell::new(Vec::new());
+                    if let Some(min_tier) = self.config.pounce_min_tier {
+                        for cq in self.pending_cqs.iter().filter(|cq| cq.tier < min_tier) {
+                            slot_skips.borrow_mut().push(CqSkipRecord {
+                                callsign: Some(cq.callsign.clone()),
+                                reason: SkipReason::BelowPounceTier,
+                            });
+                        }
+                    }
                     let best_cq = self
                         .pending_cqs
                         .iter()
-                        .filter(|cq| cq.dx_score >= threshold)
+                        .filter(|cq| match self.config.pounce_min_tier {
+                            Some(min_tier) => cq.tier >= min_tier,
+                            None => cq.dx_score >= threshold,
+                        })
                         .filter(|cq| {
                             let recent = self.is_recently_responded_to(&cq.callsign, now);
                             if recent {
@@ -2974,7 +3013,7 @@ impl AutonomousOperator {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn is_cq_message(text: &str) -> bool {
+pub fn is_cq_message(text: &str) -> bool {
     let upper = text.to_uppercase();
     upper.starts_with("CQ ")
 }
@@ -6871,6 +6910,114 @@ mod tests {
             decode_origin: None,
             captured_dial_hz: None,
         }
+    }
+
+    struct PounceTierEvaluator;
+    impl DxEvaluator for PounceTierEvaluator {
+        fn evaluate_cq(&self, call: &str, _: Option<&str>, _: i8, _: f64) -> f64 {
+            if call == "VP8PJ" {
+                0.571
+            } else {
+                0.721
+            }
+        }
+        fn evaluate_cq_tiered(
+            &self,
+            call: &str,
+            _: Option<&str>,
+            _: i8,
+            _: f64,
+        ) -> Option<TieredScore> {
+            Some(TieredScore {
+                tier: if call == "T88AA" {
+                    PriorityTier::PerBandDxccNew
+                } else {
+                    PriorityTier::Atno
+                },
+                secondary: 0.5,
+            })
+        }
+    }
+
+    fn tier_pounce_operator(
+        min_tier: Option<PriorityTier>,
+        active: u32,
+        calls: &[&str],
+    ) -> AutonomousOperator {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.max_concurrent_qsos = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.pounce_min_tier = min_tier;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_active_qso_count(active);
+        let messages: Vec<_> = calls.iter().map(|c| cq_message(c, "PM95")).collect();
+        op.feed_decoded_messages_at(
+            &messages,
+            &PounceTierEvaluator,
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        op
+    }
+
+    fn pounced_on(actions: &[OperatorAction], call: &str) -> bool {
+        actions.iter().any(|a| matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.starts_with(call)))
+    }
+
+    #[test]
+    fn tier_pounce_atno_wins_idle_and_busy_despite_lower_weighted_score() {
+        for active in [0, 1] {
+            let mut op =
+                tier_pounce_operator(Some(PriorityTier::Atno), active, &["T88AA", "VP8PJ"]);
+            assert!(pounced_on(&op.decide_at(0), "VP8PJ"));
+            assert!(op
+                .skip_log
+                .iter()
+                .any(|r| r.callsign.as_deref() == Some("T88AA")
+                    && matches!(r.reason, SkipReason::BelowPounceTier)));
+        }
+    }
+
+    #[test]
+    fn tier_pounce_preserves_recent_busy_and_capacity_gates() {
+        let now = DateTime::from_timestamp(0, 0).unwrap();
+        let mut recent = tier_pounce_operator(Some(PriorityTier::Atno), 0, &["VP8PJ"]);
+        recent.mark_responded_to("VP8PJ", now);
+        assert!(!pounced_on(&recent.decide_at(0), "VP8PJ"));
+        assert!(recent
+            .take_skip_log()
+            .iter()
+            .any(|r| matches!(r.reason, SkipReason::RecentlyResponded)));
+        let mut busy = tier_pounce_operator(Some(PriorityTier::Atno), 0, &["VP8PJ"]);
+        busy.recently_in_qso.insert("VP8PJ".into(), now);
+        assert!(!pounced_on(&busy.decide_at(0), "VP8PJ"));
+        assert!(busy
+            .take_skip_log()
+            .iter()
+            .any(|r| matches!(r.reason, SkipReason::DxBusy { .. })));
+        let mut full = tier_pounce_operator(Some(PriorityTier::Atno), 3, &["VP8PJ"]);
+        assert!(!pounced_on(&full.decide_at(0), "VP8PJ"));
+        assert!(full
+            .take_skip_log()
+            .iter()
+            .any(|r| matches!(r.reason, SkipReason::AtCapacity { .. })));
+    }
+
+    #[test]
+    fn tier_pounce_same_tier_uses_weighted_score() {
+        let mut op = tier_pounce_operator(Some(PriorityTier::Atno), 0, &["VP8PJ", "JA1ABC"]);
+        assert!(pounced_on(&op.decide_at(0), "JA1ABC"));
+    }
+
+    #[test]
+    fn default_pounce_keeps_weighted_order_and_busy_threshold() {
+        let mut idle = tier_pounce_operator(None, 0, &["VP8PJ", "T88AA"]);
+        assert!(pounced_on(&idle.decide_at(0), "T88AA"));
+        let mut busy = tier_pounce_operator(None, 1, &["VP8PJ"]);
+        assert!(!pounced_on(&busy.decide_at(0), "VP8PJ"));
+        let mut busy = tier_pounce_operator(None, 1, &["T88AA"]);
+        assert!(pounced_on(&busy.decide_at(0), "T88AA"));
     }
 
     #[test]

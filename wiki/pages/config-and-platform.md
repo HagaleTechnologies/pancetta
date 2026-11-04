@@ -92,3 +92,11 @@ so queued audio and a retune and return between two reads are not caught.
 Retuning can cost a decode window. Don't add a deadband without measured CAT
 jitter. See
 [Dial-change in-flight-window flush](../../docs/DECISIONS/config-and-platform.md#dial-change-in-flight-window-flush-pan-70-2026-10-24).
+
+PAN-261 adds top-level `[alerts]` and `[watchlist]` sections and optional
+`[autonomous].pounce_min_tier`. Defaults leave tier admission unset and all
+alert channels disabled. `Config::set_watchlist_pinned_in_file` replaces only
+the pin array through the secure atomic, comment-preserving writer. The relay
+persists changed snapshots, including completion removal; do not write from
+the TUI render loop. These settings require restart. See
+[tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).

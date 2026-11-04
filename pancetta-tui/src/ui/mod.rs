@@ -1403,6 +1403,24 @@ pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModa
     f.render_widget(Paragraph::new(body).block(block), modal_area);
 }
 
+/// Callsign entry for persistent operator pins.
+pub fn render_watchlist_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
+    if area.width < 10 || area.height < 6 {
+        return;
+    }
+    let width = 60.min(area.width);
+    let modal = Rect::new((area.width - width) / 2, (area.height - 6) / 2, width, 6);
+    f.render_widget(ratatui::widgets::Clear, modal);
+    let text = format!(
+        "Callsign to watch\n> {}_\nEnter toggles, Esc cancels",
+        m.buffer
+    );
+    f.render_widget(
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Watchlist ")),
+        modal,
+    );
+}
+
 /// Render the `o`-key TX-audio-offset modal.
 ///
 /// One integer Hz field in [300, 2700]; blank Enter = Auto; Esc = cancel.
@@ -3395,6 +3413,7 @@ mod view_render_tests {
             audio_offset_hz: None,
             slot_parity: None,
             watchlisted: false,
+            pinned: false,
         }
     }
 

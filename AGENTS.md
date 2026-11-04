@@ -32,6 +32,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), and persistent operator watchlist pins are implemented, unreleased; live notification-service and on-air qualification are pending.
 
 ## Building and Testing
 
