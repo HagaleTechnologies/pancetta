@@ -804,6 +804,15 @@ pub struct ContestInfo {
     /// row's serialized `ContestInfo` lacks this key; deserialization fills
     /// it for those rows (`legacy_adif_contest_id`).
     pub adif_contest_id: Option<String>,
+
+    /// PAN-50 contest-scoring stamp: which contest instance this contact
+    /// was made under. Exchange verification (`ContestProfile::verified`)
+    /// and scoring provenance stay separate — this carries no cached score
+    /// and no multiplier; those are always derived from raw evidence by
+    /// `contest::scoring::reduce_contest_score`. Old rows lack the key and
+    /// default to `None` (ordinary, noncontest contacts keep `None` too).
+    #[serde(default)]
+    pub scoring: Option<crate::contest::scoring::ContestScoringStamp>,
 }
 
 /// How [`ContestInfo`] deserializes: the same fields, except that it tells
@@ -818,6 +827,8 @@ struct ContestInfoRow {
     multiplier: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_key")]
     adif_contest_id: Option<Option<String>>,
+    #[serde(default)]
+    scoring: Option<crate::contest::scoring::ContestScoringStamp>,
 }
 
 /// `Some(value)` whenever the key is present, so a present `null` stays
@@ -859,6 +870,7 @@ impl From<ContestInfoRow> for ContestInfo {
             points: row.points,
             multiplier: row.multiplier,
             adif_contest_id,
+            scoring: row.scoring,
         }
     }
 }
@@ -1316,6 +1328,42 @@ mod tests {
         obj.remove("their_state");
         let back: QsoMetadata = serde_json::from_value(obj.into()).unwrap();
         assert!(back.their_state.is_none());
+    }
+
+    /// PAN-50: a `ContestInfo` row written before the scoring stamp existed
+    /// (key absent) deserializes through the custom row deserializer with
+    /// `scoring: None`, and a stamped row round-trips.
+    #[test]
+    fn contest_info_deserializes_without_and_with_scoring_stamp() {
+        let stamped = ContestInfo {
+            contest_name: "us-state-qso-party".to_string(),
+            category: String::new(),
+            serials: ContestSerials {
+                sent: None,
+                received: None,
+            },
+            points: 0,
+            multiplier: None,
+            adif_contest_id: None,
+            scoring: Some(crate::contest::scoring::ContestScoringStamp {
+                instance_id: "KSQP-2026-K5ARH".to_string(),
+                rules_id: crate::contest::scoring::KSQP_FT_2026.to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&stamped).unwrap();
+        let round: ContestInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.scoring, stamped.scoring);
+
+        // Pre-PAN-50 row: no `scoring` key at all.
+        let mut obj = serde_json::to_value(&stamped)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        obj.remove("scoring");
+        let legacy: ContestInfo = serde_json::from_value(obj.into()).unwrap();
+        assert!(legacy.scoring.is_none());
+        assert_eq!(legacy.contest_name, "us-state-qso-party");
     }
 
     /// PAN-214: a QSO pancetta logs itself carries no type indicators, and its

@@ -751,6 +751,10 @@ impl AdifProcessor {
                     },
                     points: 1, // Default
                     multiplier: None,
+                    // PAN-50: imported rows carry no scoring instance until
+                    // contest app-field evidence decoding lands (a later
+                    // phase); the stamp defaults to None for them.
+                    scoring: None,
                 }),
             tags: Self::tags_with_unmodeled_fields(adif_qso),
             adif_field_types: adif_qso.field_types.clone(),

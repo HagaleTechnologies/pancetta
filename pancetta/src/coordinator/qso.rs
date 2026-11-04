@@ -3058,6 +3058,36 @@ impl super::ApplicationCoordinator {
         // `[station] tx_late_max_ms` reaches `keep_call_tx_slot` — the same
         // value the TX worker snapshots for `schedule_tx`.
         let station_tx_late_max_ms = config.station.tx_late_max_ms;
+
+        // PAN-50: convert the validated `[contest]` section into the
+        // contest-scoring context here, where both pancetta-config and the
+        // pancetta-qso rule catalog are visible (serialized config stays
+        // independent of pancetta-qso). An unknown rules_id or invalid
+        // operator_region refuses startup with the operator-facing message
+        // rather than silently disabling scoring; structural validation
+        // (required fields, period shape) already ran in Config::validate.
+        // Computed before `drop(config)` below so the read guard can be
+        // released on schedule.
+        let contest_scoring = match &config.contest {
+            Some(contest) if contest.enabled => {
+                let periods = contest
+                    .periods
+                    .iter()
+                    .map(|window| pancetta_qso::contest::scoring::ContestPeriod {
+                        start: window.start,
+                        end: window.end,
+                    })
+                    .collect();
+                Some(pancetta_qso::contest::scoring::ContestScoringContext::new(
+                    contest.instance_id.as_deref().unwrap_or(""),
+                    contest.profile_id.as_deref().unwrap_or(""),
+                    contest.rules_id.as_deref().unwrap_or(""),
+                    contest.operator_region.as_deref().unwrap_or(""),
+                    periods,
+                ))
+            }
+            _ => None,
+        };
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -3209,6 +3239,13 @@ impl super::ApplicationCoordinator {
         // `start_wsjtx_udp_component`, so the field is always already
         // populated by the time the latter reads it — no channel, handoff, or
         // timeout needed.
+        // PAN-50: surface the contest-context conversion error (unknown
+        // rules_id / invalid operator_region) with the operator-facing
+        // message; see the extraction above `drop(config)`.
+        let contest_scoring = contest_scoring
+            .transpose()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
         let qso_config = {
             use pancetta_qso::{
                 DuplicateCheckConfig, HoundRegions, QsoManagerConfig, TimeoutConfig,
@@ -3217,6 +3254,7 @@ impl super::ApplicationCoordinator {
             QsoManagerConfig {
                 our_callsign: our_callsign.clone(),
                 our_grid: our_grid.clone(),
+                contest_scoring,
                 hound: HoundRegions {
                     call_min_hz: hound_cfg.call_min_hz,
                     call_max_hz: hound_cfg.call_max_hz,

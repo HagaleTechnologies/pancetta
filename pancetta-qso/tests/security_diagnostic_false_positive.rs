@@ -20,6 +20,7 @@ fn manager() -> QsoManager {
         our_grid: Some("EM10".into()),
         timeouts: TimeoutConfig::default(),
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: AutoSequenceConfig::default(),
         duplicate_checking: DuplicateCheckConfig::default(),
         hound: HoundRegions::default(),

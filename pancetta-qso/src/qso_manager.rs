@@ -789,6 +789,14 @@ pub struct QsoManagerConfig {
     /// Contest mode settings
     pub contest_mode: Option<ContestConfig>,
 
+    /// PAN-50 contest-scoring context: the validated `[contest]` TOML
+    /// section converted by the coordinator at startup. `None` (default)
+    /// disables contest scoring entirely. Unrelated to the dormant
+    /// `contest_mode` serial-exchange scaffolding above, which is NOT
+    /// reused (see the PAN-50 plan's implementation approach).
+    #[serde(default)]
+    pub contest_scoring: Option<crate::contest::scoring::ContestScoringContext>,
+
     /// Automatic sequencing configuration
     pub auto_sequence: AutoSequenceConfig,
 
@@ -1204,6 +1212,7 @@ impl Default for QsoManagerConfig {
             our_grid: None,
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -2794,8 +2803,66 @@ impl QsoManager {
             },
             points: 0,
             multiplier: None,
+            // PAN-50: engagement stamps exchange identity only; a scoring
+            // instance stamp is attached separately when a validated
+            // `[contest]` context owns the attempt.
+            scoring: None,
         });
         Ok(())
+    }
+
+    /// Compute the contest score snapshot (PAN-50) from the in-memory
+    /// completed-QSO ledger under the configured contest instance.
+    ///
+    /// Returns `None` when contest scoring is not configured. Facts are
+    /// typed from persisted QSO metadata only: the logged band comes from
+    /// `completed_rf_frequency_hz` (never today's dial), the partner region
+    /// from the persisted `their_state`, and the contest instance from the
+    /// contact's `ContestInfo::scoring` stamp. The strict SQLite/ADIF
+    /// history query and the live refresh loop are a later PAN-50 phase;
+    /// this in-memory view covers the session's own contacts.
+    pub async fn contest_score_snapshot(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<
+        Result<
+            crate::contest::scoring::ContestScoreSnapshot,
+            crate::contest::scoring::ScoringError,
+        >,
+    > {
+        let context = self.config.contest_scoring.as_ref()?;
+        let qsos = self.qsos.read().await;
+        let facts: Vec<crate::contest::scoring::ContestContactFact> = qsos
+            .iter()
+            .filter(|(_, progress)| matches!(progress.state, QsoState::Completed { .. }))
+            .filter_map(|(qso_id, progress)| {
+                let metadata = &progress.metadata;
+                let callsign = metadata.their_callsign.as_deref()?;
+                Some(crate::contest::scoring::ContestContactFact {
+                    contact_id: qso_id.to_string(),
+                    instance_id: metadata
+                        .contest_info
+                        .as_ref()
+                        .and_then(|info| info.scoring.as_ref())
+                        .map(|stamp| stamp.instance_id.clone())
+                        .unwrap_or_default(),
+                    callsign: callsign.to_string(),
+                    band: metadata
+                        .completed_rf_frequency_hz
+                        .map(crate::utils::frequency_to_band),
+                    mode: metadata.mode.clone(),
+                    start: metadata.start_time,
+                    failed: false,
+                    their_region: metadata.their_state.clone(),
+                    their_county: None,
+                    our_county: None,
+                })
+            })
+            .collect();
+        drop(qsos);
+        Some(crate::contest::scoring::reduce_contest_score(
+            context, &facts, now,
+        ))
     }
 
     /// Open a manual **Hound** QSO to work a Fox (DXpedition) station.
@@ -10006,6 +10073,7 @@ mod tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -15316,6 +15384,7 @@ mod sender_verification_tests {
             our_grid: Some("FN42".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -16826,6 +16895,7 @@ mod reply_emitter_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -18359,6 +18429,7 @@ mod state_regression_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19019,6 +19090,7 @@ mod sm_f4_waiting_for_report_resend_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19306,6 +19378,7 @@ mod sm_f6_auto_bounded_resend_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19498,6 +19571,7 @@ mod sm_f5_qso_failed_event_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19769,6 +19843,7 @@ mod tx_frequency_hold_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19878,6 +19953,7 @@ mod pan72_stall_detection_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -25977,6 +26053,7 @@ mod has_active_or_recent_qso_tests {
             our_grid: Some("FN42".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -26337,6 +26414,7 @@ mod hound_tests {
             our_grid: Some("EM20".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -27224,6 +27302,7 @@ mod current_remote_binding_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
