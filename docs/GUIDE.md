@@ -48,7 +48,13 @@ you will decode.** The two classic first-run killers it catches:
 - **Clock offset ≥ 1 s.** FT8 slots are aligned to UTC; a drifted clock
   fails every decode while looking otherwise healthy.
 - **Flat-line audio.** The input device exists but no signal reaches it
-  (OS-muted, wrong device, rig AF at zero).
+  (OS-muted, wrong device, rig AF at zero). On macOS, doctor names a known
+  missing microphone approval. Open System Settings > Privacy & Security >
+  Microphone and allow access for pancetta or the terminal app running it,
+  then restart that app and re-run `pancetta doctor`. Approval is normally
+  needed only once. If macOS has not asked yet, allow access when it asks;
+  restricted access requires the Mac's administrator. Approved or unknown
+  access keeps the generic device and audio-level advice.
 
 ### 3. Start and watch the first decode (~30 seconds)
 
