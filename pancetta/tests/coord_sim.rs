@@ -1769,36 +1769,32 @@ async fn in_band_dial_control_keys() {
 }
 
 // ===========================================================================
-// Hound mode — DXpedition chaser (Task 9, coord-level wire proof)
+// Hound mode — DXpedition chaser (Task 9, coord-level wire proof; PAN-259)
 //
-// The engine-level QSY is unit-tested in pancetta-qso/src/qso_manager.rs.
+// The engine-level procedure is unit-tested in pancetta-qso/src/qso_manager.rs.
 // This scenario proves it reaches the **modulator/PTT through the real
-// coordinator path**: engage_hound → PTT keys at the low calling offset
-// (300–900 Hz), then after the Fox's report the next slot keys at the high
-// QSY'd offset (1000–2700 Hz) — offset-on-the-wire, not just state.
+// coordinator path**, following the WSJT-X Fox/Hound convention:
+// engage_hound → PTT keys in the calling region (1000–2700 Hz, where a WSJT-X
+// Fox listens), then after the Fox's report the next slot keys at the Fox's
+// own offset (600 Hz) — offset-on-the-wire, not just state. The Fox's RR73
+// completes the QSO and the Hound queues no 73.
 //
-// Deterministic offset for seed "D2UY":
-//   low  = 700 Hz  (hound_offset_for("D2UY", 300, 900))
-//   high = 2140 Hz (hound_offset_for("D2UY", 1000, 2700))
+// Deterministic calling offset for seed "D2UY":
+//   call = 2140 Hz (hound_offset_for("D2UY", 1000, 2700))
 // ===========================================================================
 
-/// Hound engage keys PTT at the low calling offset (300–900 Hz) first, then
-/// QSYs to the high response offset (1000–2700 Hz) after the Fox sends its
-/// signal report — proved at the mock-rig PTT + keyed-audio-offset level
-/// through the real coordinator TX path.
-///
-/// Also drives the Fox's RR73 to verify the QSO reaches `Completed`.
+/// Hound engage keys PTT in the calling region (1000–2700 Hz) first, then
+/// answers the Fox's signal report at the Fox's own 600 Hz offset — proved at
+/// the mock-rig PTT + keyed-audio-offset level through the real coordinator
+/// TX path. The Fox's RR73 completes the QSO with no 73 queued.
 #[tokio::test]
-async fn hound_engage_keys_low_then_qsys_high_on_report() {
+async fn hound_engage_keys_high_then_answers_at_fox_offset_on_report() {
     let mut sim = CoordSim::new("K5ARH").await;
 
-    // ── Slot 0: engage Hound on Fox "D2UY" at 1800 Hz (Fox's audio offset) ──
-    //
-    // engage_hound picks our deterministic LOW calling offset (700 Hz for D2UY)
-    // and emits the opening CqResponse (`D2UY K5ARH EM10`) there.
+    // ── Slot 0: engage Hound on Fox "D2UY" at 600 Hz (Fox's audio offset) ──
     let qso_id = sim
         .manager
-        .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+        .engage_hound("D2UY", 600.0, Some("JI64"), Some(SlotParity::Even))
         .await
         .expect("engage_hound must succeed");
 
@@ -1808,103 +1804,77 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
         "engage_hound must emit at least one TransmitRequest (the opening call)"
     );
 
-    // Verify the forwarded offset is in the LOW calling region before keying.
     let opening_offset = pending[0].frequency_offset;
     assert!(
-        (300.0..=900.0).contains(&opening_offset),
-        "opening TransmitRequest must be in the Hound calling region [300, 900] Hz, got {opening_offset}"
+        (1000.0..=2700.0).contains(&opening_offset),
+        "opening TransmitRequest must be in the Hound calling region [1000, 2700] Hz, got {opening_offset}"
     );
 
     let slot0 = sim.drive_slot(pending).await;
 
-    // PTT must have keyed, and at the LOW calling offset.
     let qso_id_str = qso_id.to_string();
     sim.timeline.assert_keyed_for_qso(&qso_id_str);
     let keyed_slot0 = sim.timeline.keyed_for_qso(&qso_id_str);
-    let low_freq = keyed_slot0
+    let call_freq = keyed_slot0
         .iter()
         .find(|k| k.slot == slot0 && k.ptt_keyed)
         .map(|k| k.freq_hz)
         .expect("a keyed TX must exist in slot 0");
     assert!(
-        (300.0..=900.0).contains(&low_freq),
-        "slot 0 must key in the Hound calling region [300, 900] Hz, got {low_freq} Hz.\n{}",
+        (1000.0..=2700.0).contains(&call_freq),
+        "slot 0 must key in the Hound calling region [1000, 2700] Hz, got {call_freq} Hz.\n{}",
         sim.timeline
     );
-    // Ideally == 700 Hz (deterministic for "D2UY").
     assert!(
-        (low_freq - 700.0).abs() < 5.0,
-        "slot 0 keyed offset should be 700 Hz (deterministic for D2UY), got {low_freq} Hz.\n{}",
+        (call_freq - 2140.0).abs() < 5.0,
+        "slot 0 keyed offset should be 2140 Hz (deterministic for D2UY), got {call_freq} Hz.\n{}",
         sim.timeline
     );
 
-    // ── Slot 1: Fox sends signal report at its own offset (1800 Hz) → QSY ──
-    //
-    // inject_decode mirrors the coordinator's decode loop: parse → process_message.
-    // The Fox's report ("K5ARH D2UY -12") is injected at 1800 Hz (Fox's audio
-    // offset = partner_freq); the relevance gate routes it to the Hound QSO because
-    // partner_freq == 1800.0, even though our TX is at 700 Hz.
-    sim.inject_decode("K5ARH D2UY -12", 1800.0).await;
+    // ── Slot 1: Fox sends our report at its own offset (600 Hz) ──
+    sim.inject_decode("K5ARH D2UY -12", 600.0).await;
 
     let pending = sim.pump_qso_events();
     assert!(
         !pending.is_empty(),
-        "Fox report must trigger a ReportAck TransmitRequest (QSY'd offset)"
+        "Fox report must trigger a ReportAck TransmitRequest"
     );
-
-    // The ReportAck must be at the HIGH response offset (QSY'd), not the low one.
     let report_ack_offset = pending[0].frequency_offset;
     assert!(
-        (1000.0..=2700.0).contains(&report_ack_offset),
-        "ReportAck TransmitRequest must be in the QSY'd response region [1000, 2700] Hz, \
-         got {report_ack_offset} Hz.\n{}",
+        (report_ack_offset - 600.0).abs() < 1.0,
+        "ReportAck TransmitRequest must ride the Fox's 600 Hz offset, got {report_ack_offset} Hz.\n{}",
         sim.timeline
     );
 
     let slot1 = sim.drive_slot(pending).await;
 
-    // PTT must have keyed in slot 1 at the HIGH offset — this is the on-wire proof.
     let keyed_slot1 = sim.timeline.keyed_for_qso(&qso_id_str);
-    let high_freq = keyed_slot1
+    let answer_freq = keyed_slot1
         .iter()
         .find(|k| k.slot == slot1 && k.ptt_keyed)
         .map(|k| k.freq_hz)
-        .expect("a keyed TX must exist in slot 1 (ReportAck after QSY)");
+        .expect("a keyed TX must exist in slot 1 (ReportAck at the Fox offset)");
     assert!(
-        (1000.0..=2700.0).contains(&high_freq),
-        "slot 1 must key in the Hound response region [1000, 2700] Hz, got {high_freq} Hz.\n{}",
-        sim.timeline
-    );
-    // Ideally == 2140 Hz (deterministic for "D2UY").
-    assert!(
-        (high_freq - 2140.0).abs() < 5.0,
-        "slot 1 keyed offset should be 2140 Hz (deterministic QSY for D2UY), got {high_freq} Hz.\n{}",
-        sim.timeline
-    );
-    // The high offset must be strictly higher than the low calling offset.
-    assert!(
-        high_freq > low_freq,
-        "QSY'd offset {high_freq} Hz must be higher than calling offset {low_freq} Hz.\n{}",
+        (answer_freq - 600.0).abs() < 1.0,
+        "slot 1 must key at the Fox's 600 Hz offset, got {answer_freq} Hz.\n{}",
         sim.timeline
     );
 
-    // ── Slot 2 (optional completion leg): Fox sends RR73 → QSO completes ──
-    //
-    // inject at Fox's offset (1800 Hz); relevance gate accepts via partner_freq.
-    sim.inject_decode("K5ARH D2UY RR73", 1800.0).await;
+    // ── Slot 2: Fox sends RR73 → QSO completes, no 73 queued ──
+    sim.inject_decode("K5ARH D2UY RR73", 600.0).await;
 
     let pending = sim.pump_qso_events();
-    sim.drive_slot(pending).await;
-
-    // The QSO must have completed (QsoCompleted captured by pump_qso_events).
-    // If the 73 was emitted and the QsoCompleted event fired, `sim.completed` is non-empty.
+    assert!(
+        pending.is_empty(),
+        "a Hound must queue no 73 after the Fox's RR73, got {} TransmitRequest(s)",
+        pending.len()
+    );
     assert!(
         !sim.completed.is_empty(),
         "QSO must reach Completed after Fox RR73 (QsoCompleted event expected).\n{}",
         sim.timeline
     );
 
-    // All PTT transitions must be cleanly released.
     sim.timeline.assert_all_released();
 }
 
