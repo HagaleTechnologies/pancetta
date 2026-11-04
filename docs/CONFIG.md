@@ -307,7 +307,7 @@ swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX h
 |---|---|---|---|
 | `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
 | `max_swr` | float | `3.0` | Trip when readings are above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
-| `swr_trip_delay_ms` | int | `5000` | How long valid readings must stay above `max_swr` before TX halts, so an antenna tuner can settle after key-down. A reading at or below the limit resets the timer; a missing reading neither resets nor advances it. `0` trips on the first high reading. Must be 0 to 30000. |
+| `swr_trip_delay_ms` | int | `5000` | How much keyed time with SWR above `max_swr` halts TX, so an antenna tuner can settle after key-down. Keyed high time adds up across transmissions, so short frames (FT4, FT2) still trip; unkeyed time never counts. A reading at or below the limit resets it, and so does a gap of more than 2 minutes without a high reading. `0` trips on the first high reading. Must be 0 to 30000. |
 
 `[rig.power_control].enabled` (default false) controls rig power setting
 only. SWR protection does not depend on it.
