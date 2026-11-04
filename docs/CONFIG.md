@@ -299,19 +299,22 @@ and negative values fail validation at config load.
 ```toml
 [rig.power_control.protection]
 swr_protection = true   # default true; needs CAT rig control ([rig.interface].enabled = true)
-max_swr = 3.0           # default 3.0; halt on any reading above this; must be a number above 1.0
+max_swr = 3.0           # default 3.0; halt when readings stay above this; must be a number above 1.0
+swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX halts; 0 to 30000
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
-| `max_swr` | float | `3.0` | Trip when a reading is above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
+| `max_swr` | float | `3.0` | Trip when readings are above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
+| `swr_trip_delay_ms` | int | `5000` | How much keyed time with SWR above `max_swr` halts TX, so an antenna tuner can settle after key-down. Keyed high time adds up across transmissions, so short frames (FT4, FT2) still trip; unkeyed time never counts. A reading at or below the limit resets it, and so does a gap of more than 2 minutes without a high reading. `0` trips on the first high reading. Must be 0 to 30000. |
 
 `[rig.power_control].enabled` (default false) controls rig power setting
 only. SWR protection does not depend on it.
 
-While the rig is keyed, pancetta reads its SWR meter every poll tick. One
-reading above `max_swr` halts the station the same way Shift+Q does. The
+While the rig is keyed, pancetta reads its SWR meter every poll tick. When
+readings stay above `max_swr` for `swr_trip_delay_ms`, pancetta halts the
+station the same way Shift+Q does. The
 readiness strip shows `■ RX ONLY` and an alert such as
 `⚠ High SWR 4.20:1 (limit 3:1): TX halted. Check the antenna, then press g to re-enable TX`,
 and Shift+D keeps an entry under `rig.swr`. To recover, fix the antenna,
