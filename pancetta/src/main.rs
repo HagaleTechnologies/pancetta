@@ -386,14 +386,26 @@ fn main() -> Result<()> {
         .exit();
     }
 
-    responsibility::prepare(opens_microphone(&cli));
+    responsibility::prepare(opens_microphone(&cli, stub_audio_requested()));
     async_main(cli)
 }
 
-fn opens_microphone(cli: &Cli) -> bool {
+/// `PANCETTA_STUB_AUDIO` makes the audio pipeline synthesize a tone instead
+/// of opening a capture device (`coordinator/audio.rs`), with the same test.
+fn stub_audio_requested() -> bool {
+    std::env::var("PANCETTA_STUB_AUDIO").is_ok()
+}
+
+/// Whether the receiving service will open a real capture device: not with
+/// `--no-audio`, a WAV file, a replay, or stub audio.
+fn live_capture(cli: &Cli, stub_audio: bool) -> bool {
+    !stub_audio && !cli.no_audio && cli.wav.is_none() && cli.replay.is_none()
+}
+
+fn opens_microphone(cli: &Cli, stub_audio: bool) -> bool {
     match cli.command.as_ref() {
         Some(Commands::Doctor) => true,
-        None | Some(Commands::Run(_)) => !cli.no_audio && cli.wav.is_none() && cli.replay.is_none(),
+        None | Some(Commands::Run(_)) => live_capture(cli, stub_audio),
         _ => false,
     }
 }
@@ -478,7 +490,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     });
 
     // PAN-264: wait before opening audio, with station shutdown handling already active.
-    let live_audio = !cli.no_audio && cli.wav.is_none() && cli.replay.is_none();
+    let live_audio = live_capture(&cli, stub_audio_requested());
     if mic_access::gate_required(responsibility::outcome(), live_audio)
         && mic_access::wait_for_station_approval(&shutdown, cli.headless).await
             == mic_access::GateResult::Stopped
@@ -4310,7 +4322,7 @@ mod microphone_command_tests {
             vec!["doctor"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
-            assert!(opens_microphone(&cli));
+            assert!(opens_microphone(&cli, false));
         }
         for args in [
             vec!["--no-audio"],
@@ -4323,7 +4335,22 @@ mod microphone_command_tests {
             vec!["config", "--show"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
-            assert!(!opens_microphone(&cli));
+            assert!(!opens_microphone(&cli, false));
         }
+    }
+
+    /// Stub audio synthesizes a tone without a capture device, so a stub run
+    /// neither relaunches for microphone identity nor waits for approval.
+    /// `doctor` still probes the real device.
+    #[test]
+    fn stub_audio_never_opens_the_microphone_for_the_service() {
+        for args in [vec![], vec!["--headless"], vec!["run"]] {
+            let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
+            assert!(!opens_microphone(&cli, true));
+            assert!(!live_capture(&cli, true));
+            assert!(live_capture(&cli, false));
+        }
+        let doctor = Cli::try_parse_from(["pancetta", "doctor"]).unwrap();
+        assert!(opens_microphone(&doctor, true));
     }
 }
