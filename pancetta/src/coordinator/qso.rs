@@ -3524,20 +3524,7 @@ impl super::ApplicationCoordinator {
                 // History is initialized before decode/command loops or readiness.
                 // Replay opens only an in-memory index and reads the canonical ADIF.
                 let history_db = if replay_mode {
-                    match tokio::fs::try_exists(&adif_path).await {
-                        Ok(false) => pancetta_qso::async_database::QsoDatabase::new_in_memory()
-                            .await
-                            .map(Arc::new),
-                        Ok(true) => pancetta_qso::async_database::QsoDatabase::replay_from_adif(
-                            ":memory:", &adif_path,
-                        )
-                        .await
-                        .map(Arc::new),
-                        Err(source) => Err(pancetta_qso::async_database::AsyncDatabaseError::Io {
-                            path: adif_path.clone(),
-                            source,
-                        }),
-                    }
+                    replay_history_db(&adif_path).await
                 } else {
                     live_seed_db.map(Arc::new).ok_or_else(|| {
                         pancetta_qso::async_database::AsyncDatabaseError::InvalidQuery {
@@ -3545,12 +3532,20 @@ impl super::ApplicationCoordinator {
                         }
                     })
                 };
+                // PAN-268: the contest worker scores replay from the prepared
+                // in-memory seed, never the real station index. Selected before
+                // `history_db` is consumed by QSO-admission history below.
+                let contest_history = super::contest::select_history_source(
+                    replay_mode,
+                    &history_db,
+                    db_path.clone(),
+                    adif_path.clone(),
+                );
                 // One sequential reader per QSO component; abort it on supervisor teardown.
                 let _contest_worker = super::contest::start(
                     qso_manager.clone(),
                     message_bus.clone(),
-                    db_path.clone(),
-                    adif_path.clone(),
+                    contest_history,
                     shutdown.clone(),
                 );
                 let history_result = match history_db {
@@ -16701,6 +16696,33 @@ async fn initialize_qso_history(
     Ok(())
 }
 
+/// Replay's prepared history seed: the canonical ADIF replayed into an
+/// in-memory index, an empty in-memory index when ADIF is absent, or the
+/// failure that must keep every replay consumer (QSO admission and the
+/// contest worker alike) off the operator's real files. Live startup never
+/// calls this (PAN-268).
+pub(super) async fn replay_history_db(
+    adif_path: &std::path::Path,
+) -> Result<
+    Arc<pancetta_qso::async_database::QsoDatabase>,
+    pancetta_qso::async_database::AsyncDatabaseError,
+> {
+    match tokio::fs::try_exists(adif_path).await {
+        Ok(false) => pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .map(Arc::new),
+        Ok(true) => {
+            pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", adif_path)
+                .await
+                .map(Arc::new)
+        }
+        Err(source) => Err(pancetta_qso::async_database::AsyncDatabaseError::Io {
+            path: adif_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod pan260 {
     use super::*;
@@ -16840,6 +16862,64 @@ mod pan260 {
             early_subscription.try_recv().is_ok(),
             "history attachment preserves early subscriptions"
         );
+    }
+}
+
+#[cfg(test)]
+mod pan268 {
+    use super::*;
+
+    // PAN-268: replay startup must hand the contest worker the prepared
+    // in-memory seed (or its failure), never the real station index.
+    #[tokio::test]
+    async fn replay_startup_selects_only_the_prepared_seed_for_the_contest_worker() {
+        use super::super::contest::{select_history_source, HistorySource};
+        let dir = tempfile::tempdir().unwrap();
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(
+            &adif_path,
+            "<EOH>\n<CALL:5>K1ABC <QSO_DATE:8>20260101 <TIME_ON:6>140000 <MODE:3>FT8 <FREQ:9>14.075200 <BAND:3>20M <EOR>\n",
+        )
+        .unwrap();
+        // Seeded ADIF: prepared in-memory seed, replay source with no paths.
+        let prepared = replay_history_db(&adif_path).await;
+        assert!(prepared.is_ok());
+        assert!(
+            matches!(
+                select_history_source(true, &prepared, db_path.clone(), adif_path.clone()),
+                HistorySource::Replay { seed: Ok(_) }
+            ),
+            "replay with a prepared seed must not select the disk reader"
+        );
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Missing ADIF: a valid empty seed, still replay, still no files.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let missing = empty_dir.path().join("qsos.adi");
+        let prepared = replay_history_db(&missing).await;
+        assert!(prepared.is_ok());
+        assert!(matches!(
+            select_history_source(true, &prepared, missing.clone(), missing.clone()),
+            HistorySource::Replay { seed: Ok(_) }
+        ));
+        assert_eq!(std::fs::read_dir(empty_dir.path()).unwrap().count(), 0);
+        // Failed preparation (existence probe under a regular file): the
+        // failure is retained and can never select the live disk reader.
+        let blocker = empty_dir.path().join("blocker");
+        std::fs::write(&blocker, b"regular file").unwrap();
+        let broken = empty_dir.path().join("blocker").join("qsos.adi");
+        let prepared = replay_history_db(&broken).await;
+        assert!(prepared.is_err());
+        assert!(matches!(
+            select_history_source(true, &prepared, db_path.clone(), broken.clone()),
+            HistorySource::Replay { seed: Err(_) }
+        ));
+        // Live startup keeps the disk paths.
+        assert!(matches!(
+            select_history_source(false, &prepared, db_path.clone(), adif_path.clone()),
+            HistorySource::Live { .. }
+        ));
     }
 }
 

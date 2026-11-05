@@ -59,3 +59,10 @@ requires the index and ADIF to agree, so a completion event alone cannot
 publish a ready score. Missing location evidence stays pending and unknown
 context versions remain lossless but unavailable. Rule ids pin sponsor
 editions; see docs/superpowers/specs/2026-11-05-contest-scoring.md.
+
+Replay differs (PAN-268): `--replay` scoring reads only the in-memory seed
+prepared once at startup from the canonical ADIF (an empty seed when ADIF is
+absent). The contest worker never receives or reopens the real
+`~/.pancetta/qso.db` during replay, and simulated completions are never
+persisted, so they never change the replayed score. A failed seed preparation
+reports the score unavailable instead of falling back to disk.
