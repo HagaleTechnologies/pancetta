@@ -80,6 +80,18 @@ fn normalized(value: Option<&str>) -> Option<String> {
         .map(str::to_ascii_uppercase)
 }
 
+/// Band evidence for a contest fact: the explicit logged BAND tag (an
+/// imported record may carry BAND with no FREQ), else the band the logged
+/// RF frequency falls in. A value outside every named band — pancetta
+/// without CAT logs the audio offset, which formats as the `0MHZ`
+/// placeholder — is unresolvable evidence rather than a disallowed band,
+/// so it stays `None` and the reducer keeps the contact pending.
+fn fact_band(tags: &HashMap<String, String>, frequency_hz: f64) -> Option<String> {
+    normalized(tags.get("BAND").map(String::as_str))
+        .or_else(|| normalized(Some(&crate::adif::freq_hz_to_band(frequency_hz))))
+        .filter(|band| !band.ends_with("MHZ"))
+}
+
 /// Prefer app evidence, filling missing fields from explicit standard facts.
 /// Any contradiction leaves all location evidence unresolved. Keep original
 /// app JSON and standard fields in the tags so this remains lossless.
@@ -222,7 +234,7 @@ pub fn fact(
             .their_callsign
             .clone()
             .ok_or("contest: missing callsign")?,
-        band: normalized(Some(&crate::adif::freq_hz_to_band(metadata.frequency))),
+        band: fact_band(&metadata.tags, metadata.frequency),
         mode: metadata.mode.clone(),
         start,
         failed: false,

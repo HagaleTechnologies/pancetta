@@ -3062,10 +3062,11 @@ impl super::ApplicationCoordinator {
         // PAN-50: convert the validated `[contest]` section into the
         // contest-scoring context here, where both pancetta-config and the
         // pancetta-qso rule catalog are visible (serialized config stays
-        // independent of pancetta-qso). An unknown rules_id or invalid
-        // operator_region refuses startup with the operator-facing message
-        // rather than silently disabling scoring; structural validation
-        // (required fields, period shape) already ran in Config::validate.
+        // independent of pancetta-qso). An unknown rules_id, a profile that
+        // does not match the selected rules, or an invalid operator_region
+        // refuses startup with the operator-facing message rather than
+        // silently disabling scoring; structural validation (required
+        // fields, period shape) already ran in Config::validate.
         // Computed before `drop(config)` below so the read guard can be
         // released on schedule.
         let contest_scoring = match &config.contest {

@@ -161,6 +161,8 @@ pub fn resolve_rules(rules_id: &str) -> Result<&'static ContestRules, ContestRul
 pub enum ContestRuleError {
     /// `contest: unknown rules_id`
     UnknownRulesId,
+    /// `contest: profile_id does not match the selected rules`
+    ProfileMismatch,
     /// `contest: operator_region is not valid for the selected rules`
     InvalidOperatorRegion,
     /// `contest: periods must be ordered, non-overlapping UTC ranges with
@@ -173,6 +175,9 @@ impl fmt::Display for ContestRuleError {
         match self {
             ContestRuleError::UnknownRulesId => {
                 write!(f, "contest: unknown rules_id")
+            }
+            ContestRuleError::ProfileMismatch => {
+                write!(f, "contest: profile_id does not match the selected rules")
             }
             ContestRuleError::InvalidOperatorRegion => {
                 write!(
@@ -224,8 +229,9 @@ pub struct ContestScoringContext {
 
 impl ContestScoringContext {
     /// Validate and build a context. Rule-dependent validation (unknown
-    /// rules id, region validity) happens here so the coordinator can refuse
-    /// to run the station with the exact operator-facing message.
+    /// rules id, profile match, region validity) happens here so the
+    /// coordinator can refuse to run the station with the exact
+    /// operator-facing message.
     pub fn new(
         instance_id: &str,
         profile_id: &str,
@@ -233,7 +239,11 @@ impl ContestScoringContext {
         operator_region: &str,
         periods: Vec<ContestPeriod>,
     ) -> Result<Self, ContestRuleError> {
-        resolve_rules(rules_id)?;
+        // Reject a profile the selected rules cannot score under before
+        // `attach` can stamp contacts with a context `decode` would reject.
+        if resolve_rules(rules_id)?.profile_id != profile_id.trim() {
+            return Err(ContestRuleError::ProfileMismatch);
+        }
         let region = operator_region.trim().to_ascii_uppercase();
         if !is_valid_region(&region) {
             return Err(ContestRuleError::InvalidOperatorRegion);
@@ -303,8 +313,9 @@ pub struct ContestContactFact {
     /// Partner callsign (case and surrounding whitespace normalize; portable
     /// suffixes are preserved).
     pub callsign: String,
-    /// Normalized logged band (uppercase, e.g. `20M`); `None` when the
-    /// logged RF frequency cannot produce a band.
+    /// Normalized logged band (uppercase, e.g. `20M`); `None` when neither
+    /// the logged BAND field nor the logged RF frequency produces a usable
+    /// band (e.g. logged without CAT), leaving eligibility pending.
     pub band: Option<String>,
     /// Logged mode string, normalized uppercase on classification.
     pub mode: String,
@@ -996,6 +1007,47 @@ mod tests {
     /// The bonus engine: credited once per band/digital group even after a
     /// county change, with synthetic weights independent of the catalog.
     /// Production sponsor weights are covered by integration fixtures.
+    #[test]
+    fn context_rejects_a_profile_that_does_not_match_the_selected_rules() {
+        let start = DateTime::parse_from_rfc3339("2026-08-29T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-08-30T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // A misspelled profile_id used to pass startup, get stamped onto
+        // contacts by `attach`, and then fail every `decode` (hence the
+        // whole ledger) with "contest: unsupported profile" — permanently,
+        // including after restart.
+        assert_eq!(
+            ContestScoringContext::new(
+                "KSQP-2026-K5ARH",
+                "us-state-qso-partty",
+                KSQP_FT_2026,
+                "TX",
+                vec![ContestPeriod { start, end }]
+            )
+            .unwrap_err(),
+            ContestRuleError::ProfileMismatch
+        );
+        assert_eq!(
+            ContestRuleError::ProfileMismatch.to_string(),
+            "contest: profile_id does not match the selected rules"
+        );
+        // Every known rule edition pairs with its family profile, trimmed
+        // as `new` normalizes it.
+        for rules in known_rules() {
+            assert!(ContestScoringContext::new(
+                "KSQP-2026-K5ARH",
+                " us-state-qso-party ",
+                rules.id,
+                "TX",
+                vec![ContestPeriod { start, end }]
+            )
+            .is_ok());
+        }
+    }
+
     #[test]
     fn bonus_stations_credit_once_per_band_with_all_three_weights() {
         let synthetic = ContestRules {

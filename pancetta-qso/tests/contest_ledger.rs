@@ -154,6 +154,45 @@ async fn unknown_and_malformed_contexts_round_trip_but_make_ledger_unavailable()
     }
 }
 
+/// An annotated contest record whose RF evidence fields the caller chooses:
+/// `record_to_qso` defaults FREQ to zero when absent, so a BAND-only record
+/// exercises the explicit-band path.
+fn annotated_record(rf_fields: &str) -> String {
+    let context = serde_json::json!({
+        "version": 1, "profile_id":"us-state-qso-party",
+        "operator_callsign":"K5ARH", "operator_region":"TX",
+        "periods":[{"start":"2026-08-29T14:00:00Z", "end":"2026-08-30T02:00:00Z"}],
+        "evidence":{"their_region":null,"their_county":null,"our_county":null,"source":"import"}
+    })
+    .to_string();
+    format!("<CALL:4>K0KS<QSO_DATE:8>20260829<TIME_ON:6>143000<MODE:3>FT8{rf_fields}<STATE:2>KS<APP_PANCETTA_CONTEST_INSTANCE:4>test<APP_PANCETTA_CONTEST_RULES:12>ksqp-ft-2026<APP_PANCETTA_CONTEST_CONTACT_ID:36>9b16f2be-7d63-4a89-b789-f863df27bccf<APP_PANCETTA_CONTEST_CONTEXT:{}>{context}<EOR>", context.len())
+}
+
+#[test]
+fn fact_honors_explicit_band_and_keeps_placeholder_bands_pending() {
+    use pancetta_qso::contest::ledger::*;
+    let p = AdifProcessor::new();
+
+    // BAND without FREQ: the logged band is the evidence. Deriving the band
+    // from the defaulted zero frequency alone would produce the `0MHZ`
+    // placeholder and the reducer would exclude an eligible contact as
+    // DisallowedBand, undercounting the reconstructed score.
+    let file = p.parse_string(&annotated_record("<BAND:3>20M")).unwrap();
+    let metadata = p.adif_to_qso(&p.record_to_qso(&file.records[0]).unwrap());
+    let f = fact(&metadata, &context(), "K5ARH").unwrap();
+    assert_eq!(f.band.as_deref(), Some("20M"));
+
+    // Pancetta without CAT logs the audio offset as FREQ with BAND=0MHZ:
+    // neither field carries usable band evidence, so the fact carries no
+    // band and the reducer keeps the contact pending instead of excluded.
+    let file = p
+        .parse_string(&annotated_record("<FREQ:8>0.001500<BAND:4>0MHZ"))
+        .unwrap();
+    let metadata = p.adif_to_qso(&p.record_to_qso(&file.records[0]).unwrap());
+    let f = fact(&metadata, &context(), "K5ARH").unwrap();
+    assert_eq!(f.band, None);
+}
+
 #[test]
 fn conflicting_evidence_is_pending_and_never_guessed_from_grid() {
     use pancetta_qso::contest::ledger::*;
