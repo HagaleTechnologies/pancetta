@@ -95,6 +95,24 @@ pub(crate) fn spot_publish_target(
     bridge.filter(|_| !replay_mode)
 }
 
+/// The `[alerts]` config the autonomous task may deliver through.
+///
+/// Under `--replay` the outbound HTTP channels (ntfy, webhook) are turned
+/// off: a replayed decode is a historical capture, and posting it would send
+/// a fabricated "live" notification and trigger downstream automation, the
+/// same failure mode [`spot_publish_target`] guards for cqdx.io. The terminal
+/// bell is local and stays as configured.
+pub(crate) fn alert_delivery_config(
+    mut alerts: pancetta_config::alerts::AlertsConfig,
+    replay_mode: bool,
+) -> pancetta_config::alerts::AlertsConfig {
+    if replay_mode {
+        alerts.ntfy.enabled = false;
+        alerts.webhook.enabled = false;
+    }
+    alerts
+}
+
 /// The absolute frequency (Hz) to report a cqdx spot at: the dial the
 /// decode's own audio window was captured on
 /// (`DecodedMessageInfo::captured_dial_hz`), plus the decode's
@@ -154,6 +172,39 @@ mod replay_gate_tests {
             spot_publish_target(Some(&b), true).is_none(),
             "--replay must never POST replayed decodes to cqdx.io as live spots"
         );
+    }
+
+    fn http_alerts() -> pancetta_config::alerts::AlertsConfig {
+        let mut a = pancetta_config::alerts::AlertsConfig::default();
+        a.bell.enabled = true;
+        a.ntfy.enabled = true;
+        a.ntfy.topic = "pancetta-test".into();
+        a.webhook.enabled = true;
+        a.webhook.url = "https://example.invalid/hook".into();
+        a
+    }
+
+    #[test]
+    fn replay_turns_off_http_alert_delivery_but_keeps_the_bell() {
+        let a = alert_delivery_config(http_alerts(), true);
+        assert!(
+            !a.ntfy.enabled,
+            "--replay must never post ntfy alerts for replayed decodes"
+        );
+        assert!(
+            !a.webhook.enabled,
+            "--replay must never POST replayed decodes to the webhook"
+        );
+        assert!(
+            a.bell.enabled,
+            "the local terminal bell is not an outbound integration"
+        );
+    }
+
+    #[test]
+    fn live_run_keeps_configured_http_alert_delivery() {
+        let a = alert_delivery_config(http_alerts(), false);
+        assert!(a.ntfy.enabled && a.webhook.enabled && a.bell.enabled);
     }
 
     #[tokio::test]
@@ -2040,8 +2091,13 @@ impl super::ApplicationCoordinator {
             .take()
             .expect("waterfall_to_auto_rx set at coordinator construction");
 
+        if self.replay_mode() && (alert_config.ntfy.enabled || alert_config.webhook.enabled) {
+            info!(
+                "Replay mode: ntfy and webhook alerts suppressed -- replayed decodes are not live"
+            );
+        }
         let mut alerts = super::alerts::AlertDispatcher::new(
-            alert_config,
+            alert_delivery_config(alert_config, self.replay_mode()),
             (*cached_lookup).clone(),
             priority_weights.clone(),
             !self.headless,
