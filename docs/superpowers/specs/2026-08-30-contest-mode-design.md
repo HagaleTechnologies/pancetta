@@ -98,3 +98,5 @@ Instead: a small in-memory tracker (rolling counts of unclassified-exchange-shap
 - PAN-50 (scoring/multipliers) and PAN-51 (text-vs-struct classification) are real gaps, deliberately deferred — this design does not attempt them.
 - Cabrillo per-contest QSO-line templates will need real submission-format verification per contest sponsor before a log is actually submitted competitively; treat v1 Cabrillo output as "structurally correct, sponsor-format-unverified" until checked against a real submission.
 - The pattern-inference thresholds (N stations × M occurrences) need tuning once live; no data yet on what avoids false positives during quiet band conditions vs. missing real contests during a busy weekend.
+
+PAN-50 scoring is specified separately in [contest scoring](2026-11-05-contest-scoring.md). It does not complete the exchange encoder, engagement modal or Cabrillo work described here.

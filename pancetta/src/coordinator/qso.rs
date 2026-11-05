@@ -3058,6 +3058,36 @@ impl super::ApplicationCoordinator {
         // `[station] tx_late_max_ms` reaches `keep_call_tx_slot` — the same
         // value the TX worker snapshots for `schedule_tx`.
         let station_tx_late_max_ms = config.station.tx_late_max_ms;
+
+        // PAN-50: convert the validated `[contest]` section into the
+        // contest-scoring context here, where both pancetta-config and the
+        // pancetta-qso rule catalog are visible (serialized config stays
+        // independent of pancetta-qso). An unknown rules_id or invalid
+        // operator_region refuses startup with the operator-facing message
+        // rather than silently disabling scoring; structural validation
+        // (required fields, period shape) already ran in Config::validate.
+        // Computed before `drop(config)` below so the read guard can be
+        // released on schedule.
+        let contest_scoring = match &config.contest {
+            Some(contest) if contest.enabled => {
+                let periods = contest
+                    .periods
+                    .iter()
+                    .map(|window| pancetta_qso::contest::scoring::ContestPeriod {
+                        start: window.start,
+                        end: window.end,
+                    })
+                    .collect();
+                Some(pancetta_qso::contest::scoring::ContestScoringContext::new(
+                    contest.instance_id.as_deref().unwrap_or(""),
+                    contest.profile_id.as_deref().unwrap_or(""),
+                    contest.rules_id.as_deref().unwrap_or(""),
+                    contest.operator_region.as_deref().unwrap_or(""),
+                    periods,
+                ))
+            }
+            _ => None,
+        };
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -3209,6 +3239,13 @@ impl super::ApplicationCoordinator {
         // `start_wsjtx_udp_component`, so the field is always already
         // populated by the time the latter reads it — no channel, handoff, or
         // timeout needed.
+        // PAN-50: surface the contest-context conversion error (unknown
+        // rules_id / invalid operator_region) with the operator-facing
+        // message; see the extraction above `drop(config)`.
+        let contest_scoring = contest_scoring
+            .transpose()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
         let qso_config = {
             use pancetta_qso::{
                 DuplicateCheckConfig, HoundRegions, QsoManagerConfig, TimeoutConfig,
@@ -3217,6 +3254,7 @@ impl super::ApplicationCoordinator {
             QsoManagerConfig {
                 our_callsign: our_callsign.clone(),
                 our_grid: our_grid.clone(),
+                contest_scoring,
                 hound: HoundRegions {
                     call_min_hz: hound_cfg.call_min_hz,
                     call_max_hz: hound_cfg.call_max_hz,
@@ -3507,6 +3545,14 @@ impl super::ApplicationCoordinator {
                         }
                     })
                 };
+                // One sequential reader per QSO component; abort it on supervisor teardown.
+                let _contest_worker = super::contest::start(
+                    qso_manager.clone(),
+                    message_bus.clone(),
+                    db_path.clone(),
+                    adif_path.clone(),
+                    shutdown.clone(),
+                );
                 let history_result = match history_db {
                     Ok(db) => initialize_qso_history(&mut qso_manager, &qso_lookup, db).await,
                     Err(error) => Err(error),
@@ -17000,5 +17046,109 @@ mod dxpedition_receive_integration_tests {
                 QsoState::Completed { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod pan50_live_contest {
+    use super::*;
+    use pancetta_qso::contest::scoring::*;
+    #[tokio::test]
+    async fn manual_completion_survives_real_writers_and_adif_index_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let index = dir.path().join("qso.db");
+        let now = chrono::Utc::now();
+        let context = ContestScoringContext::new(
+            "live",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "KS",
+            vec![ContestPeriod {
+                start: now - chrono::Duration::minutes(1),
+                end: now + chrono::Duration::minutes(10),
+            }],
+        )
+        .unwrap();
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            our_grid: Some("FN42".into()),
+            contest_scoring: Some(context.clone()),
+            ..Default::default()
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_writer, _logger, db) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &index,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+        let db = db.unwrap();
+        let id = manager
+            .start_cq_manual(14_074_000.0, None, false, None)
+            .await
+            .unwrap();
+        use pancetta_qso::MessageType as M;
+        for message in [
+            M::CqResponse {
+                calling_station: "W1ABC".into(),
+                responding_station: "K1DEF".into(),
+                grid: Some("FN31".into()),
+            },
+            M::ReportAck {
+                to_station: "W1ABC".into(),
+                from_station: "K1DEF".into(),
+                report: -12,
+            },
+            M::SeventyThree {
+                to_station: "W1ABC".into(),
+                from_station: "K1DEF".into(),
+            },
+        ] {
+            manager
+                .process_message(message, String::new(), 14_074_000.0, Some(-10.0))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            pancetta_qso::QsoState::Completed { .. }
+        ));
+        let facts = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let facts = db.contest_ledger(&context, "W1ABC").await.unwrap();
+                if facts.len() == 1
+                    && tokio::fs::read_to_string(&adif)
+                        .await
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains("<eor>")
+                {
+                    break facts;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.store(true, Ordering::Release);
+        let rebuilt =
+            pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", &adif)
+                .await
+                .unwrap();
+        assert_eq!(
+            facts,
+            rebuilt.contest_ledger(&context, "W1ABC").await.unwrap()
+        );
+        assert_eq!(
+            reduce_contest_score(&context, &facts, chrono::Utc::now())
+                .unwrap()
+                .score,
+            1
+        );
     }
 }

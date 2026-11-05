@@ -57,6 +57,7 @@ use tracing::{debug, info};
 // Re-export all configuration modules
 pub mod audio;
 pub mod autonomous;
+pub mod contest;
 pub mod database;
 pub mod decoder;
 pub mod duplicate_check;
@@ -72,6 +73,7 @@ pub mod ui;
 
 pub use audio::*;
 pub use autonomous::*;
+pub use contest::*;
 pub use database::*;
 pub use decoder::*;
 pub use duplicate_check::*;
@@ -198,6 +200,11 @@ pub struct Config {
     #[serde(default)]
     pub database: database::DatabaseConfig,
 
+    /// Contest scoring (PAN-50). Optional startup-only opt-in; absent means
+    /// contest scoring is disabled and nothing changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contest: Option<contest::ContestScoringConfig>,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -244,6 +251,7 @@ impl Default for Config {
             decoder: decoder::DecoderConfig::default(),
             duplicate_checking: duplicate_check::DuplicateCheckingConfig::default(),
             database: database::DatabaseConfig::default(),
+            contest: None,
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -359,6 +367,10 @@ impl Config {
         self.duplicate_checking.validate_section()?;
         self.database.validate_section()?;
 
+        if let Some(contest) = &self.contest {
+            contest.validate_section()?;
+        }
+
         info!("Configuration validation successful");
         Ok(())
     }
@@ -379,6 +391,13 @@ impl Config {
         self.decoder.merge_with(other.decoder);
         self.duplicate_checking.merge_with(other.duplicate_checking);
         self.database.merge_with(other.database);
+
+        // [contest] replaces as a unit; an overlay without the section leaves
+        // the base's contest untouched (absent ≠ disabled — the explicit
+        // opt-out is `enabled = false`).
+        if other.contest.is_some() {
+            self.contest = other.contest;
+        }
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
@@ -1987,5 +2006,20 @@ mod merge_guard {
         assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
             a.merge_with(b)
         });
+
+        assert_carries_all::<contest::ContestScoringConfig>(
+            "ContestScoringConfig",
+            &[
+                ("instance_id", json!("KSQP-2026-K5ARH")),
+                ("profile_id", json!("us-state-qso-party")),
+                ("rules_id", json!("ksqp-ft-2026")),
+                ("operator_region", json!("TX")),
+                (
+                    "periods",
+                    json!([{ "start": "2026-08-29T14:00:00Z", "end": "2026-08-30T02:00:00Z" }]),
+                ),
+            ],
+            |a, b| a.merge_with(b),
+        );
     }
 }

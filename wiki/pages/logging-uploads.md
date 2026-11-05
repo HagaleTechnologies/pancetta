@@ -49,3 +49,13 @@ waits at most 250 ms for the fsync, so a stalled disk never holds PTT, and
 is best-effort and is dropped headless. A test that bounds the time until
 `TxFrameLogged` also times that fsync, so time it on a worker harness built
 with `TxFrameLog::disabled()` (PAN-248).
+
+## Contest history recovery
+
+PAN-50 keeps instance context and a stable contact UUID in four ADIF app
+fields, so deleting the SQLite index does not erase contest membership.
+Standard CONTEST_ID remains absent for family profiles. The score reader
+requires the index and ADIF to agree, so a completion event alone cannot
+publish a ready score. Missing location evidence stays pending and unknown
+context versions remain lossless but unavailable. Rule ids pin sponsor
+editions; see docs/superpowers/specs/2026-11-05-contest-scoring.md.

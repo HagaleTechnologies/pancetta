@@ -1675,6 +1675,7 @@ pub struct App {
     /// PAN-89: latest coordinator readiness snapshot (`None` until the
     /// relay's first push, which the strip shows as `… CHECKING`).
     pub station_readiness: Option<crate::readiness::StationReadiness>,
+    pub contest_score: Option<pancetta_qso::contest::ledger::ContestScoreUpdate>,
     /// PAN-89: sticky error alerts from `TuiMessage::Error`, oldest first,
     /// capped at `readiness::ALERT_CAP`. They stay on the readiness strip
     /// until acknowledged with `!`; decodes can't erase them.
@@ -1885,6 +1886,7 @@ impl App {
             tx_output_default: false,
             input_fallback: false,
             station_readiness: None,
+            contest_score: None,
             alerts: VecDeque::new(),
             acknowledged_readiness: HashSet::new(),
             next_alert_id: 0,
@@ -2081,13 +2083,16 @@ impl App {
     /// openness-STRIP row (row 0; other instrument rows just focus the
     /// panel) parks at the clicked frequency via `click_park_tx_placement`.
     fn handle_left_click(&mut self, x: u16, y: u16) -> Option<crate::tui_runner::TuiCommand> {
-        let content_area =
-            crate::ui::content_area(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
+        let content_area = crate::contest_score::content(
+            crate::ui::content_area(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1)),
+            self.contest_score.as_ref(),
+        );
         let (panel, row) = crate::ui::hit_test(
             self.active_view,
             self.zoomed,
             self.active_panel,
             content_area,
+            self.contest_score.as_ref(),
             x,
             y,
         )?;
