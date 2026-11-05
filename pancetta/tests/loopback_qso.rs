@@ -201,6 +201,7 @@ async fn test_loopback_state_machine_driven_qso() {
             qso_stall_switch_after: 4,
         },
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: AutoSequenceConfig {
             enabled: false,
             auto_respond_cq: false,
@@ -219,6 +220,7 @@ async fn test_loopback_state_machine_driven_qso() {
         our_grid: Some("FM18".to_string()),
         timeouts: config_a.timeouts.clone(),
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: config_a.auto_sequence.clone(),
         duplicate_checking: config_a.duplicate_checking.clone(),
         ..Default::default()
@@ -1271,6 +1273,7 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
             qso_stall_switch_after: 4,
         },
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: AutoSequenceConfig {
             enabled: false,
             auto_respond_cq: false,
@@ -1289,6 +1292,7 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
         our_grid: Some("FN42".to_string()),
         timeouts: config_dx.timeouts.clone(),
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: config_dx.auto_sequence.clone(),
         duplicate_checking: config_dx.duplicate_checking.clone(),
         ..Default::default()
@@ -1463,6 +1467,7 @@ async fn test_loopback_pan_49_contest_r_grid_ack_advances_qso() {
             qso_stall_switch_after: 4,
         },
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: AutoSequenceConfig {
             enabled: false,
             auto_respond_cq: false,
@@ -1596,6 +1601,7 @@ async fn genuinely_unresolvable_caller_hash_never_resolves_but_retires_cleanly()
             qso_stall_switch_after: 4,
         },
         contest_mode: None,
+        contest_scoring: None,
         auto_sequence: AutoSequenceConfig {
             enabled: false,
             auto_respond_cq: false,

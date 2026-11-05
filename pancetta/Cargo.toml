@@ -96,6 +96,12 @@ hound = "3.5"
 # FFT for live waterfall
 rustfft = "6.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSString"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
+
 [dev-dependencies]
 async-trait = "0.1"
 ratatui = "0.30"
@@ -126,8 +132,3 @@ ft2 = ["pancetta-ft8/ft2"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-block2 = "0.6"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSString"] }
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
