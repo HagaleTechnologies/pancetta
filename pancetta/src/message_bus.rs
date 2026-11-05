@@ -116,6 +116,11 @@ pub enum TxOrigin {
 /// share the same type across the bus boundary.
 pub use pancetta_core::DiagnosticLevel;
 
+/// `MessageType::Error::error_code` for a runtime audio stream/output error.
+/// Audio auto-recovery sends a matching `ErrorResolved` once the devices
+/// reopen.
+pub const AUDIO_RUNTIME_ERROR_CODE: u32 = 1;
+
 /// Message types that can be sent between components
 #[derive(Debug, Clone)]
 pub enum MessageType {
@@ -149,6 +154,13 @@ pub enum MessageType {
         component_id: ComponentId,
         error_message: String,
         error_code: Option<u32>,
+    },
+
+    /// The fault behind earlier `Error`s with this `error_code` recovered on
+    /// its own, so the TUI clears their alerts.
+    ErrorResolved {
+        component_id: ComponentId,
+        error_code: u32,
     },
 
     /// A retained, operator-facing diagnostic event (docs/observability-
