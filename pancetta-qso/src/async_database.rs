@@ -822,9 +822,10 @@ impl QsoDatabase {
             {
                 continue;
             }
-            let adif: AdifQso = serde_json::from_str(row.get("adif_data"))?;
-            let fact =
-                ledger::fact(&metadata, &adif.band, context, operator_callsign).map_err(error)?;
+            // Unreadable `adif_data` must fail the supposedly complete
+            // history closed, same as unreadable metadata.
+            serde_json::from_str::<AdifQso>(row.get("adif_data"))?;
+            let fact = ledger::fact(&metadata, context, operator_callsign).map_err(error)?;
             let state: QsoState = serde_json::from_str(row.get("final_state"))?;
             if matches!(state, QsoState::Completed { .. }) && context.in_period(fact.start) {
                 facts.push(fact);

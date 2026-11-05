@@ -617,6 +617,7 @@ pub fn hit_test(
     zoomed: bool,
     active_panel: ActivePanel,
     area: Rect,
+    contest_score: Option<&pancetta_qso::contest::ledger::ContestScoreUpdate>,
     x: u16,
     y: u16,
 ) -> Option<(ActivePanel, u16)> {
@@ -626,8 +627,14 @@ pub fn hit_test(
     // floor below is the content area's size at the exact MIN_TERMINAL_*
     // boundary, not those constants themselves (comparing directly against
     // them would reject clicks on plenty of valid, non-degraded terminals
-    // right at the floor).
-    let min_content = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT));
+    // right at the floor). The caller's area is additionally shortened by
+    // the contest strip (`contest_score::content`, exactly what `draw()`
+    // lays panels out in), so the floor subtracts the same strip rows and a
+    // supported terminal with the strip visible still hit-tests.
+    let min_content = crate::contest_score::content(
+        content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT)),
+        contest_score,
+    );
     if area.width < min_content.width || area.height < min_content.height {
         return None;
     }
@@ -3751,6 +3758,7 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             area,
+            None,
             x,
             y,
         );
@@ -3769,6 +3777,7 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             area,
+            None,
             5,
             area.y + area.height + 1,
         );
@@ -3794,6 +3803,7 @@ mod hit_test_tests {
             false,
             ActivePanel::Callers,
             area,
+            None,
             tx_rect.x + 2,
             tx_rect.y + 1, // border(1) + row 0 (strip)
         );
@@ -3804,6 +3814,7 @@ mod hit_test_tests {
             false,
             ActivePanel::Callers,
             area,
+            None,
             tx_rect.x + 2,
             tx_rect.y + 1 + 3, // border(1) + row 3 (park line)
         );
@@ -3821,6 +3832,7 @@ mod hit_test_tests {
             true,
             ActivePanel::DxHunter,
             area,
+            None,
             10,
             area.y + 2 + 5,
         );
@@ -3838,6 +3850,7 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             too_narrow,
+            None,
             5,
             too_narrow.y + 2,
         );
@@ -3849,6 +3862,7 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             too_short,
+            None,
             5,
             too_short.y + 2,
         );
@@ -3879,6 +3893,54 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             at_floor,
+            None,
+            band_activity_rect.x + 2,
+            band_activity_rect.y + 2,
+        );
+        assert_eq!(hit, Some((ActivePanel::BandActivity, 0)));
+    }
+
+    /// PAN-50: with a Ready contest strip visible, `handle_left_click`
+    /// passes `hit_test` the content area already shortened by the strip's
+    /// rows — the same area `draw()` lays panels out in. At the 80x20
+    /// floor that area is 15 - 2 = 13 rows, which must still hit-test:
+    /// the terminal is supported and the panels are rendered.
+    #[test]
+    fn hit_test_works_at_min_terminal_with_contest_strip() {
+        use pancetta_qso::contest::ledger::{ContestScoreState, ContestScoreUpdate};
+        use pancetta_qso::contest::scoring::{
+            reduce_contest_score, ContestScoringContext, KSQP_FT_2026,
+        };
+        let snapshot = reduce_contest_score(
+            &ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
+                .unwrap(),
+            &[],
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let update = ContestScoreUpdate {
+            generation: 1,
+            instance_id: "ks".into(),
+            rules_id: KSQP_FT_2026.into(),
+            display_name: "KSQP 2026".into(),
+            outside_period: false,
+            state: ContestScoreState::Ready(snapshot),
+        };
+        let full = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT));
+        let area = crate::contest_score::content(full, Some(&update));
+        assert_eq!(area.height, 13);
+        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        let (_, band_activity_rect) = rects
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::BandActivity)
+            .unwrap();
+
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            Some(&update),
             band_activity_rect.x + 2,
             band_activity_rect.y + 2,
         );

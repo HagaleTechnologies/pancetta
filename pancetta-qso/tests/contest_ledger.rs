@@ -162,7 +162,7 @@ fn conflicting_evidence_is_pending_and_never_guessed_from_grid() {
     let mut adif = p.record_to_qso(&file.records[0]).unwrap();
     adif.state = Some("SC".into());
     let metadata = p.adif_to_qso(&adif);
-    let f = fact(&metadata, "20M", &context(), "K5ARH").unwrap();
+    let f = fact(&metadata, &context(), "K5ARH").unwrap();
     assert!(f.their_region.is_none());
     assert!(f.their_county.is_none());
     let exported = p.qso_to_adif(&metadata, metadata.contest_info.as_ref());
@@ -174,7 +174,7 @@ fn conflicting_evidence_is_pending_and_never_guessed_from_grid() {
     adif.additional_fields.remove("CNTY");
     adif.gridsquare = Some("EM10".into());
     let metadata = p.adif_to_qso(&adif);
-    let f = fact(&metadata, "20M", &context(), "K5ARH").unwrap();
+    let f = fact(&metadata, &context(), "K5ARH").unwrap();
     assert!(f.their_region.is_none());
     assert!(f.their_county.is_none());
 }
@@ -285,11 +285,11 @@ fn fractional_live_start_survives_adif_round_trip() {
     metadata.our_callsign = "K5ARH".into();
     metadata.start_time = "2026-08-29T14:30:00.123456Z".parse().unwrap();
     attach(&mut metadata, &context());
-    let before = fact(&metadata, "20M", &context(), "K5ARH").unwrap();
+    let before = fact(&metadata, &context(), "K5ARH").unwrap();
     let raw = p
         .generate_record(&p.qso_to_adif(&metadata, metadata.contest_info.as_ref()))
         .unwrap();
     let file = p.parse_string(&raw).unwrap();
     let metadata = p.adif_to_qso(&p.record_to_qso(&file.records[0]).unwrap());
-    assert_eq!(before, fact(&metadata, "20M", &context(), "K5ARH").unwrap());
+    assert_eq!(before, fact(&metadata, &context(), "K5ARH").unwrap());
 }

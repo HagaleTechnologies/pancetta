@@ -178,7 +178,7 @@ async fn read_history(
                     continue;
                 }
                 let metadata = p.adif_to_qso(&adif);
-                let row = fact(&metadata, &adif.band, &context, &operator)?;
+                let row = fact(&metadata, &context, &operator)?;
                 if context.in_period(row.start) {
                     facts.push(row);
                 }
@@ -205,6 +205,48 @@ async fn read_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn freq_without_band_history_still_scores_after_rebuild() {
+        use pancetta_qso::async_database::QsoDatabase;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("qso.db");
+        let adif_path = dir.path().join("qsos.adi");
+        let context = ContestScoringContext::new(
+            "test",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "TX",
+            vec![ContestPeriod {
+                start: "2026-08-29T14:00:00Z".parse().unwrap(),
+                end: "2026-08-30T02:00:00Z".parse().unwrap(),
+            }],
+        )
+        .unwrap();
+        // ADIF permits FREQ with no BAND. The index rebuild derives the band
+        // from the frequency (qso_to_adif); the durable reader must apply the
+        // same normalization or the cross-check rejects the history forever.
+        let logged = serde_json::json!({
+            "version": 1, "profile_id": "us-state-qso-party",
+            "operator_callsign": "K5ARH", "operator_region": "TX",
+            "periods": [{"start": "2026-08-29T14:00:00Z", "end": "2026-08-30T02:00:00Z"}],
+            "evidence": {"their_region": null, "their_county": null, "our_county": null, "source": "import"}
+        })
+        .to_string();
+        let raw = format!(
+            "<CALL:4>K0KS<QSO_DATE:8>20260829<TIME_ON:6>143000<FREQ:6>14.074<MODE:3>FT8<STATION_CALLSIGN:5>K5ARH<STATE:2>KS<CNTY:5>KS,SB<APP_PANCETTA_CONTEST_INSTANCE:4>test<APP_PANCETTA_CONTEST_RULES:12>ksqp-ft-2026<APP_PANCETTA_CONTEST_CONTACT_ID:36>9b16f2be-7d63-4a89-b789-f863df27bccf<APP_PANCETTA_CONTEST_CONTEXT:{}>{logged}<EOR>",
+            logged.len()
+        );
+        tokio::fs::write(&adif_path, &raw).await.unwrap();
+        QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap();
+        let facts = read_history(&db_path, &adif_path, &context, "K5ARH", &[])
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].band.as_deref(), Some("20M"));
+    }
+
     #[tokio::test]
     async fn persisted_history_requires_both_writers_and_recovers_after_rebuild_and_undo() {
         use pancetta_qso::{adif::AdifProcessor, async_database::QsoDatabase};

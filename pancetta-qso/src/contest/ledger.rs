@@ -194,7 +194,6 @@ pub fn attach(metadata: &mut QsoMetadata, context: &ContestScoringContext) {
 /// with the same instance id outside today's configured periods.
 pub fn fact(
     metadata: &QsoMetadata,
-    band: &str,
     context: &ContestScoringContext,
     operator_callsign: &str,
 ) -> Result<ContestContactFact, String> {
@@ -223,7 +222,7 @@ pub fn fact(
             .their_callsign
             .clone()
             .ok_or("contest: missing callsign")?,
-        band: normalized(Some(band)),
+        band: normalized(Some(&crate::adif::freq_hz_to_band(metadata.frequency))),
         mode: metadata.mode.clone(),
         start,
         failed: false,

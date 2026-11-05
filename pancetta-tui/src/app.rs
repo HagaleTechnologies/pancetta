@@ -2092,6 +2092,7 @@ impl App {
             self.zoomed,
             self.active_panel,
             content_area,
+            self.contest_score.as_ref(),
             x,
             y,
         )?;
