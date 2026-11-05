@@ -827,7 +827,7 @@ impl super::ApplicationCoordinator {
                         MessageType::Error {
                             component_id,
                             ref error_message,
-                            ..
+                            error_code,
                         } => {
                             // Component-level errors (audio init failure, audio
                             // device stalls, etc.) get surfaced to the TUI's error
@@ -838,6 +838,18 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::Error {
                                     component: format!("{}", component_id),
                                     message: error_message.clone(),
+                                    code: error_code,
+                                },
+                            );
+                        }
+                        MessageType::ErrorResolved {
+                            component_id,
+                            error_code,
+                        } => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::ErrorResolved {
+                                    component: format!("{}", component_id),
+                                    code: error_code,
                                 },
                             );
                         }
@@ -1393,6 +1405,7 @@ impl super::ApplicationCoordinator {
                 let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::Error {
                     component: "config".to_string(),
                     message: w.clone(),
+                    code: None,
                 });
             }
 

@@ -1678,7 +1678,8 @@ pub struct App {
     pub contest_score: Option<pancetta_qso::contest::ledger::ContestScoreUpdate>,
     /// PAN-89: sticky error alerts from `TuiMessage::Error`, oldest first,
     /// capped at `readiness::ALERT_CAP`. They stay on the readiness strip
-    /// until acknowledged with `!`; decodes can't erase them.
+    /// until acknowledged with `!` or resolved by `TuiMessage::ErrorResolved`;
+    /// decodes can't erase them.
     pub alerts: VecDeque<crate::readiness::Alert>,
     /// PAN-89: warnings the operator acknowledged with `!`. Pruned to the
     /// still-active conditions whenever readiness inputs update, so an ack
@@ -3351,6 +3352,12 @@ impl App {
     }
 
     pub fn add_error_message(&mut self, error: String) {
+        self.add_coded_error_message(error, None);
+    }
+
+    /// Like [`Self::add_error_message`], tagged with the `code` a later
+    /// [`Self::resolve_alerts`] clears it by.
+    pub fn add_coded_error_message(&mut self, error: String, code: Option<u32>) {
         self.status_message = format!("Error: {}", error);
         // PAN-89: also a sticky alert on the readiness strip until `!`
         // acknowledges it. A repeat of an unacknowledged alert counts up
@@ -3358,7 +3365,7 @@ impl App {
         if let Some(alert) = self
             .alerts
             .iter_mut()
-            .find(|a| !a.acknowledged && a.text == error)
+            .find(|a| !a.acknowledged && a.text == error && a.code == code)
         {
             alert.count += 1;
             return;
@@ -3367,6 +3374,7 @@ impl App {
         self.alerts.push_back(crate::readiness::Alert {
             id: self.next_alert_id,
             text: error,
+            code,
             count: 1,
             first_at: Utc::now(),
             acknowledged: false,
@@ -3374,6 +3382,14 @@ impl App {
         while self.alerts.len() > crate::readiness::ALERT_CAP {
             self.alerts.pop_front();
         }
+    }
+
+    /// The fault behind every alert tagged `code` recovered on its own: drop
+    /// those alerts, acknowledged or not. Returns how many were dropped.
+    pub fn resolve_alerts(&mut self, code: u32) -> usize {
+        let before = self.alerts.len();
+        self.alerts.retain(|a| a.code != Some(code));
+        before - self.alerts.len()
     }
 
     /// PAN-89 `!`: acknowledge every visible readiness Warning (alerts are

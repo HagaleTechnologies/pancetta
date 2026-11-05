@@ -133,6 +133,14 @@ pub enum TuiMessage {
     Error {
         component: String,
         message: String,
+        /// Set when the producer will report recovery with `ErrorResolved`.
+        code: Option<u32>,
+    },
+    /// The fault behind `Error`s with this `code` recovered on its own;
+    /// their alerts clear.
+    ErrorResolved {
+        component: String,
+        code: u32,
     },
     /// PAN-89: station readiness snapshot — coordinator relay, 2 s tick,
     /// pushed on change. Drives the readiness strip's verdict and items.
@@ -858,8 +866,14 @@ impl TuiRunner {
             TuiMessage::Error {
                 component: _,
                 message,
+                code,
             } => {
-                app.add_error_message(message);
+                app.add_coded_error_message(message, code);
+            }
+            TuiMessage::ErrorResolved { component, code } => {
+                if app.resolve_alerts(code) > 0 {
+                    app.status_message = format!("{component} recovered — alert cleared");
+                }
             }
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
@@ -3711,11 +3725,36 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn recovered_error_clears_its_alert_without_ack() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Audio".to_string(),
+            message: "Audio processing error: Stream error".to_string(),
+            code: Some(1),
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("Audio processing error"), "row 1: {row}");
+
+        r.handle_message(TuiMessage::ErrorResolved {
+            component: "Audio".to_string(),
+            code: 1,
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Audio processing error"), "row 1: {row}");
+        assert!(!row.contains("ack"), "row 1: {row}");
+    }
+
+    #[tokio::test]
     async fn pan89_error_alert_survives_decode_burst_until_acknowledged() {
         let (mut r, _cmd_rx, app) = make_runner().await;
         r.handle_message(TuiMessage::Error {
             component: "Hamlib".to_string(),
             message: "Rig connect failed (connection refused)".to_string(),
+            code: None,
         })
         .await
         .unwrap();
