@@ -40,6 +40,7 @@ pub mod receive_overload;
 mod remote_gateway;
 mod replay;
 mod restart_budget;
+mod session_state;
 mod shutdown;
 pub mod station_agent;
 mod swr_guard;
@@ -1345,6 +1346,22 @@ pub struct ApplicationCoordinator {
     /// helpers set this to an isolated temp dir.
     pub(crate) pancetta_home_override: Option<PathBuf>,
 
+    /// PAN-270: the canonical session record (the operator's last live
+    /// TX-frequency mode and decode-effort choices, plus the effort record's
+    /// config baseline). Resolved once in `new` from
+    /// `~/.pancetta/session_state.json`; every live mutation (`e` cycle,
+    /// `f` toggle, `o` set/clear) updates exactly its own field and rewrites
+    /// the file through `session_state::persist_session_choice`.
+    session_record: Arc<std::sync::Mutex<session_state::SessionRecord>>,
+    /// The resolved session-state file path (`None` only when no home
+    /// directory can be resolved at all — then persistence is disabled and
+    /// defaults apply).
+    session_state_path: Option<PathBuf>,
+    /// PAN-270: the operator-facing startup facts (what was restored /
+    /// superseded / ignored), consumed once by the TUI relay's startup seed
+    /// so the console and the log lines can never diverge.
+    session_report: session_state::SessionReport,
+
     /// PAN-232: test-only override for the QRZ XML endpoint the QSO upload
     /// subscriber's `QrzXmlClient` talks to, so a coordinator test can point it
     /// at a server that never answers. Always `None` in production (nothing
@@ -2123,6 +2140,7 @@ impl ApplicationCoordinator {
         config_warnings: Vec<String>,
         config_path: PathBuf,
         config_write_is_toml: bool,
+        pancetta_home: Option<PathBuf>,
     ) -> Result<Self> {
         let span = span!(Level::INFO, "coordinator_init");
         let _enter = span.enter();
@@ -2194,12 +2212,60 @@ impl ApplicationCoordinator {
         // while Fox mode is engaged.
         let fox_max_streams_init = config.fox.max_streams;
 
+        // PAN-270: resolve the operator's last-session TX-frequency mode and
+        // decode-effort choice BEFORE the decode window, the effort atomic,
+        // and the TX-mode atomic are seeded, so the first decode slot and
+        // the first TUI frame already run at the restored values. Restoring
+        // here — before anything is shared — needs no lock discipline and
+        // keeps the PAN-164 atomic-publish invariant intact for free. The
+        // `pancetta_home` parameter seeds `pancetta_home_override` below so
+        // replay/tx-log behavior is unchanged, and gives tests an isolated
+        // temp home (production passes `None` → the real home directory).
+        let session_state_path = session_state::session_state_path(pancetta_home.as_deref());
+        let session_startup = session_state::resolve(
+            config.decoder.effort,
+            match session_state_path.as_deref() {
+                Some(path) => session_state::load(path),
+                None => session_state::SessionLoad::Missing,
+            },
+        );
+        let session_report = session_state::startup_report(&session_startup);
+        if let Some(reason) = &session_startup.ignored_reason {
+            warn!("Session: saved choices ignored ({reason}); using defaults");
+        }
+        // A superseding config edit becomes the saved choice: rewrite the
+        // file now, best-effort, so the NEXT restart compares against the
+        // config value that actually won.
+        if session_startup.superseded_saved_effort.is_some() {
+            if let Some(path) = session_state_path.as_deref() {
+                if let Err(e) = session_state::save(path, &session_startup.record) {
+                    warn!(
+                        "Session: failed to rewrite {} after the config superseded the saved effort: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if let Some(status) = &session_report.status {
+            info!("{status}");
+        }
+
         // Snapshot [decoder] before config is moved into the Arc<RwLock>
         // (decoder-speed-overhaul Task 14). `effort` + an optional explicit
         // `budget_ms` override drive the decode budget published into
         // `decode_window` below; `budget_ms` always wins over the preset when set.
-        let decoder_effort_init = config.decoder.effort;
-        let decoder_budget_override_init = config.decoder.budget_ms;
+        // PAN-270: the effective effort is the session-resolved value, and a
+        // RESTORED live effort choice ignores the config `budget_ms` override
+        // — the same live-choice semantics `effort::cycle_decode_effort` has
+        // (an operator preset beats a static budget override). When the
+        // config value is in effect (no saved choice, or a superseding config
+        // edit) the override still applies.
+        let decoder_effort_init = session_startup.decode_effort;
+        let decoder_budget_override_init = if session_startup.restored_decode_effort.is_some() {
+            None
+        } else {
+            config.decoder.budget_ms
+        };
 
         // Derive the active protocol's slot length from [rig].mode before
         // config is moved into the Arc<RwLock>. The config validator already
@@ -2354,9 +2420,12 @@ impl ApplicationCoordinator {
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
-            // to Auto from the TUI (`f`).
+            // to Auto from the TUI (`f`). PAN-270: seeded from the
+            // session-resolved value so a restored Auto choice is in effect
+            // from the first autonomous decision. Startup seeding is NOT a
+            // transition and does not bump the generation below (PAN-39).
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
-                pancetta_core::TxFreqMode::default().as_u8(),
+                session_startup.tx_freq_mode.as_u8(),
             )),
             // PAN-39: bumped once per `tx_freq_mode` store (see the
             // `ToggleTxFreqMode`/`SetTxOffset` handlers in `tui_relay.rs`) so
@@ -2377,7 +2446,14 @@ impl ApplicationCoordinator {
             replay_path,
             config_path,
             config_write_is_toml,
-            pancetta_home_override: None,
+            pancetta_home_override: pancetta_home,
+            // PAN-270: the coordinator-owned session record (canonical from
+            // `resolve` on) and the resolved state-file path. The TUI relay
+            // clones both and persists every live choice through
+            // `session_state::persist_session_choice` — the single write seam.
+            session_record: Arc::new(std::sync::Mutex::new(session_startup.record)),
+            session_state_path,
+            session_report,
             qrz_xml_base_url_override: None,
             test_tx,
             test_tx_offset,
@@ -3824,12 +3900,202 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
     }
 
-    /// PAN-62: `config_path` must reflect whatever path the caller actually
+    // ------------------------------------------------------------------
+    // PAN-270: session restore at coordinator construction. These are the
+    // restart simulations — session file on disk in, seeded atomics out.
+    // ------------------------------------------------------------------
+
+    /// `build_coordinator` with a `pancetta_home` override so the session
+    /// state resolves an isolated temp dir (PAN-194 discipline), never the
+    /// real `~/.pancetta`.
+    async fn build_coordinator_with_home(
+        config: Config,
+        home: Option<PathBuf>,
+    ) -> ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true, // test-only: assume TOML
+            home,
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Write a session file into `home/.pancetta/session_state.json`.
+    fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
+        let dir = home.join(".pancetta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session_state.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Ticket scenarios 1+2: a saved {AUTO TX, MAX effort} session restores
+    /// the TX-mode atomic (generation still 0 — startup is not a transition,
+    /// PAN-39) and the effort atomic, and the restored live MAX choice
+    /// ignores a config `budget_ms` override (live-choice semantics), so the
+    /// first decode window already runs at the MAX preset budget (0 ms).
+    #[tokio::test]
+    async fn session_restore_seeds_tx_mode_effort_and_budget() {
+        let home = tempfile::tempdir().unwrap();
+        write_session_file(
+            home.path(),
+            r#"{"tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO"}"#,
+        );
+        let mut config = Config::default();
+        config.decoder.effort = pancetta_config::DecodeEffort::Auto;
+        config.decoder.budget_ms = Some(5000);
+
+        let coordinator =
+            build_coordinator_with_home(config, Some(home.path().to_path_buf())).await;
+
+        assert_eq!(
+            pancetta_core::TxFreqMode::from_u8(
+                coordinator
+                    .tx_freq_mode
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_core::TxFreqMode::Auto
+        );
+        assert_eq!(
+            coordinator
+                .tx_freq_mode_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "startup seeding is not a transition and must not bump the generation (PAN-39)"
+        );
+        assert_eq!(
+            pancetta_config::DecodeEffort::from_u8(
+                coordinator
+                    .current_decode_effort
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_config::DecodeEffort::Max
+        );
+        let budget_ms = coordinator.decode_window.read().await.budget_ms();
+        assert_eq!(
+            budget_ms, 0,
+            "a restored live MAX choice must ignore a config budget_ms override"
+        );
+    }
+
+    /// Ticket scenario 6: a config `[decoder].effort` edit newer than the
+    /// saved choice wins at startup, and the file is rewritten so the config
+    /// value becomes the saved choice.
+    #[tokio::test]
+    async fn session_config_edit_supersedes_saved_effort_and_rewrites_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = write_session_file(
+            home.path(),
+            r#"{"tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO"}"#,
+        );
+        let mut config = Config::default();
+        config.decoder.effort = pancetta_config::DecodeEffort::Deep;
+
+        let coordinator =
+            build_coordinator_with_home(config, Some(home.path().to_path_buf())).await;
+
+        assert_eq!(
+            pancetta_config::DecodeEffort::from_u8(
+                coordinator
+                    .current_decode_effort
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_config::DecodeEffort::Deep,
+            "the newer config effort must win over the saved MAX"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"tx_freq_mode":"AUTO","decode_effort":"DEEP","decode_effort_config_at_save":"DEEP"}"#,
+            "the canonical record (config value folded in) must be rewritten to disk"
+        );
+    }
+
+    /// Ticket scenario 5: a corrupt session file falls back to defaults
+    /// (Hold + the config effort) without failing startup.
+    #[tokio::test]
+    async fn session_corrupt_file_falls_back_to_defaults_without_failing_startup() {
+        let home = tempfile::tempdir().unwrap();
+        write_session_file(home.path(), "{not json");
+        let mut config = Config::default();
+        config.decoder.effort = pancetta_config::DecodeEffort::Deep;
+
+        let coordinator =
+            build_coordinator_with_home(config, Some(home.path().to_path_buf())).await;
+
+        assert_eq!(
+            pancetta_core::TxFreqMode::from_u8(
+                coordinator
+                    .tx_freq_mode
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_core::TxFreqMode::Hold
+        );
+        assert_eq!(
+            pancetta_config::DecodeEffort::from_u8(
+                coordinator
+                    .current_decode_effort
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_config::DecodeEffort::Deep,
+            "the config value must apply when the saved choices are ignored"
+        );
+    }
+
+    /// Ticket scenario 4: a first run (no saved session) uses the defaults
+    /// and writes no state file.
+    #[tokio::test]
+    async fn session_first_run_uses_defaults_and_writes_no_state_file() {
+        let home = tempfile::tempdir().unwrap();
+        let coordinator =
+            build_coordinator_with_home(Config::default(), Some(home.path().to_path_buf())).await;
+
+        assert_eq!(
+            pancetta_core::TxFreqMode::from_u8(
+                coordinator
+                    .tx_freq_mode
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_core::TxFreqMode::Hold
+        );
+        assert_eq!(
+            pancetta_config::DecodeEffort::from_u8(
+                coordinator
+                    .current_decode_effort
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            pancetta_config::DecodeEffort::Auto
+        );
+        assert!(
+            !home
+                .path()
+                .join(".pancetta")
+                .join("session_state.json")
+                .exists(),
+            "startup of a first run must write no session file"
+        );
+    }
+
+    /// PAN-62: `config_path` must reflect whatever the caller actually
     /// resolved (e.g. `main.rs`'s `--config <path>` handling), not a
     /// hardcoded `~/.pancetta/pancetta.toml` -- `tui_relay.rs`'s
     /// SelectDevice/SelectRig/SaveRigBookmark/DeleteRigBookmark handlers
@@ -3853,6 +4119,7 @@ mod tests {
             Vec::new(), // no config warnings
             custom.clone(),
             true, // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -3925,6 +4192,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -3953,6 +4221,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -4539,6 +4808,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await;
 
@@ -4578,6 +4848,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -4624,6 +4895,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -4712,6 +4984,7 @@ mod tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");

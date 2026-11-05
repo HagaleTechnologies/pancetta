@@ -484,6 +484,9 @@ async fn run_application(cli: Cli) -> Result<()> {
         config_warnings,
         config_write_path,
         config_write_is_toml,
+        // PAN-270: no home override in production — the session-state
+        // resolver falls back to the real home directory.
+        None,
     )
     .await?;
     if let Some((seconds, path)) = gain_options {

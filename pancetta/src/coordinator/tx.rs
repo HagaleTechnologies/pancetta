@@ -22279,6 +22279,7 @@ mod pan115_worker_gate_tests {
                 uuid::Uuid::new_v4()
             )),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -26082,6 +26083,7 @@ mod pan122_tx_log_worker_tests {
                 uuid::Uuid::new_v4()
             )),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");

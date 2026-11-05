@@ -5127,6 +5127,7 @@ mod restart_orphan_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -5613,6 +5614,7 @@ mod teardown_stall_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -5706,6 +5708,7 @@ mod ptt_off_unconfirmed_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -5928,6 +5931,7 @@ mod teardown_replay_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -7881,6 +7885,7 @@ mod pan_59_reconnect_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")
@@ -8928,6 +8933,7 @@ mod pan206_split_poll_tests {
             Vec::new(),
             std::env::temp_dir().join("pancetta-test-config.toml"),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -9592,6 +9598,7 @@ mod pan251_swr_protection_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")

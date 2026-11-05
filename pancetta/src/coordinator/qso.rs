@@ -11186,6 +11186,7 @@ mod replay_history_seed_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -11275,6 +11276,7 @@ mod replay_history_seed_tests {
             Vec::new(),
             std::env::temp_dir().join("pancetta-test-config.toml"),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -11920,6 +11922,7 @@ mod respond_to_caller_admission_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -15014,6 +15017,7 @@ mod manual_capacity_admission_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -15574,6 +15578,7 @@ mod remote_controller_change_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
@@ -16397,6 +16402,7 @@ mod pan120_tests {
                 Vec::new(),
                 home.path().join("pancetta.toml"),
                 true,
+                None, // PAN-270: no session-home override
             )
             .await
             .unwrap();

@@ -412,6 +412,7 @@ mod tests {
             vec![],
             path.with_extension("config.toml"),
             false,
+            None, // PAN-270: no session-home override
         )
         .await
         .unwrap();

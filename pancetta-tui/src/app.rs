@@ -35,6 +35,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// Test-only thread-local backing `App::set_test_session_state_path` /
+// `App::session_state_path` (PAN-270) — same shape and reasoning as
+// TEST_TUI_STATE_PATH_OVERRIDE above: unset (`None`) means "no session
+// file" in test builds, so a first-frame label read falls back to the
+// defaults and never touches the operator's real
+// `~/.pancetta/session_state.json`. Never compiled into production builds.
+#[cfg(test)]
+thread_local! {
+    static TEST_SESSION_STATE_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Terminal color support level, detected at startup
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorCapability {
@@ -1805,6 +1817,10 @@ impl App {
             })
             .unwrap_or(5); // fallback to 20m
 
+        // PAN-270: best-effort first-frame labels from the coordinator-owned
+        // session file (see the struct-literal fields below).
+        let (session_tx_freq_mode, session_decode_effort_label) = Self::load_session_labels();
+
         let mut app = Self {
             config: config.clone(),
             should_quit: false,
@@ -1877,8 +1893,13 @@ impl App {
             is_transmitting: false,
             tx_frequency_offset: 1500.0,
             tx_policy: pancetta_core::TxPolicy::default(),
-            tx_freq_mode: pancetta_core::TxFreqMode::default(),
-            decode_effort: Self::load_persisted_decode_effort(),
+            // PAN-270: first-frame chip labels seeded best-effort from the
+            // coordinator-owned session file (same file the coordinator
+            // restores its atomics from), so a restored AUTO/MAX session
+            // shows correctly from frame 1 with no flash of HOLD/AUTO. The
+            // coordinator's startup seeds remain authoritative.
+            tx_freq_mode: session_tx_freq_mode,
+            decode_effort: session_decode_effort_label,
             tx_now_sending: None,
             tx_queued: Vec::new(),
             rig_connected: RigConnDisplay::default(),
@@ -1969,32 +1990,86 @@ impl App {
             .unwrap_or(crate::view::ActiveView::Operate)
     }
 
-    /// Load the operator's last-cycled decode-effort preset label from disk
-    /// (decoder-speed-overhaul Task 15). Best-effort, mirroring
-    /// [`Self::load_persisted_view`]: a missing file, unreadable file,
-    /// malformed JSON, or missing key all fall back to `"AUTO"` (matching
-    /// `pancetta_config::DecodeEffort::default()`'s label) — never fails App
-    /// construction. The coordinator's startup `DecodeEffortUpdate` echo
-    /// corrects a stale persisted guess within the first health tick
-    /// regardless, so this is purely cosmetic (avoids a blank/default chip
-    /// flash before that echo arrives).
-    pub fn load_persisted_decode_effort() -> String {
-        Self::tui_state_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("decode_effort")
-                    .and_then(|x| x.as_str())
-                    .map(String::from)
+    /// Read the coordinator-owned `~/.pancetta/session_state.json` for the
+    /// TUI's FIRST-FRAME chip labels: `(tx_freq_mode, decode_effort_label)`
+    /// (PAN-270). Best-effort and cosmetic — the coordinator's startup
+    /// `TxFreqModeUpdate`/`DecodeEffortUpdate` seeds remain authoritative —
+    /// but reading the same file the coordinator restores from means frame 1
+    /// already shows the restored choices with no flash of HOLD/AUTO.
+    /// Unknown or absent values fall back silently to the defaults (the
+    /// coordinator owns the corrupt-file warning).
+    pub fn load_session_labels() -> (pancetta_core::TxFreqMode, String) {
+        let fallback = (pancetta_core::TxFreqMode::default(), "AUTO".to_string());
+        let Some(path) = Self::session_state_path() else {
+            return fallback;
+        };
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return fallback;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return fallback;
+        };
+        let mode = value
+            .get("tx_freq_mode")
+            .and_then(|x| x.as_str())
+            .and_then(|s| match s {
+                "HOLD" => Some(pancetta_core::TxFreqMode::Hold),
+                "AUTO" => Some(pancetta_core::TxFreqMode::Auto),
+                _ => None,
             })
-            .unwrap_or_else(|| "AUTO".to_string())
+            .unwrap_or(pancetta_core::TxFreqMode::default());
+        let effort = value
+            .get("decode_effort")
+            .and_then(|x| x.as_str())
+            .filter(|s| matches!(*s, "ECO" | "STANDARD" | "DEEP" | "MAX" | "AUTO"))
+            .map(String::from)
+            .unwrap_or_else(|| "AUTO".to_string());
+        (mode, effort)
     }
 
-    /// Write both persisted fields (`active_view` + `decode_effort`) to
-    /// `~/.pancetta/tui_state.json` in one shot, from the CURRENT in-memory
-    /// state — so whichever one just changed, the file always reflects both,
-    /// and a change to one can never clobber the other back to a stale
-    /// value. Best-effort: a write failure (e.g. no home dir, read-only
+    /// Path to the coordinator-owned session state file
+    /// (`~/.pancetta/session_state.json`, PAN-270). `None` if the home
+    /// directory can't be resolved.
+    ///
+    /// Test builds (`#[cfg(test)]`) never resolve the real file: they return
+    /// only the thread-local override (see [`Self::set_test_session_state_path`]),
+    /// and an unset override means `None` — no session file, so the
+    /// first-frame labels fall back to their defaults (PAN-194 discipline).
+    /// Production builds always use the real `~/.pancetta` path.
+    fn session_state_path() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        {
+            TEST_SESSION_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone())
+        }
+        #[cfg(not(test))]
+        {
+            Self::home_session_state_path()
+        }
+    }
+
+    /// The real `~/.pancetta/session_state.json`; `None` if the home
+    /// directory can't be resolved.
+    fn home_session_state_path() -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|h| h.join(".pancetta").join("session_state.json"))
+    }
+
+    /// Test-only: point [`Self::session_state_path`] at `path` for the
+    /// calling thread only (PAN-270). Leaving it unset means "no session
+    /// file" in test builds — never the real
+    /// `~/.pancetta/session_state.json`. Same thread-local reasoning as
+    /// [`Self::set_test_tui_state_path`].
+    #[cfg(test)]
+    pub(crate) fn set_test_session_state_path(path: std::path::PathBuf) {
+        TEST_SESSION_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+    }
+
+    /// Write the persisted field (`active_view`) to
+    /// `~/.pancetta/tui_state.json`. PAN-270 removed the cosmetic
+    /// `decode_effort` field: the coordinator-owned
+    /// `~/.pancetta/session_state.json` is the single source of truth for
+    /// the operator's TX-mode and effort choices (it drives the decoder, not
+    /// just this chip), and this file now remembers only the TUI-local view
+    /// preference. Best-effort: a write failure (e.g. no home dir, read-only
     /// filesystem) is silently ignored and never panics or fails the TUI.
     fn persist_tui_state(&self) {
         if let Some(p) = Self::tui_state_path() {
@@ -2003,11 +2078,7 @@ impl App {
             }
             let _ = std::fs::write(
                 &p,
-                format!(
-                    "{{\"active_view\":\"{}\",\"decode_effort\":\"{}\"}}",
-                    self.active_view.as_str(),
-                    self.decode_effort
-                ),
+                format!("{{\"active_view\":\"{}\"}}", self.active_view.as_str()),
             );
         }
     }
@@ -2036,12 +2107,13 @@ impl App {
     }
 
     /// Apply the coordinator's authoritative `DecodeEffortUpdate` echo
-    /// (decoder-speed-overhaul Task 15, operator `e` keybinding) and persist
-    /// the chosen preset alongside the active view.
+    /// (decoder-speed-overhaul Task 15, operator `e` keybinding). The TUI no
+    /// longer persists the label (PAN-270): the coordinator's relay writes
+    /// the choice into its own `~/.pancetta/session_state.json` when the
+    /// keystroke is handled, and this file stopped carrying a cosmetic copy.
     pub fn set_decode_effort(&mut self, effort: String, budget_ms: u64) {
         self.status_message = format!("Decode effort: {} ({} ms budget)", effort, budget_ms);
         self.decode_effort = effort;
-        self.persist_tui_state();
     }
 
     /// Returns the `TuiCommand` to send as a result of this event, if any.
@@ -5535,52 +5607,100 @@ mod tests {
     #[tokio::test]
     async fn tui_state_path_without_override_is_none_and_app_seeds_defaults() {
         TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        TEST_SESSION_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         assert_eq!(App::tui_state_path(), None);
+        assert_eq!(App::session_state_path(), None);
         let app = fixture_app().await;
         assert_eq!(app.decode_effort, "AUTO");
+        assert_eq!(
+            app.tx_freq_mode,
+            pancetta_core::TxFreqMode::Hold,
+            "no session file anywhere: the TUI seeds the compiled-in defaults"
+        );
         assert_eq!(app.active_view, crate::view::ActiveView::Operate);
     }
 
-    /// `set_decode_effort` (decoder-speed-overhaul Task 15) persists the
-    /// chosen preset to `tui_state.json` ALONGSIDE the active view — a
-    /// change to one must never clobber the other back to a stale value.
-    /// Regression for the single-key-write footgun `cycle_view`'s old
-    /// inline write had (it only ever wrote `active_view`).
+    /// PAN-270: `tui_state.json` shrinks to `{"active_view":"..."}` — the
+    /// cosmetic `decode_effort` field is retired (the coordinator-owned
+    /// `session_state.json` is the single source of truth) — and
+    /// `set_decode_effort` updates the label + status but writes NOTHING to
+    /// disk.
     #[tokio::test]
-    async fn set_decode_effort_persists_alongside_active_view() {
-        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state_path = std::env::temp_dir().join(format!("pancetta_apprs_test_state_{n}.json"));
-        App::set_test_tui_state_path(state_path);
+    async fn persist_tui_state_writes_only_active_view_and_set_decode_effort_writes_nothing() {
+        // A fresh tempdir (not a /tmp counter name, which a previous test
+        // process may have left behind) so the non-existence asserts below
+        // are hermetic across repeated runs.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("tui_state.json");
+        App::set_test_tui_state_path(state_path.clone());
 
         let mut app = fixture_app().await;
         app.active_view = crate::view::ActiveView::Hunt;
         app.set_decode_effort("DEEP".to_string(), 1000);
-
         assert_eq!(app.decode_effort, "DEEP");
-
-        // A fresh load (same thread, same override) must see BOTH fields —
-        // decode_effort from the just-completed write, active_view from the
-        // in-memory field the write also serialized.
-        assert_eq!(App::load_persisted_decode_effort(), "DEEP");
-        assert_eq!(App::load_persisted_view(), crate::view::ActiveView::Hunt);
-
-        // cycle_view flips only active_view — decode_effort must survive.
-        app.cycle_view(true);
-        assert_eq!(
-            App::load_persisted_decode_effort(),
-            "DEEP",
-            "cycle_view must not clobber the persisted decode_effort"
+        // set_decode_effort must not have written the file: nothing exists
+        // until a view change (persist_tui_state) runs.
+        assert!(
+            !state_path.exists(),
+            "set_decode_effort must not persist anything"
         );
+
+        // cycle_view persists — ONLY the active view.
+        app.cycle_view(true);
+        let text = std::fs::read_to_string(&state_path).unwrap();
+        assert_eq!(text, r#"{"active_view":"Run"}"#);
+        assert!(
+            !text.contains("decode_effort"),
+            "the retired cosmetic decode_effort field must never come back"
+        );
+        // The in-memory label the coordinator echoed still stands.
+        assert_eq!(app.decode_effort, "DEEP");
     }
 
-    /// With no persisted file, `load_persisted_decode_effort` falls back to
-    /// `"AUTO"` — matching `pancetta_config::DecodeEffort::default()`'s label.
-    #[test]
-    fn load_persisted_decode_effort_defaults_to_auto_when_missing() {
+    /// PAN-270, ticket scenario 1 ("no flash of HOLD"): with a session file
+    /// saying {AUTO, MAX}, `App::new` seeds `tx_freq_mode = Auto` and the
+    /// "MAX" effort label from frame 1.
+    #[tokio::test]
+    async fn app_new_seeds_first_frame_labels_from_the_session_file() {
         let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state_path = std::env::temp_dir().join(format!("pancetta_apprs_test_missing_{n}.json"));
-        App::set_test_tui_state_path(state_path);
-        assert_eq!(App::load_persisted_decode_effort(), "AUTO");
+        let session_path =
+            std::env::temp_dir().join(format!("pancetta_apprs_test_session_{n}.json"));
+        std::fs::write(
+            &session_path,
+            r#"{"tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO"}"#,
+        )
+        .unwrap();
+        App::set_test_session_state_path(session_path);
+
+        let app = fixture_app().await;
+        assert_eq!(app.tx_freq_mode, pancetta_core::TxFreqMode::Auto);
+        assert_eq!(app.decode_effort, "MAX");
+    }
+
+    /// PAN-270, ticket scenario 5 (console side): a corrupt or unknown
+    /// session file falls back to the defaults silently — no panic, the
+    /// coordinator owns the warning.
+    #[tokio::test]
+    async fn app_new_with_a_corrupt_session_file_seeds_defaults_silently() {
+        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session_path =
+            std::env::temp_dir().join(format!("pancetta_apprs_test_session_bad_{n}.json"));
+        std::fs::write(&session_path, "{not json").unwrap();
+        App::set_test_session_state_path(session_path);
+
+        let app = fixture_app().await;
+        assert_eq!(app.tx_freq_mode, pancetta_core::TxFreqMode::Hold);
+        assert_eq!(app.decode_effort, "AUTO");
+    }
+
+    /// PAN-270 hermeticity: `home_session_state_path()` — what production
+    /// builds' `session_state_path()` resolves to — is exactly
+    /// `~/.pancetta/session_state.json` (computation-only, like the
+    /// tui_state twin above).
+    #[test]
+    fn home_session_state_path_is_real_home_pancetta_path() {
+        let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("session_state.json"));
+        assert_eq!(App::home_session_state_path(), expected);
     }
 
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
