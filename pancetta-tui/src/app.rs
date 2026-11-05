@@ -1755,6 +1755,16 @@ fn station_state_key(callsign: &str) -> Option<String> {
     pancetta_core::callsign::resolve_hash_render(&upper).map(str::to_string)
 }
 
+/// The key (and displayed callsign) of a `dx_stations` row: the decoded
+/// callsign with a resolved FT8 hash-render unwrapped, so a station heard both
+/// as `"6W/IK2HKT"` and as `"<6W/IK2HKT>"` is one DX Hunter row instead of two
+/// that split its decodes (and lose the entity on the bracketed one). Case is
+/// left as received; the unresolved placeholder `"<...>"` passes through
+/// unchanged for callers to filter.
+fn dx_row_call(callsign: &str) -> &str {
+    pancetta_core::callsign::resolve_hash_render(callsign).unwrap_or(callsign)
+}
+
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
 fn spectral_peak(row: &[f32], center_hz: f64, radius_hz: f64, range: (f64, f64)) -> f32 {
     if row.is_empty() {
@@ -2316,7 +2326,9 @@ impl App {
             .call_sign
             .as_ref()
             .filter(|c| !self.is_our_call(c) && c.as_str() != "<...>")
+            .map(|c| dx_row_call(c).to_string())
         {
+            let call_sign = &call_sign;
             // Preserve existing grid if new message doesn't have one
             // (e.g., RR73/73 messages don't carry grid info)
             let grid_square = message.grid_square.clone().or_else(|| {
@@ -2751,16 +2763,17 @@ impl App {
                             self.station_state_for(&row.call_sign),
                             current_hz,
                         );
-                        (key.clone(), status)
+                        (dx_row_call(key).to_string(), status)
                     })
                     .collect()
             })
             .unwrap_or_default();
     }
 
-    /// The exact DX-row key, including its original case/hash rendering.
+    /// The DX-row key in its original case; a resolved hash-render (`"<K1ABC>"`)
+    /// finds the plain row it was merged into.
     pub fn dx_need_for(&self, key: &str) -> Option<&crate::dx_need::DxNeedStatus> {
-        self.dx_need.get(key)
+        self.dx_need.get(dx_row_call(key))
     }
 
     /// PAN-93: `(needed, atno)` as the row at `key` shows them (`+`/`!`, the
@@ -3294,6 +3307,7 @@ impl App {
         if self.is_our_call(&callsign) {
             return;
         }
+        let callsign = dx_row_call(&callsign).to_string();
         let dx_station = DxStation {
             call_sign: callsign.clone(),
             grid_square: None,
@@ -3440,7 +3454,7 @@ impl App {
     /// with the Why line before the station is decoded again (PAN-228).
     /// Decodes match by the relay's hash-render identity, not by base call.
     pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
-        let Some(entry) = self.dx_stations.get_mut(callsign) else {
+        let Some(entry) = self.dx_stations.get_mut(dx_row_call(callsign)) else {
             return;
         };
         let Some(rank) = entry.local_rank.as_mut() else {
@@ -7028,9 +7042,39 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            app.dx_stations.contains_key("<K1ABC>"),
+            app.dx_stations.contains_key("K1ABC"),
             "a resolved hash form is a real, identifiable callsign and must still be listed"
         );
+    }
+
+    /// A station heard both plainly (`6W/IK2HKT`) and as a resolved i3=4
+    /// hash-render (`<6W/IK2HKT>`) is one station: it must share one DX
+    /// Hunter row (keyed and shown by the plain call), not split into two
+    /// rows that each carry half its decodes and lose the entity on the
+    /// bracketed one.
+    #[tokio::test]
+    async fn plain_and_hash_render_decodes_share_one_dx_hunter_row() {
+        let mut app = fixture_app().await;
+        for (call, snr) in [("6W/IK2HKT", -12), ("<6W/IK2HKT>", -8)] {
+            let mut view = fixture_view(call, snr);
+            view.priority_score = Some(1000);
+            view.priority_factors = Some(null_factors("6W/IK2HKT"));
+            app.add_decoded_message(view).await.unwrap();
+        }
+
+        assert_eq!(
+            app.dx_stations.len(),
+            1,
+            "keys: {:?}",
+            app.dx_stations.keys()
+        );
+        let row = app.dx_stations.get("6W/IK2HKT").expect("plain-keyed row");
+        assert_eq!(row.call_sign, "6W/IK2HKT");
+        assert_eq!(row.snr, -8, "the hash-render decode updated the same row");
+
+        // Relay rescores name the row by the decode's raw spelling.
+        app.refresh_local_rank("<6W/IK2HKT>", 1234, null_factors("6W/IK2HKT"));
+        assert_eq!(app.dx_stations["6W/IK2HKT"].local_rank.unwrap().score, 1234);
     }
 
     /// #42 extension: add_dx_spot (PSKReporter/local path) must not insert our
