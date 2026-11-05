@@ -143,6 +143,16 @@ struct RankInputs {
     dial_mhz: f64,
 }
 
+/// The `last_rank_inputs` key for a decoded callsign: the DX Hunter row's call
+/// (a resolved hash-render unwrapped, as `pancetta_tui`'s row key does), so a
+/// station heard as both `6W/IK2HKT` and `<6W/IK2HKT>` keeps one entry — its
+/// newest decode — and a QSO outcome rescores its single row once.
+fn rank_inputs_key(call: &str) -> String {
+    pancetta_core::callsign::resolve_hash_render(call)
+        .unwrap_or(call)
+        .to_owned()
+}
+
 /// Rescore every row a terminal QSO outcome names from its latest decode's
 /// inputs, so worked and failure history recorded at QSO end reach DX Hunter
 /// before that station is decoded again. Rows match on resolved identity, so
@@ -492,7 +502,7 @@ impl super::ApplicationCoordinator {
                                 &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
                                 decoded_msg.snr_db, dial_mhz);
                             if let Some(call) = call_sign.as_deref() {
-                                last_rank_inputs.insert(call.to_owned(), RankInputs {
+                                last_rank_inputs.insert(rank_inputs_key(call), RankInputs {
                                     grid: grid_square.clone(),
                                     snr_db: decoded_msg.snr_db,
                                     dial_mhz,
@@ -663,6 +673,9 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on },
                             );
                         }
+                        MessageType::ContestScore(ref update) => {
+                            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ContestScore(update.clone()));
+                        }
                         MessageType::ActiveQsosSnapshot {
                             ref qsos,
                             ref pending,
@@ -826,7 +839,7 @@ impl super::ApplicationCoordinator {
                         MessageType::Error {
                             component_id,
                             ref error_message,
-                            ..
+                            error_code,
                         } => {
                             // Component-level errors (audio init failure, audio
                             // device stalls, etc.) get surfaced to the TUI's error
@@ -837,6 +850,18 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::Error {
                                     component: format!("{}", component_id),
                                     message: error_message.clone(),
+                                    code: error_code,
+                                },
+                            );
+                        }
+                        MessageType::ErrorResolved {
+                            component_id,
+                            error_code,
+                        } => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::ErrorResolved {
+                                    component: format!("{}", component_id),
+                                    code: error_code,
                                 },
                             );
                         }
@@ -1428,6 +1453,7 @@ impl super::ApplicationCoordinator {
                 let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::Error {
                     component: "config".to_string(),
                     message: w.clone(),
+                    code: None,
                 });
             }
 
@@ -4752,6 +4778,36 @@ mod tui_relay_tests {
         assert_eq!(rank.at, heard_at, "a rescore is not a new decode");
         let reason = pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
         assert!(reason.contains("QSO failed this session"), "{reason}");
+    }
+
+    #[test]
+    fn plain_and_hash_render_decodes_keep_one_rank_input() {
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(crate::priority_evaluator::CachedStationLookup::new()),
+        );
+        let mut last_inputs = super::RelayCache::default();
+        for (call, dial_mhz) in [("6W/IK2HKT", 7.074), ("<6W/IK2HKT>", 14.074)] {
+            last_inputs.insert(
+                super::rank_inputs_key(call),
+                super::RankInputs {
+                    grid: None,
+                    snr_db: -8.0,
+                    dial_mhz,
+                },
+            );
+        }
+        let refreshes = super::outcome_rank_refresh(&scorer, &last_inputs, "6W/IK2HKT");
+        assert_eq!(refreshes.len(), 1, "one row, one refresh");
+        let Some(pancetta_tui::tui_runner::TuiMessage::DxRankRefresh {
+            callsign, score, ..
+        }) = refreshes.into_iter().next()
+        else {
+            panic!("expected a rank refresh");
+        };
+        assert_eq!(callsign, "6W/IK2HKT");
+        let latest = super::display_rank(&scorer, Some("6W/IK2HKT"), None, -8.0, 14.074).0;
+        assert_eq!(Some(score), latest, "the newest decode's inputs win");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use tokio::time::interval;
 use tracing::{error, info, span, warn, Level};
 
 use crate::coordinator::audio_recovery::OutputEdge;
-use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageType, AUDIO_RUNTIME_ERROR_CODE};
 
 /// PAN-115: clears `audio_output_alive` whenever the real audio thread exits
 /// (early return, `break`, or panic), so the TX hard mute fails closed.
@@ -399,26 +399,36 @@ impl super::ApplicationCoordinator {
                 // PAN-115: first statement, so every exit (init failure,
                 // `break`, panic) leaves the output marked dead.
                 let _output_alive_guard = AudioOutputAliveGuard(audio_output_alive.clone());
-                let report_audio_error = {
+                // Errors and their resolutions go through one forwarding
+                // task, so an auto-recovery's ErrorResolved can never overtake
+                // the Error it clears.
+                let audio_error_tx = {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MessageType>();
                     let bus = audio_bus.clone();
-                    let rt = runtime_handle.clone();
-                    move |msg: String| {
-                        let bus = bus.clone();
-                        rt.spawn(async move {
-                            let err_msg = ComponentMessage::new(
+                    runtime_handle.spawn(async move {
+                        while let Some(message_type) = rx.recv().await {
+                            let msg = ComponentMessage::new(
                                 ComponentId::Audio,
                                 ComponentId::Tui,
-                                MessageType::Error {
-                                    component_id: ComponentId::Audio,
-                                    error_message: msg,
-                                    error_code: None,
-                                },
+                                message_type,
                                 Instant::now(),
                             );
-                            let _ = bus.send_message(err_msg).await;
+                            let _ = bus.send_message(msg).await;
+                        }
+                    });
+                    tx
+                };
+                let send_audio_error = {
+                    let tx = audio_error_tx.clone();
+                    move |msg: String, error_code: Option<u32>| {
+                        let _ = tx.send(MessageType::Error {
+                            component_id: ComponentId::Audio,
+                            error_message: msg,
+                            error_code,
                         });
                     }
                 };
+                let report_audio_error = |msg: String| send_audio_error(msg, None);
 
                 let mut audio_manager = match AudioManager::with_config(audio_config) {
                     Ok(manager) => manager,
@@ -481,7 +491,10 @@ impl super::ApplicationCoordinator {
                 let runtime_report_min_gap = std::time::Duration::from_secs(5);
                 let mut maybe_report_runtime = |kind: &str, e: String| {
                     if last_runtime_report.elapsed() >= runtime_report_min_gap {
-                        report_audio_error(format!("Audio {}: {}", kind, e));
+                        send_audio_error(
+                            format!("Audio {}: {}", kind, e),
+                            Some(AUDIO_RUNTIME_ERROR_CODE),
+                        );
                         last_runtime_report = std::time::Instant::now();
                     }
                 };
@@ -689,6 +702,11 @@ impl super::ApplicationCoordinator {
                                         recovery.attempts()
                                     );
                                     output_watch.rebaseline(Instant::now());
+                                    // The runtime-error alert is stale now.
+                                    let _ = audio_error_tx.send(MessageType::ErrorResolved {
+                                        component_id: ComponentId::Audio,
+                                        error_code: AUDIO_RUNTIME_ERROR_CODE,
+                                    });
                                     if recovery.attempts() > 1 {
                                         report_audio_diagnostic(
                                             Level::INFO,

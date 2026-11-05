@@ -720,10 +720,14 @@ impl ConfigLoader {
     }
 
     /// Top-level section names `Config` understands, derived from the struct
-    /// itself (serialize a default and take the object keys) so this set can
-    /// never drift when a config section is added or renamed.
+    /// itself. Materialize optional sections omitted by default serialization
+    /// before taking the object keys, so opt-in sections remain recognized.
     fn known_top_level_keys() -> std::collections::BTreeSet<String> {
-        serde_json::to_value(Config::default())
+        let schema = Config {
+            contest: Some(crate::contest::ContestScoringConfig::default()),
+            ..Config::default()
+        };
+        serde_json::to_value(schema)
             .ok()
             .and_then(|v| {
                 v.as_object()
@@ -1494,6 +1498,14 @@ callsign = "N0CALL"
         );
         assert!(warnings.iter().any(|w| w.contains("autonomous_operator")));
         assert!(warnings.iter().any(|w| w.contains("priority_weights")));
+    }
+
+    #[test]
+    fn optional_contest_section_is_known_even_when_disabled() {
+        let loader = ConfigLoader::new().unwrap();
+        let config = loader.parse_toml("[contest]\nenabled = false\n").unwrap();
+        assert!(!config.contest.unwrap().enabled);
+        assert!(loader.load_warnings().is_empty());
     }
 
     #[test]

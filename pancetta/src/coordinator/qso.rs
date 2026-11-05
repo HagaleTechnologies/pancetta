@@ -3058,6 +3058,37 @@ impl super::ApplicationCoordinator {
         // `[station] tx_late_max_ms` reaches `keep_call_tx_slot` — the same
         // value the TX worker snapshots for `schedule_tx`.
         let station_tx_late_max_ms = config.station.tx_late_max_ms;
+
+        // PAN-50: convert the validated `[contest]` section into the
+        // contest-scoring context here, where both pancetta-config and the
+        // pancetta-qso rule catalog are visible (serialized config stays
+        // independent of pancetta-qso). An unknown rules_id, a profile that
+        // does not match the selected rules, or an invalid operator_region
+        // refuses startup with the operator-facing message rather than
+        // silently disabling scoring; structural validation (required
+        // fields, period shape) already ran in Config::validate.
+        // Computed before `drop(config)` below so the read guard can be
+        // released on schedule.
+        let contest_scoring = match &config.contest {
+            Some(contest) if contest.enabled => {
+                let periods = contest
+                    .periods
+                    .iter()
+                    .map(|window| pancetta_qso::contest::scoring::ContestPeriod {
+                        start: window.start,
+                        end: window.end,
+                    })
+                    .collect();
+                Some(pancetta_qso::contest::scoring::ContestScoringContext::new(
+                    contest.instance_id.as_deref().unwrap_or(""),
+                    contest.profile_id.as_deref().unwrap_or(""),
+                    contest.rules_id.as_deref().unwrap_or(""),
+                    contest.operator_region.as_deref().unwrap_or(""),
+                    periods,
+                ))
+            }
+            _ => None,
+        };
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -3209,6 +3240,13 @@ impl super::ApplicationCoordinator {
         // `start_wsjtx_udp_component`, so the field is always already
         // populated by the time the latter reads it — no channel, handoff, or
         // timeout needed.
+        // PAN-50: surface the contest-context conversion error (unknown
+        // rules_id / invalid operator_region) with the operator-facing
+        // message; see the extraction above `drop(config)`.
+        let contest_scoring = contest_scoring
+            .transpose()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
         let qso_config = {
             use pancetta_qso::{
                 DuplicateCheckConfig, HoundRegions, QsoManagerConfig, TimeoutConfig,
@@ -3217,6 +3255,7 @@ impl super::ApplicationCoordinator {
             QsoManagerConfig {
                 our_callsign: our_callsign.clone(),
                 our_grid: our_grid.clone(),
+                contest_scoring,
                 hound: HoundRegions {
                     call_min_hz: hound_cfg.call_min_hz,
                     call_max_hz: hound_cfg.call_max_hz,
@@ -3486,20 +3525,7 @@ impl super::ApplicationCoordinator {
                 // History is initialized before decode/command loops or readiness.
                 // Replay opens only an in-memory index and reads the canonical ADIF.
                 let history_db = if replay_mode {
-                    match tokio::fs::try_exists(&adif_path).await {
-                        Ok(false) => pancetta_qso::async_database::QsoDatabase::new_in_memory()
-                            .await
-                            .map(Arc::new),
-                        Ok(true) => pancetta_qso::async_database::QsoDatabase::replay_from_adif(
-                            ":memory:", &adif_path,
-                        )
-                        .await
-                        .map(Arc::new),
-                        Err(source) => Err(pancetta_qso::async_database::AsyncDatabaseError::Io {
-                            path: adif_path.clone(),
-                            source,
-                        }),
-                    }
+                    replay_history_db(&adif_path).await
                 } else {
                     live_seed_db.map(Arc::new).ok_or_else(|| {
                         pancetta_qso::async_database::AsyncDatabaseError::InvalidQuery {
@@ -3507,6 +3533,22 @@ impl super::ApplicationCoordinator {
                         }
                     })
                 };
+                // PAN-268: the contest worker scores replay from the prepared
+                // in-memory seed, never the real station index. Selected before
+                // `history_db` is consumed by QSO-admission history below.
+                let contest_history = super::contest::select_history_source(
+                    replay_mode,
+                    &history_db,
+                    db_path.clone(),
+                    adif_path.clone(),
+                );
+                // One sequential reader per QSO component; abort it on supervisor teardown.
+                let _contest_worker = super::contest::start(
+                    qso_manager.clone(),
+                    message_bus.clone(),
+                    contest_history,
+                    shutdown.clone(),
+                );
                 let history_result = match history_db {
                     Ok(db) => initialize_qso_history(&mut qso_manager, &qso_lookup, db).await,
                     Err(error) => Err(error),
@@ -16668,6 +16710,33 @@ async fn initialize_qso_history(
     Ok(())
 }
 
+/// Replay's prepared history seed: the canonical ADIF replayed into an
+/// in-memory index, an empty in-memory index when ADIF is absent, or the
+/// failure that must keep every replay consumer (QSO admission and the
+/// contest worker alike) off the operator's real files. Live startup never
+/// calls this (PAN-268).
+pub(super) async fn replay_history_db(
+    adif_path: &std::path::Path,
+) -> Result<
+    Arc<pancetta_qso::async_database::QsoDatabase>,
+    pancetta_qso::async_database::AsyncDatabaseError,
+> {
+    match tokio::fs::try_exists(adif_path).await {
+        Ok(false) => pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .map(Arc::new),
+        Ok(true) => {
+            pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", adif_path)
+                .await
+                .map(Arc::new)
+        }
+        Err(source) => Err(pancetta_qso::async_database::AsyncDatabaseError::Io {
+            path: adif_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod pan260 {
     use super::*;
@@ -16807,6 +16876,64 @@ mod pan260 {
             early_subscription.try_recv().is_ok(),
             "history attachment preserves early subscriptions"
         );
+    }
+}
+
+#[cfg(test)]
+mod pan268 {
+    use super::*;
+
+    // PAN-268: replay startup must hand the contest worker the prepared
+    // in-memory seed (or its failure), never the real station index.
+    #[tokio::test]
+    async fn replay_startup_selects_only_the_prepared_seed_for_the_contest_worker() {
+        use super::super::contest::{select_history_source, HistorySource};
+        let dir = tempfile::tempdir().unwrap();
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(
+            &adif_path,
+            "<EOH>\n<CALL:5>K1ABC <QSO_DATE:8>20260101 <TIME_ON:6>140000 <MODE:3>FT8 <FREQ:9>14.075200 <BAND:3>20M <EOR>\n",
+        )
+        .unwrap();
+        // Seeded ADIF: prepared in-memory seed, replay source with no paths.
+        let prepared = replay_history_db(&adif_path).await;
+        assert!(prepared.is_ok());
+        assert!(
+            matches!(
+                select_history_source(true, &prepared, db_path.clone(), adif_path.clone()),
+                HistorySource::Replay { seed: Ok(_) }
+            ),
+            "replay with a prepared seed must not select the disk reader"
+        );
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Missing ADIF: a valid empty seed, still replay, still no files.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let missing = empty_dir.path().join("qsos.adi");
+        let prepared = replay_history_db(&missing).await;
+        assert!(prepared.is_ok());
+        assert!(matches!(
+            select_history_source(true, &prepared, missing.clone(), missing.clone()),
+            HistorySource::Replay { seed: Ok(_) }
+        ));
+        assert_eq!(std::fs::read_dir(empty_dir.path()).unwrap().count(), 0);
+        // Failed preparation (existence probe under a regular file): the
+        // failure is retained and can never select the live disk reader.
+        let blocker = empty_dir.path().join("blocker");
+        std::fs::write(&blocker, b"regular file").unwrap();
+        let broken = empty_dir.path().join("blocker").join("qsos.adi");
+        let prepared = replay_history_db(&broken).await;
+        assert!(prepared.is_err());
+        assert!(matches!(
+            select_history_source(true, &prepared, db_path.clone(), broken.clone()),
+            HistorySource::Replay { seed: Err(_) }
+        ));
+        // Live startup keeps the disk paths.
+        assert!(matches!(
+            select_history_source(false, &prepared, db_path.clone(), adif_path.clone()),
+            HistorySource::Live { .. }
+        ));
     }
 }
 
@@ -17013,5 +17140,109 @@ mod dxpedition_receive_integration_tests {
                 QsoState::Completed { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod pan50_live_contest {
+    use super::*;
+    use pancetta_qso::contest::scoring::*;
+    #[tokio::test]
+    async fn manual_completion_survives_real_writers_and_adif_index_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let index = dir.path().join("qso.db");
+        let now = chrono::Utc::now();
+        let context = ContestScoringContext::new(
+            "live",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "KS",
+            vec![ContestPeriod {
+                start: now - chrono::Duration::minutes(1),
+                end: now + chrono::Duration::minutes(10),
+            }],
+        )
+        .unwrap();
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            our_grid: Some("FN42".into()),
+            contest_scoring: Some(context.clone()),
+            ..Default::default()
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_writer, _logger, db) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &index,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+        let db = db.unwrap();
+        let id = manager
+            .start_cq_manual(14_074_000.0, None, false, None)
+            .await
+            .unwrap();
+        use pancetta_qso::MessageType as M;
+        for message in [
+            M::CqResponse {
+                calling_station: "W1ABC".into(),
+                responding_station: "K1DEF".into(),
+                grid: Some("FN31".into()),
+            },
+            M::ReportAck {
+                to_station: "W1ABC".into(),
+                from_station: "K1DEF".into(),
+                report: -12,
+            },
+            M::SeventyThree {
+                to_station: "W1ABC".into(),
+                from_station: "K1DEF".into(),
+            },
+        ] {
+            manager
+                .process_message(message, String::new(), 14_074_000.0, Some(-10.0))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            pancetta_qso::QsoState::Completed { .. }
+        ));
+        let facts = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let facts = db.contest_ledger(&context, "W1ABC").await.unwrap();
+                if facts.len() == 1
+                    && tokio::fs::read_to_string(&adif)
+                        .await
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains("<eor>")
+                {
+                    break facts;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.store(true, Ordering::Release);
+        let rebuilt =
+            pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", &adif)
+                .await
+                .unwrap();
+        assert_eq!(
+            facts,
+            rebuilt.contest_ledger(&context, "W1ABC").await.unwrap()
+        );
+        assert_eq!(
+            reduce_contest_score(&context, &facts, chrono::Utc::now())
+                .unwrap()
+                .score,
+            1
+        );
     }
 }

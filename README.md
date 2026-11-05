@@ -284,6 +284,11 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 
 ## Capability status
 
+Contest scoring is opt-in for Kansas FT4/FT8 2026 and SC fixed digital 2026.
+The TUI shows local claimed score, multipliers, contest dupes and hourly rate
+from durable evidence. SC grid-only contacts remain pending. See
+[configuration](docs/CONFIG.md#contest-scoring).
+
 What each part of Pancetta has been proven to do. This describes `main`
 after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 [CHANGELOG.md](CHANGELOG.md). Each row shows the highest state reached:

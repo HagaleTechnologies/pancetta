@@ -789,6 +789,14 @@ pub struct QsoManagerConfig {
     /// Contest mode settings
     pub contest_mode: Option<ContestConfig>,
 
+    /// PAN-50 contest-scoring context: the validated `[contest]` TOML
+    /// section converted by the coordinator at startup. `None` (default)
+    /// disables contest scoring entirely. Unrelated to the dormant
+    /// `contest_mode` serial-exchange scaffolding above, which is NOT
+    /// reused (see the PAN-50 plan's implementation approach).
+    #[serde(default)]
+    pub contest_scoring: Option<crate::contest::scoring::ContestScoringContext>,
+
     /// Automatic sequencing configuration
     pub auto_sequence: AutoSequenceConfig,
 
@@ -1204,6 +1212,7 @@ impl Default for QsoManagerConfig {
             our_grid: None,
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -2623,7 +2632,7 @@ impl QsoManager {
         };
 
         let raw_text = self.render_sent_text(&message);
-        let metadata = QsoMetadata {
+        let mut metadata = QsoMetadata {
             qso_id,
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: None,
@@ -2670,6 +2679,7 @@ impl QsoManager {
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         let progress = QsoProgress {
             state: state.clone(),
@@ -2764,6 +2774,27 @@ impl QsoManager {
         .await
     }
 
+    /// Enroll new manual attempts only. Exchange activation is separate
+    /// from scoring identity: SC's Field Day exchange is not implemented.
+    fn enroll_manual_contest(&self, metadata: &mut QsoMetadata) {
+        if metadata.initiated_by != CallInitiation::Manual {
+            return;
+        }
+        if let Some(context) = self.config.contest_scoring.as_ref() {
+            if context.in_period(metadata.start_time) {
+                crate::contest::ledger::attach(metadata, context);
+            }
+        }
+    }
+
+    fn grid_contest_engaged(metadata: &QsoMetadata) -> bool {
+        metadata.contest_info.as_ref().is_some_and(|info| {
+            info.scoring
+                .as_ref()
+                .is_none_or(|stamp| stamp.rules_id == crate::contest::scoring::KSQP_FT_2026)
+        })
+    }
+
     /// Engage a contest profile on an existing QSO. Stamps
     /// `metadata.contest_info` so `process_message_with_parity`'s
     /// reclassification step (PAN-49) knows to try this QSO's engaged
@@ -2794,8 +2825,33 @@ impl QsoManager {
             },
             points: 0,
             multiplier: None,
+            // PAN-50: engagement stamps exchange identity only; a scoring
+            // instance stamp is attached separately when a validated
+            // `[contest]` context owns the attempt.
+            scoring: progress
+                .metadata
+                .contest_info
+                .as_ref()
+                .and_then(|info| info.scoring.clone()),
         });
         Ok(())
+    }
+
+    /// Stable IDs of completed session contacts expected in both durable logs.
+    /// The caller performs all I/O after this short read lock is released.
+    pub async fn completed_contest_contact_ids(&self) -> Vec<String> {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| matches!(p.state, QsoState::Completed { .. }))
+            .filter_map(|p| {
+                p.metadata
+                    .tags
+                    .get(crate::contest::ledger::CONTACT_ID)
+                    .cloned()
+            })
+            .collect()
     }
 
     /// Open a manual **Hound** QSO to work a Fox (DXpedition) station.
@@ -3068,7 +3124,7 @@ impl QsoManager {
             started_at: now,
         };
 
-        let metadata = QsoMetadata {
+        let mut metadata = QsoMetadata {
             qso_id,
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: Some(target_callsign.clone()),
@@ -3113,6 +3169,7 @@ impl QsoManager {
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         // Send response message
         let message = MessageType::CqResponse {
@@ -3571,6 +3628,7 @@ impl QsoManager {
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
         // completion reports/end-time so the logged record is well-formed.
@@ -4002,7 +4060,7 @@ impl QsoManager {
                             let qsos = self.qsos.read().await;
                             qsos.values().any(|p| {
                                 p.state.is_active()
-                                    && p.metadata.contest_info.is_some()
+                                    && Self::grid_contest_engaged(&p.metadata)
                                     && p.state.their_callsign().is_some_and(|c| {
                                         crate::exchange::callsigns_match(c, &m.from_station)
                                     })
@@ -5479,7 +5537,7 @@ impl QsoManager {
         // be gated the same way, or an ordinary non-contest QSO advances and
         // logs a contest-shaped exchange the moment its real partner happens
         // to send an "R"+grid/report shape.
-        let qso_contest_engaged = progress.metadata.contest_info.is_some();
+        let qso_contest_engaged = Self::grid_contest_engaged(&progress.metadata);
 
         // PAN-259: a Hound answers a Fox report at the Fox's own offset. A
         // report whose offset is outside the response envelope (or not a
@@ -10006,6 +10064,7 @@ mod tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -15316,6 +15375,7 @@ mod sender_verification_tests {
             our_grid: Some("FN42".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -16826,6 +16886,7 @@ mod reply_emitter_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -18359,6 +18420,7 @@ mod state_regression_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19019,6 +19081,7 @@ mod sm_f4_waiting_for_report_resend_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19306,6 +19369,7 @@ mod sm_f6_auto_bounded_resend_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19498,6 +19562,7 @@ mod sm_f5_qso_failed_event_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19769,6 +19834,7 @@ mod tx_frequency_hold_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -19878,6 +19944,7 @@ mod pan72_stall_detection_tests {
             our_grid: Some("EM12".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -25977,6 +26044,7 @@ mod has_active_or_recent_qso_tests {
             our_grid: Some("FN42".into()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -26337,6 +26405,7 @@ mod hound_tests {
             our_grid: Some("EM20".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
@@ -27224,6 +27293,7 @@ mod current_remote_binding_tests {
             our_grid: Some("FN42".to_string()),
             timeouts: TimeoutConfig::default(),
             contest_mode: None,
+            contest_scoring: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),

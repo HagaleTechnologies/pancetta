@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - PAN-261: optional `autonomous.pounce_min_tier` admits pounce targets by DX tier and uses the weighted score within each tier. Opt-in bell, ntfy and webhook decode alerts have independent tier thresholds. `Shift+W` edits persistent watchlist pins, which alert when heard and disappear when removed or worked. Auto watchlist expiry is configurable.
+- PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.
 
 - `pancetta-ft8`: standalone decoder contract for other programs (PAN-176).
   A new cycle-level API — `decode_cycle(samples, protocol)` and the
