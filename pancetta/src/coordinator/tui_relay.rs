@@ -661,6 +661,9 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on },
                             );
                         }
+                        MessageType::ContestScore(ref update) => {
+                            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ContestScore(update.clone()));
+                        }
                         MessageType::ActiveQsosSnapshot {
                             ref qsos,
                             ref pending,

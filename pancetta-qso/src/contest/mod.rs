@@ -3,4 +3,7 @@
 pub mod catalog;
 pub mod matcher;
 pub mod profile;
+pub mod scoring;
 pub mod tokenizer;
+
+pub mod ledger;

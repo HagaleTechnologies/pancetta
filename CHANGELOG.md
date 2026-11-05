@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.
+
 - `pancetta-ft8`: standalone decoder contract for other programs (PAN-176).
   A new cycle-level API — `decode_cycle(samples, protocol)` and the
   reusable `CycleDecoder` — accepts one full 15 s FT8 (180 000 samples) or

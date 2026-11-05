@@ -58,3 +58,5 @@ pub use view::ActiveView;
 
 /// TUI library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod contest_score;
