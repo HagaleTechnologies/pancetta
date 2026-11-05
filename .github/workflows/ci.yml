@@ -590,7 +590,7 @@ jobs:
 
       # Never requests microphone access. Exercises macOS FFI and thin-parent signals.
       - name: Test macOS microphone identity (PAN-264)
-        run: cargo test -p pancetta --bin pancetta -- responsibility:: mic_access::
+        run: "cargo test -p pancetta --bin pancetta -- responsibility:: mic_access::"
 
   # PAN-172: advisories still run on code PRs, pushes and the weekly schedule.
   # Only research-notes-only merge groups skip this integration lane.
