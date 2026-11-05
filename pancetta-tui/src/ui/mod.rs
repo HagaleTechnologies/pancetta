@@ -90,6 +90,14 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             height: size.height.saturating_sub(y).clamp(1, 3),
         };
         f.render_widget(p, area);
+        crate::contest_score::render(
+            f,
+            Rect {
+                height: 2.min(size.height),
+                ..size
+            },
+            app.contest_score.as_ref(),
+        );
         return Ok(());
     }
 
@@ -103,12 +111,15 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // redrawn from typed state so status-line traffic can't erase it.
     readiness_strip::render_readiness_strip(f, chunks[1], app);
 
+    crate::contest_score::render(f, chunks[2], app.contest_score.as_ref());
+    let content = crate::contest_score::content(chunks[2], app.contest_score.as_ref());
+
     // Panel zoom (`z`): the focused panel fills the whole content area,
     // bypassing the active view's grid entirely. Orthogonal to the 4-view
     // system — checked before the view dispatch so it applies identically
     // regardless of `app.active_view`.
     if app.zoomed {
-        let (banner, panel) = compute_zoom_rects(chunks[2]);
+        let (banner, panel) = compute_zoom_rects(content);
         render_active_qsos(f, banner, app);
         render_zoomed_panel(f, panel, app)?;
     } else {
@@ -118,10 +129,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         // activity narrowed to CQs via `App::displayed_messages`); Run is
         // Callers-first for working a pileup.
         match app.active_view {
-            crate::view::ActiveView::Operate => layout_operate(f, chunks[2], app)?,
-            crate::view::ActiveView::Monitor => layout_monitor(f, chunks[2], app)?,
-            crate::view::ActiveView::Hunt => layout_hunt(f, chunks[2], app)?,
-            crate::view::ActiveView::Run => layout_run(f, chunks[2], app)?,
+            crate::view::ActiveView::Operate => layout_operate(f, content, app)?,
+            crate::view::ActiveView::Monitor => layout_monitor(f, content, app)?,
+            crate::view::ActiveView::Hunt => layout_hunt(f, content, app)?,
+            crate::view::ActiveView::Run => layout_run(f, content, app)?,
         }
     }
 

@@ -799,6 +799,40 @@ impl QsoDatabase {
         Ok(latest.into_iter().map(|((b, c), d)| (b, c, d)).collect())
     }
 
+    /// Complete, unpaginated contest ledger. Malformed rows fail closed.
+    /// Identity is checked before time filtering so reusing an instance id
+    /// with different rules or periods cannot silently hide older evidence.
+    pub async fn contest_ledger(
+        &self,
+        context: &crate::contest::scoring::ContestScoringContext,
+        operator_callsign: &str,
+    ) -> Result<Vec<crate::contest::scoring::ContestContactFact>, AsyncDatabaseError> {
+        use crate::contest::ledger;
+        let rows = sqlx::query("SELECT metadata, final_state, adif_data FROM qsos")
+            .fetch_all(&self.pool)
+            .await?;
+        let error = |message: String| AsyncDatabaseError::InvalidQuery { message };
+        let mut facts = Vec::new();
+        for row in rows {
+            // Do not use json_extract to select rows: malformed JSON must
+            // not disappear from a supposedly complete history.
+            let metadata: QsoMetadata = serde_json::from_str(row.get("metadata"))?;
+            if metadata.tags.get(ledger::INSTANCE).map(String::as_str)
+                != Some(context.instance_id.as_str())
+            {
+                continue;
+            }
+            let adif: AdifQso = serde_json::from_str(row.get("adif_data"))?;
+            let fact =
+                ledger::fact(&metadata, &adif.band, context, operator_callsign).map_err(error)?;
+            let state: QsoState = serde_json::from_str(row.get("final_state"))?;
+            if matches!(state, QsoState::Completed { .. }) && context.in_period(fact.start) {
+                facts.push(fact);
+            }
+        }
+        Ok(facts)
+    }
+
     /// Search QSOs returning QsoDatabaseRecord format for compatibility
     pub async fn search_qsos_records(
         &self,

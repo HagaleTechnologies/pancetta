@@ -447,6 +447,9 @@ pub enum MessageType {
         tone_offset_hz: f64,
     },
 
+    /// Persisted contest score, additive and local to the TUI.
+    ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
+
     /// Snapshot of in-progress QSOs, pushed by the QSO coordinator
     /// on every state change. tui_relay forwards this to the TUI as
     /// `TuiMessage::ActiveQsosUpdate`; the TUI replaces its previous

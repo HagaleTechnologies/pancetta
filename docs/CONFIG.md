@@ -1195,3 +1195,48 @@ files, and deleting them reclaims the space (the directory was capped at
 - Rust types and validation logic live under `pancetta-config/src/`.
 - See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
   through the coordinator.
+
+## Contest scoring
+
+Contest scoring is off when `[contest]` is absent. It is startup-only and
+applies to new manual attempts within the configured UTC periods. It does
+not enable autonomous contest operation or change general duplicate admission.
+
+```toml
+[contest]
+instance_id = "KSQP-2026-K5ARH"
+profile_id = "us-state-qso-party"
+rules_id = "ksqp-ft-2026"
+operator_region = "TX"
+periods = [
+  { start = "2026-08-29T14:00:00Z", end = "2026-08-30T02:00:00Z" },
+  { start = "2026-08-30T14:00:00Z", end = "2026-08-30T20:00:00Z" },
+]
+```
+
+For South Carolina fixed digital, use a separate instance and
+`rules_id = "scqp-digital-fixed-2026"`. For example:
+
+```toml
+[contest]
+instance_id = "SCQP-2026-K5ARH"
+profile_id = "us-state-qso-party"
+rules_id = "scqp-digital-fixed-2026"
+operator_region = "SC"
+periods = [{ start = "2026-02-28T15:00:00Z", end = "2026-03-01T02:00:00Z" }]
+```
+
+Regions are US state/DC codes, Canadian province/territory codes, or `DX`.
+Period ends are exclusive. Use a new instance id for each edition or entrant;
+conflicting logged rules, entrant or periods make its score unavailable.
+Set `[contest] enabled = false` to disable explicitly, then restart.
+
+The score strip shows local claimed score, multiplier count, trailing-hour
+rate, scored contacts, dupes, pending and excluded contacts. Kansas has no
+multipliers and displays `n/a`. SC requires explicit partner county/state
+facts. Standard ADIF `STATE` and `CNTY` or the versioned contest application
+evidence provide them. A grid or QRZ lookup never supplies a county.
+SC's Field Day exchange is not implemented here; grid-only SC contacts stay
+pending. Historical contacts without an explicit contest instance stay outside
+scoring. Duplicate contacts remain loggable. See
+[contest scoring rules and persistence](superpowers/specs/2026-11-05-contest-scoring.md).

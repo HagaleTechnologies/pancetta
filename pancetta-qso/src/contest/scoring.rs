@@ -120,11 +120,21 @@ const SCQP_DIGITAL_FIXED_2026_RULES: ContestRules = ContestRules {
     // duplicates.
     allowed_bands: &["160M", "80M", "40M", "20M", "15M", "10M", "6M", "2M"],
     allowed_modes: &["FT4", "FT8", "RTTY", "PSK31", "MFSK"],
-    // The published per-band digital station bonuses are not yet transcribed
-    // with sponsor confirmation; the engine credits them from this table,
-    // and the table ships empty rather than guessing weights (PAN-50
-    // deviation record: a follow-up pins the three published stations).
-    bonus_stations: &[],
+    // Sponsor revision 2.2.26, section 9.3. Once per band/digital group.
+    bonus_stations: &[
+        ContestBonusStation {
+            callsign: "W4CAE",
+            weight: 350,
+        },
+        ContestBonusStation {
+            callsign: "WW4SF",
+            weight: 250,
+        },
+        ContestBonusStation {
+            callsign: "K4YTZ",
+            weight: 250,
+        },
+    ],
     source_notes: "SC QSO Party rules revision 2.2.26 sections 9.1–9.5 \
          (https://scqso.com/wp-content/uploads/2026/02/SCQPRULES2024_0126.pdf) \
          and FT8/FT4 instructions (https://scqso.com/ft8-4-instructions/)",
@@ -611,6 +621,10 @@ fn reduce_with_rules(
             if fact.instance_id != context.instance_id {
                 return Stage1::Excluded(fact, ExclusionReason::WrongInstance);
             }
+            // Exclude future evidence before band-pending and county collapse.
+            if fact.start > now || !context.in_period(fact.start) {
+                return Stage1::Excluded(fact, ExclusionReason::OutOfPeriod);
+            }
             let mode = fact.mode.trim().to_ascii_uppercase();
             if !rules.allowed_modes.contains(&mode.as_str()) {
                 return Stage1::Excluded(fact, ExclusionReason::UnsupportedMode);
@@ -626,9 +640,6 @@ fn reduce_with_rules(
             };
             if !rules.allowed_bands.contains(&band.as_str()) {
                 return Stage1::Excluded(fact, ExclusionReason::DisallowedBand);
-            }
-            if !context.in_period(fact.start) {
-                return Stage1::Excluded(fact, ExclusionReason::OutOfPeriod);
             }
             Stage1::Eligible(fact)
         })
@@ -823,7 +834,11 @@ fn reduce_with_rules(
                 let region = normalize_region(&fact.their_region).unwrap_or_default();
                 if region == "SC" {
                     let county = county.value.clone().unwrap_or_default();
-                    (2, vec![MultiplierKey(format!("{band}:county:{county}"))])
+                    let mut keys = vec![MultiplierKey(format!("{band}:county:{county}"))];
+                    if operator_in_host {
+                        keys.push(MultiplierKey(format!("{band}:state:SC")));
+                    }
+                    (2, keys)
                 } else if region == REGION_DX {
                     // DX earns points but no multiplier.
                     (4, Vec::new())
@@ -979,9 +994,8 @@ mod tests {
     }
 
     /// The bonus engine: credited once per band/digital group even after a
-    /// county change, with all three weights summed — exercised with
-    /// synthetic weights because the sponsor's published station/weight
-    /// table is not yet transcribed (see the catalog note).
+    /// county change, with synthetic weights independent of the catalog.
+    /// Production sponsor weights are covered by integration fixtures.
     #[test]
     fn bonus_stations_credit_once_per_band_with_all_three_weights() {
         let synthetic = ContestRules {
@@ -1044,10 +1058,11 @@ mod tests {
         ];
         let snapshot = reduce_with_rules(&synthetic, &context, &facts, end).unwrap();
         // points: five SC partners × 2 = 10; multipliers: 20M:county:GV,
-        // 20M:county:SP, 40M:county:GV, 20M:county:RI, 80M:county:CH = 5;
+        // 20M:county:SP, 40M:county:GV, 20M:county:RI, 80M:county:CH,
+        // plus the SC state key on each of the three bands = 8;
         // bonuses 25 (20M once) + 25 (40M) + 50 + 100 = 200.
         assert_eq!(snapshot.scored, 5);
-        assert_eq!(snapshot.multiplier_count, 5);
-        assert_eq!(snapshot.score, 10 * 5 + 25 + 25 + 50 + 100);
+        assert_eq!(snapshot.multiplier_count, 8);
+        assert_eq!(snapshot.score, 10 * 8 + 25 + 25 + 50 + 100);
     }
 }

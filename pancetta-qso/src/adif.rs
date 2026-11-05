@@ -636,6 +636,20 @@ impl AdifProcessor {
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
+        if let Ok(Some(mut logged)) = crate::contest::ledger::decode(&additional_fields) {
+            let evidence = crate::contest::ledger::resolved_evidence(
+                &logged,
+                &additional_fields,
+                metadata.their_state.as_deref(),
+            );
+            if evidence.source.as_deref() != Some("conflict") {
+                logged.evidence = evidence;
+                if let Ok(json) = serde_json::to_string(&logged) {
+                    additional_fields.insert(crate::contest::ledger::CONTEXT.into(), json);
+                }
+            }
+        }
+
         // An imported record's QSL status rides in the tags (see
         // `adif_to_qso`); a QSO Pancetta logged itself has none, so it
         // exports as not yet sent or received.
@@ -734,28 +748,37 @@ impl AdifProcessor {
                 theirs: adif_qso.gridsquare.clone(),
             },
             their_state: adif_qso.state.clone(),
-            contest_info: adif_qso
-                .contest_id
-                .as_ref()
-                .map(|contest_name| ContestInfo {
-                    contest_name: contest_name.clone(),
-                    // PAN-52: keep the file's verbatim CONTEST_ID so the
-                    // index → export path re-renders it byte-identically
-                    // instead of dropping it (the export side stamps
-                    // CONTEST_ID from this field, not from contest_name).
-                    adif_contest_id: Some(contest_name.clone()),
-                    category: "".to_string(), // Not available in ADIF
-                    serials: ContestSerials {
-                        sent: adif_qso.stx,
-                        received: adif_qso.srx,
-                    },
-                    points: 1, // Default
-                    multiplier: None,
-                    // PAN-50: imported rows carry no scoring instance until
-                    // contest app-field evidence decoding lands (a later
-                    // phase); the stamp defaults to None for them.
-                    scoring: None,
-                }),
+            contest_info: crate::contest::ledger::imported_info(
+                &adif_qso.additional_fields,
+                adif_qso.contest_id.as_deref(),
+                ContestSerials {
+                    sent: adif_qso.stx,
+                    received: adif_qso.srx,
+                },
+            )
+            .or_else(|| {
+                adif_qso
+                    .contest_id
+                    .as_ref()
+                    .map(|contest_name| ContestInfo {
+                        contest_name: contest_name.clone(),
+                        // PAN-52: keep the file's verbatim CONTEST_ID so the
+                        // index → export path re-renders it byte-identically
+                        // instead of dropping it (the export side stamps
+                        // CONTEST_ID from this field, not from contest_name).
+                        adif_contest_id: Some(contest_name.clone()),
+                        category: "".to_string(), // Not available in ADIF
+                        serials: ContestSerials {
+                            sent: adif_qso.stx,
+                            received: adif_qso.srx,
+                        },
+                        points: 1, // Default
+                        multiplier: None,
+                        // Ordinary legacy CONTEST_ID records are not enrolled
+                        // into a scoring instance retrospectively.
+                        scoring: None,
+                    })
+            }),
             tags: Self::tags_with_unmodeled_fields(adif_qso),
             adif_field_types: adif_qso.field_types.clone(),
             notes: adif_qso.comment.clone(),

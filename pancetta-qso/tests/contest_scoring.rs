@@ -422,8 +422,8 @@ fn scqp_multipliers_are_band_scoped_and_county_changes_permit_another_contact() 
     let snapshot = reduce_contest_score(&context, &facts, t(60)).unwrap();
     assert_eq!(snapshot.scored, 3);
     assert_eq!(snapshot.dupes, 1);
-    assert_eq!(snapshot.multiplier_count, 3); // 20M:GV, 20M:SP, 40M:GV
-    assert_eq!(snapshot.score, (2 * 3) * 3);
+    assert_eq!(snapshot.multiplier_count, 5); // Three counties plus SC on both bands.
+    assert_eq!(snapshot.score, (2 * 3) * 5);
 }
 
 #[test]
@@ -450,12 +450,12 @@ fn scqp_entrant_vs_outside_entrant_eligibility_and_mult_sets_differ() {
             .at(30, "c"),
         ]
     };
-    // SC entrant: SC partner 2 points + county mult; NC partner 4 points +
+    // SC entrant: SC partner 2 points + county and SC state; NC partner 4 points +
     // state mult; DX 4 points, no mult.
     let sc = reduce_contest_score(&sc_entrant, &facts_for(&sc_entrant.instance_id), t(60)).unwrap();
     assert_eq!(sc.scored, 3);
-    assert_eq!(sc.multiplier_count, 2); // 20M:county:GV, 20M:state:NC
-    assert_eq!(sc.score, (2 + 4 + 4) * 2);
+    assert_eq!(sc.multiplier_count, 3); // County GV, state SC, state NC.
+    assert_eq!(sc.score, (2 + 4 + 4) * 3);
 
     // Outside entrant: only SC partners score; NC and DX partners are
     // excluded and add no multipliers.
@@ -682,10 +682,69 @@ fn checked_arithmetic_path_holds_for_large_ledgers() {
             .at(10 + index, Box::leak(format!("c{index}").into_boxed_str())),
         );
     }
-    // 64 scored SC contacts: 128 points × 64 multiplier keys — the checked
+    // 64 scored SC contacts: 128 points × 65 multiplier keys including SC — the checked
     // u64 path yields the exact formula rather than wrapping.
     let snapshot = reduce_contest_score(&context, &facts, t(600)).unwrap();
     assert_eq!(snapshot.scored, 64);
-    assert_eq!(snapshot.multiplier_count, 64);
-    assert_eq!(snapshot.score, 128 * 64);
+    assert_eq!(snapshot.multiplier_count, 65);
+    assert_eq!(snapshot.score, 128 * 65);
+}
+
+#[test]
+fn future_contact_cannot_score_or_collapse_current_counties() {
+    let context = kansas_tx_entrant();
+    let builder = FactBuilder {
+        their_region: Some("KS"),
+        their_county: Some("SB"),
+        ..FactBuilder::new(&context.instance_id, "K0KS")
+    };
+    let mut second = builder.at(20, "b");
+    second.their_county = Some("DG".into());
+    let mut future = builder.at(120, "future");
+    future.their_county = None;
+    let snapshot =
+        reduce_contest_score(&context, &[builder.at(10, "a"), second, future], t(60)).unwrap();
+    assert_eq!(snapshot.scored, 2);
+    assert_eq!(snapshot.dupes, 0);
+    assert_eq!(snapshot.excluded, 1);
+}
+
+#[test]
+fn published_sc_bonus_stations_credit_once_per_band_digital_group() {
+    let context = scqp("TX", "SC-test");
+    let mut facts = Vec::new();
+    for (i, call) in ["W4CAE", "WW4SF", "K4YTZ"].into_iter().enumerate() {
+        let b = FactBuilder {
+            their_region: Some("SC"),
+            their_county: Some("GVIL"),
+            ..FactBuilder::new(&context.instance_id, call)
+        };
+        facts.push(b.at(10, &format!("{i}-a")));
+        let mut repeat = b.at(20, &format!("{i}-b"));
+        repeat.mode = "FT4".into();
+        repeat.their_county = Some("CHAR".into());
+        facts.push(repeat);
+        let mut other_band = b.at(30, &format!("{i}-c"));
+        other_band.band = Some("40M".into());
+        facts.push(other_band);
+    }
+    let snapshot = reduce_contest_score(&context, &facts, t(60)).unwrap();
+    assert_eq!(snapshot.scored, 9);
+    assert_eq!(snapshot.multiplier_count, 3);
+    assert_eq!(snapshot.score, 18 * 3 + 2 * (350 + 250 + 250));
+}
+
+#[test]
+fn sc_entrant_gets_county_and_sc_state_per_band() {
+    for (region, expected) in [("SC", 2), ("TX", 1)] {
+        let context = scqp(region, "SC-test");
+        let b = FactBuilder {
+            their_region: Some("SC"),
+            their_county: Some("GVIL"),
+            ..FactBuilder::new(&context.instance_id, "K0SC")
+        };
+        let snapshot = reduce_contest_score(&context, &[b.at(10, "a")], t(60)).unwrap();
+        assert_eq!(snapshot.multiplier_count, expected);
+        assert_eq!(snapshot.score, 2 * expected);
+    }
 }
