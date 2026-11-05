@@ -139,3 +139,10 @@ The scope is dependency-based, not restart-policy-based: Audio remains deliberat
 but its loss still invalidates every active on-air exchange, while a StationAgent crash cannot
 invalidate local operation. Component-crash drops also suppress the autonomous engine's normal
 "QSO ended, start another" reaction so recovery cannot cascade into fresh transmissions.
+
+- **macOS microphone approval is per binary and unverified on hardware.** Ad hoc
+  signatures tie the TCC grant to one build (Apple TN3127). Developer ID signing
+  would keep it across versions. The PAN-264 Mac matrix M1-M8 has not run yet,
+  including prompt delivery, ssh/tmux/launchd capture, Terminal behavior,
+  background fast-user-switch capture and upgrade recovery.
+  (Surfaced by PAN-264, 2026-11-04.)

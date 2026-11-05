@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded in the macOS pancetta binary as __TEXT,__info_plist by pancetta/build.rs (PAN-264). -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>net.hagale.pancetta</string>
+    <key>CFBundleName</key>
+    <string>pancetta</string>
+    <key>CFBundleExecutable</key>
+    <string>pancetta</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>pancetta listens to your radio's USB audio so it can decode FT8 and FT4 signals.</string>
+</dict>
+</plist>

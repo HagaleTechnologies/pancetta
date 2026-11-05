@@ -378,6 +378,41 @@ takes effect.
   never applied the operator's file, so the station was never configured
   as intended.
 
+### macOS: pancetta waits for microphone approval, or doctor shows FLAT LINE over ssh
+
+macOS asks one process for microphone permission: the "responsible" one.
+From a Terminal window that is Terminal, which already has access. Over
+ssh, in a tmux session started over ssh, and under the LaunchAgent,
+pancetta makes itself the responsible process and macOS asks about
+pancetta itself (`net.hagale.pancetta`).
+
+Approve it once:
+
+1. Start the station over ssh (`pancetta --headless`) or load the LaunchAgent.
+   pancetta says microphone access needs a one-time approval and waits.
+2. At the Mac, log in as the same user, or connect with Screen Sharing,
+   and click Allow on the microphone prompt for pancetta.
+3. The waiting station starts by itself. Check with `pancetta doctor`
+   over ssh; the audio level row should PASS.
+
+If no prompt appears, open System Settings > Privacy & Security >
+Microphone at the Mac and turn on pancetta.
+
+Each new pancetta binary needs this approval again. Release binaries are
+not signed with a Developer ID, so macOS ties the approval to the exact
+binary, and an upgrade or a rebuild is a new binary. If pancetta is
+listed and turned on but the station still waits after an upgrade, run
+`tccutil reset Microphone net.hagale.pancetta` at the Mac and start
+pancetta again to get a new prompt.
+
+The ssh-started station runs as two processes: a small parent and the
+station. Stop it with Ctrl-C or SIGTERM. A SIGINT sent to the parent's
+pid alone is ignored, and a SIGKILL of the parent leaves the station
+running; stop the station by its own pid in that case.
+
+`PANCETTA_MACOS_RELAUNCH=0` turns the relaunch off. pancetta then uses
+the launching app's approval, as before PAN-264.
+
 ### Logged QSOs don't appear in `qsos.adi`
 
 - ADIF write is fail-soft: a failed open logs a `WARN` and the QSO

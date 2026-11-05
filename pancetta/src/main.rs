@@ -21,6 +21,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use pancetta_lib::coordinator::ApplicationCoordinator;
 
 mod doctor;
+mod mic_access;
+mod responsibility;
 
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
@@ -369,8 +371,7 @@ impl std::fmt::Display for LogFormat {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.gain_sweep_seconds.is_some()
         && cli
@@ -385,6 +386,20 @@ async fn main() -> Result<()> {
         .exit();
     }
 
+    responsibility::prepare(opens_microphone(&cli));
+    async_main(cli)
+}
+
+fn opens_microphone(cli: &Cli) -> bool {
+    match cli.command.as_ref() {
+        Some(Commands::Doctor) => true,
+        None | Some(Commands::Run(_)) => !cli.no_audio && cli.wav.is_none() && cli.replay.is_none(),
+        _ => false,
+    }
+}
+
+#[tokio::main]
+async fn async_main(cli: Cli) -> Result<()> {
     // Initialize logging first
     let _log_guard = init_logging(&cli, cli.headless)?;
 
@@ -394,6 +409,8 @@ async fn main() -> Result<()> {
         "Starting Pancetta v{} - High-Performance Amateur Radio FT8 Processing",
         env!("CARGO_PKG_VERSION")
     );
+
+    responsibility::log_outcome();
 
     // Handle subcommands
     if let Some(ref command) = cli.command {
@@ -459,6 +476,19 @@ async fn run_application(cli: Cli) -> Result<()> {
         interrupted_for_signals.store(true, Ordering::Release);
         shutdown_for_signals.store(true, Ordering::Release);
     });
+
+    // PAN-264: wait before opening audio, with station shutdown handling already active.
+    let live_audio = !cli.no_audio && cli.wav.is_none() && cli.replay.is_none();
+    if mic_access::gate_required(responsibility::outcome(), live_audio)
+        && mic_access::wait_for_station_approval(&shutdown, cli.headless).await
+            == mic_access::GateResult::Stopped
+    {
+        info!("Stopped while waiting for microphone approval");
+        if sweep_requested && interrupted.load(Ordering::Acquire) {
+            std::process::exit(130);
+        }
+        return Ok(());
+    }
 
     // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
     let config_write_path = config_write_path(&cli);
@@ -1843,6 +1873,11 @@ async fn info_command() -> Result<()> {
     println!("  OS: {}", std::env::consts::OS);
     println!("  Architecture: {}", std::env::consts::ARCH);
     println!("  CPU cores: {}", num_cpus::get());
+    #[cfg(target_os = "macos")]
+    println!(
+        "  {}",
+        mic_access::identity_line(mic_access::embedded_identity().as_ref())
+    );
     println!();
 
     // Component versions
@@ -4259,5 +4294,36 @@ mod wizard_validation_tests {
         let mut cfg = Config::default();
         cfg.station.power_watts = 5000;
         assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod microphone_command_tests {
+    use super::*;
+    #[test]
+    fn opens_microphone_only_for_live_capture_commands() {
+        for args in [
+            vec![],
+            vec!["--headless"],
+            vec!["run"],
+            vec!["--headless", "--test-tx", "N0CALL N0CALL 73"],
+            vec!["doctor"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
+            assert!(opens_microphone(&cli));
+        }
+        for args in [
+            vec!["--no-audio"],
+            vec!["--headless", "--no-audio"],
+            vec!["--wav", "x.wav"],
+            vec!["--replay", "dir"],
+            vec!["info"],
+            vec!["setup"],
+            vec!["test-audio", "--list"],
+            vec!["config", "--show"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
+            assert!(!opens_microphone(&cli));
+        }
     }
 }

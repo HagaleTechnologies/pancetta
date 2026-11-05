@@ -143,6 +143,11 @@ jobs:
           "$BIN" info | grep -q "ft8_lib C decoder: native-C" \
             || { echo "::error::binary was built with ft8lib_stub — degraded decoder must not ship"; exit 1; }
 
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            "$BIN" info | grep -qF "Microphone identity: net.hagale.pancetta (embedded Info.plist)" \
+              || { echo "::error::macOS binary lacks the embedded Info.plist (PAN-264)"; exit 1; }
+          fi
+
       - name: Decode fixture verification (ARM only) — proves decoding, not just linkage
         # The smoke test above only proves the native C decoder is linked in;
         # it never decodes anything, so it can't catch an ARM-specific

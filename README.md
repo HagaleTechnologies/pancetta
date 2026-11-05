@@ -319,6 +319,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
+| macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 
 ### Platform archive evidence
