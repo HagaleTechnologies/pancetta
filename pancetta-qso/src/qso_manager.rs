@@ -2632,7 +2632,7 @@ impl QsoManager {
         };
 
         let raw_text = self.render_sent_text(&message);
-        let metadata = QsoMetadata {
+        let mut metadata = QsoMetadata {
             qso_id,
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: None,
@@ -2679,6 +2679,7 @@ impl QsoManager {
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         let progress = QsoProgress {
             state: state.clone(),
@@ -2773,6 +2774,27 @@ impl QsoManager {
         .await
     }
 
+    /// Enroll new manual attempts only. Exchange activation is separate
+    /// from scoring identity: SC's Field Day exchange is not implemented.
+    fn enroll_manual_contest(&self, metadata: &mut QsoMetadata) {
+        if metadata.initiated_by != CallInitiation::Manual {
+            return;
+        }
+        if let Some(context) = self.config.contest_scoring.as_ref() {
+            if context.in_period(metadata.start_time) {
+                crate::contest::ledger::attach(metadata, context);
+            }
+        }
+    }
+
+    fn grid_contest_engaged(metadata: &QsoMetadata) -> bool {
+        metadata.contest_info.as_ref().is_some_and(|info| {
+            info.scoring
+                .as_ref()
+                .is_none_or(|stamp| stamp.rules_id == crate::contest::scoring::KSQP_FT_2026)
+        })
+    }
+
     /// Engage a contest profile on an existing QSO. Stamps
     /// `metadata.contest_info` so `process_message_with_parity`'s
     /// reclassification step (PAN-49) knows to try this QSO's engaged
@@ -2806,9 +2828,30 @@ impl QsoManager {
             // PAN-50: engagement stamps exchange identity only; a scoring
             // instance stamp is attached separately when a validated
             // `[contest]` context owns the attempt.
-            scoring: None,
+            scoring: progress
+                .metadata
+                .contest_info
+                .as_ref()
+                .and_then(|info| info.scoring.clone()),
         });
         Ok(())
+    }
+
+    /// Stable IDs of completed session contacts expected in both durable logs.
+    /// The caller performs all I/O after this short read lock is released.
+    pub async fn completed_contest_contact_ids(&self) -> Vec<String> {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| matches!(p.state, QsoState::Completed { .. }))
+            .filter_map(|p| {
+                p.metadata
+                    .tags
+                    .get(crate::contest::ledger::CONTACT_ID)
+                    .cloned()
+            })
+            .collect()
     }
 
     /// Compute the contest score snapshot (PAN-50) from the in-memory
@@ -2819,8 +2862,8 @@ impl QsoManager {
     /// `completed_rf_frequency_hz` (never today's dial), the partner region
     /// from the persisted `their_state`, and the contest instance from the
     /// contact's `ContestInfo::scoring` stamp. The strict SQLite/ADIF
-    /// history query and the live refresh loop are a later PAN-50 phase;
-    /// this in-memory view covers the session's own contacts.
+    /// history query and live refresh loop supply the operator's score;
+    /// this separate in-memory view covers only the session's own contacts.
     pub async fn contest_score_snapshot(
         &self,
         now: DateTime<Utc>,
@@ -2832,33 +2875,28 @@ impl QsoManager {
     > {
         let context = self.config.contest_scoring.as_ref()?;
         let qsos = self.qsos.read().await;
-        let facts: Vec<crate::contest::scoring::ContestContactFact> = qsos
-            .iter()
-            .filter(|(_, progress)| matches!(progress.state, QsoState::Completed { .. }))
-            .filter_map(|(qso_id, progress)| {
-                let metadata = &progress.metadata;
-                let callsign = metadata.their_callsign.as_deref()?;
-                Some(crate::contest::scoring::ContestContactFact {
-                    contact_id: qso_id.to_string(),
-                    instance_id: metadata
-                        .contest_info
-                        .as_ref()
-                        .and_then(|info| info.scoring.as_ref())
-                        .map(|stamp| stamp.instance_id.clone())
-                        .unwrap_or_default(),
-                    callsign: callsign.to_string(),
-                    band: metadata
-                        .completed_rf_frequency_hz
-                        .map(crate::utils::frequency_to_band),
-                    mode: metadata.mode.clone(),
-                    start: metadata.start_time,
-                    failed: false,
-                    their_region: metadata.their_state.clone(),
-                    their_county: None,
-                    our_county: None,
-                })
-            })
-            .collect();
+        let mut facts = Vec::new();
+        for progress in qsos
+            .values()
+            .filter(|p| matches!(p.state, QsoState::Completed { .. }))
+        {
+            let metadata = &progress.metadata;
+            if metadata.tags.get(crate::contest::ledger::INSTANCE) != Some(&context.instance_id) {
+                continue;
+            }
+            let band = crate::utils::frequency_to_band(
+                metadata
+                    .completed_rf_frequency_hz
+                    .unwrap_or(metadata.frequency),
+            );
+            match crate::contest::ledger::fact(metadata, &band, context, &self.config.our_callsign)
+            {
+                Ok(fact) => facts.push(fact),
+                Err(_) => {
+                    return Some(Err(crate::contest::scoring::ScoringError::ScoreUnavailable))
+                }
+            }
+        }
         drop(qsos);
         Some(crate::contest::scoring::reduce_contest_score(
             context, &facts, now,
@@ -3135,7 +3173,7 @@ impl QsoManager {
             started_at: now,
         };
 
-        let metadata = QsoMetadata {
+        let mut metadata = QsoMetadata {
             qso_id,
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: Some(target_callsign.clone()),
@@ -3180,6 +3218,7 @@ impl QsoManager {
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         // Send response message
         let message = MessageType::CqResponse {
@@ -3638,6 +3677,7 @@ impl QsoManager {
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
+        self.enroll_manual_contest(&mut metadata);
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
         // completion reports/end-time so the logged record is well-formed.
@@ -4069,7 +4109,7 @@ impl QsoManager {
                             let qsos = self.qsos.read().await;
                             qsos.values().any(|p| {
                                 p.state.is_active()
-                                    && p.metadata.contest_info.is_some()
+                                    && Self::grid_contest_engaged(&p.metadata)
                                     && p.state.their_callsign().is_some_and(|c| {
                                         crate::exchange::callsigns_match(c, &m.from_station)
                                     })
@@ -5546,7 +5586,7 @@ impl QsoManager {
         // be gated the same way, or an ordinary non-contest QSO advances and
         // logs a contest-shaped exchange the moment its real partner happens
         // to send an "R"+grid/report shape.
-        let qso_contest_engaged = progress.metadata.contest_info.is_some();
+        let qso_contest_engaged = Self::grid_contest_engaged(&progress.metadata);
 
         // PAN-259: a Hound answers a Fox report at the Fox's own offset. A
         // report whose offset is outside the response envelope (or not a
