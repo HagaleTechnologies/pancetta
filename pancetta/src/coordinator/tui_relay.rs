@@ -1482,6 +1482,7 @@ impl super::ApplicationCoordinator {
                 let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::Error {
                     component: "session".to_string(),
                     message: message.clone(),
+                    code: None,
                 });
             }
 
