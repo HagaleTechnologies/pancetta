@@ -183,6 +183,26 @@ pub(crate) fn load(path: &Path) -> SessionLoad {
             return SessionLoad::Ignored(format!("{}: malformed JSON ({e})", path.display()));
         }
     };
+    if !value.is_object() {
+        return SessionLoad::Ignored(format!("{}: expected a JSON object", path.display()));
+    }
+    // Validate the whole record before restoring any field. Missing/null
+    // choices are supported, but a wrong type must not look like no choice.
+    for field in [
+        "tx_freq_mode",
+        "decode_effort",
+        "decode_effort_config_at_save",
+    ] {
+        if value
+            .get(field)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return SessionLoad::Ignored(format!(
+                "{}: {field} must be a string or null",
+                path.display()
+            ));
+        }
+    }
     let mut record = SessionRecord::default();
     if let Some(label) = value.get("tx_freq_mode").and_then(|v| v.as_str()) {
         match parse_tx_freq_mode(label) {
@@ -500,6 +520,60 @@ mod tests {
     #[test]
     fn structurally_valid_file_with_absent_keys_is_a_record_of_nones() {
         let (_dir, path) = session_file("{}");
+        assert_eq!(load(&path), SessionLoad::Record(SessionRecord::default()));
+    }
+
+    #[test]
+    fn structurally_invalid_records_fall_back_as_a_whole_and_warn() {
+        let valid = serde_json::json!({
+            "tx_freq_mode": "AUTO",
+            "decode_effort": "MAX",
+            "decode_effort_config_at_save": "AUTO"
+        });
+        let mut cases = vec![
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(123),
+            serde_json::json!("AUTO"),
+            serde_json::json!([]),
+        ];
+        for field in [
+            "tx_freq_mode",
+            "decode_effort",
+            "decode_effort_config_at_save",
+        ] {
+            for wrong_type in [
+                serde_json::json!(123),
+                serde_json::json!(false),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let mut record = valid.clone();
+                record[field] = wrong_type;
+                cases.push(record);
+            }
+        }
+        for value in cases {
+            let (_dir, path) = session_file(&value.to_string());
+            let loaded = load(&path);
+            assert!(
+                matches!(loaded, SessionLoad::Ignored(_)),
+                "{value}: {loaded:?}"
+            );
+            let choices = resolve(DecodeEffort::Deep, loaded);
+            assert_eq!(choices.tx_freq_mode, TxFreqMode::Hold, "{value}");
+            assert_eq!(choices.decode_effort, DecodeEffort::Deep, "{value}");
+            let report = startup_report(&choices);
+            assert!(report.error.is_some(), "{value}: {report:?}");
+            assert!(report.status.is_none(), "{value}: {report:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_null_choices_remain_supported() {
+        let (_dir, path) = session_file(
+            r#"{"tx_freq_mode":null,"decode_effort":null,"decode_effort_config_at_save":null}"#,
+        );
         assert_eq!(load(&path), SessionLoad::Record(SessionRecord::default()));
     }
 
