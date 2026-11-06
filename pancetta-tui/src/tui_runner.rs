@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,15 +94,22 @@ pub enum TuiMessage {
     /// Decoded FT8 message
     DecodedMessage(DecodedMessageView),
     /// Frequency update
-    FrequencyUpdate { vfo: u8, frequency: u64 },
+    FrequencyUpdate {
+        vfo: u8,
+        frequency: u64,
+    },
     /// Rig S-meter update. Value follows the hamlib STRENGTH
     /// convention: dB relative to S9 (0 = S9, -54 ≈ S0, +20 = S9+20).
     /// Produced by the coordinator's rig polling loop (Batch 95); only
     /// real rig readings arrive here — never synthesized data.
-    SignalStrengthUpdate { db_over_s9: i32 },
+    SignalStrengthUpdate {
+        db_over_s9: i32,
+    },
     /// Live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed. Shown in
     /// the status bar only during TX. Real `\get_level SWR` reads.
-    SwrUpdate { swr: f32 },
+    SwrUpdate {
+        swr: f32,
+    },
     /// DX spot
     DxSpot {
         callsign: String,
@@ -123,12 +130,27 @@ pub enum TuiMessage {
         band_needed: bool,
     },
     /// Error message
-    Error { component: String, message: String },
+    Error {
+        component: String,
+        message: String,
+        /// Set when the producer will report recovery with `ErrorResolved`.
+        code: Option<u32>,
+    },
+    /// The fault behind `Error`s with this `code` recovered on its own;
+    /// their alerts clear.
+    ErrorResolved {
+        component: String,
+        code: u32,
+    },
     /// PAN-89: station readiness snapshot — coordinator relay, 2 s tick,
     /// pushed on change. Drives the readiness strip's verdict and items.
     StationReadiness(crate::readiness::StationReadiness),
+    ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
     /// Status update
-    StatusUpdate { component: String, status: String },
+    StatusUpdate {
+        component: String,
+        status: String,
+    },
     /// A retained, operator-facing diagnostic event (docs/observability-
     /// diagnostics-plan.md Layer 1) — relayed from
     /// `MessageType::DiagnosticEvent`. Appended to `App`'s bounded event
@@ -148,11 +170,17 @@ pub enum TuiMessage {
     /// from `diagnostic_events`.
     RecentQsoOutcome(crate::app::RecentQsoOutcome),
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
-    WaterfallUpdate { rows: Vec<Vec<f32>> },
+    WaterfallUpdate {
+        rows: Vec<Vec<f32>>,
+    },
     /// Live spot groups from cqdx.io
-    SpotGroupUpdate { spots: Vec<CqdxSpotInfo> },
+    SpotGroupUpdate {
+        spots: Vec<CqdxSpotInfo>,
+    },
     /// Audio level update (RMS, 0.0-1.0)
-    AudioLevel { level: f32 },
+    AudioLevel {
+        level: f32,
+    },
     /// Pipeline health snapshot (sent periodically by coordinator)
     PipelineHealth(crate::app::PipelineHealth),
     /// Snapshot of QSOs currently in progress, pushed by the QSO
@@ -196,7 +224,9 @@ pub enum TuiMessage {
     /// TX worker when PTT is asserted; `false` when the transmission
     /// ends — normal completion, operator abort (F8 / Shift+Q), or
     /// shutdown all clear it. Drives the title-bar " TX " badge.
-    TxStatus { active: bool },
+    TxStatus {
+        active: bool,
+    },
     /// Richer TX-queue snapshot: what is on the air RIGHT NOW and what is
     /// queued for an upcoming slot. Forwarded by the coordinator relay from
     /// the TX worker's `TxQueueStatus`. Drives the "TX" NOW/QUEUED lines.
@@ -346,11 +376,19 @@ pub enum TuiMessage {
     },
     /// Currently-watchlisted callsigns (#197 DX watchlist). Full resync each
     /// time — `App::apply_dx_watchlist` bulk-replaces, never diffs.
-    DxWatchlistUpdate { callsigns: Vec<String> },
+    DxWatchlistUpdate {
+        callsigns: Vec<String>,
+        pinned: Vec<String>,
+    },
+    /// Ring the configured terminal bell.
+    AlertBell,
     /// A station's US state/territory became known (PAN-85). Sent at most
     /// once per callsign per sender, and only when a value actually exists,
     /// so a state learned later in the session still propagates.
-    StationState { callsign: String, state: String },
+    StationState {
+        callsign: String,
+        state: String,
+    },
     /// The relay rescored a station's latest decode after a QSO with it ended
     /// (PAN-94), so new worked or failure history reaches DX Hunter before
     /// that station is decoded again.
@@ -364,6 +402,8 @@ pub enum TuiMessage {
 /// Commands sent from TUI
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
+    /// Add or remove an operator watchlist pin.
+    WatchlistToggle { callsign: String },
     /// Change frequency
     SetFrequency { vfo: u8, frequency: u64 },
     /// Enable/disable rig split (RX dial ≠ TX dial). `tx_frequency` is the
@@ -841,8 +881,14 @@ impl TuiRunner {
             TuiMessage::Error {
                 component: _,
                 message,
+                code,
             } => {
-                app.add_error_message(message);
+                app.add_coded_error_message(message, code);
+            }
+            TuiMessage::ErrorResolved { component, code } => {
+                if app.resolve_alerts(code) > 0 {
+                    app.status_message = format!("{component} recovered — alert cleared");
+                }
             }
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
@@ -859,6 +905,15 @@ impl TuiRunner {
             TuiMessage::PipelineHealth(health) => {
                 app.pipeline_health = Some(health);
                 app.prune_acknowledged_readiness();
+            }
+            TuiMessage::ContestScore(update) => {
+                if app
+                    .contest_score
+                    .as_ref()
+                    .is_none_or(|current| update.generation > current.generation)
+                {
+                    app.contest_score = Some(update);
+                }
             }
             TuiMessage::StationReadiness(readiness) => {
                 app.station_readiness = Some(readiness);
@@ -1037,8 +1092,12 @@ impl TuiRunner {
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
             }
-            TuiMessage::DxWatchlistUpdate { callsigns } => {
-                app.apply_dx_watchlist(&callsigns);
+            TuiMessage::AlertBell => {
+                io::stdout().write_all(b"\x07")?;
+                io::stdout().flush()?;
+            }
+            TuiMessage::DxWatchlistUpdate { callsigns, pinned } => {
+                app.apply_dx_watchlist(&callsigns, &pinned);
             }
             TuiMessage::StationState { callsign, state } => {
                 app.set_station_state(&callsign, &state);
@@ -1403,6 +1462,34 @@ impl TuiRunner {
                         // handles this SelectRig must not revert the form.
                         app.rig_selection.submits_sent += 1;
                         app.status_message = "Applying rig config…".to_string();
+                    }
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
+        if app.watchlist_modal.visible {
+            match key.code {
+                KeyCode::Esc => app.watchlist_modal.visible = false,
+                KeyCode::Backspace => {
+                    app.watchlist_modal.buffer.pop();
+                }
+                KeyCode::Char(c) => app.watchlist_modal.buffer.push(c),
+                KeyCode::Enter => {
+                    let callsign = app.watchlist_modal.buffer.trim().to_uppercase();
+                    if callsign.is_empty() {
+                        app.status_message = "Enter a callsign to watch".into();
+                    } else {
+                        let action = if app.pinned_callsigns.contains(&callsign) {
+                            "removed from"
+                        } else {
+                            "added to"
+                        };
+                        app.status_message = format!("{callsign} {action} watchlist");
+                        self.message_tx
+                            .send(TuiCommand::WatchlistToggle { callsign })?;
+                        app.watchlist_modal.visible = false;
                     }
                 }
                 _ => {}
@@ -2265,6 +2352,18 @@ impl TuiRunner {
             // `o` — open the TX-audio-offset modal. Prompts for an integer Hz
             // value in [200, 2900]; blank Enter = clear (→ Auto). Mirrors the
             // Shift+F pattern but for audio offsets within the passband.
+            KeyCode::Char('W') if !ctrl_or_alt_held => {
+                app.watchlist_modal.buffer =
+                    if matches!(app.active_panel, crate::app::ActivePanel::DxHunter) {
+                        app.displayed_dx_stations()
+                            .get(app.dx_hunter_scroll)
+                            .map(|s| s.call_sign.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                app.watchlist_modal.visible = true;
+            }
             KeyCode::Char('o') => {
                 app.offset_modal.visible = true;
                 app.offset_modal.buffer.clear();
@@ -2475,6 +2574,8 @@ impl TuiRunner {
                 crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
             } else if app.freq_modal.visible {
                 crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
+            } else if app.watchlist_modal.visible {
+                crate::ui::render_watchlist_modal(f, f.area(), &app.watchlist_modal);
             } else if app.offset_modal.visible {
                 crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
             } else if app.show_diagnostics {
@@ -3264,6 +3365,49 @@ mod key_tests {
     static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    #[tokio::test]
+    async fn contest_score_ignores_old_generation_and_survives_status_updates() {
+        use pancetta_qso::contest::ledger::*;
+        let (mut runner, _, app) = make_runner().await;
+        let update = ContestScoreUpdate {
+            generation: 2,
+            instance_id: "test".into(),
+            rules_id: "ksqp-ft-2026".into(),
+            display_name: "KSQP 2026".into(),
+            outside_period: false,
+            state: ContestScoreState::Loading,
+        };
+        runner
+            .handle_message(TuiMessage::ContestScore(update.clone()))
+            .await
+            .unwrap();
+        let mut stale = update.clone();
+        stale.generation = 1;
+        stale.state = ContestScoreState::Unavailable("old failure".into());
+        runner
+            .handle_message(TuiMessage::ContestScore(stale))
+            .await
+            .unwrap();
+        runner
+            .handle_message(TuiMessage::StatusUpdate {
+                component: "qso".into(),
+                status: "update".into(),
+            })
+            .await
+            .unwrap();
+        pan89_decode_burst(&mut runner, 5).await;
+        assert_eq!(app.read().await.contest_score.as_ref(), Some(&update));
+        let mut recovered = update;
+        recovered.generation = 3;
+        recovered.state =
+            ContestScoreState::Unavailable("contest history could not be read".into());
+        runner
+            .handle_message(TuiMessage::ContestScore(recovered.clone()))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.contest_score.as_ref(), Some(&recovered));
+    }
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
@@ -3647,11 +3791,36 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn recovered_error_clears_its_alert_without_ack() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Audio".to_string(),
+            message: "Audio processing error: Stream error".to_string(),
+            code: Some(1),
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("Audio processing error"), "row 1: {row}");
+
+        r.handle_message(TuiMessage::ErrorResolved {
+            component: "Audio".to_string(),
+            code: 1,
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Audio processing error"), "row 1: {row}");
+        assert!(!row.contains("ack"), "row 1: {row}");
+    }
+
+    #[tokio::test]
     async fn pan89_error_alert_survives_decode_burst_until_acknowledged() {
         let (mut r, _cmd_rx, app) = make_runner().await;
         r.handle_message(TuiMessage::Error {
             component: "Hamlib".to_string(),
             message: "Rig connect failed (connection refused)".to_string(),
+            code: None,
         })
         .await
         .unwrap();
@@ -3708,6 +3877,7 @@ mod key_tests {
             audio_offset_hz: Some(750),
             slot_parity: Some(pancetta_core::slot::SlotParity::Even),
             watchlisted: false,
+            pinned: false,
         }
     }
 
@@ -4338,7 +4508,12 @@ mod key_tests {
     async fn shift_q_emergency_stops_through_every_overlay() {
         type Open = fn(&mut crate::app::App);
         type IsOpen = fn(&crate::app::App) -> bool;
-        let cases: [(&str, Open, IsOpen); 14] = [
+        let cases: [(&str, Open, IsOpen); 15] = [
+            (
+                "watchlist",
+                |a| a.watchlist_modal.visible = true,
+                |a| a.watchlist_modal.visible,
+            ),
             (
                 "out-of-band ack",
                 |a| a.out_of_band_ack_visible = true,
@@ -6141,6 +6316,7 @@ mod key_tests {
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
                     watchlisted: false,
+                    pinned: false,
                 },
             );
             a.dx_hunter_scroll = 0;
@@ -6202,6 +6378,61 @@ mod key_tests {
             app.read().await.status_message.contains("selected"),
             "shows a 'no station selected' hint"
         );
+    }
+
+    #[tokio::test]
+    async fn watchlist_modal_validates_toggles_and_cancels() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('W')).await.unwrap();
+        assert!(app.read().await.watchlist_modal.visible);
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.status_message, "Enter a callsign to watch");
+        assert!(app.read().await.watchlist_modal.visible);
+        for c in " vp8pj ".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.watchlist_modal.visible);
+        assert_eq!(app.read().await.status_message, "VP8PJ added to watchlist");
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::WatchlistToggle { callsign }) if callsign == "VP8PJ")
+        );
+        app.write().await.pinned_callsigns.insert("VP8PJ".into());
+        r.handle_key_event(key('W')).await.unwrap();
+        app.write().await.watchlist_modal.buffer = "VP8PJ".into();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.status_message,
+            "VP8PJ removed from watchlist"
+        );
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::WatchlistToggle { callsign }) if callsign == "VP8PJ")
+        );
+        r.handle_key_event(key('W')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.watchlist_modal.visible);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn watchlist_modal_prefills_focused_dx_station() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            let station = cq_dx_station();
+            a.dx_stations.insert(station.call_sign.clone(), station);
+        }
+        r.handle_key_event(key('W')).await.unwrap();
+        assert_eq!(app.read().await.watchlist_modal.buffer, "VK9XX");
     }
 
     // === TX-offset modal (`o` key) =====================================
@@ -6801,6 +7032,7 @@ mod key_tests {
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
                     watchlisted: false,
+                    pinned: false,
                 },
             );
             a.dx_hunter_scroll = 0;

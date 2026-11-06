@@ -72,6 +72,12 @@ const fn kb(
 /// Modal-scoped keys (y/n confirms, digit entry in the freq modal, j/k in
 /// the device picker) are documented by each modal's own footer, not here.
 pub const KEYBINDINGS: &[KeyBinding] = &[
+    kb(
+        "Shift+W",
+        "Watchlist: toggle focused/typed callsign (persists; removed when worked)",
+        Category::QsoOperation,
+        false,
+    ),
     kb("?", "Toggle this help", Category::Diagnostics, true),
     kb(
         "Tab / Shift+Tab",

@@ -579,6 +579,28 @@ fn c20_no_new_window_is_ignored() {
     assert_eq!(m.consecutive(), 0);
 }
 
+/// The relay ticks every 2 s, but a window's decodes land ~2.5 s after the
+/// DSP counts the window — so they arrive on a tick with no new window. Those
+/// decodes must still count, or a station decoding every slot latches the
+/// warning on.
+#[test]
+fn c20_decodes_landing_between_windows_still_count() {
+    let mut m = RfNoDecodeMonitor::new();
+    assert_eq!(m.observe(0, 0, RF).rf_no_decode, None); // seed
+    let mut decodes = 0u64;
+    for window in 1..=(RfNoDecodeMonitor::WARN_AFTER_SLOTS as u64 * 3) {
+        // Tick just after the DSP counted the window: decode still running.
+        m.observe(window, decodes, RF);
+        // Next tick: decode finished, no new window yet.
+        decodes += 20;
+        m.observe(window, decodes, RF);
+    }
+    assert!(
+        !m.warning_active(),
+        "decoding every slot must never raise the RF/no-decode warning"
+    );
+}
+
 /// Round-4 review (Codex P1): a pivot must carry the fresher intent's
 /// authorization binding, not just its text/frequency — a station-agent
 /// action can rebind an existing LOCAL manual QSO to a remote client and

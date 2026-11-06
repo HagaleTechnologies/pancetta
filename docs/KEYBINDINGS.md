@@ -20,6 +20,7 @@ Press `?` inside the TUI for the same list as an overlay.
 
 | Key | Action |
 |---|---|
+| `Shift+W` | Watchlist: toggle focused/typed callsign (persists; removed when worked) |
 | `Space` | Call selected station |
 | `/` | Compose free-text TX (Enter sends, Esc cancels) |
 | `Enter` | Callers: reply at shown step; TX Placement: park at selected slice |

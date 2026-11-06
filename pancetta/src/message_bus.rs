@@ -85,6 +85,13 @@ impl std::fmt::Display for ComponentId {
     }
 }
 
+/// Explicit edits allow completion removal to be idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchlistAction {
+    Pin,
+    Unpin,
+}
+
 /// Where a transmit request originated.
 ///
 /// This is a **safety-relevant** discriminator: the coordinator's TX worker
@@ -115,6 +122,11 @@ pub enum TxOrigin {
 /// `pancetta-core` so `pancetta-tui` (which cannot depend on this crate) can
 /// share the same type across the bus boundary.
 pub use pancetta_core::DiagnosticLevel;
+
+/// `MessageType::Error::error_code` for a runtime audio stream/output error.
+/// Audio auto-recovery sends a matching `ErrorResolved` once the devices
+/// reopen.
+pub const AUDIO_RUNTIME_ERROR_CODE: u32 = 1;
 
 /// Message types that can be sent between components
 #[derive(Debug, Clone)]
@@ -149,6 +161,13 @@ pub enum MessageType {
         component_id: ComponentId,
         error_message: String,
         error_code: Option<u32>,
+    },
+
+    /// The fault behind earlier `Error`s with this `error_code` recovered on
+    /// its own, so the TUI clears their alerts.
+    ErrorResolved {
+        component_id: ComponentId,
+        error_code: u32,
     },
 
     /// A retained, operator-facing diagnostic event (docs/observability-
@@ -199,7 +218,18 @@ pub enum MessageType {
     /// cadence. A full resync each tick (not a diff), matching this
     /// codebase's existing "bulk replace, self-healing" convention (see
     /// `FrequencyAllocator::set_own_frequencies`).
-    DxWatchlistUpdate { callsigns: Vec<String> },
+    DxWatchlistUpdate {
+        callsigns: Vec<String>,
+        pinned: Vec<String>,
+    },
+
+    /// Operator watchlist edits, owned and applied by Autonomous.
+    WatchlistEdit {
+        callsign: String,
+        action: WatchlistAction,
+    },
+    /// Terminal BEL, emitted only when a TUI is attached.
+    AlertBell,
 
     /// Hamlib rig control messages
     RigControl(RigControlMessage),
@@ -446,6 +476,9 @@ pub enum MessageType {
         duration_secs: u32,
         tone_offset_hz: f64,
     },
+
+    /// Persisted contest score, additive and local to the TUI.
+    ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
 
     /// Snapshot of in-progress QSOs, pushed by the QSO coordinator
     /// on every state change. tui_relay forwards this to the TUI as

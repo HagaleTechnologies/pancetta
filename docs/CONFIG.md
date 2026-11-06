@@ -997,6 +997,7 @@ A small set of environment variables override config keys:
 | Variable | Effect |
 |---|---|
 | `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
+| `PANCETTA_MACOS_RELAUNCH=0` | macOS only. Do not relaunch pancetta as its own microphone-responsible process; macOS then uses the launching app's microphone approval (behavior before PAN-264). |
 | `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
 | `RIGCTLD_HOST` | Override the rigctld bind host. Default `127.0.0.1`. |
 | `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |
@@ -1195,3 +1196,110 @@ files, and deleting them reclaims the space (the directory was capped at
 - Rust types and validation logic live under `pancetta-config/src/`.
 - See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
   through the coordinator.
+
+## DX tiers, alerts and watchlist
+
+`[autonomous].pounce_min_tier` is optional. When set, it replaces both numeric
+pounce score thresholds with tier admission. Rarer tiers win first, and the
+weighted score breaks ties within a tier. All other pounce gates still apply.
+Omitting it preserves score-based pouncing. Pins never cause or boost TX.
+
+| Name | Rank (lower is rarer) | Meaning |
+|---|---|---|
+| `atno` | 1 | All-time new DXCC entity |
+| `per_band_dxcc_new` | 2 | Entity new on this band |
+| `special_station` | 3 | Special event, government, research or UN station |
+| `per_band_grid_new` | 4 | Grid new on this band |
+| `standard` | 5 | Ordinary station |
+| `suspect` | 6 | Implausible callsign |
+
+Each alert channel has its own `min_tier`. For example, `special_station`
+admits ranks 1 through 3. Unknown names fail configuration loading.
+
+```toml
+[autonomous]
+# pounce_min_tier = "atno"
+
+[watchlist]
+ttl_secs = 150
+pinned = []
+
+[alerts]
+dedupe_secs = 300
+
+[alerts.bell]
+enabled = false
+min_tier = "atno"
+
+[alerts.ntfy]
+enabled = false
+server = "https://ntfy.sh"
+topic = ""
+min_tier = "atno"
+
+[alerts.webhook]
+enabled = false
+url = ""
+min_tier = "atno"
+```
+
+`ttl_secs` governs automatically remembered near-miss stations; operator pins
+survive expiry and restart until removed or worked. `Shift+W` toggles a typed
+or focused callsign. Pins are saved in `~/.pancetta/pancetta.toml`.
+
+Alerts trigger on CQs meeting the channel's tier, or on any decode of a pinned
+callsign. `dedupe_secs` suppresses repeats per channel, callsign and band.
+Both duration fields must be at least 1. Enabled ntfy requires a non-empty
+topic and an HTTP(S) server; enabled webhook requires an HTTP(S) URL.
+Bell emits terminal BEL in TUI mode. Every raised alert produces an INFO
+line naming the call, entity, band and audio offset. The webhook receives
+one JSON POST per alert; ntfy receives a JSON notification. Failed requests
+are logged without retry; three consecutive failures pause that target for
+five minutes. Tier alerts suppress uncertain cqdx fallback evidence during
+need-list outages, while locally established band needs and pins remain usable.
+These settings require a restart, like existing autonomous score settings.
+
+## Contest scoring
+
+Contest scoring is off when `[contest]` is absent. It is startup-only and
+applies to new manual attempts within the configured UTC periods. It does
+not enable autonomous contest operation or change general duplicate admission.
+
+```toml
+[contest]
+instance_id = "KSQP-2026-K5ARH"
+profile_id = "us-state-qso-party"
+rules_id = "ksqp-ft-2026"
+operator_region = "TX"
+periods = [
+  { start = "2026-08-29T14:00:00Z", end = "2026-08-30T02:00:00Z" },
+  { start = "2026-08-30T14:00:00Z", end = "2026-08-30T20:00:00Z" },
+]
+```
+
+For South Carolina fixed digital, use a separate instance and
+`rules_id = "scqp-digital-fixed-2026"`. For example:
+
+```toml
+[contest]
+instance_id = "SCQP-2026-K5ARH"
+profile_id = "us-state-qso-party"
+rules_id = "scqp-digital-fixed-2026"
+operator_region = "SC"
+periods = [{ start = "2026-02-28T15:00:00Z", end = "2026-03-01T02:00:00Z" }]
+```
+
+Regions are US state/DC codes, Canadian province/territory codes, or `DX`.
+Period ends are exclusive. Use a new instance id for each edition or entrant;
+conflicting logged rules, entrant or periods make its score unavailable.
+Set `[contest] enabled = false` to disable explicitly, then restart.
+
+The score strip shows local claimed score, multiplier count, trailing-hour
+rate, scored contacts, dupes, pending and excluded contacts. Kansas has no
+multipliers and displays `n/a`. SC requires explicit partner county/state
+facts. Standard ADIF `STATE` and `CNTY` or the versioned contest application
+evidence provide them. A grid or QRZ lookup never supplies a county.
+SC's Field Day exchange is not implemented here; grid-only SC contacts stay
+pending. Historical contacts without an explicit contest instance stay outside
+scoring. Duplicate contacts remain loggable. See
+[contest scoring rules and persistence](superpowers/specs/2026-11-05-contest-scoring.md).

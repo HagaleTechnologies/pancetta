@@ -284,6 +284,11 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 
 ## Capability status
 
+Contest scoring is opt-in for Kansas FT4/FT8 2026 and SC fixed digital 2026.
+The TUI shows local claimed score, multipliers, contest dupes and hourly rate
+from durable evidence. SC grid-only contacts remain pending. See
+[configuration](docs/CONFIG.md#contest-scoring).
+
 What each part of Pancetta has been proven to do. This describes `main`
 after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 [CHANGELOG.md](CHANGELOG.md). Each row shows the highest state reached:
@@ -302,6 +307,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity of the shipped pipeline, and of the native decoder alone vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
+| Tier-based pouncing, decode alerts and editable watchlist | Implemented, *Unreleased* | Optional tier admission; bell, ntfy and webhook alerts; persistent pins edited with Shift+W. No live notification-service or on-air qualification | [configuration](docs/CONFIG.md#dx-tiers-alerts-and-watchlist) |
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
@@ -319,6 +325,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
+| macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 
 ### Platform archive evidence

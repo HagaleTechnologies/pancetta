@@ -228,12 +228,16 @@ impl Verdict {
     }
 }
 
-/// A sticky error alert from `TuiMessage::Error` (no "resolved" signal, so it
-/// stays until acknowledged).
+/// A sticky error alert from `TuiMessage::Error`. It stays until acknowledged,
+/// or until a `TuiMessage::ErrorResolved` with the same `code` reports that
+/// the fault recovered on its own.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alert {
     pub id: u64,
     pub text: String,
+    /// The error code a later `ErrorResolved` matches; `None` = stays until
+    /// acknowledged.
+    pub code: Option<u32>,
     pub count: u32,
     pub first_at: DateTime<Utc>,
     pub acknowledged: bool,
@@ -905,6 +909,22 @@ mod tests {
         assert_eq!(app.alerts.len(), ALERT_CAP);
         assert_eq!(app.alerts.back().unwrap().text, "error 9");
         assert_eq!(app.alerts.front().unwrap().text, "error 2");
+    }
+
+    #[tokio::test]
+    async fn resolve_clears_only_alerts_with_that_code() {
+        let mut app = app().await;
+        app.add_coded_error_message("Audio processing error: stream".to_string(), Some(1));
+        app.add_coded_error_message("Audio TX output error: gone".to_string(), Some(1));
+        app.add_error_message("Rig connect failed".to_string());
+        app.add_coded_error_message("Other fault".to_string(), Some(2));
+        app.acknowledge_readiness();
+        app.add_coded_error_message("Audio processing error: stream".to_string(), Some(1));
+
+        assert_eq!(app.resolve_alerts(1), 3, "acknowledged alerts clear too");
+        let left: Vec<_> = app.alerts.iter().map(|a| a.text.as_str()).collect();
+        assert_eq!(left, vec!["Rig connect failed", "Other fault"]);
+        assert_eq!(app.resolve_alerts(1), 0);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), and persistent operator watchlist pins are implemented, unreleased; live notification-service and on-air qualification are pending.
 
 ## Building and Testing
 
@@ -60,6 +61,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - **cqdx.io**: First-party web service (owned by the developer) providing rarity scoring, needed DXCC/grid lookups, and live spots. Custom API endpoints can be built specifically for pancetta. API requirements doc: `docs/cqdx-api-requirements.md`
 
 ## Key Invariants
+
+- macOS responsibility relaunch (PAN-264): only commands that open the microphone relaunch, and only when the responsible process is neither an `.app` nor pancetta itself. The thin parent never initialises logging, config, audio or rig; it forwards SIGTERM/SIGHUP, ignores SIGINT/SIGQUIT, and exits with the child's status. A missing private symbol, lookup failure, missing usage description, failed spawn, or `PANCETTA_MACOS_RELAUNCH=0` falls back to in-process; no other OS ever relaunches. Implementation is unreleased and not yet verified on a Mac.
 
 - Every concurrent active QSO transmits on the same parity; never TX in sequential windows.
 - Single-scorer: the TX-placement display and autonomous decisions share one allocator path.

@@ -1212,6 +1212,7 @@ mod tests {
             audio_offset_hz: None,
             slot_parity: None,
             watchlisted: false,
+            pinned: false,
         }
     }
 

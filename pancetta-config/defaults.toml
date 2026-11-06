@@ -5,6 +5,24 @@
 # generated and never read by the loader; do not edit it by hand.)
 # Regenerate: PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test defaults_drift
 
+[alerts]
+dedupe_secs = 300
+
+[alerts.bell]
+enabled = false
+min_tier = "atno"
+
+[alerts.ntfy]
+enabled = false
+min_tier = "atno"
+server = "https://ntfy.sh"
+topic = ""
+
+[alerts.webhook]
+enabled = false
+min_tier = "atno"
+url = ""
+
 [audio]
 bit_depth = "float32"
 buffer_size = 512
@@ -115,6 +133,7 @@ level = 0.30000001192092896
 shape = "sine"
 
 [autonomous]
+# pounce_min_tier = "atno" # Optional; supersedes numeric pounce thresholds
 cq_after_idle_cycles = 10
 cq_direction = ""
 cq_no_response_switch_after = 4
@@ -959,3 +978,7 @@ span_monitors = false
 auto_save_interval_minutes = 5
 restore_layouts = true
 restore_positions = true
+
+[watchlist]
+pinned = []
+ttl_secs = 150

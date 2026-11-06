@@ -533,7 +533,7 @@ jobs:
 
   # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
   # (development on Mac, production on Windows MiniPC), so a Linux-only
-  # CI lane silently lets platform regressions land. Check-only (not test)
+  # CI lane silently lets platform regressions land. Check-only plus scoped microphone identity tests
   # to keep wall-clock manageable. PR + weekly cron + manual dispatch
   # (skipped on direct human push to main; macos minutes are 10x cost).
   cross-platform-check:
@@ -587,6 +587,10 @@ jobs:
       # other crates must compile on all three platforms.
       - name: Check workspace (default members)
         run: cargo check
+
+      # Never requests microphone access. Exercises macOS FFI and thin-parent signals.
+      - name: Test macOS microphone identity (PAN-264)
+        run: "cargo test -p pancetta --bin pancetta -- responsibility:: mic_access::"
 
   # PAN-172: advisories still run on code PRs, pushes and the weekly schedule.
   # Only research-notes-only merge groups skip this integration lane.

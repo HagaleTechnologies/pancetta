@@ -320,14 +320,18 @@ impl RfNoDecodeMonitor {
         }
 
         let windows_delta = dsp_windows.saturating_sub(self.last_windows);
-        let decodes_delta = total_decodes.saturating_sub(self.last_decodes);
-        self.last_windows = dsp_windows;
-        self.last_decodes = total_decodes;
 
         // No new window ran since last tick — nothing to judge this tick.
+        // Keep the decode baseline: a window's decodes finish after the DSP
+        // counts it, usually on a tick like this one, and must carry into the
+        // next judged tick.
         if windows_delta == 0 {
             return HealthEdges::default();
         }
+
+        let decodes_delta = total_decodes.saturating_sub(self.last_decodes);
+        self.last_windows = dsp_windows;
+        self.last_decodes = total_decodes;
 
         let rf_present = last_rms >= Self::RF_PRESENT_RMS_FLOOR;
         let silent = last_rms < Self::SILENT_RMS_CEILING;

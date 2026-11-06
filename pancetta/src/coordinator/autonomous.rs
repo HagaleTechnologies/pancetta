@@ -95,6 +95,24 @@ pub(crate) fn spot_publish_target(
     bridge.filter(|_| !replay_mode)
 }
 
+/// The `[alerts]` config the autonomous task may deliver through.
+///
+/// Under `--replay` the outbound HTTP channels (ntfy, webhook) are turned
+/// off: a replayed decode is a historical capture, and posting it would send
+/// a fabricated "live" notification and trigger downstream automation, the
+/// same failure mode [`spot_publish_target`] guards for cqdx.io. The terminal
+/// bell is local and stays as configured.
+pub(crate) fn alert_delivery_config(
+    mut alerts: pancetta_config::alerts::AlertsConfig,
+    replay_mode: bool,
+) -> pancetta_config::alerts::AlertsConfig {
+    if replay_mode {
+        alerts.ntfy.enabled = false;
+        alerts.webhook.enabled = false;
+    }
+    alerts
+}
+
 /// The absolute frequency (Hz) to report a cqdx spot at: the dial the
 /// decode's own audio window was captured on
 /// (`DecodedMessageInfo::captured_dial_hz`), plus the decode's
@@ -154,6 +172,39 @@ mod replay_gate_tests {
             spot_publish_target(Some(&b), true).is_none(),
             "--replay must never POST replayed decodes to cqdx.io as live spots"
         );
+    }
+
+    fn http_alerts() -> pancetta_config::alerts::AlertsConfig {
+        let mut a = pancetta_config::alerts::AlertsConfig::default();
+        a.bell.enabled = true;
+        a.ntfy.enabled = true;
+        a.ntfy.topic = "pancetta-test".into();
+        a.webhook.enabled = true;
+        a.webhook.url = "https://example.invalid/hook".into();
+        a
+    }
+
+    #[test]
+    fn replay_turns_off_http_alert_delivery_but_keeps_the_bell() {
+        let a = alert_delivery_config(http_alerts(), true);
+        assert!(
+            !a.ntfy.enabled,
+            "--replay must never post ntfy alerts for replayed decodes"
+        );
+        assert!(
+            !a.webhook.enabled,
+            "--replay must never POST replayed decodes to the webhook"
+        );
+        assert!(
+            a.bell.enabled,
+            "the local terminal bell is not an outbound integration"
+        );
+    }
+
+    #[test]
+    fn live_run_keeps_configured_http_alert_delivery() {
+        let a = alert_delivery_config(http_alerts(), false);
+        assert!(a.ntfy.enabled && a.webhook.enabled && a.bell.enabled);
     }
 
     #[tokio::test]
@@ -1776,6 +1827,7 @@ fn skip_reason_key(reason: &pancetta_qso::SkipReason) -> &'static str {
         pancetta_qso::SkipReason::CallsignContinuity { .. } => "callsign_continuity",
         pancetta_qso::SkipReason::ContentScore { .. } => "content_score",
         pancetta_qso::SkipReason::FrequencyClash => "frequency_clash",
+        pancetta_qso::SkipReason::BelowPounceTier => "below_pounce_tier",
     }
 }
 
@@ -1783,6 +1835,11 @@ pub(crate) fn skip_record_diagnostic(record: &pancetta_qso::CqSkipRecord) -> Gat
     use pancetta_core::DiagnosticLevel as L;
     let call = record.callsign.as_deref().unwrap_or("unknown");
     match record.reason {
+        pancetta_qso::SkipReason::BelowPounceTier => GateDiagnostic {
+            target: "qso.autonomous",
+            level: L::Info,
+            text: format!("Skipped CQ from {call}: below configured pounce tier"),
+        },
         pancetta_qso::SkipReason::AtCapacity { active, cap } => GateDiagnostic {
             target: "tx.policy",
             level: L::Info,
@@ -1882,6 +1939,10 @@ impl super::ApplicationCoordinator {
             max_concurrent_qsos: config.autonomous.max_concurrent_qsos,
             tx_offset_hz: config.autonomous.tx_offset_hz,
             min_dx_score: config.autonomous.min_dx_score,
+            pounce_min_tier: config
+                .autonomous
+                .pounce_min_tier
+                .map(super::alerts::priority_tier),
             min_multi_slot_score: config.autonomous.min_multi_slot_score,
             cq_direction: config.autonomous.cq_direction.clone(),
             listen_cycle: pancetta_qso::autonomous::ListenCycleConfig {
@@ -1917,10 +1978,7 @@ impl super::ApplicationCoordinator {
             // DX-busy suppression window. Not yet plumbed to pancetta-config;
             // use the AutonomousConfig default (90 s).
             dx_busy_window_secs: pancetta_qso::AutonomousConfig::default().dx_busy_window_secs,
-            // DX watchlist (#197) TTL. Not yet plumbed to pancetta-config;
-            // use the AutonomousConfig default (150 s / 2.5 min), same
-            // precedent as dx_busy_window_secs above.
-            watchlist_ttl_secs: pancetta_qso::AutonomousConfig::default().watchlist_ttl_secs,
+            watchlist_ttl_secs: config.watchlist.ttl_secs,
         };
 
         let dry_run = config.autonomous.dry_run;
@@ -1973,6 +2031,8 @@ impl super::ApplicationCoordinator {
         // the other autonomous-loop settings extracted here.
         let auto_repark_enabled = config.tx_placement.auto_repark;
         let repark_min_score_gain = config.tx_placement.repark_min_score_gain;
+        let alert_config = config.alerts.clone();
+        let pinned_seed = config.watchlist.pinned.clone();
         drop(config);
 
         let cached_lookup = self.cached_lookup.clone();
@@ -1989,6 +2049,9 @@ impl super::ApplicationCoordinator {
         {
             let op = operator.clone();
             let mut guard = op.lock().await;
+            for callsign in &pinned_seed {
+                guard.pin_watchlist(callsign);
+            }
             guard.set_tx_freq_mode_source(self.tx_freq_mode.clone());
             // PAN-39: share the generation counter bumped alongside every
             // `tx_freq_mode` store, so `decide_at` can detect a Hold/Auto
@@ -2028,6 +2091,17 @@ impl super::ApplicationCoordinator {
             .take()
             .expect("waterfall_to_auto_rx set at coordinator construction");
 
+        if self.replay_mode() && (alert_config.ntfy.enabled || alert_config.webhook.enabled) {
+            info!(
+                "Replay mode: ntfy and webhook alerts suppressed -- replayed decodes are not live"
+            );
+        }
+        let mut alerts = super::alerts::AlertDispatcher::new(
+            alert_delivery_config(alert_config, self.replay_mode()),
+            (*cached_lookup).clone(),
+            priority_weights.clone(),
+            !self.headless,
+        )?;
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> = std::sync::Arc::new(
             pancetta_qso::PriorityScorer::new(priority_weights, Box::new((*cached_lookup).clone())),
         );
@@ -2166,6 +2240,31 @@ impl super::ApplicationCoordinator {
         // (qso.rs); see `qso_manager_watch_publishes_a_clone_with_injected_
         // sources_not_defaults` (qso.rs) for the regression test.
         let qso_manager_watch = self.qso_manager_watch.subscribe();
+        let watchlist_config = self.config.clone();
+        let headless_persist = if self.headless && self.config_write_is_toml {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+            let path = self.config_path.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(pins) = rx.recv().await {
+                    let path = path.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let target = super::tui_relay::resolve_config_write_target(&path)?;
+                        pancetta_config::Config::default()
+                            .set_watchlist_pinned_in_file(&target, &pins)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        _ => warn!("Watchlist persistence failed in headless mode"),
+                    }
+                }
+                Ok(())
+            });
+            self.named_task_handles.push((ComponentId::Config, handle));
+            Some(tx)
+        } else {
+            None
+        };
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -2368,7 +2467,12 @@ impl super::ApplicationCoordinator {
                                 op.update_live_spots(&spot_freqs);
                             }
 
-                            op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+                            op.feed_decoded_messages_on_dial_at(
+                                &slot_messages,
+                                evaluator.as_ref(),
+                                operating_frequency_hz.load(Ordering::Relaxed),
+                                chrono::Utc::now(),
+                            );
 
                             // PAN-72: resolve and commit any mid-QSO
                             // TX-offset actions the QSO event-forwarder
@@ -2447,6 +2551,7 @@ impl super::ApplicationCoordinator {
                                     ComponentId::Tui,
                                     MessageType::DxWatchlistUpdate {
                                         callsigns: op.watchlist_callsigns(),
+                                        pinned: op.pinned_watchlist_callsigns(),
                                     },
                                     Instant::now(),
                                 );
@@ -3263,7 +3368,29 @@ impl super::ApplicationCoordinator {
                                 match auto_inbox.try_recv() {
                                     Ok(message) => {
                                         match message.message_type {
+                                            MessageType::WatchlistEdit { callsign, action } => {
+                                                let mut op = operator.lock().await;
+                                                apply_watchlist_edit(&mut op, &callsign, action);
+                                                let pinned = op.pinned_watchlist_callsigns();
+                                                watchlist_config.write().await.watchlist.pinned = pinned.clone();
+                                                if let Some(tx) = &headless_persist { let _ = tx.send(pinned.clone()); }
+                                                let _ = message_bus.send_message(ComponentMessage::new(
+                                                    ComponentId::Autonomous, ComponentId::Tui,
+                                                    MessageType::DxWatchlistUpdate { callsigns: op.watchlist_callsigns(), pinned },
+                                                    Instant::now(),
+                                                )).await;
+                                            }
                                             MessageType::DecodedMessage(decoded_msg) => {
+                                                let pins = operator.lock().await.pinned_watchlist_callsigns();
+                                                let (bell, _deliveries) = alerts.on_decode(
+                                                    &decoded_msg, operating_frequency_hz.load(Ordering::Relaxed), &pins,
+                                                );
+                                                if bell {
+                                                    let _ = message_bus.send_message(ComponentMessage::new(
+                                                        ComponentId::Autonomous, ComponentId::Tui,
+                                                        MessageType::AlertBell, Instant::now(),
+                                                    )).await;
+                                                }
                                                 // PAN-69: drop at push time — a decode captured on a since-left
                                                 // band must not enter slot_messages at all: every consumer of the
                                                 // list (slot-activity stats, frequency allocator occupancy, decode
@@ -7392,5 +7519,106 @@ mod fq_f9_placement_feed_when_disabled_tests {
         );
 
         coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+}
+
+/// Apply both operator edits and QSO-completion removal at the watchlist owner.
+pub(crate) fn apply_watchlist_edit(
+    operator: &mut pancetta_qso::AutonomousOperator,
+    callsign: &str,
+    action: crate::message_bus::WatchlistAction,
+) {
+    match action {
+        crate::message_bus::WatchlistAction::Pin => operator.pin_watchlist(callsign),
+        crate::message_bus::WatchlistAction::Unpin => {
+            let key = callsign.trim().to_uppercase();
+            let was_pinned = operator.pinned_watchlist_callsigns().contains(&key);
+            operator.unpin_watchlist(callsign);
+            if was_pinned {
+                info!(
+                    "{} removed from watchlist (operator removal or completed QSO)",
+                    key
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pan261_watchlist_tests {
+    use super::*;
+    use crate::message_bus::{MessageBus, WatchlistAction};
+
+    #[tokio::test]
+    async fn pan261_watchlist_edit_broadcast_persist_and_completion_removal() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_, _) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let owner = bus.durable_inbox(ComponentId::Autonomous).await.unwrap();
+        let (_, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let mut operator = pancetta_qso::AutonomousOperator::new(
+            pancetta_qso::AutonomousConfig::default(),
+            "W1ABC".into(),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let config = pancetta_config::Config::default();
+
+        for (source, action, expected) in [
+            (
+                ComponentId::Tui,
+                WatchlistAction::Pin,
+                vec!["VP8PJ".to_string()],
+            ),
+            (ComponentId::Qso, WatchlistAction::Unpin, vec![]),
+        ] {
+            bus.send_message_durable(ComponentMessage::new(
+                source,
+                ComponentId::Autonomous,
+                MessageType::WatchlistEdit {
+                    callsign: "vp8pj".into(),
+                    action,
+                },
+                Instant::now(),
+            ))
+            .await;
+            let message = owner.try_recv().unwrap();
+            match message.message_type {
+                MessageType::WatchlistEdit { callsign, action } => {
+                    apply_watchlist_edit(&mut operator, &callsign, action)
+                }
+                _ => panic!("expected watchlist edit"),
+            }
+            bus.send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Tui,
+                MessageType::DxWatchlistUpdate {
+                    callsigns: operator.watchlist_callsigns(),
+                    pinned: operator.pinned_watchlist_callsigns(),
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+            match tui.try_recv().unwrap().message_type {
+                MessageType::DxWatchlistUpdate { callsigns, pinned } => {
+                    assert_eq!(callsigns, expected);
+                    assert_eq!(pinned, expected);
+                    config.set_watchlist_pinned_in_file(&path, &pinned).unwrap();
+                    let reloaded = pancetta_config::Config::load_from_file(&path).unwrap();
+                    assert_eq!(reloaded.watchlist.pinned, expected);
+                    let mut restarted = pancetta_qso::AutonomousOperator::new(
+                        pancetta_qso::AutonomousConfig::default(),
+                        "W1ABC".into(),
+                        None,
+                    );
+                    for call in reloaded.watchlist.pinned {
+                        restarted.pin_watchlist(&call);
+                    }
+                    assert_eq!(restarted.pinned_watchlist_callsigns(), expected);
+                }
+                _ => panic!("expected watchlist broadcast"),
+            }
+        }
     }
 }
