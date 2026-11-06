@@ -16,20 +16,17 @@ pub(crate) struct EmbeddedIdentity {
 #[cfg(target_os = "macos")]
 pub(crate) fn embedded_identity() -> Option<EmbeddedIdentity> {
     use objc2_foundation::{ns_string, NSBundle, NSString};
-    // SAFETY: these Foundation queries return retained objects and do not mutate shared Rust state.
-    unsafe {
-        let bundle = NSBundle::mainBundle();
-        let id = bundle.objectForInfoDictionaryKey(ns_string!("CFBundleIdentifier"))?;
-        let id = id.downcast_ref::<NSString>()?.to_string();
-        let usage = bundle.objectForInfoDictionaryKey(ns_string!("NSMicrophoneUsageDescription"));
-        Some(EmbeddedIdentity {
-            bundle_id: id,
-            has_usage_description: usage
-                .as_ref()
-                .and_then(|v| v.downcast_ref::<NSString>())
-                .is_some_and(|v| !v.is_empty()),
-        })
-    }
+    let bundle = NSBundle::mainBundle();
+    let id = bundle.objectForInfoDictionaryKey(ns_string!("CFBundleIdentifier"))?;
+    let id = id.downcast_ref::<NSString>()?.to_string();
+    let usage = bundle.objectForInfoDictionaryKey(ns_string!("NSMicrophoneUsageDescription"));
+    Some(EmbeddedIdentity {
+        bundle_id: id,
+        has_usage_description: usage
+            .as_ref()
+            .and_then(|v| v.downcast_ref::<NSString>())
+            .is_some_and(|v| !v.is_empty()),
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
