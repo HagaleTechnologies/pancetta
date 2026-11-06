@@ -1236,6 +1236,15 @@ impl super::ApplicationCoordinator {
         // `DecodeWindowConfig` `ft8.rs` reads once per window (PAN-164).
         let cmd_current_decode_effort = self.current_decode_effort();
         let cmd_resolved_hardware_tier = self.resolved_hardware_tier();
+        // PAN-270: session-choice persistence. The keystroke handlers below
+        // (`e` cycle, `f` toggle, `o` set/clear) update the coordinator-owned
+        // record and rewrite `~/.pancetta/session_state.json` through
+        // `session_state::persist_session_choice` — the single write seam.
+        // `cmd_session_report` carries the startup facts (restored /
+        // superseded / ignored) to the TUI seeds below.
+        let cmd_session_record = self.session_record.clone();
+        let cmd_session_state_path = self.session_state_path.clone();
+        let cmd_session_report = self.session_report.clone();
         // Mode-switch machinery (Shift+M). Cloned here (not previously
         // needed by this task) so the CycleOperatingMode handler can call
         // `try_switch_operating_mode` directly, mirroring how `cmd_tx_policy`
@@ -1443,6 +1452,38 @@ impl super::ApplicationCoordinator {
                         effort,
                         budget_ms,
                     });
+            }
+
+            // PAN-270: seed the TX-frequency-mode chip from the shared atomic
+            // — the missing sibling of the TxPolicy/FoxMode seeds above. The
+            // atomic was seeded from the session-resolved value in
+            // `ApplicationCoordinator::new`, so a restored Auto mode shows
+            // from frame 1 and the chip can never disagree with what the
+            // autonomous service actually reads.
+            {
+                let mode =
+                    pancetta_core::TxFreqMode::from_u8(cmd_tx_freq_mode.load(Ordering::Acquire));
+                let _ = cmd_tui_msg_tx
+                    .send(pancetta_tui::tui_runner::TuiMessage::TxFreqModeUpdate { mode });
+            }
+
+            // PAN-270: say what was restored from the last session — the
+            // status line for a restore/supersede, the error banner (the
+            // same surface config-load warnings use below) for ignored
+            // choices. Headless runs got the same facts as log lines in
+            // `ApplicationCoordinator::new`.
+            if let Some(status) = &cmd_session_report.status {
+                let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                    component: "Session".to_string(),
+                    status: status.clone(),
+                });
+            }
+            if let Some(message) = &cmd_session_report.error {
+                let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::Error {
+                    component: "session".to_string(),
+                    message: message.clone(),
+                    code: None,
+                });
             }
 
             // Surface any non-fatal config-load warnings to the operator as an
@@ -2185,6 +2226,25 @@ impl super::ApplicationCoordinator {
                                 );
                                 (next, budget_ms, tier)
                             };
+                            // PAN-270: persist the operator's live choice
+                            // (outside the decode_window guard — no decode
+                            // state is involved). The baseline recorded is
+                            // the RUNNING config effort (the shared snapshot),
+                            // not the config file on disk: `decoder.effort`
+                            // never hot-applies, so the snapshot is exactly
+                            // the value the station was running when the
+                            // choice was made — and an edit made after the
+                            // choice still differs at the next startup
+                            // compare.
+                            let config_effort_now = cmd_config.read().await.decoder.effort;
+                            super::session_state::persist_session_choice(
+                                &cmd_session_record,
+                                &cmd_session_state_path,
+                                super::session_state::SessionChoiceUpdate::DecodeEffort {
+                                    choice: next,
+                                    config_at_save: config_effort_now,
+                                },
+                            );
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",
@@ -2233,6 +2293,15 @@ impl super::ApplicationCoordinator {
                                 cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                 cmd_tx_freq_mode.store(next.as_u8(), Ordering::SeqCst);
                             }
+                            // PAN-270: persist the toggled mode (outside the
+                            // PTT gate; the record write touches no shared
+                            // atomic). A mode-only save must never refresh
+                            // the effort record's config baseline.
+                            super::session_state::persist_session_choice(
+                                &cmd_session_record,
+                                &cmd_session_state_path,
+                                super::session_state::SessionChoiceUpdate::TxFreqMode(next),
+                            );
                             info!(
                                 target: "tx.freq",
                                 "Operator toggled TX-frequency mode: {} -> {}",
@@ -2268,6 +2337,15 @@ impl super::ApplicationCoordinator {
                                             Ordering::SeqCst,
                                         );
                                     }
+                                    // PAN-270: an `o`-modal set forces Hold —
+                                    // persist that mode choice.
+                                    super::session_state::persist_session_choice(
+                                        &cmd_session_record,
+                                        &cmd_session_state_path,
+                                        super::session_state::SessionChoiceUpdate::TxFreqMode(
+                                            pancetta_core::TxFreqMode::Hold,
+                                        ),
+                                    );
                                     info!(
                                         target: "tx.freq",
                                         "Operator set TX offset hold @ {} Hz (mode → Hold)",
@@ -2295,6 +2373,15 @@ impl super::ApplicationCoordinator {
                                             Ordering::SeqCst,
                                         );
                                     }
+                                    // PAN-270: an `o`-modal clear forces Auto
+                                    // — persist that mode choice.
+                                    super::session_state::persist_session_choice(
+                                        &cmd_session_record,
+                                        &cmd_session_state_path,
+                                        super::session_state::SessionChoiceUpdate::TxFreqMode(
+                                            pancetta_core::TxFreqMode::Auto,
+                                        ),
+                                    );
                                     info!(
                                         target: "tx.freq",
                                         "Operator cleared TX offset hold (mode → Auto)"

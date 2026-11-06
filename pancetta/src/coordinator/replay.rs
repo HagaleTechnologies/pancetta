@@ -773,6 +773,7 @@ mod tests {
             Vec::new(),
             std::env::temp_dir().join("pancetta-test-config.toml"),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .unwrap();

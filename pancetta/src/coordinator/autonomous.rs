@@ -7165,6 +7165,7 @@ mod fq_f9_placement_feed_when_disabled_tests {
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
             true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed")

@@ -294,6 +294,16 @@ pub enum TuiMessage {
         /// `true` if Fox mode is now active; `false` if refused or disengaged.
         on: bool,
     },
+    /// TX-frequency-mode authoritative seed (PAN-270). Sent once by the
+    /// coordinator relay at startup — the missing sibling of the
+    /// `TxPolicyUpdate`/`FoxModeUpdate`/`DecodeEffortUpdate` seeds — so a
+    /// session-restored Auto mode is shown from frame 1 and the `f` chip can
+    /// never disagree with the shared atomic. The `f` key handler still flips
+    /// optimistically; this seed lands before the first render.
+    TxFreqModeUpdate {
+        /// The restored/current TX-frequency mode.
+        mode: pancetta_core::TxFreqMode,
+    },
     /// Available audio devices, enumerated by the coordinator (which owns
     /// the `pancetta-audio` host) and pushed to the TUI once at startup so
     /// the `d` device-selection picker can list them. Each entry is
@@ -991,6 +1001,11 @@ impl TuiRunner {
                 if on && app.active_view != crate::view::ActiveView::Run {
                     app.status_message = "FOX on — press v for Run view".to_string();
                 }
+            }
+            TuiMessage::TxFreqModeUpdate { mode } => {
+                // PAN-270: authoritative startup seed from the coordinator's
+                // session-restored shared atomic.
+                app.tx_freq_mode = mode;
             }
             TuiMessage::DeviceListUpdate {
                 input,
@@ -4953,6 +4968,24 @@ mod key_tests {
             app.read().await.decode_effort,
             "DEEP",
             "DecodeEffortUpdate must set app.decode_effort to the echoed preset"
+        );
+    }
+
+    /// PAN-270: the coordinator's `TxFreqModeUpdate` startup seed sets the
+    /// `FREQ` chip's backing field, so a session-restored Auto mode shows
+    /// from frame 1 and never disagrees with the shared atomic.
+    #[tokio::test]
+    async fn tx_freq_mode_update_sets_app_state() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::TxFreqModeUpdate {
+            mode: pancetta_core::TxFreqMode::Auto,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.tx_freq_mode,
+            pancetta_core::TxFreqMode::Auto,
+            "TxFreqModeUpdate must set app.tx_freq_mode to the seeded mode"
         );
     }
 

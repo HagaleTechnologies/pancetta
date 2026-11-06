@@ -1319,6 +1319,7 @@ mod tests {
             Vec::new(),
             temp_path("missing-config.toml"),
             true,
+            None, // PAN-270: no session-home override
         )
         .await
         .expect("coordinator creation should succeed");
