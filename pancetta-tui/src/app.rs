@@ -525,6 +525,8 @@ pub struct DxStation {
     /// Bulk-resynced each autonomous tick via `apply_dx_watchlist` — never
     /// diffed, so a stale `true` can't linger past the next tick.
     pub watchlisted: bool,
+    /// Operator pin, surviving automatic watchlist expiry.
+    pub pinned: bool,
 }
 
 impl DxStation {
@@ -1590,6 +1592,8 @@ pub struct App {
     pub freq_modal: FreqModalState,
     /// TX-audio-offset modal (`o` key). See `OffsetModalState`.
     pub offset_modal: OffsetModalState,
+    pub watchlist_modal: OffsetModalState,
+    pub pinned_callsigns: std::collections::HashSet<String>,
     /// Held TX audio offset in Hz, or `None` when in Auto mode. Set
     /// optimistically on the TUI side when the operator applies the offset
     /// modal; the coordinator echo is authoritative.
@@ -1876,6 +1880,8 @@ impl App {
             quit_confirm_visible: false,
             freq_modal: FreqModalState::default(),
             offset_modal: OffsetModalState::default(),
+            watchlist_modal: OffsetModalState::default(),
+            pinned_callsigns: Default::default(),
             tx_offset_hold_hz: None,
             split_tx_hz: 0,
             out_of_band_warned: false,
@@ -2417,6 +2423,7 @@ impl App {
                             audio_offset_hz: Some(audio_offset_hz),
                             slot_parity: message.slot_parity,
                             watchlisted: false,
+                            pinned: false,
                         },
                     );
                 }
@@ -3345,6 +3352,7 @@ impl App {
             audio_offset_hz: None,
             slot_parity: None,
             watchlisted: false,
+            pinned: false,
         };
         self.dx_stations.insert(callsign, dx_station);
         // Adding a spot can re-sort the DX-Hunter list; keep the cursor pinned.
@@ -3584,11 +3592,16 @@ impl App {
     /// missing from `callsigns` is cleared, matching this codebase's
     /// existing "self-healing bulk replace" convention (e.g.
     /// `FrequencyAllocator::set_own_frequencies`).
-    pub fn apply_dx_watchlist(&mut self, callsigns: &[String]) {
+    pub fn apply_dx_watchlist(&mut self, callsigns: &[String], pinned: &[String]) {
+        self.pinned_callsigns = pinned.iter().map(|c| c.to_uppercase()).collect();
         let watchlisted: std::collections::HashSet<String> =
             callsigns.iter().map(|c| c.to_uppercase()).collect();
         for station in self.dx_stations.values_mut() {
-            station.watchlisted = watchlisted.contains(&station.call_sign.to_uppercase());
+            station.pinned = self
+                .pinned_callsigns
+                .contains(&station.call_sign.to_uppercase());
+            station.watchlisted =
+                station.pinned || watchlisted.contains(&station.call_sign.to_uppercase());
         }
     }
 
@@ -4502,6 +4515,7 @@ impl App {
                     audio_offset_hz: None,
                     slot_parity: None,
                     watchlisted: false,
+                    pinned: false,
                 });
 
             // If already exists from local decode, upgrade source
@@ -7258,6 +7272,7 @@ mod tests {
                 audio_offset_hz: None,
                 slot_parity: None,
                 watchlisted: false,
+                pinned: false,
             },
         );
 
@@ -7284,10 +7299,25 @@ mod tests {
             dx_fixture("W1XYZ", 500, -10, 14.074, false),
         );
 
-        app.apply_dx_watchlist(&["JA1ABC".to_string()]);
+        app.apply_dx_watchlist(&["JA1ABC".to_string()], &[]);
 
         assert!(app.dx_stations["ja1abc"].watchlisted);
         assert!(!app.dx_stations["W1XYZ"].watchlisted);
+    }
+
+    #[test]
+    fn watchlist_pins_bulk_replace_case_insensitively() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(fixture_app());
+        app.dx_stations.insert(
+            "VP8PJ".into(),
+            dx_fixture("VP8PJ", 3000, -10, 14.074, false),
+        );
+        app.apply_dx_watchlist(&[], &["vp8pj".into()]);
+        assert!(app.pinned_callsigns.contains("VP8PJ"));
+        assert!(app.dx_stations["VP8PJ"].pinned);
+        app.apply_dx_watchlist(&[], &[]);
+        assert!(app.pinned_callsigns.is_empty());
     }
 
     #[test]
@@ -7300,7 +7330,7 @@ mod tests {
         app.dx_stations.insert("JA1ABC".to_string(), station);
 
         // Bulk resync with an empty list — must clear, not just leave stale.
-        app.apply_dx_watchlist(&[]);
+        app.apply_dx_watchlist(&[], &[]);
 
         assert!(!app.dx_stations["JA1ABC"].watchlisted);
     }
@@ -7407,6 +7437,7 @@ mod tests {
             audio_offset_hz: Some(1200),
             slot_parity: None,
             watchlisted: false,
+            pinned: false,
         }
     }
 

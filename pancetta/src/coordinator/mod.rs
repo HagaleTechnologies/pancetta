@@ -16,6 +16,7 @@
 //! 12 kHz mono, feeds the samples through the DSP/FT8 pipeline, prints decoded messages,
 //! and exits.
 
+mod alerts;
 mod audio;
 mod audio_recovery;
 mod autonomous;

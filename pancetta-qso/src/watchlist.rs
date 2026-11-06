@@ -1,4 +1,4 @@
-//! Short-lived (~2-3 minute) per-callsign memory of `PerBandDxccNew`+/`Atno`
+//! Persistent operator pins and short-lived (~2-3 minute) per-callsign memory of `PerBandDxccNew`+/`Atno`
 //! CQs heard but not pounced on. See
 //! `docs/superpowers/specs/2026-07-24-dx-watchlist-design.md`.
 //!
@@ -6,11 +6,11 @@
 //! CQ-scoring pass in `AutonomousOperator::feed_decoded_messages_at`, purely
 //! bookkeeping. A watchlisted callsign only ever gets pounced on the
 //! ordinary way: by being freshly, actively re-decoded as a CQ on a later
-//! cycle.
+//! cycle. Pins drive alerts only, never TX decisions.
 
 use crate::priority::PriorityTier;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// One remembered near-miss.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,19 +21,50 @@ pub struct DxWatchlistEntry {
     pub last_heard: DateTime<Utc>,
 }
 
-/// Short-lived memory of `PerBandDxccNew`+ CQs heard but not pounced on.
+/// Operator pins plus TTL memory of `PerBandDxccNew`+ near-miss CQs.
 #[derive(Debug, Clone)]
 pub struct DxWatchlist {
     entries: HashMap<String, DxWatchlistEntry>,
     ttl: Duration,
+    pinned: BTreeSet<String>,
 }
 
 impl DxWatchlist {
     pub fn new(ttl: Duration) -> Self {
-        Self {
+        Self::with_pinned(ttl, std::iter::empty::<&str>())
+    }
+
+    /// Seed persistent operator pins; transient entries keep their own TTL.
+    pub fn with_pinned<I, S>(ttl: Duration, pinned: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut list = Self {
             entries: HashMap::new(),
             ttl,
+            pinned: BTreeSet::new(),
+        };
+        for call in pinned {
+            list.pin(call.as_ref());
         }
+        list
+    }
+
+    pub fn pin(&mut self, callsign: &str) {
+        let key = callsign.trim().to_uppercase();
+        if !key.is_empty() {
+            self.pinned.insert(key);
+        }
+    }
+
+    /// Operator removal and completion both remove transient memory too.
+    pub fn unpin(&mut self, callsign: &str) {
+        self.remove(callsign);
+    }
+
+    pub fn pinned_callsigns(&self) -> Vec<String> {
+        self.pinned.iter().cloned().collect()
     }
 
     /// Insert or refresh an entry (uppercased callsign key). Overwrites any
@@ -68,22 +99,30 @@ impl DxWatchlist {
 
     /// Remove a specific callsign immediately (e.g. once worked).
     pub fn remove(&mut self, callsign: &str) {
-        self.entries.remove(&callsign.to_uppercase());
+        let key = callsign.trim().to_uppercase();
+        self.entries.remove(&key);
+        self.pinned.remove(&key);
     }
 
     /// Currently-watchlisted callsigns (uppercased), for TUI/status surfacing.
     pub fn callsigns(&self) -> Vec<String> {
-        let mut callsigns: Vec<String> = self.entries.keys().cloned().collect();
+        let mut callsigns: Vec<String> = self
+            .entries
+            .keys()
+            .chain(self.pinned.iter())
+            .cloned()
+            .collect();
         callsigns.sort();
+        callsigns.dedup();
         callsigns
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.callsigns().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.pinned.is_empty()
     }
 }
 
@@ -93,6 +132,29 @@ mod tests {
 
     fn t(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
+    }
+
+    #[test]
+    fn pins_survive_ttl_and_seed_normalizes_and_deduplicates() {
+        let mut wl = DxWatchlist::with_pinned(Duration::seconds(150), [" vp8pj ", "VP8PJ"]);
+        wl.refresh("T88AA", None, PriorityTier::Atno, t(0));
+        wl.prune(t(151));
+        assert_eq!(wl.callsigns(), vec!["VP8PJ"]);
+        assert_eq!(wl.pinned_callsigns(), vec!["VP8PJ"]);
+        assert_eq!(wl.len(), 1);
+    }
+
+    #[test]
+    fn pin_union_is_sorted_and_unpin_removes_auto_entry_too() {
+        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        wl.refresh("VP8PJ", None, PriorityTier::Atno, t(0));
+        wl.pin("vp8pj");
+        wl.pin("T88AA");
+        assert_eq!(wl.callsigns(), vec!["T88AA", "VP8PJ"]);
+        assert_eq!(wl.pinned_callsigns(), vec!["T88AA", "VP8PJ"]);
+        wl.unpin("vp8pj");
+        wl.unpin("T88AA");
+        assert!(wl.is_empty());
     }
 
     #[test]

@@ -255,6 +255,8 @@ pub struct AutonomousConfig {
     pub tx_offset_hz: f64,
     /// Minimum DX score (0.0–1.0) required to respond to a CQ.
     pub min_dx_score: f64,
+    /// Optional tier admission, replacing numeric pounce thresholds when set.
+    pub pounce_min_tier: Option<crate::DxTier>,
     /// Minimum DX score required to open an additional QSO slot (0.0–1.0).
     /// Only applies to second+ concurrent QSOs. First QSO uses min_dx_score.
     pub min_multi_slot_score: f64,
@@ -290,6 +292,7 @@ impl Default for AutonomousConfig {
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
+            pounce_min_tier: None,
             min_multi_slot_score: 0.7,
             frequency: FrequencyAllocatorConfig::default(),
             cq_direction: String::new(),
@@ -359,6 +362,7 @@ impl ConfigSection for AutonomousConfig {
         self.max_concurrent_qsos = other.max_concurrent_qsos;
         self.tx_offset_hz = other.tx_offset_hz;
         self.min_dx_score = other.min_dx_score;
+        self.pounce_min_tier = other.pounce_min_tier;
         self.min_multi_slot_score = other.min_multi_slot_score;
         self.frequency = other.frequency;
         self.cq_direction = other.cq_direction;

@@ -86,3 +86,12 @@ the half-duplex [[parity-rule]] and the [[tx-scheduling]] gate.
 ## Persistent duplicate history (PAN-260)
 
 Autonomous admission checks the ADIF-derived index and completed session history by callsign and band within the configured rolling window. Audio offsets do not define duplicate identity. Production requires readable history; errors refuse automatic calls while manual calls remain available. Live and replay startup seed dated worked history for all bands before readiness. The display and ranking keep all-time worked status even outside the admission window. Replay builds its index in memory and does not write the real log directory.
+
+PAN-261 pounce admission uses the already-computed candidate tier when
+`pounce_min_tier` is set. It replaces the idle and busy numeric thresholds;
+combining them would wrongly refuse a rare ATNO with a modest weighted score.
+Rarer tiers win, then the weighted score breaks ties. Unset preserves existing
+score ordering. Pins bypass watchlist expiry and alert when heard, but never
+boost a score or initiate TX. Edits and completion removal converge through
+`WatchlistEdit` to the autonomous task. See
+[tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).

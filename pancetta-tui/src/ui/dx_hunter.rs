@@ -528,7 +528,13 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
         } else {
             ""
         },
-        if station.watchlisted { "◇" } else { "" },
+        if station.pinned {
+            "◆"
+        } else if station.watchlisted {
+            "◇"
+        } else {
+            ""
+        },
         if is_engaged { "● " } else { "" },
         station.call_sign
     )
@@ -1064,6 +1070,16 @@ mod tests {
     }
 
     #[test]
+    fn pinned_watchlist_glyph_takes_precedence() {
+        let mut station = make_test_station("VP8PJ");
+        station.watchlisted = true;
+        station.pinned = true;
+        let display = format_call_display(&station, false, false, false);
+        assert!(display.contains('◆'));
+        assert!(!display.contains('◇'));
+    }
+
+    #[test]
     fn watchlist_glyph_absent_when_not_watchlisted() {
         let station = make_test_station("W1XYZ");
         let call_display = format_call_display(&station, station.atno, station.needed, false);
@@ -1132,6 +1148,7 @@ mod tests {
             audio_offset_hz: None,
             slot_parity: None,
             watchlisted: false,
+            pinned: false,
         }
     }
 }

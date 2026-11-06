@@ -55,6 +55,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 // Re-export all configuration modules
+pub mod alerts;
 pub mod audio;
 pub mod autonomous;
 pub mod contest;
@@ -70,7 +71,9 @@ pub mod rig;
 pub mod station;
 pub mod tx_placement;
 pub mod ui;
+pub mod watchlist;
 
+pub use alerts::*;
 pub use audio::*;
 pub use autonomous::*;
 pub use contest::*;
@@ -85,6 +88,7 @@ pub use rig::*;
 pub use station::*;
 pub use tx_placement::*;
 pub use ui::*;
+pub use watchlist::*;
 
 /// Configuration error types
 #[derive(Error, Debug)]
@@ -176,6 +180,11 @@ pub struct Config {
     #[serde(default)]
     pub autonomous: AutonomousConfig,
 
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub watchlist: WatchlistConfig,
+
     /// Hound (DXpedition chaser) audio-region configuration
     #[serde(default)]
     pub hound: hound::HoundConfig,
@@ -245,6 +254,8 @@ impl Default for Config {
             ui: UiConfig::default(),
             network: NetworkConfig::default(),
             autonomous: AutonomousConfig::default(),
+            alerts: AlertsConfig::default(),
+            watchlist: WatchlistConfig::default(),
             hound: hound::HoundConfig::default(),
             fox: fox::FoxConfig::default(),
             tx_placement: tx_placement::TxPlacementConfig::default(),
@@ -360,6 +371,8 @@ impl Config {
         self.ui.validate_section()?;
         self.network.validate_section()?;
         self.autonomous.validate_section()?;
+        self.alerts.validate_section()?;
+        self.watchlist.validate_section()?;
         self.hound.validate_section()?;
         self.fox.validate_section()?;
         self.tx_placement.validate_section()?;
@@ -385,6 +398,8 @@ impl Config {
         self.ui.merge_with(other.ui);
         self.network.merge_with(other.network);
         self.autonomous.merge_with(other.autonomous);
+        self.alerts.merge_with(other.alerts);
+        self.watchlist.merge_with(other.watchlist);
         self.hound.merge_with(other.hound);
         self.fox.merge_with(other.fox);
         self.tx_placement.merge_with(other.tx_placement);
@@ -530,7 +545,9 @@ impl Config {
         };
         let table =
             Self::stable_toml_table(&cfg).expect("Config::default() must convert to a TOML table");
-        let body = toml::to_string_pretty(&table).expect("Config must serialize to TOML");
+        let body = toml::to_string_pretty(&table)
+            .expect("Config must serialize to TOML")
+            .replace("[autonomous]\n", "[autonomous]\n# pounce_min_tier = \"atno\" # Optional; supersedes numeric pounce thresholds\n");
         format!("{}\n{}", Self::DEFAULTS_TOML_HEADER, body)
     }
 
@@ -887,6 +904,23 @@ impl Config {
 
         Self::write_secure_atomic(path, &doc.to_string())?;
         info!("Rig bookmarks persisted to: {}", path.display());
+        Ok(())
+    }
+
+    /// Replace operator pins while preserving other config keys and comments.
+    pub fn set_watchlist_pinned_in_file<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        pinned: &[String],
+    ) -> ConfigResult<()> {
+        let path = path.as_ref();
+        let mut doc = Self::read_edit_doc(path)?;
+        let table = Self::edit_table_at(doc.as_item_mut(), &["watchlist"], "")?
+            .as_table_like_mut()
+            .expect("table");
+        let value = toml::Value::Array(pinned.iter().cloned().map(toml::Value::String).collect());
+        Self::set_edit_leaf(table, "pinned", &value)?;
+        Self::write_secure_atomic(path, &doc.to_string())?;
         Ok(())
     }
 
@@ -1979,7 +2013,29 @@ mod merge_guard {
             &[
                 ("slot_parity", json!("even")),
                 ("unattended_policy", json!("respond_only")),
+                ("pounce_min_tier", json!("atno")),
             ],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<AlertsConfig>(
+            "AlertsConfig",
+            &[
+                ("bell", json!({"enabled":true,"min_tier":"standard"})),
+                (
+                    "ntfy",
+                    json!({"enabled":true,"min_tier":"special_station","server":"https://localhost","topic":"dx"}),
+                ),
+                (
+                    "webhook",
+                    json!({"enabled":true,"min_tier":"per_band_dxcc_new","url":"https://localhost/hook"}),
+                ),
+            ],
+            |a, b| a.merge_with(b),
+        );
+        assert_carries_all::<WatchlistConfig>(
+            "WatchlistConfig",
+            &[("pinned", json!(["VP8PJ"]))],
             |a, b| a.merge_with(b),
         );
 

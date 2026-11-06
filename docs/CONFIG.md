@@ -1197,6 +1197,68 @@ files, and deleting them reclaims the space (the directory was capped at
 - See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
   through the coordinator.
 
+## DX tiers, alerts and watchlist
+
+`[autonomous].pounce_min_tier` is optional. When set, it replaces both numeric
+pounce score thresholds with tier admission. Rarer tiers win first, and the
+weighted score breaks ties within a tier. All other pounce gates still apply.
+Omitting it preserves score-based pouncing. Pins never cause or boost TX.
+
+| Name | Rank (lower is rarer) | Meaning |
+|---|---|---|
+| `atno` | 1 | All-time new DXCC entity |
+| `per_band_dxcc_new` | 2 | Entity new on this band |
+| `special_station` | 3 | Special event, government, research or UN station |
+| `per_band_grid_new` | 4 | Grid new on this band |
+| `standard` | 5 | Ordinary station |
+| `suspect` | 6 | Implausible callsign |
+
+Each alert channel has its own `min_tier`. For example, `special_station`
+admits ranks 1 through 3. Unknown names fail configuration loading.
+
+```toml
+[autonomous]
+# pounce_min_tier = "atno"
+
+[watchlist]
+ttl_secs = 150
+pinned = []
+
+[alerts]
+dedupe_secs = 300
+
+[alerts.bell]
+enabled = false
+min_tier = "atno"
+
+[alerts.ntfy]
+enabled = false
+server = "https://ntfy.sh"
+topic = ""
+min_tier = "atno"
+
+[alerts.webhook]
+enabled = false
+url = ""
+min_tier = "atno"
+```
+
+`ttl_secs` governs automatically remembered near-miss stations; operator pins
+survive expiry and restart until removed or worked. `Shift+W` toggles a typed
+or focused callsign. Pins are saved in `~/.pancetta/pancetta.toml`.
+
+Alerts trigger on CQs meeting the channel's tier, or on any decode of a pinned
+callsign. `dedupe_secs` suppresses repeats per channel, callsign and band.
+Both duration fields must be at least 1. Enabled ntfy requires a non-empty
+topic and an HTTP(S) server; enabled webhook requires an HTTP(S) URL.
+Bell emits terminal BEL in TUI mode. Every raised alert produces an INFO
+line naming the call, entity, band and audio offset. The webhook receives
+one JSON POST per alert; ntfy receives a JSON notification. Failed requests
+are logged without retry; three consecutive failures pause that target for
+five minutes. Tier alerts suppress uncertain cqdx fallback evidence during
+need-list outages, while locally established band needs and pins remain usable.
+These settings require a restart, like existing autonomous score settings.
+
 ## Contest scoring
 
 Contest scoring is off when `[contest]` is absent. It is startup-only and

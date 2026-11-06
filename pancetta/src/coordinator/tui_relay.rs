@@ -345,6 +345,18 @@ impl super::ApplicationCoordinator {
         let relay_pending_gain_save = pending_gain_save.clone();
         let relay_gain_mutation_tx = gain_mutation_tx.clone();
         let relay_gain_frequency = self.operating_frequency_hz.clone();
+        let watchlist_pins = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let relay_watchlist_pins = watchlist_pins.clone();
+        let watchlist_write_tx = cmd_config_write_tx.clone();
+        let watchlist_path = self.config_path.clone();
+        let watchlist_is_toml = self.config_write_is_toml;
+        let mut persisted_pins = self.config.read().await.watchlist.pinned.clone();
+        *watchlist_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = persisted_pins.clone();
+        let mut pending_pin_writes = std::collections::VecDeque::<
+            tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
+        >::new();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -921,10 +933,46 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
-                        MessageType::DxWatchlistUpdate { ref callsigns } => {
+                        MessageType::AlertBell => {
+                            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::AlertBell);
+                        }
+                        MessageType::DxWatchlistUpdate { ref callsigns, ref pinned } => {
+                            *relay_watchlist_pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pinned.clone();
+                            let mut retry_write = false;
+                            while let Some(mut response) = pending_pin_writes.pop_front() {
+                                match response.try_recv() {
+                                    Ok(Ok(())) => {},
+                                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                        pending_pin_writes.push_front(response);
+                                        break;
+                                    },
+                                    _ => {
+                                        retry_write = true;
+                                        warn!("Watchlist persistence failed; retrying latest pins");
+                                    },
+                                }
+                            }
+                            // Queue every changed snapshot, including while an earlier write
+                            // is running. The serialized writer drains these during shutdown.
+                            if (*pinned != persisted_pins || retry_write) && watchlist_is_toml {
+                                let path = watchlist_path.clone();
+                                let pins = pinned.clone();
+                                let (respond, response) = tokio::sync::oneshot::channel();
+                                let sent = watchlist_write_tx.send(ConfigFileWriteRequest {
+                                    work: Box::new(move || {
+                                        let target = resolve_config_write_target(&path)?;
+                                        pancetta_config::Config::default().set_watchlist_pinned_in_file(&target, &pins)
+                                    }), respond,
+                                });
+                                if sent.is_ok() {
+                                    persisted_pins = pinned.clone();
+                                    pending_pin_writes.push_back(response);
+                                }
+                            }
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DxWatchlistUpdate {
                                     callsigns: callsigns.clone(),
+                                    pinned: pinned.clone(),
                                 },
                             );
                         }
@@ -1675,6 +1723,28 @@ impl super::ApplicationCoordinator {
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to forward RespondToCaller command: {}", e);
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::WatchlistToggle { callsign } => {
+                            let action = {
+                                let mut pins = watchlist_pins
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if pins.iter().any(|p| p.eq_ignore_ascii_case(&callsign)) {
+                                    pins.retain(|p| !p.eq_ignore_ascii_case(&callsign));
+                                    crate::message_bus::WatchlistAction::Unpin
+                                } else {
+                                    pins.push(callsign.clone());
+                                    crate::message_bus::WatchlistAction::Pin
+                                }
+                            };
+                            let _ = cmd_message_bus
+                                .send_message_durable(ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Autonomous,
+                                    MessageType::WatchlistEdit { callsign, action },
+                                    Instant::now(),
+                                ))
+                                .await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::AbortQso { qso_id } => {
                             info!("TUI AbortQso: {}", qso_id);
@@ -3964,7 +4034,7 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
 /// Atomic replacement must land on the real target, never on the symlink
 /// (PAN-62), so a dangling symlink refuses the write. A missing plain path
 /// (first-run default) is written as given.
-fn resolve_config_write_target(
+pub(super) fn resolve_config_write_target(
     config_path: &std::path::Path,
 ) -> pancetta_config::ConfigResult<std::path::PathBuf> {
     match std::fs::canonicalize(config_path) {

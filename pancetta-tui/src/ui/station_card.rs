@@ -605,6 +605,7 @@ pub(in crate::ui) mod tests {
                 audio_offset_hz: Some(1200),
                 slot_parity: None,
                 watchlisted: false,
+                pinned: false,
             },
         );
 
