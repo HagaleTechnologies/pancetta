@@ -4000,8 +4000,9 @@ mod tests {
     }
 
     /// Ticket scenario 6: a config `[decoder].effort` edit newer than the
-    /// saved choice wins at startup, and the file is rewritten so the config
-    /// value becomes the saved choice.
+    /// saved choice wins at startup, and the file is rewritten without the
+    /// saved effort, so every later restart keeps the config value AS config
+    /// and honors its `budget_ms` override (Codex P1 on #581).
     #[tokio::test]
     async fn session_config_edit_supersedes_saved_effort_and_rewrites_the_file() {
         let home = tempfile::tempdir().unwrap();
@@ -4011,24 +4012,32 @@ mod tests {
         );
         let mut config = Config::default();
         config.decoder.effort = pancetta_config::DecodeEffort::Deep;
+        config.decoder.budget_ms = Some(5000);
 
-        let coordinator =
-            build_coordinator_with_home(config, Some(home.path().to_path_buf())).await;
+        for restart in ["first", "second"] {
+            let coordinator =
+                build_coordinator_with_home(config.clone(), Some(home.path().to_path_buf())).await;
 
-        assert_eq!(
-            pancetta_config::DecodeEffort::from_u8(
-                coordinator
-                    .current_decode_effort
-                    .load(std::sync::atomic::Ordering::Acquire)
-            ),
-            pancetta_config::DecodeEffort::Deep,
-            "the newer config effort must win over the saved MAX"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            r#"{"tx_freq_mode":"AUTO","decode_effort":"DEEP","decode_effort_config_at_save":"DEEP"}"#,
-            "the canonical record (config value folded in) must be rewritten to disk"
-        );
+            assert_eq!(
+                pancetta_config::DecodeEffort::from_u8(
+                    coordinator
+                        .current_decode_effort
+                        .load(std::sync::atomic::Ordering::Acquire)
+                ),
+                pancetta_config::DecodeEffort::Deep,
+                "{restart} restart: the newer config effort must win over the saved MAX"
+            );
+            assert_eq!(
+                coordinator.decode_window.read().await.budget_ms(),
+                5000,
+                "{restart} restart: a config-derived effort keeps the config budget_ms"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                r#"{"tx_freq_mode":"AUTO","decode_effort":null,"decode_effort_config_at_save":null}"#,
+                "{restart} restart: the superseded effort must be dropped from disk"
+            );
+        }
     }
 
     /// Ticket scenario 5: a corrupt session file falls back to defaults

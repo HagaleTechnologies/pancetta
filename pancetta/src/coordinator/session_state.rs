@@ -29,8 +29,9 @@
 //! `decode_effort_config_at_save` — the config value the station was RUNNING
 //! when the choice was saved (the shared config snapshot, because
 //! `decoder.effort` never hot-applies). If they differ, the config edit is
-//! newer: the station runs the config value and the file is rewritten so the
-//! config value becomes the saved choice. Per-field records (not one
+//! newer: the station runs the config value and the file is rewritten
+//! without a saved effort, so later restarts keep running the config value
+//! as config (including its `budget_ms` override) until the next live `e`. Per-field records (not one
 //! whole-file timestamp) mean an `f` press never refreshes the effort
 //! baseline and cannot mask a later config edit.
 
@@ -276,16 +277,10 @@ pub(crate) fn resolve(config_effort: DecodeEffort, load: SessionLoad) -> Startup
                 None => (config_effort, None, None, None),
                 Some(choice) if choice.config_at_save != config_effort => {
                     // The config edit is newer than the saved choice: the
-                    // config value wins and becomes the saved choice.
-                    (
-                        config_effort,
-                        None,
-                        Some(choice.choice),
-                        Some(EffortChoice {
-                            choice: config_effort,
-                            config_at_save: config_effort,
-                        }),
-                    )
+                    // config value wins and the saved choice is dropped. Not
+                    // re-saved as a live choice, or the next restart would
+                    // restore it as one and discard `budget_ms`.
+                    (config_effort, None, Some(choice.choice), None)
                 }
                 Some(choice) => (choice.choice, Some(choice.choice), None, Some(choice)),
             };
@@ -618,9 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lets_a_newer_config_effort_win_and_folds_it_in() {
+    fn resolve_lets_a_newer_config_effort_win_and_drops_the_saved_choice() {
         // Ticket scenario 6: the config edit is newer than the saved MAX;
-        // DEEP runs and becomes the saved choice.
+        // DEEP runs and the saved choice is dropped.
         let record = SessionRecord {
             tx_freq_mode: Some(TxFreqMode::Hold),
             decode_effort: Some(EffortChoice {
@@ -633,13 +628,33 @@ mod tests {
         assert_eq!(choices.restored_decode_effort, None);
         assert_eq!(choices.superseded_saved_effort, Some(DecodeEffort::Max));
         assert_eq!(
-            choices.record.decode_effort,
-            Some(EffortChoice {
-                choice: DecodeEffort::Deep,
-                config_at_save: DecodeEffort::Deep,
-            }),
-            "the canonical record must become DEEP/DEEP"
+            choices.record.decode_effort, None,
+            "the canonical record must drop the superseded effort"
         );
+        assert_eq!(choices.record.tx_freq_mode, Some(TxFreqMode::Hold));
+    }
+
+    #[test]
+    fn resolve_keeps_a_superseding_config_effort_as_config_on_later_restarts() {
+        // Codex P1 on #581: the restart AFTER a supersede must still treat
+        // the effort as config-derived, or startup drops `budget_ms`.
+        let first = resolve(
+            DecodeEffort::Deep,
+            SessionLoad::Record(SessionRecord {
+                tx_freq_mode: None,
+                decode_effort: Some(EffortChoice {
+                    choice: DecodeEffort::Max,
+                    config_at_save: DecodeEffort::Auto,
+                }),
+            }),
+        );
+        let second = resolve(DecodeEffort::Deep, SessionLoad::Record(first.record));
+        assert_eq!(second.decode_effort, DecodeEffort::Deep);
+        assert_eq!(
+            second.restored_decode_effort, None,
+            "a config-derived effort must not come back as a restored live choice"
+        );
+        assert_eq!(second.superseded_saved_effort, None);
     }
 
     #[test]
