@@ -21,3 +21,4 @@
 - [What can invalidate a timing-history experiment?](pages/timing-history.md) — fresh slot clocks, native timing coordinates, and missing baseline truth.
 - [What will bite you about receive overload attenuation?](pages/receive-overload-guard.md) - raw capture provenance, confirmed PTT-off and gain reservations.
 - [What can invalidate a receive-gain experiment?](pages/receive-gain-sweep.md) — source-slot gain epochs, coordinator-owned restoration and conservative TX-parity skips.
+- [What will bite you about macOS microphone approval?](pages/macos-microphone-approval.md)

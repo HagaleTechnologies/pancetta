@@ -997,6 +997,7 @@ A small set of environment variables override config keys:
 | Variable | Effect |
 |---|---|
 | `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
+| `PANCETTA_MACOS_RELAUNCH=0` | macOS only. Do not relaunch pancetta as its own microphone-responsible process; macOS then uses the launching app's microphone approval (behavior before PAN-264). |
 | `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
 | `RIGCTLD_HOST` | Override the rigctld bind host. Default `127.0.0.1`. |
 | `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |

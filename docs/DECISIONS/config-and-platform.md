@@ -891,3 +891,40 @@ Evidence status:
 Cross-repo scope: pancetta only. The workflow interface is unchanged, so no `dispensa` contract
 applies; `dispensa` was not available to scan from the implementing session. Credenza's template
 was not inspected.
+
+## macOS microphone identity: embedded Info.plist and responsibility relaunch (PAN-264, 2026-11-04)
+
+The macOS binary embeds `net.hagale.pancetta` and its microphone usage description in
+`__TEXT,__info_plist`. Live station launches and doctor inspect the responsible
+process before creating the Tokio runtime. An app launcher keeps its grant.
+An already self-responsible process stays in place. Other launchers, including
+ssh and ssh-created tmux, cause one disclaimed posix_spawn.
+
+Both private libSystem symbols are loaded through dlsym. Missing symbols, failed
+lookups, missing usage description and spawn errors retain the old behavior.
+`PANCETTA_MACOS_RELAUNCH=0` also retains it. A child-only environment marker is
+removed before threads start and prevents relaunch loops.
+
+The thin parent forwards TERM/HUP through an async-signal-safe handler, ignores
+INT/QUIT after spawning, and waits for the child. Signals are blocked across
+spawn; SETSIGDEF resets INT/QUIT/TERM/HUP/PIPE and SETSIGMASK clears the child's
+mask. Failed spawns restore the parent's handlers and original mask.
+Normal exit codes pass through. INT, TERM, HUP, KILL and PIPE are re-raised;
+other child signals map to 128 + signal to avoid a second crash report.
+
+Only a self-responsible live station waits for AVFoundation authorization.
+It requests once when undetermined, polls every two seconds and reminds every
+ten minutes. Denied and restricted states wait with actionable instructions.
+Ctrl-C and SIGTERM stop the wait. Doctor never requests authorization explicitly.
+No-audio and recorded input paths never relaunch or wait.
+
+SETEXEC would remove the parent, but the station probe verified spawn, not
+SETEXEC. An app wrapper and Developer ID signing are separate work. Ad hoc
+signatures tie permission to one binary; upgrades may need approval again.
+The Mac matrix M1-M8 remains unrun, including the unbundled prompt and capture
+during fast user switching. README capability status records that limit.
+
+Sources: the PAN-264 sophon probe; LLDB's PosixSpawnResponsible.h;
+Chromium's base/process/launch_mac.cc; Apple TN3127, "Inside Code Signing:
+Requirements"; Apple's "Requesting authorization for media capture on macOS";
+launchd.plist(5). Operator recovery steps are in docs/RUNBOOK.md.

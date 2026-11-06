@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
+- PAN-264: On macOS, pancetta started over ssh, in a tmux session started over ssh, or by the LaunchAgent now asks for its own microphone approval and hears the rig after you approve once at the Mac. Until then the station waits and says how to approve, instead of running on silence. Each new pancetta binary needs approving once. `PANCETTA_MACOS_RELAUNCH=0` restores the old behavior.
 - PAN-267: The shipped macOS LaunchAgent keeps supervisor logs across a reboot: `StandardOutPath`/`StandardErrorPath` now point at `~/.pancetta/logs/launchd.out.log` and `~/.pancetta/logs/launchd.err.log` (persistent home-directory paths) instead of `/tmp` (cleared at boot). The install steps now create the directory and customize both paths before loading. Existing installations must unload, re-copy and re-customize the plist to pick up the new paths (see `docs/RUNBOOK.md`); these two files are not rotated.
 - PAN-260: Preserve autonomous duplicate protection across restarts and audio-offset changes. Load dated worked history for every band so band switches show and rank prior contacts correctly. Refuse automatic calls when required history is unavailable.
 - Hound mode now follows the WSJT-X Fox/Hound convention (PAN-259). The Hound calls at 1000-2700 Hz, sends its R-report at the Fox's own offset when the Fox reports it, and logs on the Fox's RR73 without sending 73. The `[hound]` defaults are now `call` 1000-2700 Hz and `response` 300-900 Hz; configs that set the old inverted values explicitly must update them (see `docs/CONFIG.md`).
