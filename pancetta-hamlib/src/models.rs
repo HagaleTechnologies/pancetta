@@ -439,7 +439,7 @@ pub enum HardwareTest {
 
 impl HardwareTest {
     /// The cell text shown in `docs/SUPPORTED_RIGS.md`.
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             HardwareTest::Tested => "Tested",
             HardwareTest::Untested => "Untested",
@@ -472,7 +472,7 @@ pub struct SupportedRig {
 
 impl SupportedRig {
     /// Display name, manufacturer and model, for example `"Icom IC-7300"`.
-    pub fn display_name(&self) -> String {
+    fn display_name(&self) -> String {
         format!("{} {}", self.manufacturer, self.model)
     }
 
@@ -501,8 +501,9 @@ const fn untested_rig(
 
 /// The one table of rigs Pancetta starts `rigctld` for.
 ///
-/// The coordinator's `rigctld` spawner, `pancetta doctor`, the TUI rig picker
-/// and `docs/SUPPORTED_RIGS.md` all read this table. After adding or changing
+/// The coordinator's `rigctld` spawner, `pancetta doctor`, the TUI rig
+/// picker's model check (`model_recognized`) and `docs/SUPPORTED_RIGS.md` all
+/// read this table. After adding or changing
 /// an entry, regenerate the page with
 /// `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current`
 /// and pin the upstream Hamlib number in `hamlib_ids_match_upstream_riglist`.
@@ -842,7 +843,10 @@ mod tests {
             std::fs::write(path, &expected).expect("write docs/SUPPORTED_RIGS.md");
             return;
         }
-        let actual = std::fs::read_to_string(path).unwrap_or_default();
+        // A Windows checkout with core.autocrlf=true has CRLF line endings.
+        let actual = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         assert_eq!(
             actual, expected,
             "docs/SUPPORTED_RIGS.md is stale. Regenerate with:\n  \
