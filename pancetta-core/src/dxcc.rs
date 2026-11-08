@@ -1,63 +1,84 @@
-//! Callsign → DXCC entity-name resolver.
+//! Callsign → DXCC entity-name resolver (offline, cty.dat-derived).
 //!
 //! The DX Hunter shows a DXCC "Entity" column. cqdx live spots already carry an
 //! `entity_name`, but LOCAL decodes (the bulk of what the operator sees) have
-//! none, so they rendered as "---". This module provides a self-contained,
-//! offline resolver covering all ~346 DXCC entities so a local decode still
-//! shows its country.
+//! none. This module provides a self-contained, offline resolver over the 317
+//! distinct entity names in the generated prefix table, so a local decode still
+//! shows its country. It lives in `pancetta-core` so the priority evaluator,
+//! alerts, QSO logging and the TUI share one domain lookup (PAN-284).
 //!
 //! The prefix table (`dxcc_table::PREFIX_TABLE`) is auto-generated from the
-//! AD1C BigCTY `cty.dat` file (see `pancetta-tui/scripts/gen_dxcc_table.py`).
-//! Resolution uses a longest-leading-prefix match, which correctly handles
-//! portable-PREFIX compounds (e.g. "EA8/G8BCG" → "EA8" → Canary Islands)
-//! and ignores trailing "/P", "/MM" suffixes. Unmatched prefixes return `None`
-//! (the column shows "---") — we never emit a GUESS that could mislabel a
-//! station. cqdx's authoritative `entity_name` always takes precedence when
-//! present.
+//! AD1C BigCTY `cty.dat` file (see `pancetta-core/scripts/gen_dxcc_table.py`).
+//! Lookups probe a prefix index built on first use, from the longest table
+//! prefix down to one character, so the first hit is the longest
+//! leading-prefix match. That handles portable-PREFIX compounds (e.g.
+//! "EA8/G8BCG" → "EA8" → Canary Islands) and ignores trailing "/P", "/MM"
+//! suffixes. A resolved FT8 hash-render (`"<N7RLK>"`, PAN-58) resolves as its
+//! plain callsign, and a small US safety net answers K/W/N and AA–AL calls the
+//! table does not cover. Unmatched prefixes return `None` (the column shows
+//! "---"): we never emit a GUESS that could mislabel a station. Where the TUI
+//! has cqdx's authoritative `entity_name`, that still takes precedence.
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::dxcc_table::PREFIX_TABLE;
+
+/// `PREFIX_TABLE` keyed by prefix, plus the longest prefix length.
+struct PrefixIndex {
+    by_prefix: HashMap<&'static str, &'static str>,
+    max_len: usize,
+}
+
+static INDEX: LazyLock<PrefixIndex> = LazyLock::new(|| PrefixIndex {
+    by_prefix: PREFIX_TABLE.iter().copied().collect(),
+    max_len: PREFIX_TABLE.iter().map(|(p, _)| p.len()).max().unwrap_or(0),
+});
 
 /// Resolve a callsign to a DXCC entity name, best-effort. Returns `None` for an
 /// unrecognized prefix (caller renders "---" rather than a guess).
 ///
-/// The lookup is a longest-leading-prefix match over the authoritative
-/// `PREFIX_TABLE` (generated from AD1C BigCTY cty.dat). The "K"/"W"/"N" and
-/// "AA"–"AL" US prefixes are covered by the table; the explicit fallback below
-/// is kept as a safety net for any sparse US callsign patterns not listed in
-/// cty.dat (e.g. rarely-allocated K/W/N blocks).
+/// The lookup is a longest-leading-prefix match against the authoritative
+/// `PREFIX_TABLE` (generated from AD1C BigCTY cty.dat), done by probing a
+/// `HashMap` index from the longest table prefix down to one character: a
+/// handful of hash probes instead of a scan of every row. Its answers are
+/// identical to the pre-PAN-284 linear scan (pinned by an equivalence test).
+/// The "K"/"W"/"N" and "AA"–"AL" US prefixes are covered by the table; the
+/// US safety net below answers the US patterns cty.dat does not list.
 pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
     let trimmed = call.trim().to_uppercase();
     if trimmed.is_empty() {
         return None;
     }
     // PAN-58: a decode heard via FT8's i3=4 hash-render comes through as
-    // "<N7RLK>" (see `pancetta_core::callsign::resolve_hash_render`'s doc).
+    // "<N7RLK>" (see `crate::callsign::resolve_hash_render`'s doc).
     // Resolve to the plain callsign it represents before prefix-matching —
     // otherwise the leading '<' never matches any PREFIX_TABLE entry and
     // every hash-rendered decode's Entity column reads blank ("---"). The
     // unresolved hash-miss placeholder "<...>" carries no identity at all
     // and correctly still resolves to `None`.
-    let c = pancetta_core::callsign::resolve_hash_render(&trimmed)?;
+    let c = crate::callsign::resolve_hash_render(&trimmed)?;
 
-    // Longest leading-prefix match over the authoritative table. The leading
-    // prefix also correctly handles portable-PREFIX compounds
+    // Longest leading-prefix match: probe from the longest table prefix down.
+    // The leading prefix also correctly handles portable-PREFIX compounds
     // (e.g. "EA8/G8BCG" → "EA8" → Canary Islands) and ignores trailing "/P",
-    // "/MM" suffixes.
-    let mut best: Option<(&str, &str)> = None;
-    for &(pfx, name) in PREFIX_TABLE {
-        if c.starts_with(pfx) && best.is_none_or(|(b, _)| pfx.len() > b.len()) {
-            best = Some((pfx, name));
+    // "/MM" suffixes. `get` is `None` off a char boundary; every key is
+    // ASCII, so such a slice could not have matched the old scan either.
+    let index = &*INDEX;
+    for len in (1..=c.len().min(index.max_len)).rev() {
+        if let Some(&name) = c.get(..len).and_then(|p| index.by_prefix.get(p)) {
+            return Some(name);
         }
     }
-    if let Some((_, name)) = best {
-        return Some(name);
-    }
 
-    // US safety-net fallback: K/W/N anything, or A followed by A–L (the
-    // AA–AL US block). The cty.dat-derived table already contains entries for
-    // "K", "W", "N", "AA"–"AL", so this branch is normally unreachable —
-    // it exists as a belt-and-suspenders guard for any K/W/N pattern that
-    // slipped through.
+    us_safety_net(c)
+}
+
+/// US safety-net fallback: K/W/N anything, or A followed by A–L (the AA–AL US
+/// block). Reachable: the table has no bare `AH` key (cty.dat lists AH0–AH9),
+/// so `AH` plus a non-digit (e.g. "AHA") lands here and answers
+/// "United States".
+fn us_safety_net(c: &str) -> Option<&'static str> {
     let b = c.as_bytes();
     match b.first() {
         Some(b'K') | Some(b'W') | Some(b'N') => return Some("United States"),
@@ -142,6 +163,103 @@ pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// The pre-PAN-284 resolver, kept verbatim as the oracle for the index.
+    fn linear_entity_for_callsign(call: &str) -> Option<&'static str> {
+        let trimmed = call.trim().to_uppercase();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let c = crate::callsign::resolve_hash_render(&trimmed)?;
+        let mut best: Option<(&str, &str)> = None;
+        for &(pfx, name) in PREFIX_TABLE {
+            if c.starts_with(pfx) && best.is_none_or(|(b, _)| pfx.len() > b.len()) {
+                best = Some((pfx, name));
+            }
+        }
+        best.map(|(_, name)| name).or_else(|| us_safety_net(c))
+    }
+
+    /// Every [A-Z0-9] string of length 1 to 3 (47,988), each table prefix in
+    /// eight shapes (57,384), and odd inputs: 105,385 in total.
+    fn equivalence_corpus() -> Vec<String> {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut out = Vec::with_capacity(105_385);
+        for &a in CHARS {
+            out.push(char::from(a).to_string());
+            for &b in CHARS {
+                out.push(format!("{}{}", char::from(a), char::from(b)));
+                for &c in CHARS {
+                    out.push(format!(
+                        "{}{}{}",
+                        char::from(a),
+                        char::from(b),
+                        char::from(c)
+                    ));
+                }
+            }
+        }
+        for (prefix, _) in PREFIX_TABLE {
+            for suffix in ["", "1ABC", "A", "/P", "0"] {
+                out.push(format!("{prefix}{suffix}"));
+            }
+            out.push(format!("{prefix}/G8BCG"));
+            out.push(format!("<{prefix}1AB>"));
+            out.push(prefix.to_lowercase());
+        }
+        out.extend(
+            [
+                "",
+                " ",
+                "<...>",
+                "<>",
+                "<<K1ABC>>",
+                "ß",
+                "ﬁ1AB",
+                "É1ABC",
+                " k5arh ",
+                "K5ARH/MM",
+                "AH",
+                "AHA",
+                "AHAB",
+            ]
+            .map(String::from),
+        );
+        out
+    }
+
+    #[test]
+    fn indexed_lookup_matches_the_linear_scan_over_the_corpus() {
+        let corpus = equivalence_corpus();
+        assert_eq!(corpus.len(), 105_385);
+        let mismatches: Vec<_> = corpus
+            .iter()
+            .filter(|c| entity_for_callsign(c) != linear_entity_for_callsign(c))
+            .take(20)
+            .collect();
+        assert!(mismatches.is_empty(), "first mismatches: {mismatches:?}");
+    }
+
+    #[test]
+    fn index_has_one_key_per_table_row() {
+        assert_eq!(PREFIX_TABLE.len(), 7_173);
+        assert_eq!(
+            INDEX.by_prefix.len(),
+            PREFIX_TABLE.len(),
+            "duplicate prefix in PREFIX_TABLE"
+        );
+        let longest = PREFIX_TABLE.iter().map(|(p, _)| p.len()).max().unwrap();
+        assert_eq!(INDEX.max_len, longest);
+    }
+
+    #[test]
+    fn us_safety_net_still_answers_ah_without_a_digit() {
+        // cty.dat has AH0..AH9 but no bare AH, so these reach the safety net.
+        for call in ["AH", "AHA", "AHAB"] {
+            assert_eq!(entity_for_callsign(call), Some("United States"), "{call}");
+        }
+        assert_eq!(entity_for_callsign("AH6ABC"), Some("Hawaii"));
+    }
+
     #[test]
     fn common_entities_resolve() {
         assert_eq!(entity_for_callsign("K5ARH"), Some("United States"));
@@ -209,7 +327,7 @@ mod tests {
     }
 
     /// PAN-58: a resolved i3=4 hash-render (`"<N7RLK>"`) is a real,
-    /// identifiable callsign (see `pancetta_core::callsign::resolve_hash_render`)
+    /// identifiable callsign (see `crate::callsign::resolve_hash_render`)
     /// and must resolve to the same entity as its plain form — the leading
     /// `'<'` previously defeated the prefix-table match entirely, leaving
     /// the DX Hunter's Entity column blank ("---") for any station heard

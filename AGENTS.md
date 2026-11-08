@@ -25,7 +25,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; CAT/PTT on-air validated (FTdx10); opt-in receive overload ATT guard is experimental and hardware-unverified |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Live; spots envelope unverified against live API |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
-| `pancetta-core` | Shared types, error handling | Stable |
+| `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |

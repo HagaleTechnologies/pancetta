@@ -12,7 +12,7 @@ without operator intervention.
 
 ```
 Layer 0 — no internal deps:
-  pancetta-core    — shared types, error handling
+  pancetta-core    — shared types, error handling, offline DXCC entity resolver
   pancetta-audio   — real-time audio I/O (cpal + ringbuf)
   pancetta-dsp     — DSP pipeline (FFT, filtering, resampling)
   pancetta-config  — configuration loading and validation; the file watch

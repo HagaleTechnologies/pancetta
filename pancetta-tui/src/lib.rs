@@ -39,8 +39,6 @@ pub mod app;
 pub mod config;
 pub mod dx_need;
 pub mod dx_reason;
-pub mod dxcc;
-mod dxcc_table;
 pub mod keymap;
 pub mod readiness;
 pub mod tui_runner;
