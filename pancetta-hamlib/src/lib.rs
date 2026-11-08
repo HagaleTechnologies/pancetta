@@ -55,7 +55,10 @@ pub mod mock;
 
 // Public surface — what the rest of the workspace depends on.
 pub use error::{ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError};
-pub use models::{Band, Mode, RigCapabilities, RigModelType, Vfo};
+pub use models::{
+    find_supported_rig, normalize_rig_model, render_supported_rigs_markdown, Band, HardwareTest,
+    Mode, RigCapabilities, RigModelType, SupportedRig, Vfo, SUPPORTED_RIGS,
+};
 pub use rig::{
     ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigConfig, RigControl,
     RigStatus,

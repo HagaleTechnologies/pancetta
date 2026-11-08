@@ -189,10 +189,10 @@ baud_rate = 38400
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `model` | string | `""` | Set to a name Pancetta knows (`FTdx10`, `IC-7300`, etc.) so it can resolve the hamlib model number. |
+| `model` | string | `"Generic"` | Set to a name from [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md) (`FTdx10`, `IC-7300`, etc.) so Pancetta can resolve the Hamlib model number and start `rigctld`. |
 | `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
 | `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
-| `interface.baud_rate` | integer | `38400` | Must match the rig's CAT port setting. |
+| `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
 
 > **Network mode:** setting environment variable `RIGCTLD_HOST` to a
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.

@@ -14,6 +14,7 @@ working note loses.
 | [CONFIG.md](CONFIG.md) | Configuration reference for `~/.pancetta/pancetta.toml` |
 | [RUNBOOK.md](RUNBOOK.md) | Operator procedures: modes, supervision, Phase 5 checklist |
 | [KEYBINDINGS.md](KEYBINDINGS.md) | Generated TUI keybinding reference (source: `pancetta-tui/src/keymap.rs`; drift-tested) |
+| [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md) | Generated supported-rig list with per-rig test status (source: `pancetta-hamlib/src/models.rs`; drift-tested) |
 | [DECISIONS/](DECISIONS/) | Decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform) + ADR-001 |
 | [fcc-part97-compliance.md](fcc-part97-compliance.md) | Regulatory / TX-safety notes |
 | [decoder-comparison.md](decoder-comparison.md) | Pancetta decoder vs. peer FT8 decoders |
