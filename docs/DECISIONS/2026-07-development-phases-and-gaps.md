@@ -17,14 +17,6 @@
   after `stop_upload_outbox` reaches neither. (Surfaced by PAN-232,
   2026-10-27.)
 
-- **Auto-73 after the 45-second rework grace can reset the resend cap.**
-  Without a QSO inside `COMPLETED_QSO_REWORK_GRACE`, an auto-73 opens a new
-  completed QSO and emits `QsoCompleted`. The completion handler then
-  replaces the callsign's cache entry with `resends: 0`, although
-  `AUTO_73_WINDOW` lasts three minutes. The engine event was reproduced
-  during planning; the resulting reset and any duplicate ADIF write still
-  need an end-to-end test. (Surfaced by PAN-138, 2026-10-20.)
-
 - **Completed-QSO resends denied at key time are not compensated.** A
   disarm after the engine's in-lock check makes the TX worker report
   `TxFrameNotSent`, but `roll_back_unsent_attempt` returns `QsoNotActive`

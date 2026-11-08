@@ -1034,8 +1034,7 @@ advanced state in place. An advance to 73 records the completion and emits
 `QsoCompleted` before key time, so the contact stays logged even if the TX
 worker then drops the 73. A brand-new close-step open still checks
 permission before awaited supersede and insert operations. Closing that
-window requires supersede and insert under one guard. These limits, plus the auto-73 grace-window budget reset,
-are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
+window requires supersede and insert under one guard. These limits are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
 
 No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
