@@ -3113,7 +3113,7 @@ async fn report_played_transmit_complete(
     )
     .await;
     if let Some((qso_id, message_text)) = sent {
-        report_frame_sent(message_bus, qso_id, message_text, aired).await;
+        report_frame_sent(message_bus, qso_id, message_text, aired, attempt_id).await;
     }
     result
 }
@@ -3126,6 +3126,7 @@ async fn report_frame_sent(
     qso_id: String,
     message_text: String,
     aired: pancetta_qso::UnsentAttemptPayload,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
     message_bus
         .send_message_durable(ComponentMessage::new(
@@ -3136,6 +3137,7 @@ async fn report_frame_sent(
                 message_text,
                 aired,
                 aired_at: chrono::Utc::now(),
+                attempt_id,
             }),
             Instant::now(),
         ))
@@ -23561,10 +23563,77 @@ mod report_transmit_complete_tests {
         assert_eq!(msg.source, ComponentId::Ft8Transmitter);
         assert!(matches!(
             msg.message_type,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, aired_at })
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, aired_at, attempt_id: None })
                 if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
                     && aired_at >= reported_from && aired_at <= chrono::Utc::now()
         ));
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// PAN-280: a played frame's `TxFrameSent` carries the frame's own
+    /// attempt id, so Qso can settle the report against the call that
+    /// charged it (the auto-73 resend marker).
+    #[tokio::test]
+    async fn played_success_reports_its_attempt_id_on_tx_frame_sent() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let aired = aired_payload(1500.0, crate::message_bus::TxOrigin::Local, None);
+        report_played_transmit_complete(
+            &bus,
+            true,
+            "K9ZZ K5ARH 73".into(),
+            12_640,
+            Some("q1".into()),
+            aired,
+            Some(pancetta_qso::TxAttemptId(7)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
+                ref qso_id,
+                attempt_id: Some(pancetta_qso::TxAttemptId(7)),
+                ..
+            }) if qso_id == "q1"
+        ));
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// PAN-280: the bundle path reports each item with `item.attempt_id`, so
+    /// two items played in one bundle each carry their own id.
+    #[tokio::test]
+    async fn bundle_item_reports_its_own_attempt_id_on_tx_frame_sent() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        for (qso_id, text, id) in [("q1", "K9ZZ K5ARH 73", 7), ("q2", "W1AW K5ARH RR73", 8)] {
+            report_played_transmit_complete(
+                &bus,
+                true,
+                text.into(),
+                12_640,
+                Some(qso_id.into()),
+                aired_payload(1500.0, crate::message_bus::TxOrigin::Local, None),
+                Some(pancetta_qso::TxAttemptId(id)),
+            )
+            .await
+            .unwrap();
+        }
+        for (want_qso, want_id) in [("q1", 7), ("q2", 8)] {
+            match qso.try_recv().unwrap().message_type {
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
+                    qso_id,
+                    attempt_id,
+                    ..
+                }) => {
+                    assert_eq!(qso_id, want_qso);
+                    assert_eq!(attempt_id, Some(pancetta_qso::TxAttemptId(want_id)));
+                }
+                other => panic!("expected TxFrameSent, got {other:?}"),
+            }
+        }
         assert!(qso.try_recv().is_err());
     }
 

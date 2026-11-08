@@ -1147,3 +1147,25 @@ guard passes, while dispatch is still awaiting, is not re-checked.
 
 No new wire shape is introduced. Replace the Error response with commandAck
 when that contract exists; this ticket does not wait for it.
+
+## PAN-280: close-step open under one guard, and the auto-73 refund
+
+- `respond_to_caller_with_outcome`'s brand-new QSO path runs the remote
+  permission check, the supersede of same-call active QSOs and the insert
+  under one `qsos` write guard. The supersede is split into
+  `supersede_active_locked` (mutates under the caller's guard) and
+  `emit_superseded` (announces after it drops, in the old order). The guard's
+  only await is `qsos_by_callsign`, taken in the existing `qsos` then
+  `qsos_by_callsign` order. A clock-based arm expiry right after the check is
+  still caught only by the TX worker at key time.
+- `ManualCallOutcome::{Opened, Resent, Advanced}` carry the emitted frame's
+  `TxAttemptId`, and `QsoMessage::TxFrameSent` carries the aired frame's
+  attempt id (the pivot target's after a pivot).
+- Each `RecentManualCompletion` keeps `pending_resends`, one marker per
+  auto-73 resend it charged and whose TX outcome has not arrived. A
+  `TxFrameNotSent` for a marked attempt refunds one unit of `resends` and
+  restores `last_resend_at` only while it still holds that resend's stamp. A
+  `TxFrameSent` for it keeps the charge. An operator FIX B re-key is never
+  marked, so its report never touches the auto-73 budget.
+- Not done in PAN-280: holding `QsoCompleted` until the closing 73 airs. A
+  completion is still logged when its 73 is queued; see the gaps doc.

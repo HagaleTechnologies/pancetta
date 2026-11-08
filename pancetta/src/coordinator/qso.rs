@@ -97,6 +97,25 @@ struct RecentManualCompletion {
     /// trusting this snapshot, which would otherwise rebind the QSO back to
     /// the ORIGINAL client on every auto-resent 73.
     qso_id: pancetta_qso::QsoId,
+    /// PAN-280: the auto-73 resends this entry charged whose TX outcome has
+    /// not arrived yet, by attempt id. A `TxFrameNotSent` for one of them
+    /// refunds its charge ([`refund_auto_73_attempt`]); a `TxFrameSent`
+    /// keeps it ([`settle_auto_73_attempt`]). A list, because two resends can
+    /// be in flight one slot apart.
+    pending_resends: Vec<PendingAuto73Resend>,
+}
+
+/// One auto-73 resend charged to a [`RecentManualCompletion`] and still
+/// waiting for its TX outcome (PAN-280).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingAuto73Resend {
+    /// The emitted resend frame's attempt id, echoed on its TX report.
+    attempt_id: pancetta_qso::TxAttemptId,
+    /// The `last_resend_at` stamp this resend set.
+    committed_at: chrono::DateTime<chrono::Utc>,
+    /// `last_resend_at` before this resend, restored on a refund while the
+    /// field still holds this resend's own stamp.
+    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Shared map of recently-completed manual QSOs. Populated by the QSO-event
@@ -924,6 +943,21 @@ async fn maybe_auto_resend_73(
         .await;
     match outcome {
         Ok((_, outcome)) if outcome.emitted_frame() => {
+            // PAN-280: remember which frame this charge paid for, so a
+            // key-time denial of it (`TxFrameNotSent`) refunds the charge.
+            if let Some(attempt_id) = outcome.attempt_id() {
+                record_pending_auto_73_resend(
+                    completions,
+                    &key,
+                    entry_qso_id,
+                    PendingAuto73Resend {
+                        attempt_id,
+                        committed_at: now,
+                        prev_last_resend_at,
+                    },
+                )
+                .await;
+            }
             emit_status(
                 message_bus,
                 format!(
@@ -991,6 +1025,139 @@ async fn roll_back_auto_73_commit(
             entry.resends = prev_resends;
             entry.last_resend_at = prev_last_resend_at;
         }
+    }
+}
+
+/// PAN-280: record an emitted auto-73 resend's attempt on the entry that
+/// charged it, if that entry is still the same completed QSO.
+async fn record_pending_auto_73_resend(
+    completions: &RecentManualCompletions,
+    key: &str,
+    qso_id: pancetta_qso::QsoId,
+    pending: PendingAuto73Resend,
+) {
+    let mut map = completions.lock().await;
+    if let Some(entry) = map.get_mut(key) {
+        if entry.qso_id == qso_id {
+            entry.pending_resends.push(pending);
+        }
+    }
+}
+
+/// PAN-280 (ticket scenario 2): a completed QSO's auto-73 resend was denied
+/// or dropped at key time (`TxFrameNotSent` for its attempt), so the resend
+/// it was charged for never aired. Take one unit off the entry's `resends`,
+/// and restore `last_resend_at` only while it still holds this resend's own
+/// stamp (a later resend's pacing stays). Returns whether a charge was
+/// refunded; an attempt no entry charged (an operator re-key, any other
+/// frame, or `None`) refunds nothing.
+async fn refund_auto_73_attempt(
+    completions: &RecentManualCompletions,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+) -> bool {
+    let Some(attempt_id) = attempt_id else {
+        return false;
+    };
+    let mut map = completions.lock().await;
+    for entry in map.values_mut() {
+        let Some(pos) = entry
+            .pending_resends
+            .iter()
+            .position(|p| p.attempt_id == attempt_id)
+        else {
+            continue;
+        };
+        let pending = entry.pending_resends.remove(pos);
+        entry.resends = entry.resends.saturating_sub(1);
+        if entry.last_resend_at == Some(pending.committed_at) {
+            entry.last_resend_at = pending.prev_last_resend_at;
+        }
+        // A later resend still in flight that recorded this one's stamp as
+        // its predecessor now restores to this one's predecessor instead.
+        for later in &mut entry.pending_resends {
+            if later.prev_last_resend_at == Some(pending.committed_at) {
+                later.prev_last_resend_at = pending.prev_last_resend_at;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// PAN-280: an auto-73 resend aired (`TxFrameSent` for its attempt), so its
+/// charge stands. Drops the pending marker; returns whether one was held.
+async fn settle_auto_73_attempt(
+    completions: &RecentManualCompletions,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+) -> bool {
+    let Some(attempt_id) = attempt_id else {
+        return false;
+    };
+    let mut map = completions.lock().await;
+    for entry in map.values_mut() {
+        if let Some(pos) = entry
+            .pending_resends
+            .iter()
+            .position(|p| p.attempt_id == attempt_id)
+        {
+            entry.pending_resends.remove(pos);
+            return true;
+        }
+    }
+    false
+}
+
+/// PAN-280: the Qso task's `TxFrameNotSent` handling. Rolls back the frame's
+/// PAN-75 ledger attempt as before, then refunds an auto-73 resend charge
+/// that frame carried (ticket scenario 2).
+async fn handle_tx_frame_not_sent(
+    qso_manager: &pancetta_qso::QsoManager,
+    completions: &RecentManualCompletions,
+    qso_id: &str,
+    message_text: &str,
+    replaced: Option<&pancetta_qso::UnsentAttemptPayload>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+) {
+    match qso_id.parse::<pancetta_qso::QsoId>() {
+        Ok(id) => {
+            let outcome = qso_manager
+                .roll_back_unsent_attempt(id, message_text, replaced, attempt_id)
+                .await;
+            let refunded = refund_auto_73_attempt(completions, attempt_id).await;
+            debug!(
+                target: "qso",
+                "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}; auto-73 charge refunded: {}",
+                qso_id, message_text, attempt_id, outcome, refunded
+            );
+        }
+        Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
+    }
+}
+
+/// PAN-280: the Qso task's `TxFrameSent` handling. Releases a PAN-182 held
+/// stall action as before, then settles an auto-73 resend that aired.
+async fn handle_tx_frame_sent(
+    qso_manager: &pancetta_qso::QsoManager,
+    completions: &RecentManualCompletions,
+    qso_id: &str,
+    message_text: &str,
+    aired: &pancetta_qso::UnsentAttemptPayload,
+    aired_at: chrono::DateTime<chrono::Utc>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+) {
+    match qso_id.parse::<pancetta_qso::QsoId>() {
+        Ok(id) => {
+            let released = qso_manager
+                .confirm_stall_trigger_aired(id, message_text, aired, aired_at)
+                .await;
+            let settled = settle_auto_73_attempt(completions, attempt_id).await;
+            debug!(
+                target: "qso",
+                "TX frame aired for QSO {} ('{}', attempt {:?}): released held stall action: {}; auto-73 charge settled: {}",
+                qso_id, message_text, attempt_id, released, settled
+            );
+        }
+        Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
     }
 }
 
@@ -4276,6 +4443,7 @@ impl super::ApplicationCoordinator {
                                                 .remote_client_key_id
                                                 .clone(),
                                             qso_id,
+                                            pending_resends: Vec::new(),
                                         };
                                         let mut map = completions_for_events.lock().await;
                                         // Prune stale entries while we hold the lock so
@@ -5801,13 +5969,7 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
-                                            match qso_id.parse::<pancetta_qso::QsoId>() {
-                                                Ok(id) => {
-                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref(), attempt_id).await;
-                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}", qso_id, message_text, attempt_id, outcome);
-                                                }
-                                                Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
-                                            }
+                                            handle_tx_frame_not_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, replaced.as_ref(), attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
@@ -5818,14 +5980,8 @@ impl super::ApplicationCoordinator {
                                                 Err(e) => debug!(target: "qso", "TxFrameScheduled: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
-                                            match qso_id.parse::<pancetta_qso::QsoId>() {
-                                                Ok(id) => {
-                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired, aired_at).await;
-                                                    debug!(target: "qso", "TX frame aired for QSO {} ('{}'): released held stall action: {}", qso_id, message_text, released);
-                                                }
-                                                Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
-                                            }
+                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at, attempt_id } => {
+                                            handle_tx_frame_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, &aired, aired_at, attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
@@ -8463,8 +8619,10 @@ mod snapshot_tests {
 #[cfg(test)]
 mod auto_73_tests {
     use super::{
-        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions,
-        AUTO_73_FIRST_RESEND_MIN_DELAY, AUTO_73_MAX_RESENDS, AUTO_73_WINDOW,
+        handle_tx_frame_not_sent, handle_tx_frame_sent, maybe_auto_resend_73,
+        refund_auto_73_attempt, PendingAuto73Resend, RecentManualCompletion,
+        RecentManualCompletions, AUTO_73_FIRST_RESEND_MIN_DELAY, AUTO_73_MAX_RESENDS,
+        AUTO_73_WINDOW,
     };
     use crate::message_bus::MessageBus;
     use pancetta_core::slot::SlotParity;
@@ -8520,6 +8678,7 @@ mod auto_73_tests {
                 remote_origin: false,
                 remote_client_key_id: None,
                 qso_id: uuid::Uuid::new_v4(),
+                pending_resends: Vec::new(),
             },
         );
         Arc::new(Mutex::new(map))
@@ -8634,6 +8793,7 @@ mod auto_73_tests {
                     remote_origin: false,
                     remote_client_key_id: None,
                     qso_id: uuid::Uuid::new_v4(),
+                    pending_resends: Vec::new(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -8854,6 +9014,7 @@ mod auto_73_tests {
                     remote_origin: false,
                     remote_client_key_id: None,
                     qso_id: uuid::Uuid::new_v4(),
+                    pending_resends: Vec::new(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -8914,6 +9075,7 @@ mod auto_73_tests {
                     remote_origin: false,
                     remote_client_key_id: None,
                     qso_id: uuid::Uuid::new_v4(),
+                    pending_resends: Vec::new(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -8962,6 +9124,7 @@ mod auto_73_tests {
                     remote_origin: true,
                     remote_client_key_id: Some("client-a".to_string()),
                     qso_id: uuid::Uuid::new_v4(),
+                    pending_resends: Vec::new(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -9101,6 +9264,7 @@ mod auto_73_tests {
                     remote_origin: true,
                     remote_client_key_id: Some("client-a".to_string()),
                     qso_id,
+                    pending_resends: Vec::new(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -9184,6 +9348,234 @@ mod auto_73_tests {
         assert_eq!(c.enabled, q.enabled);
         assert_eq!(c.time_window_hours, q.time_window_hours);
         assert_eq!(c.check_frequency, q.check_frequency);
+    }
+
+    /// PAN-280: an engine holding a remote-origin QSO completed at 73 for
+    /// `DX` (client-a permitted) and a stash entry for it, completed long
+    /// enough ago to clear the first-resend guard.
+    async fn completed_remote_qso() -> (QsoManager, RecentManualCompletions, pancetta_qso::QsoId) {
+        let mut mgr = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        mgr.set_remote_tx_permitted_source(Arc::new(|k: Option<&str>| k == Some("client-a")));
+        mgr.start().await.expect("manager start");
+        let qso_id = mgr
+            .respond_to_caller(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                pancetta_core::ResponseStep::SeventyThree,
+                None,
+                None,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            DX.to_string(),
+            RecentManualCompletion {
+                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                frequency_hz: 1500.0,
+                dx_parity: Some(SlotParity::Even),
+                resends: 0,
+                last_resend_at: None,
+                remote_origin: true,
+                remote_client_key_id: Some("client-a".to_string()),
+                qso_id,
+                pending_resends: Vec::new(),
+            },
+        );
+        (mgr, Arc::new(Mutex::new(m)), qso_id)
+    }
+
+    /// Runs one auto-73 for `DX` and returns the emitted frame's attempt id.
+    async fn run_auto_73(
+        mgr: &QsoManager,
+        map: &RecentManualCompletions,
+    ) -> Option<pancetta_qso::TxAttemptId> {
+        let mut rx = mgr.subscribe();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let (_tui_s, _tui) = bus
+            .create_channel(crate::message_bus::ComponentId::Tui)
+            .await
+            .unwrap();
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            mgr,
+            map,
+            &policy,
+            &bus,
+            &armed_for("client-a"),
+        )
+        .await;
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let pancetta_qso::QsoEvent::MessageToSend { attempt_id, .. } = ev {
+                last = attempt_id;
+            }
+        }
+        last
+    }
+
+    /// PAN-280 scenario 2: a completed QSO re-sending 73 is denied at key
+    /// time; the auto-73 counter is not charged for that attempt.
+    #[tokio::test]
+    async fn key_time_denial_of_an_auto_73_refunds_the_counter() {
+        let (mgr, map, qso_id) = completed_remote_qso().await;
+        let id_b = run_auto_73(&mgr, &map)
+            .await
+            .expect("auto-73 emitted a frame");
+        let entry = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(entry.resends, 1);
+        assert!(entry.last_resend_at.is_some());
+        assert_eq!(
+            entry
+                .pending_resends
+                .iter()
+                .map(|p| p.attempt_id)
+                .collect::<Vec<_>>(),
+            vec![id_b],
+            "the marker holds the emitted frame's attempt id"
+        );
+        handle_tx_frame_not_sent(
+            &mgr,
+            &map,
+            &qso_id.to_string(),
+            "JA1ABC K5ARH 73",
+            None,
+            Some(id_b),
+        )
+        .await;
+        let entry = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(entry.resends, 0, "the denied resend's charge is refunded");
+        assert_eq!(entry.last_resend_at, None);
+        assert!(entry.pending_resends.is_empty());
+    }
+
+    /// PAN-280: an auto-73 that aired keeps its charge; its marker clears.
+    #[tokio::test]
+    async fn aired_auto_73_keeps_its_charge() {
+        let (mgr, map, qso_id) = completed_remote_qso().await;
+        let id_b = run_auto_73(&mgr, &map)
+            .await
+            .expect("auto-73 emitted a frame");
+        handle_tx_frame_sent(
+            &mgr,
+            &map,
+            &qso_id.to_string(),
+            "JA1ABC K5ARH 73",
+            &pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1500.0,
+                remote_binding: Some((true, Some("client-a".into()))),
+            },
+            chrono::Utc::now(),
+            Some(id_b),
+        )
+        .await;
+        let entry = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(entry.resends, 1, "an aired resend stays charged");
+        assert!(entry.last_resend_at.is_some());
+        assert!(entry.pending_resends.is_empty());
+        // A later not-sent report for the same id refunds nothing.
+        assert!(!refund_auto_73_attempt(&map, Some(id_b)).await);
+        assert_eq!(map.lock().await.get(DX).unwrap().resends, 1);
+    }
+
+    /// PAN-280: an operator FIX B re-key reported not sent never touches the
+    /// auto-73 budget: only attempts an auto-73 charged are refunded.
+    #[tokio::test]
+    async fn operator_rekey_not_sent_does_not_touch_the_auto_73_budget() {
+        let (mgr, map, qso_id) = completed_remote_qso().await;
+        let id_b = run_auto_73(&mgr, &map)
+            .await
+            .expect("auto-73 emitted a frame");
+        let (_, outcome) = mgr
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                pancetta_core::ResponseStep::SeventyThree,
+                None,
+                None,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap();
+        let id_c = outcome
+            .attempt_id()
+            .expect("operator re-key emitted a frame");
+        assert_ne!(id_c, id_b);
+        handle_tx_frame_not_sent(
+            &mgr,
+            &map,
+            &qso_id.to_string(),
+            "JA1ABC K5ARH 73",
+            None,
+            Some(id_c),
+        )
+        .await;
+        let entry = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(entry.resends, 1);
+        assert_eq!(entry.pending_resends.len(), 1);
+        assert_eq!(entry.pending_resends[0].attempt_id, id_b);
+        // An id-less report refunds nothing either.
+        assert!(!refund_auto_73_attempt(&map, None).await);
+        assert_eq!(map.lock().await.get(DX).unwrap().resends, 1);
+    }
+
+    /// PAN-280: two resends in flight one slot apart are refunded one unit
+    /// each; the pacing stamp is restored only while it holds the refunded
+    /// resend's own stamp.
+    #[tokio::test]
+    async fn overlapping_auto_73_refund_takes_off_one_unit() {
+        let map = map_with_dx();
+        let t1 = chrono::Utc::now() - chrono::Duration::seconds(20);
+        let t2 = t1 + chrono::Duration::seconds(15);
+        {
+            let mut m = map.lock().await;
+            let e = m.get_mut(DX).unwrap();
+            e.resends = 2;
+            e.last_resend_at = Some(t2);
+            e.pending_resends = vec![
+                PendingAuto73Resend {
+                    attempt_id: pancetta_qso::TxAttemptId(1),
+                    committed_at: t1,
+                    prev_last_resend_at: None,
+                },
+                PendingAuto73Resend {
+                    attempt_id: pancetta_qso::TxAttemptId(2),
+                    committed_at: t2,
+                    prev_last_resend_at: Some(t1),
+                },
+            ];
+        }
+        assert!(refund_auto_73_attempt(&map, Some(pancetta_qso::TxAttemptId(1))).await);
+        let e = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(e.resends, 1);
+        assert_eq!(
+            e.last_resend_at,
+            Some(t2),
+            "the later resend's pacing stays"
+        );
+        assert!(refund_auto_73_attempt(&map, Some(pancetta_qso::TxAttemptId(2))).await);
+        let e = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(e.resends, 0);
+        assert_eq!(
+            e.last_resend_at, None,
+            "back to the value before the first refunded resend"
+        );
+        assert!(e.pending_resends.is_empty());
     }
 }
 
@@ -12055,6 +12447,7 @@ mod respond_to_caller_admission_tests {
                         },
                         // After the rearm's own TX slot has played out.
                         aired_at: opened + chrono::Duration::minutes(2),
+                        attempt_id: None,
                     }),
                     Instant::now(),
                 ))

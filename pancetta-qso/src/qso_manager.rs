@@ -1506,15 +1506,28 @@ pub enum ScheduledTxSlot {
     DuplicateCountRemoved { stall_cycles: u32 },
 }
 
-/// What a manual open or re-call actually did (PAN-138).
+/// One QSO [`QsoManager`]'s locked supersede retired (PAN-280), announced
+/// after the caller's `qsos` guard drops.
+struct SupersededQso {
+    qso_id: QsoId,
+    old_state: QsoState,
+    new_state: QsoState,
+    metadata: QsoMetadata,
+    state_history: Vec<StateTransition>,
+    messages: Vec<QsoMessage>,
+}
+
+/// What a manual open or re-call actually did (PAN-138). The frame-emitting
+/// outcomes carry the emitted `MessageToSend`'s attempt id (PAN-280), so a
+/// caller can match that frame's later TX report to this call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualCallOutcome {
     /// A new QSO was created and its first frame emitted.
-    Opened,
+    Opened(TxAttemptId),
     /// An existing QSO's latest outbound frame was re-emitted and charged.
-    Resent,
+    Resent(TxAttemptId),
     /// An existing QSO moved to a later step and that step's frame was emitted.
-    Advanced,
+    Advanced(TxAttemptId),
     /// Nothing emitted: the remote client was not TX-permitted when re-checked
     /// under the `qsos` write guard.
     NotPermitted,
@@ -1526,7 +1539,16 @@ pub enum ManualCallOutcome {
 impl ManualCallOutcome {
     /// Whether a `MessageToSend` was emitted.
     pub fn emitted_frame(self) -> bool {
-        matches!(self, Self::Opened | Self::Resent | Self::Advanced)
+        self.attempt_id().is_some()
+    }
+
+    /// The emitted `MessageToSend`'s attempt id (PAN-280), or `None` when
+    /// nothing was emitted.
+    pub fn attempt_id(self) -> Option<TxAttemptId> {
+        match self {
+            Self::Opened(id) | Self::Resent(id) | Self::Advanced(id) => Some(id),
+            Self::NotPermitted | Self::NothingToResend => None,
+        }
     }
 }
 
@@ -3213,6 +3235,7 @@ impl QsoManager {
         // do" bug).
         self.emit_state_change(qso_id, QsoState::Idle, state).await;
 
+        let attempt_id = self.next_attempt_id();
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
@@ -3220,7 +3243,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: Some(self.next_attempt_id()),
+            attempt_id: Some(attempt_id),
         })
         .await;
 
@@ -3229,7 +3252,7 @@ impl QsoManager {
             target_callsign, frequency, qso_id
         );
 
-        Ok((qso_id, ManualCallOutcome::Opened))
+        Ok((qso_id, ManualCallOutcome::Opened(attempt_id)))
     }
 
     /// Respond to a station **calling us**, opening the exchange at an
@@ -3494,24 +3517,14 @@ impl QsoManager {
         // NOT covered: their states are rearm-eligible and
         // `frame_reaches_the_air` already refuses to compound a denial, so
         // they self-correct.
-        if Self::step_ladder_rank(step) >= Some(2)
-            && remote_origin
-            && !(self.remote_tx_permitted)(remote_client_key_id.as_deref())
-        {
-            return Err(QsoManagerError::Internal {
-                message: format!(
-                    "refusing to open a brand-new QSO with {target} at close step {step:?}: \
-                     the bound remote client is not currently TX-permitted"
-                ),
-            });
-        }
-
-        // Manual: supersede any same-call QSO on this band, then build the new
-        // one (no duplicate gate — the operator explicitly chose this caller).
-        // With FIX 1 above this only fires when no ACTIVE QSO remains (e.g. a
-        // lingering terminal record), so it should rarely trigger now.
-        self.supersede_active_qsos_for(&target, frequency).await;
-
+        //
+        // PAN-280: the check now runs under the SAME `qsos` write guard as the
+        // supersede and the insert below (no `qsos` release between them), so
+        // no other `qsos` holder can run between the check and the insert.
+        // Everything the open needs is built before that guard is taken; the
+        // guard's only await is `qsos_by_callsign`, taken in the existing
+        // `qsos` -> `qsos_by_callsign` order. A clock-based arm expiry right
+        // after the check is still caught only by the TX worker at key time.
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
         // See the matching comment in `respond_to_cq_with`: a `None`
@@ -3642,6 +3655,27 @@ impl QsoManager {
         }
 
         let raw_text = self.render_sent_text(&message);
+
+        // If we are opening at the close, the logged record carries the real
+        // on-air RF frequency (dial + offset), mirroring the completion path
+        // in `process_message_for_qso`. Only the event's clone gets
+        // `frequency` overwritten with the RF value -- the STORED entry's
+        // `frequency` must stay the audio offset (PAN-25 round 2: see
+        // `QsoMetadata::frequency`'s doc comment for why). The stored entry
+        // gets `completed_rf_frequency_hz` instead, for the recent-completed
+        // suppression's band check. PAN-280: stamped before the insert, under
+        // the same guard, instead of by a second write lock afterwards.
+        let mut stored_metadata = metadata.clone();
+        if is_completed_open {
+            let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+            let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
+            let dial = effective_tx_dial(rx_dial, split);
+            if dial > 0 {
+                let rf_frequency = metadata.frequency + dial as f64;
+                metadata.frequency = rf_frequency;
+                stored_metadata.completed_rf_frequency_hz = Some(rf_frequency);
+            }
+        }
         let progress = QsoProgress {
             state: state.clone(),
             state_history: vec![],
@@ -3653,7 +3687,7 @@ impl QsoManager {
                 signal_strength: None,
                 frequency,
             }],
-            metadata: metadata.clone(),
+            metadata: stored_metadata,
         };
         // Captured before the move into the map below so the
         // QsoCompleted-on-open-at-close emit further down still has it
@@ -3661,7 +3695,41 @@ impl QsoManager {
         let opening_state_history = progress.state_history.clone();
         let opening_messages = progress.messages.clone();
 
-        self.qsos.write().await.insert(qso_id, progress);
+        // PAN-280: check, supersede and insert under ONE `qsos` write guard.
+        // Round-16 / PAN-139 ordering kept: the permission check runs before
+        // any supersede mutation, so a denied open mutates nothing.
+        let new_band = crate::utils::frequency_to_band(frequency);
+        let (superseded, attempt_id) = {
+            let mut qsos = self.qsos.write().await;
+            if Self::step_ladder_rank(step) >= Some(2)
+                && remote_origin
+                && !(self.remote_tx_permitted)(remote_client_key_id.as_deref())
+            {
+                return Err(QsoManagerError::Internal {
+                    message: format!(
+                        "refusing to open a brand-new QSO with {target} at close step {step:?}: \
+                         the bound remote client is not currently TX-permitted"
+                    ),
+                });
+            }
+            // Manual: supersede any same-call QSO on this band, then insert
+            // the new one (no duplicate gate — the operator explicitly chose
+            // this caller). With FIX 1 above this only fires when no ACTIVE
+            // QSO remains (e.g. a lingering terminal record), so it should
+            // rarely trigger now.
+            let candidate_ids = self
+                .qsos_by_callsign
+                .read()
+                .await
+                .get(&target.to_uppercase())
+                .cloned()
+                .unwrap_or_default();
+            let superseded =
+                Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, Utc::now());
+            qsos.insert(qso_id, progress);
+            (superseded, self.next_attempt_id())
+        };
+        self.emit_superseded(&target, &new_band, superseded).await;
         self.add_callsign_mapping(&target, qso_id).await;
 
         // See the matching comment in `respond_to_cq_with`: emit the initial
@@ -3682,7 +3750,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: Some(self.next_attempt_id()),
+            attempt_id: Some(attempt_id),
         })
         .await;
 
@@ -3692,28 +3760,8 @@ impl QsoManager {
         );
 
         // If we opened directly at the close, emit QsoCompleted so the logger
-        // records the QSO. Mirror the completion metadata path in
-        // `process_message_for_qso`, including the dial-frequency stamp so the
-        // ADIF carries the real on-air RF frequency, not the bare audio offset.
+        // records the QSO, with the RF-stamped metadata built above.
         if is_completed_open {
-            let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
-            let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
-            let dial = effective_tx_dial(rx_dial, split);
-            if dial > 0 {
-                let rf_frequency = metadata.frequency + dial as f64;
-                // Only the LOCAL `metadata` (used for the emitted event) gets
-                // `frequency` overwritten with the RF value -- the STORED
-                // entry's `frequency` must stay the audio offset (PAN-25
-                // round 2: see `QsoMetadata::frequency`'s doc comment for
-                // why). Instead, stamp the stored entry's
-                // `completed_rf_frequency_hz` for the recent-completed
-                // suppression's band check, same as the
-                // `process_message_for_qso` completion path.
-                metadata.frequency = rf_frequency;
-                if let Some(stored) = self.qsos.write().await.get_mut(&qso_id) {
-                    stored.metadata.completed_rf_frequency_hz = Some(rf_frequency);
-                }
-            }
             self.emit_event(QsoEvent::QsoCompleted {
                 qso_id,
                 metadata,
@@ -3723,7 +3771,7 @@ impl QsoManager {
             .await;
         }
 
-        Ok((qso_id, ManualCallOutcome::Opened))
+        Ok((qso_id, ManualCallOutcome::Opened(attempt_id)))
     }
 
     /// Two-strike confirm-before-relatch at the current time. See
@@ -4375,7 +4423,7 @@ impl QsoManager {
         };
         self.send_attempt_message(qso_id, message, frequency, attempt_id)
             .await;
-        ManualCallOutcome::Resent
+        ManualCallOutcome::Resent(attempt_id)
     }
 
     /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
@@ -8233,6 +8281,7 @@ impl QsoManager {
         ) = emit;
 
         self.emit_state_change(qso_id, old_state, new_state).await;
+        let attempt_id = self.next_attempt_id();
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
@@ -8240,7 +8289,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: Some(self.next_attempt_id()),
+            attempt_id: Some(attempt_id),
         })
         .await;
         if let Some(metadata) = completed_metadata {
@@ -8252,7 +8301,7 @@ impl QsoManager {
             })
             .await;
         }
-        Ok(ManualCallOutcome::Advanced)
+        Ok(ManualCallOutcome::Advanced(attempt_id))
     }
 
     /// FIX 3: retire every active (non-terminal) QSO with `callsign` on the
@@ -8272,77 +8321,94 @@ impl QsoManager {
         // Look up case-insensitively (Batch 2 #7) so a case/format mismatch
         // can't leak a duplicate active QSO past supersede.
         let key = callsign.to_uppercase();
-
-        // Collect the QSO IDs to supersede under the read lock, then mutate.
-        let to_supersede: Vec<QsoId> = {
-            let qsos = self.qsos.read().await;
-            let ids = match self.qsos_by_callsign.read().await.get(&key) {
-                Some(ids) => ids.clone(),
-                None => Vec::new(),
-            };
-            ids.into_iter()
-                .filter(|id| {
-                    qsos.get(id).is_some_and(|p| {
-                        p.state.is_active()
-                            && crate::utils::frequency_to_band(p.metadata.frequency) == new_band
-                    })
-                })
-                .collect()
+        let superseded = {
+            let mut qsos = self.qsos.write().await;
+            let candidate_ids = self
+                .qsos_by_callsign
+                .read()
+                .await
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, Utc::now())
         };
+        self.emit_superseded(callsign, &new_band, superseded).await;
+    }
 
-        for qso_id in to_supersede {
-            let old_state_and_metadata = {
-                let mut qsos = self.qsos.write().await;
-                match qsos.get_mut(&qso_id) {
-                    Some(progress) => {
-                        let old_state = progress.state.clone();
-                        progress.state = QsoState::Failed {
-                            reason: QsoFailureReason::Superseded,
-                            failed_at: Utc::now(),
-                            last_state: Box::new(old_state.clone()),
-                        };
-                        // Capture metadata before this loop iteration's lock
-                        // guard drops (Batch 4, SM-F5 — needed for QsoFailed).
-                        // Also capture the timeline (Layer 2 persistence) —
-                        // superseded QSOs stay in the map and are picked up
-                        // later by `cleanup_completed_qsos`, but emitting it
-                        // here too means a persistence subscriber doesn't
-                        // have to wait up to an hour for it.
-                        Some((
-                            old_state,
-                            progress.metadata.clone(),
-                            progress.state_history.clone(),
-                            progress.messages.clone(),
-                        ))
-                    }
-                    None => None,
-                }
+    /// PAN-280: the mutating core of [`Self::supersede_active_qsos_for`],
+    /// run under a caller's `qsos` write guard so a new QSO's permission
+    /// check, supersede and insert share one guard. Marks every active
+    /// candidate on `new_band` `Failed{Superseded}` and returns what
+    /// [`Self::emit_superseded`] announces once the guard drops.
+    fn supersede_active_locked(
+        qsos: &mut HashMap<QsoId, QsoProgress>,
+        candidate_ids: &[QsoId],
+        new_band: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<SupersededQso> {
+        let mut superseded = Vec::new();
+        for qso_id in candidate_ids {
+            let Some(progress) = qsos.get_mut(qso_id) else {
+                continue;
             };
-            if let Some((old_state, metadata, state_history, messages)) = old_state_and_metadata {
-                let new_state = self.qsos.read().await.get(&qso_id).map(|p| p.state.clone());
-                if let Some(new_state) = new_state {
-                    self.emit_state_change(qso_id, old_state.clone(), new_state)
-                        .await;
-                }
-                // SM-F5: also emit QsoFailed alongside StateChanged — see the
-                // cancel_qso comment for why (dead priority-scoring backoff
-                // consumer; idempotent HashSet::remove on the coordinator
-                // side makes emitting both events safe).
-                self.emit_event(QsoEvent::QsoFailed {
-                    qso_id,
-                    reason: QsoFailureReason::Superseded,
-                    last_state: old_state,
-                    metadata,
-                    state_history,
-                    messages,
-                })
-                .await;
-                self.remove_callsign_mapping(callsign, qso_id).await;
-                info!(
-                    "Superseded older active QSO {} with {} on band {} (re-call)",
-                    qso_id, callsign, new_band
-                );
+            if !(progress.state.is_active()
+                && crate::utils::frequency_to_band(progress.metadata.frequency) == *new_band)
+            {
+                continue;
             }
+            let old_state = progress.state.clone();
+            progress.state = QsoState::Failed {
+                reason: QsoFailureReason::Superseded,
+                failed_at: now,
+                last_state: Box::new(old_state.clone()),
+            };
+            // Capture metadata (Batch 4, SM-F5 — needed for QsoFailed) and
+            // the timeline (Layer 2 persistence) — superseded QSOs stay in
+            // the map and are picked up later by `cleanup_completed_qsos`,
+            // but emitting it here too means a persistence subscriber
+            // doesn't have to wait up to an hour for it.
+            superseded.push(SupersededQso {
+                qso_id: *qso_id,
+                old_state,
+                new_state: progress.state.clone(),
+                metadata: progress.metadata.clone(),
+                state_history: progress.state_history.clone(),
+                messages: progress.messages.clone(),
+            });
+        }
+        superseded
+    }
+
+    /// PAN-280: announce what [`Self::supersede_active_locked`] retired, in
+    /// the order the supersede always used: `StateChanged`, `QsoFailed`,
+    /// then the callsign mapping removal.
+    async fn emit_superseded(
+        &self,
+        callsign: &str,
+        new_band: &str,
+        superseded: Vec<SupersededQso>,
+    ) {
+        for s in superseded {
+            self.emit_state_change(s.qso_id, s.old_state.clone(), s.new_state)
+                .await;
+            // SM-F5: also emit QsoFailed alongside StateChanged — see the
+            // cancel_qso comment for why (dead priority-scoring backoff
+            // consumer; idempotent HashSet::remove on the coordinator
+            // side makes emitting both events safe).
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id: s.qso_id,
+                reason: QsoFailureReason::Superseded,
+                last_state: s.old_state,
+                metadata: s.metadata,
+                state_history: s.state_history,
+                messages: s.messages,
+            })
+            .await;
+            self.remove_callsign_mapping(callsign, s.qso_id).await;
+            info!(
+                "Superseded older active QSO {} with {} on band {} (re-call)",
+                s.qso_id, callsign, new_band
+            );
         }
     }
 
@@ -17578,6 +17644,135 @@ mod reply_emitter_tests {
                 .iter()
                 .any(|e| matches!(e, QsoEvent::StateChanged { .. })),
             "no QSO may be created (or superseded) for a refused open, got {events:?}"
+        );
+    }
+
+    /// PAN-280 scenario 3 (structural half): the close-step permission check
+    /// runs while the open holds the `qsos` write guard, so nothing can run
+    /// between the check and the insert. Before PAN-280 the predicate below
+    /// could take the lock (no guard was held at the check) and the open then
+    /// parked in `supersede_active_qsos_for`, i.e. other `qsos` holders could
+    /// run between the check and the insert.
+    #[tokio::test]
+    async fn close_step_open_checks_permission_inside_the_insert_guard() {
+        use std::sync::atomic::AtomicBool;
+        type Stash = Arc<
+            std::sync::Mutex<
+                Option<tokio::sync::OwnedRwLockWriteGuard<HashMap<QsoId, QsoProgress>>>,
+            >,
+        >;
+        let mut manager = manager();
+        let qsos = Arc::clone(&manager.qsos);
+        let took_lock = Arc::new(AtomicBool::new(false));
+        let stash: Stash = Default::default();
+        let (flag, st) = (Arc::clone(&took_lock), Arc::clone(&stash));
+        manager.set_remote_tx_permitted_source(Arc::new(move |k: Option<&str>| {
+            if k == Some("client-A") {
+                if let Ok(g) = Arc::clone(&qsos).try_write_owned() {
+                    flag.store(true, Ordering::SeqCst);
+                    *st.lock().unwrap() = Some(g);
+                }
+            }
+            k == Some("client-A")
+        }));
+        let mut rx = manager.subscribe();
+        let call = manager.respond_to_caller(
+            DX.into(),
+            FREQ,
+            None,
+            ResponseStep::SeventyThree,
+            Some(-8.0),
+            Some(-4),
+            None,
+            true,
+            Some("client-A".into()),
+        );
+        tokio::pin!(call);
+        let parked = tokio::select! {
+            biased;
+            _ = &mut call => false,
+            _ = tokio::task::yield_now() => true,
+        };
+        // Never leave the test hung on the stashed guard.
+        drop(stash.lock().unwrap().take());
+        if parked {
+            let _ = call.await;
+        }
+        assert!(
+            !took_lock.load(Ordering::SeqCst),
+            "the permission check ran while no `qsos` guard was held"
+        );
+        assert!(
+            !parked,
+            "the open must not suspend between its check and its insert"
+        );
+        let events = drain(&mut rx);
+        assert_eq!(messages_to_send(&events).len(), 1);
+    }
+
+    /// PAN-280: the single-guard open still supersedes an older active
+    /// same-call QSO, still emits `StateChanged(Failed{Superseded})` and
+    /// `QsoFailed{Superseded}` for it, and the new QSO's `StateChanged`
+    /// and `MessageToSend` follow them.
+    #[tokio::test]
+    async fn single_guard_open_still_supersedes_an_active_same_call_qso() {
+        let manager = manager();
+        // Autonomous QSOs are invisible to the manual lookups (FIX 1), so
+        // this open reaches the supersede.
+        let old_id = manager.respond_to_cq(DX.into(), FREQ, None).await.unwrap();
+        let mut rx = manager.subscribe();
+        let new_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(new_id, old_id);
+        let old = manager.get_qso(old_id).await.unwrap();
+        assert!(matches!(
+            old.state,
+            QsoState::Failed {
+                reason: QsoFailureReason::Superseded,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager.qsos_by_callsign.read().await.get(DX).cloned(),
+            Some(vec![new_id]),
+            "the callsign mapping holds only the new QSO"
+        );
+        let events = drain(&mut rx);
+        let order: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::StateChanged {
+                    qso_id, new_state, ..
+                } if *qso_id == old_id && matches!(new_state, QsoState::Failed { .. }) => {
+                    Some("old-failed")
+                }
+                QsoEvent::QsoFailed {
+                    qso_id,
+                    reason: QsoFailureReason::Superseded,
+                    ..
+                } if *qso_id == old_id => Some("old-qso-failed"),
+                QsoEvent::StateChanged {
+                    qso_id, old_state, ..
+                } if *qso_id == new_id && matches!(old_state, QsoState::Idle) => Some("new-opened"),
+                QsoEvent::MessageToSend { qso_id, .. } if *qso_id == new_id => Some("new-send"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["old-failed", "old-qso-failed", "new-opened", "new-send"]
         );
     }
 
@@ -27612,28 +27807,71 @@ mod pan138_outcome_tests {
         n
     }
 
+    /// The attempt id on the newest `MessageToSend` the receiver holds.
+    fn last_send_attempt(rx: &mut broadcast::Receiver<QsoEvent>) -> Option<TxAttemptId> {
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let QsoEvent::MessageToSend { attempt_id, .. } = ev {
+                last = attempt_id;
+            }
+        }
+        last
+    }
+
     #[tokio::test]
     async fn outcome_names_what_each_branch_did() {
         let permitted = Arc::new(AtomicBool::new(true));
         let manager = manager(Arc::clone(&permitted));
         let (id, opened) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
-        assert_eq!(opened, ManualCallOutcome::Opened);
-        assert_eq!(
-            reply(&manager, ResponseStep::Report, Some("client-a")).await,
-            (id, ManualCallOutcome::Resent)
-        );
-        assert_eq!(
-            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
-            (id, ManualCallOutcome::Advanced)
-        );
-        assert_eq!(
-            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
-            (id, ManualCallOutcome::Resent),
+        assert!(matches!(opened, ManualCallOutcome::Opened(_)));
+        let (rid, resent) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        assert_eq!(rid, id);
+        assert!(matches!(resent, ManualCallOutcome::Resent(_)));
+        let (aid, advanced) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert_eq!(aid, id);
+        assert!(matches!(advanced, ManualCallOutcome::Advanced(_)));
+        let (fid, fix_b) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert_eq!(fid, id);
+        assert!(
+            matches!(fix_b, ManualCallOutcome::Resent(_)),
             "FIX B re-keys the completed QSO"
         );
-        assert!(ManualCallOutcome::Resent.emitted_frame());
+        assert!(ManualCallOutcome::Resent(TxAttemptId(1)).emitted_frame());
         assert!(!ManualCallOutcome::NotPermitted.emitted_frame());
         assert!(!ManualCallOutcome::NothingToResend.emitted_frame());
+    }
+
+    /// PAN-280: every frame-emitting outcome carries the attempt id of the
+    /// `MessageToSend` it emitted, so the coordinator can match that frame's
+    /// later TX report (the auto-73 refund) to the call that charged it.
+    #[tokio::test]
+    async fn manual_call_outcome_carries_the_emitted_attempt_id() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = manager(Arc::clone(&permitted));
+        let mut rx = manager.subscribe();
+        let (id, opened) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        assert!(matches!(opened, ManualCallOutcome::Opened(_)));
+        assert_eq!(opened.attempt_id(), last_send_attempt(&mut rx));
+        let (_, resent) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        assert!(matches!(resent, ManualCallOutcome::Resent(_)));
+        assert_eq!(resent.attempt_id(), last_send_attempt(&mut rx));
+        let (_, advanced) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert!(matches!(advanced, ManualCallOutcome::Advanced(_)));
+        assert_eq!(advanced.attempt_id(), last_send_attempt(&mut rx));
+        let (_, fix_b) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert!(matches!(fix_b, ManualCallOutcome::Resent(_)));
+        assert_eq!(fix_b.attempt_id(), last_send_attempt(&mut rx));
+        let ids = [opened, resent, advanced, fix_b].map(|o| o.attempt_id().unwrap());
+        for (i, a) in ids.iter().enumerate() {
+            assert!(!ids[i + 1..].contains(a), "attempt ids are never reused");
+        }
+        permitted.store(false, SeqCst);
+        let (denied_id, denied) =
+            reply(&manager, ResponseStep::SeventyThree, Some("client-b")).await;
+        assert_eq!(denied_id, id);
+        assert_eq!(denied, ManualCallOutcome::NotPermitted);
+        assert_eq!(denied.attempt_id(), None);
+        assert_eq!(ManualCallOutcome::NothingToResend.attempt_id(), None);
     }
 
     #[tokio::test]
@@ -27690,10 +27928,9 @@ mod pan138_outcome_tests {
         let permitted = Arc::new(AtomicBool::new(false));
         let manager = manager(permitted);
         let (id, _) = reply(&manager, ResponseStep::Report, None).await;
-        assert_eq!(
-            reply(&manager, ResponseStep::Report, None).await,
-            (id, ManualCallOutcome::Resent)
-        );
+        let (rid, outcome) = reply(&manager, ResponseStep::Report, None).await;
+        assert_eq!(rid, id);
+        assert!(matches!(outcome, ManualCallOutcome::Resent(_)));
     }
 
     #[tokio::test]
