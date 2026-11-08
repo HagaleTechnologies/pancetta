@@ -19,3 +19,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "dxcc_lookup"
+harness = false

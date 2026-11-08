@@ -1,0 +1,52 @@
+---
+id: dxcc-entity-lookup
+title: What will bite you about the DXCC entity resolver?
+kind: gotcha
+status: current
+maintainer: agent
+sources:
+  - pancetta-core/src/dxcc.rs
+  - pancetta-core/src/dxcc_table.rs
+  - pancetta-core/scripts/gen_dxcc_table.py
+  - pancetta-tui/src/app.rs
+  - pancetta-tui/src/dx_need.rs
+verified:
+  commit: ebd09fa6
+  date: 2026-11-08
+links:
+  - tui
+---
+The offline callsign to DXCC entity resolver is `pancetta_core::dxcc`
+(PAN-284). It probes a prefix index, not a scan, and its answers must stay
+identical to the old linear scan; a test keeps that scan as an oracle.
+
+## Never resolve inside a frame
+
+Each DX Hunter row (`DxStation`) carries `offline_entity`, resolved once when
+the row is created. Read it through `DxStation::display_entity`, which puts
+cqdx's `entity_name` first. `DxNeedLookup::lookup_need` receives the row's
+entity as a parameter: a provider must use it and must not resolve the
+callsign again. A lookup in the renderer or the need refresh runs for every
+row in every frame.
+
+## The US safety net is reachable
+
+cty.dat lists `AH0` to `AH9` but no bare `AH`. So `AH`, `AHA` and `AH` plus
+any non-digit fall through the table to the K/W/N and AA to AL safety net and
+answer "United States". Do not delete the safety net as dead code.
+
+## Regenerating the table
+
+The generator lives in `pancetta-core/scripts/gen_dxcc_table.py`:
+`python3 pancetta-core/scripts/gen_dxcc_table.py /path/to/cty.dat >
+pancetta-core/src/dxcc_table.rs`, then run
+`cargo test -p pancetta-core --lib -- dxcc::`. A duplicate prefix would be
+silently collapsed by the `HashMap`, so `index_has_one_key_per_table_row`
+fails on it. The index computes its longest key when built, so longer prefixes
+need no code change.
+
+## Keep normalization as it is
+
+The lookup uppercases with `to_uppercase`, not `to_ascii_uppercase` (`ß`
+becomes `SS`), resolves FT8 hash-renders (`<N7RLK>`) first, and slices with
+`str::get` so a non-ASCII first character cannot panic.

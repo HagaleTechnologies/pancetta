@@ -13,6 +13,7 @@
 //! - [`Mode`] -- operating mode (FT8, USB, etc.)
 //! - [`PancettaError`] -- unified error type
 //! - [`ComponentError`] -- per-component error with severity and context
+//! - [`dxcc`] -- offline callsign to DXCC entity resolver (cty.dat prefix index)
 //!
 //! ## Crate Relationships
 //! - Receives from: nothing (foundational layer)
@@ -24,6 +25,8 @@
 
 pub mod callsign;
 pub mod diagnostic_level;
+pub mod dxcc;
+mod dxcc_table;
 pub mod error;
 pub mod freq_bin;
 pub mod gridsquare;

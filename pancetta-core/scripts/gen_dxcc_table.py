@@ -3,8 +3,8 @@
 Generate a Rust prefix→DXCC-entity-name table from an AD1C BigCTY cty.dat file.
 
 Usage:
-    python3 pancetta-tui/scripts/gen_dxcc_table.py /path/to/cty.dat \
-        > pancetta-tui/src/dxcc_table.rs
+    python3 pancetta-core/scripts/gen_dxcc_table.py /path/to/cty.dat \
+        > pancetta-core/src/dxcc_table.rs
 
 Source: https://www.country-files.com/ (free for amateur use).
 
@@ -143,9 +143,9 @@ def build_table(path: str) -> list[tuple[str, str]]:
             continue
         clean[pfx] = name
 
-    # Sort by prefix length DESC then alphabetically so the consumer's
-    # longest-prefix-wins scan works without caring about order,
-    # but we produce a deterministic, human-readable output.
+    # Sort by prefix length DESC then alphabetically so a regeneration
+    # diffs cleanly. The consumer (`pancetta_core::dxcc`) indexes the rows
+    # by prefix, so its lookup does not depend on this order.
     sorted_entries = sorted(clean.items(), key=lambda kv: (-len(kv[0]), kv[0]))
     return sorted_entries
 
@@ -162,14 +162,14 @@ def main():
     path = sys.argv[1]
     entries = build_table(path)
 
-    print('//! AUTO-GENERATED from cty.dat (AD1C BigCTY, https://www.country-files.com/, free for amateur use).')
+    print('//! AUTO-GENERATED from cty.dat (AD1C BigCTY, <https://www.country-files.com/>, free for amateur use).')
     print('//! Do not edit by hand — regenerate with:')
-    print('//!   python3 pancetta-tui/scripts/gen_dxcc_table.py /path/to/cty.dat \\')
-    print('//!       > pancetta-tui/src/dxcc_table.rs')
+    print('//!   python3 pancetta-core/scripts/gen_dxcc_table.py /path/to/cty.dat \\')
+    print('//!       > pancetta-core/src/dxcc_table.rs')
     print('//!')
     print('//! Maps callsign prefix -> DXCC entity name.')
-    print('//! Entries are sorted by prefix length DESC then alphabetically,')
-    print('//! which enables a simple longest-first linear scan.')
+    print('//! Entries are sorted by prefix length DESC then alphabetically so a')
+    print('//! regeneration diffs cleanly; `crate::dxcc` indexes them by prefix.')
     print()
     print('pub static PREFIX_TABLE: &[(&str, &str)] = &[')
     for pfx, name in entries:

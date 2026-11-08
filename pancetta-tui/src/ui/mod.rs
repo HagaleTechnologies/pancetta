@@ -3421,6 +3421,7 @@ mod view_render_tests {
             network_rank: None,
             source: crate::app::SpotSource::Both,
             entity_name: Some("New Zealand".to_string()),
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
             rarity_tier: Some("rare".to_string()),
             reporter_count: Some(14),
             is_notable: false,
@@ -3469,6 +3470,7 @@ mod view_render_tests {
             fn lookup_need(
                 &self,
                 _: &str,
+                _: Option<&'static str>,
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,

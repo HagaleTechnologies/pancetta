@@ -3290,6 +3290,7 @@ version = "0.9.6"
 dependencies = [
  "approx",
  "chrono",
+ "criterion",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
