@@ -1028,7 +1028,9 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   critical section; `create_channel`'s doc comment says so and
   `pan202_rig_route_is_the_registered_channel` pins it.
 - **Scope.** Only PTT commands use the route. PTT-off from `PttGuard` keeps its PAN-135
-  confirmed-enqueue path (`send_message_retrying`), audio output keeps `send_message_if`
+  confirmed-enqueue path (`send_message_retrying`); since PAN-273 that path is every TX-worker
+  unkey (Step 9, multi-TX, tune, clock-step hold guard, supersede), not only the
+  remote-revocation ones. Audio output keeps `send_message_if`
   (PAN-134's audio recheck), and every other send stays on the table path. The TUI's
   `TogglePtt` builds one message for either state, so its PTT-off takes the helper too, with the
   same best-effort semantics as its old `send_message`.
