@@ -254,3 +254,44 @@ Follow-ups, not done here:
 - Worked versus confirmed, and an incomplete-history or new-account signal.
   cqdx returns no per-entity worked/confirmed state and no log-completeness
   signal; both need a cqdx API, raised as a dispensa/cqdx question.
+
+## Offline DXCC resolver is an index in pancetta-core (PAN-284, 2026-11-08)
+
+`entity_for_callsign` and the PAN-85 US helpers moved from
+`pancetta-tui/src/dxcc.rs` to `pancetta_core::dxcc`, with the generated table
+(`pancetta-core/src/dxcc_table.rs`) and its generator
+(`pancetta-core/scripts/gen_dxcc_table.py`). The priority evaluator, decode
+alerts and QSO logging now resolve entities through a domain crate, not the
+TUI crate. `pancetta` still depends on `pancetta-tui` because it hosts
+`TuiRunner`.
+
+The lookup probes a `LazyLock<HashMap>` keyed by table prefix, from the longest
+prefix in the table (5 characters today; computed when the index is built)
+down to 1. The first hit is the longest leading-prefix match. The old code
+scanned all 7,173 rows on every call: about 31 µs per call in the dev profile.
+The index costs 26 to 66 ns per call under criterion on the development host.
+
+The answers are identical to the old scan. A test keeps the old scan as an
+oracle and compares the two over 105,385 inputs: every `[A-Z0-9]` string of
+length 1 to 3, every table prefix in eight shapes, and odd inputs (Unicode,
+padding, hash-renders, `AH`). Normalization stays `trim().to_uppercase()` and
+the PAN-58 hash-render rule stays. The US safety net (K/W/N, AA to AL) is
+reachable: cty.dat lists `AH0` to `AH9` but no bare `AH`, so `AH` plus a
+non-digit answers "United States" through it.
+
+Each DX Hunter row (`DxStation`) carries `offline_entity`, resolved once when
+the row is created. `DxStation::display_entity` gives cqdx's `entity_name`
+first and the carried entity second. `DxNeedLookup::lookup_need` takes the
+row's entity as a parameter, and `CachedStationLookup` decides state
+eligibility from it. A frame (render plus need refresh) runs no entity lookup.
+The research measured 3.4 ms of resolver time per 150-row render and 3.3 ms per
+150-row need refresh before this change. State eligibility still uses the
+offline cty.dat entity, as before; cqdx's `entity_name` does not feed it. One
+input changes answer on the need path: a double-bracketed `<<X>>` string,
+which the FT8 decoder never emits. The carried entity is resolved from the
+row's stored call, so eligibility now matches what a local row displays.
+
+CI enforces the 2 µs budget from the ticket. The Workspace Check lane runs
+`cargo bench -p pancetta-core --bench dxcc_lookup` and
+`scripts/ci/check-criterion-budget.sh`, which fails when any benchmark mean is
+2,000 ns or more.

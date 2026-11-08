@@ -174,7 +174,7 @@ pub struct CachedStationLookup {
     /// value = latest contact start date per resolved uppercase callsign.
     worked_on_band: Arc<RwLock<HashMap<String, HashMap<String, DateTime<Utc>>>>>,
     /// DXCC entities worked per band, derived locally from `worked_on_band`
-    /// via the offline prefix→entity resolver (`pancetta_tui::dxcc`) — no
+    /// via the offline prefix→entity resolver (`pancetta_core::dxcc`) — no
     /// cqdx dependency. Key = uppercase band name, value = set of resolved
     /// entity names (e.g. "Japan"). A callsign whose prefix doesn't resolve
     /// contributes nothing (safe: never claims an unresolvable entity is
@@ -335,7 +335,7 @@ impl CachedStationLookup {
         let mut resolved = 0usize;
         let mut skipped = 0usize;
         for (band, callsign) in pairs {
-            match pancetta_tui::dxcc::entity_for_callsign(&callsign) {
+            match pancetta_core::dxcc::entity_for_callsign(&callsign) {
                 Some(entity) => {
                     map.entry(band.trim().to_uppercase())
                         .or_default()
@@ -392,7 +392,7 @@ impl CachedStationLookup {
         let Some(key) = resolved_identity(callsign) else {
             return;
         };
-        if let Some(code) = pancetta_tui::dxcc::normalize_us_state(state) {
+        if let Some(code) = pancetta_core::dxcc::normalize_us_state(state) {
             self.station_states.write().insert(key, code.to_string());
         }
     }
@@ -405,7 +405,7 @@ impl CachedStationLookup {
             self.record_worked_state(&call, &state);
             if let (Some(key), Some(code)) = (
                 resolved_identity(&call),
-                pancetta_tui::dxcc::normalize_us_state(&state),
+                pancetta_core::dxcc::normalize_us_state(&state),
             ) {
                 latest.insert(key, code.to_string());
             }
@@ -420,19 +420,19 @@ impl CachedStationLookup {
 
     /// Record a completed contact's validated US subdivision, not an observation.
     pub fn record_worked_state(&self, callsign: &str, state: &str) {
-        if !pancetta_tui::dxcc::entity_for_callsign(callsign)
-            .is_some_and(pancetta_tui::dxcc::is_us_related_entity)
+        if !pancetta_core::dxcc::entity_for_callsign(callsign)
+            .is_some_and(pancetta_core::dxcc::is_us_related_entity)
         {
             return;
         }
-        if let Some(code) = pancetta_tui::dxcc::normalize_us_state(state) {
+        if let Some(code) = pancetta_core::dxcc::normalize_us_state(state) {
             self.worked_states.write().insert(code.to_string());
         }
     }
 
     /// Local all-time worked status. Display callers must also check availability.
     pub fn is_state_needed(&self, state: &str) -> bool {
-        pancetta_tui::dxcc::normalize_us_state(state)
+        pancetta_core::dxcc::normalize_us_state(state)
             .is_some_and(|code| !self.worked_states.read().contains(code))
     }
 
@@ -640,7 +640,7 @@ impl CachedStationLookup {
         // `rarity_by_entity` for why this matters.
         let mut by_entity: HashMap<String, f64> = HashMap::new();
         for (callsign, rarity) in &scores {
-            if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+            if let Some(entity) = pancetta_core::dxcc::entity_for_callsign(callsign) {
                 by_entity.insert(entity.to_string(), *rarity);
             }
         }
@@ -673,7 +673,7 @@ impl CachedStationLookup {
         // itself seen in a cqdx live-spot poll, but another callsign from the
         // same DXCC entity may have been — reuse that rarity rather than the
         // flat neutral default.
-        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) {
+        if let Some(entity) = pancetta_core::dxcc::entity_for_callsign(&upper) {
             if let Some(r) = self.rarity_by_entity.read().get(entity).copied() {
                 return r;
             }
@@ -716,7 +716,7 @@ impl CachedStationLookup {
         // Keep worked_dxcc_on_band live-updated as QSOs complete during the
         // session, not just at startup seeding — same resolver, same
         // skip-if-unresolvable behavior as seed_worked_dxcc_from_list.
-        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) {
+        if let Some(entity) = pancetta_core::dxcc::entity_for_callsign(&upper) {
             self.worked_dxcc_on_band
                 .write()
                 .entry(band.trim().to_uppercase())
@@ -745,14 +745,13 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
     fn lookup_need(
         &self,
         callsign: &str,
+        entity: Option<&'static str>,
         grid: Option<&str>,
         known_state: Option<&str>,
         current_frequency_hz: f64,
     ) -> pancetta_tui::dx_need::DxNeedStatus {
-        use pancetta_tui::{
-            dx_need::{canonical_grid_square, DxNeedStatus},
-            dxcc,
-        };
+        use pancetta_core::dxcc;
+        use pancetta_tui::dx_need::{canonical_grid_square, DxNeedStatus};
         let Some(call) = resolved_identity(callsign) else {
             return DxNeedStatus::default();
         };
@@ -770,7 +769,9 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
                 .and_then(dxcc::normalize_us_state)
                 .map(str::to_string)
         });
-        let eligible = dxcc::entity_for_callsign(&call).is_some_and(dxcc::is_us_related_entity);
+        // PAN-284: the row resolved its entity once, at creation; never
+        // resolve `callsign` again here (this runs per row per frame).
+        let eligible = entity.is_some_and(dxcc::is_us_related_entity);
         let state_needed = state
             .as_deref()
             .filter(|_| state_available && eligible)
@@ -929,7 +930,7 @@ impl WorkedStationLookup for CachedStationLookup {
 
         // Unresolvable callsign (no matching prefix in the offline table):
         // never claim "needed" for an entity we can't even identify.
-        let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) else {
+        let Some(entity) = pancetta_core::dxcc::entity_for_callsign(&upper) else {
             return false;
         };
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
@@ -1000,17 +1001,36 @@ mod tests {
         // PAN-93: dxcc_needed is None until a list loads, then Some(true/false)
         // with its source.
         assert_eq!(
-            l.lookup_need("JA1ABC", None, None, 14_074_000.0)
-                .dxcc_needed,
+            l.lookup_need(
+                "JA1ABC",
+                pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
+                None,
+                None,
+                14_074_000.0
+            )
+            .dxcc_needed,
             None
         );
         assert_eq!(
-            l.lookup_need("JA1ABC", None, None, 14_074_000.0).dxcc_list,
+            l.lookup_need(
+                "JA1ABC",
+                pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
+                None,
+                None,
+                14_074_000.0
+            )
+            .dxcc_list,
             None
         );
         let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         l.update_needed_dxcc_for_band(HashSet::from(["JA".into()]), Some("20M".into()), at);
-        let s = l.lookup_need("JA1ABC", None, None, 14_074_000.0);
+        let s = l.lookup_need(
+            "JA1ABC",
+            pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
+            None,
+            None,
+            14_074_000.0,
+        );
         assert_eq!(s.dxcc_needed, Some(true));
         assert_eq!(
             s.dxcc_list,
@@ -1020,15 +1040,27 @@ mod tests {
             })
         );
         assert_eq!(
-            l.lookup_need("DL1ABC", None, None, 14_074_000.0)
-                .dxcc_needed,
+            l.lookup_need(
+                "DL1ABC",
+                pancetta_core::dxcc::entity_for_callsign("DL1ABC"),
+                None,
+                None,
+                14_074_000.0
+            )
+            .dxcc_needed,
             Some(false)
         );
         let l = CachedStationLookup::new();
         assert!(l.is_grid_needed_on_band("EM34", 14_074_000.0));
         assert_eq!(
-            l.lookup_need("W5ABC", Some("EM34"), Some("AR"), 14_074_000.0)
-                .grid_needed,
+            l.lookup_need(
+                "W5ABC",
+                pancetta_core::dxcc::entity_for_callsign("W5ABC"),
+                Some("EM34"),
+                Some("AR"),
+                14_074_000.0
+            )
+            .grid_needed,
             None
         );
         let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
@@ -1039,7 +1071,14 @@ mod tests {
         for grid in ["EM34", "em34ab", "FN42", "PM95"] {
             for hz in [14_074_000.0, 7_074_000.0] {
                 assert_eq!(
-                    l.lookup_need("W5ABC", Some(grid), None, hz).grid_needed,
+                    l.lookup_need(
+                        "W5ABC",
+                        pancetta_core::dxcc::entity_for_callsign("W5ABC"),
+                        Some(grid),
+                        None,
+                        hz
+                    )
+                    .grid_needed,
                     Some(l.is_grid_needed_on_band(grid, hz))
                 );
             }
@@ -1055,35 +1094,104 @@ mod tests {
             "EM34garbage",
         ] {
             assert_eq!(
-                l.lookup_need("W5ABC", Some(grid), None, 14_074_000.0)
-                    .grid_needed,
+                l.lookup_need(
+                    "W5ABC",
+                    pancetta_core::dxcc::entity_for_callsign("W5ABC"),
+                    Some(grid),
+                    None,
+                    14_074_000.0
+                )
+                .grid_needed,
                 None,
                 "{grid}"
             );
         }
         for hz in [0.0, -1.0, f64::NAN, f64::INFINITY, 123_000_000.0] {
             assert_eq!(
-                l.lookup_need("W5ABC", Some("EM34"), None, hz).grid_needed,
+                l.lookup_need(
+                    "W5ABC",
+                    pancetta_core::dxcc::entity_for_callsign("W5ABC"),
+                    Some("EM34"),
+                    None,
+                    hz
+                )
+                .grid_needed,
                 None
             );
         }
         assert_eq!(
-            l.lookup_need("<...>", Some("EM34"), Some("AR"), 14_074_000.0),
+            l.lookup_need(
+                "<...>",
+                pancetta_core::dxcc::entity_for_callsign("<...>"),
+                Some("EM34"),
+                Some("AR"),
+                14_074_000.0
+            ),
             Default::default()
         );
         assert_eq!(
-            l.lookup_need("JA1ABC", None, Some("CA"), 14_074_000.0)
-                .state_needed,
+            l.lookup_need(
+                "JA1ABC",
+                pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
+                None,
+                Some("CA"),
+                14_074_000.0
+            )
+            .state_needed,
             None
         );
         l.record_state("W5ABC", "AR");
-        let need = l.lookup_need("<W5ABC>", None, Some("CA"), 14_074_000.0);
+        let need = l.lookup_need(
+            "<W5ABC>",
+            pancetta_core::dxcc::entity_for_callsign("<W5ABC>"),
+            None,
+            Some("CA"),
+            14_074_000.0,
+        );
         assert_eq!(need.state.as_deref(), Some("AR"));
         assert_eq!(need.state_needed, Some(true));
         l.record_worked_state("W1AW", "AR");
         assert_eq!(
-            l.lookup_need("W5ABC", None, None, 7_074_000.0).state_needed,
+            l.lookup_need(
+                "W5ABC",
+                pancetta_core::dxcc::entity_for_callsign("W5ABC"),
+                None,
+                None,
+                7_074_000.0
+            )
+            .state_needed,
             Some(false)
+        );
+    }
+
+    /// PAN-284: the display adapter runs per row per frame, so it takes state
+    /// eligibility from the entity the row resolved at creation and never
+    /// resolves the callsign itself.
+    #[tokio::test]
+    async fn display_adapter_takes_state_eligibility_from_the_carried_entity() {
+        use pancetta_tui::dx_need::DxNeedLookup;
+        let l = CachedStationLookup::new();
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        l.seed_display_history(&db).await;
+        // JA1ABC resolves to Japan, but the row says United States: eligible.
+        assert_eq!(
+            l.lookup_need(
+                "JA1ABC",
+                Some("United States"),
+                None,
+                Some("AR"),
+                14_074_000.0
+            )
+            .state_needed,
+            Some(true)
+        );
+        // W5ABC resolves to United States, but the row says Japan: not eligible.
+        assert_eq!(
+            l.lookup_need("W5ABC", Some("Japan"), None, Some("AR"), 14_074_000.0)
+                .state_needed,
+            None
         );
     }
 
@@ -1728,11 +1836,11 @@ mod tests {
     /// prefix must still score as needed via the branches below, not be
     /// silently zeroed just because the local table has a gap. "QQ" is used
     /// here as a stand-in for a locally-unresolvable-but-valid-shaped
-    /// prefix (confirmed absent from `pancetta_tui::dxcc_table::PREFIX_TABLE`
+    /// prefix (confirmed absent from the offline `pancetta_core::dxcc` table
     /// and not covered by its K/W/N/AA-AL US safety net).
     #[test]
     fn test_locally_unresolvable_prefix_not_wrongly_zeroed() {
-        assert_eq!(pancetta_tui::dxcc::entity_for_callsign("QQ9XYZ"), None);
+        assert_eq!(pancetta_core::dxcc::entity_for_callsign("QQ9XYZ"), None);
 
         // Historical default (no needed set, no exclusions): still needed.
         let lookup = CachedStationLookup::new();

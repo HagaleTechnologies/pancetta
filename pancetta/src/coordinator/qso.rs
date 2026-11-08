@@ -9371,13 +9371,13 @@ fn merge_qrz_lookup(
     let us_related = metadata
         .their_callsign
         .as_deref()
-        .and_then(pancetta_tui::dxcc::entity_for_callsign)
-        .is_some_and(pancetta_tui::dxcc::is_us_related_entity);
+        .and_then(pancetta_core::dxcc::entity_for_callsign)
+        .is_some_and(pancetta_core::dxcc::is_us_related_entity);
     if state_missing && us_related {
         if let Some(code) = lookup
             .state
             .as_deref()
-            .and_then(pancetta_tui::dxcc::normalize_us_state)
+            .and_then(pancetta_core::dxcc::normalize_us_state)
         {
             metadata.their_state = Some(code.to_string());
             result.state_filled = true;
@@ -9411,8 +9411,8 @@ fn needs_qrz_enrichment(metadata: &pancetta_qso::QsoMetadata) -> bool {
         && metadata
             .their_callsign
             .as_deref()
-            .and_then(pancetta_tui::dxcc::entity_for_callsign)
-            .is_some_and(pancetta_tui::dxcc::is_us_related_entity)
+            .and_then(pancetta_core::dxcc::entity_for_callsign)
+            .is_some_and(pancetta_core::dxcc::is_us_related_entity)
 }
 
 /// Best-effort QRZ-XML grid/state enrichment for a completed QSO.
