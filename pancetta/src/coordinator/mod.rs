@@ -1718,6 +1718,10 @@ pub struct ApplicationCoordinator {
     /// PAN-57: the upload worker's task, awaited by `shutdown` so runtime
     /// teardown never cancels it while it drains and saves the queue.
     pub(crate) upload_outbox_task: Option<tokio::task::JoinHandle<()>>,
+    /// PAN-274: every ADIF subscriber this process started, and the signal that
+    /// asks them to finish. Shared with each Qso start, so a supervisor restart
+    /// registers with the same holder. `shutdown` stops and waits for them.
+    pub(crate) adif_subscribers: qso::AdifSubscribers,
 
     /// PAN-57: the upload worker's readiness view, read by the TUI relay's
     /// readiness snapshot (`readiness::ReadinessSources`). A std mutex for
@@ -2559,6 +2563,7 @@ impl ApplicationCoordinator {
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
             upload_outbox: None,
             upload_outbox_task: None,
+            adif_subscribers: qso::AdifSubscribers::new(),
             upload_health: Arc::new(std::sync::Mutex::new(Default::default())),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
