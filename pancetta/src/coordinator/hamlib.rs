@@ -1649,29 +1649,15 @@ impl super::ApplicationCoordinator {
         }
     }
 
-    /// Map rig model name to hamlib model number.
-    /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
-    /// Public so `pancetta doctor` (in the bin crate) can pre-validate the
-    /// configured model against the same table the spawner uses.
+    /// Map a configured `rig.model` name to its Hamlib model number.
+    ///
+    /// The rig table is `pancetta_hamlib::SUPPORTED_RIGS`, published as
+    /// `docs/SUPPORTED_RIGS.md`. Public so `pancetta doctor` (in the bin crate)
+    /// can pre-validate the configured model against the same table the
+    /// spawner uses.
     #[cfg(feature = "pancetta-hamlib")]
     pub fn hamlib_model_id(model: &str) -> Option<u32> {
-        match model.to_lowercase().replace(['-', ' '], "").as_str() {
-            "ftdx10" => Some(1042),
-            "ftdx101d" | "ftdx101mp" => Some(1040),
-            "ft991" | "ft991a" => Some(1036),
-            "ft710" => Some(1046),
-            "ft891" => Some(1038),
-            "ft857" | "ft857d" => Some(1022),
-            "ft817" | "ft817nd" => Some(1020),
-            "ic7300" => Some(3073),
-            "ic7610" => Some(3078),
-            "ic7851" => Some(3075),
-            "ic705" => Some(3085),
-            "ic9700" => Some(3081),
-            "ts890" | "ts890s" => Some(2029),
-            "ts590" | "ts590s" | "ts590sg" => Some(2026),
-            _ => None,
-        }
+        pancetta_hamlib::find_supported_rig(model).map(|rig| rig.hamlib_id)
     }
 
     /// SECURITY (I-10 / I-11): validate the `station.interface.port` device
@@ -7837,14 +7823,19 @@ mod model_recognized_tests {
 
     #[test]
     fn recognizes_every_model_in_the_hamlib_id_table() {
-        for model in [
-            "FTdx10", "ftdx10", "FT-DX10", "FTdx101D", "FT991", "ft991a", "FT710", "FT891",
-            "FT857", "FT817", "IC-7300", "ic7610", "IC7851", "IC705", "IC9700", "TS890", "ts590sg",
-        ] {
-            assert!(
-                model_recognized(model),
-                "expected {model:?} to be recognized (it's in hamlib_model_id's table)"
-            );
+        for rig in pancetta_hamlib::SUPPORTED_RIGS {
+            for name in rig.config_names {
+                assert_eq!(
+                    super::super::ApplicationCoordinator::hamlib_model_id(name),
+                    Some(rig.hamlib_id),
+                    "{name:?} must map to {}'s Hamlib model",
+                    rig.model
+                );
+                assert!(
+                    model_recognized(name),
+                    "expected {name:?} to be recognized (it's in SUPPORTED_RIGS)"
+                );
+            }
         }
     }
 

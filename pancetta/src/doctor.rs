@@ -484,8 +484,9 @@ pub(crate) fn check_rigctld() -> DoctorCheck {
                         cfg.rig.model
                     ),
                     fix: Some(
-                        "run `pancetta setup` and set a supported model (FTdx10, IC-7300, …), \
-                         or run an external rigctld and set RIGCTLD_HOST/RIGCTLD_PORT"
+                        "run `pancetta setup` and set a model listed in docs/SUPPORTED_RIGS.md \
+                         (e.g. IC-7300, FTdx10), or run an external rigctld and set \
+                         RIGCTLD_HOST/RIGCTLD_PORT"
                             .to_string(),
                     ),
                 };

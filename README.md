@@ -311,7 +311,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
-| Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
+| Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
 | SWR protection | Integration-tested, *Unreleased* | Halts all TX on one SWR reading above `max_swr` (default 3.0) while keyed; needs CAT. Mock rig and fake `rigctld` only; no real-rig trip recorded | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
@@ -359,7 +359,8 @@ Honest gaps, so you can judge whether it fits your station:
   the binary builds and decodes correctly on an ARM64 cloud runner, not on a
   Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
-  Other hamlib-supported rigs should work; nobody has proven it.
+  Other hamlib-supported rigs should work; nobody has proven it. The
+  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI
   and unsupported.
 
@@ -388,6 +389,7 @@ is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — audio init, missing decodes, duplicate QSOs, `rigctld`.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate graph, data flow, key abstractions.
 - [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md) — every TUI binding.
+- [`docs/SUPPORTED_RIGS.md`](docs/SUPPORTED_RIGS.md) — rigs Pancetta starts `rigctld` for, with per-rig test status.
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — operating procedures, including the autonomous QSO loop.
 - [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib, measured.
 - [`docs/PROVENANCE.md`](docs/PROVENANCE.md) — licensing provenance and the clean-room firewall.
