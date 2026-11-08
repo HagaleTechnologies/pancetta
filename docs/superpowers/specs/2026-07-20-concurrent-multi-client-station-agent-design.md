@@ -87,10 +87,13 @@ Rules, in order of precedence:
 3. **Implicit grab (backward compatibility):** a control-mutating action (`Arm`, `Qsy`,
    `SetSplit`, `TxRequest`, `StopCq`) from peer P when `controller == None` sets
    `controller = Some(P)` and then proceeds. Today's panino never sends `takeControl`; a single
-   client connecting and arming works byte-for-byte as it does now. `StopCq` first needs a
-   currently-valid hello capability of any scope (PAN-250); without one it is refused (`warn!`,
-   no frame) before it can grab.
-   Qsy/SetSplit first pass the PAN-252 station-activity check: keyed rigs and active QSOs without a remote_client_key_id refuse the command with a peer-targeted error. A refusal does not grab control.
+   client connecting and arming works byte-for-byte as it does now, provided it has sent a
+   `hello`. `Arm`, `Qsy`, `SetSplit` and `TxRequest` first need a currently-valid `qsy`-or-higher
+   hello capability (PAN-283); `StopCq` first needs a currently-valid hello capability of any
+   scope (PAN-250). Without it the action is refused (`warn!`, no frame; `Arm` and `TxRequest`
+   are also audited `TxDenied`) before it can grab, so the controller slot, the PAN-137 cleanup
+   and other clients' QSOs are left alone.
+   Qsy/SetSplit then pass the PAN-252 station-activity check: keyed rigs and active QSOs without a remote_client_key_id refuse the command with a peer-targeted error. A refusal does not grab control.
 4. **Exclusivity:** a control-mutating action from a non-controller while a controller is
    assigned is refused — `warn!`, audited, and answered with an error frame to that peer (so
    its UI can render "take control first"). It does NOT implicitly grab.

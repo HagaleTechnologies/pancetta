@@ -820,7 +820,9 @@ async fn flush_qso_cleanup(ctx: &mut ArmContext, bus: &MessageBus) {
 }
 
 /// The outcome of the one-controller-at-a-time gate for a control-mutating
-/// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`).
+/// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`). Every caller checks the
+/// peer's hello capability first (PAN-283: `qsy` for all but `StopCq`, which
+/// needs any live scope), so the gate itself never looks at the capability.
 enum ControllerGate {
     /// The peer may proceed. Carries any `controlState` frames from an implicit
     /// grab (empty when the peer was already the controller).
@@ -831,7 +833,10 @@ enum ControllerGate {
 }
 
 /// Apply rules 3 (implicit grab) + 4 (exclusivity) for a control-mutating
-/// action from `peer`:
+/// action from `peer`. Callers reach it only after the peer's hello capability
+/// check (PAN-283: [`refuse_without_control_capability`] for
+/// `Arm`/`Qsy`/`SetSplit`/`TxRequest`; any live scope for `StopCq`), so an
+/// implicit grab is never made by a peer without a currently-valid hello:
 /// - no controller yet → `peer` implicitly grabs control (+ `controlState`),
 ///   then proceeds;
 /// - `peer` already holds control → proceed with no extra frames;
@@ -843,6 +848,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
             // Rule 3 — implicit grab keeps a single connected client (today's
             // only real-world case, which never sends takeControl) working with
             // zero behavior change. PAN-137 also cleans up other clients' QSOs.
+            // The caller has already checked the hello capability (PAN-283).
             ctx.controller = Some(peer.to_string());
             owe_qso_cleanup(ctx, peer);
             debug!(target: "agent.control", peer = %peer, "implicit control grab (no controller set)");
@@ -869,6 +875,36 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
             }])
         }
     }
+}
+
+/// PAN-283: an action that can take control (`Arm`, `Qsy`, `SetSplit`,
+/// `TxRequest`, `TakeControl`) needs a currently-valid qsy-or-higher hello
+/// capability, checked before any gate or side effect. Returns `None` when the
+/// peer holds one. Otherwise logs `verb`, records an audit `TxDenied` with
+/// `audit_detail` when given, and returns the refusal: no frame (a peer
+/// without a live hello may be sent nothing, PAN-95), no controller change, no
+/// owed cleanup.
+fn refuse_without_control_capability(
+    ctx: &ArmContext,
+    peer: &str,
+    verb: &str,
+    audit_detail: Option<String>,
+    now: ArmTime,
+) -> Option<DispatchOutcome> {
+    if peer_grants(ctx, peer, "qsy", now.unix_ms) {
+        return None;
+    }
+    warn!(target: "agent.control", peer = %peer, verb,
+        "refused — no currently-valid qsy-scoped hello capability for this peer");
+    if let Some(detail) = audit_detail {
+        ctx.audit.record(&AuditEvent {
+            ts_unix_ms: now.unix_ms,
+            kind: AuditKind::TxDenied,
+            operator_callsign: None,
+            detail,
+        });
+    }
+    Some(DispatchOutcome::cont())
 }
 
 async fn remote_qsy_refusal(ctx: &ArmContext, bus: &MessageBus) -> Option<&'static str> {
@@ -915,6 +951,14 @@ fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
 /// mutation, audit writes, and best-effort bus sends. This is the security spine
 /// of the component and is unit-tested directly.
 ///
+/// PAN-283: `Arm`, `Qsy`, `SetSplit`, `TxRequest` and `TakeControl` can take
+/// control, so each first requires a currently-valid `qsy`-or-higher hello
+/// capability ([`refuse_without_control_capability`]); `StopCq` requires a
+/// live hello of any scope. Those checks run before the controller gate and
+/// before any other side effect, so a refused action grabs nothing, sends no
+/// frame and owes no PAN-137 cleanup (`Arm` and `TxRequest` refusals are
+/// audited `TxDenied`).
+///
 /// - `Arm { capability_token, grant }` → verify the capabilityToken as a
 ///   SEPARATE input (against the pinned IdP key) then verify the client-signed
 ///   grant (fail-closed, including the `txEnabledUntil` clock-2 gate + the
@@ -934,7 +978,9 @@ fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
 ///   `arm_jti` is a sanity match, NOT a security gate: disarm-any always
 ///   proceeds; a non-empty arm_jti that doesn't match the live arm still
 ///   disarms but logs a `warn!`.
-/// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
+/// - `Qsy` / `SetSplit` → after the capability check, the PAN-252 activity
+///   refusal and the controller gate, a coordinator `RigControlMessage`
+///   (NON-TX rig control).
 /// - `TxRequest(_)` → refused (audited `TxDenied`) while this channel's own
 ///   consent (`remote_tx_enabled`) is off; otherwise audited `TxRequested` +
 ///   routed into the REAL QSO engine via a `remote_origin = true`
@@ -980,8 +1026,19 @@ async fn dispatch_action(
             capability_token,
             grant,
         } => {
+            // PAN-283: arming takes control, so it needs a currently-valid
+            // qsy-or-higher hello capability, checked before any side effect.
+            if let Some(refused) = refuse_without_control_capability(
+                ctx,
+                peer,
+                "arm",
+                Some("arm refused: no currently-valid qsy-scoped hello capability".to_string()),
+                now,
+            ) {
+                return refused;
+            }
             // Rule 3/4: arming is a control-mutating action — gate on the
-            // controller first (implicit grab if unset; refuse a non-controller).
+            // controller next (implicit grab if unset; refuse a non-controller).
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1077,6 +1134,14 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            // PAN-283: the capability check runs first, ahead of the PAN-252
+            // activity refusal, so a peer without the tier grabs nothing and
+            // learns nothing about rig or QSO activity.
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "setFrequency", None, now)
+            {
+                return refused;
+            }
             if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setFrequency", reason);
             }
@@ -1084,10 +1149,6 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "setFrequency refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont_with(grab);
-            }
             let msg = RigControlMessage::SetFrequency {
                 vfo: vfo.clamp(0, u8::MAX as i64) as u8,
                 frequency: frequency_hz.max(0.0) as u64,
@@ -1099,6 +1160,12 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
+            // PAN-283: capability first, as for `Qsy`.
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "setSplit", None, now)
+            {
+                return refused;
+            }
             if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setSplit", reason);
             }
@@ -1106,10 +1173,6 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont_with(grab);
-            }
             let tx_frequency = tx_frequency_hz.max(0.0) as u64;
             info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
             let store = crate::coordinator::forward_split_change(
@@ -1133,6 +1196,28 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(grab)
         }
         ControlAction::TxRequest(kind) => {
+            let detail = match &kind {
+                TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
+                TxKind::AnswerCaller { callsign, step, .. } => {
+                    format!("answerCaller {callsign} step={step}")
+                }
+                TxKind::StartCq { offset_hz } => format!("startCq offset={offset_hz}"),
+            };
+            // PAN-283: a TX request takes control and opens a remote-origin
+            // QSO, so it needs a currently-valid qsy-or-higher hello
+            // capability, checked before the gate: a refused request grabs
+            // nothing, owes no cleanup and creates no QSO.
+            if let Some(refused) = refuse_without_control_capability(
+                ctx,
+                peer,
+                "txRequest",
+                Some(format!(
+                    "txRequest refused: no currently-valid qsy-scoped hello capability ({detail})"
+                )),
+                now,
+            ) {
+                return refused;
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1160,13 +1245,6 @@ async fn dispatch_action(
             // the request is refused (audited `TxDenied`) and no QSO is
             // created. Another channel's consent never satisfies this check.
             // A poisoned arm lock refuses too (fail-closed).
-            let detail = match &kind {
-                TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
-                TxKind::AnswerCaller { callsign, step, .. } => {
-                    format!("answerCaller {callsign} step={step}")
-                }
-                TxKind::StartCq { offset_hz } => format!("startCq offset={offset_hz}"),
-            };
             let (consented, operator_callsign) = match ctx.arm.lock() {
                 Ok(st) => (
                     st.channel_consent(ConsentChannel::StationAgent),
@@ -1277,9 +1355,10 @@ async fn dispatch_action(
             // end its QSOs, so it needs a currently-valid qsy-or-higher hello
             // capability. Checked before any side effect: a refused takeover
             // leaves the controller, its arm and any owed cleanup untouched.
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "takeControl refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont();
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "takeControl", None, now)
+            {
+                return refused;
             }
             // An authorized grab always succeeds. If it displaces a DIFFERENT
             // controller, disarm that controller's arm FIRST (arms never
@@ -3065,6 +3144,17 @@ mod tests {
         m
     }
 
+    /// PAN-283: give established peer `peer` a verified hello carrying
+    /// `scope`, valid until `NOW + 600_000`. Control actions (`Arm`, `Qsy`,
+    /// `SetSplit`, `TxRequest`, `TakeControl`) need `qsy` or `tx`; the
+    /// `ctx_with` default peer stays unauthorized.
+    fn with_hello(ctx: &mut ArmContext, peer: &str, scope: &str) {
+        ctx.peers.insert(
+            peer.to_string(),
+            PeerCtx::authorized_until(vec![scope.to_string()], NOW + 600_000),
+        );
+    }
+
     fn ctx_with(allow_client: bool, have_device_key: bool) -> ArmContext {
         let mut allow = HashSet::new();
         if allow_client {
@@ -3480,6 +3570,7 @@ mod tests {
     #[tokio::test]
     async fn arm_from_allowlisted_client_permits_tx() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let d = dispatch_action(
@@ -3510,7 +3601,8 @@ mod tests {
     /// the sets directly.
     #[tokio::test]
     async fn owner_edge_is_both_admitted_and_tx_arm_eligible() {
-        let ctx = ctx_with(true, true);
+        let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         assert!(
             ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
             "an owner's client keyId must be in the connection-admission set"
@@ -3528,6 +3620,7 @@ mod tests {
         // `arm_from_allowlisted_client_permits_tx` — kept as an explicit,
         // separately-named CQD-11 regression pin).
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let d = dispatch_action(
@@ -3558,6 +3651,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_edge_is_admitted_but_not_tx_arm_eligible() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         // Simulate the poll having classified CLIENT_KEY_ID as a delegated
         // edge: still connection-admitted (and its device key still loaded —
         // admission doesn't change), but removed from the TX-arm-eligible set.
@@ -4053,6 +4147,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_loss_disarms_after_timeout() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4080,6 +4175,7 @@ mod tests {
         );
         // A heartbeat *before* the deadline slides the window.
         let mut ctx2 = ctx_with(true, true);
+        with_hello(&mut ctx2, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx2, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("arm-jti-1"),
@@ -4115,6 +4211,7 @@ mod tests {
     #[tokio::test]
     async fn stale_seq_heartbeat_does_not_extend_the_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
@@ -4194,6 +4291,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_arm_jti_heartbeat_is_rejected() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4265,6 +4363,7 @@ mod tests {
     #[tokio::test]
     async fn udp_consent_does_not_enable_station_agent_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         // Mirror production seeding for remote_tx_enabled=false +
         // wsjtx_udp.enabled=true + allow_tx_initiation=true.
         with_channel_consent(&ctx, ConsentChannel::StationAgent, false);
@@ -4320,6 +4419,7 @@ mod tests {
     #[tokio::test]
     async fn tx_request_refused_when_station_agent_consent_off() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, false);
         with_channel_consent(&ctx, ConsentChannel::WsjtxUdp, true);
         let bus = MessageBus::new(64).unwrap();
@@ -4362,6 +4462,7 @@ mod tests {
     #[tokio::test]
     async fn arm_and_tx_request_still_work_when_own_consent_on_and_wsjtx_off() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         with_channel_consent(&ctx, ConsentChannel::WsjtxUdp, false);
         let bus = MessageBus::new(64).unwrap();
@@ -4439,6 +4540,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_disarm_clears_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4556,6 +4658,7 @@ mod tests {
     #[tokio::test]
     async fn tx_disarm_with_arm_jti_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4594,6 +4697,7 @@ mod tests {
     #[tokio::test]
     async fn tx_disarm_mismatched_arm_jti_still_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4638,6 +4742,7 @@ mod tests {
     #[tokio::test]
     async fn tx_request_routes_to_qso_engine_but_never_arms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         // Subscribe to the QSO component's inbox so we can assert the routed msg.
@@ -4693,7 +4798,8 @@ mod tests {
     }
 
     // PAN-137: controller cleanup uses the same ordered inbox as QSO intents.
-    // B holds a qsy hello so its explicit takeover is authorized (PAN-253).
+    // B holds a qsy hello so its explicit takeover is authorized (PAN-253);
+    // A holds one too so its arm and TX requests may take control (PAN-283).
     fn controller_change_ctx() -> ArmContext {
         let mut ctx = ctx_with(true, true);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -4701,10 +4807,8 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
-        ctx.peers.insert(
-            PEER_B.to_string(),
-            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
-        );
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
+        with_hello(&mut ctx, PEER_B, "qsy");
         ctx
     }
 
@@ -4956,14 +5060,15 @@ mod tests {
     #[tokio::test]
     async fn a_controller_stop_cq_reaches_the_qso_engine() {
         let mut ctx = controller_change_ctx();
-        // PAN-250: a stop needs a live hello; status scope is enough.
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        // PAN-250: a stop needs a live hello; status scope is enough. A
+        // arms with its qsy hello (PAN-283), then holds only status.
         ctx.peers.insert(
             CLIENT_KEY_ID.to_string(),
             PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
         );
-        let bus = MessageBus::new(64).unwrap();
-        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
-        grab_a(&mut ctx, &bus).await;
         flush_qso_cleanup(&mut ctx, &bus).await;
         assert_eq!(qso_inbox_tags(&rx).len(), 1);
         let out = dispatch_action(
@@ -5001,11 +5106,6 @@ mod tests {
     #[tokio::test]
     async fn an_undelivered_stop_cq_tells_the_client_to_retry() {
         let mut ctx = controller_change_ctx();
-        // PAN-250: a stop needs a live hello; status scope is enough.
-        ctx.peers.insert(
-            CLIENT_KEY_ID.to_string(),
-            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
-        );
         let bus = MessageBus::new(1).unwrap();
         let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         tx.try_send(ComponentMessage::new(
@@ -5016,6 +5116,12 @@ mod tests {
         ))
         .unwrap();
         grab_a(&mut ctx, &bus).await;
+        // PAN-250: a stop needs a live hello; status scope is enough. A
+        // arms with its qsy hello (PAN-283), then holds only status.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
         let out = dispatch_action(
             ControlAction::StopCq,
             CLIENT_KEY_ID,
@@ -5118,6 +5224,200 @@ mod tests {
             qso_inbox_tags(&rx),
             [format!("changed:{PEER_B}"), "stopCq".to_string()]
         );
+    }
+
+    /// PAN-283: the four actions that implicitly take control. `callStation`
+    /// stands for every `TxRequest` kind (they share one dispatch arm).
+    fn pan283_control_actions() -> [(&'static str, ControlAction); 4] {
+        [
+            ("callStation", call_w1xyz()),
+            (
+                "setFrequency",
+                ControlAction::Qsy {
+                    vfo: 0,
+                    frequency_hz: 14_074_000.0,
+                },
+            ),
+            (
+                "setSplit",
+                ControlAction::SetSplit {
+                    enabled: true,
+                    tx_frequency_hz: 14_075_000.0,
+                },
+            ),
+            ("txArm", arm_action("pan283-arm")),
+        ]
+    }
+
+    fn audit_events(ctx: &ArmContext) -> Vec<AuditEvent> {
+        std::fs::read_to_string(ctx.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .collect()
+    }
+
+    /// PAN-283: with the controller slot empty, a peer without a
+    /// currently-valid qsy-or-higher hello (none, expiring at `now`, expired,
+    /// revoked, or status-only) is refused before the controller gate for
+    /// `callStation`, `setFrequency`, `setSplit` and `txArm`. Nothing is
+    /// sent, control is not taken, no PAN-137 cleanup is owed, no QSO or rig
+    /// message is enqueued and nothing arms. `txArm` and `callStation` record
+    /// a `TxDenied` audit naming the missing capability, never `TxRequested`.
+    #[tokio::test]
+    async fn implicit_grab_needs_a_live_qsy_hello() {
+        let auths: [(&str, Option<(&str, i64)>, bool); 5] = [
+            ("no hello", None, false),
+            ("qsy expires at now", Some(("qsy", NOW)), false),
+            ("qsy expired", Some(("qsy", NOW - 1)), false),
+            ("qsy revoked", Some(("qsy", NOW + 600_000)), true),
+            ("status only", Some(("status", NOW + 600_000)), false),
+        ];
+        for (verb, _) in pan283_control_actions() {
+            for (label, auth, revoke) in auths {
+                let action = pan283_control_actions()
+                    .into_iter()
+                    .find(|(v, _)| *v == verb)
+                    .unwrap()
+                    .1;
+                let mut ctx = controller_change_ctx();
+                let bus = MessageBus::new(64).unwrap();
+                let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                let (_hamlib_tx, hamlib_rx) =
+                    bus.create_channel(ComponentId::Hamlib).await.unwrap();
+                ctx.peers.insert(
+                    CLIENT_KEY_ID.to_string(),
+                    auth.map_or_else(PeerCtx::unauthorized, |(scope, exp)| {
+                        PeerCtx::authorized_until(vec![scope.to_string()], exp)
+                    }),
+                );
+                if revoke {
+                    // `authorized_until`'s fixture jti.
+                    ctx.revoked_jtis.insert("test-jti".to_string());
+                }
+                assert!(ctx.controller.is_none());
+                let out =
+                    dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW))
+                        .await;
+                assert_eq!(out.flow, Dispatch::Continue);
+                assert!(out.sends.is_empty(), "{verb} [{label}]: no frame");
+                assert!(
+                    ctx.controller.is_none(),
+                    "{verb} [{label}]: the controller slot stays empty"
+                );
+                assert!(
+                    ctx.qso_cleanup_owed.is_none(),
+                    "{verb} [{label}]: no controller-change cleanup owed"
+                );
+                assert!(
+                    qso_inbox_tags(&qso_rx).is_empty(),
+                    "{verb} [{label}]: nothing reaches the QSO engine"
+                );
+                assert_eq!(
+                    hamlib_rx.try_iter().count(),
+                    0,
+                    "{verb} [{label}]: nothing reaches the rig"
+                );
+                assert!(
+                    !ctx.arm.lock().unwrap().is_armed(),
+                    "{verb} [{label}]: nothing arms"
+                );
+                let audit = audit_events(&ctx);
+                assert!(
+                    !audit.iter().any(|ev| ev.kind == AuditKind::TxRequested),
+                    "{verb} [{label}]: a refused request is never audited TxRequested"
+                );
+                if verb == "txArm" || verb == "callStation" {
+                    assert!(
+                        audit.iter().any(|ev| ev.kind == AuditKind::TxDenied
+                            && ev.detail.contains("qsy-scoped hello capability")),
+                        "{verb} [{label}]: the refusal is audited TxDenied naming the capability: {audit:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// PAN-283: a status-only peer B cannot disturb controller A. Each of the
+    /// four control actions from B is refused before the controller gate: A
+    /// keeps control and its arm, B gets no `takeControl first` error frame
+    /// (it could not act on one, `takeControl` needs `qsy`), and the owed
+    /// cleanup is unchanged.
+    #[tokio::test]
+    async fn a_status_only_peer_cannot_disturb_another_controller() {
+        for (verb, action) in pan283_control_actions() {
+            let mut ctx = controller_change_ctx();
+            let bus = MessageBus::new(64).unwrap();
+            let (_qso_tx, _qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+            let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+            grab_a(&mut ctx, &bus).await;
+            flush_qso_cleanup(&mut ctx, &bus).await;
+            assert!(ctx.qso_cleanup_owed.is_none());
+            with_hello(&mut ctx, PEER_B, "status");
+            let out = dispatch_action(action, PEER_B, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+            assert!(
+                out.sends.is_empty(),
+                "{verb}: no frame, not even the takeControl-first error"
+            );
+            assert_eq!(
+                ctx.controller.as_deref(),
+                Some(CLIENT_KEY_ID),
+                "{verb}: A keeps control"
+            );
+            assert!(
+                ctx.arm.lock().unwrap().is_armed(),
+                "{verb}: A's arm is untouched"
+            );
+            assert!(ctx.qso_cleanup_owed.is_none(), "{verb}: no cleanup owed");
+            assert_eq!(
+                hamlib_rx.try_iter().count(),
+                0,
+                "{verb}: nothing reaches the rig"
+            );
+        }
+    }
+
+    /// PAN-283 no over-blocking: with a `qsy` or a `tx` hello and an empty
+    /// controller slot, each control action still grabs control implicitly
+    /// and does its work.
+    #[tokio::test]
+    async fn implicit_grab_with_a_qsy_or_tx_hello_still_works() {
+        for scope in ["qsy", "tx"] {
+            for (verb, action) in pan283_control_actions() {
+                let mut ctx = controller_change_ctx();
+                with_hello(&mut ctx, CLIENT_KEY_ID, scope);
+                let bus = MessageBus::new(64).unwrap();
+                let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                let (_hamlib_tx, hamlib_rx) =
+                    bus.create_channel(ComponentId::Hamlib).await.unwrap();
+                dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+                assert_eq!(
+                    ctx.controller.as_deref(),
+                    Some(CLIENT_KEY_ID),
+                    "{verb} [{scope}]: A takes control"
+                );
+                match verb {
+                    "callStation" => assert_eq!(
+                        qso_inbox_tags(&qso_rx),
+                        [
+                            format!("changed:{CLIENT_KEY_ID}"),
+                            format!("start:W1XYZ:{CLIENT_KEY_ID}")
+                        ],
+                        "{verb} [{scope}]"
+                    ),
+                    "setFrequency" | "setSplit" => assert_eq!(
+                        hamlib_rx.try_iter().count(),
+                        1,
+                        "{verb} [{scope}]: one rig message"
+                    ),
+                    "txArm" => assert!(
+                        ctx.arm.lock().unwrap().is_armed(),
+                        "{verb} [{scope}]: armed"
+                    ),
+                    other => panic!("unexpected verb {other}"),
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -5328,6 +5628,7 @@ mod tests {
     #[tokio::test]
     async fn implicit_grab_on_first_arm_single_client_compat() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let out = dispatch_action(
@@ -5591,6 +5892,7 @@ mod tests {
         // B (PEER_B) as a SECOND allow-listed, established peer with its OWN
         // device key — a genuinely admitted second client, not a bare claim.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -5606,8 +5908,9 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string(), key(0x33).verifying_key());
-        ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        // B holds a qsy hello (PAN-283) so the arm reaches the sender-binding
+        // check under test.
+        with_hello(&mut ctx, PEER_B, "qsy");
         // Consent ON: nothing but the sender-binding check gates this arm.
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
@@ -5654,6 +5957,7 @@ mod tests {
     /// B's admission is asserted so a later refusal can only be the scope gate.
     async fn armed_a_and_admitted_b(b_auth: PeerCtx, bus: &MessageBus) -> ArmContext {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -5908,6 +6212,7 @@ mod tests {
     #[tokio::test]
     async fn disarm_accepted_from_non_controller() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -5947,6 +6252,7 @@ mod tests {
     #[tokio::test]
     async fn failing_audit_sink_keeps_valid_arms_and_every_disarm_working() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         let (failing_audit, _audit_tmp) = failing_audit_log();
         ctx.audit = failing_audit;
         ctx.peers
@@ -6029,6 +6335,7 @@ mod tests {
     #[tokio::test]
     async fn release_control_clears_and_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -6090,6 +6397,7 @@ mod tests {
         {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
+            with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
             with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
             let bus = MessageBus::new(64).unwrap();
             // Pre-arm: implicit grab makes CLIENT_KEY_ID the controller.
@@ -6130,6 +6438,7 @@ mod tests {
         {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
+            with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
             // B must be allow-listed so MultiPeerSession admits it.
             ctx.tx_allow_list
                 .write()
@@ -6484,6 +6793,25 @@ mod tests {
         let mut ctx = ctx_with_agent(&agent_kid, true, true);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
+        // PAN-283: the client hellos with its capability token before arming,
+        // so it holds the qsy capability arming needs to take control.
+        let ControlAction::Arm {
+            capability_token, ..
+        } = &action
+        else {
+            unreachable!("asserted above");
+        };
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(capability_token.clone()),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            agent_session_id,
+            at(NOW),
+        )
+        .await;
         let d = dispatch_action(
             action,
             CLIENT_KEY_ID,
@@ -7459,6 +7787,7 @@ mod tests {
     #[tokio::test]
     async fn controller_capability_expiry_disarms_and_releases_control() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -7502,6 +7831,7 @@ mod tests {
 
         // A non-controller expiring disarms nothing.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("expiry-arm-jti-2"),
@@ -10601,7 +10931,14 @@ mod tests {
     /// sending client (PAN-95: a peer receives nothing until this verifies).
     fn pan97_hello() -> Pan97Frame {
         Box::new(|c: &Pan97Client| {
-            hello_frame_bytes(&injected_clock_token(&c.agent_kid, &c.kid, &["status"]))
+            // PAN-283: the arming client needs a qsy hello to take control;
+            // listeners stay status-only.
+            let scopes: &[&str] = if c.kid == CLIENT_KEY_ID {
+                &["status", "qsy"]
+            } else {
+                &["status"]
+            };
+            hello_frame_bytes(&injected_clock_token(&c.agent_kid, &c.kid, scopes))
         })
     }
 
@@ -10757,6 +11094,7 @@ mod tests {
     async fn arm_response_reflects_arm_accepted_after_dispatch_sample() {
         let bus = MessageBus::new(64).unwrap();
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.controller = Some(CLIENT_KEY_ID.to_string());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         ctx.clock = fixed_clock(NOW + 1);
@@ -10786,6 +11124,7 @@ mod tests {
     async fn sweep_uses_clock_sampled_under_arm_lock() {
         let bus = MessageBus::new(64).unwrap();
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("arm-jti-1"),
@@ -10825,6 +11164,7 @@ mod tests {
         // admitted (PAN-96 refuses every action from a non-admitted peer,
         // heartbeats included — refusing can only shorten an arm).
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -10870,6 +11210,7 @@ mod tests {
 
         // Housekeeping first, then the late heartbeat.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -11255,7 +11596,15 @@ mod tests {
             1,
             "arm-jti-2 must not arm on a capability that expired during the stall"
         );
-        assert_eq!(audit_count(&ctx, "arm rejected: capability"), 1);
+        // PAN-283: the hello expired with the token, so arm-jti-2 is refused
+        // by the qsy hello check before its token is even verified.
+        assert_eq!(
+            audit_count(
+                &ctx,
+                "arm refused: no currently-valid qsy-scoped hello capability"
+            ),
+            1
+        );
     }
 
     /// Housekeeping likewise checks capability expiry after its own sends: a
