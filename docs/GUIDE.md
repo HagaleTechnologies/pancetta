@@ -27,7 +27,8 @@ On first run (no config yet) pancetta walks you through:
   rig while your FT8 tones play through the laptop speakers.
 - **Rig CAT control** — answer `y` if your radio is connected by USB now.
   Pancetta lists your serial ports (with USB product names), asks for the
-  rig model (e.g. `FTdx10`, `IC-7300`), baud rate (38400 for a Yaesu
+  rig model (e.g. `FTdx10`, `IC-7300`; see
+  [supported rigs](SUPPORTED_RIGS.md)), baud rate (38400 for a Yaesu
   FTdx10), and PTT method (**CAT** is right for most modern rigs).
   Answer `n` to stay decode-only; you can add the rig any time with
   `pancetta setup`.

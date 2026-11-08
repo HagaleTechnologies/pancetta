@@ -4,8 +4,6 @@
 //! and their specific capabilities for optimal integration.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use string_cache::DefaultAtom as Atom;
 
 // Re-export unified types from pancetta-core
 pub use pancetta_core::{Band, Mode};
@@ -263,6 +261,9 @@ impl Default for RigCapabilities {
 }
 
 /// Popular amateur radio transceiver models
+///
+/// This is not the supported-rig list. The rigs Pancetta starts `rigctld`
+/// for, and their Hamlib model numbers, live in [`SUPPORTED_RIGS`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RigModelType {
     /// Dummy rig for testing
@@ -296,30 +297,6 @@ pub enum RigModelType {
 }
 
 impl RigModelType {
-    /// Get the hamlib numeric model ID (used to spawn rigctld -m).
-    ///
-    /// Returns `None` for `Unknown`, since the unknown variant doesn't
-    /// know which model it is. Callers (the coordinator) treat that as
-    /// "fall back to manual rigctld config" rather than a hard failure.
-    pub fn hamlib_id(&self) -> Option<u32> {
-        Some(match self {
-            RigModelType::Dummy => 1,
-            RigModelType::NetRigctl => 2,
-            RigModelType::YaesuFT991A => 1035,
-            RigModelType::YaesuFTdx10 => 1045,
-            RigModelType::YaesuFT818 => 1049,
-            RigModelType::IcomIC7300 => 3074,
-            RigModelType::IcomIC7610 => 3076,
-            RigModelType::IcomIC705 => 3085,
-            RigModelType::KenwoodTS590SG => 2030,
-            RigModelType::KenwoodTS890S => 2042,
-            RigModelType::ElecraftK3S => 2073,
-            RigModelType::ElecraftKX3 => 2074,
-            RigModelType::FlexRadio6000 => 2025,
-            RigModelType::Unknown => return None,
-        })
-    }
-
     /// Get manufacturer name
     pub fn manufacturer(&self) -> &'static str {
         match self {
@@ -450,57 +427,250 @@ impl RigModelType {
     }
 }
 
-/// Registry of supported rig models
-pub struct RigModelRegistry {
-    models: HashMap<Atom, RigModelType>,
+/// Whether this repository records a hardware test of one rig capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareTest {
+    /// Used on a real station with this rig, with the evidence recorded in
+    /// [`SupportedRig::evidence`].
+    Tested,
+    /// No hardware test of this capability is recorded in the repository.
+    Untested,
 }
 
-impl RigModelRegistry {
-    /// Create new registry with common models
-    pub fn new() -> Self {
-        let mut models = HashMap::new();
+impl HardwareTest {
+    /// The cell text shown in `docs/SUPPORTED_RIGS.md`.
+    pub fn label(self) -> &'static str {
+        match self {
+            HardwareTest::Tested => "Tested",
+            HardwareTest::Untested => "Untested",
+        }
+    }
+}
 
-        // Add popular models
-        models.insert(Atom::from("dummy"), RigModelType::Dummy);
-        models.insert(Atom::from("netrigctl"), RigModelType::NetRigctl);
-        models.insert(Atom::from("ft991a"), RigModelType::YaesuFT991A);
-        models.insert(Atom::from("ftdx10"), RigModelType::YaesuFTdx10);
-        models.insert(Atom::from("ft818"), RigModelType::YaesuFT818);
-        models.insert(Atom::from("ic7300"), RigModelType::IcomIC7300);
-        models.insert(Atom::from("ic7610"), RigModelType::IcomIC7610);
-        models.insert(Atom::from("ic705"), RigModelType::IcomIC705);
-        models.insert(Atom::from("ts590sg"), RigModelType::KenwoodTS590SG);
-        models.insert(Atom::from("ts890s"), RigModelType::KenwoodTS890S);
-        models.insert(Atom::from("k3s"), RigModelType::ElecraftK3S);
-        models.insert(Atom::from("kx3"), RigModelType::ElecraftKX3);
-        models.insert(Atom::from("flex6000"), RigModelType::FlexRadio6000);
+/// One rig Pancetta starts `rigctld` for, as listed in `docs/SUPPORTED_RIGS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedRig {
+    /// Manufacturer, for example `"Icom"`.
+    pub manufacturer: &'static str,
+    /// Model name as the manufacturer writes it, for example `"IC-7300"`.
+    pub model: &'static str,
+    /// Accepted `rig.model` values, as shown on the page. Matching ignores
+    /// case, hyphens and spaces (see [`normalize_rig_model`]).
+    pub config_names: &'static [&'static str],
+    /// Hamlib model number passed to `rigctld -m`.
+    pub hamlib_id: u32,
+    /// CAT (frequency, split, PTT through `rigctld`) hardware-test status.
+    pub cat: HardwareTest,
+    /// Rig USB sound device (receive decode and transmit audio) hardware-test status.
+    pub audio: HardwareTest,
+    /// On-air FT8 transmit hardware-test status.
+    pub tx: HardwareTest,
+    /// Where the repository records the hardware test. Required when any
+    /// capability is [`HardwareTest::Tested`].
+    pub evidence: Option<&'static str>,
+}
 
-        Self { models }
+impl SupportedRig {
+    /// Display name, manufacturer and model, for example `"Icom IC-7300"`.
+    pub fn display_name(&self) -> String {
+        format!("{} {}", self.manufacturer, self.model)
     }
 
-    /// Get model by name
-    pub fn get_model(&self, name: &str) -> Option<&RigModelType> {
-        self.models.get(&Atom::from(name.to_lowercase()))
+    fn has_any_test(&self) -> bool {
+        [self.cat, self.audio, self.tx].contains(&HardwareTest::Tested)
     }
+}
 
-    /// List all available models
-    pub fn list_models(&self) -> Vec<(&str, &RigModelType)> {
-        self.models
+const fn untested_rig(
+    manufacturer: &'static str,
+    model: &'static str,
+    config_names: &'static [&'static str],
+    hamlib_id: u32,
+) -> SupportedRig {
+    SupportedRig {
+        manufacturer,
+        model,
+        config_names,
+        hamlib_id,
+        cat: HardwareTest::Untested,
+        audio: HardwareTest::Untested,
+        tx: HardwareTest::Untested,
+        evidence: None,
+    }
+}
+
+/// The one table of rigs Pancetta starts `rigctld` for.
+///
+/// The coordinator's `rigctld` spawner, `pancetta doctor`, the TUI rig picker
+/// and `docs/SUPPORTED_RIGS.md` all read this table. After adding or changing
+/// an entry, regenerate the page with
+/// `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current`
+/// and pin the upstream Hamlib number in `hamlib_ids_match_upstream_riglist`.
+/// Mark a capability [`HardwareTest::Tested`] only when the repository records
+/// a hardware test, and name that record in `evidence`.
+pub static SUPPORTED_RIGS: &[SupportedRig] = &[
+    untested_rig("Icom", "IC-7300", &["IC-7300"], 3073),
+    untested_rig("Icom", "IC-705", &["IC-705"], 3085),
+    untested_rig("Icom", "IC-7610", &["IC-7610"], 3078),
+    untested_rig("Icom", "IC-7851", &["IC-7851"], 3075),
+    untested_rig("Icom", "IC-9700", &["IC-9700"], 3081),
+    untested_rig("Kenwood", "TS-590S", &["TS-590", "TS-590S"], 2031),
+    untested_rig("Kenwood", "TS-590SG", &["TS-590SG"], 2037),
+    untested_rig("Kenwood", "TS-890S", &["TS-890", "TS-890S"], 2041),
+    untested_rig("Yaesu", "FT-710", &["FT-710"], 1049),
+    untested_rig("Yaesu", "FT-817", &["FT-817", "FT-817ND"], 1020),
+    untested_rig("Yaesu", "FT-857", &["FT-857", "FT-857D"], 1022),
+    untested_rig("Yaesu", "FT-891", &["FT-891"], 1036),
+    untested_rig("Yaesu", "FT-991", &["FT-991", "FT-991A"], 1035),
+    SupportedRig {
+        manufacturer: "Yaesu",
+        model: "FTdx10",
+        config_names: &["FTdx10"],
+        hamlib_id: 1042,
+        cat: HardwareTest::Tested,
+        audio: HardwareTest::Tested,
+        tx: HardwareTest::Tested,
+        evidence: Some(
+            "CAT and PTT radio-qualified; TX validated 2026-04-26 (clean ALC, \
+             PSKReporter spots across NA and EU); manual on-air QSOs since 2026-09.",
+        ),
+    },
+    untested_rig("Yaesu", "FTdx101D", &["FTdx101D"], 1040),
+    untested_rig("Yaesu", "FTdx101MP", &["FTdx101MP"], 1044),
+];
+
+/// Rigs listed first on the supported-rig page, by [`SupportedRig::model`]:
+/// the most common remote-operation targets. The rest follow sorted by
+/// manufacturer and model.
+const LEAD_RIG_MODELS: &[&str] = &["IC-7300", "IC-705"];
+
+/// Normalize a `rig.model` value for lookup: lowercase, with hyphens and
+/// spaces removed, so `"IC-7300"`, `"ic7300"` and `"ic 7300"` match.
+pub fn normalize_rig_model(name: &str) -> String {
+    name.to_lowercase().replace(['-', ' '], "")
+}
+
+/// Look up a configured `rig.model` value in [`SUPPORTED_RIGS`].
+pub fn find_supported_rig(name: &str) -> Option<&'static SupportedRig> {
+    let wanted = normalize_rig_model(name);
+    if wanted.is_empty() {
+        return None;
+    }
+    SUPPORTED_RIGS.iter().find(|rig| {
+        rig.config_names
             .iter()
-            .map(|(name, model)| (name.as_ref(), model))
-            .collect()
-    }
-
-    /// Add custom model
-    pub fn add_model(&mut self, name: &str, model: RigModelType) {
-        self.models.insert(Atom::from(name.to_lowercase()), model);
-    }
+            .any(|n| normalize_rig_model(n) == wanted)
+    })
 }
 
-impl Default for RigModelRegistry {
-    fn default() -> Self {
-        Self::new()
+/// [`SUPPORTED_RIGS`] in page order: [`LEAD_RIG_MODELS`] first, then the
+/// rest sorted by manufacturer and model.
+fn supported_rigs_in_page_order() -> Vec<&'static SupportedRig> {
+    let mut lead: Vec<&'static SupportedRig> = LEAD_RIG_MODELS
+        .iter()
+        .filter_map(|m| SUPPORTED_RIGS.iter().find(|r| r.model == *m))
+        .collect();
+    let mut rest: Vec<&'static SupportedRig> = SUPPORTED_RIGS
+        .iter()
+        .filter(|r| !LEAD_RIG_MODELS.contains(&r.model))
+        .collect();
+    rest.sort_by(|a, b| (a.manufacturer, a.model).cmp(&(b.manufacturer, b.model)));
+    lead.append(&mut rest);
+    lead
+}
+
+/// Render the generated `docs/SUPPORTED_RIGS.md` content from [`SUPPORTED_RIGS`].
+pub fn render_supported_rigs_markdown() -> String {
+    let rigs = supported_rigs_in_page_order();
+    let tested: Vec<String> = rigs
+        .iter()
+        .filter(|r| r.has_any_test())
+        .map(|r| r.display_name())
+        .collect();
+
+    let mut out = String::from(
+        "<!-- GENERATED FILE - do not edit by hand.\n     \
+         Source: pancetta-hamlib/src/models.rs (SUPPORTED_RIGS).\n     \
+         Regenerate: PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current -->\n\n\
+         # Supported rigs\n\n\
+         Pancetta controls a rig through Hamlib's `rigctld`. It starts `rigctld` itself for the rigs below.\n\
+         Set `rig.model` in `~/.pancetta/pancetta.toml` to a name from the `rig.model` column.\n\
+         Case, hyphens and spaces are ignored.\n\n",
+    );
+    match tested.as_slice() {
+        [] => out.push_str("No rig has a recorded hardware test.\n"),
+        [one] => {
+            out.push_str(&format!(
+                "The {one} is the only rig with a recorded hardware test.\n"
+            ));
+            out.push_str(
+                "Every other rig is mapped to its Hamlib model, but nobody has recorded using it with Pancetta.\n",
+            );
+        }
+        many => {
+            out.push_str(&format!(
+                "These rigs have a recorded hardware test: {}.\n",
+                many.join(", ")
+            ));
+            out.push_str(
+                "Every other rig is mapped to its Hamlib model, but nobody has recorded using it with Pancetta.\n",
+            );
+        }
     }
+
+    out.push_str(
+        "\n| Rig | `rig.model` | Hamlib model | CAT | Audio | TX |\n|---|---|---|---|---|---|\n",
+    );
+    for rig in &rigs {
+        let names = rig
+            .config_names
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            rig.display_name(),
+            names,
+            rig.hamlib_id,
+            rig.cat.label(),
+            rig.audio.label(),
+            rig.tx.label()
+        ));
+    }
+
+    out.push_str(
+        "\n## What the columns mean\n\n\
+         - CAT: Pancetta reads and sets frequency and split, and keys PTT, through `rigctld`. Pancetta does not set the rig mode.\n\
+         - Audio: Pancetta decodes from and transmits into the rig's USB sound device, which you pick as input and output in `pancetta setup`. Pancetta has no rig-specific audio code.\n\
+         - TX: Pancetta keys the rig and sends FT8 on air.\n\
+         - Tested: used on a real station with this rig, as recorded in the README [Capability status](../README.md#capability-status) table.\n\
+         - Untested: this repository records no hardware test of this rig.\n\
+         - Hamlib model: the number Pancetta passes to `rigctld -m`. `rigctl -l` lists the models your installed Hamlib knows; an older Hamlib may lack a newer rig.\n",
+    );
+
+    let records: Vec<String> = rigs
+        .iter()
+        .filter_map(|r| r.evidence.map(|e| format!("- {}: {e}\n", r.display_name())))
+        .collect();
+    if !records.is_empty() {
+        out.push_str("\n## Test records\n\n");
+        for record in records {
+            out.push_str(&record);
+        }
+    }
+
+    out.push_str(
+        "\n## Remote operation\n\n\
+         The station agent uses the same rig connection and the same audio devices as local operation, so a rig's row also applies to remote use.\n\
+         No remote session on a real rig is recorded. Remote operation is integration-tested only.\n\
+         \n## Rigs not in this list\n\n\
+         If a `rigctld` is already listening on `RIGCTLD_HOST`:`RIGCTLD_PORT` (default `127.0.0.1:4532`), Pancetta connects to it and does not start its own.\n\
+         To use another rig Hamlib supports, start `rigctld -m <model> -r <port>` yourself before Pancetta.\n\
+         `pancetta doctor` still reports a `rig.model` that is not in this list as unknown.\n\
+         \nSWR readings, attenuator steps and preamp steps differ between rigs. Pancetta reads them from `rigctld` when it connects, so this page does not list them.\n",
+    );
+    out
 }
 
 #[cfg(test)]
@@ -518,14 +688,6 @@ mod tests {
     // not numeric hamlib constants.
 
     #[test]
-    fn test_rig_model_registry() {
-        let registry = RigModelRegistry::new();
-        assert!(registry.get_model("ic7300").is_some());
-        assert!(registry.get_model("ft991a").is_some());
-        assert!(registry.get_model("nonexistent").is_none());
-    }
-
-    #[test]
     fn test_rig_capabilities() {
         let ft991a = RigModelType::YaesuFT991A;
         let caps = ft991a.capabilities();
@@ -533,5 +695,172 @@ mod tests {
         assert!(caps.has_scanning);
         assert!(caps.modes.contains(&Mode::USB));
         // Remove this line since we simplified the mode list
+    }
+
+    /// Upstream Hamlib model numbers, hand-copied from
+    /// https://github.com/Hamlib/Hamlib/blob/master/include/hamlib/riglist.h
+    /// (master, checked 2026-11-08). The `RIG_MODEL_*` define is named per row.
+    /// A new `SUPPORTED_RIGS` entry fails this test until its author checks
+    /// the upstream number and pins it here.
+    const UPSTREAM_RIGLIST: &[(&str, u32, &str)] = &[
+        ("IC-7300", 3073, "RIG_MODEL_IC7300"),
+        ("IC-705", 3085, "RIG_MODEL_IC705"),
+        ("IC-7610", 3078, "RIG_MODEL_IC7610"),
+        ("IC-7851", 3075, "RIG_MODEL_IC785x"),
+        ("IC-9700", 3081, "RIG_MODEL_IC9700"),
+        ("TS-590S", 2031, "RIG_MODEL_TS590S"),
+        ("TS-590SG", 2037, "RIG_MODEL_TS590SG"),
+        ("TS-890S", 2041, "RIG_MODEL_TS890S"),
+        ("FT-710", 1049, "RIG_MODEL_FT710"),
+        ("FT-817", 1020, "RIG_MODEL_FT817"),
+        ("FT-857", 1022, "RIG_MODEL_FT857"),
+        ("FT-891", 1036, "RIG_MODEL_FT891"),
+        ("FT-991", 1035, "RIG_MODEL_FT991"),
+        ("FTdx10", 1042, "RIG_MODEL_FTDX10"),
+        ("FTdx101D", 1040, "RIG_MODEL_FTDX101D"),
+        ("FTdx101MP", 1044, "RIG_MODEL_FTDX101MP"),
+    ];
+
+    #[test]
+    fn hamlib_ids_match_upstream_riglist() {
+        for rig in SUPPORTED_RIGS {
+            let pinned = UPSTREAM_RIGLIST
+                .iter()
+                .find(|(model, _, _)| *model == rig.model)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} has no pinned upstream number: check Hamlib riglist.h and add it \
+                         to UPSTREAM_RIGLIST",
+                        rig.model
+                    )
+                });
+            assert_eq!(
+                rig.hamlib_id, pinned.1,
+                "{} must use {} = {}",
+                rig.model, pinned.2, pinned.1
+            );
+        }
+        assert_eq!(
+            SUPPORTED_RIGS.len(),
+            UPSTREAM_RIGLIST.len(),
+            "UPSTREAM_RIGLIST pins a rig that SUPPORTED_RIGS no longer lists"
+        );
+    }
+
+    #[test]
+    fn todays_model_names_still_resolve() {
+        // Every normalized name `hamlib_model_id` accepted before PAN-271.
+        for name in [
+            "ftdx10",
+            "ftdx101d",
+            "ftdx101mp",
+            "ft991",
+            "ft991a",
+            "ft710",
+            "ft891",
+            "ft857",
+            "ft857d",
+            "ft817",
+            "ft817nd",
+            "ic7300",
+            "ic7610",
+            "ic7851",
+            "ic705",
+            "ic9700",
+            "ts890",
+            "ts890s",
+            "ts590",
+            "ts590s",
+            "ts590sg",
+        ] {
+            assert!(find_supported_rig(name).is_some(), "{name} must resolve");
+        }
+        assert_eq!(
+            find_supported_rig("IC-7300").map(|r| r.hamlib_id),
+            Some(3073)
+        );
+        assert_eq!(
+            find_supported_rig("FT-DX10").map(|r| r.hamlib_id),
+            Some(1042)
+        );
+        assert_eq!(
+            find_supported_rig("ts 590 sg").map(|r| r.hamlib_id),
+            Some(2037)
+        );
+    }
+
+    #[test]
+    fn config_names_are_unique_after_normalization() {
+        let mut seen = std::collections::HashSet::new();
+        for rig in SUPPORTED_RIGS {
+            assert!(
+                !rig.config_names.is_empty(),
+                "{} has no config name",
+                rig.model
+            );
+            for name in rig.config_names {
+                let normalized = normalize_rig_model(name);
+                assert!(
+                    !normalized.is_empty(),
+                    "{} has an empty config name",
+                    rig.model
+                );
+                assert!(
+                    seen.insert(normalized.clone()),
+                    "config name {name:?} ({normalized}) is listed twice"
+                );
+            }
+        }
+        for name in ["Generic", "", "K3S", " - "] {
+            assert!(
+                find_supported_rig(name).is_none(),
+                "{name:?} must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn tested_requires_evidence() {
+        for rig in SUPPORTED_RIGS {
+            assert_eq!(
+                rig.has_any_test(),
+                rig.evidence.is_some(),
+                "{}: a Tested capability needs evidence, and evidence needs a Tested capability",
+                rig.model
+            );
+        }
+    }
+
+    /// Drift guard, same pattern as `keybindings_doc_is_current` in
+    /// pancetta-tui/src/keymap.rs: a rig table change without a regenerated
+    /// page fails a test, not a human review.
+    #[test]
+    fn supported_rigs_doc_is_current() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/SUPPORTED_RIGS.md");
+        let expected = render_supported_rigs_markdown();
+        if std::env::var("PANCETTA_REGEN_DOCS").is_ok() {
+            std::fs::write(path, &expected).expect("write docs/SUPPORTED_RIGS.md");
+            return;
+        }
+        let actual = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "docs/SUPPORTED_RIGS.md is stale. Regenerate with:\n  \
+             PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current"
+        );
+    }
+
+    #[test]
+    fn lead_rigs_render_first() {
+        let page = render_supported_rigs_markdown();
+        let rows: Vec<&str> = page
+            .lines()
+            .skip_while(|l| !l.starts_with("|---"))
+            .skip(1)
+            .take_while(|l| l.starts_with('|'))
+            .collect();
+        assert_eq!(rows.len(), SUPPORTED_RIGS.len());
+        assert!(rows[0].starts_with("| Icom IC-7300 |"), "{}", rows[0]);
+        assert!(rows[1].starts_with("| Icom IC-705 |"), "{}", rows[1]);
     }
 }
