@@ -2121,12 +2121,7 @@ impl QsoManager {
             // Recently completed, on the same band? (`completed_at` lives in
             // QsoState::Completed { .. }.)
             if let QsoState::Completed { completed_at, .. } = &p.state {
-                let completed_band = crate::utils::frequency_to_band(
-                    p.metadata
-                        .completed_rf_frequency_hz
-                        .unwrap_or(p.metadata.frequency),
-                );
-                return completed_band == want_band
+                return Self::completed_band(p) == want_band
                     && now.signed_duration_since(*completed_at).num_seconds() <= window_secs;
             }
             false
@@ -4376,25 +4371,150 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> ManualCallOutcome {
+        self.resend_existing_where(
+            qso_id,
+            |_| true,
+            Self::last_sent_frame,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+    }
+
+    /// [`Self::resend_existing_if_permitted`], refusing with `NothingToResend`
+    /// when `eligible` rejects the QSO or `frame` builds nothing to send.
+    /// `eligible`, `frame`, the permission check and the charge share one
+    /// `qsos` write guard (PAN-138, PAN-275).
+    async fn resend_existing_where(
+        &self,
+        qso_id: QsoId,
+        eligible: impl FnOnce(&QsoProgress) -> bool,
+        frame: impl FnOnce(&QsoProgress) -> Option<MessageType>,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> ManualCallOutcome {
         let now = Utc::now();
         let (message, frequency, attempt_id) = {
             let mut qsos = self.qsos.write().await;
             let Some(progress) = qsos.get_mut(&qso_id) else {
                 return ManualCallOutcome::NothingToResend;
             };
+            if !eligible(progress) {
+                return ManualCallOutcome::NothingToResend;
+            }
             if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
                 return ManualCallOutcome::NotPermitted;
             }
             progress.metadata.remote_origin = remote_origin;
             progress.metadata.remote_client_key_id = remote_client_key_id;
-            match self.charge_resend_locked(qso_id, progress, now) {
-                Some(emit) => emit,
-                None => return ManualCallOutcome::NothingToResend,
-            }
+            let Some(message) = frame(progress) else {
+                return ManualCallOutcome::NothingToResend;
+            };
+            self.charge_frame_locked(qso_id, progress, now, message)
         };
         self.send_attempt_message(qso_id, message, frequency, attempt_id)
             .await;
         ManualCallOutcome::Resent
+    }
+
+    /// PAN-275: send a 73 for a COMPLETED manual QSO by id, for the
+    /// coordinator's bounded auto-73. It never opens a QSO, never changes a
+    /// state and never emits `QsoCompleted`, however long ago the QSO completed.
+    /// It builds the 73 rather than replaying the QSO's last sent frame: a QSO
+    /// that completed on a plain incoming 73 sent none, so its last sent frame
+    /// is a report or the opening call (Codex P2 on PR #588).
+    /// Returns `NothingToResend` unless the QSO exists, is `Completed`, was
+    /// `Manual`, is not a Hound, and completed on the band that `frequency` (the
+    /// decode's audio offset) maps to now. Like
+    /// `resend_existing_if_permitted`, except for the frame it sends, the
+    /// eligibility check, the remote permission re-check, the identity rebind
+    /// and the charge share one `qsos` write guard.
+    pub async fn resend_completed_close(
+        &self,
+        qso_id: QsoId,
+        frequency: f64,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> ManualCallOutcome {
+        let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
+        self.resend_existing_where(
+            qso_id,
+            |p| Self::completed_close_rekeyable(p, &want_band),
+            |p| self.closing_73_frame(p),
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+    }
+
+    /// Read-only preview of [`Self::resend_completed_close`]'s eligibility
+    /// rule (it does not check remote permission).
+    /// The coordinator asks it before registering the QSO's TX liveness, so
+    /// a re-key the engine is certain to refuse (another band, not a
+    /// completed manual QSO) never keeps the QSO live for the TX worker.
+    /// `resend_completed_close` re-checks under its own write guard.
+    pub async fn completed_close_rekeyable_now(&self, qso_id: QsoId, frequency: f64) -> bool {
+        let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
+        self.qsos
+            .read()
+            .await
+            .get(&qso_id)
+            .is_some_and(|p| Self::completed_close_rekeyable(p, &want_band))
+    }
+
+    /// The 73 [`Self::resend_completed_close`] sends: our callsign to the
+    /// QSO's station, addressed like the exchange's own 73 (the state's call,
+    /// not the logged call a C18 compound upgrade may have lengthened).
+    /// `None` when the QSO names no station.
+    fn closing_73_frame(&self, p: &QsoProgress) -> Option<MessageType> {
+        let their = p
+            .state
+            .their_callsign()
+            .or(p.metadata.their_callsign.as_deref())?;
+        Some(MessageType::SeventyThree {
+            to_station: their.to_string(),
+            from_station: self.config.our_callsign.clone(),
+        })
+    }
+
+    /// The PAN-275 rule: a COMPLETED, manual, non-Hound QSO worked on
+    /// `want_band`.
+    fn completed_close_rekeyable(p: &QsoProgress, want_band: &str) -> bool {
+        matches!(p.state, QsoState::Completed { .. })
+            && p.metadata.initiated_by == CallInitiation::Manual
+            && !p.metadata.hound
+            && Self::completed_band(p) == want_band
+    }
+
+    /// The band a COMPLETED QSO was worked on: its completion-time RF
+    /// frequency when stamped, else its stored `metadata.frequency` (PAN-25).
+    fn completed_band(p: &QsoProgress) -> String {
+        crate::utils::frequency_to_band(
+            p.metadata
+                .completed_rf_frequency_hz
+                .unwrap_or(p.metadata.frequency),
+        )
+    }
+
+    /// Test seam (PAN-275): move a completed QSO's completion time, and its
+    /// `end_time` when set, back by `by`, so tests in other crates can exercise
+    /// the windows measured from `completed_at` without sleeping. Returns `false`
+    /// and changes nothing unless the QSO exists and is `Completed`. Not part of
+    /// the supported API; hidden from rustdoc like `pancetta_qso::sim`.
+    #[doc(hidden)]
+    pub async fn backdate_completion_for_test(&self, qso_id: QsoId, by: chrono::Duration) -> bool {
+        let mut qsos = self.qsos.write().await;
+        let Some(progress) = qsos.get_mut(&qso_id) else {
+            return false;
+        };
+        let QsoState::Completed { completed_at, .. } = &mut progress.state else {
+            return false;
+        };
+        *completed_at -= by;
+        if let Some(end) = progress.metadata.end_time.as_mut() {
+            *end -= by;
+        }
+        true
     }
 
     /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
@@ -4890,13 +5010,28 @@ impl QsoManager {
         progress: &mut QsoProgress,
         now: DateTime<Utc>,
     ) -> Option<(MessageType, f64, TxAttemptId)> {
-        let message = progress
+        let message = Self::last_sent_frame(progress)?;
+        Some(self.charge_frame_locked(qso_id, progress, now, message))
+    }
+
+    /// The QSO's most recent `Sent` frame, if any.
+    fn last_sent_frame(progress: &QsoProgress) -> Option<MessageType> {
+        progress
             .messages
             .iter()
             .rev()
-            .find(|m| m.direction == MessageDirection::Sent)?
-            .message_type
-            .clone();
+            .find(|m| m.direction == MessageDirection::Sent)
+            .map(|m| m.message_type.clone())
+    }
+
+    /// [`Self::charge_resend_locked`]'s bookkeeping for a given `message`.
+    fn charge_frame_locked(
+        &self,
+        qso_id: QsoId,
+        progress: &mut QsoProgress,
+        now: DateTime<Utc>,
+        message: MessageType,
+    ) -> (MessageType, f64, TxAttemptId) {
         let frequency = progress.metadata.frequency;
         let prev_last_call_at = progress.metadata.last_call_at;
         progress.metadata.call_count += 1;
@@ -4921,7 +5056,7 @@ impl QsoManager {
                 remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
             },
         );
-        Some((message, frequency, attempt_id))
+        (message, frequency, attempt_id)
     }
 
     /// External commit point for PAN-72's stall-switch/revert and the manual
@@ -8034,11 +8169,7 @@ impl QsoManager {
                 qsos.get(&id).and_then(|p| match &p.state {
                     QsoState::Completed { completed_at, .. }
                         if p.metadata.initiated_by == CallInitiation::Manual
-                            && crate::utils::frequency_to_band(
-                                p.metadata
-                                    .completed_rf_frequency_hz
-                                    .unwrap_or(p.metadata.frequency),
-                            ) == want_band
+                            && Self::completed_band(p) == want_band
                             && now - *completed_at <= within =>
                     {
                         Some((id, *completed_at))
@@ -27980,6 +28111,408 @@ mod pan260 {
             .check_duplicate_at("K1ABC", 1800.0, now)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod pan275_completed_close_tests {
+    //! PAN-275: the coordinator's auto-73 re-keys a COMPLETED manual QSO by
+    //! id through `resend_completed_close`, however long ago it completed,
+    //! and never opens a second QSO or emits a second `QsoCompleted`.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::AtomicBool;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "DL1ABC";
+    const FREQ: f64 = 1500.0;
+
+    fn config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            ..Default::default()
+        }
+    }
+
+    fn manager() -> QsoManager {
+        QsoManager::new(config())
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn sends_for(events: &[QsoEvent], id: QsoId) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend {
+                    qso_id, message, ..
+                } if *qso_id == id => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count_sends(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::MessageToSend { .. }))
+            .count()
+    }
+
+    fn count_completed(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::QsoCompleted { .. }))
+            .count()
+    }
+
+    fn count_state_changes(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::StateChanged { .. }))
+            .count()
+    }
+
+    async fn complete_manual(
+        manager: &QsoManager,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> QsoId {
+        manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                ResponseStep::SeventyThree,
+                Some(-10.0),
+                Some(-12),
+                None,
+                remote_origin,
+                remote_client_key_id,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn call_count(manager: &QsoManager, id: QsoId) -> u32 {
+        manager.get_qso(id).await.unwrap().metadata.call_count
+    }
+
+    #[tokio::test]
+    async fn resend_completed_close_past_the_grace_rekeys_the_same_qso() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let id = complete_manual(&manager, false, None).await;
+        drain(&mut rx);
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let before = call_count(&manager, id).await;
+        assert!(manager.completed_close_rekeyable_now(id, FREQ).await);
+
+        let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::Resent);
+        let events = drain(&mut rx);
+        let sends = sends_for(&events, id);
+        assert_eq!(sends.len(), 1, "exactly one MessageToSend for the QSO");
+        assert!(
+            matches!(sends[0], MessageType::SeventyThree { .. }),
+            "the re-key carries the QSO's 73, got {:?}",
+            sends[0]
+        );
+        assert_eq!(count_sends(&events), 1, "no frame for any other QSO");
+        assert_eq!(count_completed(&events), 0, "no second QsoCompleted");
+        assert_eq!(count_state_changes(&events), 0, "no state change");
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+        assert_eq!(call_count(&manager, id).await, before + 1);
+
+        // Control: the operator path past the grace still opens a new QSO.
+        let (new_id, outcome) = manager
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                ResponseStep::SeventyThree,
+                Some(-10.0),
+                Some(-12),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, ManualCallOutcome::Opened);
+        assert_ne!(new_id, id);
+    }
+
+    /// Codex P2 on PR #588: a QSO that completed on a plain incoming 73 sent
+    /// no 73, so its last sent frame is a report. The re-key past the grace
+    /// still sends a 73 to the QSO's station, not that report.
+    #[tokio::test]
+    async fn resend_completed_close_sends_a_73_when_the_last_sent_frame_is_a_report() {
+        let manager = manager();
+        let id = complete_manual(&manager, false, None).await;
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&id).unwrap();
+            progress
+                .messages
+                .retain(|m| m.direction != MessageDirection::Sent);
+            progress.messages.push(QsoMessage {
+                timestamp: Utc::now(),
+                direction: MessageDirection::Sent,
+                message_type: MessageType::ReportAck {
+                    to_station: DX.into(),
+                    from_station: OUR.into(),
+                    report: -10,
+                },
+                raw_text: format!("{DX} {OUR} R-10"),
+                signal_strength: None,
+                frequency: FREQ,
+            });
+        }
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let mut rx = manager.subscribe();
+
+        let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::Resent);
+        let sends = sends_for(&drain(&mut rx), id);
+        assert_eq!(
+            sends,
+            vec![MessageType::SeventyThree {
+                to_station: DX.into(),
+                from_station: OUR.into(),
+            }],
+            "the auto-73 re-key sends a 73, never the last sent report"
+        );
+    }
+
+    /// The re-key addresses its 73 like the exchange's own 73: to the state's
+    /// call, not to the logged call a C18 compound upgrade lengthened.
+    #[tokio::test]
+    async fn resend_completed_close_addresses_the_73_to_the_worked_call() {
+        let manager = manager();
+        let id = complete_manual(&manager, false, None).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .their_callsign = Some(format!("EA8/{DX}"));
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let mut rx = manager.subscribe();
+
+        let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::Resent);
+        assert_eq!(
+            sends_for(&drain(&mut rx), id),
+            vec![MessageType::SeventyThree {
+                to_station: DX.into(),
+                from_station: OUR.into(),
+            }]
+        );
+    }
+
+    async fn assert_refused(manager: &QsoManager, id: QsoId, freq: f64) {
+        let mut rx = manager.subscribe();
+        let before = manager
+            .get_qso(id)
+            .await
+            .ok()
+            .map(|p| p.metadata.call_count);
+        assert!(
+            !manager.completed_close_rekeyable_now(id, freq).await,
+            "the read-only preview agrees with the refusal"
+        );
+        let outcome = manager.resend_completed_close(id, freq, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::NothingToResend);
+        let events = drain(&mut rx);
+        assert_eq!(count_sends(&events), 0, "a refused re-key emits nothing");
+        assert_eq!(count_completed(&events), 0);
+        let after = manager
+            .get_qso(id)
+            .await
+            .ok()
+            .map(|p| p.metadata.call_count);
+        assert_eq!(before, after, "a refused re-key charges nothing");
+    }
+
+    #[tokio::test]
+    async fn resend_completed_close_refuses_what_it_must_not_rekey() {
+        // An unknown id.
+        let manager = manager();
+        assert_refused(&manager, Uuid::new_v4(), FREQ).await;
+
+        // An ACTIVE manual QSO.
+        let manager = self::manager();
+        let active = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        assert!(manager.get_qso(active).await.unwrap().state.is_active());
+        assert_refused(&manager, active, FREQ).await;
+
+        // A completed AUTONOMOUS QSO.
+        let manager = self::manager();
+        let id = complete_manual(&manager, false, None).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .initiated_by = CallInitiation::Auto;
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        assert_refused(&manager, id, FREQ).await;
+
+        // A completed Hound QSO.
+        let manager = self::manager();
+        let id = complete_manual(&manager, false, None).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .hound = true;
+        assert_refused(&manager, id, FREQ).await;
+
+        // A completed QSO on ANOTHER band than the dial maps to now.
+        let dial = Arc::new(AtomicU64::new(14_074_000));
+        let mut manager = self::manager();
+        manager.set_dial_frequency_source(Arc::clone(&dial));
+        let id = complete_manual(&manager, false, None).await;
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        dial.store(7_074_000, Ordering::Relaxed);
+        assert_refused(&manager, id, FREQ).await;
+        // Same QSO, back on its own band: it re-keys.
+        dial.store(14_074_000, Ordering::Relaxed);
+        assert_eq!(
+            manager.resend_completed_close(id, FREQ, false, None).await,
+            ManualCallOutcome::Resent
+        );
+    }
+
+    #[tokio::test]
+    async fn resend_completed_close_denied_remote_client_charges_nothing() {
+        let permits = Arc::new(AtomicBool::new(true));
+        let mut manager = manager();
+        let p = Arc::clone(&permits);
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| p.load(Ordering::SeqCst)));
+        let id = complete_manual(&manager, true, Some("client-a".into())).await;
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let before = call_count(&manager, id).await;
+        permits.store(false, Ordering::SeqCst);
+        let mut rx = manager.subscribe();
+
+        let outcome = manager
+            .resend_completed_close(id, FREQ, true, Some("client-a".into()))
+            .await;
+        assert_eq!(outcome, ManualCallOutcome::NotPermitted);
+        let events = drain(&mut rx);
+        assert_eq!(count_sends(&events), 0);
+        assert_eq!(call_count(&manager, id).await, before);
+        assert_eq!(
+            manager
+                .get_qso(id)
+                .await
+                .unwrap()
+                .metadata
+                .remote_client_key_id
+                .as_deref(),
+            Some("client-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn backdate_completion_for_test_moves_only_completed_qsos() {
+        let manager = manager();
+        assert!(
+            !manager
+                .backdate_completion_for_test(Uuid::new_v4(), Duration::seconds(60))
+                .await
+        );
+
+        let other = self::manager();
+        let active = other
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let before = other.get_qso(active).await.unwrap();
+        assert!(
+            !other
+                .backdate_completion_for_test(active, Duration::seconds(60))
+                .await
+        );
+        let after = other.get_qso(active).await.unwrap();
+        assert_eq!(format!("{:?}", before.state), format!("{:?}", after.state));
+
+        let id = complete_manual(&manager, false, None).await;
+        let completed_at = |p: QsoProgress| match p.state {
+            QsoState::Completed { completed_at, .. } => completed_at,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        let original = completed_at(manager.get_qso(id).await.unwrap());
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
+                .await,
+            Some(id)
+        );
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let moved = completed_at(manager.get_qso(id).await.unwrap());
+        assert_eq!(original - moved, Duration::seconds(60));
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
+                .await,
+            None
+        );
     }
 }
 

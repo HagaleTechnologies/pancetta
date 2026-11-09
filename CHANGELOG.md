@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-275: When a station repeats RR73 more than 45 s after a manual QSO completed, but inside the 3-minute auto-73 window, Pancetta re-sends 73 for the existing QSO. It no longer logs a second contact in `qsos.adi`, the QSO database, logbook uploads or the WSJT-X relay, and the limit of three automatic 73 re-sends holds. Automatic caller answering no longer opens a new QSO for such an RR73 either.
 - PAN-289: A manual call queued for the other window now expires after 10 minutes of real time, including time the computer spent asleep. Before, a call queued just before a sleep could be keyed right after wake. An expired call is also discarded when a QSO finishes, not only by the 15-second check.
 - PAN-278: When Hamlib's command queue drops the key-down, the frame is now reported as not sent and its audio is not played, so the QSO engine retries it instead of counting it as aired. A tune in that state is abandoned. `--replay` and builds without `pancetta-hamlib` are unchanged.
 - PAN-273: The transmitter now retries its PTT-off at the end of every transmission (normal, multi-stream, tune, clock-step guard and supersede) when Hamlib's queue is momentarily full, and keeps its fallback unkey armed until one is queued. The transmitter's next transmission waits for that fallback unkey first, so it cannot cut the new transmission short. Before, a dropped PTT-off was treated as sent and the rig stayed keyed until Hamlib's 14 s watchdog.
