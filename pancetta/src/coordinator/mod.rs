@@ -1177,9 +1177,9 @@ pub struct ApplicationCoordinator {
     /// Defaults to `true` (i.e. un-gated by this mechanism) so replay
     /// mode -- where `start_hamlib_component` never runs at all and no
     /// transmitter is under control -- is never gated by a flag nothing
-    /// would ever set (PAN-331 removed the `pancetta-hamlib` feature). `start_hamlib_component`
-    /// resets this to `false` at the very start of every call (first boot
-    /// AND every restart) and only sets it back to `true` once the
+    /// would ever set (rig control is always compiled in since PAN-331).
+    /// `start_hamlib_component` resets this to `false` at the very start
+    /// of every call (first boot AND every restart) and only sets it back to `true` once the
     /// message loop genuinely confirms readiness (or, on the mock/
     /// disabled-rig path, immediately -- that path's connect/PTT/
     /// frequency-read sequence and message-loop start are local and fast

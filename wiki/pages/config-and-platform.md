@@ -108,3 +108,16 @@ keeps the generic FLAT LINE advice; zero captured samples remain a capture error
 macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
+
+Cargo feature gotcha (PAN-331): workspace builds turn on
+`pancetta-ft8/transmit` for every crate (feature unification, from the
+`--features transmit` command line or a dependent's manifest), so a break in
+pancetta-ft8's default build is invisible to `cargo check --workspace`. Check
+`cargo check -p pancetta-ft8 --all-targets` on its own; `scripts/check.sh` and
+CI's ft8-tests job do. The encoder and modulator are in every pancetta-ft8
+build and `transmit` gates only `transmit.rs`; do not feature-gate a module
+the decoder calls, because a gated callee forces a cfg at every caller. The
+`pancetta` crate has no `pancetta-hamlib` feature any more, and CI checks
+`cargo check -p pancetta --no-default-features`. See
+[config-and-platform decisions](../../docs/DECISIONS/config-and-platform.md).
+

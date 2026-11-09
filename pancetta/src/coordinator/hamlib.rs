@@ -3592,8 +3592,8 @@ pub struct HamlibReconnectRequest {
 ///
 /// This defers to the same recognized-model table `start_hamlib_component`
 /// itself uses ([`ApplicationCoordinator::hamlib_model_id`]), so the two
-/// can never silently disagree. (PAN-331 removed the `pancetta-hamlib`
-/// feature, so rig control is always compiled in.)
+/// can never silently disagree. (Rig control is always compiled in since
+/// PAN-331.)
 pub(crate) fn model_recognized(model: &str) -> bool {
     super::ApplicationCoordinator::hamlib_model_id(model).is_some()
 }
