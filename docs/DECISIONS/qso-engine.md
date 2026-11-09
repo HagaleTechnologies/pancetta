@@ -146,3 +146,11 @@ Tests: the predicate's full semantic matrix in `coordinator::mod.rs` (`coordinat
 Autonomous admission uses the configured rolling start-time window and normalized callsign plus band. `check_frequency = false` retains callsign-only matching across bands. Completed memory records use captured RF rather than today's dial or the mutable audio offset. Production attaches the prepared ADIF-derived index to the existing manager, preserving its subscriptions. Missing or failed required history refuses automatic calls; manual calls bypass this gate.
 
 Live and replay seed dated callsign and DXCC history for every band before readiness. The worked-before display and score remain all-time checks. Replay retains an in-memory index built from read-only ADIF input. A failed refresh preserves the last successful cache and emits a diagnostics warning.
+
+## PAN-296: Watchdog recovery after a wall-clock step
+
+Before each production watchdog pass, `ClockStepDetector` compares UTC progress with monotonic elapsed time. A divergence of at least 250 ms in either direction grants every active QSO fresh state and first-call timeout budgets in the new UTC frame. Ordinary delays with matching clock progress still expire overdue contacts. Repeated steps replace the grace anchors.
+
+These private anchors are shared across manager clones. A state variant or start-time change discards state grace; first-call grace survives state advances until its original first-call identity changes. New contacts use their own timestamps. Historical state starts, first-call timestamps and timelines remain untouched. Explicit-time watchdog callers consume existing anchors without sampling real clocks.
+
+Recovery precedes rearming, which still precedes retirement. Call-count caps, unresolved-attempt guards, progress reprieves and unencodable-message failures retain their existing behavior. Rearm cadence, TX scheduling and ledger retention are unchanged.

@@ -1692,6 +1692,21 @@ impl TxRelocationEpochs {
     }
 }
 
+// Historical UTC timestamps remain untouched. A state identity includes its
+// variant as well as its original start, so transitions discard only state grace.
+type WatchdogStateIdentity = (std::mem::Discriminant<QsoState>, DateTime<Utc>);
+
+struct WatchdogAnchors {
+    state: Option<(WatchdogStateIdentity, DateTime<Utc>)>,
+    first_call: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+fn watchdog_state_identity(state: &QsoState, now: DateTime<Utc>) -> Option<WatchdogStateIdentity> {
+    state
+        .state_duration(now)
+        .map(|age| (std::mem::discriminant(state), now - age))
+}
+
 /// QSO manager implementation
 pub struct QsoManager {
     /// Configuration
@@ -1699,6 +1714,9 @@ pub struct QsoManager {
 
     /// Active QSOs by ID
     qsos: Arc<RwLock<HashMap<QsoId, QsoProgress>>>,
+    /// PAN-296: timeout-only anchors, shared with the production loop's clone.
+    /// Lock order is qsos, then watchdog_anchors. Never hold this across await.
+    watchdog_anchors: Arc<std::sync::Mutex<HashMap<QsoId, WatchdogAnchors>>>,
 
     /// PAN-75 accounting only. Lock after `qsos`, never across an await.
     keep_call_ledger: Arc<std::sync::Mutex<HashMap<QsoId, KeepCallLedger>>>,
@@ -2250,6 +2268,7 @@ impl QsoManager {
         Self {
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
+            watchdog_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             keep_call_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_completions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_reverted_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -8962,22 +8981,19 @@ impl QsoManager {
     }
 
     async fn timeout_check_loop(&self) {
-        let mut interval_timer = interval(TokioDuration::from_secs(5)); // Check every 5 seconds
-
+        let mut detector = pancetta_core::slot_clock::ClockStepDetector::new(Utc::now());
+        let mut last_mono = std::time::Instant::now();
+        let mut interval_timer = interval(TokioDuration::from_secs(5));
         loop {
             interval_timer.tick().await;
-            // Re-arm manual keep-calling BEFORE the watchdog so a re-call
-            // that pushes the count to the cap is still counted, then the
-            // watchdog can retire it on the same or next tick.
-            self.rearm_manual_calls().await;
-            self.check_timeouts().await;
+            self.watchdog_pass_at(
+                Utc::now(),
+                std::time::Instant::now(),
+                &mut detector,
+                &mut last_mono,
+            )
+            .await;
         }
-    }
-
-    /// Re-arm manual keep-calling at the current time. See
-    /// [`Self::rearm_manual_calls_at`].
-    async fn rearm_manual_calls(&self) {
-        self.rearm_manual_calls_at(Utc::now()).await;
     }
 
     /// For every manual-initiated QSO still in `CallingCq`, `WaitingForReport`,
@@ -9486,8 +9502,43 @@ impl QsoManager {
         }
     }
 
-    async fn check_timeouts(&self) {
-        self.check_timeouts_at(Utc::now()).await;
+    async fn watchdog_pass_at(
+        &self,
+        now: DateTime<Utc>,
+        mono_now: std::time::Instant,
+        detector: &mut pancetta_core::slot_clock::ClockStepDetector,
+        last_mono: &mut std::time::Instant,
+    ) {
+        let step = detector.observe(now, mono_now.duration_since(*last_mono));
+        *last_mono = mono_now;
+        if let Some(skew) = step {
+            let qsos = self.qsos.write().await;
+            let mut anchors = self
+                .watchdog_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            anchors.clear();
+            for (&id, progress) in qsos.iter().filter(|(_, p)| p.state.is_active()) {
+                anchors.insert(
+                    id,
+                    WatchdogAnchors {
+                        state: watchdog_state_identity(&progress.state, now)
+                            .map(|identity| (identity, now)),
+                        first_call: progress
+                            .metadata
+                            .first_call_at
+                            .map(|original| (original, now)),
+                    },
+                );
+            }
+            warn!(
+                skew_ms = skew.num_milliseconds(),
+                "Wall-clock step: reset active QSO watchdog budgets"
+            );
+        }
+        // Preserve rearm-before-retirement ordering and independent call caps.
+        self.rearm_manual_calls_at(now).await;
+        self.check_timeouts_at(now).await;
     }
 
     /// Watchdog pass at an explicit time (for testability).
@@ -9514,11 +9565,45 @@ impl QsoManager {
         };
         let mut qsos = self.qsos.write().await;
         let mut timeouts = Vec::new();
+        self.watchdog_anchors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| qsos.get(id).is_some_and(|p| p.state.is_active()));
 
         for (&qso_id, progress) in qsos.iter_mut() {
+<<<<<<< HEAD
             if reworking.contains(&qso_id) {
                 continue;
             }
+=======
+            let (state_age, first_call_age) = {
+                let mut anchors = self
+                    .watchdog_anchors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut state_age = progress.state.state_duration(now);
+                let mut first_call_age = progress.metadata.first_call_at.map(|at| now - at);
+                if let Some(anchor) = anchors.get_mut(&qso_id) {
+                    if anchor.state.as_ref().is_some_and(|(identity, _)| {
+                        Some(*identity) != watchdog_state_identity(&progress.state, now)
+                    }) {
+                        anchor.state = None;
+                    }
+                    if anchor.first_call.as_ref().is_some_and(|(original, _)| {
+                        Some(*original) != progress.metadata.first_call_at
+                    }) {
+                        anchor.first_call = None;
+                    }
+                    if let Some((_, effective)) = anchor.state {
+                        state_age = Some(now - effective);
+                    }
+                    if let Some((_, effective)) = anchor.first_call {
+                        first_call_age = Some(now - effective);
+                    }
+                }
+                (state_age, first_call_age)
+            };
+>>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
             let active_tx_state = matches!(
                 progress.state,
                 QsoState::CallingCq { .. }
@@ -9637,7 +9722,7 @@ impl QsoManager {
             // otherwise keep re-arming. A forward state advance resets the
             // state's `started_at`, so a healthy, progressing QSO never trips this.
             if active_tx_state {
-                if let Some(dur) = progress.state.state_duration(now) {
+                if let Some(dur) = state_age {
                     if dur.num_seconds() > self.config.timeouts.repetitive_tx_timeout_secs as i64 {
                         timeouts.push((qso_id, QsoFailureReason::Timeout));
                         continue;
@@ -9668,11 +9753,7 @@ impl QsoManager {
                 let max_calls = self.config.timeouts.manual_call_max_calls;
                 let watchdog =
                     Duration::minutes(self.config.timeouts.manual_call_watchdog_minutes as i64);
-                let elapsed = progress
-                    .metadata
-                    .first_call_at
-                    .map(|t| now - t)
-                    .unwrap_or_else(Duration::zero);
+                let elapsed = first_call_age.unwrap_or_else(Duration::zero);
 
                 // C3 race guard: if this QSO made a forward state advance in the
                 // current watchdog cycle (the DX just answered), grant a
@@ -9739,7 +9820,7 @@ impl QsoManager {
                 continue;
             }
 
-            if let Some(duration) = progress.state.state_duration(now) {
+            if let Some(duration) = state_age {
                 let timeout_seconds = match &progress.state {
                     QsoState::CallingCq { .. } => self.config.timeouts.cq_timeout,
                     QsoState::WaitingForReport { .. } => self.config.timeouts.report_timeout,
@@ -9775,6 +9856,10 @@ impl QsoManager {
 
         for (qso_id, reason) in timeouts {
             if let Some(mut progress) = qsos.remove(&qso_id) {
+                self.watchdog_anchors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&qso_id);
                 let old_state = progress.state.clone();
                 progress.state = QsoState::Failed {
                     reason: reason.clone(),
@@ -9828,6 +9913,7 @@ impl Clone for QsoManager {
         Self {
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
+            watchdog_anchors: Arc::clone(&self.watchdog_anchors),
             keep_call_ledger: Arc::clone(&self.keep_call_ledger),
             pending_completions: Arc::clone(&self.pending_completions),
             completion_reverted_at: Arc::clone(&self.completion_reverted_at),
@@ -28666,6 +28752,7 @@ mod pan260 {
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 mod pending_completion_tests {
     //! PAN-280: a completion that queues a closing frame emits `QsoCompleted`
     //! only when that frame airs; a frame that never airs reverts it.
@@ -29175,4 +29262,369 @@ mod pending_completion_tests {
             assert_eq!(completions(&drain(&mut rx)), 0);
         }
     }
+=======
+mod pan296_watchdog_tests {
+    use super::*;
+    use pancetta_core::slot_clock::ClockStepDetector;
+    use std::time::{Duration as StdDuration, Instant};
+
+    fn manager() -> QsoManager {
+        QsoManager::new(QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            our_grid: Some("FN42".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            contest_scoring: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        })
+    }
+
+    async fn open(manager: &QsoManager, call: &str, at: DateTime<Utc>) -> QsoId {
+        let id = manager
+            .respond_to_cq(call.into(), 14074000.0, None)
+            .await
+            .unwrap();
+        let mut qsos = manager.qsos.write().await;
+        let qso = qsos.get_mut(&id).unwrap();
+        if let QsoState::RespondingToCq { started_at, .. } = &mut qso.state {
+            *started_at = at;
+        }
+        qso.metadata.first_call_at = Some(at);
+        qso.metadata.last_call_at = Some(at);
+        id
+    }
+
+    fn failures(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoFailureReason> {
+        let mut failures = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let QsoEvent::QsoFailed { reason, .. } = event {
+                failures.push(reason);
+            }
+        }
+        failures
+    }
+
+    #[tokio::test]
+    async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let base = Utc::now();
+        let mono = Instant::now();
+        let mut last = mono;
+        let mut detector = ClockStepDetector::new(base);
+        let mut ids = Vec::new();
+        for call in ["K1DEF", "K2DEF", "K3DEF"] {
+            ids.push(open(&manager, call, base).await);
+        }
+        for (wall, elapsed) in [(20, 20), (80, 20), (85, 25), (110, 50)] {
+            manager
+                .watchdog_pass_at(
+                    base + Duration::seconds(wall),
+                    mono + StdDuration::from_secs(elapsed),
+                    &mut detector,
+                    &mut last,
+                )
+                .await;
+            for id in &ids {
+                assert!(manager.get_qso(*id).await.is_ok(), "retired at {wall}");
+            }
+            assert!(failures(&mut rx).is_empty());
+        }
+        manager
+            .watchdog_pass_at(
+                base + Duration::seconds(111),
+                mono + StdDuration::from_secs(51),
+                &mut detector,
+                &mut last,
+            )
+            .await;
+        for id in ids {
+            assert!(manager.get_qso(id).await.is_err());
+        }
+        let reasons = failures(&mut rx);
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons
+            .iter()
+            .all(|reason| matches!(reason, QsoFailureReason::Timeout)));
+        assert!(manager.qsos_by_callsign.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backward_and_repeated_steps_reanchor_but_ordinary_delay_expires() {
+        let manager = manager();
+        let base = Utc::now();
+        let id = open(&manager, "K1DEF", base).await;
+        let mono = Instant::now();
+        let mut last = mono;
+        let mut detector = ClockStepDetector::new(base);
+        for (wall, elapsed) in [(20, 20), (-40, 20), (-10, 50), (90, 50), (120, 80)] {
+            manager
+                .watchdog_pass_at(
+                    base + Duration::seconds(wall),
+                    mono + StdDuration::from_secs(elapsed),
+                    &mut detector,
+                    &mut last,
+                )
+                .await;
+            assert!(manager.get_qso(id).await.is_ok());
+        }
+        manager
+            .watchdog_pass_at(
+                base + Duration::seconds(160),
+                mono + StdDuration::from_secs(120),
+                &mut detector,
+                &mut last,
+            )
+            .await;
+        assert!(manager.get_qso(id).await.is_err());
+    }
+    async fn recover(manager: &QsoManager, base: DateTime<Utc>) {
+        let mono = Instant::now();
+        let mut last = mono;
+        let mut detector = ClockStepDetector::new(base);
+        manager
+            .watchdog_pass_at(
+                base + Duration::seconds(80),
+                mono + StdDuration::from_secs(20),
+                &mut detector,
+                &mut last,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn repetitive_and_manual_watchdogs_keep_their_boundaries() {
+        for manual in [false, true] {
+            let mut manager = manager();
+            manager.config.timeouts.report_timeout = 1000;
+            manager.config.timeouts.repetitive_tx_timeout_secs = if manual { 1000 } else { 30 };
+            manager.config.timeouts.manual_call_watchdog_minutes = 1;
+            let base = Utc::now();
+            let id = open(&manager, "K1DEF", base).await;
+            if manual {
+                manager
+                    .qsos
+                    .write()
+                    .await
+                    .get_mut(&id)
+                    .unwrap()
+                    .metadata
+                    .initiated_by = CallInitiation::Manual;
+            }
+            recover(&manager, base).await;
+            assert!(manager.get_qso(id).await.is_ok());
+            let boundary = base + Duration::seconds(if manual { 140 } else { 110 });
+            manager
+                .check_timeouts_at(boundary - Duration::milliseconds(1))
+                .await;
+            assert!(manager.get_qso(id).await.is_ok());
+            manager.check_timeouts_at(boundary).await;
+            assert_eq!(manager.get_qso(id).await.is_ok(), !manual);
+            manager
+                .check_timeouts_at(boundary + Duration::seconds(1))
+                .await;
+            assert!(manager.get_qso(id).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_count_cap_and_unencodable_failures() {
+        for unencodable in [false, true] {
+            let manager = manager();
+            let mut rx = manager.subscribe();
+            let base = Utc::now();
+            let id = open(&manager, "K1DEF", base).await;
+            {
+                let mut qsos = manager.qsos.write().await;
+                let qso = qsos.get_mut(&id).unwrap();
+                qso.metadata.initiated_by = CallInitiation::Manual;
+                qso.metadata.call_count = manager.config.timeouts.manual_call_max_calls;
+                if unencodable {
+                    qso.metadata.their_callsign = Some("WAYTOOLONGCALLSIGN".into());
+                }
+            }
+            recover(&manager, base).await;
+            assert!(manager.get_qso(id).await.is_err());
+            let reasons = failures(&mut rx);
+            assert_eq!(reasons.len(), 1);
+            assert_eq!(
+                matches!(&reasons[0], QsoFailureReason::MessageUnencodable(_)),
+                unencodable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transitions_new_contacts_and_clones_use_the_right_anchors() {
+        let mut manager = manager();
+        manager.config.timeouts.repetitive_tx_timeout_secs = 1000;
+        manager.config.timeouts.manual_call_watchdog_minutes = 1;
+        let base = Utc::now();
+        let auto = open(&manager, "K1DEF", base).await;
+        let manual = open(&manager, "K2DEF", base).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&manual)
+            .unwrap()
+            .metadata
+            .initiated_by = CallInitiation::Manual;
+        let history = manager.get_qso(manual).await.unwrap().state_history;
+        let clone = manager.clone();
+        recover(&clone, base).await;
+        let original = manager.get_qso(manual).await.unwrap();
+        assert_eq!(original.metadata.first_call_at, Some(base));
+        assert_eq!(original.state.state_duration(base), Some(Duration::zero()));
+        assert_eq!(
+            format!("{:?}", original.state_history),
+            format!("{history:?}")
+        );
+        // A new state, including one with an unchanged started_at, invalidates
+        // the old state identity. First-call grace survives both transitions.
+        {
+            let mut qsos = manager.qsos.write().await;
+            for id in [auto, manual] {
+                qsos.get_mut(&id).unwrap().state = QsoState::WaitingForReport {
+                    their_callsign: if id == auto { "K1DEF" } else { "K2DEF" }.into(),
+                    started_at: base + Duration::seconds(100),
+                    frequency: 14074000.0,
+                    their_grid: None,
+                    our_report: -10,
+                };
+            }
+        }
+        let new = open(&manager, "K3DEF", base + Duration::seconds(100)).await;
+        manager
+            .check_timeouts_at(base + Duration::seconds(130))
+            .await;
+        for id in [auto, manual, new] {
+            assert!(manager.get_qso(id).await.is_ok());
+        }
+        clone.check_timeouts_at(base + Duration::seconds(131)).await;
+        assert!(manager.get_qso(auto).await.is_err());
+        assert!(manager.get_qso(new).await.is_err());
+        assert!(manager.get_qso(manual).await.is_ok());
+        clone.check_timeouts_at(base + Duration::seconds(140)).await;
+        assert!(
+            manager.get_qso(manual).await.is_err(),
+            "first-call recovery must persist across a state advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_variant_and_first_call_identity_changes_discard_grace() {
+        let manager = manager();
+        let base = Utc::now();
+        let id = open(&manager, "K1DEF", base).await;
+        recover(&manager, base).await;
+        manager.qsos.write().await.get_mut(&id).unwrap().state = QsoState::WaitingForReport {
+            their_callsign: "K1DEF".into(),
+            frequency: 14074000.0,
+            started_at: base,
+            their_grid: None,
+            our_report: -10,
+        };
+        manager
+            .check_timeouts_at(base + Duration::seconds(81))
+            .await;
+        assert!(
+            manager.get_qso(id).await.is_err(),
+            "variant change must invalidate grace even with the same start time"
+        );
+        assert!(manager.watchdog_anchors.lock().unwrap().is_empty());
+
+        let id = open(&manager, "K2DEF", base).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .initiated_by = CallInitiation::Manual;
+        recover(&manager, base).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .first_call_at = None;
+        manager
+            .check_timeouts_at(base + Duration::seconds(81))
+            .await;
+        assert!(
+            manager.get_qso(id).await.is_ok(),
+            "missing first call retains zero elapsed behavior"
+        );
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .first_call_at = Some(base - Duration::minutes(10));
+        manager
+            .check_timeouts_at(base + Duration::seconds(82))
+            .await;
+        assert!(
+            manager.get_qso(id).await.is_err(),
+            "new first-call identity uses its own timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn contacts_created_between_observations_receive_grace_and_same_state_restart_expires() {
+        let manager = manager();
+        let base = Utc::now();
+        let mono = Instant::now();
+        let mut last = mono;
+        let mut detector = ClockStepDetector::new(base);
+        manager
+            .watchdog_pass_at(
+                base + Duration::seconds(20),
+                mono + StdDuration::from_secs(20),
+                &mut detector,
+                &mut last,
+            )
+            .await;
+        let id = open(&manager, "K1DEF", base + Duration::seconds(25)).await;
+        manager
+            .watchdog_pass_at(
+                base + Duration::seconds(85),
+                mono + StdDuration::from_secs(25),
+                &mut detector,
+                &mut last,
+            )
+            .await;
+        assert!(manager.get_qso(id).await.is_ok());
+        assert_eq!(
+            manager
+                .get_qso(id)
+                .await
+                .unwrap()
+                .state
+                .state_duration(base + Duration::seconds(25)),
+            Some(Duration::zero())
+        );
+        if let QsoState::RespondingToCq { started_at, .. } =
+            &mut manager.qsos.write().await.get_mut(&id).unwrap().state
+        {
+            *started_at = base + Duration::seconds(40);
+        }
+        manager
+            .check_timeouts_at(base + Duration::seconds(86))
+            .await;
+        assert!(
+            manager.get_qso(id).await.is_err(),
+            "a changed start invalidates grace even in the same state variant"
+        );
+    }
+>>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
 }
