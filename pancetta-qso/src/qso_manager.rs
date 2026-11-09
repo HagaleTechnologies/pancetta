@@ -1506,6 +1506,18 @@ pub enum ScheduledTxSlot {
     DuplicateCountRemoved { stall_cycles: u32 },
 }
 
+/// PAN-280: a pending completion [`QsoManager`] reverted, announced after the
+/// caller's `qsos` guard drops.
+struct RevertedCompletion {
+    qso_id: QsoId,
+    to: RevertedTo,
+    old_state: QsoState,
+    new_state: QsoState,
+    metadata: QsoMetadata,
+    state_history: Vec<StateTransition>,
+    messages: Vec<QsoMessage>,
+}
+
 /// One QSO [`QsoManager`]'s locked supersede retired (PAN-280), announced
 /// after the caller's `qsos` guard drops.
 struct SupersededQso {
@@ -1550,6 +1562,86 @@ impl ManualCallOutcome {
             Self::NotPermitted | Self::NothingToResend => None,
         }
     }
+}
+
+/// PAN-280: how long a completion waits for its closing frame's TX outcome
+/// before it is treated as not aired: `max(6 slots, 30 s)` of the live slot
+/// length (FT8 90 s, FT4 45 s, FT2 30 s). The worst case from queue to
+/// `TxFrameSent`, computed from the TX worker's constants, is about 58 s on
+/// FT8.
+const PENDING_COMPLETION_EXPIRY_SLOTS: i64 = 6;
+const PENDING_COMPLETION_EXPIRY_FLOOR_MS: i64 = 30_000;
+
+/// PAN-280: what a pending completion puts back when its closing frame never
+/// airs.
+#[derive(Debug, Clone)]
+enum CompletionRestore {
+    /// Opened directly at the close: there is no earlier state, so the QSO
+    /// retires as `Failed { CloseNotAired }`.
+    RetireOpen,
+    /// Advanced an existing QSO: put back what the completion changed.
+    Revert {
+        state: QsoState,
+        reports: SignalReports,
+        end_time: Option<DateTime<Utc>>,
+        completed_rf_frequency_hz: Option<f64>,
+        /// The `Sent` record the completion appended: `(timestamp, raw_text)`.
+        sent_record: Option<(DateTime<Utc>, String)>,
+    },
+}
+
+/// PAN-280: a completion that queued a closing frame, held until the TX
+/// worker reports that frame aired. Kept in its own map, not on the PAN-75
+/// ledger entry, because the rearm prunes ledger entries of non-active QSOs
+/// and a pending completion's QSO is `Completed`.
+#[derive(Debug, Clone)]
+struct PendingCompletion {
+    /// The closing frame's attempt, plus each FIX B re-key charged while
+    /// pending. Any one airing commits; the last one reported not sent
+    /// reverts.
+    attempt_ids: Vec<TxAttemptId>,
+    raw_text: String,
+    frequency_hz: f64,
+    remote_origin: bool,
+    remote_client_key_id: Option<String>,
+    queued_at: DateTime<Utc>,
+    /// The `Completed` state this record created; commit and revert act only
+    /// while the QSO still holds exactly this state.
+    completed_state: QsoState,
+    restore: CompletionRestore,
+    /// The `QsoCompleted` payload, built at queue time exactly as before.
+    metadata: QsoMetadata,
+    state_history: Vec<StateTransition>,
+    messages: Vec<QsoMessage>,
+}
+
+/// PAN-280: what [`QsoManager::confirm_completion_aired`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionAired {
+    /// The held `QsoCompleted` was emitted.
+    Committed,
+    /// No pending completion matched this frame.
+    NotPending,
+}
+
+/// PAN-280: where a reverted completion left its QSO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertedTo {
+    /// An advanced QSO is back in its pre-close state.
+    Reopened,
+    /// A QSO opened at the close is `Failed { CloseNotAired }`.
+    Retired,
+}
+
+/// PAN-280: what [`QsoManager::resolve_unsent_completion`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsentCompletion {
+    /// No pending completion holds this attempt (or the report had no id).
+    NotPending,
+    /// The attempt was dropped from the pending set; another can still air.
+    StillPending,
+    /// The last pending attempt did not air; nothing was logged.
+    Reverted(RevertedTo),
 }
 
 /// The payload of a frame a TX pivot replaced (PAN-75). Text alone cannot
@@ -1610,6 +1702,15 @@ pub struct QsoManager {
 
     /// PAN-75 accounting only. Lock after `qsos`, never across an await.
     keep_call_ledger: Arc<std::sync::Mutex<HashMap<QsoId, KeepCallLedger>>>,
+
+    /// PAN-280: completions held until their closing frame airs. Lock after
+    /// `qsos`, never across an await, never together with `keep_call_ledger`.
+    pending_completions: Arc<std::sync::Mutex<HashMap<QsoId, PendingCompletion>>>,
+
+    /// PAN-280: when a QSO's pending completion was reverted to its pre-close
+    /// state. `check_timeouts_at` exempts it from every timeout for one
+    /// [`COMPLETED_QSO_REWORK_GRACE`]. Same lock rules as above.
+    completion_reverted_at: Arc<std::sync::Mutex<HashMap<QsoId, DateTime<Utc>>>>,
 
     /// PAN-183: allocates [`TxAttemptId`]s, shared across clones like the
     /// ledger so ids stay unique per process.
@@ -2150,6 +2251,8 @@ impl QsoManager {
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
             keep_call_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_completions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            completion_reverted_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
             attempt_id_counter: Arc::new(AtomicU64::new(0)),
             qsos_by_callsign: Arc::new(RwLock::new(HashMap::new())),
             event_sender,
@@ -3676,6 +3779,7 @@ impl QsoManager {
                 stored_metadata.completed_rf_frequency_hz = Some(rf_frequency);
             }
         }
+        let closing_text = raw_text.clone();
         let progress = QsoProgress {
             state: state.clone(),
             state_history: vec![],
@@ -3689,9 +3793,9 @@ impl QsoManager {
             }],
             metadata: stored_metadata,
         };
-        // Captured before the move into the map below so the
-        // QsoCompleted-on-open-at-close emit further down still has it
-        // (Layer 2 timeline persistence).
+        // Captured before the move into the map below so the held
+        // QsoCompleted for an open at the close still has it (Layer 2
+        // timeline persistence).
         let opening_state_history = progress.state_history.clone();
         let opening_messages = progress.messages.clone();
 
@@ -3727,7 +3831,29 @@ impl QsoManager {
             let superseded =
                 Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, Utc::now());
             qsos.insert(qso_id, progress);
-            (superseded, self.next_attempt_id())
+            let attempt_id = self.next_attempt_id();
+            // PAN-280: an open at the close holds its QsoCompleted until the
+            // 73 airs. Stored under the same guard as the insert and before
+            // the MessageToSend below, so its TX report always finds it.
+            if is_completed_open {
+                self.hold_completion(
+                    qso_id,
+                    PendingCompletion {
+                        attempt_ids: vec![attempt_id],
+                        raw_text: closing_text,
+                        frequency_hz: frequency,
+                        remote_origin,
+                        remote_client_key_id: remote_client_key_id.clone(),
+                        queued_at: now,
+                        completed_state: state.clone(),
+                        restore: CompletionRestore::RetireOpen,
+                        metadata,
+                        state_history: opening_state_history,
+                        messages: opening_messages,
+                    },
+                );
+            }
+            (superseded, attempt_id)
         };
         self.emit_superseded(&target, &new_band, superseded).await;
         self.add_callsign_mapping(&target, qso_id).await;
@@ -3759,17 +3885,9 @@ impl QsoManager {
             target, frequency, step, qso_id
         );
 
-        // If we opened directly at the close, emit QsoCompleted so the logger
-        // records the QSO, with the RF-stamped metadata built above.
-        if is_completed_open {
-            self.emit_event(QsoEvent::QsoCompleted {
-                qso_id,
-                metadata,
-                state_history: opening_state_history,
-                messages: opening_messages,
-            })
-            .await;
-        }
+        // PAN-280: an open at the close no longer logs here. Its QsoCompleted,
+        // with the RF-stamped metadata built above, is held until the 73's
+        // `TxFrameSent` (`confirm_completion_aired`).
 
         Ok((qso_id, ManualCallOutcome::Opened(attempt_id)))
     }
@@ -4950,7 +5068,291 @@ impl QsoManager {
                 remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
             },
         );
+        // PAN-280: a FIX B re-key of a completion still waiting on its 73
+        // joins the pending set; whichever of them airs logs the QSO.
+        if let Some(pending) = self
+            .pending_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&qso_id)
+        {
+            pending.attempt_ids.push(attempt_id);
+        }
         Some((message, frequency, attempt_id))
+    }
+
+    /// PAN-280: store a completion that queued a closing frame. Called under
+    /// the caller's `qsos` write guard, before the frame's `MessageToSend`.
+    fn hold_completion(&self, qso_id: QsoId, pending: PendingCompletion) {
+        self.pending_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(qso_id, pending);
+    }
+
+    /// PAN-280: the TX worker reports a QSO frame aired (`TxFrameSent`). If
+    /// it is a pending completion's frame, emit the held `QsoCompleted` once.
+    /// With an attempt id only that id matches. A report without one matches
+    /// on text, offset and remote binding, and only for a frame that finished
+    /// airing after the completion was queued.
+    pub async fn confirm_completion_aired(
+        &self,
+        qso_id: QsoId,
+        attempt_id: Option<TxAttemptId>,
+        message_text: &str,
+        aired: &UnsentAttemptPayload,
+        aired_at: DateTime<Utc>,
+    ) -> CompletionAired {
+        let event = {
+            let qsos = self.qsos.read().await;
+            let mut pending = self
+                .pending_completions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(record) = pending.get(&qso_id) else {
+                return CompletionAired::NotPending;
+            };
+            let matches = match attempt_id {
+                Some(id) => record.attempt_ids.contains(&id),
+                None => {
+                    record.raw_text == message_text
+                        && aired_at >= record.queued_at
+                        && emission_carries(
+                            record.frequency_hz,
+                            record.remote_origin,
+                            &record.remote_client_key_id,
+                            aired,
+                        )
+                }
+            };
+            if !matches {
+                return CompletionAired::NotPending;
+            }
+            let Some(record) = pending.remove(&qso_id) else {
+                return CompletionAired::NotPending;
+            };
+            // Never log a QSO something else changed since the queue.
+            if !qsos
+                .get(&qso_id)
+                .is_some_and(|p| p.state == record.completed_state)
+            {
+                return CompletionAired::NotPending;
+            }
+            QsoEvent::QsoCompleted {
+                qso_id,
+                metadata: record.metadata,
+                state_history: record.state_history,
+                messages: record.messages,
+            }
+        };
+        self.emit_event(event).await;
+        CompletionAired::Committed
+    }
+
+    /// PAN-280: the TX worker reports a frame not sent (`TxFrameNotSent`).
+    /// Drops its attempt from the pending set and reverts the completion when
+    /// the set empties. A report without an id never reverts: text alone
+    /// cannot tell a pivot-replaced frame from the one that aired (PAN-75);
+    /// the expiry covers it.
+    pub async fn resolve_unsent_completion(
+        &self,
+        qso_id: QsoId,
+        attempt_id: Option<TxAttemptId>,
+    ) -> UnsentCompletion {
+        self.resolve_unsent_completion_at(qso_id, attempt_id, Utc::now())
+            .await
+    }
+
+    /// Deterministic-clock form of [`Self::resolve_unsent_completion`].
+    pub async fn resolve_unsent_completion_at(
+        &self,
+        qso_id: QsoId,
+        attempt_id: Option<TxAttemptId>,
+        now: DateTime<Utc>,
+    ) -> UnsentCompletion {
+        let Some(attempt_id) = attempt_id else {
+            return UnsentCompletion::NotPending;
+        };
+        let reverted = {
+            let mut qsos = self.qsos.write().await;
+            let record = {
+                let mut pending = self
+                    .pending_completions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(record) = pending.get_mut(&qso_id) else {
+                    return UnsentCompletion::NotPending;
+                };
+                let Some(pos) = record.attempt_ids.iter().position(|id| *id == attempt_id) else {
+                    return UnsentCompletion::NotPending;
+                };
+                record.attempt_ids.remove(pos);
+                if !record.attempt_ids.is_empty() {
+                    return UnsentCompletion::StillPending;
+                }
+                let Some(record) = pending.remove(&qso_id) else {
+                    return UnsentCompletion::NotPending;
+                };
+                record
+            };
+            self.revert_completion_locked(&mut qsos, qso_id, record, now)
+        };
+        let Some(reverted) = reverted else {
+            return UnsentCompletion::NotPending;
+        };
+        let to = reverted.to;
+        self.emit_reverted_completion(reverted).await;
+        UnsentCompletion::Reverted(to)
+    }
+
+    /// PAN-280: revert every pending completion whose closing frame has had
+    /// no TX outcome for [`PENDING_COMPLETION_EXPIRY_SLOTS`] slots (at least
+    /// [`PENDING_COMPLETION_EXPIRY_FLOOR_MS`]). Returns how many reverted.
+    pub async fn expire_pending_completions_at(&self, now: DateTime<Utc>) -> usize {
+        let expiry = Duration::milliseconds(
+            (PENDING_COMPLETION_EXPIRY_SLOTS * self.rearm_slot_millis())
+                .max(PENDING_COMPLETION_EXPIRY_FLOOR_MS),
+        );
+        let reverted: Vec<RevertedCompletion> = {
+            let mut qsos = self.qsos.write().await;
+            let expired: Vec<(QsoId, PendingCompletion)> = {
+                let mut pending = self
+                    .pending_completions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let ids: Vec<QsoId> = pending
+                    .iter()
+                    .filter(|(_, record)| now - record.queued_at >= expiry)
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| pending.remove(&id).map(|record| (id, record)))
+                    .collect()
+            };
+            expired
+                .into_iter()
+                .filter_map(|(id, record)| {
+                    self.revert_completion_locked(&mut qsos, id, record, now)
+                })
+                .collect()
+        };
+        let count = reverted.len();
+        for one in reverted {
+            warn!(
+                "QSO {}: no TX outcome for its closing frame before the pending completion expired; not logged",
+                one.qso_id
+            );
+            self.emit_reverted_completion(one).await;
+        }
+        count
+    }
+
+    /// PAN-280: undo a pending completion under the caller's `qsos` write
+    /// guard. Acts only while the QSO still holds the record's `Completed`
+    /// state. Returns the events to emit once the guard drops.
+    fn revert_completion_locked(
+        &self,
+        qsos: &mut HashMap<QsoId, QsoProgress>,
+        qso_id: QsoId,
+        record: PendingCompletion,
+        now: DateTime<Utc>,
+    ) -> Option<RevertedCompletion> {
+        let progress = qsos.get_mut(&qso_id)?;
+        if progress.state != record.completed_state {
+            return None;
+        }
+        match record.restore {
+            CompletionRestore::RetireOpen => {
+                let failed = QsoState::Failed {
+                    reason: QsoFailureReason::CloseNotAired,
+                    failed_at: now,
+                    last_state: Box::new(record.completed_state.clone()),
+                };
+                progress.state = failed.clone();
+                Some(RevertedCompletion {
+                    qso_id,
+                    to: RevertedTo::Retired,
+                    old_state: record.completed_state,
+                    new_state: failed,
+                    metadata: progress.metadata.clone(),
+                    state_history: progress.state_history.clone(),
+                    messages: progress.messages.clone(),
+                })
+            }
+            CompletionRestore::Revert {
+                state,
+                reports,
+                end_time,
+                completed_rf_frequency_hz,
+                sent_record,
+            } => {
+                progress.state = state.clone();
+                progress.metadata.reports = reports;
+                progress.metadata.end_time = end_time;
+                progress.metadata.completed_rf_frequency_hz = completed_rf_frequency_hz;
+                if let Some(index) = progress
+                    .state_history
+                    .iter()
+                    .rposition(|t| t.to_state == record.completed_state)
+                {
+                    progress.state_history.remove(index);
+                }
+                if let Some((timestamp, text)) = sent_record {
+                    if let Some(index) = progress.messages.iter().rposition(|m| {
+                        m.direction == MessageDirection::Sent
+                            && m.timestamp == timestamp
+                            && m.raw_text == text
+                    }) {
+                        progress.messages.remove(index);
+                    }
+                }
+                self.completion_reverted_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(qso_id, now);
+                Some(RevertedCompletion {
+                    qso_id,
+                    to: RevertedTo::Reopened,
+                    old_state: record.completed_state,
+                    new_state: state,
+                    metadata: progress.metadata.clone(),
+                    state_history: progress.state_history.clone(),
+                    messages: progress.messages.clone(),
+                })
+            }
+        }
+    }
+
+    /// PAN-280: announce a reverted completion after the `qsos` guard drops.
+    /// A reopened QSO gets a `StateChanged` back to its pre-close state; a
+    /// retired open gets `StateChanged` plus `QsoFailed { CloseNotAired }`
+    /// and loses its callsign mapping. Neither emits `QsoCompleted`.
+    async fn emit_reverted_completion(&self, reverted: RevertedCompletion) {
+        let RevertedCompletion {
+            qso_id,
+            to,
+            old_state,
+            new_state,
+            metadata,
+            state_history,
+            messages,
+        } = reverted;
+        self.emit_state_change(qso_id, old_state.clone(), new_state)
+            .await;
+        if to == RevertedTo::Retired {
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id,
+                reason: QsoFailureReason::CloseNotAired,
+                last_state: old_state,
+                metadata: metadata.clone(),
+                state_history,
+                messages,
+            })
+            .await;
+            if let Some(callsign) = &metadata.their_callsign {
+                self.remove_callsign_mapping(callsign, qso_id).await;
+            }
+        }
     }
 
     /// External commit point for PAN-72's stall-switch/revert and the manual
@@ -5835,7 +6237,18 @@ impl QsoManager {
             }
         }
 
+        // PAN-280: a completion that queues a reply (our 73 to the DX's RR73)
+        // holds its QsoCompleted until that reply airs. The reply's attempt
+        // id is minted here when it closes a QSO, so the held record and the
+        // MessageToSend below carry the same id; `reply_sent_at` is the one
+        // timestamp of its `Sent` record, so a revert can find that record.
+        let mut reply_attempt_id: Option<TxAttemptId> = None;
+        let reply_sent_at = Utc::now();
         if new_state != old_state {
+            // PAN-280: what a dropped closing reply puts back.
+            let pre_close_reports = progress.metadata.reports.clone();
+            let pre_close_end_time = progress.metadata.end_time;
+            let pre_close_rf = progress.metadata.completed_rf_frequency_hz;
             // CQer flow: the QSO was created by start_cq with their_callsign
             // None (we didn't know who would answer). The moment a state
             // advance reveals the contra callsign (caller answered), latch it
@@ -5938,17 +6351,54 @@ impl QsoManager {
                 reason: TransitionReason::MessageReceived(message.message_type.clone()),
             });
 
-            self.emit_state_change(qso_id, old_state, new_state).await;
-
-            // Emit QsoCompleted event so loggers can auto-log the QSO
-            if let Some(metadata) = completed_metadata {
-                self.emit_event(QsoEvent::QsoCompleted {
-                    qso_id,
-                    metadata,
-                    state_history: progress.state_history.clone(),
-                    messages: progress.messages.clone(),
-                })
-                .await;
+            let closing_reply = completed_metadata
+                .as_ref()
+                .and(reply_to_emit.as_ref())
+                .map(|reply| self.render_sent_text(reply));
+            match (completed_metadata, closing_reply) {
+                // PAN-280: our 73 is queued below; log only once it airs.
+                (Some(metadata), Some(reply_text)) => {
+                    let attempt_id = self.next_attempt_id();
+                    reply_attempt_id = Some(attempt_id);
+                    self.hold_completion(
+                        qso_id,
+                        PendingCompletion {
+                            attempt_ids: vec![attempt_id],
+                            raw_text: reply_text.clone(),
+                            frequency_hz: qso_frequency,
+                            remote_origin: qso_remote_origin,
+                            remote_client_key_id: qso_remote_client_key_id.clone(),
+                            queued_at: reply_sent_at,
+                            completed_state: new_state.clone(),
+                            restore: CompletionRestore::Revert {
+                                state: old_state.clone(),
+                                reports: pre_close_reports,
+                                end_time: pre_close_end_time,
+                                completed_rf_frequency_hz: pre_close_rf,
+                                sent_record: Some((reply_sent_at, reply_text)),
+                            },
+                            metadata,
+                            state_history: progress.state_history.clone(),
+                            messages: progress.messages.clone(),
+                        },
+                    );
+                    self.emit_state_change(qso_id, old_state, new_state).await;
+                }
+                // A completion with no closing frame (the DX's bare 73, a
+                // Hound on the Fox's RR73) logs at once, as before.
+                (Some(metadata), None) => {
+                    self.emit_state_change(qso_id, old_state, new_state).await;
+                    self.emit_event(QsoEvent::QsoCompleted {
+                        qso_id,
+                        metadata,
+                        state_history: progress.state_history.clone(),
+                        messages: progress.messages.clone(),
+                    })
+                    .await;
+                }
+                (None, _) => {
+                    self.emit_state_change(qso_id, old_state, new_state).await;
+                }
             }
         }
 
@@ -6272,7 +6722,7 @@ impl QsoManager {
             let reply_text = self.render_sent_text(reply);
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.messages.push(QsoMessage {
-                    timestamp: Utc::now(),
+                    timestamp: reply_sent_at,
                     direction: MessageDirection::Sent,
                     message_type: reply.clone(),
                     raw_text: reply_text,
@@ -6293,7 +6743,7 @@ impl QsoManager {
                     tx_parity: qso_tx_parity,
                     remote_origin: qso_remote_origin,
                     remote_client_key_id: qso_remote_client_key_id.clone(),
-                    attempt_id: Some(self.next_attempt_id()),
+                    attempt_id: Some(reply_attempt_id.unwrap_or_else(|| self.next_attempt_id())),
                 })
                 .await;
             }
@@ -6331,7 +6781,7 @@ impl QsoManager {
                 tx_parity: qso_tx_parity,
                 remote_origin,
                 remote_client_key_id,
-                attempt_id: Some(self.next_attempt_id()),
+                attempt_id: Some(reply_attempt_id.unwrap_or_else(|| self.next_attempt_id())),
             })
             .await;
         }
@@ -8201,15 +8651,21 @@ impl QsoManager {
             // retire) runs between the check and the mutation. The check is
             // still a point-in-time read of `ArmState`, not a TX gate: a
             // disarm or expiry after it is caught only by the TX worker at
-            // key time. The advance is not undone then (advances record no
-            // PAN-75 attempt), and a completion it records stays logged
-            // (known gap, 2026-07-development-phases-and-gaps.md).
+            // key time. A non-completing advance is not undone then (advances
+            // record no PAN-75 attempt); a completing one holds its
+            // QsoCompleted until the 73 airs and reverts if it does not
+            // (PAN-280).
             if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
                 return Ok(ManualCallOutcome::NotPermitted);
             }
             progress.metadata.remote_origin = remote_origin;
             progress.metadata.remote_client_key_id = remote_client_key_id;
             let old_state = progress.state.clone();
+            // PAN-280: what a dropped 73 puts back.
+            let pre_close_reports = progress.metadata.reports.clone();
+            let pre_close_end_time = progress.metadata.end_time;
+            let pre_close_rf = progress.metadata.completed_rf_frequency_hz;
+            let closing_text = raw_text.clone();
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
                 from_state: old_state.clone(),
@@ -8256,32 +8712,48 @@ impl QsoManager {
                 None
             };
             // Layer 2 timeline persistence: capture the timeline as of this
-            // mutation while the write lock is still held, for the
-            // QsoCompleted emit below (after the lock is released).
+            // mutation while the write lock is still held, for the held
+            // QsoCompleted.
             let state_history = progress.state_history.clone();
             let messages = progress.messages.clone();
+            let attempt_id = self.next_attempt_id();
+            // PAN-280: a completing advance holds its QsoCompleted until the
+            // 73 airs, stored under this guard and before the MessageToSend.
+            if let Some(metadata) = completed_metadata {
+                self.hold_completion(
+                    qso_id,
+                    PendingCompletion {
+                        attempt_ids: vec![attempt_id],
+                        raw_text: closing_text.clone(),
+                        frequency_hz: frequency,
+                        remote_origin,
+                        remote_client_key_id: remote_client_key_id.clone(),
+                        queued_at: now,
+                        completed_state: new_state.clone(),
+                        restore: CompletionRestore::Revert {
+                            state: old_state.clone(),
+                            reports: pre_close_reports,
+                            end_time: pre_close_end_time,
+                            completed_rf_frequency_hz: pre_close_rf,
+                            sent_record: Some((now, closing_text)),
+                        },
+                        metadata,
+                        state_history,
+                        messages,
+                    },
+                );
+            }
             (
                 old_state,
                 tx_parity,
                 remote_origin,
                 remote_client_key_id,
-                completed_metadata,
-                state_history,
-                messages,
+                attempt_id,
             )
         };
-        let (
-            old_state,
-            tx_parity,
-            remote_origin,
-            remote_client_key_id,
-            completed_metadata,
-            state_history,
-            messages,
-        ) = emit;
+        let (old_state, tx_parity, remote_origin, remote_client_key_id, attempt_id) = emit;
 
         self.emit_state_change(qso_id, old_state, new_state).await;
-        let attempt_id = self.next_attempt_id();
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
@@ -8292,15 +8764,6 @@ impl QsoManager {
             attempt_id: Some(attempt_id),
         })
         .await;
-        if let Some(metadata) = completed_metadata {
-            self.emit_event(QsoEvent::QsoCompleted {
-                qso_id,
-                metadata,
-                state_history,
-                messages,
-            })
-            .await;
-        }
         Ok(ManualCallOutcome::Advanced(attempt_id))
     }
 
@@ -9036,10 +9499,26 @@ impl QsoManager {
     /// `manual_call_max_calls` calls OR `manual_call_watchdog_minutes`
     /// have elapsed since the first call — whichever comes first.
     pub async fn check_timeouts_at(&self, now: DateTime<Utc>) {
+        // PAN-280: a completion whose closing frame never got a TX outcome
+        // reverts first, so the exemption below applies to it at once.
+        self.expire_pending_completions_at(now).await;
+        // PAN-280: a QSO whose dropped 73 put it back in its pre-close state
+        // gets one rework grace before any timeout applies again.
+        let reworking: std::collections::HashSet<QsoId> = {
+            let mut reverted = self
+                .completion_reverted_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            reverted.retain(|_, at| now - *at < COMPLETED_QSO_REWORK_GRACE);
+            reverted.keys().copied().collect()
+        };
         let mut qsos = self.qsos.write().await;
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter_mut() {
+            if reworking.contains(&qso_id) {
+                continue;
+            }
             let active_tx_state = matches!(
                 progress.state,
                 QsoState::CallingCq { .. }
@@ -9350,6 +9829,8 @@ impl Clone for QsoManager {
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
             keep_call_ledger: Arc::clone(&self.keep_call_ledger),
+            pending_completions: Arc::clone(&self.pending_completions),
+            completion_reverted_at: Arc::clone(&self.completion_reverted_at),
             attempt_id_counter: Arc::clone(&self.attempt_id_counter),
             qsos_by_callsign: Arc::clone(&self.qsos_by_callsign),
             event_sender: self.event_sender.clone(),
@@ -16985,6 +17466,41 @@ mod reply_emitter_tests {
         crate::utils::generate_ft8_message(msg, OUR).unwrap()
     }
 
+    /// PAN-280: report the newest frame emitted among `events` as aired, as
+    /// the TX worker's `TxFrameSent` does, and return `events` plus what that
+    /// produced (a held `QsoCompleted`).
+    async fn air_last_send(
+        manager: &QsoManager,
+        rx: &mut broadcast::Receiver<QsoEvent>,
+        mut events: Vec<QsoEvent>,
+    ) -> Vec<QsoEvent> {
+        let last = events.iter().rev().find_map(|e| match e {
+            QsoEvent::MessageToSend {
+                qso_id,
+                frequency,
+                attempt_id: Some(id),
+                ..
+            } => Some((*qso_id, *id, *frequency)),
+            _ => None,
+        });
+        if let Some((qso_id, id, frequency)) = last {
+            manager
+                .confirm_completion_aired(
+                    qso_id,
+                    Some(id),
+                    "",
+                    &UnsentAttemptPayload {
+                        frequency_hz: frequency,
+                        remote_binding: None,
+                    },
+                    Utc::now(),
+                )
+                .await;
+            events.extend(drain(rx));
+        }
+        events
+    }
+
     /// 1. Manual QSO in RespondingToCq + SignalReport → emits ReportAck
     ///    (R+report) and state advances to SendingReport.
     #[tokio::test]
@@ -17149,7 +17665,9 @@ mod reply_emitter_tests {
             .await
             .unwrap();
 
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let sends = messages_to_send(&events);
         assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
         match &sends[0] {
@@ -17224,7 +17742,9 @@ mod reply_emitter_tests {
             .await
             .unwrap();
 
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let sends = messages_to_send(&events);
         assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
         assert!(
@@ -17287,7 +17807,9 @@ mod reply_emitter_tests {
             .await
             .unwrap();
 
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let completed = events.iter().find_map(|e| match e {
             QsoEvent::QsoCompleted { metadata, .. } => Some(metadata.clone()),
             _ => None,
@@ -17333,7 +17855,9 @@ mod reply_emitter_tests {
             )
             .await
             .unwrap();
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let metadata = events
             .iter()
             .find_map(|e| match e {
@@ -17532,7 +18056,9 @@ mod reply_emitter_tests {
             )
             .await
             .unwrap();
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let sends = messages_to_send(&events);
         assert_eq!(sends.len(), 1);
         assert!(
@@ -18233,7 +18759,9 @@ mod reply_emitter_tests {
             .await
             .unwrap();
 
+        // PAN-280: the QsoCompleted is held until the 73 airs.
         let events = drain(&mut rx);
+        let events = air_last_send(&manager, &mut rx, events).await;
         let sends = messages_to_send(&events);
         assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
         assert!(
@@ -28134,5 +28662,517 @@ mod pan260 {
             .check_duplicate_at("K1ABC", 1800.0, now)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_completion_tests {
+    //! PAN-280: a completion that queues a closing frame emits `QsoCompleted`
+    //! only when that frame airs; a frame that never airs reverts it.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn manager(permitted: Arc<AtomicBool>) -> QsoManager {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            ..QsoManagerConfig::default()
+        });
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| permitted.load(SeqCst)));
+        manager
+    }
+
+    async fn reply(
+        manager: &QsoManager,
+        step: ResponseStep,
+        remote: Option<&str>,
+    ) -> (QsoId, ManualCallOutcome) {
+        manager
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                step,
+                Some(-8.0),
+                Some(-4),
+                None,
+                remote.is_some(),
+                remote.map(str::to_string),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn completions(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::QsoCompleted { .. }))
+            .count()
+    }
+
+    fn payload() -> UnsentAttemptPayload {
+        UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: None,
+        }
+    }
+
+    async fn air(manager: &QsoManager, id: QsoId, attempt: TxAttemptId) -> CompletionAired {
+        manager
+            .confirm_completion_aired(id, Some(attempt), "", &payload(), Utc::now())
+            .await
+    }
+
+    fn newest_sent_text(progress: &QsoProgress) -> Option<String> {
+        progress
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Sent)
+            .map(|m| m.raw_text.clone())
+    }
+
+    /// Ticket scenario 1: a remote-origin QSO advances to 73, the client's
+    /// arm expires before the 73 keys, the frame is not sent, and nothing is
+    /// logged; the QSO is back in its pre-73 state.
+    #[tokio::test]
+    async fn dropped_remote_ladder_73_is_not_logged_and_reopens() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = manager(Arc::clone(&permitted));
+        let (id, _) = reply(&manager, ResponseStep::ReportAck, Some("client-a")).await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert!(matches!(before.state, QsoState::SendingReport { .. }));
+        let mut rx = manager.subscribe();
+
+        let (aid, advanced) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert_eq!(aid, id);
+        let attempt = advanced.attempt_id().expect("the advance emitted a 73");
+        let events = drain(&mut rx);
+        assert_eq!(completions(&events), 0, "nothing logs at queue time");
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+
+        permitted.store(false, SeqCst);
+        assert_eq!(
+            manager
+                .resolve_unsent_completion_at(id, Some(attempt), Utc::now())
+                .await,
+            UnsentCompletion::Reverted(RevertedTo::Reopened)
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.metadata.end_time, before.metadata.end_time);
+        assert_eq!(
+            after.metadata.completed_rf_frequency_hz,
+            before.metadata.completed_rf_frequency_hz
+        );
+        assert_eq!(after.metadata.reports.sent, before.metadata.reports.sent);
+        assert_eq!(
+            after.metadata.reports.received,
+            before.metadata.reports.received
+        );
+        assert_eq!(after.messages.len(), before.messages.len());
+        assert_eq!(newest_sent_text(&after), newest_sent_text(&before));
+
+        let events = drain(&mut rx);
+        assert_eq!(completions(&events), 0);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            QsoEvent::StateChanged {
+                old_state: QsoState::Completed { .. },
+                new_state: QsoState::SendingReport { .. },
+                ..
+            }
+        )));
+        assert_eq!(
+            air(&manager, id, attempt).await,
+            CompletionAired::NotPending
+        );
+        assert_eq!(completions(&drain(&mut rx)), 0);
+    }
+
+    /// Ticket scenario 1: the reverted QSO stays in its pre-73 state for one
+    /// rework grace, then the normal timeouts apply.
+    #[tokio::test]
+    async fn reverted_qso_is_exempt_from_timeouts_for_one_rework_grace() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let (id, _) = reply(&manager, ResponseStep::Rr73, None).await;
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
+        let (_, advanced) = reply(&manager, ResponseStep::SeventyThree, None).await;
+        let t0 = Utc::now();
+        assert_eq!(
+            manager
+                .resolve_unsent_completion_at(id, advanced.attempt_id(), t0)
+                .await,
+            UnsentCompletion::Reverted(RevertedTo::Reopened)
+        );
+        // confirmation_timeout is 30 s: without the exemption this retires.
+        manager.check_timeouts_at(t0 + Duration::seconds(44)).await;
+        assert!(matches!(
+            manager.get_qso(id).await.map(|p| p.state),
+            Ok(QsoState::WaitingForConfirmation { .. })
+        ));
+        manager.check_timeouts_at(t0 + Duration::seconds(46)).await;
+        assert!(!matches!(
+            manager.get_qso(id).await.map(|p| p.state),
+            Ok(QsoState::WaitingForConfirmation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn aired_ladder_73_logs_once_with_the_queue_time_record() {
+        let mut manager = manager(Arc::new(AtomicBool::new(true)));
+        manager.set_dial_frequency_source(Arc::new(AtomicU64::new(14_074_000)));
+        let (id, _) = reply(&manager, ResponseStep::ReportAck, None).await;
+        let mut rx = manager.subscribe();
+        let (_, advanced) = reply(&manager, ResponseStep::SeventyThree, None).await;
+        let stored = manager.get_qso(id).await.unwrap();
+        assert_eq!(completions(&drain(&mut rx)), 0);
+
+        assert_eq!(
+            air(&manager, id, advanced.attempt_id().unwrap()).await,
+            CompletionAired::Committed
+        );
+        let events = drain(&mut rx);
+        assert_eq!(completions(&events), 1);
+        let metadata = events
+            .iter()
+            .find_map(|e| match e {
+                QsoEvent::QsoCompleted { metadata, .. } => Some(metadata.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(metadata.frequency, 14_074_000.0 + FREQ);
+        assert_eq!(
+            metadata.end_time, stored.metadata.end_time,
+            "TIME_OFF is the queue time"
+        );
+        assert_eq!(metadata.reports.sent, stored.metadata.reports.sent);
+        assert_eq!(
+            air(&manager, id, advanced.attempt_id().unwrap()).await,
+            CompletionAired::NotPending
+        );
+        assert_eq!(completions(&drain(&mut rx)), 0, "logged exactly once");
+    }
+
+    /// Drive a manual QSO to WaitingForConfirmation (our RR73 sent).
+    async fn manual_qso_awaiting_confirmation(manager: &QsoManager) -> QsoId {
+        let id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        for (message, text) in [
+            (
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -10,
+                },
+                format!("{OUR} {DX} -10"),
+            ),
+            (
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} R-07"),
+            ),
+        ] {
+            manager
+                .process_message(message, text, FREQ, Some(-15.0))
+                .await
+                .unwrap();
+        }
+        id
+    }
+
+    async fn dx_sends_rr73(manager: &QsoManager) {
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{OUR} {DX} RR73"),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn last_send(events: &[QsoEvent]) -> Option<(TxAttemptId, MessageType)> {
+        events.iter().rev().find_map(|e| match e {
+            QsoEvent::MessageToSend {
+                attempt_id: Some(id),
+                message,
+                ..
+            } => Some((*id, message.clone())),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn dx_rr73_reply_73_is_held_until_aired() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let id = manual_qso_awaiting_confirmation(&manager).await;
+        let mut rx = manager.subscribe();
+        dx_sends_rr73(&manager).await;
+        let events = drain(&mut rx);
+        let (attempt, message) = last_send(&events).expect("our 73 is queued");
+        assert!(matches!(message, MessageType::SeventyThree { .. }));
+        assert_eq!(completions(&events), 0);
+        assert_eq!(air(&manager, id, attempt).await, CompletionAired::Committed);
+        assert_eq!(completions(&drain(&mut rx)), 1);
+    }
+
+    #[tokio::test]
+    async fn dx_rr73_reply_73_dropped_reopens_and_a_repeat_rr73_completes_again() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let id = manual_qso_awaiting_confirmation(&manager).await;
+        let before = manager.get_qso(id).await.unwrap();
+        let mut rx = manager.subscribe();
+        dx_sends_rr73(&manager).await;
+        let (attempt, _) = last_send(&drain(&mut rx)).unwrap();
+        assert_eq!(
+            manager
+                .resolve_unsent_completion_at(id, Some(attempt), Utc::now())
+                .await,
+            UnsentCompletion::Reverted(RevertedTo::Reopened)
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.state, before.state);
+        // Our 73's Sent record is gone; the DX's received RR73 stays.
+        let sent = |p: &QsoProgress| {
+            p.messages
+                .iter()
+                .filter(|m| m.direction == MessageDirection::Sent)
+                .count()
+        };
+        assert_eq!(sent(&after), sent(&before));
+        assert_eq!(newest_sent_text(&after), newest_sent_text(&before));
+        assert_eq!(completions(&drain(&mut rx)), 0);
+
+        // The DX repeats RR73: the QSO completes again and queues a new 73.
+        dx_sends_rr73(&manager).await;
+        let events = drain(&mut rx);
+        let (again, _) = last_send(&events).expect("a new 73 is queued");
+        assert_ne!(again, attempt);
+        assert_eq!(completions(&events), 0);
+        assert_eq!(air(&manager, id, again).await, CompletionAired::Committed);
+        assert_eq!(completions(&drain(&mut rx)), 1);
+    }
+
+    /// Guard: a completion that queues no closing frame (we sent RR73, the
+    /// DX's 73 closes it) logs at once, as before.
+    #[tokio::test]
+    async fn bare_73_completion_without_a_reply_logs_immediately() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let (id, _) = reply(&manager, ResponseStep::Rr73, None).await;
+        let mut rx = manager.subscribe();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{OUR} {DX} 73"),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let events = drain(&mut rx);
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+        assert!(last_send(&events).is_none(), "no closing frame is queued");
+        assert_eq!(completions(&events), 1, "a frame-less completion logs now");
+        assert!(manager
+            .pending_completions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_none());
+    }
+
+    /// Ticket scenario 3 (second half): an open at 73 whose 73 the TX worker
+    /// rejects is retired, never logged.
+    #[tokio::test]
+    async fn dropped_open_at_close_is_retired_close_not_aired() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = manager(Arc::clone(&permitted));
+        let mut rx = manager.subscribe();
+        let (id, opened) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert_eq!(completions(&drain(&mut rx)), 0);
+        permitted.store(false, SeqCst);
+        assert_eq!(
+            manager
+                .resolve_unsent_completion_at(id, opened.attempt_id(), Utc::now())
+                .await,
+            UnsentCompletion::Reverted(RevertedTo::Retired)
+        );
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Failed {
+                reason: QsoFailureReason::CloseNotAired,
+                ..
+            }
+        ));
+        let events = drain(&mut rx);
+        assert_eq!(completions(&events), 0);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    QsoEvent::QsoFailed {
+                        reason: QsoFailureReason::CloseNotAired,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        // FIX B no longer matches the failed QSO: a new press opens a new one.
+        permitted.store(true, SeqCst);
+        let (new_id, again) = reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await;
+        assert_ne!(new_id, id);
+        assert!(matches!(again, ManualCallOutcome::Opened(_)));
+    }
+
+    #[tokio::test]
+    async fn fix_b_rekey_while_pending_joins_the_pending_set() {
+        for b_airs in [true, false] {
+            let manager = manager(Arc::new(AtomicBool::new(true)));
+            let mut rx = manager.subscribe();
+            let (id, opened) = reply(&manager, ResponseStep::SeventyThree, None).await;
+            let (rid, rekey) = reply(&manager, ResponseStep::SeventyThree, None).await;
+            assert_eq!(rid, id);
+            assert!(matches!(rekey, ManualCallOutcome::Resent(_)));
+            let a = opened.attempt_id().unwrap();
+            let b = rekey.attempt_id().unwrap();
+            assert_eq!(
+                manager
+                    .resolve_unsent_completion_at(id, Some(a), Utc::now())
+                    .await,
+                UnsentCompletion::StillPending
+            );
+            if b_airs {
+                assert_eq!(air(&manager, id, b).await, CompletionAired::Committed);
+                assert_eq!(completions(&drain(&mut rx)), 1);
+            } else {
+                assert_eq!(
+                    manager
+                        .resolve_unsent_completion_at(id, Some(b), Utc::now())
+                        .await,
+                    UnsentCompletion::Reverted(RevertedTo::Retired)
+                );
+                assert_eq!(completions(&drain(&mut rx)), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn id_less_not_sent_never_reverts() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let mut rx = manager.subscribe();
+        let (id, opened) = reply(&manager, ResponseStep::SeventyThree, None).await;
+        assert_eq!(
+            manager
+                .resolve_unsent_completion_at(id, None, Utc::now())
+                .await,
+            UnsentCompletion::NotPending
+        );
+        assert_eq!(
+            air(&manager, id, opened.attempt_id().unwrap()).await,
+            CompletionAired::Committed
+        );
+        assert_eq!(completions(&drain(&mut rx)), 1);
+    }
+
+    #[tokio::test]
+    async fn aired_report_without_id_commits_on_content_match_only_after_queue() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let mut rx = manager.subscribe();
+        let before_queue = Utc::now() - Duration::seconds(5);
+        let (id, _) = reply(&manager, ResponseStep::SeventyThree, None).await;
+        let text = format!("{DX} {OUR} 73");
+        let confirm = |text: String, at: DateTime<Utc>| {
+            let manager = &manager;
+            async move {
+                manager
+                    .confirm_completion_aired(id, None, &text, &payload(), at)
+                    .await
+            }
+        };
+        assert_eq!(
+            confirm("K9ZZ K5ARH RR73".into(), Utc::now()).await,
+            CompletionAired::NotPending
+        );
+        assert_eq!(
+            confirm(text.clone(), before_queue).await,
+            CompletionAired::NotPending
+        );
+        assert_eq!(confirm(text, Utc::now()).await, CompletionAired::Committed);
+        assert_eq!(completions(&drain(&mut rx)), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_completion_expires_as_not_aired_per_mode() {
+        for (slot_ns, expiry_s) in [
+            (15_000_000_000_i64, 90),
+            (7_500_000_000, 45),
+            (3_200_000_000, 30),
+        ] {
+            let mut manager = manager(Arc::new(AtomicBool::new(true)));
+            manager.set_active_slot_ns_source(Arc::new(AtomicI64::new(slot_ns)));
+            let mut rx = manager.subscribe();
+            let t0 = Utc::now();
+            let (id, _) = reply(&manager, ResponseStep::SeventyThree, None).await;
+            assert_eq!(
+                manager
+                    .expire_pending_completions_at(t0 + Duration::seconds(expiry_s - 1))
+                    .await,
+                0,
+                "slot {slot_ns}"
+            );
+            assert_eq!(
+                manager
+                    .expire_pending_completions_at(t0 + Duration::seconds(expiry_s + 1))
+                    .await,
+                1,
+                "slot {slot_ns}"
+            );
+            assert!(matches!(
+                manager.get_qso(id).await.unwrap().state,
+                QsoState::Failed {
+                    reason: QsoFailureReason::CloseNotAired,
+                    ..
+                }
+            ));
+            assert_eq!(completions(&drain(&mut rx)), 0);
+        }
     }
 }

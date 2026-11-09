@@ -1056,8 +1056,10 @@ advanced state in place. An advance to 73 records the completion and emits
 `QsoCompleted` before key time, so the contact stays logged even if the TX
 worker then drops the 73. A brand-new close-step open still checks
 permission before awaited supersede and insert operations. Closing that
-window requires supersede and insert under one guard. These limits, plus the auto-73 grace-window budget reset,
-are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
+window requires supersede and insert under one guard. PAN-280 (below) closed
+the logged-after-drop limit, the completed-QSO auto-73 marker and the
+close-step guard; the remaining limits, plus the auto-73 grace-window budget
+reset, are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
 
 No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
@@ -1170,7 +1172,7 @@ guard passes, while dispatch is still awaiting, is not re-checked.
 No new wire shape is introduced. Replace the Error response with commandAck
 when that contract exists; this ticket does not wait for it.
 
-## PAN-280: close-step open under one guard, and the auto-73 refund
+## PAN-280: log a completion when its closing 73 airs
 
 - `respond_to_caller_with_outcome`'s brand-new QSO path runs the remote
   permission check, the supersede of same-call active QSOs and the insert
@@ -1179,7 +1181,8 @@ when that contract exists; this ticket does not wait for it.
   `emit_superseded` (announces after it drops, in the old order). The guard's
   only await is `qsos_by_callsign`, taken in the existing `qsos` then
   `qsos_by_callsign` order. A clock-based arm expiry right after the check is
-  still caught only by the TX worker at key time.
+  caught by the TX worker at key time, and the deferral below then retires
+  the open as `Failed{CloseNotAired}` with nothing logged.
 - `ManualCallOutcome::{Opened, Resent, Advanced}` carry the emitted frame's
   `TxAttemptId`, and `QsoMessage::TxFrameSent` carries the aired frame's
   attempt id (the pivot target's after a pivot).
@@ -1189,5 +1192,22 @@ when that contract exists; this ticket does not wait for it.
   restores `last_resend_at` only while it still holds that resend's stamp. A
   `TxFrameSent` for it keeps the charge. An operator FIX B re-key is never
   marked, so its report never touches the auto-73 budget.
-- Not done in PAN-280: holding `QsoCompleted` until the closing 73 airs. A
-  completion is still logged when its 73 is queued; see the gaps doc.
+- A completion that queues a closing frame (open at the close, ladder
+  advance to 73, our 73 answering the DX's RR73) keeps the tentative
+  `Completed` state but holds its `QsoCompleted` in a pending record keyed by
+  QSO id. The record's attempt set is the closing frame's id plus each FIX B
+  re-key charged while it is pending. `TxFrameSent` for any of them emits the
+  held event once, with the payload built at queue time (`TIME_OFF` stays the
+  queue time). `TxFrameNotSent` for the last one, or no outcome within
+  `max(6 slots, 30 s)`, reverts it: an advanced QSO goes back to its pre-73
+  state, reports and `Sent` record, and is exempt from every timeout for one
+  `COMPLETED_QSO_REWORK_GRACE`; an open at the close becomes
+  `Failed{CloseNotAired}` and emits `QsoFailed`. An id-less not-sent report
+  never reverts (PAN-75); an id-less aired report commits only on a text,
+  offset and binding match after the queue time. Completions with no closing
+  frame (the DX's bare 73, a Hound on the Fox's RR73) still log at once.
+- The coordinator keeps a completed QSO's key TX-live from the `Completed`
+  state change, not from `QsoCompleted`, and its 45 s grace purge acts only if
+  the key's generation is unchanged, so a reopened, failed or re-completed QSO
+  keeps the key it needs. A reopened QSO shows `73 to <call> was not sent; QSO
+  not logged, still open`.

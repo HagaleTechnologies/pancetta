@@ -132,8 +132,10 @@ use crate::frequency::{
     DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, SmartFrequencyAllocator,
     SpectralSnapshot, TimeSlot,
 };
-use crate::qso_manager::{QsoEvent, QsoManager, QsoManagerConfig};
-use crate::states::{MessageType, QsoFailureReason, QsoState};
+use crate::qso_manager::{
+    QsoEvent, QsoManager, QsoManagerConfig, TxAttemptId, UnsentAttemptPayload,
+};
+use crate::states::{MessageType, QsoFailureReason, QsoId, QsoState};
 
 /// Length of one FT8 slot, in seconds.
 pub const SLOT_SECONDS: i64 = 15;
@@ -800,6 +802,10 @@ pub struct Sim {
     /// against the same real [`QsoManager`]. `None` (default) leaves the
     /// harness in its original operator-driven mode, unchanged.
     autonomous: Option<AutonomousDrive>,
+    /// PAN-280: frames emitted this slot that the harness reports aired
+    /// (`confirm_completion_aired`) after draining, since "everything we
+    /// transmit airs" here: `(qso_id, attempt_id, text, frequency)`.
+    unconfirmed_sends: Vec<(QsoId, TxAttemptId, String, f64)>,
 }
 
 /// The autonomous-drive state bundled into a [`Sim`] when
@@ -850,6 +856,7 @@ impl Sim {
             allocator: SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default()),
             hifi_seed: 0xF18_C0DE,
             autonomous: None,
+            unconfirmed_sends: Vec::new(),
         }
     }
 
@@ -1146,11 +1153,21 @@ impl Sim {
             self.run_autonomous_slot(&injects, now).await;
         }
 
+        // 1c. PAN-280: every frame we sent this slot aired, so a completion
+        // held on its closing 73 logs now, at this same slot, and before the
+        // watchdog below could expire it (the engine stamps the queue time
+        // from the wall clock, which the virtual `now` runs ahead of).
+        self.drain_events(slot);
+        self.air_unconfirmed_sends(now).await;
+
         // 2. Manual keep-call re-arm + timeout watchdog at the virtual `now`.
         self.manager.rearm_manual_calls_at(now).await;
         self.manager.check_timeouts_at(now).await;
 
-        // 3. Drain all events emitted during this slot into the timeline.
+        // 3. Drain all events emitted during this slot into the timeline,
+        // and air whatever the re-arm sent.
+        self.drain_events(slot);
+        self.air_unconfirmed_sends(now).await;
         self.drain_events(slot);
 
         // 4. Advance the clock.
@@ -1286,6 +1303,25 @@ impl Sim {
         }
     }
 
+    /// PAN-280: report each frame drained since the last call as aired, the
+    /// way the TX worker's `TxFrameSent` does in production.
+    async fn air_unconfirmed_sends(&mut self, now: DateTime<Utc>) {
+        for (qso_id, attempt_id, text, frequency) in std::mem::take(&mut self.unconfirmed_sends) {
+            self.manager
+                .confirm_completion_aired(
+                    qso_id,
+                    Some(attempt_id),
+                    &text,
+                    &UnsentAttemptPayload {
+                        frequency_hz: frequency,
+                        remote_binding: None,
+                    },
+                    now,
+                )
+                .await;
+        }
+    }
+
     /// Drain pending events from the broadcast receiver, recording each into the
     /// timeline at `slot`.
     fn drain_events(&mut self, slot: u64) {
@@ -1304,13 +1340,13 @@ impl Sim {
     fn record_event(&mut self, slot: u64, event: QsoEvent) {
         match event {
             QsoEvent::MessageToSend {
-                qso_id: _,
+                qso_id,
                 message,
                 frequency,
                 tx_parity,
                 remote_origin: _,
                 remote_client_key_id: _,
-                attempt_id: _,
+                attempt_id,
             } => {
                 let text = self
                     .exchange
@@ -1322,6 +1358,10 @@ impl Sim {
                             format!("{message:?}")
                         }
                     });
+                if let Some(attempt_id) = attempt_id {
+                    self.unconfirmed_sends
+                        .push((qso_id, attempt_id, text.clone(), frequency));
+                }
                 self.timeline.transmissions.push(Transmission {
                     slot,
                     text,

@@ -472,6 +472,121 @@ async fn wait_out_completed_tx_grace(
     }
 }
 
+/// PAN-280: per-QSO-key completion generations (see the QSO event task).
+type CompletionGenerations = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+
+/// PAN-280: bump `key`'s completion generation and return the new value.
+fn bump_completion_generation(generations: &CompletionGenerations, key: &str) -> u64 {
+    let mut map = generations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let generation = map.entry(key.to_string()).or_insert(0);
+    *generation += 1;
+    *generation
+}
+
+/// What a completed QSO's grace purge needs (PAN-280).
+struct CompletedTxPurge {
+    qso_id: pancetta_qso::QsoId,
+    key: String,
+    generation: u64,
+    generations: CompletionGenerations,
+    /// `COMPLETED_QSO_REWORK_GRACE` in production.
+    grace: Duration,
+    active_tx_qsos: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    fox_admitted: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    latest_tx_intent: Arc<std::sync::RwLock<HashMap<String, super::LatestTxIntent>>>,
+    active_tx_offsets: Arc<std::sync::RwLock<HashMap<String, f64>>>,
+    qso_manager: pancetta_qso::QsoManager,
+    pending: PendingManualCalls,
+    bus: MessageBus,
+    limits: QsoCapacityLimits,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Drop-stale-TX grace window for a QSO that entered `Completed`. Its
+/// closing 73 is queued at completion, so its key must stay live until that
+/// 73 has had time to key.
+///
+/// The grace MUST outlast the worst-case wait for the 73 to actually key
+/// PTT. Our TX slots are SAME-PARITY only, which are **30 s** apart, so a 73
+/// emitted just too late for the next same-parity slot waits a full 30 s.
+/// The old 16 s grace expired before that deferred slot and the stale-TX
+/// gate silently dropped the 73 (observed on-air with G8KHF, 2026-06-23).
+/// 45 s covers that deferral plus the tx-late window and margin. It shares
+/// its value with `pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE`, so
+/// the FIX-B re-key window and this one never drift apart.
+///
+/// PAN-280: spawned on the `Completed` state change (not on `QsoCompleted`,
+/// which now waits for the 73 to air). It purges only if the key's
+/// generation is unchanged when the grace ends, so a QSO the engine reopened
+/// (its 73 was not sent), failed, or completed again keeps its key.
+/// #40: after purging, promote any operator-deferred cross-parity manual
+/// call, since only then is the window truly free. PAN-274: shutdown ends
+/// the grace early and nothing is purged or promoted.
+fn spawn_completed_tx_purge(purge: CompletedTxPurge) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let CompletedTxPurge {
+            qso_id,
+            key,
+            generation,
+            generations,
+            grace,
+            active_tx_qsos,
+            fox_admitted,
+            latest_tx_intent,
+            active_tx_offsets,
+            qso_manager,
+            pending,
+            bus,
+            limits,
+            shutdown,
+        } = purge;
+        if !wait_out_completed_tx_grace(grace, &shutdown).await {
+            debug!(
+                target: "tx.policy",
+                "QSO {} completed; shutdown began before its grace elapsed, nothing promoted",
+                qso_id
+            );
+            return;
+        }
+        {
+            let mut map = generations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.get(&key).copied() != Some(generation) {
+                debug!(
+                    target: "tx.policy",
+                    "QSO {} completed, then reopened, failed or completed again; this grace purge stands down",
+                    qso_id
+                );
+                return;
+            }
+            map.remove(&key);
+        }
+        if let Ok(mut s) = active_tx_qsos.write() {
+            s.remove(&key);
+        }
+        // PAN-76: a completed Hound keeps its Fox-admitted slot through the
+        // grace, so its final RR73/73 still airs.
+        if let Ok(mut s) = fox_admitted.write() {
+            s.remove(&key);
+        }
+        if let Ok(mut m) = latest_tx_intent.write() {
+            m.remove(&key);
+        }
+        if let Ok(mut offsets) = active_tx_offsets.write() {
+            offsets.remove(&key);
+        }
+        info!(
+            target: "tx.policy",
+            "QSO {} completed — grace elapsed, purging its TX from the active set",
+            qso_id
+        );
+        promote_pending_manual_calls(&qso_manager, &pending, &bus, &limits, &shutdown).await;
+    })
+}
+
 /// Promote operator-deferred manual calls (#40) once the TX window is free to
 /// accept them.
 ///
@@ -1136,9 +1251,11 @@ async fn settle_auto_73_attempt(
     false
 }
 
-/// PAN-280: the Qso task's `TxFrameNotSent` handling. Rolls back the frame's
-/// PAN-75 ledger attempt as before, then refunds an auto-73 resend charge
-/// that frame carried (ticket scenario 2).
+/// PAN-280: the Qso task's `TxFrameNotSent` handling. First reverts a
+/// completion still waiting on this frame (ticket scenario 1), so a reopened
+/// QSO is active again and a re-key's PAN-75 ledger charge is reversible;
+/// then rolls back the frame's ledger attempt as before, then refunds an
+/// auto-73 resend charge that frame carried (ticket scenario 2).
 async fn handle_tx_frame_not_sent(
     qso_manager: &pancetta_qso::QsoManager,
     completions: &RecentManualCompletions,
@@ -1149,14 +1266,15 @@ async fn handle_tx_frame_not_sent(
 ) {
     match qso_id.parse::<pancetta_qso::QsoId>() {
         Ok(id) => {
+            let completion = qso_manager.resolve_unsent_completion(id, attempt_id).await;
             let outcome = qso_manager
                 .roll_back_unsent_attempt(id, message_text, replaced, attempt_id)
                 .await;
             let refunded = refund_auto_73_attempt(completions, attempt_id).await;
             debug!(
                 target: "qso",
-                "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}; auto-73 charge refunded: {}",
-                qso_id, message_text, attempt_id, outcome, refunded
+                "TX frame not sent for QSO {} ('{}', attempt {:?}): completion {:?}; {:?}; auto-73 charge refunded: {}",
+                qso_id, message_text, attempt_id, completion, outcome, refunded
             );
         }
         Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
@@ -1164,7 +1282,8 @@ async fn handle_tx_frame_not_sent(
 }
 
 /// PAN-280: the Qso task's `TxFrameSent` handling. Releases a PAN-182 held
-/// stall action as before, then settles an auto-73 resend that aired.
+/// stall action as before, logs a completion that was waiting on this frame
+/// (its held `QsoCompleted`), then settles an auto-73 resend that aired.
 async fn handle_tx_frame_sent(
     qso_manager: &pancetta_qso::QsoManager,
     completions: &RecentManualCompletions,
@@ -1179,11 +1298,14 @@ async fn handle_tx_frame_sent(
             let released = qso_manager
                 .confirm_stall_trigger_aired(id, message_text, aired, aired_at)
                 .await;
+            let completion = qso_manager
+                .confirm_completion_aired(id, attempt_id, message_text, aired, aired_at)
+                .await;
             let settled = settle_auto_73_attempt(completions, attempt_id).await;
             debug!(
                 target: "qso",
-                "TX frame aired for QSO {} ('{}', attempt {:?}): released held stall action: {}; auto-73 charge settled: {}",
-                qso_id, message_text, attempt_id, released, settled
+                "TX frame aired for QSO {} ('{}', attempt {:?}): released held stall action: {}; completion {:?}; auto-73 charge settled: {}",
+                qso_id, message_text, attempt_id, released, completion, settled
             );
         }
         Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
@@ -2045,6 +2167,8 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         // the watchdog retired it fast instead of waiting on the DX.
         R::MessageUnencodable(detail) => format!("cannot transmit this message: {detail}"),
         R::ControlTransferred => "remote control passed to another client".to_string(),
+        // PAN-280: a QSO opened at 73 whose 73 never aired; nothing logged.
+        R::CloseNotAired => "closing 73 not sent, not logged".to_string(),
     }
 }
 
@@ -3857,6 +3981,12 @@ impl super::ApplicationCoordinator {
                     fox_admitted_qsos: fox_admitted_qsos.clone(),
                     admission: qso_admission.clone(),
                 };
+                // PAN-280: per-QSO-key generation, bumped whenever a key
+                // enters `Completed`, reopens from it or fails, so a
+                // completion's grace purge acts only if nothing happened to
+                // that key since it was spawned.
+                let completion_generations: CompletionGenerations =
+                    Arc::new(std::sync::Mutex::new(HashMap::new()));
                 tokio::spawn(async move {
                     // Task 5 (gap 2/4): built once for this task's lifetime,
                     // mirroring the autonomous operator's own scorer
@@ -3882,12 +4012,49 @@ impl super::ApplicationCoordinator {
                                 // terminal Failed state (covers Superseded /
                                 // UserCancelled / Timeout / SignalLost / …) must
                                 // STOP transmitting at once, so we remove it
-                                // immediately. (Completion is handled in the
-                                // QsoCompleted arm with a grace window so the
-                                // final 73 still goes out.)
+                                // immediately. A QSO entering `Completed` stays
+                                // live for a grace window so its closing 73
+                                // still goes out (PAN-280: here, not on
+                                // `QsoCompleted`, which now waits for that 73 to
+                                // air).
                                 {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     if new_state.is_active() {
+                                        if matches!(
+                                            old_state,
+                                            pancetta_qso::QsoState::Completed { .. }
+                                        ) {
+                                            // PAN-280: the closing 73 was not sent and
+                                            // the engine reopened the QSO. Stop the
+                                            // completion's grace purge from removing
+                                            // the key the reopened QSO needs.
+                                            bump_completion_generation(
+                                                &completion_generations,
+                                                &key,
+                                            );
+                                            let call = new_state
+                                                .their_callsign()
+                                                .unwrap_or("the DX")
+                                                .to_string();
+                                            let text = format!(
+                                                "73 to {call} was not sent; QSO not logged, still open"
+                                            );
+                                            emit_status(&snapshot_bus, text.clone()).await;
+                                            let _ = snapshot_bus
+                                                .send_message(ComponentMessage::new(
+                                                    ComponentId::Qso,
+                                                    ComponentId::Tui,
+                                                    MessageType::DiagnosticEvent {
+                                                        target: "qso",
+                                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                                        text,
+                                                        qso_id: Some(qso_id.to_string()),
+                                                        callsign: Some(call),
+                                                    },
+                                                    Instant::now(),
+                                                ))
+                                                .await;
+                                        }
                                         if let Ok(mut set) = active_tx_qsos.write() {
                                             set.insert(key.clone());
                                         }
@@ -3899,10 +4066,58 @@ impl super::ApplicationCoordinator {
                                                 offsets.insert(key, freq);
                                             }
                                         }
+                                    } else if let pancetta_qso::QsoState::Completed {
+                                        frequency,
+                                        ..
+                                    } = &new_state
+                                    {
+                                        // Keep the closing 73 live for the grace
+                                        // window. A QSO opened directly at the close
+                                        // never passed through an active state, so
+                                        // without this insert its 73 would be dropped
+                                        // by the Step 4b gate and never key PTT.
+                                        if let Ok(mut s) = active_tx_qsos.write() {
+                                            s.insert(key.clone());
+                                        }
+                                        // FQ-F3: the registry holds the audio offset.
+                                        if let Ok(mut offsets) = active_tx_offsets.write() {
+                                            offsets.insert(key.clone(), *frequency);
+                                        }
+                                        let generation = bump_completion_generation(
+                                            &completion_generations,
+                                            &key,
+                                        );
+                                        // A positive 45 s chrono literal never
+                                        // overflows `to_std`.
+                                        let grace: Duration =
+                                            pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE
+                                                .to_std()
+                                                .expect(
+                                                    "COMPLETED_QSO_REWORK_GRACE is a positive literal duration",
+                                                );
+                                        let _purge = spawn_completed_tx_purge(CompletedTxPurge {
+                                            qso_id,
+                                            key,
+                                            generation,
+                                            generations: completion_generations.clone(),
+                                            grace,
+                                            active_tx_qsos: active_tx_qsos.clone(),
+                                            fox_admitted: fox_admitted_for_events.clone(),
+                                            latest_tx_intent: latest_tx_intent.clone(),
+                                            active_tx_offsets: active_tx_offsets.clone(),
+                                            qso_manager: snapshot_qso_manager.clone(),
+                                            pending: pending_for_events.clone(),
+                                            bus: snapshot_bus.clone(),
+                                            limits: capacity_for_events.clone(),
+                                            shutdown: tx_shutdown.clone(),
+                                        });
                                     } else if let pancetta_qso::QsoState::Failed {
                                         reason, ..
                                     } = &new_state
                                     {
+                                        // PAN-280: a pending grace purge must not act
+                                        // on a key this immediate purge clears.
+                                        bump_completion_generation(&completion_generations, &key);
                                         opening_self_cqs_for_events
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4246,129 +4461,10 @@ impl super::ApplicationCoordinator {
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .remove(&qso_id);
-                                // Drop-stale-TX grace window. A normally
-                                // completing QSO emits its FINAL 73 right at
-                                // completion, so we must NOT purge it from the
-                                // active set immediately — that would race the
-                                // 73 out of existence.
-                                //
-                                // The grace MUST outlast the worst-case wait for
-                                // the 73 to actually key PTT. Crucially, our TX
-                                // slots are SAME-PARITY only, which are **30 s**
-                                // apart (e.g. Odd = :15/:45), not 15 s. When the
-                                // 73 is emitted just too late to key the
-                                // immediately-next same-parity slot, the
-                                // scheduler defers it a full 30 s to the slot
-                                // after that. The old 16 s grace expired before
-                                // that deferred slot, so the stale-TX gate
-                                // silently DROPPED the 73 — the operator saw us
-                                // stop at R-report and had to send 73 by hand
-                                // (observed on-air with G8KHF, 2026-06-23).
-                                //
-                                // 45 s comfortably covers a full 30 s
-                                // same-parity deferral plus the ≤8 s tx-late
-                                // window and margin, while still purging any
-                                // leftover backlog shortly after. Only the
-                                // single 73 is pending post-completion (the
-                                // coalescer keeps newest-per-QSO), so a longer
-                                // grace cannot leak stale report frames.
-                                // Shares its value with
-                                // `pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE`
-                                // (the grace window `respond_to_caller`'s FIX-B
-                                // idempotent-close dispatch uses to find a
-                                // just-completed manual QSO to re-key instead of
-                                // spawning a duplicate) so the two windows can
-                                // never drift apart. A positive 45s chrono
-                                // literal never overflows `to_std`.
-                                let completed_tx_grace: Duration =
-                                    pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE
-                                        .to_std()
-                                        .expect(
-                                            "COMPLETED_QSO_REWORK_GRACE is a positive literal duration",
-                                        );
-                                {
-                                    let key = super::active_tx_qso_key(&qso_id.to_string());
-                                    // Ensure the key is present for the grace
-                                    // window's duration. Normally a prior
-                                    // active StateChanged already inserted it
-                                    // (idempotent here), but a QSO that OPENS
-                                    // directly at the close (respond_to_caller
-                                    // SeventyThree → Completed) never passed
-                                    // through an active state, so without this
-                                    // insert its single final-73 TransmitRequest
-                                    // would be dropped by the Step 4b gate and
-                                    // never key PTT.
-                                    if let Ok(mut s) = active_tx_qsos.write() {
-                                        s.insert(key.clone());
-                                    }
-                                    // FQ-F3: same idempotent insert for the
-                                    // offset registry, mirroring the
-                                    // active_tx_qsos insert immediately above.
-                                    if let Ok(mut offsets) = active_tx_offsets.write() {
-                                        offsets.insert(key.clone(), metadata.frequency);
-                                    }
-                                    let set = active_tx_qsos.clone();
-                                    let fox_set = fox_admitted_for_events.clone();
-                                    let intent_map = latest_tx_intent.clone();
-                                    let offsets_map = active_tx_offsets.clone();
-                                    let qid = qso_id;
-                                    // #40: promote any operator-deferred
-                                    // cross-parity manual call once THIS QSO's
-                                    // trailing 73 has cleared (grace elapsed) —
-                                    // only then is the window truly free, so we
-                                    // never end up TXing the 73 and a new
-                                    // opposite-window call in sequential slots.
-                                    let promote_mgr = snapshot_qso_manager.clone();
-                                    let promote_pending = pending_for_events.clone();
-                                    let promote_bus = snapshot_bus.clone();
-                                    let promote_limits = capacity_for_events.clone();
-                                    let promote_shutdown = tx_shutdown.clone();
-                                    tokio::spawn(async move {
-                                        // PAN-274: shutdown ends the grace
-                                        // early; nothing is purged or promoted.
-                                        if !wait_out_completed_tx_grace(
-                                            completed_tx_grace,
-                                            &promote_shutdown,
-                                        )
-                                        .await
-                                        {
-                                            debug!(
-                                                target: "tx.policy",
-                                                "QSO {} completed; shutdown began before its grace elapsed, nothing promoted",
-                                                qid
-                                            );
-                                            return;
-                                        }
-                                        if let Ok(mut s) = set.write() {
-                                            s.remove(&key);
-                                        }
-                                        // PAN-76: a completed Hound keeps its
-                                        // Fox-admitted slot through the grace,
-                                        // so its final RR73/73 still airs.
-                                        if let Ok(mut s) = fox_set.write() {
-                                            s.remove(&key);
-                                        }
-                                        if let Ok(mut m) = intent_map.write() {
-                                            m.remove(&key);
-                                        }
-                                        if let Ok(mut offsets) = offsets_map.write() {
-                                            offsets.remove(&key);
-                                        }
-                                        info!(
-                                            target: "tx.policy",
-                                            "QSO {} completed — grace elapsed, purging its TX from the active set",
-                                            qid
-                                        );
-                                        promote_pending_manual_calls(
-                                            &promote_mgr,
-                                            &promote_pending,
-                                            &promote_bus,
-                                            &promote_limits,
-                                            &promote_shutdown,
-                                        )
-                                        .await;
-                                    });
-                                }
+                                // PAN-280: the closing 73's TX liveness and its
+                                // grace purge moved to the `Completed` state
+                                // change (`spawn_completed_tx_purge`): this event
+                                // now fires only after that 73 aired.
                                 // Task 5: recompute the ranked active-QSO AP
                                 // state now this QSO has gone terminal — it
                                 // naturally drops out of `get_active_qsos()`,
@@ -8645,6 +8741,15 @@ mod snapshot_tests {
         assert!(item.watchdog_deadline.is_none());
     }
 
+    /// PAN-280: an open at 73 whose 73 never aired has its own failure text.
+    #[test]
+    fn close_not_aired_has_its_own_failure_text() {
+        assert_eq!(
+            super::failure_reason_text(&pancetta_qso::QsoFailureReason::CloseNotAired),
+            "closing 73 not sent, not logged"
+        );
+    }
+
     /// Batch 2 #3: every failure reason maps to an operator-readable string.
     #[test]
     fn failure_reason_text_is_human_readable() {
@@ -9565,6 +9670,122 @@ mod auto_73_tests {
             }
         }
         last
+    }
+
+    /// PAN-280: the 73 of an open at the close logs only when its
+    /// `TxFrameSent` reaches the Qso task's handler.
+    #[tokio::test]
+    async fn tx_frame_sent_commits_a_pending_completion() {
+        let mgr = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        let mut rx = mgr.subscribe();
+        let (qso_id, opened) = mgr
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                pancetta_core::ResponseStep::SeventyThree,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let completed = |rx: &mut tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>| {
+            let mut n = 0;
+            while let Ok(ev) = rx.try_recv() {
+                n += usize::from(matches!(ev, pancetta_qso::QsoEvent::QsoCompleted { .. }));
+            }
+            n
+        };
+        assert_eq!(completed(&mut rx), 0, "nothing logs at queue time");
+        let map: RecentManualCompletions = Arc::new(Mutex::new(HashMap::new()));
+        handle_tx_frame_sent(
+            &mgr,
+            &map,
+            &qso_id.to_string(),
+            "JA1ABC K5ARH 73",
+            &pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1500.0,
+                remote_binding: Some((false, None)),
+            },
+            chrono::Utc::now(),
+            opened.attempt_id(),
+        )
+        .await;
+        assert_eq!(completed(&mut rx), 1);
+    }
+
+    /// PAN-280: a not-sent report reverts a pending completion before the
+    /// PAN-75 ledger rollback, so a re-key's charge on the reopened (active)
+    /// QSO is reversible.
+    #[tokio::test]
+    async fn tx_frame_not_sent_reverts_before_rolling_back_the_ledger() {
+        let mgr = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        let open = |step| {
+            mgr.respond_to_caller_with_outcome(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                step,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+        };
+        let (qso_id, _) = open(pancetta_core::ResponseStep::ReportAck).await.unwrap();
+        let (_, advanced) = open(pancetta_core::ResponseStep::SeventyThree)
+            .await
+            .unwrap();
+        let before_rekey = mgr.get_qso(qso_id).await.unwrap().metadata.call_count;
+        let (_, rekey) = open(pancetta_core::ResponseStep::SeventyThree)
+            .await
+            .unwrap();
+        assert!(matches!(rekey, pancetta_qso::ManualCallOutcome::Resent(_)));
+        assert_eq!(
+            mgr.get_qso(qso_id).await.unwrap().metadata.call_count,
+            before_rekey + 1
+        );
+        let map: RecentManualCompletions = Arc::new(Mutex::new(HashMap::new()));
+        let id = qso_id.to_string();
+        handle_tx_frame_not_sent(
+            &mgr,
+            &map,
+            &id,
+            "JA1ABC K5ARH 73",
+            None,
+            advanced.attempt_id(),
+        )
+        .await;
+        assert!(
+            matches!(
+                mgr.get_qso(qso_id).await.unwrap().state,
+                pancetta_qso::QsoState::Completed { .. }
+            ),
+            "the re-key can still air"
+        );
+        handle_tx_frame_not_sent(&mgr, &map, &id, "JA1ABC K5ARH 73", None, rekey.attempt_id())
+            .await;
+        let after = mgr.get_qso(qso_id).await.unwrap();
+        assert!(matches!(
+            after.state,
+            pancetta_qso::QsoState::SendingReport { .. }
+        ));
+        assert_eq!(
+            after.metadata.call_count, before_rekey,
+            "the reopened QSO is active, so the re-key's charge rolled back"
+        );
     }
 
     /// PAN-280 scenario 2: a completed QSO re-sending 73 is denied at key
@@ -15095,6 +15316,16 @@ mod respond_to_caller_admission_tests {
             .create_channel(ComponentId::Tui)
             .await
             .unwrap();
+        // PAN-280: a TX worker channel, so closing frames are accepted and
+        // stay in flight as on a live station. Without one every
+        // `TransmitRequest` is self-reported not sent, and a Hound opened at
+        // its close is retired `CloseNotAired` instead of entering its grace.
+        let (_tx_worker_tx, tx_worker_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        std::mem::forget(tx_worker_rx);
         coordinator.start_qso_component().await.unwrap();
         let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
 
@@ -18246,6 +18477,120 @@ mod pan50_live_contest {
                 .unwrap()
                 .score,
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod completed_tx_purge_tests {
+    //! PAN-280: a completed QSO's TX liveness starts on the `Completed` state
+    //! change and its grace purge acts only if the key's generation is
+    //! unchanged when the grace ends.
+    use super::{
+        bump_completion_generation, spawn_completed_tx_purge, CompletedTxPurge,
+        CompletionGenerations, QsoCapacityLimits,
+    };
+    use crate::message_bus::MessageBus;
+    use pancetta_qso::{QsoManager, QsoManagerConfig};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+
+    const GRACE: Duration = Duration::from_millis(60);
+
+    struct Sets {
+        generations: CompletionGenerations,
+        active: Arc<RwLock<HashSet<String>>>,
+        fox: Arc<RwLock<HashSet<String>>>,
+        intent: Arc<RwLock<HashMap<String, crate::coordinator::LatestTxIntent>>>,
+        offsets: Arc<RwLock<HashMap<String, f64>>>,
+    }
+
+    fn sets(key: &str) -> Sets {
+        let sets = Sets {
+            generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active: Arc::new(RwLock::new(HashSet::new())),
+            fox: Arc::new(RwLock::new(HashSet::new())),
+            intent: Arc::new(RwLock::new(HashMap::new())),
+            offsets: Arc::new(RwLock::new(HashMap::new())),
+        };
+        sets.active.write().unwrap().insert(key.to_string());
+        sets.offsets
+            .write()
+            .unwrap()
+            .insert(key.to_string(), 1500.0);
+        sets
+    }
+
+    fn spawn(sets: &Sets, key: &str, generation: u64) -> tokio::task::JoinHandle<()> {
+        spawn_completed_tx_purge(CompletedTxPurge {
+            qso_id: pancetta_qso::QsoId::new_v4(),
+            key: key.to_string(),
+            generation,
+            generations: sets.generations.clone(),
+            grace: GRACE,
+            active_tx_qsos: sets.active.clone(),
+            fox_admitted: sets.fox.clone(),
+            latest_tx_intent: sets.intent.clone(),
+            active_tx_offsets: sets.offsets.clone(),
+            qso_manager: QsoManager::new(QsoManagerConfig {
+                our_callsign: "K5ARH".to_string(),
+                ..Default::default()
+            }),
+            pending: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            bus: MessageBus::new(100).expect("bus"),
+            limits: QsoCapacityLimits {
+                max_concurrent: 1,
+                fox_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fox_max_streams: Arc::new(std::sync::atomic::AtomicUsize::new(5)),
+                fox_admitted_qsos: Arc::new(RwLock::new(Default::default())),
+                admission: Arc::new(tokio::sync::Mutex::new(())),
+            },
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn live(sets: &Sets, key: &str) -> bool {
+        sets.active.read().unwrap().contains(key) && sets.offsets.read().unwrap().contains_key(key)
+    }
+
+    #[tokio::test]
+    async fn completed_state_change_keeps_the_73_live_then_purges_after_grace() {
+        let key = "qso-a";
+        let sets = sets(key);
+        let generation = bump_completion_generation(&sets.generations, key);
+        let purge = spawn(&sets, key, generation);
+        assert!(live(&sets, key), "live during the grace");
+        purge.await.unwrap();
+        assert!(!live(&sets, key), "purged once the grace elapsed");
+    }
+
+    #[tokio::test]
+    async fn purge_skips_a_qso_reverted_to_an_active_state() {
+        let key = "qso-b";
+        let sets = sets(key);
+        let generation = bump_completion_generation(&sets.generations, key);
+        let purge = spawn(&sets, key, generation);
+        // The engine reopened the QSO (its 73 was not sent).
+        bump_completion_generation(&sets.generations, key);
+        purge.await.unwrap();
+        assert!(live(&sets, key), "a reopened QSO keeps its TX key");
+    }
+
+    #[tokio::test]
+    async fn purge_of_an_earlier_completion_spares_a_recompletion() {
+        let key = "qso-c";
+        let sets = sets(key);
+        let first = bump_completion_generation(&sets.generations, key);
+        let first_purge = spawn(&sets, key, first);
+        bump_completion_generation(&sets.generations, key); // reverted
+        let third = bump_completion_generation(&sets.generations, key); // completed again
+        first_purge.await.unwrap();
+        assert!(live(&sets, key), "the earlier purge stands down");
+        spawn(&sets, key, third).await.unwrap();
+        assert!(
+            !live(&sets, key),
+            "the re-completion's own purge removes it"
         );
     }
 }
