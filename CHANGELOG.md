@@ -9,11 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - PAN-279: A frame that arrives too late to replace the one on air now goes out in its own next slot instead of being lost. Replacing an autonomous CQ with a newer frame for the same QSO no longer undoes the CQ. A multi-TX stream left out of a bundle now gives back its call count.
-=======
 - PAN-289: A manual call queued for the other window now expires after 10 minutes of real time, including time the computer spent asleep. Before, a call queued just before a sleep could be keyed right after wake. An expired call is also discarded when a QSO finishes, not only by the 15-second check.
->>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
 - PAN-278: When Hamlib's command queue drops the key-down, the frame is now reported as not sent and its audio is not played, so the QSO engine retries it instead of counting it as aired. A tune in that state is abandoned. `--replay` and builds without `pancetta-hamlib` are unchanged.
 - PAN-273: The transmitter now retries its PTT-off at the end of every transmission (normal, multi-stream, tune, clock-step guard and supersede) when Hamlib's queue is momentarily full, and keeps its fallback unkey armed until one is queued. The transmitter's next transmission waits for that fallback unkey first, so it cannot cut the new transmission short. Before, a dropped PTT-off was treated as sent and the rig stayed keyed until Hamlib's 14 s watchdog.
 - A QSO that completes while pancetta is shutting down is now written to `qsos.adi` (PAN-274). Before, quitting during a QSO's final exchange queued its ClubLog, QRZ Logbook, eQSL and cqdx.io uploads but left the QSO out of the logbook. If the logbook writer falls behind the QSO event stream, the log now reports it as an error. A call deferred until another QSO's 73 clears is no longer started once shutdown has begun.

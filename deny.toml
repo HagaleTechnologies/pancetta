@@ -17,13 +17,6 @@ yanked = "deny"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
 ignore = [
-    # PAN-390 accepts the bundled SQLite risk while sqlx 0.8 requires
-    # libsqlite3-sys 0.30. A crafted database and sibling WAL can expose
-    # process memory when opened. This is a temporary risk acceptance,
-    # not a claim that the bundled SQLite is patched. Remove this ignore
-    # once sqlx accepts libsqlite3-sys >=0.39 (SQLite >=3.54.0).
-    { id = "RUSTSEC-2026-0459", reason = "PAN-390: accept bundled SQLite risk pending sqlx support for libsqlite3-sys >=0.39" },
-
     # webpki-roots 0.26.11 is a compatibility shim: it depends on webpki-roots
     # 1.x and re-exports its root list, and Cargo.lock resolves that to 1.0.10,
     # which drops the distrusted emSign root. The advisory matches the shim on
