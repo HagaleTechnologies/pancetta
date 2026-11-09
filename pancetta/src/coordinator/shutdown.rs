@@ -203,16 +203,19 @@ impl super::ApplicationCoordinator {
             }
         }
 
-        // PAN-57/PAN-232: the upload worker. Every QSO component above has
-        // stopped, so no more QSOs complete: ask the upload subscribers to
-        // queue what they hold and let go, then wait for the worker to save
-        // it before the runtime goes away.
-        super::upload_outbox::stop_upload_outbox(
-            self.upload_outbox.take(),
-            self.upload_outbox_task.take(),
-            super::upload_outbox::OutboxTiming::PRODUCTION,
-        )
-        .await;
+        // PAN-57/PAN-232/PAN-274: every QSO component above has stopped, and
+        // promotion starts no queued call once the flag is set, so nothing is
+        // left to complete a QSO. Ask the ADIF subscribers and the upload
+        // subscribers to handle what is still in their channels and finish,
+        // and wait for both (each bounded) before the runtime goes away.
+        tokio::join!(
+            self.adif_subscribers.stop(super::qso::ADIF_SHUTDOWN_DRAIN),
+            super::upload_outbox::stop_upload_outbox(
+                self.upload_outbox.take(),
+                self.upload_outbox_task.take(),
+                super::upload_outbox::OutboxTiming::PRODUCTION,
+            ),
+        );
 
         // Join the TUI relay OS thread
         if let Some(handle) = self.tui_relay_handle.take() {

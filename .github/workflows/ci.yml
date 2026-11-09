@@ -127,6 +127,8 @@ jobs:
               - '**/Cargo.lock'
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
+              # PAN-284: the Workspace Check lane runs this gate on real bench output.
+              - 'scripts/ci/check-criterion-budget.sh'
 
       # PAN-172: a merge group whose cumulative diff (base_sha..head_sha covers every PR
       # ahead in the queue plus this one) touches nothing outside research/notes/ has a
@@ -530,6 +532,17 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --exclude pancetta-research --features transmit
+
+      # PAN-284: one DXCC entity lookup must stay under 2 µs on the CI host.
+      # CI builds no other bench; this one is an acceptance criterion. The rm
+      # drops estimates restored from the rust-cache so only this run counts.
+      - name: DXCC lookup budget (PAN-284)
+        env:
+          CARGO_PROFILE_BENCH_DEBUG: line-tables-only
+        run: |
+          rm -rf target/criterion/dxcc_entity_for_callsign
+          cargo bench -p pancetta-core --bench dxcc_lookup -- --warm-up-time 1 --measurement-time 2 --noplot
+          bash scripts/ci/check-criterion-budget.sh target/criterion/dxcc_entity_for_callsign 2000
 
   # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
   # (development on Mac, production on Windows MiniPC), so a Linux-only

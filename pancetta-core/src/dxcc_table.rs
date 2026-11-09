@@ -1,11 +1,11 @@
-//! AUTO-GENERATED from cty.dat (AD1C BigCTY, https://www.country-files.com/, free for amateur use).
+//! AUTO-GENERATED from cty.dat (AD1C BigCTY, <https://www.country-files.com/>, free for amateur use).
 //! Do not edit by hand — regenerate with:
-//!   python3 pancetta-tui/scripts/gen_dxcc_table.py /path/to/cty.dat \
-//!       > pancetta-tui/src/dxcc_table.rs
+//!   python3 pancetta-core/scripts/gen_dxcc_table.py /path/to/cty.dat \
+//!       > pancetta-core/src/dxcc_table.rs
 //!
 //! Maps callsign prefix -> DXCC entity name.
-//! Entries are sorted by prefix length DESC then alphabetically,
-//! which enables a simple longest-first linear scan.
+//! Entries are sorted by prefix length DESC then alphabetically so a
+//! regeneration diffs cleanly; `crate::dxcc` indexes them by prefix.
 
 pub static PREFIX_TABLE: &[(&str, &str)] = &[
     ("PP0ZF", "Fernando de Noronha"),

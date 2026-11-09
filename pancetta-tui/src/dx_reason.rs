@@ -561,6 +561,7 @@ mod tests {
             network_rank: None,
             source: SpotSource::Local,
             entity_name: None,
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
             rarity_tier: None,
             reporter_count: None,
             is_notable: false,
