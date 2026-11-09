@@ -3583,9 +3583,15 @@ mod key_tests {
                 for &mods in refused {
                     let (mut runner, _cmd_rx, app) = make_runner().await;
                     enter_context(&mut *app.write().await, chord.when);
-                    let _ = runner
+                    let result = runner
                         .handle_key_event(KeyEvent::new(chord.code, mods))
                         .await;
+                    assert!(
+                        matches!(result, Ok(true)),
+                        "row {:?}: {:?}+{mods:?} returned {result:?}",
+                        row.key,
+                        chord.code
+                    );
                     assert!(
                         !runner.dispatched.contains(&chord.action),
                         "row {:?}: {:?}+{mods:?} must not fire {:?}",

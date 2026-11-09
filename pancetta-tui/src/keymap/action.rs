@@ -298,21 +298,78 @@ impl Action {
 
     /// Actions that can key the transmitter (PAN-112 tier A plus `u`, Space
     /// and Callers Enter). Every Main-scope chord for one of these must
-    /// refuse Ctrl and Alt (`Mods::NoCtrlAlt` or `Mods::Bare`).
+    /// refuse Ctrl and Alt (`Mods::NoCtrlAlt` or `Mods::Bare`). Exhaustive
+    /// with no `_` arm, so a new variant must be classified before it compiles.
     pub const fn starts_tx(self) -> bool {
-        matches!(
-            self,
+        match self {
             Action::StartCq
-                | Action::TogglePtt
-                | Action::ToggleTune
-                | Action::NudgeTxOffset
-                | Action::CycleTxPolicy
-                | Action::ToggleAutonomous
-                | Action::EngageHound
-                | Action::ToggleFoxMode
-                | Action::ResendLastTx
-                | Action::CallOrReplySelected
-                | Action::ReplyToSelectedCaller
-        )
+            | Action::TogglePtt
+            | Action::ToggleTune
+            | Action::NudgeTxOffset
+            | Action::CycleTxPolicy
+            | Action::ToggleAutonomous
+            | Action::EngageHound
+            | Action::ToggleFoxMode
+            | Action::ResendLastTx
+            | Action::CallOrReplySelected
+            | Action::ReplyToSelectedCaller => true,
+            Action::EmergencyStop
+            | Action::OpenQuitConfirm
+            | Action::ToggleHelp
+            | Action::OpenDevicePicker
+            | Action::OpenRigPicker
+            | Action::OpenWatchlistModal
+            | Action::OpenFreqModal
+            | Action::OpenOffsetModal
+            | Action::EnterCompose
+            | Action::ComposeHint
+            | Action::OpenDiagnostics
+            | Action::OpenHealth
+            | Action::OpenRecentQsos
+            | Action::OpenWhy
+            | Action::ClearStopBanner
+            | Action::ClearZoom
+            | Action::ToggleZoom
+            | Action::AckReadiness
+            | Action::NextPanel
+            | Action::PrevPanel
+            | Action::QsoCursorUp
+            | Action::QsoCursorDown
+            | Action::ListUp
+            | Action::ListDown
+            | Action::JumpNewest
+            | Action::JumpOldest
+            | Action::ListPageUp
+            | Action::ListPageDown
+            | Action::FocusBandActivity
+            | Action::FocusQsoStatus
+            | Action::FocusCallers
+            | Action::FocusDxHunter
+            | Action::FocusTxPlacement
+            | Action::CycleViewForward
+            | Action::CycleViewBack
+            | Action::PrevReplyStep
+            | Action::NextReplyStep
+            | Action::PlacementCursorLeft
+            | Action::PlacementCursorRight
+            | Action::TxOffsetDown
+            | Action::TxOffsetUp
+            | Action::BandUp
+            | Action::BandDown
+            | Action::StopCq
+            | Action::HaltTx
+            | Action::FindClearOffset
+            | Action::ToggleTxFreqMode
+            | Action::SaveGainPreset
+            | Action::ToggleAutonomousPause
+            | Action::CycleOperatingMode
+            | Action::CycleDecodeEffort
+            | Action::HoundFocusHint
+            | Action::ResendFocusHint
+            | Action::AbortSelectedQso
+            | Action::ParkAtPlacement
+            | Action::ToggleMonitoring
+            | Action::ClearDecodes => false,
+        }
     }
 }
