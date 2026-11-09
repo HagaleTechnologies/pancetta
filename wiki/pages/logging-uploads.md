@@ -41,6 +41,13 @@ worker closes its queue once every `UploadOutboxHandle` is dropped, so a new
 long-lived holder of a handle must also watch `stop_requested()`, or every
 shutdown waits out the 2 s backstop.
 
+Gotcha (PAN-274): the ADIF subscriber does not stop on the shutdown flag
+either. Shutdown calls `AdifSubscribers::stop` after the QSO components are
+joined; the subscriber writes what is left in its channel and shutdown waits
+up to 5 s for it. A new task that writes `qsos.adi` on `QsoCompleted` must
+register with `AdifSubscribers` the same way, or runtime teardown cancels it
+during shutdown.
+
 Gotcha (PAN-122): the local TX log `~/.pancetta/tx-log.jsonl` is written by
 the TX worker directly through `TxFrameLog` (`coordinator/tx_log.rs`), never
 via the message bus, and only once a frame's audio is `Enqueued`. The worker

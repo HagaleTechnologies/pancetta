@@ -222,7 +222,7 @@ Bundles are **not** allowed to silently disagree on parity or collide in frequen
 
 **Opens that add nothing still pass.** `QsoManager::manual_open_adds_active_qso(callsign, tx_off, step)` reports whether a manual open would add an active QSO or resolve to an existing one: FIX 1 re-call of an active manual QSO, FIX 3 one-for-one supersede of any active QSO with that callsign on that band, FIX B `Rr73` re-key of a manual QSO completed within the 45 s rework grace, and `SeventyThree` (opens at `Completed`, never active). Those opens are never refused, so the gate can never block the "repeated manual actions resolve to the existing QSO" invariant. The `manual_open_predicate_matches_real_open_effect` test pins the predicate to the real open functions. `EngageHound` is a manual `respond_to_cq_with` at the Fox's deterministic low calling offset, so `QsoManager::engage_hound_adds_active_qso` applies the same predicate at that offset: pressing Shift+H again on a Fox already being worked continues that QSO and is never refused. `StartCq` always opens a new QSO and skips the predicate.
 
-**Capacity-aware promotion.** `promote_pending_manual_calls` takes `QsoCapacityLimits` and starts at most `cap - active` (saturating) queued calls per run, oldest first; `partition_pending_calls(queue, side, free_slots)` keeps the rest in order. Parity decides which calls may start; capacity decides how many. Each promoted entry consumes a slot even if it later resolves to an existing QSO: that can delay a queued call by one terminal event but never exceeds the cap.
+**Capacity-aware promotion.** `promote_pending_manual_calls` takes `QsoCapacityLimits` and starts at most `cap - active` (saturating) queued calls per run, oldest first; `partition_pending_calls(queue, side, free_slots)` keeps the rest in order. Parity decides which calls may start; capacity decides how many. Each promoted entry consumes a slot even if it later resolves to an existing QSO: that can delay a queued call by one terminal event but never exceeds the cap. Once the shutdown flag is set, promotion starts no queued call; skipped calls stay queued and end with the process. The completed-TX grace task returns as soon as shutdown begins, without purging or promoting (PAN-274).
 
 **Why `tx.rs` is unchanged.** The coalescer's cap stays the per-cycle stream bound for frames already in flight, including the `admitted.len() == 1` fast path. PR #348's history (an active-count floor that defeated the cap, rounds 4→5; an over-cap re-enqueue livelock, round 6) is why admission is enforced here, against `QsoManager`'s true state, instead of being reconstructed from the TX worker's message-driven view. Admission refuses new QSOs at the true count; it never raises the ceiling for QSOs already admitted.
 
@@ -1045,7 +1045,9 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   critical section; `create_channel`'s doc comment says so and
   `pan202_rig_route_is_the_registered_channel` pins it.
 - **Scope.** Only PTT commands use the route. PTT-off from `PttGuard` keeps its PAN-135
-  confirmed-enqueue path (`send_message_retrying`), audio output keeps `send_message_if`
+  confirmed-enqueue path (`send_message_retrying`); since PAN-273 that path is every TX-worker
+  unkey (Step 9, multi-TX, tune, clock-step hold guard, supersede), not only the
+  remote-revocation ones. Audio output keeps `send_message_if`
   (PAN-134's audio recheck), and every other send stays on the table path. The TUI's
   `TogglePtt` builds one message for either state, so its PTT-off takes the helper too, with the
   same best-effort semantics as its old `send_message`.
@@ -1055,6 +1057,44 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   key-down with a `#[cfg(test)]` `KeyDownProbe`, holds the table (`hold_channel_table`), and
   requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
   helper is tested directly.
+
+## A dropped key-down settles the frame as not sent (PAN-278, 2026-11-08)
+
+When `send_ptt_command` came back `SendIfOutcome::Dropped`, the TX worker logged "PTT ON failed"
+and carried on: it slept to the slot, enqueued the audio, and reported `success =
+audio_enqueued`. With Hamlib's channel full or disconnected, the QSO engine got `TxFrameSent`
+and Autonomous got `TransmitComplete { success: true }` for a frame that never keyed the rig. A
+tune in the same state played a tone with no carrier.
+
+- **Guard on the route.** The new path runs only when `MessageBus::has_rig_route()` is true.
+  Without a Hamlib route every PTT-on is `Dropped` by design (replay mode and
+  no-`pancetta-hamlib` builds, see the PAN-202 mechanism bullet above) and the audio is meant to
+  go out, so those modes keep the old proceed path with a reworded warning. Every drop that can
+  happen while a rig exists (a full or disconnected Hamlib channel) takes the new path. The
+  predicate is PAN-273's, copied byte for byte so either branch merges cleanly.
+- **Unwind like a pre-PTT refusal.** Single TX and bundles mirror the `Denied` arm: store
+  `last_ptt_off_ms`, clear `ptt_active`, `ptt_guard.disarm()`, clear this cycle's pivot
+  tombstones, clear the queue status, and report through `report_unaired_frame` (per item for a
+  bundle, with `unwind_bundle_pivots`/`take_bundle_replaced`). That honours the PAN-185 pivot
+  ownership rule: with no pivot the frame sends the failed `TransmitComplete` and its
+  `TxFrameNotSent`; with a pivot only the replaced frame's `TxFrameNotSent` goes out, so nothing
+  settles twice. The tune unwinds the same flag and is abandoned; its `TxStatusGuard` clears the
+  TX badge. The tune's check is `!= Enqueued`, so a receive-gain `Denied` with a route is
+  abandoned too, worded `refused` instead of `dropped`.
+- **No PTT-off.** The PTT-on never entered Hamlib's queue, so there is nothing to unkey;
+  `disarm()` is for frames whose PTT-on was never enqueued.
+- **No remote audit.** The `Denied` arm's `emit_disarm_interrupt_signals` is the remote-arm
+  audit and relay; a bus drop is not an arm event. The drop raises a `tx.ptt` Warn diagnostic
+  instead (`PTT-on dropped (rig not keyed): '<text>' not sent`, `... multi-TX bundle of <n> items
+  not sent`, `Tune: PTT-on dropped (rig not keyed); tune abandoned`).
+- **Gap left open.** Hamlib can still discard an enqueued PTT-on with no acknowledgement to the
+  worker: its command loop skips a key-down during a receive-gain transition, while the restart
+  inhibit is active, or when `hardware_ptt_on` refuses (`coordinator/hamlib.rs`, the `SetPtt`
+  handling). So `TxFrameSent` is still not proof of keying.
+- **Tests.** `pan278_dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
+  after the outcome settles (draining earlier lets the key-down through and hides the defect).
+  It covers single TX, a two-item bundle, a tune, and the no-route proceed path on
+  `worker_harness_without_rig`.
 
 ## High SWR halts the station (PAN-251), 2026-11-01
 

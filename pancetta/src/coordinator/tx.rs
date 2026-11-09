@@ -2718,6 +2718,10 @@ enum PttRelease {
     Delivered,
     /// Every attempt dropped; the guard stays armed.
     Undelivered,
+    /// PAN-273: no Hamlib channel is registered (`--replay`, or a build
+    /// without `pancetta-hamlib`), so no PTT-on was ever enqueued; the guard
+    /// stood down without sending.
+    NoRig,
 }
 
 /// PAN-135: the shortest a disarm flush waits for its ack, and how far
@@ -2801,6 +2805,67 @@ async fn flush_disarmed_audio_confirmed(
     DisarmFlush::WaitedOutPlayback
 }
 
+/// PAN-273 (Codex P2, PR #587): the retrying PTT-off an armed
+/// [`PttGuard`]'s `Drop` spawned, while it may still be outstanding.
+/// Coordinator-owned, so a restarted TX worker shares it. [`PttGuard::new`]
+/// waits for it before reserving the next key-down, so a fallback unkey can
+/// never reach Hamlib's channel after a later PTT-on from the TX worker
+/// (for example the re-key a supersede starts right after an undelivered
+/// release).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingPttOff(
+    std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+);
+
+impl PendingPttOff {
+    /// Record a fallback PTT-off so the next [`Self::settle`] waits for it
+    /// and for any fallback already recorded. Both send independently.
+    fn push(&self, unkey: tokio::task::JoinHandle<()>) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(match slot.take() {
+            None => unkey,
+            Some(earlier) => tokio::task::spawn(async move {
+                let _ = earlier.await;
+                let _ = unkey.await;
+            }),
+        });
+    }
+
+    /// Wait until every fallback PTT-off recorded so far has finished
+    /// (delivered or given up after its bounded retries). If this wait is
+    /// cancelled (worker abort or restart), the unfinished handle goes back
+    /// in the slot, so the next key-down still waits for it.
+    async fn settle(&self) {
+        struct Waiting<'a> {
+            slot: &'a PendingPttOff,
+            unkey: Option<tokio::task::JoinHandle<()>>,
+        }
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if let Some(unkey) = self.unkey.take() {
+                    self.slot.push(unkey);
+                }
+            }
+        }
+        let outstanding = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut waiting = Waiting {
+            slot: self,
+            unkey: outstanding,
+        };
+        if let Some(unkey) = waiting.unkey.as_mut() {
+            let _ = unkey.await;
+        }
+        waiting.unkey = None;
+    }
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -2810,6 +2875,8 @@ struct PttGuard {
     /// cleared on drop (RAII — clears on every exit path incl. abort/panic).
     ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_ptt_off_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Where `Drop` records its fallback PTT-off for the next `new` to await.
+    pending_ptt_off: PendingPttOff,
 }
 
 impl PttGuard {
@@ -2826,13 +2893,22 @@ impl PttGuard {
     /// constructor is `async` accordingly; the wait here is expected to be
     /// negligible (the QSO-manager side never does I/O or hardware calls
     /// while holding it, only channel sends).
+    ///
+    /// PAN-273 (Codex P2, PR #587): first waits for any fallback PTT-off a
+    /// previous armed guard's `Drop` left outstanding (at most its bounded
+    /// retry schedule), so that unkey is serialized ahead of this guard's
+    /// key-down. The TX-worker arms already settle before their audio
+    /// refresh (single, multi) or hard-mute check (tune), so this wait is
+    /// normally a no-op backstop.
     async fn new(
         message_bus: MessageBus,
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ptt_sync_gate: &std::sync::Arc<tokio::sync::Mutex<()>>,
         last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        pending_ptt_off: &PendingPttOff,
     ) -> Self {
+        pending_ptt_off.settle().await;
         {
             let _ptt_sync = ptt_sync_gate.lock().await;
             // Reserve the relocation interlock even if gain currently blocks
@@ -2846,6 +2922,7 @@ impl PttGuard {
             armed: true,
             ptt_active,
             last_ptt_off_ms: last_ptt_off_ms.clone(),
+            pending_ptt_off: pending_ptt_off.clone(),
         }
     }
 
@@ -2854,20 +2931,31 @@ impl PttGuard {
     /// Hamlib applies that channel in order, so any later PTT-on from this
     /// worker lands after this unkey. An enqueued PTT-off is handed off.
     /// If every attempt drops, the guard stays armed (its `Drop` retries on
-    /// scope exit) and `ptt_active` stays true until then; Hamlib's 14 s
+    /// scope exit, and the next [`Self::new`] waits for that retry before
+    /// keying) and `ptt_active` stays true until then; Hamlib's 14 s
     /// PTT watchdog is the remaining backstop.
+    ///
+    /// PAN-273: every TX-worker unkey after a key-down goes through here
+    /// (Step 9, multi-TX, tune, the clock-step hold guard and supersede),
+    /// never through a best-effort `send_message` followed by `disarm()`.
+    /// With no Hamlib channel registered nothing was keyed, so the guard
+    /// stands down at once and returns [`PttRelease::NoRig`].
     async fn release(&mut self, context: &str) -> PttRelease {
+        if !self.message_bus.has_rig_route() {
+            debug!(
+                target: "pancetta::tx.ptt",
+                "{context}: no Hamlib channel registered; nothing to unkey"
+            );
+            self.stand_down();
+            return PttRelease::NoRig;
+        }
         match self
             .message_bus
             .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
             .await
         {
             Ok(true) => {
-                self.last_ptt_off_ms
-                    .store(super::now_epoch_ms(), Ordering::Release);
-                self.ptt_active
-                    .store(false, std::sync::atomic::Ordering::Release);
-                self.armed = false;
+                self.stand_down();
                 PttRelease::Delivered
             }
             Ok(false) | Err(_) => {
@@ -2881,7 +2969,19 @@ impl PttGuard {
         }
     }
 
-    /// Disarm the guard after PTT-off has been sent normally.
+    /// The unkey is handed off (or nothing was keyed): stamp the PTT-off
+    /// time, clear the keyed flag, and stand the `Drop` fallback down.
+    fn stand_down(&mut self) {
+        self.last_ptt_off_ms
+            .store(super::now_epoch_ms(), Ordering::Release);
+        self.ptt_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.armed = false;
+    }
+
+    /// Stand the guard down when no PTT-on was enqueued (before the key-down
+    /// send, or after a `Denied` one). Every unkey after a key-down uses
+    /// [`Self::release`] (PAN-273).
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -7169,12 +7269,10 @@ impl Drop for PttGuard {
             .store(false, std::sync::atomic::Ordering::Release);
         if self.armed {
             let bus = self.message_bus.clone();
-            // Spawn a fire-and-forget task to send PTT-off.
-            // This runs even if the parent task was cancelled.
-            // rationale: intentional detach — `spawn` runs the task independently;
-            // the dropped JoinHandle is the canonical fire-and-forget idiom.
-            #[allow(clippy::let_underscore_future)]
-            let _ = tokio::task::spawn(async move {
+            // Spawn a task to send PTT-off. This runs even if the parent task
+            // was cancelled. PAN-273 (Codex P2, PR #587): its handle goes in
+            // the shared slot so the TX worker's next key-down waits for it.
+            self.pending_ptt_off.push(tokio::task::spawn(async move {
                 match bus
                     .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
                     .await
@@ -7189,7 +7287,7 @@ impl Drop for PttGuard {
                     ),
                     Err(e) => tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e),
                 }
-            });
+            }));
         }
     }
 }
@@ -7345,10 +7443,7 @@ async fn supersede_and_rekey_or_bundle(
     message_text: &mut String,
     frequency_offset: &mut f64,
     schedule: &mut TxSchedule,
-    message_bus: &crate::message_bus::MessageBus,
-    ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-    last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ptt_guard: &mut PttGuard,
     tx_late_max_ms_eff: u64,
     sample_rate: u32,
     slot_ns: i64,
@@ -7362,26 +7457,21 @@ async fn supersede_and_rekey_or_bundle(
     // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
     // superseding message's type or its schedulability. EVERY return path out of
     // this function (viable re-key, too-late defer, or a non-re-keyable
-    // `MultiTransmitRequest`) must leave PTT off, because both callers assume it:
-    // the multi-TX arm unconditionally `ptt_guard.disarm()`s (skipping the
-    // guard's own Drop PTT-off) right after this returns, and the single-TX arm
-    // relies on PTT already being off on its `NotViable`/`Replace`/`Bundle`
-    // arms. Doing this up front (rather than after the `TransmitRequest`
+    // `MultiTransmitRequest`) must unkey, because both callers assume it.
+    // Doing this up front (rather than after the `TransmitRequest`
     // destructure) is what fixes the stuck-PTT bug when the superseding message
     // is a `MultiTransmitRequest`. (The aborted transmission's audio may still
     // be draining from the ring buffer; PTT-off means that's harmless — the
     // flush happens next, before new audio is pushed in Step 7 of the retry.)
-    let ptt_off_msg = ComponentMessage::new(
-        ComponentId::Ft8Transmitter,
-        ComponentId::Hamlib,
-        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false }),
-        Instant::now(),
-    );
-    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-        warn!("supersede: PTT OFF failed: {}", e);
-    }
-    last_ptt_off_ms.store(super::now_epoch_ms(), Ordering::Release);
-    ptt_active.store(false, Ordering::Release);
+    //
+    // PAN-273: the unkey goes through the caller's guard. A delivered
+    // PTT-off stands the guard down (stamps `last_ptt_off_ms`, clears
+    // `ptt_active`); an undelivered one leaves it armed so its `Drop`
+    // retries when the caller's arm exits. Callers never `disarm()` after
+    // this returns. A `Replace`/`Bundle` re-key after an undelivered
+    // release is serialized behind that retry: the re-key's
+    // `PttGuard::new` waits for it before keying (Codex P2, PR #587).
+    ptt_guard.release("Supersede").await;
 
     let (
         new_attempt_id,
@@ -7411,6 +7501,7 @@ async fn supersede_and_rekey_or_bundle(
         ),
         // A `MultiTransmitRequest` arriving as the superseding message isn't
         // re-keyable content here (Phase 1 manual triggers are single
+<<<<<<< HEAD
         // requests) — not viable. PTT was already deasserted above, so the
         // caller can safely disarm its guard. Both callers requeue the
         // returned bundle at the front of the TX inbox (PAN-279).
@@ -7419,6 +7510,14 @@ async fn supersede_and_rekey_or_bundle(
                 superseder: Box::new(other),
             }
         }
+=======
+        // requests) — not viable. PTT was already released above through the
+        // caller's guard, so the caller can abandon this message. The
+        // multi-TX caller re-enqueues the dropped bundle (see
+        // `supersede_multi_reenqueue`); the single-TX caller drops it (an
+        // already-accepted Phase-1 gap for single-request supersedes).
+        return SupersedeOutcome::NotViable;
+>>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
     };
 
     let now = chrono::Utc::now();
@@ -7463,7 +7562,6 @@ async fn supersede_and_rekey_or_bundle(
     *message_text = new_text.clone();
     *frequency_offset = new_freq;
     *schedule = new_schedule;
-    let _ = last_ptt_on_ms; // re-stamped by PttGuard when Step 5 re-asserts PTT
 
     // Prefer folding the new request into a multi-TX bundle alongside the
     // in-flight content when the station runs concurrent QSOs. The actual
@@ -7623,8 +7721,9 @@ async fn supersede_and_rekey_or_bundle(
 /// [`tx_outcome::settle_unaired_frame`]; an item whose QSO the requeued
 /// successor carries leaves the Autonomous outcome to it (PAN-279).
 ///
-/// In every case `supersede_and_rekey_or_bundle` has already deasserted PTT, so
-/// the caller safely disarms its `PttGuard` and `continue`s after this returns.
+/// In every case `supersede_and_rekey_or_bundle` has already released PTT
+/// through the caller's `PttGuard` (PAN-273), so the caller `continue`s after
+/// this returns.
 /// In-flight bundle items a `NotViable` multi-TX supersede really abandons:
 /// every item, except those `reenqueued` (the incoming bundle put back on the
 /// queue) carries unchanged for the same QSO under the same authorization,
@@ -7799,9 +7898,7 @@ async fn supersede_multi_reenqueue(
     tx_params: &pancetta_ft8::ProtocolParams,
     message_bus: &crate::message_bus::MessageBus,
     inbox: &TxInbox,
-    ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-    last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ptt_guard: &mut PttGuard,
     tx_late_max_ms_eff: u64,
     sample_rate: u32,
     slot_ns: i64,
@@ -7826,10 +7923,7 @@ async fn supersede_multi_reenqueue(
         &mut scratch_text,
         &mut scratch_freq,
         &mut scratch_schedule,
-        message_bus,
-        ptt_active,
-        last_ptt_on_ms,
-        last_ptt_off_ms,
+        ptt_guard,
         tx_late_max_ms_eff,
         sample_rate,
         slot_ns,
@@ -8224,6 +8318,8 @@ impl super::ApplicationCoordinator {
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
             let last_ptt_off_ms = self.last_ptt_off_ms.clone();
+            // PAN-273: the armed-guard drop fallback each key-down waits for.
+            let pending_ptt_off = self.pending_ptt_off.clone();
             // Active slot period (FT8 = 15e9 ns, FT4 = 7.5e9 ns), set once at
             // startup from `[rig].mode`. The TX scheduler keys against this so
             // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
@@ -9443,6 +9539,11 @@ impl super::ApplicationCoordinator {
                                         // real FT8 slot grid regardless of how long the steps
                                         // above took. See
                                         // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                        // PAN-273: wait out an outstanding drop-fallback
+                                        // PTT-off (e.g. after an undelivered supersede
+                                        // release) before the refresh, so the wait cannot
+                                        // misalign the audio.
+                                        pending_ptt_off.settle().await;
                                         let (fresh_pad_samples, fresh_cursor_samples) =
                                             pad_and_cursor_for_target(
                                                 chrono::Utc::now(),
@@ -9685,6 +9786,7 @@ impl super::ApplicationCoordinator {
                                             &ptt_sync_gate,
                                             &last_ptt_on_ms,
                                             &last_ptt_off_ms,
+                                            &pending_ptt_off,
                                         )
                                         .await;
                                         // TX badge on; guard drop clears it on every
@@ -10061,8 +10163,62 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue 'worker;
                                             }
+                                            // PAN-278: the bus dropped the key-down (full or
+                                            // disconnected Hamlib channel), so the rig was
+                                            // never keyed. Unwind like a pre-PTT refusal:
+                                            // nothing entered Hamlib's queue, so there is no
+                                            // PTT-off to send. Report the frame as not sent and
+                                            // play no audio. Without a Hamlib route (`--replay`,
+                                            // builds without `pancetta-hamlib`) every PTT-on is
+                                            // dropped by design and the audio still goes out,
+                                            // so that case keeps the arm below.
+                                            SendIfOutcome::Dropped
+                                                if message_bus.has_rig_route() =>
+                                            {
+                                                last_ptt_off_ms.store(
+                                                    super::now_epoch_ms(),
+                                                    Ordering::Release,
+                                                );
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                let pivot_replaced =
+                                                    pivoted_this_key.take().and_then(|key| {
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
+                                                warn!(
+                                                    target: "pancetta::tx.ptt",
+                                                    "PTT-on dropped by the bus (rig not keyed): '{}' not sent",
+                                                    message_text
+                                                );
+                                                emit_diagnostic(
+                                                    &message_bus,
+                                                    "tx.ptt",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!(
+                                                        "PTT-on dropped (rig not keyed): '{message_text}' not sent"
+                                                    ),
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    message_text,
+                                                    qso_id.clone(),
+                                                    attempt_id,
+                                                    pivot_replaced,
+                                                )
+                                                .await;
+                                                continue 'worker;
+                                            }
                                             SendIfOutcome::Dropped => {
-                                                warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
+                                                warn!("PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)");
                                             }
                                         }
 
@@ -10079,28 +10235,7 @@ impl super::ApplicationCoordinator {
                                         // `ptt_lead_ms` + PTT_HOLD_SLACK_MS; release PTT
                                         // FIRST, exactly like `SleepOutcome::AbortedByDisarm`.
                                         if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Clock-step PTT hold guard: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            last_ptt_off_ms
-                                                .store(super::now_epoch_ms(), Ordering::Release);
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            ptt_guard.release("Clock-step PTT hold guard").await;
                                             // Pre-slot abort: nothing reached the air, so a
                                             // Step 4c pivot tombstone must go too (same as
                                             // the AbortedByDisarm branch below).
@@ -10262,10 +10397,7 @@ impl super::ApplicationCoordinator {
                                                     &mut message_text,
                                                     &mut frequency_offset,
                                                     &mut schedule,
-                                                    &message_bus,
-                                                    &ptt_active,
-                                                    &last_ptt_on_ms,
-                                                    &last_ptt_off_ms,
+                                                    &mut ptt_guard,
                                                     tx_late_max_ms_effective(
                                                         active_protocol,
                                                         tx_late_max_ms,
@@ -10297,7 +10429,7 @@ impl super::ApplicationCoordinator {
                                                         // leave the retry loop and fall through to
                                                         // the next dequeue. The armed PttGuard's
                                                         // drop is the PTT-off safety net if the
-                                                        // explicit send failed.
+                                                        // supersede's release was not delivered.
                                                         // PAN-75: the abandoned frame gets the same
                                                         // failed completion as the `Replace` arm's
                                                         // below, so the QSO engine hands back its
@@ -10330,10 +10462,10 @@ impl super::ApplicationCoordinator {
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
-                                                        // flush stale audio at Step 7, clear the
-                                                        // abort flag the supersede set, and disarm
-                                                        // this iteration's PttGuard (PTT-off was
-                                                        // already sent; Step 5 re-asserts on retry).
+                                                        // flush stale audio at Step 7, and clear the
+                                                        // abort flag the supersede set. The supersede
+                                                        // already released this iteration's PttGuard
+                                                        // (PAN-273; Step 5 re-asserts on retry).
                                                         // Re-point `origin` at the SUPERSEDING
                                                         // request's origin so Step 4b-arm gates the
                                                         // frame that is actually about to transmit,
@@ -10368,7 +10500,6 @@ impl super::ApplicationCoordinator {
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
-                                                        ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -10418,6 +10549,7 @@ impl super::ApplicationCoordinator {
                                                                         bundle_remote_client_key_id,
                                                                 };
                                                             // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
+<<<<<<< HEAD
                                                             inbox.requeue_front(vec![
                                                                 self_message(successor.clone()),
                                                             ]);
@@ -10431,6 +10563,9 @@ impl super::ApplicationCoordinator {
                                                             )
                                                             .await;
                                                             ptt_guard.disarm();
+=======
+                                                            inbox.requeue_front(vec![bundle_msg]);
+>>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -10471,7 +10606,6 @@ impl super::ApplicationCoordinator {
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
-                                                        ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -10748,10 +10882,7 @@ impl super::ApplicationCoordinator {
                                                     &mut message_text,
                                                     &mut frequency_offset,
                                                     &mut schedule,
-                                                    &message_bus,
-                                                    &ptt_active,
-                                                    &last_ptt_on_ms,
-                                                    &last_ptt_off_ms,
+                                                    &mut ptt_guard,
                                                     tx_late_max_ms_effective(
                                                         active_protocol,
                                                         tx_late_max_ms,
@@ -10840,7 +10971,6 @@ impl super::ApplicationCoordinator {
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
-                                                        ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -10877,6 +11007,7 @@ impl super::ApplicationCoordinator {
                                                                         bundle_remote_client_key_id,
                                                                 };
                                                             // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
+<<<<<<< HEAD
                                                             inbox.requeue_front(vec![
                                                                 self_message(successor.clone()),
                                                             ]);
@@ -10890,6 +11021,9 @@ impl super::ApplicationCoordinator {
                                                             )
                                                             .await;
                                                             ptt_guard.disarm();
+=======
+                                                            inbox.requeue_front(vec![bundle_msg]);
+>>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -10921,7 +11055,6 @@ impl super::ApplicationCoordinator {
                                                         is_rekey = true;
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
-                                                        ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -10980,24 +11113,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue 'worker;
                                         }
-                                        let ptt_off_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetPtt {
-                                                    state: false,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
-                                        {
-                                            warn!(
-                                                "PTT OFF failed (rig may be stuck in TX!): {}",
-                                                e
-                                            );
-                                        }
-                                        ptt_guard.disarm();
+                                        ptt_guard.release("Step 9 unkey").await;
 
                                         // --- Step 10: Send TransmitComplete ---
                                         if let Err(e) = report_played_transmit_complete(
@@ -12607,6 +12723,9 @@ impl super::ApplicationCoordinator {
                                     // above (adaptive coalesce window, encoding,
                                     // possible key-time re-encode) took. See
                                     // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                    // PAN-273: wait out an outstanding drop-fallback
+                                    // PTT-off before the refresh (see the single-TX arm).
+                                    pending_ptt_off.settle().await;
                                     let (fresh_pad_samples, fresh_cursor_samples) =
                                         pad_and_cursor_for_target(
                                             chrono::Utc::now(),
@@ -12669,6 +12788,7 @@ impl super::ApplicationCoordinator {
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
                                         &last_ptt_off_ms,
+                                        &pending_ptt_off,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -13102,8 +13222,60 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
+                                        // PAN-278: the bus dropped the bundle's key-down
+                                        // (full or disconnected Hamlib channel), so the rig
+                                        // was never keyed. Unwind like the `Denied` arm, with
+                                        // no PTT-off (nothing entered Hamlib's queue), and
+                                        // settle every item as not sent. Without a Hamlib
+                                        // route (`--replay`, builds without
+                                        // `pancetta-hamlib`) the drop is by design and the
+                                        // audio still goes out, so that case keeps the arm
+                                        // below.
+                                        SendIfOutcome::Dropped if message_bus.has_rig_route() => {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let mut bundle_replaced = unwind_bundle_pivots(
+                                                &pivoted_this_bundle_keys,
+                                                &mut pivoted_once,
+                                                &mut pivoted_from,
+                                            );
+                                            warn!(
+                                                target: "pancetta::tx.ptt",
+                                                "PTT-on dropped by the bus (rig not keyed): multi-TX bundle of {} items not sent",
+                                                items.len()
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.ptt",
+                                                pancetta_core::DiagnosticLevel::Warn,
+                                                format!(
+                                                    "PTT-on dropped (rig not keyed): multi-TX bundle of {} items not sent",
+                                                    items.len()
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for item in &items {
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    item.attempt_id,
+                                                    take_bundle_replaced(
+                                                        &mut bundle_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            continue;
+                                        }
                                         SendIfOutcome::Dropped => {
-                                            warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
+                                            warn!("PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)");
                                         }
                                     }
 
@@ -13119,27 +13291,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-114 (D6): never hold PTT through a backward clock
                                     // step — see the single-TX arm's identical guard.
                                     if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
-                                        let ptt_off_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetPtt {
-                                                    state: false,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
-                                        {
-                                            warn!(
-                                                "Clock-step PTT hold guard: PTT OFF failed: {}",
-                                                e
-                                            );
-                                        }
-                                        last_ptt_off_ms
-                                            .store(super::now_epoch_ms(), Ordering::Release);
-                                        ptt_active.store(false, Ordering::Release);
-                                        ptt_guard.disarm();
+                                        ptt_guard.release("Clock-step PTT hold guard").await;
                                         // Pre-slot abort: nothing reached the air yet.
                                         let mut bundle_replaced = unwind_bundle_pivots(
                                             &pivoted_this_bundle_keys,
@@ -13276,9 +13428,7 @@ impl super::ApplicationCoordinator {
                                                 &tx_params,
                                                 &message_bus,
                                                 &inbox,
-                                                &ptt_active,
-                                                &last_ptt_on_ms,
-                                                &last_ptt_off_ms,
+                                                &mut ptt_guard,
                                                 tx_late_max_ms_effective(
                                                     active_protocol,
                                                     tx_late_max_ms,
@@ -13300,7 +13450,6 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             )
                                             .await;
-                                            ptt_guard.disarm();
                                             continue;
                                         }
                                     }
@@ -13573,9 +13722,7 @@ impl super::ApplicationCoordinator {
                                                 &tx_params,
                                                 &message_bus,
                                                 &inbox,
-                                                &ptt_active,
-                                                &last_ptt_on_ms,
-                                                &last_ptt_off_ms,
+                                                &mut ptt_guard,
                                                 tx_late_max_ms_effective(
                                                     active_protocol,
                                                     tx_late_max_ms,
@@ -13597,7 +13744,6 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             )
                                             .await;
-                                            ptt_guard.disarm();
                                             continue;
                                         }
                                     }
@@ -13653,20 +13799,7 @@ impl super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
-                                    let ptt_off_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: false,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        warn!("PTT OFF failed (rig may be stuck in TX!): {}", e);
-                                    }
-                                    ptt_guard.disarm();
+                                    ptt_guard.release("Multi-TX Step 9 unkey").await;
 
                                     // --- Step 10: Send TransmitComplete for each item ---
                                     for ((text, qso_id), item) in item_texts
@@ -13700,6 +13833,9 @@ impl super::ApplicationCoordinator {
                                 } => {
                                     info!("Tune: {}s tone at {} Hz", duration_secs, tone_offset_hz);
                                     TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    // PAN-273: wait out an outstanding drop-fallback
+                                    // PTT-off before the gates below, not after them.
+                                    pending_ptt_off.settle().await;
 
                                     // --- TX-policy hard mute ---
                                     // A tune carrier is a transmission. If the
@@ -13794,6 +13930,7 @@ impl super::ApplicationCoordinator {
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
                                         &last_ptt_off_ms,
+                                        &pending_ptt_off,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -13843,16 +13980,56 @@ impl super::ApplicationCoordinator {
 
                                     #[cfg(test)]
                                     key_down_probe.pause_if_armed().await;
-                                    if send_ptt_command(
+                                    let ptt_on = send_ptt_command(
                                         &message_bus,
                                         ComponentId::Ft8Transmitter,
                                         true,
                                         || true,
-                                    ) != SendIfOutcome::Enqueued
-                                    {
-                                        warn!(
-                                            "Tune: PTT ON failed (rig not keyed): message dropped"
-                                        );
+                                    );
+                                    if ptt_on != SendIfOutcome::Enqueued {
+                                        // `Denied` here is the receive-gain gate, never
+                                        // `authorize` (always true for a tune).
+                                        let dropped = ptt_on == SendIfOutcome::Dropped;
+                                        // PAN-278: with a Hamlib route the key-down was
+                                        // dropped (full or disconnected channel) or
+                                        // refused, so the rig was never keyed. Abandon
+                                        // the tune rather than play a tone with no
+                                        // carrier. Unwind the in-process flag like the
+                                        // band-plan refusal above: nothing entered
+                                        // Hamlib's queue, so there is no PTT-off to send.
+                                        // Without a route (`--replay`, builds without
+                                        // `pancetta-hamlib`) the drop is by design and the
+                                        // tone still plays.
+                                        if message_bus.has_rig_route() {
+                                            last_ptt_off_ms
+                                                .store(super::now_epoch_ms(), Ordering::Release);
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let why = if dropped { "dropped" } else { "refused" };
+                                            warn!(
+                                                target: "pancetta::tx.ptt",
+                                                "Tune: PTT-on {} (rig not keyed); tune ({}s @ {} Hz) abandoned",
+                                                why, duration_secs, tone_offset_hz
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.ptt",
+                                                pancetta_core::DiagnosticLevel::Warn,
+                                                format!(
+                                                    "Tune: PTT-on {why} (rig not keyed); tune abandoned"
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        if dropped {
+                                            warn!(
+                                                "Tune: PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)"
+                                            );
+                                        } else {
+                                            warn!("Tune: PTT ON refused (rig not keyed)");
+                                        }
                                     }
 
                                     // Emit the audio buffer.
@@ -13896,23 +14073,7 @@ impl super::ApplicationCoordinator {
 
                                     // Natural completion: explicit PTT-off
                                     // (matches the regular TX path).
-                                    let ptt_off_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: false,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        warn!(
-                                            "Tune: PTT OFF failed (rig may be stuck in TX!): {}",
-                                            e
-                                        );
-                                    }
-                                    ptt_guard.disarm();
+                                    ptt_guard.release("Tune unkey").await;
                                     info!("Tune: complete");
                                 }
 
@@ -16571,6 +16732,183 @@ mod supersede_rekey_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
+    /// PAN-273: the supersede helpers unkey through the caller's guard, so
+    /// tests hand them one keyed the way the worker's arm does.
+    pub(super) async fn keyed_guard(
+        bus: &MessageBus,
+        ptt_active: &Arc<AtomicBool>,
+        last_ptt_on_ms: &Arc<AtomicU64>,
+        last_ptt_off_ms: &Arc<AtomicU64>,
+    ) -> PttGuard {
+        PttGuard::new(
+            bus.clone(),
+            ptt_active.clone(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            last_ptt_on_ms,
+            last_ptt_off_ms,
+            &PendingPttOff::default(),
+        )
+        .await
+    }
+
+    fn ptt_offs(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> usize {
+        rx.try_iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: false
+                    })
+                )
+            })
+            .count()
+    }
+
+    fn viable_single_replace(now: chrono::DateTime<chrono::Utc>) -> (MessageType, TxSchedule) {
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
+            message_text: "NEW TEXT".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        (new_request, schedule)
+    }
+
+    /// PAN-273 scenario 1 at the supersede helper: Hamlib's channel is full
+    /// for the whole release window. The re-key decision still stands, but
+    /// the guard stays armed and keyed (no PTT-off was queued), and its
+    /// `Drop` delivers the unkey once Hamlib catches up. Before, the helper
+    /// returned `Replace` with `ptt_active=false` and nothing delivered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_into_a_full_hamlib_channel_keeps_the_guard_armed() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap());
+        let now = chrono::Utc::now();
+        let (new_request, mut schedule) = viable_single_replace(now);
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &mut guard,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            1,
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(outcome, super::SupersedeOutcome::Replace { .. }));
+        assert!(guard.armed, "an undelivered unkey keeps the fallback armed");
+        assert!(
+            ptt_active.load(Ordering::Acquire),
+            "no PTT-off was queued: the rig is still keyed"
+        );
+        assert_eq!(ptt_offs(&hamlib_rx), 0, "the channel was full throughout");
+
+        // Hamlib catches up; the armed guard's Drop delivers the unkey.
+        drop(guard);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            ptt_offs(&hamlib_rx),
+            1,
+            "the guard's Drop unkeys exactly once"
+        );
+        assert!(!ptt_active.load(Ordering::Acquire));
+    }
+
+    /// PAN-273: room frees inside the release window, so the supersede's own
+    /// retry queues the PTT-off and stands the guard down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supersede_retries_ptt_off_until_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap());
+        let drain = hamlib_rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = drain.try_recv();
+        });
+        let now = chrono::Utc::now();
+        let (new_request, mut schedule) = viable_single_replace(now);
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &mut guard,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            1,
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(outcome, super::SupersedeOutcome::Replace { .. }));
+        assert_eq!(ptt_offs(&hamlib_rx), 1, "the retry queued the unkey");
+        assert!(!guard.armed, "a delivered unkey stands the guard down");
+        assert!(!ptt_active.load(Ordering::Acquire));
+        assert!(last_ptt_off_ms.load(Ordering::Acquire) > 0);
+    }
+
     /// The core Phase-1 re-key decision: a genuinely different superseding
     /// request that can still make this slot must deassert PTT and swap the
     /// working `message_text`/`frequency_offset`/`schedule` in place so the
@@ -16613,15 +16951,13 @@ mod supersede_rekey_tests {
         };
 
         // max_concurrent_qsos == 1 → single-item replace (Task 6 behavior).
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16730,15 +17066,13 @@ mod supersede_rekey_tests {
         };
 
         // max_concurrent_qsos == 1 → the single-TX arm's `Replace` path.
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16878,15 +17212,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -16973,15 +17305,13 @@ mod supersede_rekey_tests {
                 remote_client_key_id: new_id.map(str::to_string),
             };
 
+            let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
                 &mut message_text,
                 &mut frequency_offset,
                 &mut schedule,
-                &bus,
-                &ptt_active,
-                &last_ptt_on_ms,
-                &last_ptt_off_ms,
+                &mut guard,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -17064,15 +17394,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: Some("client-a".to_string()),
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17157,15 +17485,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: Some("client-b".to_string()),
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17281,15 +17607,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17395,15 +17719,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17503,15 +17825,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17600,15 +17920,13 @@ mod supersede_rekey_tests {
             };
 
             // max_concurrent_qsos == 1 → the single-TX arm's Replace path.
+            let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
                 &mut message_text,
                 &mut frequency_offset,
                 &mut schedule,
-                &bus,
-                &ptt_active,
-                &last_ptt_on_ms,
-                &last_ptt_off_ms,
+                &mut guard,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -17736,15 +18054,13 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             };
 
+            let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
                 &mut message_text,
                 &mut frequency_offset,
                 &mut schedule,
-                &bus,
-                &ptt_active,
-                &last_ptt_on_ms,
-                &last_ptt_off_ms,
+                &mut guard,
                 20_000,
                 12_000,
                 pancetta_core::slot::SLOT_NS,
@@ -17806,15 +18122,13 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         };
 
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             8000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -17840,8 +18154,8 @@ mod supersede_rekey_tests {
         );
         // Even on the wrong-type NotViable path, PTT must be deasserted (the
         // stuck-PTT bug: PTT-off used to sit AFTER the destructure and never
-        // ran here). This is what makes the multi-TX arm's unconditional
-        // `ptt_guard.disarm()` safe.
+        // ran here). Since PAN-273 the release goes through the caller's
+        // guard, so the multi-TX arm no longer disarms after it.
         assert!(
             !ptt_active.load(Ordering::Acquire),
             "PTT must be deasserted even when the supersede is declined"
@@ -17852,8 +18166,8 @@ mod supersede_rekey_tests {
     /// the stuck-PTT bug it had: when a `MultiTransmitRequest` supersedes an
     /// in-flight multi-TX bundle, `supersede_multi_reenqueue` must (1) actually
     /// deassert PTT — both the `ptt_active` flag AND a real `SetPtt{false}`
-    /// message on the Hamlib channel (the multi-TX arm's `ptt_guard.disarm()`
-    /// otherwise leaves the rig physically keyed) — and (2) re-enqueue the
+    /// message on the Hamlib channel (a flag-only unkey would leave the rig
+    /// physically keyed) — and (2) re-enqueue the
     /// superseding bundle rather than silently dropping it.
     #[tokio::test(flavor = "current_thread")]
     async fn multi_reenqueue_deasserts_ptt_and_reenqueues_superseding_bundle() {
@@ -17910,6 +18224,7 @@ mod supersede_rekey_tests {
         let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -17921,9 +18236,7 @@ mod supersede_rekey_tests {
             &tx_params,
             &bus,
             &inbox,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18038,6 +18351,7 @@ mod supersede_rekey_tests {
         let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -18049,9 +18363,7 @@ mod supersede_rekey_tests {
             &tx_params,
             &bus,
             &inbox,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18178,6 +18490,7 @@ mod supersede_rekey_tests {
         let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -18189,9 +18502,7 @@ mod supersede_rekey_tests {
             &tx_params,
             &bus,
             &inbox,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18695,6 +19006,7 @@ mod supersede_rekey_tests {
         let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
 
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -18706,9 +19018,7 @@ mod supersede_rekey_tests {
             &tx_params,
             &bus,
             &inbox,
-            &ptt_active,
-            &last_ptt_on_ms,
-            &last_ptt_off_ms,
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18883,16 +19193,14 @@ mod supersede_rekey_tests {
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
             let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
+            let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             outcomes.push(
                 super::supersede_and_rekey_or_bundle(
                     refresh(),
                     &mut message_text,
                     &mut frequency_offset,
                     &mut schedule,
-                    &bus,
-                    &ptt_active,
-                    &last_ptt_on_ms,
-                    &last_ptt_off_ms,
+                    &mut guard,
                     20_000,
                     12_000,
                     pancetta_core::slot::SLOT_NS,
@@ -18968,6 +19276,13 @@ mod supersede_rekey_tests {
             12_000,
             pancetta_core::slot::SLOT_NS,
         );
+        let mut guard = keyed_guard(
+            &bus,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await;
         let outcome = super::supersede_and_rekey_or_bundle(
             MessageType::TransmitRequest {
                 attempt_id: None,
@@ -18981,10 +19296,7 @@ mod supersede_rekey_tests {
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &Arc::new(AtomicBool::new(true)),
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU64::new(0)),
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -22738,6 +23050,29 @@ mod pan115_worker_gate_tests {
         prepare: impl FnOnce(&mut ApplicationCoordinator),
         arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
     ) -> Harness {
+        build_worker_harness(cfg, prepare, arm_clock, true).await
+    }
+
+    /// [`worker_harness`] with no Hamlib channel registered, as in
+    /// `--replay` or a build without `pancetta-hamlib`: the bus has no rig
+    /// route, so every PTT-on comes back `Dropped` by design (PAN-278).
+    /// `hamlib_rx` is a detached receiver that never sees a message.
+    pub(crate) async fn worker_harness_without_rig() -> Harness {
+        build_worker_harness(
+            Config::default(),
+            |_| {},
+            Arc::new(pancetta_agent::arm::ArmTime::now),
+            false,
+        )
+        .await
+    }
+
+    async fn build_worker_harness(
+        cfg: Config,
+        prepare: impl FnOnce(&mut ApplicationCoordinator),
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+        register_rig: bool,
+    ) -> Harness {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
             cfg,
@@ -22772,10 +23107,14 @@ mod pan115_worker_gate_tests {
             .hamlib_command_loop_ready
             .store(true, Ordering::Release);
         let bus = coordinator.message_bus.clone();
-        let (_, hamlib_rx) = bus
-            .get_or_create_channel(ComponentId::Hamlib)
-            .await
-            .unwrap();
+        let hamlib_rx = if register_rig {
+            bus.get_or_create_channel(ComponentId::Hamlib)
+                .await
+                .unwrap()
+                .1
+        } else {
+            crossbeam_channel::bounded(1).1
+        };
         let (_, autonomous_rx) = bus
             .get_or_create_channel(ComponentId::Autonomous)
             .await
@@ -25386,6 +25725,7 @@ mod pan135_ptt_release_tests {
             &Arc::new(tokio::sync::Mutex::new(())),
             &Arc::new(AtomicU64::new(0)),
             &Arc::new(AtomicU64::new(0)),
+            &PendingPttOff::default(),
         )
         .await
     }
@@ -25452,7 +25792,8 @@ mod pan135_ptt_release_tests {
         let on = Arc::new(AtomicU64::new(0));
         let off = Arc::new(AtomicU64::new(0));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let mut g = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off).await;
+        let pending = PendingPttOff::default();
+        let mut g = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
         assert!(on.load(Ordering::Acquire) > 0);
         assert_eq!(off.load(Ordering::Acquire), 0);
         assert_eq!(g.release("timestamp test").await, PttRelease::Delivered);
@@ -25460,7 +25801,7 @@ mod pan135_ptt_release_tests {
         drop(g);
         let first_on = on.load(Ordering::Acquire);
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let g = PttGuard::new(bus, active.clone(), &gate, &on, &off).await;
+        let g = PttGuard::new(bus, active.clone(), &gate, &on, &off, &pending).await;
         assert!(on.load(Ordering::Acquire) > first_on);
         assert!(off.load(Ordering::Acquire) < on.load(Ordering::Acquire));
         drop(g);
@@ -25538,6 +25879,274 @@ mod pan135_ptt_release_tests {
         let _ = rx.try_recv(); // room frees inside the Drop's retry window
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(ptt_offs(&rx), 1, "Drop retries, not one best-effort shot");
+    }
+
+    /// PAN-273 (Codex P2, PR #587): an undelivered release leaves the
+    /// guard's `Drop` fallback PTT-off outstanding. The next key-down (a
+    /// supersede re-key, or the next frame) must not overtake it: the next
+    /// `PttGuard::new` waits for it, so Hamlib sees that PTT-off before the
+    /// new PTT-on. Before, the new guard came straight back and the stale
+    /// PTT-off landed after the re-key's PTT-on, cutting the new frame off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_key_down_waits_for_an_outstanding_drop_fallback_unkey() {
+        let bus = MessageBus::new(2).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        assert!(backlog(&bus).await);
+        let active = Arc::new(AtomicBool::new(false));
+        let on = Arc::new(AtomicU64::new(0));
+        let off = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let pending = PendingPttOff::default();
+        let mut a = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
+        assert_eq!(a.release("Supersede").await, PttRelease::Undelivered);
+        drop(a); // armed: its fallback PTT-off is now outstanding
+        let _ = rx.try_iter().count(); // Hamlib catches up
+        let b = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "the earlier guard's fallback PTT-off is on Hamlib's channel before the new key-down"
+        );
+        drop(b);
+        let_drop_task_run().await;
+    }
+
+    /// PAN-273 self-review: a key-down's wait for the fallback can be
+    /// cancelled (worker abort or supervisor restart). The unfinished
+    /// fallback must stay recorded, so the restarted worker's first
+    /// key-down still waits for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_settle_keeps_the_fallback_for_the_next_key_down() {
+        let pending = PendingPttOff::default();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        pending.push(tokio::task::spawn(async move {
+            let _ = held.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending.settle())
+                .await
+                .is_err(),
+            "the fallback is still running"
+        );
+        assert!(
+            pending.0.lock().unwrap().is_some(),
+            "the cancelled wait put the unfinished fallback back"
+        );
+        let _ = release.send(());
+        pending.settle().await;
+        assert!(pending.0.lock().unwrap().is_none());
+    }
+
+    /// PAN-273: with no Hamlib channel (`--replay`, a build without
+    /// `pancetta-hamlib`) nothing was keyed, so `release` stands the guard
+    /// down without a send. Before, it stalled ~78 ms, logged an error and
+    /// left the guard armed with 4 drops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_with_no_hamlib_channel_stands_down_without_sending() {
+        let bus = MessageBus::new(16).unwrap();
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let off = Arc::new(AtomicU64::new(0));
+        let mut g = PttGuard::new(
+            bus.clone(),
+            ptt_active.clone(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &Arc::new(AtomicU64::new(0)),
+            &off,
+            &PendingPttOff::default(),
+        )
+        .await;
+        assert!(ptt_active.load(Ordering::Acquire));
+        assert_eq!(g.release("test").await, PttRelease::NoRig);
+        assert!(!g.armed, "nothing to unkey: the fallback stands down");
+        assert!(!ptt_active.load(Ordering::Acquire));
+        assert!(off.load(Ordering::Acquire) > 0, "PTT-off time is stamped");
+        assert_eq!(
+            bus.get_statistics().dropped_messages,
+            0,
+            "no PTT-off was attempted"
+        );
+        drop(g);
+        let_drop_task_run().await;
+        assert_eq!(bus.get_statistics().dropped_messages, 0, "no Drop retry");
+    }
+}
+
+/// PAN-273: the real TX worker unkeys through `PttGuard::release`, so a
+/// PTT-off dropped on a momentarily full Hamlib channel is retried, and a
+/// delivered one stands the guard down (no duplicate unkey from its `Drop`).
+#[cfg(test)]
+mod pan273_worker_unkey_tests {
+    use super::pan115_worker_gate_tests::{await_ptt_on, request, worker_harness, Harness};
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, RigControlMessage};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// 20m: in-band under the default region-2 plan (as the PAN-118 tests).
+    const IN_BAND_DIAL_HZ: u64 = 14_074_000;
+
+    fn is_ptt_off(msg: &ComponentMessage) -> bool {
+        matches!(
+            msg.message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+        )
+    }
+
+    async fn hamlib_drops(h: &Harness) -> u32 {
+        h.coordinator
+            .message_bus
+            .get_component_health()
+            .await
+            .into_iter()
+            .find(|c| c.component_id == ComponentId::Hamlib)
+            .map(|c| c.error_count)
+            .expect("the harness registers Hamlib")
+    }
+
+    async fn request_tune(h: &Harness, duration_secs: u32) {
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Ticket scenario 1's setup and catch-up, after PTT-on: fill Hamlib's
+    /// channel, wait for the worker's first PTT-off attempt to be dropped
+    /// on it, then let Hamlib catch up (drain) and count the PTT-offs that
+    /// reach it from then on.
+    async fn ptt_offs_after_hamlib_catches_up(h: &Harness, within: Duration) -> usize {
+        let bus = &h.coordinator.message_bus;
+        let mut filled = 0usize;
+        loop {
+            let enqueued = bus
+                .send_message_checked(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Hamlib,
+                    MessageType::AudioData(Vec::new()),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            if !enqueued {
+                break;
+            }
+            filled += 1;
+            assert!(filled <= 100_000, "Hamlib's channel never filled");
+        }
+        let full_at = hamlib_drops(h).await;
+        let deadline = Instant::now() + within;
+        while hamlib_drops(h).await == full_at {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never tried to unkey into the full channel"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Hamlib catches up. A retry can land while this drains, so count
+        // PTT-offs in the backlog as well as after it.
+        let mut offs = h.hamlib_rx.try_iter().filter(is_ptt_off).count();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        offs += h.hamlib_rx.try_iter().filter(is_ptt_off).count();
+        offs
+    }
+
+    /// Ticket scenario 1 on the tune path (keys at once, no slot wait).
+    /// Before PAN-273 this delivered 0 PTT-offs: the dropped send returned
+    /// `Ok(())` and the guard was disarmed anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_unkey_retries_a_dropped_ptt_off_until_hamlib_has_room() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        request_tune(&h, 2).await;
+        assert!(await_ptt_on(&h, Duration::from_secs(5)).await, "tune keyed");
+        let offs = ptt_offs_after_hamlib_catches_up(&h, Duration::from_secs(10)).await;
+        assert_eq!(offs, 1, "the worker's retry delivers exactly one unkey");
+    }
+
+    /// Ticket scenario 2: a delivered PTT-off stands the guard down, so its
+    /// `Drop` sends no second unkey and the keyed flag clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_unkey_on_a_healthy_channel_sends_exactly_one_ptt_off() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        request_tune(&h, 1).await;
+        assert!(await_ptt_on(&h, Duration::from_secs(5)).await, "tune keyed");
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let offs = h.hamlib_rx.try_iter().filter(is_ptt_off).count();
+        assert_eq!(offs, 1, "one unkey, no duplicate from the guard's Drop");
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    /// Ticket scenario 1 as written: a frame has finished playing and the
+    /// worker unkeys at Step 9 into a full Hamlib channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_tx_unkey_retries_a_dropped_ptt_off_after_the_frame_plays() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "the frame keyed"
+        );
+        let offs = ptt_offs_after_hamlib_catches_up(&h, Duration::from_secs(40)).await;
+        assert_eq!(offs, 1, "the worker's retry delivers exactly one unkey");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == "CQ N0CALL FN20" {
+                        completed = Some(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(completed.is_some(), "the frame's TransmitComplete arrives");
+    }
+
+    /// Source pin for the two clock-step PTT hold guards (PAN-114), which
+    /// need a backward wall-clock step and have no runtime seam: no unkey in
+    /// this file builds its own PTT-off for a best-effort `send_message`.
+    /// The needle is built at runtime so this test does not match itself.
+    #[test]
+    fn pan273_no_best_effort_ptt_off_remains_in_tx_rs() {
+        let source = include_str!("tx.rs");
+        let needle = ["let ", "ptt_off_msg"].concat();
+        assert!(
+            !source.contains(&needle),
+            "every TX-worker unkey goes through PttGuard::release (PAN-273)"
+        );
+        for context in [
+            "Step 9 unkey",
+            "Multi-TX Step 9 unkey",
+            "Tune unkey",
+            "Supersede",
+            "Clock-step PTT hold guard",
+        ] {
+            let call = [".release(\"", context, "\")"].concat();
+            assert!(source.contains(&call), "missing {call}");
+        }
     }
 }
 #[cfg(test)]
@@ -26838,6 +27447,357 @@ mod pan182_audio_delivery_tests {
     }
 }
 
+/// PAN-278: a PTT-on that `send_ptt_command` returns `Dropped` while Hamlib's
+/// route is registered (here: Hamlib's channel is full) never keyed the rig.
+/// The worker must unwind like a pre-PTT refusal, play no audio, and settle
+/// the frame as not sent. Without a route (`--replay`, builds without
+/// `pancetta-hamlib`) the drop is by design and the frame still plays.
+///
+/// Hamlib's backlog is read only after the completion: draining it earlier
+/// (as `await_completion` does) un-saturates the channel and lets the
+/// key-down through, which hides the defect.
+#[cfg(test)]
+mod pan278_dropped_ptt_on_tests {
+    use super::pan115_worker_gate_tests::{worker_harness, worker_harness_without_rig, Harness};
+    use super::pan122_tx_log_worker_tests::fill_channel;
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, QsoMessage, RigControlMessage,
+        TransmitRequestItem, TxOrigin,
+    };
+    use crossbeam_channel::Receiver;
+    use pancetta_qso::TxAttemptId;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    const Q1_TEXT: &str = "K1ABC N0CALL FN20";
+    const QA_TEXT: &str = "SM2LIY K5ARH R-14";
+    const QB_TEXT: &str = "C6AVD K5ARH EM10";
+
+    #[derive(Default)]
+    struct Seen {
+        /// `(message_text, success)` per `TransmitComplete` on Autonomous.
+        completions: Vec<(String, bool)>,
+        /// `(qso_id, attempt_id)` per `TxFrameNotSent` on Qso.
+        not_sent: Vec<(String, Option<TxAttemptId>)>,
+        /// `qso_id` per `TxFrameSent` on Qso.
+        sent: Vec<String>,
+        /// `(target, text)` per `DiagnosticEvent` on the TUI.
+        diagnostics: Vec<(&'static str, String)>,
+        audio_msgs: usize,
+    }
+
+    impl Seen {
+        fn drain(&mut self, h: &Harness, audio_rx: &Receiver<ComponentMessage>) {
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    self.completions.push((message_text, success));
+                }
+            }
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                match msg.message_type {
+                    MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                        qso_id,
+                        attempt_id,
+                        ..
+                    }) => self.not_sent.push((qso_id, attempt_id)),
+                    MessageType::QsoMessage(QsoMessage::TxFrameSent { qso_id, .. }) => {
+                        self.sent.push(qso_id)
+                    }
+                    _ => {}
+                }
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { target, text, .. } = msg.message_type {
+                    self.diagnostics.push((target, text));
+                }
+            }
+            while let Ok(msg) = audio_rx.try_recv() {
+                if matches!(msg.message_type, MessageType::AudioOutput { .. }) {
+                    self.audio_msgs += 1;
+                }
+            }
+        }
+
+        fn completed(&self, text: &str) -> bool {
+            self.completions.iter().any(|(t, _)| t == text)
+        }
+
+        fn ptt_drop_diagnostics(&self) -> usize {
+            self.diagnostics
+                .iter()
+                .filter(|(target, text)| *target == "tx.ptt" && text.contains("PTT-on dropped"))
+                .count()
+        }
+    }
+
+    /// Drain every receiver except Hamlib's until each of `texts` has a
+    /// `TransmitComplete` (or `within` elapses), then once more for anything
+    /// still in flight.
+    async fn collect(
+        h: &Harness,
+        audio_rx: &Receiver<ComponentMessage>,
+        texts: &[&str],
+        within: Duration,
+    ) -> Seen {
+        let mut seen = Seen::default();
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline && !texts.iter().all(|t| seen.completed(t)) {
+            seen.drain(h, audio_rx);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        seen.drain(h, audio_rx);
+        seen
+    }
+
+    /// `SetPtt` messages in Hamlib's backlog, read after the outcome settled.
+    fn hamlib_set_ptt_count(h: &Harness) -> usize {
+        let mut n = 0;
+        while let Ok(msg) = h.hamlib_rx.try_recv() {
+            if matches!(
+                msg.message_type,
+                MessageType::RigControl(RigControlMessage::SetPtt { .. })
+            ) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    async fn audio_rx(h: &Harness) -> Receiver<ComponentMessage> {
+        h.coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap()
+            .1
+    }
+
+    /// `q1` TX-live and one `TransmitRequest` for it carrying attempt 7.
+    async fn send_q1_request(h: &Harness) {
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("q1"));
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    attempt_id: Some(TxAttemptId(7)),
+                    message_text: Q1_TEXT.to_string(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("q1".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_ptt_on_settles_a_single_frame_as_not_sent() {
+        let h = worker_harness().await;
+        assert!(h.coordinator.message_bus.has_rig_route());
+        let audio_rx = audio_rx(&h).await;
+        assert!(fill_channel(&h, ComponentId::Hamlib).await > 0);
+        send_q1_request(&h).await;
+
+        let seen = collect(&h, &audio_rx, &[Q1_TEXT], Duration::from_secs(45)).await;
+
+        assert_eq!(
+            seen.completions,
+            vec![(Q1_TEXT.to_string(), false)],
+            "a frame whose PTT-on was dropped must complete once, as failed"
+        );
+        assert_eq!(
+            seen.not_sent,
+            vec![("q1".to_string(), Some(TxAttemptId(7)))],
+            "the QSO engine gets exactly one TxFrameNotSent for that attempt"
+        );
+        assert!(
+            seen.sent.is_empty(),
+            "no TxFrameSent for a frame that never keyed: {:?}",
+            seen.sent
+        );
+        assert_eq!(seen.audio_msgs, 0, "no audio for a frame that never keyed");
+        assert_eq!(
+            hamlib_set_ptt_count(&h),
+            0,
+            "no SetPtt reached Hamlib: the PTT-on was dropped and no PTT-off follows"
+        );
+        assert_eq!(
+            seen.ptt_drop_diagnostics(),
+            1,
+            "one tx.ptt diagnostic names the drop: {:?}",
+            seen.diagnostics
+        );
+        assert!(
+            !h.coordinator.ptt_active.load(Ordering::Acquire),
+            "the in-process PTT flag is released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_ptt_on_settles_every_bundle_item_as_not_sent() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        {
+            let mut live = h.coordinator.active_tx_qsos.write().unwrap();
+            live.insert(super::super::active_tx_qso_key("qa"));
+            live.insert(super::super::active_tx_qso_key("qb"));
+        }
+        let audio_rx = audio_rx(&h).await;
+        assert!(fill_channel(&h, ComponentId::Hamlib).await > 0);
+        let item = |text: &str, offset: f64, qso: &str| TransmitRequestItem {
+            attempt_id: None,
+            message_text: text.to_string(),
+            frequency_offset: offset,
+            qso_id: Some(qso.to_string()),
+            origin: TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![item(QA_TEXT, 1000.0, "qa"), item(QB_TEXT, 1600.0, "qb")],
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+
+        let seen = collect(&h, &audio_rx, &[QA_TEXT, QB_TEXT], Duration::from_secs(45)).await;
+
+        let mut completions = seen.completions.clone();
+        completions.sort();
+        assert_eq!(
+            completions,
+            vec![(QB_TEXT.to_string(), false), (QA_TEXT.to_string(), false)],
+            "each bundle item completes once, as failed"
+        );
+        let mut not_sent: Vec<&str> = seen.not_sent.iter().map(|(q, _)| q.as_str()).collect();
+        not_sent.sort();
+        assert_eq!(
+            not_sent,
+            vec!["qa", "qb"],
+            "each item's QSO gets one TxFrameNotSent"
+        );
+        assert!(
+            seen.sent.is_empty(),
+            "no TxFrameSent for a bundle that never keyed: {:?}",
+            seen.sent
+        );
+        assert_eq!(seen.audio_msgs, 0, "no audio for a bundle that never keyed");
+        assert_eq!(hamlib_set_ptt_count(&h), 0, "no SetPtt reached Hamlib");
+        assert_eq!(
+            seen.ptt_drop_diagnostics(),
+            1,
+            "one tx.ptt diagnostic names the dropped bundle: {:?}",
+            seen.diagnostics
+        );
+    }
+
+    /// Decision 1: with no Hamlib route every PTT-on is `Dropped` by design,
+    /// and the frame still plays and reports as aired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_rig_route_keeps_the_proceed_path() {
+        let h = worker_harness_without_rig().await;
+        assert!(
+            !h.coordinator.message_bus.has_rig_route(),
+            "the harness must register no Hamlib channel"
+        );
+        let audio_rx = audio_rx(&h).await;
+        send_q1_request(&h).await;
+
+        let seen = collect(&h, &audio_rx, &[Q1_TEXT], Duration::from_secs(45)).await;
+
+        assert_eq!(
+            seen.completions,
+            vec![(Q1_TEXT.to_string(), true)],
+            "without a rig route the frame plays and completes as aired"
+        );
+        assert_eq!(seen.sent, vec!["q1".to_string()], "one TxFrameSent");
+        assert!(seen.not_sent.is_empty(), "no TxFrameNotSent");
+        assert_eq!(seen.audio_msgs, 1, "the frame's audio is enqueued");
+        assert_eq!(
+            seen.ptt_drop_diagnostics(),
+            0,
+            "the no-route path raises no PTT-drop diagnostic"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_tune_ptt_on_abandons_the_tune() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        let audio_rx = audio_rx(&h).await;
+        assert!(fill_channel(&h, ComponentId::Hamlib).await > 0);
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 5,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+
+        let mut seen = Seen::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !seen
+                .diagnostics
+                .iter()
+                .any(|(target, text)| *target == "tx.ptt" && text.contains("tune abandoned"))
+        {
+            seen.drain(&h, &audio_rx);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        seen.drain(&h, &audio_rx);
+
+        assert!(
+            seen.diagnostics
+                .iter()
+                .any(|(target, text)| *target == "tx.ptt"
+                    && text == "Tune: PTT-on dropped (rig not keyed); tune abandoned"),
+            "a tune whose PTT-on was dropped is abandoned with a diagnostic: {:?}",
+            seen.diagnostics
+        );
+        assert_eq!(seen.audio_msgs, 0, "no tune tone without a keyed rig");
+        assert_eq!(hamlib_set_ptt_count(&h), 0, "no SetPtt reached Hamlib");
+        assert!(
+            !h.coordinator.ptt_active.load(Ordering::Acquire),
+            "the in-process PTT flag is released"
+        );
+    }
+}
+
 /// PAN-223: `report_frame_scheduled` carries the worker's own
 /// `TxSchedule::target_slot` to the QSO engine, durably, and only for frames
 /// that name both a QSO and a ledger attempt.
@@ -27465,6 +28425,13 @@ mod pan183_attempt_identity_tests {
             attempt_id: Some(TxAttemptId(23)),
         };
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let mut guard = super::supersede_rekey_tests::keyed_guard(
+            &bus,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await;
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -27476,9 +28443,7 @@ mod pan183_attempt_identity_tests {
             &tx_params,
             &bus,
             &inbox,
-            &Arc::new(AtomicBool::new(true)),
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU64::new(0)),
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,

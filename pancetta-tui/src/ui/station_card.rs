@@ -110,13 +110,13 @@ fn newest_decode_for<'a>(app: &'a App, call: &str) -> Option<&'a DecodedMessageV
 /// Line 1: `"{call} — {entity|'---'} {ATNO★|needed|worked|new}"`.
 fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageView>) -> Line<'a> {
     // PAN-85: append the station's US state/territory when known, matching
-    // DX Hunter. Deliberately no offline `dxcc::entity_for_callsign`
-    // fallback here — out of scope (see D10).
+    // DX Hunter. Deliberately no offline `pancetta_core::dxcc` fallback
+    // (`DxStation::offline_entity`) here — out of scope (see D10).
     let entity = app
         .dx_stations
         .get(call)
         .and_then(|d| d.entity_name.clone())
-        .map(|e| crate::dxcc::format_entity_with_state(&e, app.station_state_for(call)))
+        .map(|e| pancetta_core::dxcc::format_entity_with_state(&e, app.station_state_for(call)))
         .unwrap_or_else(|| "---".to_string());
 
     // Worked status is per exact call: a newer decode of the base or
@@ -524,6 +524,7 @@ pub(in crate::ui) mod tests {
             fn lookup_need(
                 &self,
                 _: &str,
+                _: Option<&'static str>,
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
@@ -595,6 +596,7 @@ pub(in crate::ui) mod tests {
                 network_rank: None,
                 source: crate::app::SpotSource::Local,
                 entity_name: Some("Japan".to_string()),
+                offline_entity: pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
                 rarity_tier: None,
                 reporter_count: None,
                 is_notable: false,

@@ -1933,6 +1933,17 @@ impl MessageBus {
         })
     }
 
+    /// Whether Hamlib's channel is registered on this bus (PAN-273).
+    ///
+    /// The route is a `OnceLock` that only `create_channel(Hamlib)` sets, and
+    /// channel entries are insert-once and never removed, so a `false` here
+    /// stays `false` for every send that happened before it: no PTT-on could
+    /// have been enqueued (`send_rig_command_if` drops without a route). This
+    /// is how `--replay` and builds without `pancetta-hamlib` run.
+    pub fn has_rig_route(&self) -> bool {
+        self.rig_route.get().is_some()
+    }
+
     /// [`Self::send_message_if`] for a Hamlib command, with no lock and no
     /// await (PAN-202): enqueues on the route `create_channel` published, so
     /// a key-down never waits on a channel registration. Same expiry check,
@@ -2687,6 +2698,23 @@ mod tests {
             SendIfOutcome::Denied
         );
         assert!(rx.try_recv().is_err(), "a denied key-down enqueues nothing");
+    }
+
+    /// PAN-273: `has_rig_route` is true only once Hamlib's own channel is
+    /// registered; another component's channel does not count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan273_has_rig_route_tracks_hamlib_registration() {
+        let bus = MessageBus::new(16).unwrap();
+        let early = bus.clone();
+        assert!(!bus.has_rig_route(), "a new bus has no rig route");
+        let (_tui_s, _tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        assert!(!bus.has_rig_route(), "a TUI channel is not the rig route");
+        let (_s, _rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(
+            bus.has_rig_route(),
+            "registering Hamlib publishes the route"
+        );
+        assert!(early.has_rig_route(), "clones share the published route");
     }
 
     /// PAN-202: same outcomes and counters as `send_message_if`
