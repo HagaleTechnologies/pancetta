@@ -7501,23 +7501,14 @@ async fn supersede_and_rekey_or_bundle(
         ),
         // A `MultiTransmitRequest` arriving as the superseding message isn't
         // re-keyable content here (Phase 1 manual triggers are single
-<<<<<<< HEAD
-        // requests) — not viable. PTT was already deasserted above, so the
-        // caller can safely disarm its guard. Both callers requeue the
-        // returned bundle at the front of the TX inbox (PAN-279).
+        // requests) — not viable. PTT was already released above through the
+        // caller's guard. Both callers requeue the returned bundle at the
+        // front of the TX inbox (PAN-279).
         other => {
             return SupersedeOutcome::NotViable {
                 superseder: Box::new(other),
             }
         }
-=======
-        // requests) — not viable. PTT was already released above through the
-        // caller's guard, so the caller can abandon this message. The
-        // multi-TX caller re-enqueues the dropped bundle (see
-        // `supersede_multi_reenqueue`); the single-TX caller drops it (an
-        // already-accepted Phase-1 gap for single-request supersedes).
-        return SupersedeOutcome::NotViable;
->>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
     };
 
     let now = chrono::Utc::now();
@@ -10549,7 +10540,6 @@ impl super::ApplicationCoordinator {
                                                                         bundle_remote_client_key_id,
                                                                 };
                                                             // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
-<<<<<<< HEAD
                                                             inbox.requeue_front(vec![
                                                                 self_message(successor.clone()),
                                                             ]);
@@ -10562,10 +10552,6 @@ impl super::ApplicationCoordinator {
                                                                 None,
                                                             )
                                                             .await;
-                                                            ptt_guard.disarm();
-=======
-                                                            inbox.requeue_front(vec![bundle_msg]);
->>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -11007,7 +10993,6 @@ impl super::ApplicationCoordinator {
                                                                         bundle_remote_client_key_id,
                                                                 };
                                                             // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
-<<<<<<< HEAD
                                                             inbox.requeue_front(vec![
                                                                 self_message(successor.clone()),
                                                             ]);
@@ -11020,10 +11005,6 @@ impl super::ApplicationCoordinator {
                                                                 None,
                                                             )
                                                             .await;
-                                                            ptt_guard.disarm();
-=======
-                                                            inbox.requeue_front(vec![bundle_msg]);
->>>>>>> 7053b62796343b8ce5b39512df7c7cb5f3705cd5
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -18666,6 +18647,10 @@ mod supersede_rekey_tests {
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let (cur, _) = pan279_parities();
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             new_request,
             in_flight,
@@ -18677,9 +18662,7 @@ mod supersede_rekey_tests {
             &tx_params,
             &bus,
             &inbox,
-            &Arc::new(AtomicBool::new(true)),
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU64::new(0)),
+            &mut guard,
             20_000,
             12_000,
             pancetta_core::slot::SLOT_NS,
@@ -18918,6 +18901,9 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
         );
         let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+        let last_ptt_off_ms = Arc::new(AtomicU64::new(0));
+        let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let (_, opposite) = pan279_parities();
         let new = pan279_item(
             "qso-sv",
@@ -18933,10 +18919,7 @@ mod supersede_rekey_tests {
             &mut message_text,
             &mut frequency_offset,
             &mut schedule,
-            &bus,
-            &ptt_active,
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU64::new(0)),
+            &mut guard,
             3_000,
             12_000,
             pancetta_core::slot::SLOT_NS,

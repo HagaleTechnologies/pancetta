@@ -718,11 +718,16 @@ Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await
 on that exit path would not preserve any observable accounting.
 
-The opening call remains counted as one. Manual-regression re-sends and silently
-coalesced, duplicate, parity-excluded or frequency-excluded frames keep their
-existing accounting because those paths have no matching ledger entry or QSO
-failure report. A single-frame supersede reports the frame it abandons whether
-it re-keys (`Replace`), folds it into a bundle (`Bundle`) or is too late to
+The opening call remains counted as one. Manual-regression re-sends, mid-TX
+duplicate drops and attempt-less coalesced requests keep their existing
+accounting because those paths have no matching ledger entry or QSO failure
+report. A pivot duplicate keeps its own attempt and rolls back only the frame
+the pivot replaced. A folded request whose attempt id a retained, excluded or
+truncated entry still carries is left to that entry. Backlog coalescing rolls
+back every other request it truncates, drops as terminal, excludes for parity
+or frequency, or folds into a newer request, with that request's own attempt
+id (see the pivot ownership rule above, PAN-279). A single-frame supersede
+reports the frame it abandons whether it re-keys (`Replace`), folds it into a bundle (`Bundle`) or is too late to
 (`NotViable`). A superseding request that is too late to re-key, or a bundle a
 single-frame re-key cannot fold, comes back inside `NotViable` and is requeued
 at the front of the TX inbox, so it airs in its own next slot (PAN-279). Only
