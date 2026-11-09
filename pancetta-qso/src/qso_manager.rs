@@ -28115,7 +28115,6 @@ mod pan260 {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pan275_completed_close_tests {
     //! PAN-275: the coordinator's auto-73 re-keys a COMPLETED manual QSO by
     //! id through `resend_completed_close`, however long ago it completed,
@@ -28454,7 +28453,70 @@ mod pan275_completed_close_tests {
         let events = drain(&mut rx);
         assert_eq!(count_sends(&events), 0);
         assert_eq!(call_count(&manager, id).await, before);
-=======
+        assert_eq!(
+            manager
+                .get_qso(id)
+                .await
+                .unwrap()
+                .metadata
+                .remote_client_key_id
+                .as_deref(),
+            Some("client-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn backdate_completion_for_test_moves_only_completed_qsos() {
+        let manager = manager();
+        assert!(
+            !manager
+                .backdate_completion_for_test(Uuid::new_v4(), Duration::seconds(60))
+                .await
+        );
+
+        let other = self::manager();
+        let active = other
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let before = other.get_qso(active).await.unwrap();
+        assert!(
+            !other
+                .backdate_completion_for_test(active, Duration::seconds(60))
+                .await
+        );
+        let after = other.get_qso(active).await.unwrap();
+        assert_eq!(format!("{:?}", before.state), format!("{:?}", after.state));
+
+        let id = complete_manual(&manager, false, None).await;
+        let completed_at = |p: QsoProgress| match p.state {
+            QsoState::Completed { completed_at, .. } => completed_at,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        let original = completed_at(manager.get_qso(id).await.unwrap());
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
+                .await,
+            Some(id)
+        );
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let moved = completed_at(manager.get_qso(id).await.unwrap());
+        assert_eq!(original - moved, Duration::seconds(60));
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
+                .await,
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod pan296_watchdog_tests {
     use super::*;
     use pancetta_core::slot_clock::ClockStepDetector;
@@ -28796,68 +28858,11 @@ mod pan296_watchdog_tests {
             )
             .await;
         assert!(manager.get_qso(id).await.is_ok());
->>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
         assert_eq!(
             manager
                 .get_qso(id)
                 .await
                 .unwrap()
-<<<<<<< HEAD
-                .metadata
-                .remote_client_key_id
-                .as_deref(),
-            Some("client-a")
-        );
-    }
-
-    #[tokio::test]
-    async fn backdate_completion_for_test_moves_only_completed_qsos() {
-        let manager = manager();
-        assert!(
-            !manager
-                .backdate_completion_for_test(Uuid::new_v4(), Duration::seconds(60))
-                .await
-        );
-
-        let other = self::manager();
-        let active = other
-            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
-            .await
-            .unwrap();
-        let before = other.get_qso(active).await.unwrap();
-        assert!(
-            !other
-                .backdate_completion_for_test(active, Duration::seconds(60))
-                .await
-        );
-        let after = other.get_qso(active).await.unwrap();
-        assert_eq!(format!("{:?}", before.state), format!("{:?}", after.state));
-
-        let id = complete_manual(&manager, false, None).await;
-        let completed_at = |p: QsoProgress| match p.state {
-            QsoState::Completed { completed_at, .. } => completed_at,
-            other => panic!("expected Completed, got {other:?}"),
-        };
-        let original = completed_at(manager.get_qso(id).await.unwrap());
-        assert_eq!(
-            manager
-                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
-                .await,
-            Some(id)
-        );
-        assert!(
-            manager
-                .backdate_completion_for_test(id, Duration::seconds(60))
-                .await
-        );
-        let moved = completed_at(manager.get_qso(id).await.unwrap());
-        assert_eq!(original - moved, Duration::seconds(60));
-        assert_eq!(
-            manager
-                .find_recently_completed_manual_qso_for(DX, FREQ, COMPLETED_QSO_REWORK_GRACE)
-                .await,
-            None
-=======
                 .state
                 .state_duration(base + Duration::seconds(25)),
             Some(Duration::zero())
@@ -28873,7 +28878,6 @@ mod pan296_watchdog_tests {
         assert!(
             manager.get_qso(id).await.is_err(),
             "a changed start invalidates grace even in the same state variant"
->>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
         );
     }
 }
