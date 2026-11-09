@@ -13422,7 +13422,9 @@ impl super::ApplicationCoordinator {
                                         MessageType::AudioOutput {
                                             samples: audio_out,
                                             sample_rate,
-                                            flush_first: false,
+                                            // Supersede requeues lose in-place rekey history.
+                                            // Each complete bundle replaces any queued predecessor.
+                                            flush_first: true,
                                             playback_started: Some(playback_ack),
                                         },
                                         Instant::now(),
@@ -28241,6 +28243,128 @@ mod pan71_playback_start_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_ack_falls_back_to_the_enqueue_instant_without_waiting() {
         assert_fallback(Behaviour::Drop).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan294_requeued_bundle_flushes_stale_waveform() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = Config::default();
+        config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+        let h = worker_harness_with(config, |_| {}).await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+        {
+            let mut live = h.coordinator.active_tx_qsos.write().unwrap();
+            for id in ["pan294-a", "pan294-b"] {
+                live.insert(super::super::active_tx_qso_key(id));
+            }
+        }
+        let submit = |texts: [&str; 2]| {
+            ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    // Matching live identities and changed text force a supersede.
+                    items: texts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, text)| TransmitRequestItem {
+                            attempt_id: None,
+                            message_text: text.to_owned(),
+                            frequency_offset: 1000.0 + i as f64 * 600.0,
+                            qso_id: Some(["pan294-a", "pan294-b"][i].to_owned()),
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
+                        })
+                        .collect(),
+                    tx_parity: Some(SlotParity::Even),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            )
+        };
+        let initial = [TEXT, "CQ K1ABC FN31"];
+        let replacement = [REPLACEMENT, "CQ K1ABC EM12"];
+        let mut waveforms = Vec::new();
+        let mut buffered = Vec::new();
+        let mut flushes = Vec::new();
+        let mut starts = Vec::new();
+        let mut ptt = Vec::new();
+        h.coordinator
+            .message_bus
+            .send_message(submit(initial))
+            .await
+            .unwrap();
+        for texts in [initial, replacement] {
+            // Simulate an audio callback that starts playback but retains all
+            // queued samples. Only a flush can remove the predecessor.
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                if let Ok(msg) = audio_rx.try_recv() {
+                    if let MessageType::AudioOutput {
+                        samples,
+                        flush_first,
+                        playback_started,
+                        ..
+                    } = msg.message_type
+                    {
+                        assert!(!samples.is_empty());
+                        if flush_first {
+                            buffered.clear();
+                        }
+                        buffered.extend_from_slice(&samples);
+                        waveforms.push(samples);
+                        flushes.push(flush_first);
+                        playback_started
+                            .expect("bundle playback ack")
+                            .started(chrono::Utc::now());
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "no bundle audio for {texts:?}");
+                sleep(Duration::from_millis(1)).await;
+            }
+            // Both log events prove both streams reached playback. Awaiting
+            // them also ensures replacement arrives after the first ack.
+            let first = await_event(&h, texts[0]).await;
+            assert_eq!(first, await_event(&h, texts[1]).await);
+            starts.push(first);
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                if let MessageType::RigControl(RigControlMessage::SetPtt { state }) =
+                    msg.message_type
+                {
+                    ptt.push(state);
+                }
+            }
+            if waveforms.len() == 1 {
+                assert_eq!(buffered, waveforms[0]);
+                h.coordinator
+                    .message_bus
+                    .send_message(submit(replacement))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(waveforms.len(), 2);
+        assert_ne!(waveforms[0], waveforms[1], "supersede changes the waveform");
+        assert_eq!(
+            starts[0].timestamp().div_euclid(15),
+            starts[1].timestamp().div_euclid(15),
+            "replacement must requeue into the same FT8 slot"
+        );
+        assert_eq!(
+            ptt,
+            [true, false, true],
+            "unkey before the replacement keys"
+        );
+        assert!(flushes[1], "replacement bundle must flush stale audio");
+        assert_eq!(buffered, waveforms[1], "only replacement samples remain");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
