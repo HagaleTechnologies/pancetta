@@ -9571,11 +9571,9 @@ impl QsoManager {
             .retain(|id, _| qsos.get(id).is_some_and(|p| p.state.is_active()));
 
         for (&qso_id, progress) in qsos.iter_mut() {
-<<<<<<< HEAD
             if reworking.contains(&qso_id) {
                 continue;
             }
-=======
             let (state_age, first_call_age) = {
                 let mut anchors = self
                     .watchdog_anchors
@@ -9603,7 +9601,6 @@ impl QsoManager {
                 }
                 (state_age, first_call_age)
             };
->>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
             let active_tx_state = matches!(
                 progress.state,
                 QsoState::CallingCq { .. }
@@ -28752,7 +28749,6 @@ mod pan260 {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pending_completion_tests {
     //! PAN-280: a completion that queues a closing frame emits `QsoCompleted`
     //! only when that frame airs; a frame that never airs reverts it.
@@ -29262,7 +29258,9 @@ mod pending_completion_tests {
             assert_eq!(completions(&drain(&mut rx)), 0);
         }
     }
-=======
+}
+
+#[cfg(test)]
 mod pan296_watchdog_tests {
     use super::*;
     use pancetta_core::slot_clock::ClockStepDetector;
@@ -29626,5 +29624,4 @@ mod pan296_watchdog_tests {
             "a changed start invalidates grace even in the same state variant"
         );
     }
->>>>>>> da5135c1705b7cbaf788835fe75437c9652e53aa
 }
