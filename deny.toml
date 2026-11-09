@@ -25,6 +25,17 @@ ignore = [
     # no TLS surface. Remove this once sqlx depends on webpki-roots 1.x directly.
     { id = "RUSTSEC-2026-0381", reason = "0.26.11 shim re-exports webpki-roots 1.0.10 (fixed); sqlx SQLite-only, no TLS use" },
 
+    # SQLite < 3.54.0 can return leftover process memory when it opens a
+    # database next to a crafted `-wal` file with a different page size. The
+    # bundled copy comes from libsqlite3-sys 0.30.1 via sqlx-sqlite 0.8.6. The
+    # fix needs libsqlite3-sys >= 0.39, but no released sqlx accepts it
+    # (sqlx-sqlite 0.9.0 caps it at < 0.38; sqlx main pins 0.37). Pancetta
+    # only opens its own qso.db under the user's data directory, so an
+    # attacker needs write access to that directory, which already gives
+    # them the account. Accepted by the owner on PAN-390 (2026-11-09).
+    # Remove this once sqlx accepts libsqlite3-sys >= 0.39 and bump sqlx.
+    { id = "RUSTSEC-2026-0459", reason = "no sqlx release accepts patched libsqlite3-sys >=0.39; local-only, needs write access to the user's data dir (PAN-390)" },
+
     # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
     # instant transitively via tokio/cpal; both are working on migration.
     # Nothing actionable at our layer.
