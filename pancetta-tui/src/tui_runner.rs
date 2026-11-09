@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::app::{App, DecodedMessageView, DevicePanel, DeviceSelectionState};
 use crate::config::Config;
+use crate::keymap::Action;
 
 /// TUI runner that manages the terminal interface
 pub struct TuiRunner {
@@ -54,6 +55,10 @@ pub struct TuiRunner {
     /// and read by the coordinator's autonomous-initiation gate. Shared with the
     /// coordinator; a fresh standalone atomic in unit tests.
     last_input_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only dispatch log: every `Action` `handle_key_event` resolved
+    /// and dispatched, in order (PAN-327 gherkin tests).
+    #[cfg(test)]
+    dispatched: Vec<crate::keymap::Action>,
     /// Frame rate limiter
     last_render: Instant,
     /// Target FPS
@@ -663,6 +668,8 @@ impl TuiRunner {
             message_tx,
             shutdown,
             last_input_ms,
+            #[cfg(test)]
+            dispatched: Vec::new(),
             last_render: Instant::now(),
             target_fps: 30,
             metrics: TuiMetrics::default(),
@@ -694,6 +701,7 @@ impl TuiRunner {
             message_tx,
             shutdown,
             last_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dispatched: Vec::new(),
             last_render: Instant::now(),
             target_fps: 30,
             metrics: TuiMetrics::default(),
@@ -1134,6 +1142,25 @@ impl TuiRunner {
         Ok(())
     }
 
+    /// Shift+Q emergency stop (hb-161, PAN-113): flip the local banner and
+    /// TX policy at once and tell the coordinator to halt the station.
+    fn emergency_stop(&self, app: &mut App) -> Result<()> {
+        app.stopped_by_operator = true;
+        // Emergency stop hard-mutes TX: reflect Disabled in the local
+        // banner immediately; the coordinator confirms via
+        // TxPolicyUpdate.
+        app.tx_policy = pancetta_core::TxPolicy::Disabled;
+        app.status_message =
+            "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
+                .to_string();
+        warn!(
+            target: "operator.override",
+            "Operator pressed Q emergency stop key — halting station"
+        );
+        self.message_tx.send(TuiCommand::OperatorEmergencyStop)?;
+        Ok(())
+    }
+
     /// Handle keyboard events
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         // Operator-presence stamp (FCC §97.221): ANY key the operator presses is
@@ -1162,20 +1189,12 @@ impl TuiRunner {
         // logs at WARN. The TUI also flips `stopped_by_operator` locally so
         // the banner appears immediately — no round-trip needed for the
         // visual signal.
-        if key.code == KeyCode::Char('Q') {
-            app.stopped_by_operator = true;
-            // Emergency stop hard-mutes TX: reflect Disabled in the local
-            // banner immediately; the coordinator confirms via
-            // TxPolicyUpdate.
-            app.tx_policy = pancetta_core::TxPolicy::Disabled;
-            app.status_message =
-                "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
-                    .to_string();
-            warn!(
-                target: "operator.override",
-                "Operator pressed Q emergency stop key — halting station"
-            );
-            self.message_tx.send(TuiCommand::OperatorEmergencyStop)?;
+        // The key resolves through the `KEYBINDINGS` Global-scope chord
+        // (PAN-327), so no dialog below can forget it.
+        if crate::keymap::resolve_global(key) == Some(Action::EmergencyStop) {
+            #[cfg(test)]
+            self.dispatched.push(Action::EmergencyStop);
+            self.emergency_stop(&mut app)?;
             return Ok(true);
         }
 
@@ -1779,23 +1798,31 @@ impl TuiRunner {
             return Ok(true);
         }
 
-        // PAN-112: crossterm delivers Ctrl+C as Char('c') + CONTROL and
-        // Ctrl+Space as Char(' ') + CONTROL. On Windows, Ctrl+Shift+T arrives
-        // as Char('T') + CONTROL|SHIFT. Allow Shift for uppercase bindings;
-        // Ctrl/Alt chords on TX-starting arms fall through to `_ => {}` (Enter
-        // on Callers has its own no-op arm). Ctrl+C is swallowed rather than
-        // mapped to quit-confirm (`q`); the keyboard remap spec (2026-04-29)
-        // moved bindings off Ctrl chords.
-        let ctrl_or_alt_held = key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // Main view: the key resolves through the `KEYBINDINGS` chord table
+        // into one `Action` (PAN-327). Modifier guards (PAN-112) live on
+        // each chord as `keymap::Mods`: TX-starting chords refuse Ctrl/Alt
+        // (crossterm delivers Ctrl+C as Char('c') + CONTROL), and Ctrl+C is
+        // swallowed rather than mapped to quit-confirm (`q`); the keyboard
+        // remap spec (2026-04-29) moved bindings off Ctrl chords.
+        //
+        // NOTE: there is intentionally NO `Char(c)` text catch-all here.
+        // Outside compose mode every letter is a command; free-text input
+        // is reachable only via `/` (compose mode), so a stray keystroke
+        // can never silently fill the TX buffer or fire a command while the
+        // operator means to type. A key with no chord does nothing.
+        let ctx = crate::keymap::KeyContext::main_view(&app);
+        let Some(action) = crate::keymap::resolve(&ctx, key) else {
+            return Ok(true);
+        };
+        #[cfg(test)]
+        self.dispatched.push(action);
 
-        match key.code {
+        match action {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
             // (not in a modal-style early-return block) so other keys keep
             // working — the banner is informational, not blocking.
-            KeyCode::Esc if app.stopped_by_operator => {
+            Action::ClearStopBanner => {
                 app.stopped_by_operator = false;
                 app.status_message = "Operator-stop banner cleared".to_string();
             }
@@ -1803,7 +1830,7 @@ impl TuiRunner {
             // `z` panel zoom: Esc restores the normal view layout (in
             // addition to `z` itself toggling it off). Guarded so it only
             // fires when nothing else claimed this Esc press above.
-            KeyCode::Esc if app.zoomed => {
+            Action::ClearZoom => {
                 app.zoomed = false;
                 app.status_message = "Zoom cleared".to_string();
             }
@@ -1812,7 +1839,7 @@ impl TuiRunner {
             // sticky alert). Red blockers can't be acknowledged — they clear
             // only when resolved. Not a TX key, so no Ctrl/Alt guard (PAN-112:
             // crossterm sets SHIFT on `!`, so match the char alone).
-            KeyCode::Char('!') => {
+            Action::AckReadiness => {
                 let acknowledged = app.acknowledge_readiness();
                 let anything_visible = crate::readiness::readiness_items(&app)
                     .iter()
@@ -1827,37 +1854,35 @@ impl TuiRunner {
             }
 
             // Panel navigation
-            KeyCode::Tab => {
+            Action::NextPanel => {
                 app.zoomed = false;
                 app.next_panel();
             }
-            KeyCode::BackTab => {
+            Action::PrevPanel => {
                 app.previous_panel();
             }
 
             // Arrow keys for list navigation. When the QSO Status panel is
             // focused, Up/Down move the QSO selection cursor instead (which
             // drives the abort/re-send target).
-            KeyCode::Up => {
-                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) {
-                    app.qso_cursor_up();
-                } else {
-                    app.previous_item();
-                    // Moving the Callers selection resets the reply override
-                    // so each newly-selected caller starts at its smart default.
-                    if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
-                        app.clamp_callers_selection();
-                    }
+            Action::QsoCursorUp => {
+                app.qso_cursor_up();
+            }
+            Action::ListUp => {
+                app.previous_item();
+                // Moving the Callers selection resets the reply override
+                // so each newly-selected caller starts at its smart default.
+                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                    app.clamp_callers_selection();
                 }
             }
-            KeyCode::Down => {
-                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) {
-                    app.qso_cursor_down();
-                } else {
-                    app.next_item();
-                    if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
-                        app.clamp_callers_selection();
-                    }
+            Action::QsoCursorDown => {
+                app.qso_cursor_down();
+            }
+            Action::ListDown => {
+                app.next_item();
+                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                    app.clamp_callers_selection();
                 }
             }
             // Jump/page navigation for the focused list (Band Activity is
@@ -1867,18 +1892,18 @@ impl TuiRunner {
             // `<` (left) = back to newest/realtime, `>` (right) = oldest. Both the
             // shifted glyphs and their unshifted `,`/`.` bases are bound so the
             // operator never needs a modifier.
-            KeyCode::Home | KeyCode::Char(',') | KeyCode::Char('<') => {
+            Action::JumpNewest => {
                 app.scroll_to_top();
                 app.status_message = "Jumped to newest (realtime)".to_string();
             }
-            KeyCode::End | KeyCode::Char('.') | KeyCode::Char('>') => {
+            Action::JumpOldest => {
                 app.scroll_to_bottom();
                 app.status_message = "Jumped to oldest".to_string();
             }
-            KeyCode::PageUp => {
+            Action::ListPageUp => {
                 app.page_up();
             }
-            KeyCode::PageDown => {
+            Action::ListPageDown => {
                 app.page_down();
             }
             // Left/Right are globally TX-offset ±50 Hz, BUT when the Callers
@@ -1890,34 +1915,27 @@ impl TuiRunner {
             // deliberate divergence from the original free-Hz-cursor spec
             // sketch: the ranked slices ARE the instrument's point, and
             // free-Hz parking already exists via the `o` modal.
-            KeyCode::Left => {
-                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
-                    app.cycle_caller_reply(false);
-                    let step = app.current_caller_reply_step();
-                    app.status_message = format!("Reply step: {:?}", step);
-                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
-                    app.placement_cursor = app.placement_cursor.saturating_sub(1);
-                } else {
-                    app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
-                    app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
-                }
+            // Left/Right on any other panel resolve to TxOffsetDown/Up below.
+            Action::PrevReplyStep => {
+                app.cycle_caller_reply(false);
+                let step = app.current_caller_reply_step();
+                app.status_message = format!("Reply step: {:?}", step);
             }
-            KeyCode::Right => {
-                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
-                    app.cycle_caller_reply(true);
-                    let step = app.current_caller_reply_step();
-                    app.status_message = format!("Reply step: {:?}", step);
-                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
-                    if let Some(max_index) = app
-                        .placement
-                        .as_ref()
-                        .map(|p| p.slices.len().saturating_sub(1))
-                    {
-                        app.placement_cursor = (app.placement_cursor + 1).min(max_index);
-                    }
-                } else {
-                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
-                    app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+            Action::PlacementCursorLeft => {
+                app.placement_cursor = app.placement_cursor.saturating_sub(1);
+            }
+            Action::NextReplyStep => {
+                app.cycle_caller_reply(true);
+                let step = app.current_caller_reply_step();
+                app.status_message = format!("Reply step: {:?}", step);
+            }
+            Action::PlacementCursorRight => {
+                if let Some(max_index) = app
+                    .placement
+                    .as_ref()
+                    .map(|p| p.slices.len().saturating_sub(1))
+                {
+                    app.placement_cursor = (app.placement_cursor + 1).min(max_index);
                 }
             }
 
@@ -1927,18 +1945,18 @@ impl TuiRunner {
             // silently encode-rejects (2900 Hz matches the TX-offset-hold
             // modal, qso_manager::TX_OFFSET_MAX_HZ headroom, and the
             // modulator's MAX_FREQUENCY_DEVIATION as of the 2026-07-05 fix).
-            KeyCode::Char('[') => {
+            Action::TxOffsetDown => {
                 app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
-            KeyCode::Char(']') => {
+            Action::TxOffsetUp => {
                 app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
             // Band switching: = = band up (+ dropped; Shift not required),
             // - / _ = band down
-            KeyCode::Char('=') => {
+            Action::BandUp => {
                 let freq_hz = app.band_up();
                 app.split_tx_hz = 0; // band change reverts rig to simplex (coordinator clears atomic+rig)
                 self.message_tx.send(TuiCommand::SetFrequency {
@@ -1946,7 +1964,7 @@ impl TuiRunner {
                     frequency: freq_hz,
                 })?;
             }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
+            Action::BandDown => {
                 let freq_hz = app.band_down();
                 app.split_tx_hz = 0; // band change reverts rig to simplex (coordinator clears atomic+rig)
                 self.message_tx.send(TuiCommand::SetFrequency {
@@ -1961,39 +1979,43 @@ impl TuiRunner {
             // TxPlacement now gets one (`5`), unlike Task 11's original
             // "no number key" scoping. 1=Band, 2=QSO, 3=Callers, 4=DX,
             // 5=Placement.
-            KeyCode::Char('1') => {
+            Action::FocusBandActivity => {
                 app.active_panel = crate::app::ActivePanel::BandActivity;
                 app.status_message = "Panel: Band Activity".to_string();
             }
-            KeyCode::Char('2') => {
+            Action::FocusQsoStatus => {
                 app.active_panel = crate::app::ActivePanel::QsoStatus;
                 app.status_message = "Panel: QSO Status".to_string();
             }
-            KeyCode::Char('3') => {
+            Action::FocusCallers => {
                 app.active_panel = crate::app::ActivePanel::Callers;
                 app.status_message = "Panel: Callers".to_string();
             }
-            KeyCode::Char('4') => {
+            Action::FocusDxHunter => {
                 app.active_panel = crate::app::ActivePanel::DxHunter;
                 app.status_message = "Panel: DX Hunter".to_string();
             }
-            KeyCode::Char('5') => {
+            Action::FocusTxPlacement => {
                 app.active_panel = crate::app::ActivePanel::TxPlacement;
                 app.status_message = "Panel: TX Placement".to_string();
             }
 
             // === Quit (with confirm modal) ===
-            KeyCode::Char('q') => {
+            Action::OpenQuitConfirm => {
                 app.quit_confirm_visible = true;
                 app.status_message =
                     "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
             }
 
-            // Shift+Q (emergency stop) is handled at the top of this
-            // function, ahead of every modal (PAN-113).
+            // Shift+Q (emergency stop) is dispatched at the top of this
+            // function, ahead of every modal (PAN-113); this arm only keeps
+            // the match exhaustive.
+            Action::EmergencyStop => {
+                self.emergency_stop(&mut app)?;
+            }
 
             // === Modal shortcuts ===
-            KeyCode::Char('d') => {
+            Action::OpenDevicePicker => {
                 app.device_selection.visible = true;
                 if app.device_selection.input_devices.is_empty()
                     && app.device_selection.output_devices.is_empty()
@@ -2006,7 +2028,7 @@ impl TuiRunner {
                             .to_string();
                 }
             }
-            KeyCode::Char('i') => {
+            Action::OpenRigPicker => {
                 // I-3 fix (PAN-59 final review): snapshot the current
                 // fields as the committed baseline BEFORE the operator can
                 // edit anything, so an Esc later in this session has
@@ -2022,20 +2044,20 @@ impl TuiRunner {
                 // keeps any edit the operator has already made.
                 self.message_tx.send(TuiCommand::RequestRigConfig)?;
             }
-            KeyCode::Char('?') => {
+            Action::ToggleHelp => {
                 app.toggle_help();
             }
 
             // === CQ + QSO actions ===
-            KeyCode::Char('c') if !ctrl_or_alt_held => {
+            Action::StartCq => {
                 self.message_tx.send(TuiCommand::StartCq {
                     frequency_offset: app.tx_frequency_offset,
                 })?;
             }
-            KeyCode::Char('s') => {
+            Action::StopCq => {
                 self.message_tx.send(TuiCommand::StopCq)?;
             }
-            KeyCode::Char('h') => {
+            Action::HaltTx => {
                 // h - Halt current TX. Releases PTT within ~150ms; pancetta
                 // keeps running and listening.
                 self.message_tx.send(TuiCommand::StopTx)?;
@@ -2045,14 +2067,14 @@ impl TuiRunner {
             // things happened, not just that they did). Lowercase `d` is
             // taken by the device-selection modal, so diagnostics uses D.
             // Opens scrolled to the newest event.
-            KeyCode::Char('D') => {
+            Action::OpenDiagnostics => {
                 app.show_diagnostics = true;
                 app.diagnostics_scroll = app.diagnostic_events.len().saturating_sub(1);
             }
             // Shift+S — toggle the consolidated station-health panel (is the
             // station healthy right now?). Lowercase `s` is taken by StopCq,
             // so health uses S.
-            KeyCode::Char('S') => {
+            Action::OpenHealth => {
                 app.show_health = true;
                 app.health_scroll = 0;
             }
@@ -2060,11 +2082,11 @@ impl TuiRunner {
             // outcome history: what happened to my last N QSOs). Lowercase
             // `r` is taken by re-send-last-TX, so Recent-QSOs uses R. Opens
             // scrolled to the newest entry.
-            KeyCode::Char('w') if !ctrl_or_alt_held => {
+            Action::OpenWhy => {
                 app.show_why = true;
                 app.why_scroll = 0;
             }
-            KeyCode::Char('R') => {
+            Action::OpenRecentQsos => {
                 app.show_recent_qsos = true;
                 app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
             }
@@ -2072,30 +2094,29 @@ impl TuiRunner {
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
             // Only active when the DX Hunter panel is focused; a no-op hint
             // is shown on other panels so the operator knows to switch.
-            KeyCode::Char('H') if !ctrl_or_alt_held => {
-                if matches!(app.active_panel, crate::app::ActivePanel::DxHunter) {
-                    // Pull callsign + fox_freq + parity from the selected row,
-                    // and also the grid (one extra field beyond get_selected_station).
-                    let selected = app.displayed_dx_stations();
-                    if let Some(station) = selected.get(app.dx_hunter_scroll) {
-                        let callsign = station.call_sign.clone();
-                        let fox_freq = station.audio_offset_hz.unwrap_or(1500);
-                        let dx_parity = station.slot_parity;
-                        let fox_grid = station.grid_square.clone();
-                        self.message_tx.send(TuiCommand::EngageHound {
-                            callsign: callsign.clone(),
-                            fox_freq,
-                            dx_parity,
-                            fox_grid,
-                        })?;
-                        app.status_message = format!("Hound: engaging {} as Fox...", callsign);
-                    } else {
-                        app.status_message = "No DX station selected for Hound".to_string();
-                    }
+            Action::EngageHound => {
+                // Pull callsign + fox_freq + parity from the selected row,
+                // and also the grid (one extra field beyond get_selected_station).
+                let selected = app.displayed_dx_stations();
+                if let Some(station) = selected.get(app.dx_hunter_scroll) {
+                    let callsign = station.call_sign.clone();
+                    let fox_freq = station.audio_offset_hz.unwrap_or(1500);
+                    let dx_parity = station.slot_parity;
+                    let fox_grid = station.grid_square.clone();
+                    self.message_tx.send(TuiCommand::EngageHound {
+                        callsign: callsign.clone(),
+                        fox_freq,
+                        dx_parity,
+                        fox_grid,
+                    })?;
+                    app.status_message = format!("Hound: engaging {} as Fox...", callsign);
                 } else {
-                    app.status_message =
-                        "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
+                    app.status_message = "No DX station selected for Hound".to_string();
                 }
+            }
+            Action::HoundFocusHint => {
+                app.status_message =
+                    "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
             }
             // Shift+X — toggle Fox (DXpedition) mode. Lowercase `x` is taken
             // by ClearMessages, so Fox uses Shift+X (spec's documented fallback).
@@ -2103,11 +2124,11 @@ impl TuiRunner {
             // send ToggleFoxMode; the coordinator's SetFoxMode handler is the
             // authority (TX-policy gated on engage, starts/stops repeating CQ,
             // raises/restores the caller-answer cap).
-            KeyCode::Char('X') if !ctrl_or_alt_held => {
+            Action::ToggleFoxMode => {
                 app.toggle_fox_mode();
                 self.message_tx.send(TuiCommand::ToggleFoxMode)?;
             }
-            KeyCode::Char('p') if !ctrl_or_alt_held => {
+            Action::TogglePtt => {
                 // TX-policy safety gate (mirror of the relay's authoritative
                 // check): refuse keying PTT while TX is Disabled. The relay
                 // can't tell a key-up from a key-down across the toggle, but
@@ -2128,20 +2149,15 @@ impl TuiRunner {
             // accidentally re-send the selected QSO's last TX while scrolling
             // Band Activity or DX Hunter. Echoes the target callsign.
             // r - re-send our most recent message in the selected QSO.
-            KeyCode::Char('r')
-                if !ctrl_or_alt_held
-                    && matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
-            {
-                match (app.selected_qso_id(), app.selected_qso_callsign()) {
-                    (Some(qso_id), Some(call)) => {
-                        self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
-                        app.status_message = format!("Re-sending last TX to {}", call);
-                    }
-                    _ => {
-                        app.status_message = "No active QSO to re-send".to_string();
-                    }
+            Action::ResendLastTx => match (app.selected_qso_id(), app.selected_qso_callsign()) {
+                (Some(qso_id), Some(call)) => {
+                    self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
+                    app.status_message = format!("Re-sending last TX to {}", call);
                 }
-            }
+                _ => {
+                    app.status_message = "No active QSO to re-send".to_string();
+                }
+            },
             // k - kill/abort the selected QSO, from ANY panel (PAN-21). The
             // old panel-gating was a defense against `k`-as-vim-scroll muscle
             // memory firing an accidental abort while browsing an unrelated
@@ -2162,7 +2178,7 @@ impl TuiRunner {
             // stable, visible answer to "what does k hit," even in the
             // views that have no QSO Status table on screen at all.
             //
-            // Guarded to a BARE `k` (`key.modifiers.is_empty()`, PAN-21
+            // Guarded to a BARE `k` (`keymap::Mods::Bare`, PAN-21
             // round-2 remediation): crossterm reports Ctrl+K / Alt+K as the
             // same `KeyCode::Char('k')` with the modifier carried separately
             // in `key.modifiers`, so without this guard an operator's
@@ -2170,23 +2186,22 @@ impl TuiRunner {
             // do with this app) would ALSO abort the QSO. That's exactly the
             // accidental-trigger foot-gun the old QsoStatus-only gating
             // existed to prevent, just via a different physical input than
-            // vim-scroll. Modified k falls through to the catch-all `_ => {}`
-            // below (a no-op). Arms that can key the transmitter (CQ, PTT,
-            // autonomous, TX policy, re-send, the `u` nudge, tune, Fox,
-            // Hound, Space, Callers Enter) are guarded by `ctrl_or_alt_held`
-            // (PAN-112). The unguarded letter arms only open overlays, change
+            // vim-scroll. Modified k matches no chord (a no-op). Chords that
+            // can key the transmitter (CQ, PTT, autonomous, TX policy,
+            // re-send, the `u` nudge, tune, Fox, Hound, Space, Callers Enter)
+            // use `keymap::Mods::NoCtrlAlt` (PAN-112, `Action::starts_tx`). The unguarded letter arms only open overlays, change
             // local view state, retune or re-pick the TX offset without
             // re-keying, or stop TX (`s`, `h`).
-            KeyCode::Char('k') if key.modifiers.is_empty() => {
+            Action::AbortSelectedQso => {
                 self.abort_selected_qso(&mut app)?;
             }
             // r pressed outside the QSO Status panel: hint, don't act.
-            KeyCode::Char('r') if !ctrl_or_alt_held => {
+            Action::ResendFocusHint => {
                 app.status_message = "Focus the QSO Status panel (2) to re-send (r)".to_string();
             }
 
             // === Tune / clear-offset (case-sensitive) ===
-            KeyCode::Char('T') if !ctrl_or_alt_held => {
+            Action::ToggleTune => {
                 // Shift-T: 12-second single-tone tune. Shift requirement is a
                 // small barrier against accidental TX during keyboard fumbling.
                 // TX-policy safety gate: a tune carrier is a transmission, so
@@ -2200,7 +2215,7 @@ impl TuiRunner {
                     self.message_tx.send(TuiCommand::ToggleTune)?;
                 }
             }
-            KeyCode::Char('t') => {
+            Action::FindClearOffset => {
                 // Lowercase t: find and HOLD the best TX offset. Always
                 // picks something (least-congested if nothing is truly
                 // clear). FQ-F8: prefers the authoritative TX-placement
@@ -2244,7 +2259,7 @@ impl TuiRunner {
             // QSO the nudge re-arms the current frame for transmission
             // (a CQ for a QSO still calling CQ), so Ctrl+U / Alt+U must not
             // reach it.
-            KeyCode::Char('u') if !ctrl_or_alt_held => {
+            Action::NudgeTxOffset => {
                 // PAN-72: "un-stick" — force a nudge without leaving Auto.
                 // The coordinator resolves the target (active QSO vs.
                 // CQ-hunting) since App doesn't track that state locally.
@@ -2252,7 +2267,7 @@ impl TuiRunner {
             }
 
             // === Autonomous controls ===
-            KeyCode::Char('a') if !ctrl_or_alt_held => {
+            Action::ToggleAutonomous => {
                 // Flip local state optimistically for immediate feedback,
                 // then send the toggle to the coordinator — it flips the
                 // authoritative `autonomous_enabled_runtime` gate (the
@@ -2266,7 +2281,7 @@ impl TuiRunner {
                 }
                 self.message_tx.send(TuiCommand::ToggleAutonomous)?;
             }
-            KeyCode::Char('P') => {
+            Action::ToggleAutonomousPause => {
                 // Shift-P: pause/resume autonomous (uppercase to disambiguate from p=PTT).
                 app.toggle_autonomous_pause();
             }
@@ -2275,7 +2290,7 @@ impl TuiRunner {
             // g - cycle Full → RespondOnly → Disabled → Full. Optimistically
             // flip the local banner for instant feedback; the coordinator
             // echoes the authoritative state back via TxPolicyUpdate.
-            KeyCode::Char('G') if !ctrl_or_alt_held => {
+            Action::SaveGainPreset => {
                 let frequency = (app.station_info.operating_frequency * 1_000_000.0).round() as u64;
                 let band = pancetta_core::Band::from_frequency(frequency)
                     .map(|band| band.to_string())
@@ -2283,7 +2298,7 @@ impl TuiRunner {
                 app.status_message = format!("Saving {} gain preset…", band);
                 self.message_tx.send(TuiCommand::SaveReceiveGainPreset)?;
             }
-            KeyCode::Char('g') if !ctrl_or_alt_held => {
+            Action::CycleTxPolicy => {
                 let next = app.tx_policy.cycle();
                 app.tx_policy = next;
                 app.status_message = format!("TX policy: {}", next.label());
@@ -2294,7 +2309,7 @@ impl TuiRunner {
             // local flip (unlike `g`): a mode switch can be refused while a
             // QSO is active, and flip-then-rollback would flicker the
             // title-bar mode span. Wait for the coordinator's echo.
-            KeyCode::Char('M') => {
+            Action::CycleOperatingMode => {
                 self.message_tx.send(TuiCommand::CycleOperatingMode)?;
             }
 
@@ -2304,7 +2319,7 @@ impl TuiRunner {
             // knows the resolved hardware tier `Auto` needs, so the TUI
             // waits for the authoritative `DecodeEffortUpdate` echo. Unlike
             // Shift+M this can never be refused (no active-QSO gate).
-            KeyCode::Char('e') => {
+            Action::CycleDecodeEffort => {
                 self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
             }
 
@@ -2313,17 +2328,17 @@ impl TuiRunner {
             // through the 4-value ring (Operate/Hunt/Run/Monitor). Local-only
             // (no coordinator round-trip): every view still renders today's
             // Operate layout until Tasks 5-7 land the per-view differences.
-            KeyCode::Char('v') => {
+            Action::CycleViewForward => {
                 app.cycle_view(true);
             }
-            KeyCode::Char('V') => {
+            Action::CycleViewBack => {
                 app.cycle_view(false);
             }
             // z - zoom the focused panel to fill the whole content area,
             // bypassing the active view's grid. Orthogonal to v/V: works
             // the same in any of the 4 views, and toggles the same panel
             // back off (Esc also clears it; see the guarded Esc arm above).
-            KeyCode::Char('z') => {
+            Action::ToggleZoom => {
                 app.zoomed = !app.zoomed;
                 app.status_message = if app.zoomed {
                     "Panel zoomed".to_string()
@@ -2335,14 +2350,14 @@ impl TuiRunner {
             // offset you picked sticky; Auto lets pancetta choose/adjust it.
             // Optimistically flip the local chip; the coordinator flips the
             // authoritative shared atomic.
-            KeyCode::Char('f') => {
+            Action::ToggleTxFreqMode => {
                 let next = app.tx_freq_mode.toggle();
                 app.tx_freq_mode = next;
                 app.status_message = format!("TX freq: {}", next.label());
                 self.message_tx.send(TuiCommand::ToggleTxFreqMode)?;
             }
             // Shift+F — open the arbitrary-frequency / split entry modal.
-            KeyCode::Char('F') => {
+            Action::OpenFreqModal => {
                 app.freq_modal.visible = true;
                 app.freq_modal.field = crate::app::FreqModalField::RxDial;
                 app.freq_modal.rx_buffer.clear();
@@ -2352,7 +2367,7 @@ impl TuiRunner {
             // `o` — open the TX-audio-offset modal. Prompts for an integer Hz
             // value in [200, 2900]; blank Enter = clear (→ Auto). Mirrors the
             // Shift+F pattern but for audio offsets within the passband.
-            KeyCode::Char('W') if !ctrl_or_alt_held => {
+            Action::OpenWatchlistModal => {
                 app.watchlist_modal.buffer =
                     if matches!(app.active_panel, crate::app::ActivePanel::DxHunter) {
                         app.displayed_dx_stations()
@@ -2364,13 +2379,13 @@ impl TuiRunner {
                     };
                 app.watchlist_modal.visible = true;
             }
-            KeyCode::Char('o') => {
+            Action::OpenOffsetModal => {
                 app.offset_modal.visible = true;
                 app.offset_modal.buffer.clear();
                 app.status_message =
                     "TX offset: enter Hz (200–2900), blank=Auto, Enter, Esc".to_string();
             }
-            KeyCode::Char('m') => {
+            Action::ToggleMonitoring => {
                 app.toggle_monitoring().await?;
             }
 
@@ -2379,7 +2394,7 @@ impl TuiRunner {
             // compose, letters are commands only — this is the single entry
             // point for typing a free-text message so command keys never fire
             // mid-typing.
-            KeyCode::Char('/') => {
+            Action::EnterCompose => {
                 app.enter_compose_mode();
             }
 
@@ -2389,7 +2404,7 @@ impl TuiRunner {
             // window actually clears. `try_clear_decodes` returns `true`
             // only when it cleared, so we only tell the coordinator to
             // clear its side on the confirming press.
-            KeyCode::Char('x') => {
+            Action::ClearDecodes => {
                 if app.try_clear_decodes() {
                     self.message_tx.send(TuiCommand::ClearMessages)?;
                 }
@@ -2409,7 +2424,7 @@ impl TuiRunner {
             // pending, `resolve_space_action` returns `None` rather than a
             // `Call` that would supersede it — surface a specific status
             // message so the operator knows why nothing happened.
-            KeyCode::Char(' ') if !ctrl_or_alt_held => match app.resolve_space_action() {
+            Action::CallOrReplySelected => match app.resolve_space_action() {
                 Some(crate::app::SpaceAction::Reply {
                     callsign,
                     frequency,
@@ -2461,63 +2476,54 @@ impl TuiRunner {
             // Callers/TxPlacement there's nothing for Enter to send — it
             // hints the operator toward compose instead.
             //
-            // PAN-112: Ctrl/Alt+Enter on Callers would reply on air, so it is
-            // swallowed here. TxPlacement parking does not transmit and keeps
+            // PAN-112: Ctrl/Alt+Enter on Callers would reply on air, so its
+            // chord is `Mods::NoCtrlAlt` and the modified press matches no
+            // chord. TxPlacement parking does not transmit and keeps
             // accepting modifiers. Only chords the terminal reports are caught:
             // legacy Unix terminals send Ctrl+Enter and Ctrl+M as a plain
             // Enter, which no guard can tell apart.
-            KeyCode::Enter
-                if ctrl_or_alt_held
-                    && matches!(app.active_panel, crate::app::ActivePanel::Callers) => {}
-            KeyCode::Enter => {
-                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
-                    if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
-                        let step = app.current_caller_reply_step();
-                        let snr = app.selected_caller().map(|m| m.snr as f32);
-                        self.message_tx.send(TuiCommand::RespondToCaller {
-                            callsign: callsign.clone(),
-                            frequency,
-                            dx_parity,
-                            step,
-                            snr,
-                        })?;
-                        app.status_message = format!("Replying to {} ({:?})", callsign, step);
-                    } else {
-                        app.status_message = "No caller selected".to_string();
-                    }
-                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
-                    if let Some(slice) = app
-                        .placement
-                        .as_ref()
-                        .and_then(|p| p.slices.get(app.placement_cursor))
-                        .cloned()
-                    {
-                        let hz = slice.offset_hz.round() as u64;
-                        let coverage = crate::ui::tx_placement::coverage_label(
-                            slice.clear_first,
-                            slice.clear_second,
-                        );
-                        app.tx_offset_hold_hz = Some(hz);
-                        app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                        app.parked_since = Some(chrono::Utc::now());
-                        app.status_message = format!("Parked at {hz} Hz ({coverage})");
-                        self.message_tx.send(TuiCommand::SetTxOffset {
-                            offset_hz: Some(hz),
-                        })?;
-                    } else {
-                        app.status_message = "No placement candidate selected".to_string();
-                    }
+            Action::ReplyToSelectedCaller => {
+                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+                    let step = app.current_caller_reply_step();
+                    let snr = app.selected_caller().map(|m| m.snr as f32);
+                    self.message_tx.send(TuiCommand::RespondToCaller {
+                        callsign: callsign.clone(),
+                        frequency,
+                        dx_parity,
+                        step,
+                        snr,
+                    })?;
+                    app.status_message = format!("Replying to {} ({:?})", callsign, step);
                 } else {
-                    app.status_message = "Press / to compose a free-text TX message".to_string();
+                    app.status_message = "No caller selected".to_string();
                 }
             }
-
-            // NOTE: there is intentionally NO `Char(c)` text catch-all here.
-            // Outside compose mode every letter is a command; free-text input
-            // is reachable only via `/` (compose mode), so a stray keystroke
-            // can never silently fill the TX buffer or fire a command while the
-            // operator means to type.
-            _ => {}
+            Action::ParkAtPlacement => {
+                if let Some(slice) = app
+                    .placement
+                    .as_ref()
+                    .and_then(|p| p.slices.get(app.placement_cursor))
+                    .cloned()
+                {
+                    let hz = slice.offset_hz.round() as u64;
+                    let coverage = crate::ui::tx_placement::coverage_label(
+                        slice.clear_first,
+                        slice.clear_second,
+                    );
+                    app.tx_offset_hold_hz = Some(hz);
+                    app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+                    app.parked_since = Some(chrono::Utc::now());
+                    app.status_message = format!("Parked at {hz} Hz ({coverage})");
+                    self.message_tx.send(TuiCommand::SetTxOffset {
+                        offset_hz: Some(hz),
+                    })?;
+                } else {
+                    app.status_message = "No placement candidate selected".to_string();
+                }
+            }
+            Action::ComposeHint => {
+                app.status_message = "Press / to compose a free-text TX message".to_string();
+            }
         }
 
         Ok(true)
@@ -3499,6 +3505,169 @@ mod key_tests {
 
     fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    // ---- PAN-327: key dispatch through the keymap table -------------------
+
+    /// Put `app` into a main-view context where `when` holds: `Panel(p)`
+    /// focuses `p`; `NotPanel`/`NeitherPanel` focus the first panel (in
+    /// BandActivity, QsoStatus, Callers, DxHunter, TxPlacement order) that
+    /// satisfies them; `StopBanner` raises the stop banner; `ZoomNoBanner`
+    /// zooms.
+    fn enter_context(app: &mut App, when: crate::keymap::When) {
+        use crate::app::ActivePanel;
+        use crate::keymap::When;
+        let first_panel = |ok: &dyn Fn(ActivePanel) -> bool| {
+            [
+                ActivePanel::BandActivity,
+                ActivePanel::QsoStatus,
+                ActivePanel::Callers,
+                ActivePanel::DxHunter,
+                ActivePanel::TxPlacement,
+            ]
+            .into_iter()
+            .find(|p| ok(*p))
+            .expect("some panel satisfies the condition")
+        };
+        match when {
+            When::Always => {}
+            When::Panel(p) => app.active_panel = p,
+            When::NotPanel(p) => app.active_panel = first_panel(&|q| q != p),
+            When::NeitherPanel(a, b) => app.active_panel = first_panel(&|q| q != a && q != b),
+            When::StopBanner => app.stopped_by_operator = true,
+            When::ZoomNoBanner => app.zoomed = true,
+        }
+    }
+
+    /// Gherkin (PAN-327): Given each row of KEYBINDINGS.md, When its key is
+    /// pressed in the documented context, Then the named action fires and
+    /// no other. Pressed with a modifier its chord refuses, the action never
+    /// fires.
+    #[tokio::test]
+    async fn every_documented_key_fires_its_action_and_no_other() {
+        use crate::keymap::{Mods, KEYBINDINGS};
+        const ANY: [KeyModifiers; 4] = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ];
+        for row in KEYBINDINGS {
+            for chord in row.chords {
+                let (admitted, refused): (&[KeyModifiers], &[KeyModifiers]) = match chord.mods {
+                    Mods::Any => (&ANY, &[]),
+                    Mods::NoCtrlAlt => (&ANY[..2], &ANY[2..]),
+                    Mods::Bare => (&ANY[..1], &ANY[1..]),
+                };
+                for &mods in admitted {
+                    let (mut runner, _cmd_rx, app) = make_runner().await;
+                    enter_context(&mut *app.write().await, chord.when);
+                    let result = runner
+                        .handle_key_event(KeyEvent::new(chord.code, mods))
+                        .await;
+                    assert!(
+                        matches!(result, Ok(true)),
+                        "row {:?}: {:?}+{mods:?} returned {result:?}",
+                        row.key,
+                        chord.code
+                    );
+                    assert_eq!(
+                        runner.dispatched,
+                        vec![chord.action],
+                        "row {:?}: {:?}+{mods:?} in {:?}",
+                        row.key,
+                        chord.code,
+                        chord.when
+                    );
+                }
+                for &mods in refused {
+                    let (mut runner, _cmd_rx, app) = make_runner().await;
+                    enter_context(&mut *app.write().await, chord.when);
+                    let _ = runner
+                        .handle_key_event(KeyEvent::new(chord.code, mods))
+                        .await;
+                    assert!(
+                        !runner.dispatched.contains(&chord.action),
+                        "row {:?}: {:?}+{mods:?} must not fire {:?}",
+                        row.key,
+                        chord.code,
+                        chord.action
+                    );
+                }
+            }
+        }
+    }
+
+    /// Shift+Q dispatches EmergencyStop, and only that, while the quit
+    /// confirm is open (a dialog the main-view chords never reach).
+    #[tokio::test]
+    async fn shift_q_dispatches_emergency_stop_through_an_open_dialog() {
+        let (mut runner, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        runner.handle_key_event(key_shift('Q')).await.unwrap();
+        assert_eq!(runner.dispatched, vec![Action::EmergencyStop]);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        assert!(app.read().await.quit_confirm_visible);
+    }
+
+    /// Characterization (PAN-327): the Ctrl/Alt guards on `G`, `W` and `w`
+    /// were untested before the table carried them. Each modified press at
+    /// the main view sends nothing, opens nothing and leaves the status line.
+    #[tokio::test]
+    async fn ctrl_or_alt_g_w_and_w_are_swallowed_at_main_view() {
+        for c in ['G', 'W', 'w'] {
+            for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                let (mut runner, cmd_rx, app) = make_runner().await;
+                let before = app.read().await.status_message.clone();
+                runner
+                    .handle_key_event(KeyEvent::new(KeyCode::Char(c), mods))
+                    .await
+                    .unwrap();
+                let app = app.read().await;
+                assert!(cmd_rx.try_recv().is_err(), "{c:?}+{mods:?} sent a command");
+                assert!(
+                    !app.watchlist_modal.visible,
+                    "{c:?}+{mods:?} opened the watchlist"
+                );
+                assert!(!app.show_why, "{c:?}+{mods:?} opened Why");
+                assert_eq!(
+                    app.status_message, before,
+                    "{c:?}+{mods:?} wrote the status line"
+                );
+                assert!(runner.dispatched.is_empty());
+            }
+        }
+    }
+
+    /// Characterization (PAN-327): while Help or Health is open, every key
+    /// except Shift+Q first clamps the stored scroll to the viewport maximum,
+    /// even a key the overlay swallows. Shift+Q returns before the clamp.
+    #[tokio::test]
+    async fn help_and_health_clamp_scroll_on_swallowed_keys() {
+        let (mut runner, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.help_visible = true;
+            a.help_scroll = 10_000;
+        }
+        runner.handle_key_event(key_shift('Q')).await.unwrap();
+        assert_eq!(app.read().await.help_scroll, 10_000);
+        runner.handle_key_event(key('j')).await.unwrap();
+        assert!(app.read().await.help_scroll < 10_000);
+        assert!(app.read().await.help_visible);
+
+        let (mut runner, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.show_health = true;
+            a.health_scroll = 10_000;
+        }
+        runner.handle_key_event(key('j')).await.unwrap();
+        assert!(app.read().await.health_scroll < 10_000);
+        assert!(app.read().await.show_health);
     }
 
     // ---- PAN-89: readiness strip ------------------------------------------
@@ -8020,3 +8189,6 @@ mod pan_59_command_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod key_effects;
