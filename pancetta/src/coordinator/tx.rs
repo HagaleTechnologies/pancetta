@@ -2804,6 +2804,67 @@ async fn flush_disarmed_audio_confirmed(
     DisarmFlush::WaitedOutPlayback
 }
 
+/// PAN-273 (Codex P2, PR #587): the retrying PTT-off an armed
+/// [`PttGuard`]'s `Drop` spawned, while it may still be outstanding.
+/// Coordinator-owned, so a restarted TX worker shares it. [`PttGuard::new`]
+/// waits for it before reserving the next key-down, so a fallback unkey can
+/// never reach Hamlib's channel after a later PTT-on from the TX worker
+/// (for example the re-key a supersede starts right after an undelivered
+/// release).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingPttOff(
+    std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+);
+
+impl PendingPttOff {
+    /// Record a fallback PTT-off so the next [`Self::settle`] waits for it
+    /// and for any fallback already recorded. Both send independently.
+    fn push(&self, unkey: tokio::task::JoinHandle<()>) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(match slot.take() {
+            None => unkey,
+            Some(earlier) => tokio::task::spawn(async move {
+                let _ = earlier.await;
+                let _ = unkey.await;
+            }),
+        });
+    }
+
+    /// Wait until every fallback PTT-off recorded so far has finished
+    /// (delivered or given up after its bounded retries). If this wait is
+    /// cancelled (worker abort or restart), the unfinished handle goes back
+    /// in the slot, so the next key-down still waits for it.
+    async fn settle(&self) {
+        struct Waiting<'a> {
+            slot: &'a PendingPttOff,
+            unkey: Option<tokio::task::JoinHandle<()>>,
+        }
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if let Some(unkey) = self.unkey.take() {
+                    self.slot.push(unkey);
+                }
+            }
+        }
+        let outstanding = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut waiting = Waiting {
+            slot: self,
+            unkey: outstanding,
+        };
+        if let Some(unkey) = waiting.unkey.as_mut() {
+            let _ = unkey.await;
+        }
+        waiting.unkey = None;
+    }
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -2813,6 +2874,8 @@ struct PttGuard {
     /// cleared on drop (RAII — clears on every exit path incl. abort/panic).
     ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_ptt_off_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Where `Drop` records its fallback PTT-off for the next `new` to await.
+    pending_ptt_off: PendingPttOff,
 }
 
 impl PttGuard {
@@ -2829,13 +2892,22 @@ impl PttGuard {
     /// constructor is `async` accordingly; the wait here is expected to be
     /// negligible (the QSO-manager side never does I/O or hardware calls
     /// while holding it, only channel sends).
+    ///
+    /// PAN-273 (Codex P2, PR #587): first waits for any fallback PTT-off a
+    /// previous armed guard's `Drop` left outstanding (at most its bounded
+    /// retry schedule), so that unkey is serialized ahead of this guard's
+    /// key-down. The TX-worker arms already settle before their audio
+    /// refresh (single, multi) or hard-mute check (tune), so this wait is
+    /// normally a no-op backstop.
     async fn new(
         message_bus: MessageBus,
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ptt_sync_gate: &std::sync::Arc<tokio::sync::Mutex<()>>,
         last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_ptt_off_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        pending_ptt_off: &PendingPttOff,
     ) -> Self {
+        pending_ptt_off.settle().await;
         {
             let _ptt_sync = ptt_sync_gate.lock().await;
             // Reserve the relocation interlock even if gain currently blocks
@@ -2849,6 +2921,7 @@ impl PttGuard {
             armed: true,
             ptt_active,
             last_ptt_off_ms: last_ptt_off_ms.clone(),
+            pending_ptt_off: pending_ptt_off.clone(),
         }
     }
 
@@ -2857,7 +2930,8 @@ impl PttGuard {
     /// Hamlib applies that channel in order, so any later PTT-on from this
     /// worker lands after this unkey. An enqueued PTT-off is handed off.
     /// If every attempt drops, the guard stays armed (its `Drop` retries on
-    /// scope exit) and `ptt_active` stays true until then; Hamlib's 14 s
+    /// scope exit, and the next [`Self::new`] waits for that retry before
+    /// keying) and `ptt_active` stays true until then; Hamlib's 14 s
     /// PTT watchdog is the remaining backstop.
     ///
     /// PAN-273: every TX-worker unkey after a key-down goes through here
@@ -7226,12 +7300,10 @@ impl Drop for PttGuard {
             .store(false, std::sync::atomic::Ordering::Release);
         if self.armed {
             let bus = self.message_bus.clone();
-            // Spawn a fire-and-forget task to send PTT-off.
-            // This runs even if the parent task was cancelled.
-            // rationale: intentional detach — `spawn` runs the task independently;
-            // the dropped JoinHandle is the canonical fire-and-forget idiom.
-            #[allow(clippy::let_underscore_future)]
-            let _ = tokio::task::spawn(async move {
+            // Spawn a task to send PTT-off. This runs even if the parent task
+            // was cancelled. PAN-273 (Codex P2, PR #587): its handle goes in
+            // the shared slot so the TX worker's next key-down waits for it.
+            self.pending_ptt_off.push(tokio::task::spawn(async move {
                 match bus
                     .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
                     .await
@@ -7246,7 +7318,7 @@ impl Drop for PttGuard {
                     ),
                     Err(e) => tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e),
                 }
-            });
+            }));
         }
     }
 }
@@ -7425,7 +7497,9 @@ async fn supersede_and_rekey_or_bundle(
     // PTT-off stands the guard down (stamps `last_ptt_off_ms`, clears
     // `ptt_active`); an undelivered one leaves it armed so its `Drop`
     // retries when the caller's arm exits. Callers never `disarm()` after
-    // this returns.
+    // this returns. A `Replace`/`Bundle` re-key after an undelivered
+    // release is serialized behind that retry: the re-key's
+    // `PttGuard::new` waits for it before keying (Codex P2, PR #587).
     ptt_guard.release("Supersede").await;
 
     let MessageType::TransmitRequest {
@@ -8174,6 +8248,8 @@ impl super::ApplicationCoordinator {
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
             let last_ptt_off_ms = self.last_ptt_off_ms.clone();
+            // PAN-273: the armed-guard drop fallback each key-down waits for.
+            let pending_ptt_off = self.pending_ptt_off.clone();
             // Active slot period (FT8 = 15e9 ns, FT4 = 7.5e9 ns), set once at
             // startup from `[rig].mode`. The TX scheduler keys against this so
             // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
@@ -9393,6 +9469,11 @@ impl super::ApplicationCoordinator {
                                         // real FT8 slot grid regardless of how long the steps
                                         // above took. See
                                         // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                        // PAN-273: wait out an outstanding drop-fallback
+                                        // PTT-off (e.g. after an undelivered supersede
+                                        // release) before the refresh, so the wait cannot
+                                        // misalign the audio.
+                                        pending_ptt_off.settle().await;
                                         let (fresh_pad_samples, fresh_cursor_samples) =
                                             pad_and_cursor_for_target(
                                                 chrono::Utc::now(),
@@ -9635,6 +9716,7 @@ impl super::ApplicationCoordinator {
                                             &ptt_sync_gate,
                                             &last_ptt_on_ms,
                                             &last_ptt_off_ms,
+                                            &pending_ptt_off,
                                         )
                                         .await;
                                         // TX badge on; guard drop clears it on every
@@ -12540,6 +12622,9 @@ impl super::ApplicationCoordinator {
                                     // above (adaptive coalesce window, encoding,
                                     // possible key-time re-encode) took. See
                                     // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                    // PAN-273: wait out an outstanding drop-fallback
+                                    // PTT-off before the refresh (see the single-TX arm).
+                                    pending_ptt_off.settle().await;
                                     let (fresh_pad_samples, fresh_cursor_samples) =
                                         pad_and_cursor_for_target(
                                             chrono::Utc::now(),
@@ -12602,6 +12687,7 @@ impl super::ApplicationCoordinator {
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
                                         &last_ptt_off_ms,
+                                        &pending_ptt_off,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -13594,6 +13680,9 @@ impl super::ApplicationCoordinator {
                                 } => {
                                     info!("Tune: {}s tone at {} Hz", duration_secs, tone_offset_hz);
                                     TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    // PAN-273: wait out an outstanding drop-fallback
+                                    // PTT-off before the gates below, not after them.
+                                    pending_ptt_off.settle().await;
 
                                     // --- TX-policy hard mute ---
                                     // A tune carrier is a transmission. If the
@@ -13688,6 +13777,7 @@ impl super::ApplicationCoordinator {
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
                                         &last_ptt_off_ms,
+                                        &pending_ptt_off,
                                     )
                                     .await;
                                     // TX badge on; guard drop clears it on every
@@ -16463,6 +16553,7 @@ mod supersede_rekey_tests {
             &Arc::new(tokio::sync::Mutex::new(())),
             last_ptt_on_ms,
             last_ptt_off_ms,
+            &PendingPttOff::default(),
         )
         .await
     }
@@ -24932,6 +25023,7 @@ mod pan135_ptt_release_tests {
             &Arc::new(tokio::sync::Mutex::new(())),
             &Arc::new(AtomicU64::new(0)),
             &Arc::new(AtomicU64::new(0)),
+            &PendingPttOff::default(),
         )
         .await
     }
@@ -24998,7 +25090,8 @@ mod pan135_ptt_release_tests {
         let on = Arc::new(AtomicU64::new(0));
         let off = Arc::new(AtomicU64::new(0));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let mut g = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off).await;
+        let pending = PendingPttOff::default();
+        let mut g = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
         assert!(on.load(Ordering::Acquire) > 0);
         assert_eq!(off.load(Ordering::Acquire), 0);
         assert_eq!(g.release("timestamp test").await, PttRelease::Delivered);
@@ -25006,7 +25099,7 @@ mod pan135_ptt_release_tests {
         drop(g);
         let first_on = on.load(Ordering::Acquire);
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let g = PttGuard::new(bus, active.clone(), &gate, &on, &off).await;
+        let g = PttGuard::new(bus, active.clone(), &gate, &on, &off, &pending).await;
         assert!(on.load(Ordering::Acquire) > first_on);
         assert!(off.load(Ordering::Acquire) < on.load(Ordering::Acquire));
         drop(g);
@@ -25086,6 +25179,63 @@ mod pan135_ptt_release_tests {
         assert_eq!(ptt_offs(&rx), 1, "Drop retries, not one best-effort shot");
     }
 
+    /// PAN-273 (Codex P2, PR #587): an undelivered release leaves the
+    /// guard's `Drop` fallback PTT-off outstanding. The next key-down (a
+    /// supersede re-key, or the next frame) must not overtake it: the next
+    /// `PttGuard::new` waits for it, so Hamlib sees that PTT-off before the
+    /// new PTT-on. Before, the new guard came straight back and the stale
+    /// PTT-off landed after the re-key's PTT-on, cutting the new frame off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_key_down_waits_for_an_outstanding_drop_fallback_unkey() {
+        let bus = MessageBus::new(2).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        assert!(backlog(&bus).await);
+        let active = Arc::new(AtomicBool::new(false));
+        let on = Arc::new(AtomicU64::new(0));
+        let off = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let pending = PendingPttOff::default();
+        let mut a = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
+        assert_eq!(a.release("Supersede").await, PttRelease::Undelivered);
+        drop(a); // armed: its fallback PTT-off is now outstanding
+        let _ = rx.try_iter().count(); // Hamlib catches up
+        let b = PttGuard::new(bus.clone(), active.clone(), &gate, &on, &off, &pending).await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "the earlier guard's fallback PTT-off is on Hamlib's channel before the new key-down"
+        );
+        drop(b);
+        let_drop_task_run().await;
+    }
+
+    /// PAN-273 self-review: a key-down's wait for the fallback can be
+    /// cancelled (worker abort or supervisor restart). The unfinished
+    /// fallback must stay recorded, so the restarted worker's first
+    /// key-down still waits for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_settle_keeps_the_fallback_for_the_next_key_down() {
+        let pending = PendingPttOff::default();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        pending.push(tokio::task::spawn(async move {
+            let _ = held.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending.settle())
+                .await
+                .is_err(),
+            "the fallback is still running"
+        );
+        assert!(
+            pending.0.lock().unwrap().is_some(),
+            "the cancelled wait put the unfinished fallback back"
+        );
+        let _ = release.send(());
+        pending.settle().await;
+        assert!(pending.0.lock().unwrap().is_none());
+    }
+
     /// PAN-273: with no Hamlib channel (`--replay`, a build without
     /// `pancetta-hamlib`) nothing was keyed, so `release` stands the guard
     /// down without a send. Before, it stalled ~78 ms, logged an error and
@@ -25101,6 +25251,7 @@ mod pan135_ptt_release_tests {
             &Arc::new(tokio::sync::Mutex::new(())),
             &Arc::new(AtomicU64::new(0)),
             &off,
+            &PendingPttOff::default(),
         )
         .await;
         assert!(ptt_active.load(Ordering::Acquire));

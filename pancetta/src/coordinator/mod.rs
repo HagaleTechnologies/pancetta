@@ -1634,6 +1634,9 @@ pub struct ApplicationCoordinator {
     pub(crate) last_ptt_on_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Enqueue-time PTT-off, paired with clearing ptt_active; not hardware confirmation.
     pub(crate) last_ptt_off_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// PAN-273: an armed `PttGuard`'s outstanding drop-fallback PTT-off.
+    /// The TX worker's next key-down waits for it (see `tx::PendingPttOff`).
+    pub(crate) pending_ptt_off: tx::PendingPttOff,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -2521,6 +2524,7 @@ impl ApplicationCoordinator {
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_ptt_off: tx::PendingPttOff::default(),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]

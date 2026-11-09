@@ -651,10 +651,14 @@ only for frames whose PTT-on was never enqueued (before the key-down send,
 or after a `Denied` one). With no Hamlib channel registered (`--replay`, a
 build without `pancetta-hamlib`) nothing was keyed, so `release` stands the
 guard down without sending and returns `PttRelease::NoRig`
-(`MessageBus::has_rig_route`). Residual risk, the same as PAN-135's: if a
-supersede's release is undelivered and the caller re-keys, the old guard's
-`Drop` retry can land after the new PTT-on and shorten that frame, never
-lengthen one.
+(`MessageBus::has_rig_route`). An armed guard's `Drop` records its retry
+task in the coordinator-owned `PendingPttOff`, and `PttGuard::new` waits for
+that task before the next TX-worker key-down (Codex P2 on PR #587). So when
+a supersede's release is undelivered and the caller re-keys, the old guard's
+fallback PTT-off reaches Hamlib's channel before the new PTT-on and cannot
+cut the new frame short. The wait is bounded by the 5, 20 and 50 ms retry
+schedule and happens before the pre-PTT gates. A PTT-on that does not
+construct a `PttGuard` (for example the gain sweep) does not wait for it.
 
 The mid-playback arms send `MessageType::AudioFlush { ack }` in band. The
 relay forwards it in order, and the audio thread settles the ack `Applied`
