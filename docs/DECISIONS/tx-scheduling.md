@@ -1039,6 +1039,44 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
   helper is tested directly.
 
+## A dropped key-down settles the frame as not sent (PAN-278, 2026-11-08)
+
+When `send_ptt_command` came back `SendIfOutcome::Dropped`, the TX worker logged "PTT ON failed"
+and carried on: it slept to the slot, enqueued the audio, and reported `success =
+audio_enqueued`. With Hamlib's channel full or disconnected, the QSO engine got `TxFrameSent`
+and Autonomous got `TransmitComplete { success: true }` for a frame that never keyed the rig. A
+tune in the same state played a tone with no carrier.
+
+- **Guard on the route.** The new path runs only when `MessageBus::has_rig_route()` is true.
+  Without a Hamlib route every PTT-on is `Dropped` by design (replay mode and
+  no-`pancetta-hamlib` builds, see the PAN-202 mechanism bullet above) and the audio is meant to
+  go out, so those modes keep the old proceed path with a reworded warning. Every drop that can
+  happen while a rig exists (a full or disconnected Hamlib channel) takes the new path. The
+  predicate is PAN-273's, copied byte for byte so either branch merges cleanly.
+- **Unwind like a pre-PTT refusal.** Single TX and bundles mirror the `Denied` arm: store
+  `last_ptt_off_ms`, clear `ptt_active`, `ptt_guard.disarm()`, clear this cycle's pivot
+  tombstones, clear the queue status, and report through `report_unaired_frame` (per item for a
+  bundle, with `unwind_bundle_pivots`/`take_bundle_replaced`). That honours the PAN-185 pivot
+  ownership rule: with no pivot the frame sends the failed `TransmitComplete` and its
+  `TxFrameNotSent`; with a pivot only the replaced frame's `TxFrameNotSent` goes out, so nothing
+  settles twice. The tune unwinds the same flag and is abandoned; its `TxStatusGuard` clears the
+  TX badge. The tune's check is `!= Enqueued`, so a receive-gain `Denied` with a route is
+  abandoned too, worded `refused` instead of `dropped`.
+- **No PTT-off.** The PTT-on never entered Hamlib's queue, so there is nothing to unkey;
+  `disarm()` is for frames whose PTT-on was never enqueued.
+- **No remote audit.** The `Denied` arm's `emit_disarm_interrupt_signals` is the remote-arm
+  audit and relay; a bus drop is not an arm event. The drop raises a `tx.ptt` Warn diagnostic
+  instead (`PTT-on dropped (rig not keyed): '<text>' not sent`, `... multi-TX bundle of <n> items
+  not sent`, `Tune: PTT-on dropped (rig not keyed); tune abandoned`).
+- **Gap left open.** Hamlib can still discard an enqueued PTT-on with no acknowledgement to the
+  worker: its command loop skips a key-down during a receive-gain transition, while the restart
+  inhibit is active, or when `hardware_ptt_on` refuses (`coordinator/hamlib.rs`, the `SetPtt`
+  handling). So `TxFrameSent` is still not proof of keying.
+- **Tests.** `pan278_dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
+  after the outcome settles (draining earlier lets the key-down through and hides the defect).
+  It covers single TX, a two-item bundle, a tune, and the no-route proceed path on
+  `worker_harness_without_rig`.
+
 ## High SWR halts the station (PAN-251), 2026-11-01
 
 `[rig.power_control.protection] swr_protection` (default on) and `max_swr` (default 3.0) were
