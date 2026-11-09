@@ -6,7 +6,6 @@
 // rationale: plain-data config structs built field-by-field in test/bench
 // setup; sequential assignment reads clearer than a struct-update splat.
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(feature = "transmit")]
 
 use pancetta_ft8::{
     DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, MESSAGE_DURATION, NUM_SYMBOLS,

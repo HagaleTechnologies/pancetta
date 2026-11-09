@@ -48,7 +48,6 @@
 //!
 //! W1.2 extends this same file with further i3/message-family AP tests.
 
-#![cfg(feature = "transmit")]
 #![allow(clippy::needless_range_loop)] // protocol-bit-position loops; see ap.rs/encoder.rs
 
 use bitvec::prelude::*;

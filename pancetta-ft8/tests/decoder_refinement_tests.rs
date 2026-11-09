@@ -6,7 +6,6 @@
 
 use pancetta_ft8::{Ft8Config, Ft8Decoder, SAMPLE_RATE, WINDOW_SAMPLES};
 
-#[cfg(feature = "transmit")]
 mod bessel_fallback_fixture {
     use super::*;
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator, LlrMetric};
@@ -171,7 +170,6 @@ mod bessel_fallback_fixture {
     }
 }
 
-#[cfg(feature = "transmit")]
 mod refinement {
     use super::*;
 
@@ -408,11 +406,10 @@ mod refinement {
 // test's convention, not the 2500 Hz WSJT-X-referenced convention
 // Workstream 0 flags as a separate, unrelated harness gap).
 //
-// Gated behind `transmit` like `mod refinement` above (needs the encoder +
-// modulator to synthesize the fixture).
+// Needs the encoder + modulator to synthesize the fixture (both in every
+// build since PAN-331).
 // ============================================================================
 
-#[cfg(feature = "transmit")]
 mod w33_matched_demod {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
@@ -581,11 +578,10 @@ mod w33_matched_demod {
 // above isolate `fine_sync_enabled`'s effect against the true legacy
 // baseline.
 //
-// Gated behind `transmit` (needs the encoder + modulator to synthesize the
-// fixture), same as `mod w33_matched_demod` above.
+// Needs the encoder + modulator to synthesize the fixture (both in every
+// build since PAN-331), same as `mod w33_matched_demod` above.
 // ============================================================================
 
-#[cfg(feature = "transmit")]
 mod w34_nsym_combining {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
@@ -743,7 +739,6 @@ mod w34_nsym_combining {
 // byte-identical when the tracker is off.
 // ============================================================================
 
-#[cfg(feature = "transmit")]
 mod w36_freq_tracker {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
@@ -819,7 +814,6 @@ mod w36_freq_tracker {
 // since it needs direct access to the private `subtract_signal` method —
 // see that module's doc comment for why.
 // ============================================================================
-#[cfg(feature = "transmit")]
 mod w42_time_varying_subtraction {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
@@ -993,8 +987,7 @@ mod w42_time_varying_subtraction {
 // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
 // dB-vs-linear-|y| gain-invariance property test.
 //
-// Unconditional (not gated behind `transmit`, unlike `mod refinement` above)
-// because it only needs a real off-air fixture WAV + `decode_window`, the
+// It only needs a real off-air fixture WAV + `decode_window`, the
 // same minimal surface `wav_decode_tests.rs` uses without any feature gate.
 // ============================================================================
 

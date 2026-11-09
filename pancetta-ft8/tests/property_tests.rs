@@ -3,8 +3,6 @@
 //! These tests use the proptest framework to generate random inputs
 //! and verify invariants of the FT8 encoding pipeline.
 
-#![cfg(feature = "transmit")]
-
 use bitvec::prelude::*;
 use pancetta_ft8::ldpc::{
     binary_to_gray, gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS,

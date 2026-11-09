@@ -4,8 +4,6 @@
 //! Uses self-referential golden tests since WSJT-X reference vectors
 //! are not yet available.
 
-#![cfg(feature = "transmit")]
-
 use bitvec::prelude::*;
 use pancetta_ft8::ldpc::{binary_to_gray, gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS};
 use pancetta_ft8::message::{calculate_crc14, PAYLOAD_BITS};

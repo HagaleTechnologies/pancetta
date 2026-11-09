@@ -1,8 +1,8 @@
 //! Test signal generator for FT8 testing
 //!
-//! When the `transmit` feature is enabled, generates real FT8 signals
-//! using the encoder+modulator pipeline. Otherwise, provides utility
-//! functions for basic signal generation.
+//! Generates real FT8 signals using the encoder+modulator pipeline (in
+//! every build since PAN-331), plus utility functions for basic signal
+//! generation.
 
 use std::f32::consts::PI;
 
@@ -32,7 +32,6 @@ impl Default for Ft8SignalParams {
 /// Generate a real FT8 signal using the encoder+modulator pipeline
 ///
 /// Encodes the message text, modulates to audio, adds noise for desired SNR.
-#[cfg(feature = "transmit")]
 pub fn generate_real_ft8_signal(
     message_text: &str,
     snr_db: f32,
@@ -255,7 +254,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_real_ft8_signal_generation() {
         let signal = generate_real_ft8_signal("CQ W1ABC FN42", 0.0, 0.0);

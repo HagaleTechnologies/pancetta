@@ -3,8 +3,6 @@
 //! Test 1: Encode -> modulate -> add noise -> decode, comparing BP-only vs OSD-enabled.
 //! Test 2: Pure noise input should produce no false decodes with OSD enabled.
 
-#![cfg(feature = "transmit")]
-
 mod test_signal_generator;
 
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};

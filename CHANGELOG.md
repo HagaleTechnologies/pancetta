@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`). `decode_cycle` output is unchanged (PAN-331).
+
 ### Fixed
 
 - PAN-278: When Hamlib's command queue drops the key-down, the frame is now reported as not sent and its audio is not played, so the QSO engine retries it instead of counting it as aired. A tune in that state is abandoned. `--replay` and builds without `pancetta-hamlib` are unchanged.
@@ -24,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `pancetta-hamlib` Cargo feature of the `pancetta` crate. Rig control is always built in, and `cargo build -p pancetta --no-default-features` compiles again (it failed with 77 errors, GitHub #270). Release builds are unchanged (PAN-331).
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
   (PAN-247). Legacy sections still load with one warning that the setting
   no longer exists and has no effect. Manual `audio.levels.input_gain_db`

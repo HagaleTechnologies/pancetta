@@ -438,7 +438,6 @@ pub enum StepOutcome {
 /// Execute within a reservation acquired under the coordinator PTT gate.
 /// The caller owns boundary admission; this helper enforces the absolute CAT
 /// deadline and rechecks the live authorization immediately before the setter.
-#[cfg(feature = "pancetta-hamlib")]
 pub async fn execute_step(
     rig: &dyn pancetta_hamlib::RigControl,
     safety: &GainSafety,

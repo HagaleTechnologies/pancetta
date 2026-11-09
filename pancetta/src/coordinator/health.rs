@@ -880,7 +880,6 @@ impl super::ApplicationCoordinator {
 
     async fn teardown_component(&mut self, component_id: ComponentId) {
         match component_id {
-            #[cfg(feature = "pancetta-hamlib")]
             ComponentId::Hamlib => self.teardown_hamlib().await,
             ComponentId::StationAgent => {
                 if let Some(poll) = self.station_agent_poll.take() {
@@ -923,7 +922,6 @@ impl super::ApplicationCoordinator {
             ComponentId::Qso => self.start_qso_component().await,
             ComponentId::Dsp => self.start_dsp_pipeline().await,
             ComponentId::Ft8Decoder => self.start_ft8_pipeline().await,
-            #[cfg(feature = "pancetta-hamlib")]
             ComponentId::Hamlib => self.start_hamlib_component().await,
             ComponentId::StationAgent => self.start_station_agent_component().await,
             ComponentId::Ft8Transmitter => self.start_transmitter_component().await,
@@ -1137,7 +1135,6 @@ mod supervisor_tests {
     /// restart budget so `handle_finished_task` takes the budget-exhausted
     /// branch deterministically, without needing a real restart attempt or
     /// backoff sleep.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn hamlib_restart_budget_exhausted_leaves_tx_permanently_inhibited() {
         let mut coordinator = test_coordinator().await;
@@ -1209,7 +1206,6 @@ mod supervisor_tests {
     /// earlier leaked `tx_restart_inhibit` increment is paid back --
     /// proving both the restart itself and the TX-inhibit accounting
     /// recover correctly.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn hamlib_stale_failed_status_gets_a_fresh_restart_when_budget_remains() {
         let mut coordinator = test_coordinator().await;
@@ -1289,7 +1285,6 @@ mod supervisor_tests {
     /// a rediscovered stale handle for an already-`Failed` component must
     /// remain a true no-op -- the fix must not reopen restart attempts
     /// forever, only when budget is actually available.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn hamlib_stale_failed_status_stays_failed_once_budget_is_truly_exhausted() {
         let mut coordinator = test_coordinator().await;
@@ -1346,7 +1341,6 @@ mod supervisor_tests {
         coordinator.shutdown_signal.store(true, Ordering::Release);
     }
 
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn hamlib_crash_mid_ptt_forces_ptt_off_on_the_rig() {
         use pancetta_hamlib::{PttState, RigControl, Vfo};
@@ -1374,7 +1368,6 @@ mod supervisor_tests {
     /// closes the loop between `tui_relay.rs` (Task 7, which only holds a
     /// cloned sender, never `&mut ApplicationCoordinator`) and
     /// `handle_hamlib_reconnect_request` (Task 5, which needs `&mut self`).
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn run_main_loop_processes_a_hamlib_reconnect_request() {
         let mut coordinator = test_coordinator().await;

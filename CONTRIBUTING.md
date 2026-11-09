@@ -77,7 +77,7 @@ cargo build --workspace
 # Build in release mode
 cargo build --release
 
-# Run tests (the encoder is behind the `transmit` feature)
+# Run tests (`transmit` adds pancetta-ft8's audio/PTT transmitter tests)
 cargo test --workspace --features transmit
 
 # Run with debug logging
@@ -158,6 +158,8 @@ cargo test --workspace --exclude pancetta-research --features transmit
 
 # pancetta-hamlib's mock-rig tests run single-threaded
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
+
+cargo check -p pancetta --no-default-features   # CI's no-default-features check
 
 # Run one test
 cargo test -p <crate> <test_name>

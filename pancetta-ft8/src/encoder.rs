@@ -21,7 +21,6 @@ use crate::message::{
 use crate::protocol::ProtocolParams;
 use crate::{Ft8Error, Ft8Result, NUM_SYMBOLS};
 use bitvec::prelude::*;
-use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// Maximum length for free text messages
@@ -36,7 +35,7 @@ pub const MIN_SIGNAL_REPORT: i8 = -35;
 /// WSJT-X constants for callsign encoding
 const NTOKENS: u32 = 2_063_592;
 const MAX22: u32 = 4_194_304;
-const MAXGRID4: u16 = 32400;
+pub(crate) const MAXGRID4: u16 = 32400;
 
 /// FT8 Costas synchronization array (same at all three positions)
 const COSTAS_ARRAY: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
@@ -1130,19 +1129,27 @@ fn is_cq_modifier(token: &str) -> bool {
 ///
 /// Returns value with bit 15 set if ir=1 (R prefix on report).
 pub fn packgrid(extra: &str) -> u16 {
+    try_packgrid(extra).unwrap_or(MAXGRID4 + 1)
+}
+
+/// Fallible [`packgrid`]: `None` where `packgrid` falls back to "no grid"
+/// (unparseable text, or a report outside -35..=30). The AP content
+/// builder (`ap::pack_extra_field`) skips those instead of packing them
+/// (PAN-331).
+pub(crate) fn try_packgrid(extra: &str) -> Option<u16> {
     if extra.is_empty() {
-        return MAXGRID4 + 1; // no grid/report
+        return Some(MAXGRID4 + 1); // no grid/report
     }
 
     // Special tokens
     if extra == "RRR" {
-        return MAXGRID4 + 2;
+        return Some(MAXGRID4 + 2);
     }
     if extra == "RR73" {
-        return MAXGRID4 + 3;
+        return Some(MAXGRID4 + 3);
     }
     if extra == "73" {
-        return MAXGRID4 + 4;
+        return Some(MAXGRID4 + 4);
     }
 
     let bytes = extra.as_bytes();
@@ -1160,7 +1167,7 @@ pub fn packgrid(extra: &str) -> u16 {
         igrid4 = igrid4 * 18 + (bytes[1] - b'A') as u16;
         igrid4 = igrid4 * 10 + (bytes[2] - b'0') as u16;
         igrid4 = igrid4 * 10 + (bytes[3] - b'0') as u16;
-        return igrid4;
+        return Some(igrid4);
     }
 
     // Parse signal report: +dd / -dd / R+dd / R-dd
@@ -1168,17 +1175,17 @@ pub fn packgrid(extra: &str) -> u16 {
         // R prefix → ir=1
         if let Some(dd) = parse_report(&extra[1..]) {
             if !(-35..=30).contains(&dd) {
-                return MAXGRID4 + 1; // out of range
+                return None; // out of range
             }
             let irpt = (35 + dd) as u16;
-            return (MAXGRID4 + irpt) | 0x8000; // ir=1
+            return Some((MAXGRID4 + irpt) | 0x8000); // ir=1
         }
     } else if let Some(dd) = parse_report(extra) {
         if !(-35..=30).contains(&dd) {
-            return MAXGRID4 + 1; // out of range
+            return None; // out of range
         }
         let irpt = (35 + dd) as u16;
-        return MAXGRID4 + irpt; // ir=0
+        return Some(MAXGRID4 + irpt); // ir=0
     }
 
     // Parse "R"+4-char-grid ack (PAN-49): state QSO parties and the ARRL
@@ -1201,11 +1208,11 @@ pub fn packgrid(extra: &str) -> u16 {
             igrid4 = igrid4 * 18 + (gbytes[1] - b'A') as u16;
             igrid4 = igrid4 * 10 + (gbytes[2] - b'0') as u16;
             igrid4 = igrid4 * 10 + (gbytes[3] - b'0') as u16;
-            return igrid4 | 0x8000;
+            return Some(igrid4 | 0x8000);
         }
     }
 
-    MAXGRID4 + 1 // fallback: no grid
+    None // fallback: no grid
 }
 
 /// Parse a signal report string like "+05" or "-12" into an integer
@@ -1406,10 +1413,9 @@ fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
 // guards the i3=4 nonstandard-callsign path against being triggered by
 // arbitrary free text, AND (PAN-27 round 5 / Codex round-2 finding 2) gates
 // what the decoder's type-4 hash-seeding loop is willing to learn into the
-// callsign hash table. Lives in `message.rs` (always compiled) rather than
-// here (feature-gated behind `transmit`) so `decoder.rs` can call the exact
-// same check without a feature-gate skew between transmit and receive-only
-// builds — see that module's doc comment for the full rationale.
+// callsign hash table. Lives in `message.rs` so there is one function for
+// the encoder and the decoder — see that module's doc comment for the full
+// rationale.
 use crate::message::looks_like_compound_callsign as looks_like_callsign;
 
 /// Does `s` look like a 4-character Maidenhead grid locator (`AA00`..`RR99`)?
@@ -1546,7 +1552,8 @@ fn encode_state_code(state: &str) -> Ft8Result<u8> {
 }
 
 /// Configuration for FT8 encoding
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8EncodingConfig {
     /// Use hash encoding for non-standard callsigns
     pub use_hash_encoding: bool,
@@ -1569,6 +1576,31 @@ impl Default for Ft8EncodingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_packgrid_is_none_exactly_where_packgrid_falls_back() {
+        // From the PAN-331 research divergence table, plus the report range edges.
+        let cases: &[(&str, Option<u16>)] = &[
+            ("", Some(MAXGRID4 + 1)),
+            ("RRR", Some(MAXGRID4 + 2)),
+            ("RR73", Some(MAXGRID4 + 3)),
+            ("73", Some(MAXGRID4 + 4)),
+            ("-35", Some(MAXGRID4)),
+            ("+30", Some(MAXGRID4 + 65)),
+            ("R-12", Some((MAXGRID4 + 23) | 0x8000)),
+            ("R5", Some((MAXGRID4 + 40) | 0x8000)),
+            ("FN42", Some(10342)),
+            ("R FN42", Some(10342 | 0x8000)),
+            ("+31", None),
+            ("-36", None),
+            ("R+99", None),
+            ("GARBAGE123", None),
+        ];
+        for &(extra, want) in cases {
+            assert_eq!(try_packgrid(extra), want, "{extra:?}");
+            assert_eq!(packgrid(extra), want.unwrap_or(MAXGRID4 + 1), "{extra:?}");
+        }
+    }
 
     #[test]
     fn test_encoder_creation() {

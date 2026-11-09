@@ -92,7 +92,6 @@ fn test_ft8lib_payload_round_trip() {
 }
 
 /// Compare our encoder output against ft8_lib for several messages.
-#[cfg(feature = "transmit")]
 #[test]
 fn test_encoder_matches_ft8lib() {
     use pancetta_ft8::Ft8Encoder;
@@ -190,7 +189,6 @@ fn test_ft8lib_decode_generated_rr73() {
 
 /// Encode with our encoder, decode payload with ft8_lib.
 /// This validates that our encoded payloads are decodable by ft8_lib.
-#[cfg(feature = "transmit")]
 #[test]
 fn test_our_encoder_ft8lib_decoder_payload() {
     use pancetta_ft8::Ft8Encoder;
@@ -252,7 +250,6 @@ fn test_our_encoder_ft8lib_decoder_payload() {
 
 /// Generate audio with our encoder+modulator, decode with ft8_lib.
 /// This is the ultimate interoperability test.
-#[cfg(feature = "transmit")]
 #[test]
 fn test_our_audio_decoded_by_ft8lib() {
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator, NUM_SYMBOLS, SAMPLE_RATE};

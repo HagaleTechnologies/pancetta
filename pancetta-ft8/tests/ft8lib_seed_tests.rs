@@ -2,10 +2,10 @@
 //!
 //! Integration tests that need the **real** vendored ft8_lib C library.
 //! File-gated on `not(ft8lib_stub)` so a stub build skips them outright rather
-//! than passing vacuously and hiding a broken translator, and on `transmit`
-//! because `Ft8Encoder` / `Ft8Modulator` — used to build the synthetic signals —
-//! are re-exported only under that feature.
-#![cfg(all(not(ft8lib_stub), feature = "transmit"))]
+//! than passing vacuously and hiding a broken translator. `Ft8Encoder` /
+//! `Ft8Modulator`, used to build the synthetic signals, are in every build
+//! (PAN-331).
+#![cfg(not(ft8lib_stub))]
 
 use pancetta_ft8::ft8_lib_ffi::{ft8lib_find_candidate_seeds, ftx_protocol_t, Ft8LibSeedSet};
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};

@@ -950,7 +950,6 @@ use util::resample_linear;
 
 /// Application coordinator that manages all Pancetta components
 pub struct ApplicationCoordinator {
-    #[cfg(feature = "pancetta-hamlib")]
     gain_sweep_original: Arc<std::sync::Mutex<Option<pancetta_hamlib::ReceiveGain>>>,
     gain_sweep_options: Option<gain_sweep_runtime::GainSweepOptions>,
     pub(crate) sweep_capture: Arc<std::sync::Mutex<pipeline::GainCaptureRegistry>>,
@@ -976,24 +975,19 @@ pub struct ApplicationCoordinator {
     component_status: Arc<RwLock<HashMap<ComponentId, ComponentStatus>>>,
 
     /// Managed rigctld child process (killed on shutdown)
-    #[cfg(feature = "pancetta-hamlib")]
     rigctld_process: Option<std::process::Child>,
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
     /// PAN-251 test seam: when set, `start_hamlib_component` uses this rig
     /// instead of `MockRig::default()` on the rig-control-disabled path.
-    #[cfg(all(test, feature = "pancetta-hamlib"))]
+    #[cfg(test)]
     pub(crate) test_mock_rig: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
     /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
     /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
     /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
     /// about the radio, so teardown only clears `ptt_off_unconfirmed` when
     /// this is set.
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) rig_handle_is_real: bool,
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_children: Option<hamlib::HamlibChildren>,
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_orphans: Vec<tokio::task::AbortHandle>,
     /// PAN-19 round-5 (Codex P1): the LATEST `SetFrequency`/`SetSplit`
     /// command that failed to replay during a Hamlib teardown (the replay
@@ -1033,10 +1027,8 @@ pub struct ApplicationCoordinator {
     /// discard (as "superseded") an older still-pending VFO-B command, or
     /// let one VFO's retry silently overwrite the other's tracking --
     /// changing A must never affect B's pending state or vice versa.
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_pending_frequency:
         Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>>,
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
@@ -1182,12 +1174,10 @@ pub struct ApplicationCoordinator {
     /// startup still keeps PTT blocked until the loop genuinely confirms
     /// readiness, without ever making a slow rig fail startup.
     ///
-    /// Defaults to `true` (i.e. un-gated by this mechanism) so a build
-    /// with the `pancetta-hamlib` feature disabled -- where
-    /// `start_hamlib_component` never runs at all and Hamlib provides no
-    /// PTT safety watchdog by design (see the `warn!` in `start_pipeline`:
-    /// "Transmit at your own risk") -- behaves exactly as before, never
-    /// gated by a flag nothing would ever set. `start_hamlib_component`
+    /// Defaults to `true` (i.e. un-gated by this mechanism) so replay
+    /// mode -- where `start_hamlib_component` never runs at all and no
+    /// transmitter is under control -- is never gated by a flag nothing
+    /// would ever set (PAN-331 removed the `pancetta-hamlib` feature). `start_hamlib_component`
     /// resets this to `false` at the very start of every call (first boot
     /// AND every restart) and only sets it back to `true` once the
     /// message loop genuinely confirms readiness (or, on the mock/
@@ -1259,7 +1249,7 @@ pub struct ApplicationCoordinator {
     /// mute_reason` gates on "count > 0", not a boolean.
     ///
     /// Defaults to `0` (nothing in flight) -- the correct "not gated"
-    /// state for a `pancetta-hamlib`-disabled build, matching
+    /// state for replay mode, where Hamlib never starts, matching
     /// `hamlib_command_loop_ready`'s own default-to-permissive convention
     /// above.
     pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -1750,9 +1740,7 @@ pub struct ApplicationCoordinator {
     /// already holding `&mut self` in a loop. Not feature-gated (unlike the
     /// Hamlib-only fields above): the sender must always exist so
     /// `tui_relay.rs`'s unconditionally-compiled command-relay task can
-    /// clone it; `handle_hamlib_reconnect_request`'s
-    /// `#[cfg(not(feature = "pancetta-hamlib"))]` arm handles the
-    /// feature-disabled case at the receiving end.
+    /// clone it.
     pub(crate) hamlib_reconnect_tx:
         tokio::sync::mpsc::Sender<crate::coordinator::hamlib::HamlibReconnectRequest>,
     hamlib_reconnect_rx:
@@ -1909,7 +1897,6 @@ pub struct ApplicationCoordinator {
     pub(crate) qso_consumer_ready: tokio::sync::watch::Sender<bool>,
 }
 
-#[cfg(feature = "pancetta-hamlib")]
 impl Drop for ApplicationCoordinator {
     fn drop(&mut self) {
         if let Some(mut child) = self.rigctld_process.take() {
@@ -2413,7 +2400,6 @@ impl ApplicationCoordinator {
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             gain_sweep_options: None,
-            #[cfg(feature = "pancetta-hamlib")]
             gain_sweep_original: Arc::new(std::sync::Mutex::new(None)),
             sweep_capture: Arc::new(std::sync::Mutex::new(
                 pipeline::GainCaptureRegistry::default(),
@@ -2527,21 +2513,14 @@ impl ApplicationCoordinator {
             pending_ptt_off: tx::PendingPttOff::default(),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
-            #[cfg(feature = "pancetta-hamlib")]
             rig_handle: None,
-            #[cfg(all(test, feature = "pancetta-hamlib"))]
+            #[cfg(test)]
             test_mock_rig: None,
-            #[cfg(feature = "pancetta-hamlib")]
             rig_handle_is_real: false,
-            #[cfg(feature = "pancetta-hamlib")]
             hamlib_children: None,
-            #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
-            #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
             station_agent_live: None,
@@ -2651,11 +2630,9 @@ impl ApplicationCoordinator {
         // `operating_freq_mhz` fallback of 14.074 MHz), so every consumer of
         // the shared atomic agrees on a real band from the first slot.
         //
-        // Deliberately outside the `pancetta-hamlib` cfg below: this is a pure
-        // in-memory atomic store with nothing hamlib-specific about it, and a
-        // build with the feature compiled out starts no rig at all — exactly
-        // the case that needs the seed most. Gating it on the feature left
-        // `--replay` back at 0 Hz in those builds.
+        // This is a pure in-memory atomic store with nothing hamlib-specific
+        // about it, and replay mode starts no rig at all — exactly the case
+        // that needs the seed most.
         if self.replay_mode() {
             const REPLAY_DEFAULT_DIAL_HZ: u64 = 14_074_000;
             self.operating_frequency_hz
@@ -2669,17 +2646,13 @@ impl ApplicationCoordinator {
         // against an already-configured rig (`[rig.interface] enabled = true`)
         // would otherwise have the real transmitter keyed in response to
         // historical traffic. Skipping Hamlib startup removes the PTT
-        // capability outright rather than relying on a downstream gate. This
-        // is the same shape as a build with the `pancetta-hamlib` feature
-        // compiled out (below), which the TX path already tolerates.
-        #[cfg(feature = "pancetta-hamlib")]
+        // capability outright rather than relying on a downstream gate. The
+        // TX path tolerates the missing Hamlib route (PTT-on is dropped).
         if self.replay_mode() {
             info!("Replay mode: skipping Hamlib startup, no real transmitter control");
         } else {
             self.start_hamlib_component().await?;
         }
-        #[cfg(not(feature = "pancetta-hamlib"))]
-        warn!("Hamlib feature is disabled -- PTT safety watchdog is not active. Transmit at your own risk.");
         self.start_qso_component().await?;
 
         // Initialize cqdx.io integration (before autonomous, so rarity/needed data is available)
