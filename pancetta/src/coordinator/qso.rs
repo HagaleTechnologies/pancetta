@@ -357,9 +357,11 @@ struct PendingManualCall {
     /// would never have been queued (it rides any side), so in practice this
     /// is always `Some`.
     dx_parity: Option<pancetta_core::slot::SlotParity>,
-    /// When the call was parked in the queue. Used by the TTL watchdog to
-    /// retire calls that have waited without a free window for too long.
-    queued_at: std::time::Instant,
+    /// When the call was parked in the queue, on both the monotonic and the
+    /// wall clock (PAN-289). Its age (see [`QueueStamp::age_at`]) drives the
+    /// TTL watchdog and the expiry check at promotion, which retire calls that
+    /// have waited without a free window for too long, sleep included.
+    queued_at: QueueStamp,
     /// Set when this entry was created by [`QsoMessage::EngageHound`].
     /// On promotion, the call is routed to `engage_hound` instead of
     /// `respond_to_cq_with` so the Hound metadata (partner_freq, low
@@ -407,6 +409,37 @@ struct PendingManualCall {
     /// Their report of us, if known. Currently always `None` at both call
     /// sites (the engine defaults it) — carried for forward completeness.
     their_report: Option<i8>,
+}
+
+/// PAN-289: when a manual call was queued, on both clocks.
+///
+/// `std::time::Instant` does not advance while the machine is suspended
+/// (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS), so a monotonic
+/// stamp alone lets a call queued just before a sleep fire right after wake.
+/// The wall clock counts the sleep; the monotonic clock keeps a backward wall
+/// step from extending a call's life.
+#[derive(Debug, Clone, Copy)]
+struct QueueStamp {
+    mono: std::time::Instant,
+    wall: chrono::DateTime<chrono::Utc>,
+}
+
+impl QueueStamp {
+    fn now() -> Self {
+        Self {
+            mono: std::time::Instant::now(),
+            wall: chrono::Utc::now(),
+        }
+    }
+
+    /// Age at `now`: the larger of monotonic and wall-clock elapsed time.
+    /// Wall time counts a suspend; monotonic time survives a backward step.
+    /// A negative wall elapsed (the wall clock stepped back) counts as zero.
+    fn age_at(&self, now: QueueStamp) -> std::time::Duration {
+        let mono = now.mono.saturating_duration_since(self.mono);
+        let wall = (now.wall - self.wall).to_std().unwrap_or_default();
+        mono.max(wall)
+    }
 }
 
 impl PendingManualCall {
@@ -718,6 +751,9 @@ async fn promote_pending_manual_calls(
     // rather than silently dropping them.
     let mut failed: Vec<PendingManualCall> = Vec::new();
     let mut stopped_for_shutdown = false;
+    // PAN-289: queued calls found past their TTL here are dropped, never
+    // started, and reported once after the passes.
+    let mut expired_calls: Vec<String> = Vec::new();
 
     // A pass starts calls up to the free slots; a call that fails to start
     // frees its slot again, so passes repeat (the failed call held aside)
@@ -738,13 +774,23 @@ async fn promote_pending_manual_calls(
             if q.is_empty() {
                 break;
             }
+            let queue = std::mem::take(&mut *q);
+            // PAN-289: drop expired calls before partitioning, so an expired
+            // head can neither start nor pick the parity an idle station
+            // adopts. Promotion can run on wake before the 15 s watchdog does.
+            let (queue, expired) = partition_expired(queue, QueueStamp::now(), QUEUED_CALL_TTL);
             info!(
                 target: "qso",
-                "promote_pending_manual_calls: current_side={:?}, queue_depth={}",
+                "promote_pending_manual_calls: current_side={:?}, queue_depth={}, expired={}",
                 current_side,
-                q.len()
+                queue.len(),
+                expired.len()
             );
-            let queue = std::mem::take(&mut *q);
+            expired_calls.extend(expired);
+            if queue.is_empty() {
+                *q = queue;
+                break;
+            }
             // The side the partition commits to (for the log line below only).
             let adopt = current_side
                 .or_else(|| queue.front().and_then(PendingManualCall::desired_tx_parity));
@@ -886,21 +932,26 @@ async fn promote_pending_manual_calls(
         let left = pending.lock().await.len();
         info!(target: "qso", "Shutdown: {left} deferred call(s) not started");
     }
+    // Report outside the admission lock: the bus sends must not hold up a
+    // manual open waiting on it.
+    drop(_admission);
+    report_expired_calls(message_bus, expired_calls).await;
 }
 
 /// Pure TTL partition: split the queue into entries that have NOT yet exceeded
 /// the TTL (retained) and entries that have expired (returned as a `Vec` of
-/// callsigns to report). `now` and `ttl` are injected so this is
-/// deterministically unit-testable without sleeping.
+/// callsigns to report). An entry's age is [`QueueStamp::age_at`], so time the
+/// machine spent asleep counts (PAN-289). `now` and `ttl` are injected so this
+/// is deterministically unit-testable without sleeping.
 fn partition_expired(
     queue: std::collections::VecDeque<PendingManualCall>,
-    now: std::time::Instant,
+    now: QueueStamp,
     ttl: std::time::Duration,
 ) -> (std::collections::VecDeque<PendingManualCall>, Vec<String>) {
     let mut kept = std::collections::VecDeque::new();
     let mut expired = Vec::new();
     for p in queue {
-        if now.duration_since(p.queued_at) >= ttl {
+        if p.queued_at.age_at(now) >= ttl {
             expired.push(p.callsign.clone());
         } else {
             kept.push_back(p);
@@ -914,17 +965,24 @@ fn partition_expired(
 /// Emits an operator status line + warn-level log for each retired call.
 /// Called from a dedicated interval task (every 15 s).
 async fn expire_stale_queued_calls(pending: &PendingManualCalls, message_bus: &MessageBus) {
-    let now = std::time::Instant::now();
     let expired = {
         let mut q = pending.lock().await;
         if q.is_empty() {
             return;
         }
         let queue = std::mem::take(&mut *q);
-        let (kept, expired) = partition_expired(queue, now, QUEUED_CALL_TTL);
+        let (kept, expired) = partition_expired(queue, QueueStamp::now(), QUEUED_CALL_TTL);
         *q = kept;
         expired
     };
+    report_expired_calls(message_bus, expired).await;
+}
+
+/// Tell the operator about queued calls retired for exceeding
+/// [`QUEUED_CALL_TTL`]: a warn log, a status line and a diagnostic per call.
+/// Shared by the TTL watchdog and the expiry check at promotion (PAN-289), so
+/// both report identically.
+async fn report_expired_calls(message_bus: &MessageBus, expired: Vec<String>) {
     for call in expired {
         warn!(
             target: "qso",
@@ -5116,7 +5174,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: std::time::Instant::now(),
+                                                            queued_at: QueueStamp::now(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -5137,7 +5195,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: std::time::Instant::now(),
+                                                            queued_at: QueueStamp::now(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -5595,10 +5653,17 @@ impl super::ApplicationCoordinator {
                                                 pancetta_qso::qso_manager::TxAdmission::Queue
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
-                                                let dup = q.iter().any(|p| {
+                                                let dup_pos = q.iter().position(|p| {
                                                     p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
-                                                if !dup {
+                                                if let Some(pos) = dup_pos {
+                                                    // PAN-289: a repeat engage restarts the
+                                                    // wait, as a repeat StartQso does by
+                                                    // replacing its entry. Otherwise a
+                                                    // re-engage after wake would keep the
+                                                    // pre-sleep stamp and be expired.
+                                                    q[pos].queued_at = QueueStamp::now();
+                                                } else {
                                                     if q.len() >= MAX_PENDING_MANUAL_CALLS {
                                                         q.pop_front();
                                                     }
@@ -5606,7 +5671,7 @@ impl super::ApplicationCoordinator {
                                                         callsign: callsign.clone(),
                                                         frequency_hz: fox_freq as f64,
                                                         dx_parity,
-                                                        queued_at: std::time::Instant::now(),
+                                                        queued_at: QueueStamp::now(),
                                                         hound: true,
                                                         fox_freq_hz: Some(fox_freq as f64),
                                                         fox_grid: fox_grid.clone(),
@@ -5819,7 +5884,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: std::time::Instant::now(),
+                                                            queued_at: QueueStamp::now(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -5840,7 +5905,7 @@ impl super::ApplicationCoordinator {
                                                             callsign: callsign.clone(),
                                                             frequency_hz: frequency as f64,
                                                             dx_parity,
-                                                            queued_at: std::time::Instant::now(),
+                                                            queued_at: QueueStamp::now(),
                                                             hound: false,
                                                             fox_freq_hz: None,
                                                             fox_grid: None,
@@ -6932,13 +6997,15 @@ async fn build_active_qso_snapshot(
     // #40: snapshot the cross-parity pending queue. Lock briefly, copy out,
     // release — never hold across await points.
     let pending: Vec<crate::message_bus::PendingCallSnapshotItem> = {
+        // PAN-289: the displayed wait uses the same age rule as expiry.
+        let stamp_now = QueueStamp::now();
         let guard = pending_manual_calls.lock().await;
         guard
             .iter()
             .map(|p| crate::message_bus::PendingCallSnapshotItem {
                 callsign: p.callsign.clone(),
                 dx_parity: p.dx_parity,
-                waited_secs: p.queued_at.elapsed().as_secs(),
+                waited_secs: p.queued_at.age_at(stamp_now).as_secs(),
             })
             .collect()
     };
@@ -7078,7 +7145,7 @@ fn snapshot_item_from_progress(
 
 #[cfg(test)]
 mod pending_manual_tests {
-    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall};
+    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall, QueueStamp};
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
 
@@ -7089,7 +7156,7 @@ mod pending_manual_tests {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: std::time::Instant::now(),
+            queued_at: QueueStamp::now(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7135,7 +7202,7 @@ mod pending_manual_tests {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: std::time::Instant::now(),
+            queued_at: QueueStamp::now(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7280,15 +7347,20 @@ mod pending_manual_tests {
 
     use super::partition_expired;
 
-    /// Build a call whose `queued_at` is `age` in the past.
+    /// Build a call whose `queued_at` is `age` in the past on both clocks.
     fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingManualCall {
+        let now = QueueStamp::now();
         PendingManualCall {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
-            queued_at: std::time::Instant::now()
-                .checked_sub(age)
-                .expect("Instant underflow in test"),
+            queued_at: QueueStamp {
+                mono: now
+                    .mono
+                    .checked_sub(age)
+                    .expect("Instant underflow in test"),
+                wall: now.wall - chrono::Duration::from_std(age).expect("age fits chrono"),
+            },
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7306,7 +7378,7 @@ mod pending_manual_tests {
     fn fresh_calls_are_kept() {
         let ttl = std::time::Duration::from_secs(600);
         let q: VecDeque<_> = [call("A", SlotParity::Even), call("B", SlotParity::Odd)].into();
-        let now = std::time::Instant::now();
+        let now = QueueStamp::now();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert_eq!(kept.len(), 2);
         assert!(expired.is_empty());
@@ -7324,7 +7396,7 @@ mod pending_manual_tests {
             aged_call("C", SlotParity::Even, std::time::Duration::from_secs(720)),
         ]
         .into();
-        let now = std::time::Instant::now();
+        let now = QueueStamp::now();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].callsign, "B");
@@ -7336,7 +7408,7 @@ mod pending_manual_tests {
         // A call that is exactly TTL old should be retired (>=, not >).
         let ttl = std::time::Duration::from_secs(600);
         let q: VecDeque<_> = [aged_call("X", SlotParity::Even, ttl)].into();
-        let now = std::time::Instant::now();
+        let now = QueueStamp::now();
         let (kept, expired) = partition_expired(q, now, ttl);
         assert!(kept.is_empty());
         assert_eq!(expired, vec!["X"]);
@@ -7346,10 +7418,82 @@ mod pending_manual_tests {
     fn empty_queue_partition_expired_is_noop() {
         let (kept, expired) = partition_expired(
             VecDeque::new(),
-            std::time::Instant::now(),
+            QueueStamp::now(),
             std::time::Duration::from_secs(600),
         );
         assert!(kept.is_empty());
+        assert!(expired.is_empty());
+    }
+
+    // ── PAN-289: age counts sleep (wall clock) and survives a backward step ──
+
+    /// The stamp `mono_elapsed` (monotonic) and `wall_elapsed` (wall clock,
+    /// may be negative) after `s`. Only adds to `s`, so a freshly booted CI
+    /// host cannot underflow an `Instant`.
+    fn stamp_after(
+        s: QueueStamp,
+        mono_elapsed: std::time::Duration,
+        wall_elapsed: chrono::Duration,
+    ) -> QueueStamp {
+        QueueStamp {
+            mono: s.mono + mono_elapsed,
+            wall: s.wall + wall_elapsed,
+        }
+    }
+
+    /// PAN-289, the ticket scenario: a call queued 10 s before a 10-minute
+    /// sleep, with a 60 s TTL. The monotonic clock saw 10 s, the wall clock
+    /// 610 s. The call is expired.
+    #[test]
+    fn call_queued_before_sleep_expires_on_wall_clock() {
+        let ttl = std::time::Duration::from_secs(60);
+        let c = call("JA1AAA", SlotParity::Even);
+        let s = c.queued_at;
+        let now = stamp_after(
+            s,
+            std::time::Duration::from_secs(10),
+            chrono::Duration::seconds(610),
+        );
+        let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
+        assert!(
+            kept.is_empty(),
+            "a call queued before sleep must not survive wake"
+        );
+        assert_eq!(expired, vec!["JA1AAA"]);
+    }
+
+    /// PAN-289: a backward wall-clock step (NTP) does not extend a call's life;
+    /// the monotonic age still retires it.
+    #[test]
+    fn backward_wall_step_does_not_extend_ttl() {
+        let ttl = std::time::Duration::from_secs(600);
+        let c = call("JA2BBB", SlotParity::Odd);
+        let s = c.queued_at;
+        let now = stamp_after(
+            s,
+            std::time::Duration::from_secs(610),
+            chrono::Duration::seconds(-3600),
+        );
+        let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
+        assert!(kept.is_empty());
+        assert_eq!(expired, vec!["JA2BBB"]);
+    }
+
+    /// PAN-289: a fresh call survives a backward wall step; a negative wall
+    /// elapsed counts as zero, so its age is the monotonic 10 s.
+    #[test]
+    fn fresh_call_survives_backward_wall_step() {
+        let ttl = std::time::Duration::from_secs(600);
+        let c = call("JA3CCC", SlotParity::Even);
+        let s = c.queued_at;
+        let now = stamp_after(
+            s,
+            std::time::Duration::from_secs(10),
+            chrono::Duration::seconds(-3600),
+        );
+        assert_eq!(s.age_at(now), std::time::Duration::from_secs(10));
+        let (kept, expired) = partition_expired(VecDeque::from([c]), now, ttl);
+        assert_eq!(queued_names(&kept), vec!["JA3CCC"]);
         assert!(expired.is_empty());
     }
 
@@ -7369,7 +7513,7 @@ mod pending_manual_tests {
             callsign: "DX1ABC".to_string(),
             frequency_hz: 900.0, // DX decoded at 900 Hz
             dx_parity: Some(SlotParity::Even),
-            queued_at: std::time::Instant::now(),
+            queued_at: QueueStamp::now(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7400,7 +7544,7 @@ mod pending_manual_tests {
             callsign: "DX2XYZ".to_string(),
             frequency_hz: 1200.0, // DX decoded at 1200 Hz
             dx_parity: Some(SlotParity::Odd),
-            queued_at: std::time::Instant::now(),
+            queued_at: QueueStamp::now(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7439,7 +7583,7 @@ mod pending_manual_tests {
             callsign: "DX3WWW".to_string(),
             frequency_hz: 1750.0,
             dx_parity: Some(SlotParity::Even),
-            queued_at: std::time::Instant::now(),
+            queued_at: QueueStamp::now(),
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
@@ -7506,6 +7650,47 @@ mod pending_manual_tests {
 
     fn queued_names(q: &VecDeque<super::PendingManualCall>) -> Vec<String> {
         q.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    /// PAN-289: promotion drops an expired call instead of starting it. On
+    /// wake, a QSO going terminal can trigger promotion before the 15 s TTL
+    /// watchdog runs. `stale` was queued 11 minutes ago by the wall clock but
+    /// just now by the monotonic clock (a sleep); it is the head and wants
+    /// Even. `fresh` wants Odd. Without the check the expired head picks Even
+    /// for the idle station, `stale` starts and `fresh` stays queued.
+    #[tokio::test]
+    async fn promotion_discards_expired_call_instead_of_starting_it() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        let mut stale = call("JA1AAA", SlotParity::Odd);
+        stale.queued_at = QueueStamp {
+            mono: std::time::Instant::now(),
+            wall: chrono::Utc::now() - chrono::Duration::minutes(11),
+        };
+        let fresh = even_dx_call_at("JA2BBB", 1500.0);
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([stale, fresh])));
+
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+
+        assert!(
+            !mgr.has_active_qso_with("JA1AAA").await,
+            "the expired call must never start"
+        );
+        assert!(
+            mgr.has_active_qso_with("JA2BBB").await,
+            "the fresh call starts in the freed window"
+        );
+        assert!(
+            pending.lock().await.is_empty(),
+            "the expired call is discarded, not re-queued"
+        );
     }
 
     /// PAN-274: once shutdown has begun, promotion starts no queued call, so no
