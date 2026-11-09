@@ -568,10 +568,16 @@ A refused pivot (tombstone cleared) sends Autonomous nothing; the queued
 request reports its own outcome when it airs, is refused, or is discarded. A
 keyed pivot (tombstone kept) reports, and the request it absorbed is dropped
 silently by Step 0-dup, the backlog pivot-duplicate pass or a mid-TX
-duplicate drop. Backlog coalescing reports a failed completion to Autonomous,
-and to Autonomous only, for every QSO request it drops as terminal or excludes
-for parity or frequency; a request coalesced into a newer one for the same QSO
-stays silent because the newer one reports. An excluded request's failure can
+duplicate drop. Backlog coalescing settles every request it drops as terminal
+or excludes for parity or frequency with both consumers: a failed completion to
+Autonomous and a `TxFrameNotSent` with the request's own attempt id, which
+returns a keep-call frame's call to the budget so the engine's rearm can
+re-emit it (PAN-279). Excluded requests are not requeued: a requeued
+parity-excluded entry would anchor the next bundle on the other parity. A
+request coalesced into a newer one for the same QSO rolls back its own attempt
+with the QSO engine only, because the newer one reports to Autonomous; an
+attempt-less coalesced request stays silent, since a text match could roll
+back the survivor's attempt (PAN-279). An excluded request's failure can
 settle a self-CQ before the QSO's next rearm airs, the same trade-off the
 DX-parity hold already makes; staying silent instead would leave the self-CQ
 pending forever when no fresh request follows. A request the TX channel never
@@ -716,11 +722,19 @@ The opening call remains counted as one. Manual-regression re-sends and silently
 coalesced, duplicate, parity-excluded or frequency-excluded frames keep their
 existing accounting because those paths have no matching ledger entry or QSO
 failure report. A single-frame supersede reports the frame it abandons whether
-it re-keys (`Replace`) or is too late to (`NotViable`). A superseding request a
-supersede drops (too late to re-key, a bundle a single-frame re-key cannot fold,
-or over the cap of a multi-TX bundle) is not reported and stays counted. A
-multi-TX supersede reports in-flight items it abandons as too late
-(`NotViable`) or on an identity conflict. On `NotViable` it skips items the
+it re-keys (`Replace`), folds it into a bundle (`Bundle`) or is too late to
+(`NotViable`). A superseding request that is too late to re-key, or a bundle a
+single-frame re-key cannot fold, comes back inside `NotViable` and is requeued
+at the front of the TX inbox, so it airs in its own next slot (PAN-279). Only
+the over-cap request of a multi-TX supersede is still dropped (requeueing it
+behind the preserved bundle livelocks); it reports as not sent. Rule D6
+(PAN-279) decides each abandoned in-flight frame's Autonomous outcome in every
+supersede outcome: a frame the successor carries unchanged is not settled; a
+frame whose QSO the successor carries settles with the QSO engine only, because
+the successor owns the QSO's Autonomous outcome; every other frame also fails
+to Autonomous. A multi-TX supersede reports in-flight items it abandons as too
+late (`NotViable`), on a `Bundle` (including its collision fallback) or on an
+identity conflict. On `NotViable` it skips items the
 re-enqueued bundle carries unchanged under the same authorization, and reports
 the rest with their own offset (plus the old binding after an authorization
 change) so the rollback cannot hit the replacement's attempt. Offsets within
@@ -750,8 +764,11 @@ early. The id now travels with the frame:
   rolls back the replaced attempt. A `Replace` or `Bundle` supersede re-keys or
   re-enqueues the new request under that request's own id.
 - Every `TxFrameNotSent` carries the failed frame's id, or the replaced frame's
-  on a pivot. Autonomous-facing `TransmitComplete` correlates on `qso_id`
-  under the pivot ownership rule above (PAN-185).
+  on a pivot. `TransmitComplete` now carries the same `attempt_id` (PAN-279),
+  but Autonomous still settles a self-CQ by `qso_id`, under the ownership rule
+  above, which PAN-279 extends from pivots to supersedes. Both messages are
+  built only in `coordinator::tx_outcome` (`settle_unaired_frame`,
+  `settle_aired_frame`).
 
 The same mechanism closes two PR #419 review threads. An identity-conflict
 supersede reported abandoned bundle items without their binding, so a

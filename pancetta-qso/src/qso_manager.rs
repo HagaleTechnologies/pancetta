@@ -1266,6 +1266,8 @@ impl Default for DuplicateCheckConfig {
 type RemoteTxPermittedSource = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 
 // A frame may wait behind an in-flight TX and a same-parity slot (~3 slots).
+// Every unaired frame now reports its own attempt (PAN-279), so retention is
+// only a backstop for a genuinely lost report.
 const UNSENT_ATTEMPT_RETENTION_SLOTS: i64 = 4;
 const MAX_UNSENT_ATTEMPTS_PER_QSO: usize = 8;
 // Same tolerance the TX worker's pivot check uses for "same offset".

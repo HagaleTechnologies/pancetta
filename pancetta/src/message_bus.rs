@@ -280,10 +280,14 @@ pub enum MessageType {
         message_text: String,
         duration_ms: u64,
         /// QSO owning this frame, or `None` for untracked manual/tune TX.
-        /// Autonomous uses it for PAN-38 self-CQ correlation. PAN-75 mirrors
-        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso;
-        /// PAN-182 mirrors aired ones as `QsoMessage::TxFrameSent`.
+        /// Autonomous uses it for PAN-38 self-CQ correlation. Built only by
+        /// `coordinator::tx_outcome`, which mirrors failed QSO-keyed outcomes
+        /// as `QsoMessage::TxFrameNotSent` (PAN-75) and aired ones as
+        /// `QsoMessage::TxFrameSent` (PAN-182) to Qso.
         qso_id: Option<String>,
+        /// PAN-279: the frame's own QSO-engine attempt (`None` for frames the
+        /// engine did not emit). The same id rides the frame's `TxFrameNotSent`.
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
 
     /// TX-active indicator for the TUI title-bar badge (Batch 93).

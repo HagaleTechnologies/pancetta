@@ -3978,39 +3978,28 @@ impl super::ApplicationCoordinator {
                                             );
                                             // Self-addressed: the Qso loop's own handler rolls
                                             // back this attempt by id (a no-op for an opening
-                                            // or advance, PAN-183).
-                                            tx_bus
-                                                .send_message_durable(ComponentMessage::new(
-                                                    ComponentId::Qso,
-                                                    ComponentId::Qso,
-                                                    MessageType::QsoMessage(
-                                                        crate::message_bus::QsoMessage::TxFrameNotSent {
-                                                            qso_id: qso_id.to_string(),
-                                                            message_text: text.clone(),
-                                                            replaced: None,
-                                                            attempt_id,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                ))
-                                                .await;
-                                            if is_opening_self_cq {
-                                                // No worker received this opening, so no
-                                                // worker outcome can settle its registration.
-                                                tx_bus
-                                                    .send_message_durable(ComponentMessage::new(
-                                                        ComponentId::Qso,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: text,
-                                                            duration_ms: 0,
-                                                            qso_id: Some(qso_id.to_string()),
-                                                        },
-                                                        Instant::now(),
-                                                    ))
-                                                    .await;
-                                            }
+                                            // or advance, PAN-183). No worker received an
+                                            // opening self-CQ, so no worker outcome can settle
+                                            // its registration: Autonomous hears it here. A
+                                            // rejected resend sends Autonomous nothing
+                                            // (PAN-185 D8, PAN-238). One settlement path
+                                            // (PAN-279).
+                                            super::tx_outcome::settle_unaired_frame(
+                                                &tx_bus,
+                                                ComponentId::Qso,
+                                                super::tx_outcome::TxFrame {
+                                                    qso_id: Some(qso_id.to_string()),
+                                                    message_text: text,
+                                                    attempt_id,
+                                                },
+                                                None,
+                                                if is_opening_self_cq {
+                                                    super::tx_outcome::AutonomousOutcome::Report
+                                                } else {
+                                                    super::tx_outcome::AutonomousOutcome::Withheld
+                                                },
+                                            )
+                                            .await;
                                         }
                                     }
                                     Err(e) => {
@@ -12692,6 +12681,65 @@ mod respond_to_caller_admission_tests {
         coordinator
     }
 
+    /// PAN-279: the forwarder settles a rejected opening through
+    /// `tx_outcome::settle_unaired_frame`, so Autonomous's failed completion
+    /// carries the opening's own QSO-engine attempt id (the same id its
+    /// self-addressed `TxFrameNotSent` carries, by construction).
+    #[tokio::test]
+    async fn pan279_rejected_opening_completion_carries_its_attempt_id() {
+        let mut coordinator = pan238_coordinator().await;
+        let (tx_sender, _tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, _autonomous_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        let autonomous = coordinator
+            .message_bus
+            .durable_inbox(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        tx_sender
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        let (op, attempt, _) = pan238_speculative_cq();
+        pan238_dispatch_cq(&coordinator, attempt, op.tx_offset_hz()).await;
+        pan238_wait_until("failed opening completion parked", || {
+            coordinator
+                .message_bus
+                .durable_lane_len(ComponentId::Autonomous)
+                == 1
+        })
+        .await;
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(QsoMessage::AutonomousCqOpened { .. })
+        ));
+        let MessageType::TransmitComplete {
+            success: false,
+            qso_id: Some(_),
+            attempt_id,
+            ..
+        } = autonomous.try_recv().unwrap().message_type
+        else {
+            panic!("rejected opening must have a failed completion");
+        };
+        assert!(
+            attempt_id.is_some(),
+            "the completion carries the opening's own attempt id"
+        );
+    }
+
     #[tokio::test]
     async fn pan238_rejected_opening_settles_after_cancellation_with_autonomous_backpressure() {
         let mut coordinator = pan238_coordinator().await;
@@ -12777,6 +12825,7 @@ mod respond_to_caller_admission_tests {
             message_text,
             duration_ms,
             qso_id: Some(completed_id),
+            attempt_id: completed_attempt_id,
         } = completion.message_type
         else {
             panic!("rejected opening must have a completion");
@@ -12791,6 +12840,7 @@ mod respond_to_caller_admission_tests {
             &mut pending,
             &completed_id,
             success,
+            completed_attempt_id,
         )
         .await;
         assert!(pending.is_empty());
@@ -12927,6 +12977,7 @@ mod respond_to_caller_admission_tests {
             &mut pending,
             "unrelated",
             false,
+            None,
         )
         .await;
         assert_eq!(pending.len(), 1);
@@ -12936,6 +12987,7 @@ mod respond_to_caller_admission_tests {
             &mut pending,
             "opening",
             true,
+            None,
         )
         .await;
         assert!(pending.is_empty());
@@ -12959,6 +13011,7 @@ mod respond_to_caller_admission_tests {
             &mut pending,
             "opening",
             false,
+            None,
         )
         .await;
         assert_eq!(
