@@ -22580,10 +22580,8 @@ mod pan115_worker_gate_tests {
         let mut coordinator = ApplicationCoordinator::new(
             cfg,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -26658,10 +26656,8 @@ mod pan122_tx_log_worker_tests {
         let mut coordinator = ApplicationCoordinator::new(
             Config::default(),
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true,                                                // no_audio
+            true,                                                // headless
             None,                                                // no WAV
             Some(std::path::PathBuf::from("/some/capture/dir")), // --replay
             None,                                                // no test-tx

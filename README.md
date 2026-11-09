@@ -280,6 +280,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |
 | `pancetta --replay <wav-dir>` | Feed a directory of WAVs through the full TUI pipeline. |
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
+| `pancetta --headless --log-format json` | The same, with one JSON object per log line on stderr and in the log file (for journald, jq or a log shipper). |
 | `pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain.json` | Measure per-band receive gain and save an advisory report. [Limits and timing](docs/receive-gain-sweep.md). |
 
 ## Capability status

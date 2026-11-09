@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
 - PAN-278: When Hamlib's command queue drops the key-down, the frame is now reported as not sent and its audio is not played, so the QSO engine retries it instead of counting it as aired. A tune in that state is abandoned. `--replay` and builds without `pancetta-hamlib` are unchanged.
 - PAN-273: The transmitter now retries its PTT-off at the end of every transmission (normal, multi-stream, tune, clock-step guard and supersede) when Hamlib's queue is momentarily full, and keeps its fallback unkey armed until one is queued. The transmitter's next transmission waits for that fallback unkey first, so it cannot cut the new transmission short. Before, a dropped PTT-off was treated as sent and the rig stayed keyed until Hamlib's 14 s watchdog.
 - A QSO that completes while pancetta is shutting down is now written to `qsos.adi` (PAN-274). Before, quitting during a QSO's final exchange queued its ClubLog, QRZ Logbook, eQSL and cqdx.io uploads but left the QSO out of the logbook. If the logbook writer falls behind the QSO event stream, the log now reports it as an error. A call deferred until another QSO's 73 clears is no longer started once shutdown has begun.
@@ -24,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- PAN-334: `--metrics` and `--metrics-port` are gone. They never served metrics: the Prometheus exporter sat behind the off-by-default `prometheus` feature, and nothing recorded a metric. A service unit or script that passes either flag now fails at startup with exit 2, so remove the flag (under `Restart=always` a unit would restart until its start limit). The `metrics`, `prometheus` and `tracing-json` cargo features are gone too.
+- PAN-334: `pancetta benchmark` is gone. It printed "not yet implemented" and exited 1, so use `pancetta benchmark-decode` or `cargo bench`. `run --callsign`, `--frequency` and `--power` are gone. They were ignored, so set the station in the config file or pass `--config`. `test-audio --device` and `--duration` are gone. `pancetta test-audio` now lists devices with or without `--list`, and `pancetta doctor` checks the input level.
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
   (PAN-247). Legacy sections still load with one warning that the setting
   no longer exists and has no effect. Manual `audio.levels.input_gain_db`
@@ -31,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-334: `--log-format json` now works. Each log line in `~/.pancetta/logs/pancetta.log.*` and, with `--headless`, on stderr is one JSON object: `timestamp`, `level`, `target`, `threadId`, `fields` (the message and the event's other fields) and, inside a span, `span` and `spans`. Headless text logs stay on stdout and are unchanged. The daily file keeps its name, so the day you switch formats holds both.
 - PAN-271: `docs/SUPPORTED_RIGS.md` lists every rig Pancetta starts `rigctld` for, with its `rig.model` names, Hamlib model and CAT, audio and TX test status. It is generated from the rig table in `pancetta-hamlib/src/models.rs` and drift-tested. The Yaesu FTdx10 is the only rig with a recorded hardware test. `pancetta doctor` points an unknown `rig.model` at the page.
 - PAN-261: optional `autonomous.pounce_min_tier` admits pounce targets by DX tier and uses the weighted score within each tier. Opt-in bell, ntfy and webhook decode alerts have independent tier thresholds. `Shift+W` edits persistent watchlist pins, which alert when heard and disappear when removed or worked. Auto watchlist expiry is configurable.
 - PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.

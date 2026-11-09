@@ -47,6 +47,13 @@ Ship-provided units (edit the binary path inside each):
 - **Linux / MiniPC:** `packaging/systemd/pancetta.service` — `Restart=always`,
   `RestartSec=2`, crash-loop rate limit. Install as a `--user` service and
   `loginctl enable-linger`. Watch with `journalctl --user -u pancetta -f`.
+  For structured logs, add `--log-format json` to `ExecStart`: each journal
+  line and each `~/.pancetta/logs/pancetta.log.*` line is then one JSON object
+  (`timestamp`, `level`, `target`, `threadId`, `fields`). Pick out warnings
+  with `journalctl --user -u pancetta -o cat | jq -r 'select(.level=="WARN") | .fields.message'`.
+  A panic is logged as a JSON event with target `panic`, and Rust's plain panic
+  message (with any backtrace) still follows it on stderr. The daily log file
+  keeps its name, so the day you switch formats holds both text and JSON lines.
 - **macOS:** `packaging/launchd/net.hagale.pancetta.plist` — `KeepAlive` with a
   `ThrottleInterval`. The supervisor's stdout and stderr go to
   `~/.pancetta/logs/launchd.out.log` and `~/.pancetta/logs/launchd.err.log`,
@@ -295,6 +302,8 @@ operator-supervised.
   ```bash
   grep -E "WARN|ERROR" ~/.pancetta/logs/pancetta.log.$(date -u +%Y-%m-%d) | head -50
   ```
+  The same command matches JSON lines from `--log-format json`
+  (`"level":"WARN"`).
   Logs rotate daily (UTC) and pancetta keeps the newest 14 files — this
   retention applies only to the daily application logs (`pancetta.log.*`),
   not to the unrotated launchd supervisor files (`launchd.out.log`,

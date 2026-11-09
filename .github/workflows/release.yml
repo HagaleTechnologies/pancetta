@@ -117,9 +117,9 @@ jobs:
 
       - name: Build release binary
         # -p pancetta only: excludes pancetta-research (local-only, never in
-        # CI) and every helper binary. Default features (metrics + hamlib
-        # rigctld-TCP client) are the production build; no system hamlib is
-        # needed at build time (runtime-only, via rigctld over TCP).
+        # CI) and every helper binary. Default features (hamlib rigctld-TCP
+        # client) are the production build; no system hamlib is needed at
+        # build time (runtime-only, via rigctld over TCP).
         #
         # CLUBLOG_API_KEY: ClubLog issues its API key per-application, not
         # per-operator, so official release binaries bake in Pancetta's own

@@ -67,7 +67,8 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Log output format (text, json)
+    /// Log output format: text, or json (one JSON object per line in the log
+    /// file, and on stderr with --headless)
     #[arg(long, default_value = "text", global = true)]
     log_format: LogFormat,
 
@@ -129,14 +130,6 @@ struct Cli {
     #[arg(long, global = true, conflicts_with_all = ["wav", "no_audio", "test_tx"])]
     replay: Option<PathBuf>,
 
-    /// Enable metrics collection
-    #[arg(long, global = true)]
-    metrics: bool,
-
-    /// Metrics server port (requires --metrics)
-    #[arg(long, default_value = "9090", global = true)]
-    metrics_port: u16,
-
     /// Inject a single TransmitRequest after startup, then shutdown when it
     /// completes. For coordinator TX validation. Example:
     ///   pancetta --headless --test-tx "N0CALL N0CALL 73"
@@ -144,22 +137,20 @@ struct Cli {
     test_tx: Option<String>,
 
     /// Audio frequency offset (Hz) for --test-tx
-    #[arg(long, default_value_t = 1500.0, global = true)]
+    #[arg(long, default_value_t = 1500.0, global = true, requires = "test_tx")]
     test_tx_offset: f64,
 }
 
 #[derive(Clone, Subcommand)]
 enum Commands {
-    /// Run the main application
-    Run(RunArgs),
-    /// Test audio device configuration
+    /// Run the station (the same as giving no subcommand)
+    Run,
+    /// List audio input and output devices
     TestAudio(TestAudioArgs),
     /// Validate configuration files
     Config(ConfigArgs),
     /// Show system information and capabilities
     Info,
-    /// Run benchmarks for performance testing
-    Benchmark(BenchmarkArgs),
     /// Benchmark decoder against ft8_lib reference
     BenchmarkDecode(BenchmarkDecodeArgs),
     /// Interactive setup wizard for station, audio, rig, and PTT
@@ -266,33 +257,10 @@ struct ImportArgs {
 }
 
 #[derive(Clone, Args)]
-struct RunArgs {
-    /// Override station callsign
-    #[arg(long)]
-    callsign: Option<String>,
-
-    /// Override operating frequency in Hz
-    #[arg(long)]
-    frequency: Option<f64>,
-
-    /// Override power output in watts
-    #[arg(long)]
-    power: Option<u32>,
-}
-
-#[derive(Clone, Args)]
 struct TestAudioArgs {
-    /// List available audio devices
+    /// List available audio devices (also what `test-audio` does with no flag)
     #[arg(short, long)]
     list: bool,
-
-    /// Test specific audio device (long flag only — `-d` is taken by global --debug)
-    #[arg(long)]
-    device: Option<String>,
-
-    /// Test duration in seconds (long flag only)
-    #[arg(long, default_value = "10")]
-    duration: u64,
 }
 
 #[derive(Clone, Args)]
@@ -317,31 +285,15 @@ struct BenchmarkDecodeArgs {
     path: String,
 
     /// Output format: "text" or "json"
-    #[arg(long, default_value = "text")]
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
     format: String,
 }
 
-#[derive(Clone, Args)]
-struct BenchmarkArgs {
-    /// Run audio processing benchmarks
-    #[arg(long)]
-    audio: bool,
-
-    /// Run DSP pipeline benchmarks
-    #[arg(long)]
-    dsp: bool,
-
-    /// Run FT8 decoder benchmarks
-    #[arg(long)]
-    ft8: bool,
-
-    /// Run all benchmarks
-    #[arg(long)]
-    all: bool,
-
-    /// Number of iterations for benchmarks
-    #[arg(long, default_value = "100")]
-    iterations: usize,
+impl Cli {
+    /// Headless JSON logging: the console layer writes JSON objects to stderr.
+    fn json_console(&self) -> bool {
+        self.headless && matches!(self.log_format, LogFormat::Json)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -377,7 +329,7 @@ fn main() -> Result<()> {
         && cli
             .command
             .as_ref()
-            .is_some_and(|command| !matches!(command, Commands::Run(_)))
+            .is_some_and(|command| !matches!(command, Commands::Run))
     {
         clap::Error::raw(
             clap::error::ErrorKind::ArgumentConflict,
@@ -385,9 +337,42 @@ fn main() -> Result<()> {
         )
         .exit();
     }
+    if let Some(flag) = receiving_service_flag_on_subcommand(&cli) {
+        clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "{flag} applies only to the receiving service (`pancetta` or `pancetta run`), \
+                 not this subcommand\n"
+            ),
+        )
+        .exit();
+    }
 
     responsibility::prepare(opens_microphone(&cli, stub_audio_requested()));
     async_main(cli)
+}
+
+/// The first receiving-service flag given with a subcommand that never reads
+/// it. These flags are `global`, so every subcommand's `--help` lists them;
+/// rejecting them keeps `pancetta info --wav x.wav` from silently ignoring
+/// `--wav` (PAN-334). `--test-tx-offset` is covered by `requires = "test_tx"`.
+fn receiving_service_flag_on_subcommand(cli: &Cli) -> Option<&'static str> {
+    if cli
+        .command
+        .as_ref()
+        .is_none_or(|c| matches!(c, Commands::Run))
+    {
+        return None;
+    }
+    [
+        (cli.audio_device.is_some(), "--audio-device"),
+        (cli.no_audio, "--no-audio"),
+        (cli.wav.is_some(), "--wav"),
+        (cli.replay.is_some(), "--replay"),
+        (cli.test_tx.is_some(), "--test-tx"),
+    ]
+    .into_iter()
+    .find_map(|(given, flag)| given.then_some(flag))
 }
 
 /// `PANCETTA_STUB_AUDIO` makes the audio pipeline synthesize a tone instead
@@ -405,7 +390,7 @@ fn live_capture(cli: &Cli, stub_audio: bool) -> bool {
 fn opens_microphone(cli: &Cli, stub_audio: bool) -> bool {
     match cli.command.as_ref() {
         Some(Commands::Doctor) => true,
-        None | Some(Commands::Run(_)) => live_capture(cli, stub_audio),
+        None | Some(Commands::Run) => live_capture(cli, stub_audio),
         _ => false,
     }
 }
@@ -516,8 +501,6 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.audio_device,
         cli.no_audio,
         cli.headless,
-        cli.metrics,
-        cli.metrics_port,
         cli.wav,
         cli.replay,
         cli.test_tx,
@@ -583,14 +566,13 @@ async fn run_application(cli: Cli) -> Result<()> {
 
 async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
     match command {
-        Commands::Run(_args) => {
+        Commands::Run => {
             // Run main application with current CLI
             run_application(cli.clone()).await
         }
         Commands::TestAudio(args) => test_audio_command(args).await,
         Commands::Config(args) => config_command(args, cli).await,
         Commands::Info => info_command().await,
-        Commands::Benchmark(args) => benchmark_command(args).await,
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
         Commands::Setup => setup_command().await,
         Commands::Doctor => doctor_command(cli).await,
@@ -1796,14 +1778,11 @@ fn shell_arg(path: &Path) -> String {
     }
 }
 
-async fn test_audio_command(args: TestAudioArgs) -> Result<()> {
-    if args.list {
-        list_audio_devices();
-        return Ok(());
-    }
-    eprintln!("Error: audio device testing is not yet implemented.");
-    eprintln!("       Use `pancetta test-audio --list` to enumerate audio devices.");
-    std::process::exit(1);
+async fn test_audio_command(_args: TestAudioArgs) -> Result<()> {
+    // Listing is the whole command; `--list` stays for existing scripts and docs.
+    // `pancetta doctor` checks the configured input's level (PAN-334).
+    list_audio_devices();
+    Ok(())
 }
 
 /// Print the available audio input and output devices, flagging the system
@@ -1912,11 +1891,6 @@ async fn info_command() -> Result<()> {
     println!("Audio devices: (run `pancetta test-audio --list`)");
 
     Ok(())
-}
-
-async fn benchmark_command(_args: BenchmarkArgs) -> Result<()> {
-    eprintln!("Error: benchmarks are not yet implemented");
-    std::process::exit(1);
 }
 
 async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
@@ -2222,7 +2196,11 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
     // Surface load warnings (unknown sections/keys) to the console at startup
     // so a typo is never a silent no-op.
     for w in &warnings {
-        eprintln!("WARNING: {w}");
+        // A JSON console prints the `warn!` itself; a plain copy would break
+        // its one-object-per-line stream (PAN-334).
+        if !cli.json_console() {
+            eprintln!("WARNING: {w}");
+        }
         warn!("{w}");
     }
 
@@ -3130,7 +3108,9 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
                 }
             }
             PttMethod::Cat => {
-                println!("       CAT PTT requires hamlib — not yet implemented in test mode.");
+                println!(
+                    "       CAT PTT is keyed through rigctld, which this serial-port test does not use; PTT not keyed."
+                );
                 println!("       Serial port connectivity looks good though.");
             }
             PttMethod::Vox => {
@@ -3223,34 +3203,58 @@ fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_block
         .unwrap_or_else(|_| tracing_appender::rolling::daily(&log_dir, "pancetta.log"));
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_ids(true);
+    // `--log-format json` (PAN-334): the text and JSON formatters are different
+    // types, so each sink gets one `Option` per format and exactly one is `Some`.
+    let json = matches!(cli.log_format, LogFormat::Json);
+    let file_text = (!json).then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+    });
+    let file_json = json.then(|| {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+    });
 
     // Console layer — only when running headless (TUI owns stdout otherwise)
-    let console_layer = if headless {
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_writer(if cli.gain_sweep_seconds.is_some() {
-                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
-                } else {
-                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
-                })
-                .with_thread_ids(true)
-                .with_file(cli.debug || cli.verbose)
-                .with_line_number(cli.debug || cli.verbose),
-        )
-    } else {
-        None
-    };
+    let source_location = cli.debug || cli.verbose;
+    let console_text = (headless && !json).then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(if cli.gain_sweep_seconds.is_some() {
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+            } else {
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+            })
+            .with_thread_ids(true)
+            .with_file(source_location)
+            .with_line_number(source_location)
+    });
+    // JSON lines always go to stderr, so stdout keeps only command output
+    // (`--wav` decode lines, the gain-sweep report).
+    let console_json = (headless && json).then(|| {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_file(source_location)
+            .with_line_number(source_location)
+    });
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
+        .with(console_text)
+        .with(console_json)
+        .with(file_text)
+        .with(file_json)
         .init();
 
     Ok(guard)
