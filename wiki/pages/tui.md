@@ -31,8 +31,8 @@ that autonomously writes a live TX atomic (opt-in auto-repark) is gated by a
 5-case safety contract and fails closed. Constants and the full key map are
 normative in the digest — not restated here.
 
-Main-view key handling is `keymap::resolve` plus `match action`: every key
-resolves through the chords on its `KEYBINDINGS` row into one `Action`, and a
+Key handling in every scope is `keymap::resolve` plus `match action`: every bound key
+resolves through its `KEYBINDINGS` or `MODAL_BINDINGS` chord, or a text-entry rule, into one `Action`. A
 table test fails when a chord is ambiguous, unreachable, unnamed by its row or
 Ctrl-reachable for a TX action. `tests/fixtures/key_effects.golden` fails a
 test whenever what a key does changes. See

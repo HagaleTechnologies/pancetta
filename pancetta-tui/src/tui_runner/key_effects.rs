@@ -381,6 +381,42 @@ fn placement_fixture() -> crate::app::PlacementView {
 /// station (VK9XX), a placement snapshot, autonomous enabled, one serial
 /// port, one rig bookmark and a 20 m dial.
 fn rich_fixture(app: &mut App) {
+    app.device_selection.input_devices = vec![
+        ("Fixture input".into(), true),
+        ("Second input".into(), false),
+    ];
+    app.device_selection.output_devices = vec![
+        ("Fixture output".into(), true),
+        ("Second output".into(), false),
+    ];
+    app.diagnostic_events
+        .push_back(crate::app::DiagnosticEventRecord {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "Fixture diagnostic".into(),
+            qso_id: None,
+            callsign: None,
+        });
+    app.diagnostic_events
+        .push_back(crate::app::DiagnosticEventRecord {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "Second diagnostic".into(),
+            qso_id: None,
+            callsign: None,
+        });
+    for callsign in ["W1AW", "G8KHF"] {
+        app.recent_qsos.push_back(crate::app::RecentQsoOutcome {
+            callsign: callsign.into(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".into(),
+            freq_hz: 14_074_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec![],
+        });
+    }
     app.station_info.operating_frequency = 14.074;
     app.apply_active_qsos(vec![banner("W1AW", "qso-1")], vec![]);
     app.decoded_messages

@@ -6,7 +6,7 @@
 //! each row carries the `chords` that `resolve` matches a key event against,
 //! and `TuiRunner::handle_key_event` runs `match action` on the result.
 //!
-//! To add or change a main-view key:
+//! To add or change a key:
 //! 1. add or edit the chord on the row whose text describes it;
 //! 2. add the `Action` variant (`keymap/action.rs`, plus `ALL` and `ordinal`);
 //! 3. add its `match action` arm in `TuiRunner::handle_key_event`;
@@ -17,9 +17,8 @@
 //!    `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`
 //!
 //! The table tests below then prove every chord resolves to exactly one
-//! action and every action is reachable. Dialog-internal keys (y/n confirms,
-//! digit entry, picker navigation) still dispatch in their own blocks in
-//! `handle_key_event`.
+//! action and every action is reachable. Dialog-internal chords live in
+//! `MODAL_BINDINGS`; character input uses the scope's `TextEntry` filter.
 
 mod action;
 pub use action::Action;
@@ -27,18 +26,159 @@ pub use action::Action;
 use crate::app::{ActivePanel, App};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Who receives a key. `Global` is checked first in every scope.
-///
-/// Only the Global and Main scopes resolve through the table today; the
-/// dialog scopes (out-of-band ack, quit confirm, help, pickers, modals,
-/// compose and the read-only overlays) still dispatch in their own blocks in
-/// `TuiRunner::handle_key_event`, ahead of the main view.
+/// Who receives a key, in legacy dialog precedence order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// Bound in every scope, ahead of every dialog (Shift+Q, PAN-113).
     Global,
-    /// The main view: no dialog or overlay is open.
+    OutOfBandAck,
+    QuitConfirm,
+    Help,
+    DevicePicker,
+    RigBookmarkName,
+    RigBookmarkList,
+    RigForm,
+    WatchlistModal,
+    FreqModal,
+    OffsetModal,
+    Compose,
+    Diagnostics,
+    Health,
+    RecentQsos,
+    Why,
     Main,
+}
+
+/// Copy of the App visibility flags, for pure scope selection.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScopeFlags {
+    pub out_of_band_ack: bool,
+    pub quit_confirm: bool,
+    pub help: bool,
+    pub device_picker: bool,
+    pub rig_picker: bool,
+    pub rig_naming_bookmark: bool,
+    pub rig_bookmark_list: bool,
+    pub watchlist: bool,
+    pub freq: bool,
+    pub offset: bool,
+    pub compose: bool,
+    pub diagnostics: bool,
+    pub health: bool,
+    pub recent_qsos: bool,
+    pub why: bool,
+}
+
+impl Scope {
+    pub const ALL: [Self; 17] = [
+        Self::Global,
+        Self::OutOfBandAck,
+        Self::QuitConfirm,
+        Self::Help,
+        Self::DevicePicker,
+        Self::RigBookmarkName,
+        Self::RigBookmarkList,
+        Self::RigForm,
+        Self::WatchlistModal,
+        Self::FreqModal,
+        Self::OffsetModal,
+        Self::Compose,
+        Self::Diagnostics,
+        Self::Health,
+        Self::RecentQsos,
+        Self::Why,
+        Self::Main,
+    ];
+    pub fn of(f: &ScopeFlags) -> Self {
+        if f.out_of_band_ack {
+            return Self::OutOfBandAck;
+        }
+        if f.quit_confirm {
+            return Self::QuitConfirm;
+        }
+        if f.help {
+            return Self::Help;
+        }
+        if f.device_picker {
+            return Self::DevicePicker;
+        }
+        if f.rig_picker {
+            return if f.rig_naming_bookmark {
+                Self::RigBookmarkName
+            } else if f.rig_bookmark_list {
+                Self::RigBookmarkList
+            } else {
+                Self::RigForm
+            };
+        }
+        if f.watchlist {
+            return Self::WatchlistModal;
+        }
+        if f.freq {
+            return Self::FreqModal;
+        }
+        if f.offset {
+            return Self::OffsetModal;
+        }
+        if f.compose {
+            return Self::Compose;
+        }
+        if f.diagnostics {
+            return Self::Diagnostics;
+        }
+        if f.health {
+            return Self::Health;
+        }
+        if f.recent_qsos {
+            return Self::RecentQsos;
+        }
+        if f.why {
+            return Self::Why;
+        }
+        Self::Main
+    }
+    pub fn text_entry(self) -> TextEntry {
+        match self {
+            Self::RigBookmarkName => TextEntry::NonControl,
+            Self::RigForm => TextEntry::NonControlInModelField,
+            Self::WatchlistModal | Self::Compose => TextEntry::AnyChar,
+            Self::FreqModal => TextEntry::DigitOrDot,
+            Self::OffsetModal => TextEntry::Digit,
+            _ => TextEntry::None,
+        }
+    }
+    pub fn text_action(self, c: char, ctx: &KeyContext) -> Option<Action> {
+        let admitted = match self.text_entry() {
+            TextEntry::None => false,
+            TextEntry::AnyChar => true,
+            TextEntry::NonControl => !c.is_control(),
+            TextEntry::NonControlInModelField => ctx.rig_field_is_model && !c.is_control(),
+            TextEntry::DigitOrDot => c.is_ascii_digit() || c == '.',
+            TextEntry::Digit => c.is_ascii_digit(),
+        };
+        if !admitted {
+            return None;
+        }
+        match self {
+            Self::RigBookmarkName => Some(Action::BookmarkNameChar(c)),
+            Self::RigForm => Some(Action::RigModelChar(c)),
+            Self::WatchlistModal => Some(Action::WatchlistChar(c)),
+            Self::FreqModal => Some(Action::FreqModalChar(c)),
+            Self::OffsetModal => Some(Action::OffsetModalChar(c)),
+            Self::Compose => Some(Action::ComposeChar(c)),
+            _ => None,
+        }
+    }
+}
+
+/// Character filters used after explicit chords, with any modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEntry {
+    None,
+    AnyChar,
+    NonControl,
+    NonControlInModelField,
+    DigitOrDot,
+    Digit,
 }
 
 /// Modifier policy for a chord (PAN-112). crossterm reports Ctrl+C as
@@ -79,12 +219,14 @@ pub enum When {
     StopBanner,
     /// Zoomed and no operator-stop banner (the banner's Esc wins).
     ZoomNoBanner,
+    RigModelField,
 }
 
 impl When {
     /// Whether the condition holds in `ctx`.
     pub fn holds(self, ctx: &KeyContext) -> bool {
         match self {
+            When::RigModelField => ctx.rig_field_is_model,
             When::Always => true,
             When::Panel(p) => ctx.panel == p,
             When::NotPanel(p) => ctx.panel != p,
@@ -162,24 +304,412 @@ pub struct KeyContext {
     pub panel: ActivePanel,
     pub zoomed: bool,
     pub stopped_by_operator: bool,
+    pub rig_field_is_model: bool,
 }
 
 impl KeyContext {
-    /// Main-view context from the live `App`. Only valid once no dialog has
-    /// claimed the key; `handle_key_event` routes the dialogs first.
-    pub fn main_view(app: &App) -> Self {
+    /// Context from the live App, preserving the legacy dialog precedence.
+    pub fn from_app(app: &App) -> Self {
         KeyContext {
-            scope: Scope::Main,
+            scope: Scope::of(&ScopeFlags {
+                out_of_band_ack: app.out_of_band_ack_visible,
+                quit_confirm: app.quit_confirm_visible,
+                help: app.help_visible,
+                device_picker: app.device_selection.visible,
+                rig_picker: app.rig_selection.visible,
+                rig_naming_bookmark: app.rig_selection.naming_bookmark,
+                rig_bookmark_list: app.rig_selection.bookmark_overlay_visible,
+                watchlist: app.watchlist_modal.visible,
+                freq: app.freq_modal.visible,
+                offset: app.offset_modal.visible,
+                compose: app.compose_mode,
+                diagnostics: app.show_diagnostics,
+                health: app.show_health,
+                recent_qsos: app.show_recent_qsos,
+                why: app.show_why,
+            }),
             panel: app.active_panel,
             zoomed: app.zoomed,
             stopped_by_operator: app.stopped_by_operator,
+            rig_field_is_model: app.rig_selection.active_field == crate::app::RigField::Model,
         }
     }
 }
 
+/// Dialog-internal keys absent from the displayed documentation.
+pub const MODAL_BINDINGS: &[Chord] = &[
+    ch(
+        Scope::OutOfBandAck,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::AckOutOfBand,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Char('y'),
+        Mods::Any,
+        When::Always,
+        Action::ConfirmQuit,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Char('Y'),
+        Mods::Any,
+        When::Always,
+        Action::ConfirmQuit,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::ConfirmQuit,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Char('n'),
+        Mods::Any,
+        When::Always,
+        Action::CancelQuit,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Char('N'),
+        Mods::Any,
+        When::Always,
+        Action::CancelQuit,
+    ),
+    ch(
+        Scope::QuitConfirm,
+        KeyCode::Char('q'),
+        Mods::Any,
+        When::Always,
+        Action::CancelQuit,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::HelpScrollUp,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::HelpScrollDown,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::PageUp,
+        Mods::Any,
+        When::Always,
+        Action::HelpPageUp,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::PageDown,
+        Mods::Any,
+        When::Always,
+        Action::HelpPageDown,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::Home,
+        Mods::Any,
+        When::Always,
+        Action::HelpTop,
+    ),
+    ch(
+        Scope::Help,
+        KeyCode::End,
+        Mods::Any,
+        When::Always,
+        Action::HelpBottom,
+    ),
+    ch(
+        Scope::DevicePicker,
+        KeyCode::Tab,
+        Mods::Any,
+        When::Always,
+        Action::DevicePickerSwitchList,
+    ),
+    ch(
+        Scope::DevicePicker,
+        KeyCode::BackTab,
+        Mods::Any,
+        When::Always,
+        Action::DevicePickerSwitchList,
+    ),
+    ch(
+        Scope::DevicePicker,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::DevicePickerUp,
+    ),
+    ch(
+        Scope::DevicePicker,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::DevicePickerDown,
+    ),
+    ch(
+        Scope::DevicePicker,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::ApplyDevices,
+    ),
+    ch(
+        Scope::RigBookmarkName,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::Always,
+        Action::BookmarkNameBackspace,
+    ),
+    ch(
+        Scope::RigBookmarkName,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::SaveBookmark,
+    ),
+    ch(
+        Scope::RigBookmarkList,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::BookmarkListUp,
+    ),
+    ch(
+        Scope::RigBookmarkList,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::BookmarkListDown,
+    ),
+    ch(
+        Scope::RigBookmarkList,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::LoadBookmark,
+    ),
+    ch(
+        Scope::RigBookmarkList,
+        KeyCode::Char('x'),
+        Mods::Any,
+        When::Always,
+        Action::DeleteBookmark,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::Tab,
+        Mods::Any,
+        When::Always,
+        Action::RigNextField,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::RigFieldUp,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::RigFieldDown,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::RigModelField,
+        Action::RigModelBackspace,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::F(2),
+        Mods::Any,
+        When::Always,
+        Action::OpenBookmarkList,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::F(3),
+        Mods::Any,
+        When::Always,
+        Action::StartBookmarkName,
+    ),
+    ch(
+        Scope::RigForm,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::ApplyRig,
+    ),
+    ch(
+        Scope::WatchlistModal,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::Always,
+        Action::WatchlistBackspace,
+    ),
+    ch(
+        Scope::WatchlistModal,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::SubmitWatchlist,
+    ),
+    ch(
+        Scope::FreqModal,
+        KeyCode::Tab,
+        Mods::Any,
+        When::Always,
+        Action::FreqModalSwitchField,
+    ),
+    ch(
+        Scope::FreqModal,
+        KeyCode::BackTab,
+        Mods::Any,
+        When::Always,
+        Action::FreqModalSwitchField,
+    ),
+    ch(
+        Scope::FreqModal,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::Always,
+        Action::FreqModalBackspace,
+    ),
+    ch(
+        Scope::FreqModal,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::SubmitFreqModal,
+    ),
+    ch(
+        Scope::OffsetModal,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::Always,
+        Action::OffsetModalBackspace,
+    ),
+    ch(
+        Scope::OffsetModal,
+        KeyCode::Enter,
+        Mods::Any,
+        When::Always,
+        Action::SubmitOffsetModal,
+    ),
+    ch(
+        Scope::Compose,
+        KeyCode::Backspace,
+        Mods::Any,
+        When::Always,
+        Action::ComposeBackspace,
+    ),
+    ch(
+        Scope::Diagnostics,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::DiagnosticsUp,
+    ),
+    ch(
+        Scope::Diagnostics,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::DiagnosticsDown,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::HealthScrollUp,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::HealthScrollDown,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::PageUp,
+        Mods::Any,
+        When::Always,
+        Action::HealthPageUp,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::PageDown,
+        Mods::Any,
+        When::Always,
+        Action::HealthPageDown,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::Home,
+        Mods::Any,
+        When::Always,
+        Action::HealthTop,
+    ),
+    ch(
+        Scope::Health,
+        KeyCode::End,
+        Mods::Any,
+        When::Always,
+        Action::HealthBottom,
+    ),
+    ch(
+        Scope::RecentQsos,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::RecentQsosUp,
+    ),
+    ch(
+        Scope::RecentQsos,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::RecentQsosDown,
+    ),
+    ch(
+        Scope::Why,
+        KeyCode::Up,
+        Mods::Any,
+        When::Always,
+        Action::WhyUp,
+    ),
+    ch(
+        Scope::Why,
+        KeyCode::Down,
+        Mods::Any,
+        When::Always,
+        Action::WhyDown,
+    ),
+];
+
 /// Every chord in the table, in row order.
 pub fn all_chords() -> impl Iterator<Item = &'static Chord> {
-    KEYBINDINGS.iter().flat_map(|b| b.chords.iter())
+    KEYBINDINGS
+        .iter()
+        .flat_map(|b| b.chords.iter())
+        .chain(MODAL_BINDINGS.iter())
 }
 
 /// Resolve `key` in `ctx` to its action: the Global scope first, then
@@ -190,17 +720,23 @@ pub fn resolve(ctx: &KeyContext, key: KeyEvent) -> Option<Action> {
             .find(|chord| chord.matches(scope, ctx, &key))
             .map(|chord| chord.action)
     };
-    hit(Scope::Global).or_else(|| hit(ctx.scope))
+    hit(Scope::Global)
+        .or_else(|| hit(ctx.scope))
+        .or_else(|| match key.code {
+            KeyCode::Char(c) => ctx.scope.text_action(c, ctx),
+            _ => None,
+        })
 }
 
-/// Resolve `key` in the Global scope only. `handle_key_event` calls this
-/// before routing to any dialog, so no dialog can swallow Shift+Q (PAN-113).
+/// Resolve only Global chords, for callers that need a global-only lookup.
+/// The full resolver checks these before any scope or text-entry rule (PAN-113).
 pub fn resolve_global(key: KeyEvent) -> Option<Action> {
     let ctx = KeyContext {
         scope: Scope::Global,
         panel: ActivePanel::BandActivity,
         zoomed: false,
         stopped_by_operator: false,
+        rig_field_is_model: false,
     };
     resolve(&ctx, key)
 }
@@ -287,7 +823,16 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Toggle this help",
         Category::Diagnostics,
         true,
-        &[main(c('?'), Action::ToggleHelp)],
+        &[
+            ch(
+                Scope::Help,
+                KeyCode::Char('?'),
+                Mods::Any,
+                When::Always,
+                Action::ToggleHelp,
+            ),
+            main(c('?'), Action::ToggleHelp),
+        ],
     ),
     kb(
         "Tab / Shift+Tab",
@@ -445,7 +990,23 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Compose free-text TX (Enter sends, Esc cancels)",
         Category::QsoOperation,
         false,
-        &[main(c('/'), Action::EnterCompose)],
+        &[
+            ch(
+                Scope::Compose,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelCompose,
+            ),
+            ch(
+                Scope::Compose,
+                KeyCode::Enter,
+                Mods::Any,
+                When::Always,
+                Action::SendCompose,
+            ),
+            main(c('/'), Action::EnterCompose),
+        ],
     ),
     kb(
         "Enter",
@@ -488,12 +1049,44 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Abort selected QSO now, no confirm (any panel)",
         Category::QsoOperation,
         false,
-        &[main_when(
-            c('k'),
-            Mods::Bare,
-            When::Always,
-            Action::AbortSelectedQso,
-        )],
+        &[
+            ch(
+                Scope::Help,
+                KeyCode::Char('k'),
+                Mods::Bare,
+                When::Always,
+                Action::AbortSelectedQso,
+            ),
+            ch(
+                Scope::Diagnostics,
+                KeyCode::Char('k'),
+                Mods::Bare,
+                When::Always,
+                Action::AbortSelectedQso,
+            ),
+            ch(
+                Scope::Health,
+                KeyCode::Char('k'),
+                Mods::Bare,
+                When::Always,
+                Action::AbortSelectedQso,
+            ),
+            ch(
+                Scope::RecentQsos,
+                KeyCode::Char('k'),
+                Mods::Bare,
+                When::Always,
+                Action::AbortSelectedQso,
+            ),
+            ch(
+                Scope::Why,
+                KeyCode::Char('k'),
+                Mods::Bare,
+                When::Always,
+                Action::AbortSelectedQso,
+            ),
+            main_when(c('k'), Mods::Bare, When::Always, Action::AbortSelectedQso),
+        ],
     ),
     kb(
         "r",
@@ -670,14 +1263,32 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Toggle Diagnostics overlay (retained event history)",
         Category::Diagnostics,
         false,
-        &[main(c('D'), Action::OpenDiagnostics)],
+        &[
+            ch(
+                Scope::Diagnostics,
+                KeyCode::Char('D'),
+                Mods::Any,
+                When::Always,
+                Action::CloseDiagnostics,
+            ),
+            main(c('D'), Action::OpenDiagnostics),
+        ],
     ),
     kb(
         "Shift+S",
         "Toggle station-health panel (is the station healthy?)",
         Category::Diagnostics,
         false,
-        &[main(c('S'), Action::OpenHealth)],
+        &[
+            ch(
+                Scope::Health,
+                KeyCode::Char('S'),
+                Mods::Any,
+                When::Always,
+                Action::CloseHealth,
+            ),
+            main(c('S'), Action::OpenHealth),
+        ],
     ),
     kb(
         "!",
@@ -691,14 +1302,32 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Toggle Recent-QSOs panel (retained terminal-QSO outcome history)",
         Category::Diagnostics,
         false,
-        &[main(c('R'), Action::OpenRecentQsos)],
+        &[
+            ch(
+                Scope::RecentQsos,
+                KeyCode::Char('R'),
+                Mods::Any,
+                When::Always,
+                Action::CloseRecentQsos,
+            ),
+            main(c('R'), Action::OpenRecentQsos),
+        ],
     ),
     kb(
         "w",
         "Why this station? Reason and score breakdown for the focused station",
         Category::Diagnostics,
         false,
-        &[main_no_ctrl_alt(c('w'), Action::OpenWhy)],
+        &[
+            ch(
+                Scope::Why,
+                KeyCode::Char('w'),
+                Mods::Any,
+                When::Always,
+                Action::CloseWhy,
+            ),
+            main_no_ctrl_alt(c('w'), Action::OpenWhy),
+        ],
     ),
     kb(
         "m",
@@ -753,12 +1382,112 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         "Dismiss overlay / cancel modal / clear stop banner",
         Category::Session,
         false,
-        &[main_when(
-            KeyCode::Esc,
-            Mods::Any,
-            When::StopBanner,
-            Action::ClearStopBanner,
-        )],
+        &[
+            ch(
+                Scope::OutOfBandAck,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::AckOutOfBand,
+            ),
+            ch(
+                Scope::QuitConfirm,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelQuit,
+            ),
+            ch(
+                Scope::Help,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::ToggleHelp,
+            ),
+            ch(
+                Scope::DevicePicker,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelDevicePicker,
+            ),
+            ch(
+                Scope::RigBookmarkName,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelBookmarkName,
+            ),
+            ch(
+                Scope::RigBookmarkList,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelBookmarkList,
+            ),
+            ch(
+                Scope::RigForm,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelRigPicker,
+            ),
+            ch(
+                Scope::WatchlistModal,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CloseWatchlistModal,
+            ),
+            ch(
+                Scope::FreqModal,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelFreqModal,
+            ),
+            ch(
+                Scope::OffsetModal,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CancelOffsetModal,
+            ),
+            ch(
+                Scope::Diagnostics,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CloseDiagnostics,
+            ),
+            ch(
+                Scope::Health,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CloseHealth,
+            ),
+            ch(
+                Scope::RecentQsos,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CloseRecentQsos,
+            ),
+            ch(
+                Scope::Why,
+                KeyCode::Esc,
+                Mods::Any,
+                When::Always,
+                Action::CloseWhy,
+            ),
+            main_when(
+                KeyCode::Esc,
+                Mods::Any,
+                When::StopBanner,
+                Action::ClearStopBanner,
+            ),
+        ],
     ),
 ];
 
@@ -839,12 +1568,15 @@ mod tests {
         for panel in PANELS {
             for zoomed in [false, true] {
                 for stopped_by_operator in [false, true] {
-                    out.push(KeyContext {
-                        scope,
-                        panel,
-                        zoomed,
-                        stopped_by_operator,
-                    });
+                    for rig_field_is_model in [false, true] {
+                        out.push(KeyContext {
+                            scope,
+                            panel,
+                            zoomed,
+                            stopped_by_operator,
+                            rig_field_is_model,
+                        });
+                    }
                 }
             }
         }
@@ -871,6 +1603,67 @@ mod tests {
     }
 
     #[test]
+    fn text_entry_scopes_bind_no_char_chords() {
+        for chord in all_chords().filter(|c| c.scope.text_entry() != TextEntry::None) {
+            if let KeyCode::Char(_) = chord.code {
+                panic!("text-entry scope has a command char chord: {chord:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scope_precedence_matches_the_legacy_if_chain() {
+        for mask in 0u32..(1 << 15) {
+            let bit = |n: u32| mask & (1u32 << n) != 0u32;
+            let f = ScopeFlags {
+                out_of_band_ack: bit(0),
+                quit_confirm: bit(1),
+                help: bit(2),
+                device_picker: bit(3),
+                rig_picker: bit(4),
+                rig_naming_bookmark: bit(5),
+                rig_bookmark_list: bit(6),
+                watchlist: bit(7),
+                freq: bit(8),
+                offset: bit(9),
+                compose: bit(10),
+                diagnostics: bit(11),
+                health: bit(12),
+                recent_qsos: bit(13),
+                why: bit(14),
+            };
+            let rig = if bit(5) {
+                Scope::RigBookmarkName
+            } else if bit(6) {
+                Scope::RigBookmarkList
+            } else {
+                Scope::RigForm
+            };
+            let expected = [
+                (bit(0), Scope::OutOfBandAck),
+                (bit(1), Scope::QuitConfirm),
+                (bit(2), Scope::Help),
+                (bit(3), Scope::DevicePicker),
+                (bit(4), rig),
+                (bit(7), Scope::WatchlistModal),
+                (bit(8), Scope::FreqModal),
+                (bit(9), Scope::OffsetModal),
+                (bit(10), Scope::Compose),
+                (bit(11), Scope::Diagnostics),
+                (bit(12), Scope::Health),
+                (bit(13), Scope::RecentQsos),
+                (bit(14), Scope::Why),
+                (true, Scope::Main),
+            ]
+            .into_iter()
+            .find(|(active, _)| *active)
+            .unwrap()
+            .1;
+            assert_eq!(Scope::of(&f), expected, "mask {mask}");
+        }
+    }
+
+    #[test]
     fn every_chord_resolves_to_its_own_action() {
         for chord in all_chords() {
             let ctx = context_for(chord.scope, chord.when);
@@ -890,7 +1683,7 @@ mod tests {
     /// order-independent: in any context, at most one chord matches a key.
     #[test]
     fn no_two_chords_match_the_same_key_in_the_same_context() {
-        for scope in [Scope::Global, Scope::Main] {
+        for scope in Scope::ALL {
             for ctx in contexts(scope) {
                 for code in key_universe() {
                     for mods in MOD_SETS {
@@ -916,7 +1709,16 @@ mod tests {
     fn every_action_is_reachable() {
         for action in Action::ALL {
             assert!(
-                all_chords().any(|c| c.action == action),
+                all_chords().any(|c| c.action == action)
+                    || Scope::ALL.into_iter().any(|scope| {
+                        contexts(scope).iter().any(|ctx| {
+                            (' '..='~').any(|c| {
+                                scope
+                                    .text_action(c, ctx)
+                                    .is_some_and(|a| a.ordinal() == action.ordinal())
+                            })
+                        })
+                    }),
                 "{action:?} has no chord, so no key can reach it"
             );
         }
@@ -1018,7 +1820,7 @@ mod tests {
     /// PAN-113: Shift+Q wins in every scope, with any modifiers.
     #[test]
     fn shift_q_resolves_to_emergency_stop_in_every_scope() {
-        for scope in [Scope::Global, Scope::Main] {
+        for scope in Scope::ALL {
             for ctx in contexts(scope) {
                 for mods in [
                     KeyModifiers::NONE,
