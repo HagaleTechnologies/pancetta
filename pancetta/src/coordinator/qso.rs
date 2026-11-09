@@ -440,6 +440,19 @@ fn partition_pending_calls(
     (start, keep)
 }
 
+/// PAN-274: wait out the completed-TX grace (#40). `false` when shutdown
+/// begins first; the caller then purges and promotes nothing.
+async fn wait_out_completed_tx_grace(
+    grace: Duration,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown_requested(shutdown) => false,
+        () = tokio::time::sleep(grace) => !shutdown.load(Ordering::Acquire),
+    }
+}
+
 /// Promote operator-deferred manual calls (#40) once the TX window is free to
 /// accept them.
 ///
@@ -457,11 +470,15 @@ fn partition_pending_calls(
 /// event but never exceed the cap. An entry that fails to open frees its slot
 /// again: the next pass starts the following matching entries, and the failed
 /// one is re-queued at the front.
+///
+/// Once the shutdown flag is set it starts no call, so no deferred call is
+/// keyed while pancetta quits; the calls it skipped stay queued (PAN-274).
 async fn promote_pending_manual_calls(
     qso_manager: &pancetta_qso::QsoManager,
     pending: &PendingManualCalls,
     message_bus: &MessageBus,
     limits: &QsoCapacityLimits,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) {
     // Capacity and parity are checked and the calls started under the
     // admission lock (see `QsoCapacityLimits::admission`).
@@ -469,6 +486,7 @@ async fn promote_pending_manual_calls(
     // Collect calls that fail to start so we can re-queue them at the front
     // rather than silently dropping them.
     let mut failed: Vec<PendingManualCall> = Vec::new();
+    let mut stopped_for_shutdown = false;
 
     // A pass starts calls up to the free slots; a call that fails to start
     // frees its slot again, so passes repeat (the failed call held aside)
@@ -536,6 +554,13 @@ async fn promote_pending_manual_calls(
         }
 
         for p in to_start {
+            // PAN-274: start nothing once shutdown has begun. The call goes
+            // back at the front of the queue with any failed ones.
+            if shutdown.load(Ordering::Acquire) {
+                stopped_for_shutdown = true;
+                failed.push(p);
+                continue;
+            }
             info!(
                 target: "qso",
                 "Promoting deferred {} call to {} on {:.0} Hz — window is now free",
@@ -613,7 +638,7 @@ async fn promote_pending_manual_calls(
                 }
             }
         }
-        if !pass_failed {
+        if stopped_for_shutdown || !pass_failed {
             break;
         }
     }
@@ -625,6 +650,10 @@ async fn promote_pending_manual_calls(
         for p in failed.into_iter().rev() {
             q.push_front(p);
         }
+    }
+    if stopped_for_shutdown {
+        let left = pending.lock().await.len();
+        info!(target: "qso", "Shutdown: {left} deferred call(s) not started");
     }
 }
 
@@ -3445,6 +3474,9 @@ impl super::ApplicationCoordinator {
 
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
+            // PAN-274: every Qso start (including a supervisor restart)
+            // registers its ADIF subscriber here, so shutdown can wait for it.
+            let adif_subscribers = self.adif_subscribers.clone();
             // Round-14 review (Codex P1): `maybe_auto_resend_73` needs this
             // to gate its own budget commit on identity-bound TX permission
             // — see the call site and that function's doc for why.
@@ -3494,7 +3526,7 @@ impl super::ApplicationCoordinator {
                     station_power_watts,
                     persist_qso_timeline,
                     &qso_manager,
-                    shutdown.clone(),
+                    &adif_subscribers,
                 )
                 .await;
 
@@ -3735,6 +3767,7 @@ impl super::ApplicationCoordinator {
                                                 &pending_for_events,
                                                 &snapshot_bus,
                                                 &capacity_for_events,
+                                                &tx_shutdown,
                                             )
                                             .await;
                                         }
@@ -4122,8 +4155,23 @@ impl super::ApplicationCoordinator {
                                     let promote_pending = pending_for_events.clone();
                                     let promote_bus = snapshot_bus.clone();
                                     let promote_limits = capacity_for_events.clone();
+                                    let promote_shutdown = tx_shutdown.clone();
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(completed_tx_grace).await;
+                                        // PAN-274: shutdown ends the grace
+                                        // early; nothing is purged or promoted.
+                                        if !wait_out_completed_tx_grace(
+                                            completed_tx_grace,
+                                            &promote_shutdown,
+                                        )
+                                        .await
+                                        {
+                                            debug!(
+                                                target: "tx.policy",
+                                                "QSO {} completed; shutdown began before its grace elapsed, nothing promoted",
+                                                qid
+                                            );
+                                            return;
+                                        }
                                         if let Ok(mut s) = set.write() {
                                             s.remove(&key);
                                         }
@@ -4149,6 +4197,7 @@ impl super::ApplicationCoordinator {
                                             &promote_pending,
                                             &promote_bus,
                                             &promote_limits,
+                                            &promote_shutdown,
                                         )
                                         .await;
                                     });
@@ -4336,6 +4385,7 @@ impl super::ApplicationCoordinator {
                                         &pending_for_events,
                                         &snapshot_bus,
                                         &capacity_for_events,
+                                        &tx_shutdown,
                                     )
                                     .await;
                                 }
@@ -7264,7 +7314,10 @@ mod pending_manual_tests {
     // `respond_to_cq_with` (which would always reopen at `RespondingToCq`
     // regardless of what step the operator actually chose).
 
-    use super::{promote_pending_manual_calls, PendingManualCalls, QsoCapacityLimits};
+    use super::{
+        promote_pending_manual_calls, wait_out_completed_tx_grace, PendingManualCalls,
+        QsoCapacityLimits,
+    };
     use crate::message_bus::MessageBus;
     use pancetta_qso::{QsoManager, QsoManagerConfig, QsoState};
     use std::sync::Arc;
@@ -7302,6 +7355,52 @@ mod pending_manual_tests {
         q.iter().map(|p| p.callsign.clone()).collect()
     }
 
+    /// PAN-274: once shutdown has begun, promotion starts no queued call, so no
+    /// deferred manual call is keyed while pancetta quits. The call stays queued.
+    #[tokio::test]
+    async fn promotion_starts_no_deferred_call_once_shutdown_has_begun() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        let pending: PendingManualCalls =
+            Arc::new(TokioMutex::new(VecDeque::from([even_dx_call_at(
+                "JA2BBB", 1500.0,
+            )])));
+        let mut events = mgr.subscribe();
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+
+        assert_eq!(mgr.active_qso_count().await, 0, "no QSO was started");
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| matches!(e, pancetta_qso::QsoEvent::MessageToSend { .. })),
+            "nothing was queued to transmit"
+        );
+        assert_eq!(queued_names(&*pending.lock().await), vec!["JA2BBB"]);
+
+        // Control: with the flag clear the same call starts.
+        shutdown.store(false, std::sync::atomic::Ordering::Release);
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1), &shutdown).await;
+        assert!(mgr.has_active_qso_with("JA2BBB").await);
+    }
+
+    /// PAN-274: the completed-TX grace ends as soon as shutdown begins and reports
+    /// that it did not elapse; without shutdown it elapses normally.
+    #[tokio::test]
+    async fn completed_tx_grace_wait_ends_when_shutdown_begins() {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flip = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flip.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        assert!(!wait_out_completed_tx_grace(std::time::Duration::from_secs(45), &shutdown).await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let clear = std::sync::atomic::AtomicBool::new(false);
+        assert!(wait_out_completed_tx_grace(std::time::Duration::from_millis(50), &clear).await);
+    }
+
     /// PAN-78 (Codex P2 on #449): a queued call that fails to start frees
     /// its slot for the next matching queued call in the same promotion.
     #[tokio::test]
@@ -7314,7 +7413,14 @@ mod pending_manual_tests {
             even_dx_call_at("JA2BBB", 1500.0),
         ])));
 
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
 
         assert_eq!(mgr.active_qso_count().await, 1, "the slot is still filled");
         assert!(mgr.has_active_qso_with("JA2BBB").await);
@@ -7341,7 +7447,14 @@ mod pending_manual_tests {
         let task = {
             let (mgr, bus, pending, lim) = (mgr.clone(), bus.clone(), pending.clone(), lim.clone());
             tokio::spawn(async move {
-                promote_pending_manual_calls(&mgr, &pending, &bus, &lim).await;
+                promote_pending_manual_calls(
+                    &mgr,
+                    &pending,
+                    &bus,
+                    &lim,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .await;
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -7395,7 +7508,14 @@ mod pending_manual_tests {
             even_dx_call_at("JA3CCC", 2000.0),
         ])));
 
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
 
         assert_eq!(mgr.active_qso_count().await, 1, "cap 1 ⇒ one QSO starts");
         let active = mgr.get_active_qsos().await;
@@ -7425,7 +7545,14 @@ mod pending_manual_tests {
             even_dx_call_at("JA3CCC", 2000.0),
         ])));
 
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(2)).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(2),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
 
         assert_eq!(
             mgr.active_qso_count().await,
@@ -7450,7 +7577,14 @@ mod pending_manual_tests {
             even_dx_call_at("JA2BBB", 1500.0),
         ])));
 
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
 
         assert_eq!(
             mgr.active_qso_count().await,
@@ -7484,7 +7618,14 @@ mod pending_manual_tests {
         // Idle (no active QSOs) — `promote_pending_manual_calls` will adopt
         // the queue's own desired parity (Odd, opposite of Even) as the side
         // to commit to, and start it.
-        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+        promote_pending_manual_calls(
+            &mgr,
+            &pending,
+            &bus,
+            &limits(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
 
         assert!(
             pending.lock().await.is_empty(),
@@ -9371,13 +9512,13 @@ fn merge_qrz_lookup(
     let us_related = metadata
         .their_callsign
         .as_deref()
-        .and_then(pancetta_tui::dxcc::entity_for_callsign)
-        .is_some_and(pancetta_tui::dxcc::is_us_related_entity);
+        .and_then(pancetta_core::dxcc::entity_for_callsign)
+        .is_some_and(pancetta_core::dxcc::is_us_related_entity);
     if state_missing && us_related {
         if let Some(code) = lookup
             .state
             .as_deref()
-            .and_then(pancetta_tui::dxcc::normalize_us_state)
+            .and_then(pancetta_core::dxcc::normalize_us_state)
         {
             metadata.their_state = Some(code.to_string());
             result.state_filled = true;
@@ -9411,8 +9552,8 @@ fn needs_qrz_enrichment(metadata: &pancetta_qso::QsoMetadata) -> bool {
         && metadata
             .their_callsign
             .as_deref()
-            .and_then(pancetta_tui::dxcc::entity_for_callsign)
-            .is_some_and(pancetta_tui::dxcc::is_us_related_entity)
+            .and_then(pancetta_core::dxcc::entity_for_callsign)
+            .is_some_and(pancetta_core::dxcc::is_us_related_entity)
 }
 
 /// Best-effort QRZ-XML grid/state enrichment for a completed QSO.
@@ -9786,7 +9927,7 @@ async fn start_local_qso_log_writers(
     station_power_watts: u32,
     persist_qso_timeline: bool,
     qso_manager: &pancetta_qso::QsoManager,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    adif_subscribers: &AdifSubscribers,
 ) -> (
     Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
@@ -9821,7 +9962,11 @@ async fn start_local_qso_log_writers(
             info!("ADIF log open at {}", adif_path.display());
             w.set_station_power_watts(station_power_watts);
             let w = std::sync::Arc::new(w);
-            start_adif_subscriber(w.clone(), adif_events, shutdown);
+            adif_subscribers.track(start_adif_subscriber(
+                w.clone(),
+                adif_events,
+                adif_subscribers,
+            ));
             Some(w)
         }
         Err(e) => {
@@ -10029,14 +10174,109 @@ async fn prepare_local_qso_index(
     }
 }
 
+/// PAN-274: how long coordinator shutdown waits for the ADIF subscribers to
+/// write what they still hold. A drain normally takes milliseconds; the bound
+/// matters only while another process holds `qsos.adi.lock`, where one append
+/// can wait up to `LIVE_LOCK_WAIT` (60 s). It runs alongside the upload
+/// worker's own wait, so it does not lengthen shutdown.
+pub(crate) const ADIF_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// PAN-274: coordinator shutdown's hold on every ADIF subscriber this process
+/// started. Each Qso start adds one; after a supervisor restart the old one can
+/// still be running. Shutdown asks them all to finish once every QSO component
+/// has stopped, then waits for them.
+#[derive(Clone)]
+pub(crate) struct AdifSubscribers {
+    /// Set once, by [`AdifSubscribers::stop`].
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl AdifSubscribers {
+    pub(crate) fn new() -> Self {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        Self {
+            stop: Arc::new(stop),
+            tasks: Arc::default(),
+        }
+    }
+
+    /// Keep `task` for shutdown to wait on, forgetting subscribers that ended.
+    fn track(&self, task: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    /// How many subscribers are tracked (test accessor).
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Ask every subscriber to write what is left in its channel and exit, then
+    /// wait for them, at most `limit` in total. The shutdown flag must already
+    /// be set and every QSO component stopped.
+    pub(crate) async fn stop(&self, limit: Duration) {
+        self.stop.send_replace(true);
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = tokio::time::Instant::now() + limit;
+        for task in tasks {
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("ADIF subscriber ended abnormally: {e}"),
+                Err(_) => {
+                    error!(
+                        "qsos.adi writer still busy after {limit:?}; shutdown continues, \
+                         and a QSO it had not written yet is not in qsos.adi"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Resolves once [`AdifSubscribers::stop`] has been called.
+async fn adif_subscriber_finish(stop: &tokio::sync::watch::Sender<bool>) {
+    let mut stop = stop.subscribe();
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// Append every `QsoCompleted` to `qsos.adi`. Runs until coordinator shutdown
+/// asks it to finish (`AdifSubscribers::stop`, after every QSO component has
+/// stopped), then writes every completion still in its channel; or until the
+/// channel closes. Never stops on the shutdown flag: the Qso task can complete
+/// a QSO after the flag flips (PAN-274). A broadcast lag is reported at ERROR
+/// and never ends the loop: the completions still in the channel are written.
 fn start_adif_subscriber(
     writer: std::sync::Arc<pancetta_qso::AdifLogWriter>,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+    subscribers: &AdifSubscribers,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let stop = subscribers.stop.clone();
     tokio::spawn(async move {
-        while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            match events.recv().await {
+        let mut draining = false;
+        loop {
+            let event = if draining {
+                match events.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Lagged(n)) => Err(RecvError::Lagged(n)),
+                    // Empty or Closed: every completion in the channel is written.
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => event,
+                    () = adif_subscriber_finish(&stop) => {
+                        draining = true;
+                        continue;
+                    }
+                }
+            };
+            match event {
                 Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
                     if let Err(e) = writer.append(&metadata).await {
                         // ADIF is the source of truth. A failed write deserves
@@ -10050,13 +10290,295 @@ fn start_adif_subscriber(
                     }
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("ADIF subscriber lagged by {n} QSO events");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Lagged(n)) => error!(
+                    "ADIF subscriber lagged by {n} QSO events; any QSO completed \
+                     among them is not in qsos.adi"
+                ),
+                Err(RecvError::Closed) => break,
             }
         }
-    });
+    })
+}
+
+#[cfg(test)]
+mod adif_subscriber_tests {
+    //! PAN-274: the ADIF subscriber writes every completion it still holds when
+    //! coordinator shutdown asks it to finish, reports a lag as an error, and
+    //! shutdown's wait for it is bounded.
+    use super::{start_adif_subscriber, AdifSubscribers};
+    use pancetta_qso::{QsoEvent, QsoState};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    const CALLS: [&str; 6] = ["A1AAA", "B1BBB", "C1CCC", "D1DDD", "E1EEE", "K1DEF"];
+    const LAG_LINE: &str =
+        "ADIF subscriber lagged by 3 QSO events; any QSO completed among them is not in qsos.adi";
+
+    fn completed(call: &str) -> QsoEvent {
+        let now = chrono::Utc::now();
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        QsoEvent::QsoCompleted {
+            qso_id,
+            metadata: pancetta_qso::QsoMetadata {
+                qso_id,
+                our_callsign: "W1ABC".to_string(),
+                their_callsign: Some(call.to_string()),
+                frequency: 14_074_000.0,
+                completed_rf_frequency_hz: None,
+                mode: "FT8".to_string(),
+                start_time: now,
+                end_time: Some(now),
+                reports: pancetta_qso::states::SignalReports::default(),
+                grids: pancetta_qso::states::GridSquares::default(),
+                their_state: None,
+                contest_info: None,
+                tags: std::collections::HashMap::new(),
+                adif_field_types: std::collections::HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                tx_parity_provisional: false,
+                initiated_by: pancetta_qso::states::CallInitiation::Auto,
+                role: pancetta_qso::states::QsoRole::Caller,
+                call_count: 1,
+                first_call_at: Some(now),
+                last_call_at: Some(now),
+                progressed_this_cycle: false,
+                stall_cycles: 0,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset: None,
+                hound: false,
+                partner_freq: None,
+                pending_freq_drift: None,
+                hound_qsyed: false,
+                remote_origin: false,
+                remote_client_key_id: None,
+            },
+            state_history: vec![],
+            messages: vec![],
+        }
+    }
+
+    fn state_changed() -> QsoEvent {
+        QsoEvent::StateChanged {
+            qso_id: pancetta_qso::QsoId::new_v4(),
+            old_state: QsoState::Idle,
+            new_state: QsoState::Idle,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// Which of the test callsigns `path` holds, in file order.
+    fn calls_in(path: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut found: Vec<(usize, &str)> = CALLS
+            .iter()
+            .filter_map(|call| text.find(call).map(|at| (at, *call)))
+            .collect();
+        found.sort();
+        found
+            .into_iter()
+            .map(|(_, call)| call.to_string())
+            .collect()
+    }
+
+    async fn writer(path: &std::path::Path) -> Arc<pancetta_qso::AdifLogWriter> {
+        Arc::new(pancetta_qso::AdifLogWriter::open(path).await.unwrap())
+    }
+
+    /// Collects formatted log output so a test can assert on it.
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+    }
+
+    /// Capture every log line on this thread (the current-thread test runtime
+    /// runs the spawned subscriber here too) until the guard drops.
+    fn capture_logs() -> (Capture, tracing::subscriber::DefaultGuard) {
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
+    }
+
+    /// A channel of capacity 2 that has lagged by 3: five completions were
+    /// sent, so only D1DDD and E1EEE are still retained.
+    fn lagged_channel() -> (broadcast::Sender<QsoEvent>, broadcast::Receiver<QsoEvent>) {
+        let (tx, rx) = broadcast::channel(2);
+        for call in &CALLS[..5] {
+            tx.send(completed(call)).unwrap();
+        }
+        (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn adif_subscriber_writes_every_completion_queued_when_asked_to_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let w = writer(&path).await;
+        let (tx, rx) = broadcast::channel(16);
+        for event in [
+            state_changed(),
+            completed("A1AAA"),
+            state_changed(),
+            completed("B1BBB"),
+        ] {
+            tx.send(event).unwrap();
+        }
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        subs.stop(Duration::from_secs(2)).await;
+        assert_eq!(calls_in(&path), vec!["A1AAA", "B1BBB"]);
+    }
+
+    #[tokio::test]
+    async fn adif_subscriber_writes_completions_sent_while_it_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let w = writer(&path).await;
+        let (tx, rx) = broadcast::channel(16);
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        // Let it park in `recv()`.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(state_changed()).unwrap();
+        tx.send(completed("K1DEF")).unwrap();
+        subs.stop(Duration::from_secs(2)).await;
+        assert_eq!(calls_in(&path), vec!["K1DEF"]);
+    }
+
+    #[tokio::test]
+    async fn adif_subscriber_writes_the_retained_completions_after_a_lag_during_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let w = writer(&path).await;
+        let (logs, _guard) = capture_logs();
+        let (_tx, rx) = lagged_channel();
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        // Stop is requested before the subscriber's first poll.
+        subs.stop(Duration::from_secs(2)).await;
+        assert_eq!(calls_in(&path), vec!["D1DDD", "E1EEE"]);
+        let logs = logs.text();
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains(LAG_LINE), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn adif_subscriber_reports_a_lag_as_an_error_and_keeps_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let w = writer(&path).await;
+        let (logs, _guard) = capture_logs();
+        let (_tx, rx) = lagged_channel();
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        for _ in 0..100 {
+            if calls_in(&path).len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(calls_in(&path), vec!["D1DDD", "E1EEE"]);
+        let logs = logs.text();
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains(LAG_LINE), "{logs}");
+        subs.stop(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn adif_shutdown_wait_is_bounded_while_the_logbook_is_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        // Open first: the open writes the header under the lock.
+        let w = writer(&path).await;
+        let lock = pancetta_qso::logbook_lock::LogbookLock::open(&path).unwrap();
+        let _held = lock.try_lock().unwrap().expect("the logbook lock is free");
+        let (logs, _guard) = capture_logs();
+        let (tx, rx) = broadcast::channel(16);
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        tx.send(completed("K1DEF")).unwrap();
+        let started = std::time::Instant::now();
+        subs.stop(Duration::from_millis(300)).await;
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(2), "stop took {took:?}");
+        let logs = logs.text();
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(
+            logs.contains(
+                "qsos.adi writer still busy after 300ms; shutdown continues, and a QSO it \
+                 had not written yet is not in qsos.adi"
+            ),
+            "{logs}"
+        );
+    }
+
+    /// The supervisor-restart case: two subscribers on one tracker.
+    #[tokio::test]
+    async fn adif_subscribers_wait_for_every_tracked_subscriber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_path = tmp.path().join("first.adi");
+        let second_path = tmp.path().join("second.adi");
+        let first = writer(&first_path).await;
+        let second = writer(&second_path).await;
+        let (first_tx, first_rx) = broadcast::channel(16);
+        let (second_tx, second_rx) = broadcast::channel(16);
+        first_tx.send(completed("A1AAA")).unwrap();
+        second_tx.send(completed("B1BBB")).unwrap();
+        let subs = AdifSubscribers::new();
+        subs.track(start_adif_subscriber(first, first_rx, &subs));
+        subs.track(start_adif_subscriber(second, second_rx, &subs));
+        subs.stop(Duration::from_secs(2)).await;
+        assert_eq!(calls_in(&first_path), vec!["A1AAA"]);
+        assert_eq!(calls_in(&second_path), vec!["B1BBB"]);
+    }
+
+    #[tokio::test]
+    async fn adif_subscribers_forget_subscribers_that_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let w = writer(&path).await;
+        let subs = AdifSubscribers::new();
+        let (closed_tx, closed_rx) = broadcast::channel::<QsoEvent>(4);
+        drop(closed_tx);
+        // Its channel is closed, so it exits on its own.
+        let ended = start_adif_subscriber(w.clone(), closed_rx, &subs);
+        for _ in 0..100 {
+            if ended.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ended.is_finished(), "a closed channel ends the subscriber");
+        subs.track(ended);
+        assert_eq!(subs.tracked(), 1);
+        let (_tx, rx) = broadcast::channel(4);
+        subs.track(start_adif_subscriber(w, rx, &subs));
+        assert_eq!(subs.tracked(), 1, "the ended subscriber was forgotten");
+        subs.stop(Duration::from_secs(2)).await;
+    }
 }
 
 #[cfg(test)]
@@ -10750,9 +11272,8 @@ mod caller_dedup_tests {
 
 #[cfg(test)]
 mod replay_local_log_tests {
-    use super::start_local_qso_log_writers;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+    use super::{start_local_qso_log_writers, AdifSubscribers};
+    use std::time::Duration;
 
     /// Minimal manager config: a real callsign (the placeholder guard in
     /// `start_cq` rejects NOCALL/N0CALL) and a grid, everything else default.
@@ -10817,7 +11338,7 @@ mod replay_local_log_tests {
     /// Number of complete ADIF records in `path` (`<eor>` terminates one).
     /// A missing file counts as zero — the file only exists once something
     /// opened it for writing.
-    fn adif_record_count(path: &std::path::Path) -> usize {
+    pub(super) fn adif_record_count(path: &std::path::Path) -> usize {
         std::fs::read_to_string(path)
             .unwrap_or_default()
             .to_ascii_lowercase()
@@ -10869,7 +11390,7 @@ mod replay_local_log_tests {
         index_with_two_rows(&db_path).await;
         assert!(!adif_path.exists(), "precondition: no ADIF log yet");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
@@ -10878,7 +11399,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
 
@@ -10893,7 +11414,7 @@ mod replay_local_log_tests {
             .parse_string(&adif)
             .expect("migrated ADIF parses");
         assert_eq!(parsed.records.len(), 2, "both contacts migrated to ADIF");
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// PAN-127: a `qsos.adi` with no `qso.db` (dropped in, or the index
@@ -10906,7 +11427,7 @@ mod replay_local_log_tests {
         let db_path = dir.path().join("qso.db");
         std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
@@ -10915,7 +11436,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
 
@@ -10923,7 +11444,7 @@ mod replay_local_log_tests {
         let mut calls = seed_db.get_worked_callsigns("20M").await;
         calls.sort();
         assert_eq!(calls, vec!["K1ABC".to_string(), "W1AW".to_string()]);
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// An index newer than the ADIF log is opened as it is, not rebuilt.
@@ -10947,7 +11468,7 @@ mod replay_local_log_tests {
             .expect("backdate qsos.adi");
         index_with_two_rows(&db_path).await;
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
@@ -10956,7 +11477,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
 
@@ -10966,7 +11487,7 @@ mod replay_local_log_tests {
             2,
             "a current index must not be rebuilt"
         );
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// PAN-127: an import stopped part-way leaves a partial index that is
@@ -11000,7 +11521,7 @@ mod replay_local_log_tests {
         let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
         std::fs::write(&marker, b"").expect("write marker");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
@@ -11009,7 +11530,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
 
@@ -11020,7 +11541,7 @@ mod replay_local_log_tests {
             "a marked index must be rebuilt from the ADIF log"
         );
         assert!(!marker.exists(), "the rebuild clears the marker");
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// PR #451 review (Codex P2): a replay that fails (here, on an
@@ -11038,7 +11559,7 @@ mod replay_local_log_tests {
         let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
         std::fs::write(&marker, b"").expect("write marker");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
@@ -11047,7 +11568,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
 
@@ -11060,7 +11581,7 @@ mod replay_local_log_tests {
             .await
             .unwrap();
         assert_eq!(retained.count_qsos().await.expect("count"), 2);
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// CONTROL (makes the replay assertion below non-vacuous): on a live run
@@ -11072,7 +11593,7 @@ mod replay_local_log_tests {
         let adif_path = dir.path().join("qsos.adi");
         let db_path = dir.path().join("qso.db");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false, // NOT replay
@@ -11081,7 +11602,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
         assert!(
@@ -11107,7 +11628,7 @@ mod replay_local_log_tests {
             db_path.display()
         );
 
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// Automatic backups land in `backups/` next to `qso.db`
@@ -11117,7 +11638,7 @@ mod replay_local_log_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("qso.db");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (_adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false,
@@ -11126,7 +11647,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
         let backup = async_logger
@@ -11136,7 +11657,7 @@ mod replay_local_log_tests {
             .expect("backup succeeds");
         assert_eq!(backup.parent().unwrap(), dir.path().join("backups"));
 
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
     /// The gate itself: under `--replay` a QSO the engine "completes" off
@@ -11149,7 +11670,7 @@ mod replay_local_log_tests {
         let adif_path = dir.path().join("qsos.adi");
         let db_path = dir.path().join("qso.db");
         let manager = manager();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
 
         let (adif_writer, async_logger, seed_db) = start_local_qso_log_writers(
             true, // --replay
@@ -11158,7 +11679,7 @@ mod replay_local_log_tests {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
         assert!(
@@ -11197,7 +11718,7 @@ mod replay_local_log_tests {
             db_path.display()
         );
 
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 }
 
@@ -11615,6 +12136,76 @@ mod replay_history_seed_tests {
         let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(outbox_path(tmp.path()));
         assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
         assert_eq!(store.entries()[0].call, "K1DEF");
+    }
+
+    /// PAN-274: a QSO that completes after the shutdown flag flips (the Qso
+    /// task finishes the message it is handling) is in qsos.adi when shutdown
+    /// returns, and the upload queue holds the same QSO.
+    #[tokio::test]
+    async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_and_the_upload_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = clublog_coordinator(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let manager = coordinator
+            .qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("QSO manager published");
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        super::replay_local_log_tests::complete_one_qso(&manager).await;
+        coordinator.shutdown().await.unwrap();
+
+        let adif_path = tmp.path().join(".pancetta").join("qsos.adi");
+        let adif = std::fs::read_to_string(&adif_path).unwrap_or_default();
+        assert_eq!(
+            super::replay_local_log_tests::adif_record_count(&adif_path),
+            1,
+            "{adif}"
+        );
+        assert!(adif.contains("K1DEF"), "{adif}");
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(outbox_path(tmp.path()));
+        assert_eq!(store.len(), 1, "the QSO's ClubLog upload was not queued");
+        assert_eq!(store.entries()[0].call, "K1DEF");
+    }
+
+    /// PAN-274: the same with no upload destination: the logbook does not
+    /// depend on uploads being enabled, and shutdown stays fast.
+    #[tokio::test]
+    async fn qso_completed_after_the_shutdown_flag_reaches_qsos_adi_without_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let manager = coordinator
+            .qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("QSO manager published");
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        super::replay_local_log_tests::complete_one_qso(&manager).await;
+        let started = std::time::Instant::now();
+        coordinator.shutdown().await.unwrap();
+        let took = started.elapsed();
+
+        let adif_path = tmp.path().join(".pancetta").join("qsos.adi");
+        let adif = std::fs::read_to_string(&adif_path).unwrap_or_default();
+        assert_eq!(
+            super::replay_local_log_tests::adif_record_count(&adif_path),
+            1,
+            "{adif}"
+        );
+        assert!(adif.contains("K1DEF"), "{adif}");
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "shutdown took {took:?}"
+        );
     }
 
     /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`
@@ -16765,9 +17356,9 @@ mod pan260 {
         let index = dir.path().join("qso.db");
         std::fs::write(&adif, [0xff, 0xfe]).unwrap();
         let m = manager();
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
         let (_, _, seed) =
-            start_local_qso_log_writers(false, &adif, &index, 100, false, &m, shutdown.clone())
+            start_local_qso_log_writers(false, &adif, &index, 100, false, &m, &adif_subscribers)
                 .await;
         assert!(seed.is_none());
         assert!(pancetta_qso::async_database::QsoDatabase::rebuild_marker(&index).exists());
@@ -16780,7 +17371,9 @@ mod pan260 {
             Err(pancetta_qso::QsoManagerError::Database { .. })
         ));
         assert!(m.get_active_qsos().await.is_empty());
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers
+            .stop(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -16791,11 +17384,18 @@ mod pan260 {
         // Use a fixed date and a deliberately wide window. Boundary semantics are
         // tested with an injected clock in the store and manager tests.
         std::fs::write(&adif, "<EOH>\n<CALL:5>K1ABC <QSO_DATE:8>20260101 <TIME_ON:6>140000 <MODE:3>FT8 <FREQ:9>14.075200 <BAND:3>20M <EOR>\n<CALL:6>JA1XYZ <QSO_DATE:8>20260102 <TIME_ON:6>140000 <MODE:3>FT8 <FREQ:8>7.075200 <BAND:3>40M <EOR>\n").unwrap();
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
         let mut first = manager();
-        let (_, _, db) =
-            start_local_qso_log_writers(false, &adif, &index, 100, false, &first, shutdown.clone())
-                .await;
+        let (_, _, db) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &index,
+            100,
+            false,
+            &first,
+            &adif_subscribers,
+        )
+        .await;
         let db = Arc::new(db.unwrap());
         let lookup = crate::priority_evaluator::CachedStationLookup::new();
         initialize_qso_history(&mut first, &lookup, db.clone())
@@ -16823,7 +17423,9 @@ mod pan260 {
         ));
         assert!(second.get_active_qsos().await.is_empty());
         assert!(events.try_recv().is_err());
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        adif_subscribers
+            .stop(std::time::Duration::from_secs(2))
+            .await;
         db.close().await;
         // A separate real-log fixture makes byte-for-byte replay isolation explicit.
         let replay_dir = tempfile::tempdir().unwrap();
@@ -17176,7 +17778,7 @@ mod pan50_live_contest {
             contest_scoring: Some(context.clone()),
             ..Default::default()
         });
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adif_subscribers = AdifSubscribers::new();
         let (_writer, _logger, db) = start_local_qso_log_writers(
             false,
             &adif,
@@ -17184,7 +17786,7 @@ mod pan50_live_contest {
             100,
             false,
             &manager,
-            shutdown.clone(),
+            &adif_subscribers,
         )
         .await;
         let db = db.unwrap();
@@ -17235,7 +17837,9 @@ mod pan50_live_contest {
         })
         .await
         .unwrap();
-        shutdown.store(true, Ordering::Release);
+        adif_subscribers
+            .stop(std::time::Duration::from_secs(2))
+            .await;
         let rebuilt =
             pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", &adif)
                 .await

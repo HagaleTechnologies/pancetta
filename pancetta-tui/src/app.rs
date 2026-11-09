@@ -508,11 +508,16 @@ pub struct DxStation {
     /// DXCC entity / country name (e.g. "Japan"), from the cqdx live-spot
     /// `dxEntityName`. `Some` for network/Both spots; `None` for local-only
     /// decodes and DX-cluster spots — but `dx_hunter::draw`'s row renderer
-    /// falls back to the offline `crate::dxcc::entity_for_callsign` prefix
-    /// resolver in that case, so the DX Hunter column is not blank ("---")
-    /// for local-only stations (fixed 2026-06-26; this field itself stays
-    /// `None`, only the rendered column is filled in).
+    /// falls back to [`DxStation::offline_entity`] in that case (through
+    /// [`DxStation::display_entity`]), so the DX Hunter column is not blank
+    /// ("---") for local-only stations (fixed 2026-06-26; this field itself
+    /// stays `None`, only the rendered column is filled in).
     pub entity_name: Option<String>,
+    /// The offline cty.dat entity for `call_sign` (`pancetta_core::dxcc`),
+    /// resolved once when the row is created. `call_sign` never changes after
+    /// that, so this cannot go stale. `None` for an unknown prefix. Frames read
+    /// this through [`DxStation::display_entity`] and never resolve again (PAN-284).
+    pub offline_entity: Option<&'static str>,
     pub rarity_tier: Option<String>,
     pub reporter_count: Option<u32>,
     pub is_notable: bool,
@@ -542,6 +547,12 @@ pub struct DxStation {
 }
 
 impl DxStation {
+    /// cqdx's authoritative `entity_name` first, then the offline entity
+    /// resolved at row creation. Runs no lookup (PAN-284).
+    pub fn display_entity(&self) -> Option<&str> {
+        self.entity_name.as_deref().or(self.offline_entity)
+    }
+
     /// Explain the displayed score. Local history wins equal scores.
     pub fn rank_basis(&self) -> Option<(RankOrigin, &RankedBy)> {
         match (&self.local_rank, &self.network_rank) {
@@ -1818,7 +1829,7 @@ impl App {
             // (carried on StationConfig); backs the title-bar mode chip
             // (rendered only when != FT8).
             mode: config.station.mode.clone(),
-            entity_name: crate::dxcc::entity_for_callsign(&config.station.call_sign)
+            entity_name: pancetta_core::dxcc::entity_for_callsign(&config.station.call_sign)
                 .map(str::to_string),
         };
 
@@ -2485,6 +2496,8 @@ impl App {
                             network_rank: None,
                             source: SpotSource::Local,
                             entity_name: None,
+                            // PAN-284: resolved once, here; frames read it.
+                            offline_entity: pancetta_core::dxcc::entity_for_callsign(call_sign),
                             rarity_tier: None,
                             reporter_count: None,
                             is_notable: false,
@@ -2813,7 +2826,7 @@ impl App {
         let Some(key) = station_state_key(callsign) else {
             return;
         };
-        if let Some(code) = crate::dxcc::normalize_us_state(state) {
+        if let Some(code) = pancetta_core::dxcc::normalize_us_state(state) {
             self.dx_states.insert(key, code.to_string());
         }
     }
@@ -2844,6 +2857,8 @@ impl App {
                     .map(|(key, row)| {
                         let status = lookup.lookup_need(
                             &row.call_sign,
+                            // PAN-284: the row's entity, resolved at creation.
+                            row.offline_entity,
                             row.grid_square.as_deref(),
                             self.station_state_for(&row.call_sign),
                             current_hz,
@@ -3414,6 +3429,8 @@ impl App {
             network_rank: None,
             source: SpotSource::Local,
             entity_name: None,
+            // PAN-284: resolved once, here; frames read it.
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(&callsign),
             rarity_tier: None,
             reporter_count: None,
             is_notable: false,
@@ -4576,6 +4593,8 @@ impl App {
                     network_rank: None,
                     source: SpotSource::Network,
                     entity_name: Some(spot.entity_name.clone()).filter(|s| !s.is_empty()),
+                    // PAN-284: resolved once, here; frames read it.
+                    offline_entity: pancetta_core::dxcc::entity_for_callsign(&spot.dx_call),
                     rarity_tier: Some(spot.rarity_tier.clone()),
                     reporter_count: Some(spot.reporter_count),
                     is_notable: spot.is_notable,
@@ -5837,6 +5856,7 @@ mod tests {
         fn lookup_need(
             &self,
             _call: &str,
+            _: Option<&'static str>,
             grid: Option<&str>,
             state: Option<&str>,
             hz: f64,
@@ -5859,6 +5879,7 @@ mod tests {
             fn lookup_need(
                 &self,
                 call: &str,
+                _: Option<&'static str>,
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
@@ -5897,6 +5918,93 @@ mod tests {
         assert!(app.dx_need_for("W5ABC").is_none());
         assert!(app.dx_need_for("W0OLD").is_some());
         assert_eq!(app.dx_need.len(), 1);
+    }
+
+    /// PAN-284 scenario 3: the need refresh hands each row's carried entity to
+    /// the provider, so no frame resolves an entity.
+    #[tokio::test]
+    async fn dx_need_refresh_passes_each_rows_carried_entity() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<(String, Option<&'static str>)>>);
+        impl crate::dx_need::DxNeedLookup for Recording {
+            fn lookup_need(
+                &self,
+                call: &str,
+                entity: Option<&'static str>,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                self.0.lock().unwrap().push((call.to_string(), entity));
+                Default::default()
+            }
+        }
+        let mut app = fixture_app().await;
+        for i in 0..150 {
+            let call = format!("W{i}ABC");
+            let mut row = dx_fixture(&call, 50, 10, 14.074, false);
+            row.offline_entity = Some("Sentinel");
+            app.dx_stations.insert(call, row);
+        }
+        let provider = Recording::default();
+        app.refresh_dx_need(Some(&provider));
+        let seen = provider.0.lock().unwrap();
+        assert_eq!(seen.len(), 150);
+        assert!(seen.iter().all(|(_, e)| *e == Some("Sentinel")));
+    }
+
+    /// PAN-284: every row-creation path resolves the offline entity once.
+    #[tokio::test]
+    async fn dx_rows_resolve_their_offline_entity_at_creation() {
+        let mut app = fixture_app().await;
+        // Local decode: new row resolves; a later decode updates in place.
+        app.add_decoded_message(fixture_view("JA1XYZ", -10))
+            .await
+            .unwrap();
+        let row = &app.dx_stations["JA1XYZ"];
+        assert_eq!(row.offline_entity, Some("Japan"));
+        assert_eq!(row.entity_name, None);
+        app.dx_stations.get_mut("JA1XYZ").unwrap().offline_entity = Some("Sentinel");
+        app.add_decoded_message(fixture_view("JA1XYZ", -8))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.dx_stations["JA1XYZ"].offline_entity,
+            Some("Sentinel"),
+            "an update must not resolve again"
+        );
+        assert_eq!(app.dx_stations["JA1XYZ"].snr, -8);
+
+        // DX-cluster spot: stored under the plain call, resolved.
+        app.add_dx_spot(
+            "<W5ABC>".into(),
+            14.074,
+            "FT8".into(),
+            -10,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            app.dx_stations["W5ABC"].offline_entity,
+            Some("United States")
+        );
+
+        // cqdx spot group: offline entity resolved; cqdx's name still displays.
+        let mut spot = reason_spot("VK3ABC", false);
+        spot.entity_name = "Australia (cqdx)".into();
+        app.merge_spot_groups(&[spot]);
+        let row = &app.dx_stations["VK3ABC"];
+        assert_eq!(row.offline_entity, Some("Australia"));
+        assert_eq!(row.display_entity(), Some("Australia (cqdx)"));
+
+        // Unknown prefix: nothing to carry.
+        app.add_decoded_message(fixture_view("QZ9ZZ", -10))
+            .await
+            .unwrap();
+        assert_eq!(app.dx_stations["QZ9ZZ"].offline_entity, None);
+        assert_eq!(app.dx_stations["QZ9ZZ"].display_entity(), None);
     }
 
     #[tokio::test]
@@ -7382,6 +7490,7 @@ mod tests {
                 network_rank: None,
                 source: SpotSource::Local,
                 entity_name: None,
+                offline_entity: pancetta_core::dxcc::entity_for_callsign("K5ARH"),
                 rarity_tier: None,
                 reporter_count: None,
                 is_notable: false,
@@ -7547,6 +7656,7 @@ mod tests {
             network_rank: None,
             source: SpotSource::Local,
             entity_name: None,
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
             rarity_tier: None,
             reporter_count: None,
             is_notable: false,
