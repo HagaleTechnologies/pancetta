@@ -3451,6 +3451,7 @@ mod key_tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 hz: f64,
+                _mode: Option<&str>,
             ) -> DxNeedStatus {
                 assert_eq!(hz, 14_074_000.0);
                 let needed = self.0.load(Ordering::Relaxed);

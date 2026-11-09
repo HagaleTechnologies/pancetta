@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-347: Hawaii, Alaska, Puerto Rico and other entities that share letters with your callsign or with calls in your log are no longer treated as already worked, and a German call on a new band is marked new whatever its prefix. `[station] dxcc_entity` no longer affects needed status; pancetta takes your home entity from `callsign`.
 - PAN-284: The DX Hunter no longer looks up every row's DXCC entity on every frame. Each row resolves its entity once, and the lookup itself is an index instead of a scan of 7,173 prefixes. Entity names are unchanged.
 - PAN-271: Pancetta now starts `rigctld` with the correct Hamlib model for seven configured rig names. Each previously used another radio's backend: `FT-991`/`FT-991A` 1036 to 1035, `FT-891` 1038 to 1036, `FT-710` 1046 to 1049, `FTdx101MP` 1040 to 1044, `TS-590`/`TS-590S` 2026 to 2031, `TS-590SG` 2026 to 2037, `TS-890`/`TS-890S` 2029 to 2041. Every name accepted before is still accepted. If the installed Hamlib is too old to know a rig's model, `rigctld` now exits at startup and Pancetta reports a CAT connection failure, instead of running another radio's backend; the log line `Spawning rigctld` names the Hamlib model, and `rigctl -l` shows whether your Hamlib has it.
 - PAN-264: On macOS, pancetta started over ssh, in a tmux session started over ssh, or by the LaunchAgent now asks for its own microphone approval and hears the rig after you approve once at the Mac. Until then the station waits and says how to approve, instead of running on silence. Each new pancetta binary needs approving once. `PANCETTA_MACOS_RELAUNCH=0` restores the old behavior.
@@ -28,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-347: Without cqdx.io, or while it is unreachable, pancetta derives needed and all-time-new entities from `qsos.adi` and says so (`local logbook`). DX Hunter shows `new mode FT4` when an entity was never logged in the current mode, and the station card shows `worked-unconfirmed` or `confirmed` from the QSL and LoTW fields in your log.
 - PAN-271: `docs/SUPPORTED_RIGS.md` lists every rig Pancetta starts `rigctld` for, with its `rig.model` names, Hamlib model and CAT, audio and TX test status. It is generated from the rig table in `pancetta-hamlib/src/models.rs` and drift-tested. The Yaesu FTdx10 is the only rig with a recorded hardware test. `pancetta doctor` points an unknown `rig.model` at the page.
 - PAN-261: optional `autonomous.pounce_min_tier` admits pounce targets by DX tier and uses the weighted score within each tier. Opt-in bell, ntfy and webhook decode alerts have independent tier thresholds. `Shift+W` edits persistent watchlist pins, which alert when heard and disappear when removed or worked. Auto watchlist expiry is configurable.
 - PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.

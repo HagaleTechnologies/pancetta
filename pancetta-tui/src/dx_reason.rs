@@ -3,12 +3,15 @@
 use crate::app::{App, DxStation, RankOrigin};
 use crate::dx_need::{canonical_grid_square, DxNeedStatus};
 use chrono::{DateTime, Utc};
-use pancetta_qso::priority::{PortableSuffix, PriorityTier, TIER_BAND_WIDTH};
+use pancetta_qso::priority::{NeedSource, PortableSuffix, PriorityTier, TIER_BAND_WIDTH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Headline {
     InvalidCallsign,
-    AllTimeNew,
+    /// PAN-347: `source` names who answered ATNO at score time.
+    AllTimeNew {
+        source: NeedSource,
+    },
     NewEntityOnBand {
         band: String,
     },
@@ -33,7 +36,11 @@ impl Headline {
     pub fn text(&self) -> String {
         match self {
             Self::InvalidCallsign => "callsign looks invalid".into(),
-            Self::AllTimeNew => "all-time new entity".into(),
+            Self::AllTimeNew { source } => match source {
+                NeedSource::LocalLogbook => "all-time new entity (local logbook)",
+                NeedSource::Cqdx | NeedSource::Guess => "all-time new entity",
+            }
+            .into(),
             Self::NewEntityOnBand { band } => format!("new entity on {band}"),
             Self::NeededEntity { known } => match known {
                 Some(true) => "needed entity (cqdx list)",
@@ -72,7 +79,7 @@ impl Headline {
     pub fn tier(&self) -> Option<PriorityTier> {
         Some(match self {
             Self::InvalidCallsign => PriorityTier::Suspect,
-            Self::AllTimeNew => PriorityTier::Atno,
+            Self::AllTimeNew { .. } => PriorityTier::Atno,
             Self::NewEntityOnBand { .. } | Self::NeededEntity { .. } => {
                 PriorityTier::PerBandDxccNew
             }
@@ -113,6 +120,9 @@ pub struct DxReason {
     pub portable: Option<PortableSuffix>,
     pub rarity: Option<&'static str>,
     pub heard: Option<String>,
+    /// PAN-347: the row's mode when its entity was never logged in it
+    /// (display only, never with an all-time-new headline).
+    pub new_mode: Option<String>,
 }
 
 impl DxReason {
@@ -129,6 +139,9 @@ impl DxReason {
 
     pub fn compact_clauses(&self) -> Vec<String> {
         let mut clauses = vec![self.headline.text()];
+        if let Some(mode) = &self.new_mode {
+            clauses.push(format!("new mode {mode}"));
+        }
         clauses.extend(self.cautions.iter().map(Caution::text));
         if let Some(suffix) = self.portable {
             clauses.push(format!("maybe POTA/SOTA ({} suffix)", suffix.as_str()));
@@ -179,6 +192,7 @@ pub fn reason_for(
             portable: None,
             rarity: None,
             heard: None,
+            new_mode: None,
         };
     };
     let band = band_label(station);
@@ -187,7 +201,9 @@ pub fn reason_for(
         None => Headline::TierOnly(tier),
         Some(f) => match tier {
             PriorityTier::Suspect => Headline::InvalidCallsign,
-            PriorityTier::Atno => Headline::AllTimeNew,
+            PriorityTier::Atno => Headline::AllTimeNew {
+                source: f.need_source,
+            },
             PriorityTier::PerBandDxccNew if f.dxcc_new_on_band => {
                 Headline::NewEntityOnBand { band: band.clone() }
             }
@@ -264,12 +280,18 @@ pub fn reason_for(
             )
         }
     });
+    let mode = station.mode.trim().to_uppercase();
+    let new_mode = (need.and_then(|n| n.new_mode) == Some(true)
+        && !matches!(headline, Headline::AllTimeNew { .. })
+        && !mode.is_empty())
+    .then_some(mode);
     DxReason {
         headline,
         cautions,
         portable: rank.factors.and_then(|f| f.portable_suffix),
         rarity,
         heard,
+        new_mode,
     }
 }
 
@@ -322,32 +344,44 @@ pub fn focused(app: &App, now: DateTime<Utc>) -> FocusedReason<'_> {
     }
 }
 
-/// PAN-93: the "needed entity" row's value and source. The value is what the
-/// score used; the source names the cqdx list's scope and age, says when the
-/// list has changed since the score, or says the score used the
-/// home/logged-prefix guess because the list is not loaded.
+/// PAN-93 / PAN-347: the "needed entity" row's value and source. The value
+/// is what the score used; the source names the cqdx list's scope and age or
+/// the local logbook, says when that answer has changed since the score, or
+/// says the score used the home-entity guess because neither has answered.
 fn needed_entity_row(
     scored_needed: bool,
     need: Option<&DxNeedStatus>,
     now: DateTime<Utc>,
 ) -> (String, String) {
     let yes_no = |v: bool| if v { "yes" } else { "no" };
+    let local = need.and_then(|n| n.dxcc_source) == Some(NeedSource::LocalLogbook);
     match need.and_then(|n| n.dxcc_needed) {
         None => (
             "unknown".into(),
             if scored_needed {
-                "cqdx list not loaded; scored as needed (not a home or logged prefix)"
+                "cqdx list not loaded, local logbook not loaded; scored as needed (not your home entity)"
             } else {
-                "cqdx list not loaded; scored as not needed (home or logged prefix)"
+                "cqdx list not loaded, local logbook not loaded; scored as not needed (your home entity)"
             }
             .into(),
         ),
-        Some(listed) if listed != scored_needed => (
+        Some(now_needed) if now_needed != scored_needed => (
             yes_no(scored_needed).into(),
-            format!(
-                "scored before the cqdx list changed (now {})",
-                yes_no(listed)
-            ),
+            if local {
+                format!(
+                    "scored before your local logbook changed (now {})",
+                    yes_no(now_needed)
+                )
+            } else {
+                format!(
+                    "scored before the cqdx list changed (now {})",
+                    yes_no(now_needed)
+                )
+            },
+        ),
+        Some(now_needed) if local => (
+            yes_no(now_needed).into(),
+            "local logbook (cqdx list not loaded)".into(),
         ),
         Some(listed) => {
             let source = need.and_then(|n| n.dxcc_list.as_ref()).map_or_else(
@@ -428,7 +462,15 @@ pub fn detail_for(
                 yes_no(f.dxcc_new_on_band),
                 "your log",
             ),
-            ("all-time new entity".into(), yes_no(f.atno), "cqdx"),
+            (
+                "all-time new entity".into(),
+                yes_no(f.atno),
+                match f.need_source {
+                    NeedSource::Cqdx => "cqdx",
+                    NeedSource::LocalLogbook => "local logbook",
+                    NeedSource::Guess => "cqdx list and local logbook not loaded",
+                },
+            ),
             ("notable station".into(), yes_no(f.notable), "cqdx"),
             (
                 "special-event callsign".into(),
@@ -484,6 +526,20 @@ pub fn detail_for(
                 .into_iter()
                 .map(|(label, value, source)| format!("  {label:<32}  {value:<10} {source}")),
         );
+        // PAN-347: the entity's standing in the local logbook, display only.
+        if let Some(standing) = need.and_then(|n| n.entity_standing) {
+            lines.push(String::new());
+            lines.push("Local logbook (all bands, not scored)".into());
+            lines.push(format!("  {:<32}  {}", "entity", standing.label()));
+            let mode = station.mode.trim().to_uppercase();
+            if let Some(v) = need.and_then(|n| n.new_mode).filter(|_| !mode.is_empty()) {
+                lines.push(format!(
+                    "  {:<32}  {}",
+                    format!("entity new in {mode}"),
+                    yes_no(v)
+                ));
+            }
+        }
         lines.push(String::new());
         lines.push("Within-tier score".into());
         let t = f.terms;
@@ -799,14 +855,14 @@ mod tests {
                 None,
                 true,
                 "unknown",
-                "cqdx list not loaded; scored as needed (not a home or logged prefix)",
+                "cqdx list not loaded, local logbook not loaded; scored as needed (not your home entity)",
             ),
             (
                 None,
                 None,
                 false,
                 "unknown",
-                "cqdx list not loaded; scored as not needed (home or logged prefix)",
+                "cqdx list not loaded, local logbook not loaded; scored as not needed (your home entity)",
             ),
         ] {
             let need = DxNeedStatus {
@@ -820,11 +876,11 @@ mod tests {
         for (scored, source) in [
             (
                 true,
-                "cqdx list not loaded; scored as needed (not a home or logged prefix)",
+                "cqdx list not loaded, local logbook not loaded; scored as needed (not your home entity)",
             ),
             (
                 false,
-                "cqdx list not loaded; scored as not needed (home or logged prefix)",
+                "cqdx list not loaded, local logbook not loaded; scored as not needed (your home entity)",
             ),
         ] {
             assert_eq!(row(scored, None), expect("unknown", source));
@@ -1097,5 +1153,120 @@ mod tests {
         );
         s.network_rank = s.local_rank.take();
         assert_eq!(detail_for(&s, None, now()).lines.last().unwrap(), "Scored by the TUI from cqdx spot data. Per-band and failure history come only from an earlier local decode.");
+    }
+
+    // ----- PAN-347: local logbook wording. -------------------------------
+
+    #[test]
+    fn local_atno_headline_names_the_local_logbook() {
+        let mut s = station("ZL1ABC");
+        set_tier(&mut s, PriorityTier::Atno);
+        factors(&mut s).atno = true;
+        factors(&mut s).need_source = NeedSource::LocalLogbook;
+        assert!(reason_for(&s, None, now())
+            .compact()
+            .starts_with("all-time new entity (local logbook)"));
+        factors(&mut s).need_source = NeedSource::Cqdx;
+        let compact = reason_for(&s, None, now()).compact();
+        assert!(compact.starts_with("all-time new entity"), "{compact}");
+        assert!(!compact.contains("local logbook"), "{compact}");
+    }
+
+    #[test]
+    fn new_mode_clause_follows_the_headline() {
+        let mut s = station("DL1XYZ");
+        s.mode = "FT4".into();
+        s.frequency = 7.0475;
+        set_tier(&mut s, PriorityTier::PerBandDxccNew);
+        factors(&mut s).dxcc_new_on_band = true;
+        let need = |new_mode| DxNeedStatus {
+            new_mode,
+            ..Default::default()
+        };
+        let clauses = reason_for(&s, Some(&need(Some(true))), now()).compact_clauses();
+        assert_eq!(clauses[..2], ["new entity on 40M", "new mode FT4"]);
+        for v in [Some(false), None] {
+            let compact = reason_for(&s, Some(&need(v)), now()).compact();
+            assert!(!compact.contains("new mode"), "{compact}");
+        }
+        set_tier(&mut s, PriorityTier::Atno);
+        let compact = reason_for(&s, Some(&need(Some(true))), now()).compact();
+        assert!(!compact.contains("new mode"), "{compact}");
+    }
+
+    #[test]
+    fn needed_row_names_its_source() {
+        let row = |scored: bool, need: &DxNeedStatus| {
+            let mut s = station("ZL1ABC");
+            set_tier(&mut s, PriorityTier::PerBandDxccNew);
+            factors(&mut s).needed_dxcc = scored;
+            detail_for(&s, Some(need), now())
+                .lines
+                .into_iter()
+                .find(|line| line.starts_with("  needed entity "))
+                .unwrap()
+        };
+        let expect =
+            |value: &str, source: &str| format!("  {:<32}  {value:<10} {source}", "needed entity");
+        let local = |needed| DxNeedStatus {
+            dxcc_needed: Some(needed),
+            dxcc_source: Some(NeedSource::LocalLogbook),
+            ..Default::default()
+        };
+        assert_eq!(
+            row(true, &local(true)),
+            expect("yes", "local logbook (cqdx list not loaded)")
+        );
+        assert_eq!(
+            row(false, &local(false)),
+            expect("no", "local logbook (cqdx list not loaded)")
+        );
+        assert_eq!(
+            row(true, &local(false)),
+            expect("yes", "scored before your local logbook changed (now no)")
+        );
+        assert_eq!(
+            row(true, &DxNeedStatus::default()),
+            expect(
+                "unknown",
+                "cqdx list not loaded, local logbook not loaded; scored as needed (not your home entity)"
+            )
+        );
+        // The all-time-new row's source follows the score's source.
+        let atno_row = |source| {
+            let mut s = station("ZL1ABC");
+            factors(&mut s).need_source = source;
+            detail_for(&s, None, now())
+                .lines
+                .into_iter()
+                .find(|line| line.starts_with("  all-time new entity "))
+                .unwrap()
+        };
+        assert!(atno_row(NeedSource::Cqdx).ends_with(" cqdx"));
+        assert!(atno_row(NeedSource::LocalLogbook).ends_with(" local logbook"));
+        assert!(atno_row(NeedSource::Guess).ends_with(" cqdx list and local logbook not loaded"));
+    }
+
+    #[test]
+    fn local_logbook_block_lists_standing_and_mode() {
+        let mut s = station("DL1XYZ");
+        s.mode = "FT4".into();
+        let need = DxNeedStatus {
+            entity_standing: Some(crate::dx_need::EntityStanding::WorkedUnconfirmed),
+            new_mode: Some(true),
+            ..Default::default()
+        };
+        let lines = detail_for(&s, Some(&need), now()).lines;
+        assert!(lines
+            .iter()
+            .any(|l| l == "Local logbook (all bands, not scored)"));
+        assert!(lines
+            .iter()
+            .any(|l| l == &format!("  {:<32}  worked-unconfirmed", "entity")));
+        assert!(lines
+            .iter()
+            .any(|l| l == &format!("  {:<32}  yes", "entity new in FT4")));
+        let lines = detail_for(&s, Some(&DxNeedStatus::default()), now()).lines;
+        assert!(!lines.iter().any(|l| l.starts_with("Local logbook")));
     }
 }
