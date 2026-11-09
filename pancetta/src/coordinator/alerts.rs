@@ -63,7 +63,8 @@ pub(super) struct AlertDispatcher {
     scorer: PriorityScorer,
     lookup: CachedStationLookup,
     tui: bool,
-    available: Option<bool>,
+    /// (cqdx list loaded, local logbook available) at the last log line.
+    available: Option<(bool, bool)>,
     dedupe: HashMap<(usize, String, String), Instant>,
     delivery: [Arc<Mutex<DeliveryState>>; 2],
 }
@@ -122,9 +123,10 @@ impl AlertDispatcher {
             self.lookup.dxcc_need_list(),
             NeedListAvailability::Loaded { .. }
         );
-        if self.available != Some(loaded) {
-            self.available = Some(loaded);
-            if !loaded && self.lookup.local_log_available() {
+        let local = self.lookup.local_log_available();
+        if self.available != Some((loaded, local)) {
+            self.available = Some((loaded, local));
+            if !loaded && local {
                 info!(target: "pancetta::alerts", "cqdx need list unavailable; tier alerts use the local logbook");
             } else if !loaded {
                 info!(target: "pancetta::alerts", "cqdx need list unavailable; tier alerts limited to local per-band evidence");

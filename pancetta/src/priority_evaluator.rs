@@ -260,6 +260,7 @@ impl CachedStationLookup {
     pub fn seed_worked_dxcc_from_list(&self, pairs: Vec<(String, String)>) {
         let mut map = self.worked_dxcc_on_band.write();
         let mut resolved = 0usize;
+        let mut entities = Vec::new();
         let mut skipped = 0usize;
         for (band, callsign) in pairs {
             match pancetta_core::dxcc::entity_for_callsign(&callsign) {
@@ -267,16 +268,26 @@ impl CachedStationLookup {
                     map.entry(band.trim().to_uppercase())
                         .or_default()
                         .insert(entity.to_string());
+                    entities.push(entity);
                     resolved += 1;
                 }
                 None => skipped += 1,
+            }
+        }
+        // PAN-347: ATNO and the band maps never disagree.
+        let band_count = map.len();
+        drop(map);
+        {
+            let mut log = self.local_log.write();
+            for entity in entities {
+                log.mark_worked(entity);
             }
         }
         tracing::info!(
             "CachedStationLookup: seeded per-band worked-DXCC from {} resolved QSO(s) \
              across {} band(s) ({} callsign(s) had no resolvable entity)",
             resolved,
-            map.len(),
+            band_count,
             skipped
         );
     }
@@ -2471,6 +2482,16 @@ mod pan260 {
         assert_eq!(
             l.dxcc_need_verdict("ZL1ABC"),
             (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_band_pairs_also_mark_the_local_log() {
+        let (_tmp, l) = seeded_lookup(&adif(&[]), "K5ARH").await;
+        l.seed_worked_dxcc_from_list(vec![("20m".into(), "JA1ABC".into())]);
+        assert_eq!(
+            l.dxcc_need_verdict("JA1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
         );
     }
 

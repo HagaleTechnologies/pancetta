@@ -19,6 +19,8 @@ pub enum Headline {
     /// is not loaded (PAN-93).
     NeededEntity {
         known: Option<bool>,
+        /// PAN-347: `known` came from the local logbook, not cqdx.
+        local: bool,
     },
     Notable,
     SpecialEvent,
@@ -42,10 +44,12 @@ impl Headline {
             }
             .into(),
             Self::NewEntityOnBand { band } => format!("new entity on {band}"),
-            Self::NeededEntity { known } => match known {
-                Some(true) => "needed entity (cqdx list)",
-                Some(false) => "maybe needed entity (cqdx list changed)",
-                None => "maybe needed entity (cqdx list not loaded)",
+            Self::NeededEntity { known, local } => match (known, local) {
+                (Some(true), false) => "needed entity (cqdx list)",
+                (Some(false), false) => "maybe needed entity (cqdx list changed)",
+                (Some(true), true) => "needed entity (local logbook)",
+                (Some(false), true) => "maybe needed entity (local logbook changed)",
+                (None, _) => "maybe needed entity (cqdx list not loaded)",
             }
             .into(),
             Self::Notable => "notable station (cqdx)".into(),
@@ -209,6 +213,7 @@ pub fn reason_for(
             }
             PriorityTier::PerBandDxccNew => Headline::NeededEntity {
                 known: need.and_then(|n| n.dxcc_needed),
+                local: need.and_then(|n| n.dxcc_source) == Some(NeedSource::LocalLogbook),
             },
             PriorityTier::SpecialStation if f.notable => Headline::Notable,
             PriorityTier::SpecialStation => Headline::SpecialEvent,
@@ -1170,6 +1175,23 @@ mod tests {
         let compact = reason_for(&s, None, now()).compact();
         assert!(compact.starts_with("all-time new entity"), "{compact}");
         assert!(!compact.contains("local logbook"), "{compact}");
+    }
+
+    #[test]
+    fn needed_entity_headline_names_the_local_logbook() {
+        let mut s = station("ZL1ABC");
+        set_tier(&mut s, PriorityTier::PerBandDxccNew);
+        for (needed, text) in [
+            (true, "needed entity (local logbook)"),
+            (false, "maybe needed entity (local logbook changed)"),
+        ] {
+            let need = DxNeedStatus {
+                dxcc_needed: Some(needed),
+                dxcc_source: Some(NeedSource::LocalLogbook),
+                ..Default::default()
+            };
+            assert_eq!(reason_for(&s, Some(&need), now()).headline.text(), text);
+        }
     }
 
     #[test]
