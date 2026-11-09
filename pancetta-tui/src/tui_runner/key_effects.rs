@@ -28,7 +28,7 @@ const GOLDEN: &str = concat!(
 );
 const BLESS_VAR: &str = "PANCETTA_BLESS_KEY_EFFECTS";
 
-const MOD_SETS: [(&str, KeyModifiers); 5] = [
+pub(super) const MOD_SETS: [(&str, KeyModifiers); 5] = [
     ("none", KeyModifiers::NONE),
     ("shift", KeyModifiers::SHIFT),
     ("ctrl", KeyModifiers::CONTROL),
@@ -39,13 +39,13 @@ const MOD_SETS: [(&str, KeyModifiers); 5] = [
     ),
 ];
 
-struct Scenario {
-    name: &'static str,
+pub(super) struct Scenario {
+    pub(super) name: &'static str,
     rich: bool,
     setup: fn(&mut App),
 }
 
-const SCENARIOS: &[Scenario] = &[
+pub(super) const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "empty/band",
         rich: false,
@@ -120,9 +120,125 @@ const SCENARIOS: &[Scenario] = &[
         setup: |a| a.tx_policy = pancetta_core::TxPolicy::Disabled,
     },
     Scenario {
+        name: "rich/out-of-band-ack",
+        rich: true,
+        setup: |a| a.out_of_band_ack_visible = true,
+    },
+    Scenario {
         name: "rich/quit-confirm",
         rich: true,
         setup: |a| a.quit_confirm_visible = true,
+    },
+    Scenario {
+        name: "rich/device-picker",
+        rich: true,
+        setup: |a| a.device_selection.visible = true,
+    },
+    Scenario {
+        name: "rich/rig-form",
+        rich: true,
+        setup: |a| {
+            a.rig_selection.snapshot_committed();
+            a.rig_selection.visible = true;
+        },
+    },
+    Scenario {
+        name: "rich/rig-form/model",
+        rich: true,
+        setup: |a| {
+            a.rig_selection.snapshot_committed();
+            a.rig_selection.visible = true;
+            a.rig_selection.active_field = crate::app::RigField::Model;
+        },
+    },
+    Scenario {
+        name: "rich/rig-bookmark-name",
+        rich: true,
+        setup: |a| {
+            a.rig_selection.visible = true;
+            a.rig_selection.naming_bookmark = true;
+            a.rig_selection.bookmark_name_input = "home".to_string();
+        },
+    },
+    Scenario {
+        name: "empty/rig-bookmark-name",
+        rich: false,
+        setup: |a| {
+            a.rig_selection.visible = true;
+            a.rig_selection.naming_bookmark = true;
+        },
+    },
+    Scenario {
+        name: "empty/rig-bookmark-list",
+        rich: false,
+        setup: |a| {
+            a.rig_selection.visible = true;
+            a.rig_selection.bookmark_overlay_visible = true;
+        },
+    },
+    Scenario {
+        name: "rich/watchlist",
+        rich: true,
+        setup: |a| {
+            a.watchlist_modal.visible = true;
+            a.watchlist_modal.buffer = "K1ABC".to_string();
+        },
+    },
+    Scenario {
+        name: "empty/watchlist",
+        rich: false,
+        setup: |a| a.watchlist_modal.visible = true,
+    },
+    Scenario {
+        name: "rich/freq-modal",
+        rich: true,
+        setup: |a| {
+            a.freq_modal.visible = true;
+            a.freq_modal.rx_buffer = "14.074".to_string();
+        },
+    },
+    Scenario {
+        name: "empty/freq-modal",
+        rich: false,
+        setup: |a| a.freq_modal.visible = true,
+    },
+    Scenario {
+        name: "rich/offset-modal",
+        rich: true,
+        setup: |a| {
+            a.offset_modal.visible = true;
+            a.offset_modal.buffer = "1500".to_string();
+        },
+    },
+    Scenario {
+        name: "empty/offset-modal",
+        rich: false,
+        setup: |a| a.offset_modal.visible = true,
+    },
+    Scenario {
+        name: "empty/compose",
+        rich: false,
+        setup: |a| a.enter_compose_mode(),
+    },
+    Scenario {
+        name: "rich/diagnostics",
+        rich: true,
+        setup: |a| a.show_diagnostics = true,
+    },
+    Scenario {
+        name: "rich/health",
+        rich: true,
+        setup: |a| a.show_health = true,
+    },
+    Scenario {
+        name: "rich/recent-qsos",
+        rich: true,
+        setup: |a| a.show_recent_qsos = true,
+    },
+    Scenario {
+        name: "rich/why",
+        rich: true,
+        setup: |a| a.show_why = true,
     },
     Scenario {
         name: "rich/help",
@@ -141,7 +257,7 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
-fn key_universe() -> Vec<KeyCode> {
+pub(super) fn key_universe() -> Vec<KeyCode> {
     let mut codes: Vec<KeyCode> = (' '..='~').map(KeyCode::Char).collect();
     codes.extend([
         KeyCode::Enter,
@@ -284,6 +400,7 @@ fn rich_fixture(app: &mut App) {
     app.dx_stations.insert("VK9XX".to_string(), cq_dx_station());
     app.clamp_dx_hunter_selection();
     app.apply_placement(placement_fixture());
+    app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
     app.autonomous_status = Some(crate::app::AutonomousStatus {
         enabled: true,
         state: "Hunting".to_string(),
@@ -417,12 +534,67 @@ async fn golden_runner(
     (runner, cmd_rx, app)
 }
 
+impl Scenario {
+    /// True for the main-view scenarios (no dialog or overlay open).
+    pub(super) fn is_main_view(&self) -> bool {
+        matches!(
+            self.name.split('/').nth(1),
+            Some("band" | "qso" | "callers" | "dx" | "placement")
+        )
+    }
+}
+
+/// A scratch directory for per-press state files, removed first if stale.
+pub(super) fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("pancetta_key_effects_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Press `code`+`mods` once on a fresh runner in `scenario`. Returns the
+/// runner and the press's effect (empty when the key did nothing).
+pub(super) async fn press(
+    dir: &std::path::Path,
+    n: usize,
+    scenario: &Scenario,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> (TuiRunner, String) {
+    let (mut runner, cmd_rx, app) = golden_runner(dir, n).await;
+    {
+        let mut a = app.write().await;
+        if scenario.rich {
+            rich_fixture(&mut a);
+        }
+        (scenario.setup)(&mut a);
+    }
+    let before = snapshot(&*app.read().await);
+    let result = runner.handle_key_event(KeyEvent::new(code, mods)).await;
+    let after = snapshot(&*app.read().await);
+    let mut parts = Vec::new();
+    match result {
+        Ok(true) => {}
+        Ok(false) => parts.push("ret=false".to_string()),
+        Err(e) => parts.push(format!("err={e:?}")),
+    }
+    let cmds: Vec<String> = cmd_rx.try_iter().map(|c| format!("{c:?}")).collect();
+    if !cmds.is_empty() {
+        parts.push(format!("cmds={cmds:?}"));
+    }
+    for ((field, b), (_, a)) in before.iter().zip(after.iter()) {
+        if b != a {
+            parts.push(format!("{field}: {b} -> {a}"));
+        }
+    }
+    (runner, parts.join("; "))
+}
+
 /// Every effectful press, one line per (scenario, key, distinct effect),
 /// listing the modifier sets that produced it.
 async fn collect_effects() -> Vec<String> {
-    let dir = std::env::temp_dir().join(format!("pancetta_key_effects_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("golden");
     let mut n = 0usize;
     let mut lines = Vec::new();
     for scenario in SCENARIOS {
@@ -431,34 +603,9 @@ async fn collect_effects() -> Vec<String> {
             let mut effects: BTreeMap<String, Vec<&str>> = BTreeMap::new();
             for (mod_name, mods) in MOD_SETS {
                 n += 1;
-                let (mut runner, cmd_rx, app) = golden_runner(&dir, n).await;
-                {
-                    let mut a = app.write().await;
-                    if scenario.rich {
-                        rich_fixture(&mut a);
-                    }
-                    (scenario.setup)(&mut a);
-                }
-                let before = snapshot(&*app.read().await);
-                let result = runner.handle_key_event(KeyEvent::new(code, mods)).await;
-                let after = snapshot(&*app.read().await);
-                let mut parts = Vec::new();
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => parts.push("ret=false".to_string()),
-                    Err(e) => parts.push(format!("err={e:?}")),
-                }
-                let cmds: Vec<String> = cmd_rx.try_iter().map(|c| format!("{c:?}")).collect();
-                if !cmds.is_empty() {
-                    parts.push(format!("cmds={cmds:?}"));
-                }
-                for ((field, b), (_, a)) in before.iter().zip(after.iter()) {
-                    if b != a {
-                        parts.push(format!("{field}: {b} -> {a}"));
-                    }
-                }
-                if !parts.is_empty() {
-                    effects.entry(parts.join("; ")).or_default().push(mod_name);
+                let (_runner, effect) = press(&dir, n, scenario, code, mods).await;
+                if !effect.is_empty() {
+                    effects.entry(effect).or_default().push(mod_name);
                 }
             }
             for (effect, mods) in effects {

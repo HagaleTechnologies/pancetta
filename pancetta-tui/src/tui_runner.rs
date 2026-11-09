@@ -3642,6 +3642,44 @@ mod key_tests {
         }
     }
 
+    /// PAN-327: across every key-effect golden scenario, key and modifier
+    /// set, a main-view press that has any effect dispatched exactly one
+    /// action (so no legacy behaviour lacks a chord), and no press
+    /// dispatches more than one. With a dialog open only Shift+Q dispatches
+    /// through the table (the dialogs keep their own blocks), so every other
+    /// dialog press dispatches nothing.
+    #[tokio::test]
+    async fn every_effectful_key_resolves_to_an_action() {
+        use super::key_effects::{key_universe, press, scratch_dir, MOD_SETS, SCENARIOS};
+        let dir = scratch_dir("dispatch");
+        let mut n = 0usize;
+        for scenario in SCENARIOS {
+            for code in key_universe() {
+                for (mod_name, mods) in MOD_SETS {
+                    n += 1;
+                    let (runner, effect) = press(&dir, n, scenario, code, mods).await;
+                    let what = format!("{} | {code:?} | {mod_name}", scenario.name);
+                    if code == KeyCode::Char('Q') {
+                        assert_eq!(runner.dispatched, vec![Action::EmergencyStop], "{what}");
+                    } else if scenario.is_main_view() {
+                        assert!(
+                            runner.dispatched.len() <= 1,
+                            "{what}: {:?}",
+                            runner.dispatched
+                        );
+                        assert!(
+                            effect.is_empty() || runner.dispatched.len() == 1,
+                            "{what}: effect {effect:?} but no action dispatched"
+                        );
+                    } else {
+                        assert!(runner.dispatched.is_empty(), "{what}");
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Characterization (PAN-327): while Help or Health is open, every key
     /// except Shift+Q first clamps the stored scroll to the viewport maximum,
     /// even a key the overlay swallows. Shift+Q returns before the clamp.
