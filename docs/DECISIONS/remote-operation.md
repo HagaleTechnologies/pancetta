@@ -638,6 +638,28 @@ retries on scope exit with the same schedule; Hamlib's 14 s PTT watchdog is
 the backstop. A late fallback PTT-off can only cut a later transmission
 short, never extend one.
 
+PAN-273 extends this to every TX-worker unkey after a key-down: single-TX and
+multi-TX Step 9, tune completion, both clock-step PTT hold guards (PAN-114)
+and supersede. Each used to build its own PTT-off, send it with
+`send_message` (whose `Err` arm could never fire on a drop) and then
+`disarm()` regardless, so a PTT-off dropped on a momentarily full Hamlib
+channel left the rig keyed until the watchdog. They now call
+`PttGuard::release`. `supersede_and_rekey_or_bundle` and
+`supersede_multi_reenqueue` take the caller's `&mut PttGuard` and release
+through it, so their callers no longer disarm afterwards. `disarm()` is left
+only for frames whose PTT-on was never enqueued (before the key-down send,
+or after a `Denied` one). With no Hamlib channel registered (`--replay`, a
+build without `pancetta-hamlib`) nothing was keyed, so `release` stands the
+guard down without sending and returns `PttRelease::NoRig`
+(`MessageBus::has_rig_route`). An armed guard's `Drop` records its retry
+task in the coordinator-owned `PendingPttOff`, and `PttGuard::new` waits for
+that task before the next TX-worker key-down (Codex P2 on PR #587). So when
+a supersede's release is undelivered and the caller re-keys, the old guard's
+fallback PTT-off reaches Hamlib's channel before the new PTT-on and cannot
+cut the new frame short. The wait is bounded by the 5, 20 and 50 ms retry
+schedule and happens before the pre-PTT gates. A PTT-on that does not
+construct a `PttGuard` (for example the gain sweep) does not wait for it.
+
 The mid-playback arms send `MessageType::AudioFlush { ack }` in band. The
 relay forwards it in order, and the audio thread settles the ack `Applied`
 only when the output callback completed the flush within `queue_output`'s
