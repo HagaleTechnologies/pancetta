@@ -169,6 +169,14 @@ pub(super) const SCENARIOS: &[Scenario] = &[
         },
     },
     Scenario {
+        name: "rich/rig-bookmark-list",
+        rich: true,
+        setup: |a| {
+            a.rig_selection.visible = true;
+            a.rig_selection.bookmark_overlay_visible = true;
+        },
+    },
+    Scenario {
         name: "empty/rig-bookmark-list",
         rich: false,
         setup: |a| {
@@ -370,7 +378,8 @@ fn placement_fixture() -> crate::app::PlacementView {
 }
 
 /// One active QSO (W1AW), one directed-at-us caller (G8KHF), one DX Hunter
-/// station (VK9XX), a placement snapshot, autonomous enabled and a 20 m dial.
+/// station (VK9XX), a placement snapshot, autonomous enabled, one serial
+/// port, one rig bookmark and a 20 m dial.
 fn rich_fixture(app: &mut App) {
     app.station_info.operating_frequency = 14.074;
     app.apply_active_qsos(vec![banner("W1AW", "qso-1")], vec![]);
@@ -401,6 +410,13 @@ fn rich_fixture(app: &mut App) {
     app.clamp_dx_hunter_selection();
     app.apply_placement(placement_fixture());
     app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
+    app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
+        name: "home".to_string(),
+        model: "1042".to_string(),
+        port: "/dev/ttyUSB0".to_string(),
+        baud_rate: 38400,
+        ptt_method: pancetta_config::rig::PttMethod::Cat,
+    }];
     app.autonomous_status = Some(crate::app::AutonomousStatus {
         enabled: true,
         state: "Hunting".to_string(),
@@ -443,6 +459,11 @@ fn snapshot(app: &App) -> Vec<(&'static str, String)> {
             format!("{:?}", app.out_of_band_ack_visible),
         ),
         (
+            "out_of_band_warned",
+            format!("{:?}", app.out_of_band_warned),
+        ),
+        ("out_of_band_rf_hz", format!("{:?}", app.out_of_band_rf_hz)),
+        (
             "quit_confirm_visible",
             format!("{:?}", app.quit_confirm_visible),
         ),
@@ -455,6 +476,7 @@ fn snapshot(app: &App) -> Vec<(&'static str, String)> {
         ("offset_modal", format!("{:?}", app.offset_modal)),
         ("compose_mode", format!("{:?}", app.compose_mode)),
         ("tx_input_buffer", format!("{:?}", app.tx_input_buffer)),
+        ("tx_input_cursor", format!("{:?}", app.tx_input_cursor)),
         ("show_diagnostics", format!("{:?}", app.show_diagnostics)),
         (
             "diagnostics_scroll",

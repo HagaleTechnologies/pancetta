@@ -34,7 +34,8 @@ normative in the digest — not restated here.
 Main-view key handling is `keymap::resolve` plus `match action`: every key
 resolves through the chords on its `KEYBINDINGS` row into one `Action`, and a
 table test fails when a chord is ambiguous, unreachable, unnamed by its row or
-Ctrl-reachable for a TX action. See
+Ctrl-reachable for a TX action. `tests/fixtures/key_effects.golden` fails a
+test whenever what a key does changes. See
 [the PAN-327 decision](../../docs/DECISIONS/tui.md#key-dispatch-through-the-keymap-table-pan-327-2026-11).
 
 A bare `k` aborts the selected QSO at once, with no confirmation (PAN-263,

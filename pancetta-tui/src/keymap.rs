@@ -12,6 +12,9 @@
 //! 3. add its `match action` arm in `TuiRunner::handle_key_event`;
 //! 4. regenerate the doc:
 //!    `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-tui keybindings_doc_is_current`
+//!    and, when what a key does changed on purpose, re-bless the key-effect
+//!    golden (`tests/fixtures/key_effects.golden`):
+//!    `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`
 //!
 //! The table tests below then prove every chord resolves to exactly one
 //! action and every action is reachable. Dialog-internal keys (y/n confirms,
