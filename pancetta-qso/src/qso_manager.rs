@@ -4352,17 +4352,25 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> ManualCallOutcome {
-        self.resend_existing_where(qso_id, |_| true, remote_origin, remote_client_key_id)
-            .await
+        self.resend_existing_where(
+            qso_id,
+            |_| true,
+            Self::last_sent_frame,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
     }
 
     /// [`Self::resend_existing_if_permitted`], refusing with `NothingToResend`
-    /// when `eligible` rejects the QSO. `eligible` runs under the same `qsos`
-    /// write guard as the permission check and the charge (PAN-138, PAN-275).
+    /// when `eligible` rejects the QSO or `frame` builds nothing to send.
+    /// `eligible`, `frame`, the permission check and the charge share one
+    /// `qsos` write guard (PAN-138, PAN-275).
     async fn resend_existing_where(
         &self,
         qso_id: QsoId,
         eligible: impl FnOnce(&QsoProgress) -> bool,
+        frame: impl FnOnce(&QsoProgress) -> Option<MessageType>,
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> ManualCallOutcome {
@@ -4380,25 +4388,28 @@ impl QsoManager {
             }
             progress.metadata.remote_origin = remote_origin;
             progress.metadata.remote_client_key_id = remote_client_key_id;
-            match self.charge_resend_locked(qso_id, progress, now) {
-                Some(emit) => emit,
-                None => return ManualCallOutcome::NothingToResend,
-            }
+            let Some(message) = frame(progress) else {
+                return ManualCallOutcome::NothingToResend;
+            };
+            self.charge_frame_locked(qso_id, progress, now, message)
         };
         self.send_attempt_message(qso_id, message, frequency, attempt_id)
             .await;
         ManualCallOutcome::Resent
     }
 
-    /// PAN-275: re-key the last sent frame of a COMPLETED manual QSO by id, for
-    /// the coordinator's bounded auto-73. It never opens a QSO, never changes a
+    /// PAN-275: send a 73 for a COMPLETED manual QSO by id, for the
+    /// coordinator's bounded auto-73. It never opens a QSO, never changes a
     /// state and never emits `QsoCompleted`, however long ago the QSO completed.
+    /// It builds the 73 rather than replaying the QSO's last sent frame: a QSO
+    /// that completed on a plain incoming 73 sent none, so its last sent frame
+    /// is a report or the opening call (Codex P2 on PR #588).
     /// Returns `NothingToResend` unless the QSO exists, is `Completed`, was
     /// `Manual`, is not a Hound, and completed on the band that `frequency` (the
-    /// decode's audio offset) maps to now. Otherwise it is
-    /// `resend_existing_if_permitted`: the eligibility check, the remote
-    /// permission re-check, the identity rebind and the charge share one
-    /// `qsos` write guard.
+    /// decode's audio offset) maps to now. Like
+    /// `resend_existing_if_permitted`, except for the frame it sends, the
+    /// eligibility check, the remote permission re-check, the identity rebind
+    /// and the charge share one `qsos` write guard.
     pub async fn resend_completed_close(
         &self,
         qso_id: QsoId,
@@ -4410,6 +4421,7 @@ impl QsoManager {
         self.resend_existing_where(
             qso_id,
             |p| Self::completed_close_rekeyable(p, &want_band),
+            |p| self.closing_73_frame(p),
             remote_origin,
             remote_client_key_id,
         )
@@ -4417,7 +4429,7 @@ impl QsoManager {
     }
 
     /// Read-only preview of [`Self::resend_completed_close`]'s eligibility
-    /// rule (it does not check remote permission or a prior `Sent` frame).
+    /// rule (it does not check remote permission).
     /// The coordinator asks it before registering the QSO's TX liveness, so
     /// a re-key the engine is certain to refuse (another band, not a
     /// completed manual QSO) never keeps the QSO live for the TX worker.
@@ -4429,6 +4441,21 @@ impl QsoManager {
             .await
             .get(&qso_id)
             .is_some_and(|p| Self::completed_close_rekeyable(p, &want_band))
+    }
+
+    /// The 73 [`Self::resend_completed_close`] sends: our callsign to the
+    /// QSO's station, addressed like the exchange's own 73 (the state's call,
+    /// not the logged call a C18 compound upgrade may have lengthened).
+    /// `None` when the QSO names no station.
+    fn closing_73_frame(&self, p: &QsoProgress) -> Option<MessageType> {
+        let their = p
+            .state
+            .their_callsign()
+            .or(p.metadata.their_callsign.as_deref())?;
+        Some(MessageType::SeventyThree {
+            to_station: their.to_string(),
+            from_station: self.config.our_callsign.clone(),
+        })
     }
 
     /// The PAN-275 rule: a COMPLETED, manual, non-Hound QSO worked on
@@ -4964,13 +4991,28 @@ impl QsoManager {
         progress: &mut QsoProgress,
         now: DateTime<Utc>,
     ) -> Option<(MessageType, f64, TxAttemptId)> {
-        let message = progress
+        let message = Self::last_sent_frame(progress)?;
+        Some(self.charge_frame_locked(qso_id, progress, now, message))
+    }
+
+    /// The QSO's most recent `Sent` frame, if any.
+    fn last_sent_frame(progress: &QsoProgress) -> Option<MessageType> {
+        progress
             .messages
             .iter()
             .rev()
-            .find(|m| m.direction == MessageDirection::Sent)?
-            .message_type
-            .clone();
+            .find(|m| m.direction == MessageDirection::Sent)
+            .map(|m| m.message_type.clone())
+    }
+
+    /// [`Self::charge_resend_locked`]'s bookkeeping for a given `message`.
+    fn charge_frame_locked(
+        &self,
+        qso_id: QsoId,
+        progress: &mut QsoProgress,
+        now: DateTime<Utc>,
+        message: MessageType,
+    ) -> (MessageType, f64, TxAttemptId) {
         let frequency = progress.metadata.frequency;
         let prev_last_call_at = progress.metadata.last_call_at;
         progress.metadata.call_count += 1;
@@ -4995,7 +5037,7 @@ impl QsoManager {
                 remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
             },
         );
-        Some((message, frequency, attempt_id))
+        (message, frequency, attempt_id)
     }
 
     /// External commit point for PAN-72's stall-switch/revert and the manual
@@ -28135,6 +28177,84 @@ mod pan275_completed_close_tests {
             .unwrap();
         assert_eq!(outcome, ManualCallOutcome::Opened);
         assert_ne!(new_id, id);
+    }
+
+    /// Codex P2 on PR #588: a QSO that completed on a plain incoming 73 sent
+    /// no 73, so its last sent frame is a report. The re-key past the grace
+    /// still sends a 73 to the QSO's station, not that report.
+    #[tokio::test]
+    async fn resend_completed_close_sends_a_73_when_the_last_sent_frame_is_a_report() {
+        let manager = manager();
+        let id = complete_manual(&manager, false, None).await;
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&id).unwrap();
+            progress
+                .messages
+                .retain(|m| m.direction != MessageDirection::Sent);
+            progress.messages.push(QsoMessage {
+                timestamp: Utc::now(),
+                direction: MessageDirection::Sent,
+                message_type: MessageType::ReportAck {
+                    to_station: DX.into(),
+                    from_station: OUR.into(),
+                    report: -10,
+                },
+                raw_text: format!("{DX} {OUR} R-10"),
+                signal_strength: None,
+                frequency: FREQ,
+            });
+        }
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let mut rx = manager.subscribe();
+
+        let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::Resent);
+        let sends = sends_for(&drain(&mut rx), id);
+        assert_eq!(
+            sends,
+            vec![MessageType::SeventyThree {
+                to_station: DX.into(),
+                from_station: OUR.into(),
+            }],
+            "the auto-73 re-key sends a 73, never the last sent report"
+        );
+    }
+
+    /// The re-key addresses its 73 like the exchange's own 73: to the state's
+    /// call, not to the logged call a C18 compound upgrade lengthened.
+    #[tokio::test]
+    async fn resend_completed_close_addresses_the_73_to_the_worked_call() {
+        let manager = manager();
+        let id = complete_manual(&manager, false, None).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .their_callsign = Some(format!("EA8/{DX}"));
+        assert!(
+            manager
+                .backdate_completion_for_test(id, Duration::seconds(60))
+                .await
+        );
+        let mut rx = manager.subscribe();
+
+        let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
+        assert_eq!(outcome, ManualCallOutcome::Resent);
+        assert_eq!(
+            sends_for(&drain(&mut rx), id),
+            vec![MessageType::SeventyThree {
+                to_station: DX.into(),
+                from_station: OUR.into(),
+            }]
+        );
     }
 
     async fn assert_refused(manager: &QsoManager, id: QsoId, freq: f64) {
