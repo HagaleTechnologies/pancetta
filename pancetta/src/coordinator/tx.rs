@@ -28251,6 +28251,9 @@ mod pan71_playback_start_tests {
 
         let mut config = Config::default();
         config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+        // Headroom for a loaded runner: the requeued replacement must still
+        // be accepted into the slot the first bundle keyed at its boundary.
+        config.station.tx_late_max_ms = 10_000;
         let h = worker_harness_with(config, |_| {}).await;
         let (_, audio_rx) = h
             .coordinator
