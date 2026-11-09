@@ -238,16 +238,13 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     Ok(())
 }
 
-/// The Entity cell: cqdx's authoritative name first, offline prefix
-/// resolver second, `"---"` when neither resolves — with the station's
-/// US state/territory appended when known (PAN-85).
+/// The Entity cell: cqdx's authoritative name first, the offline entity the
+/// row resolved at creation second, `"---"` when neither exists — with the
+/// station's US state/territory appended when known (PAN-85). Runs no
+/// entity lookup: this is called per row per frame (PAN-284).
 fn entity_cell_text(station: &DxStation, state: Option<&str>) -> String {
-    match station
-        .entity_name
-        .clone()
-        .or_else(|| crate::dxcc::entity_for_callsign(&station.call_sign).map(str::to_string))
-    {
-        Some(entity) => crate::dxcc::format_entity_with_state(&entity, state),
+    match station.display_entity() {
+        Some(entity) => pancetta_core::dxcc::format_entity_with_state(entity, state),
         None => "---".to_string(),
     }
 }
@@ -410,8 +407,8 @@ fn create_dx_row<'a>(
     let state = need
         .and_then(|n| n.state.as_deref())
         .or_else(|| app.station_state_for(&station.call_sign))
-        .filter(|_| crate::dxcc::is_us_related_entity(&entity))
-        .and_then(crate::dxcc::normalize_us_state);
+        .filter(|_| pancetta_core::dxcc::is_us_related_entity(&entity))
+        .and_then(pancetta_core::dxcc::normalize_us_state);
     let entity_style = Style::default().fg(app.theme.accent_color());
     let mut entity_spans = vec![Span::styled(entity, entity_style)];
     if let Some(code) = state {
@@ -646,6 +643,7 @@ mod tests {
         fn lookup_need(
             &self,
             _: &str,
+            _: Option<&'static str>,
             _: Option<&str>,
             _: Option<&str>,
             _: f64,
@@ -1119,6 +1117,32 @@ mod tests {
         assert_eq!(entity_cell_text(&s, Some("AR")), "---");
     }
 
+    /// PAN-284 scenario 3: every row carries its resolved entity, and a frame
+    /// renders it without a lookup.
+    #[tokio::test]
+    async fn a_150_row_frame_shows_each_rows_carried_entity() {
+        // Every W…ABC call resolves to "United States". If the renderer ran a
+        // lookup, that name would appear instead of the carried sentinel.
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        for i in 0..150 {
+            let call = format!("W{i}ABC");
+            let mut row = make_test_station(&call);
+            row.offline_entity = Some("Sentinel");
+            app.dx_stations.insert(call, row);
+        }
+        let rendered = text(&render_buffer(&app, 160, 60));
+        assert!(rendered.contains("Sentinel"), "{rendered}");
+        assert!(!rendered.contains("United States"), "{rendered}");
+    }
+
+    #[test]
+    fn cqdx_entity_name_still_wins_over_the_carried_entity() {
+        let mut s = make_test_station("JA1ABC");
+        s.offline_entity = Some("Sentinel");
+        s.entity_name = Some("Nippon (cqdx)".into());
+        assert_eq!(entity_cell_text(&s, None), "Nippon (cqdx)");
+    }
+
     fn make_test_station(call: &str) -> crate::app::DxStation {
         crate::app::DxStation {
             call_sign: call.to_string(),
@@ -1138,6 +1162,7 @@ mod tests {
             network_rank: None,
             source: crate::app::SpotSource::Local,
             entity_name: None,
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
             rarity_tier: None,
             reporter_count: None,
             is_notable: false,

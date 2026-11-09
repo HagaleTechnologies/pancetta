@@ -1,5 +1,7 @@
 //! Prepared, local worked-history indicators for DX Hunter.
 //! Providers read memory only; no database or network calls belong in a frame.
+//! Providers also receive the row's DXCC entity, resolved once when the row
+//! was created, and must not resolve the callsign's entity again (PAN-284).
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DxNeedStatus {
@@ -23,9 +25,13 @@ pub struct NeedListSource {
 }
 
 pub trait DxNeedLookup: Send + Sync {
+    /// `entity` is the row's `DxStation::offline_entity`, resolved once when
+    /// the row was created. Frames call this per row: use `entity`, never
+    /// resolve `callsign` again.
     fn lookup_need(
         &self,
         callsign: &str,
+        entity: Option<&'static str>,
         grid: Option<&str>,
         known_state: Option<&str>,
         current_frequency_hz: f64,

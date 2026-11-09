@@ -10,19 +10,23 @@ use ratatui::{
 use super::{create_panel_block, format_time_ago};
 use crate::app::{ActivePanel, App};
 
-/// Resolve a DX station's DXCC entity name for display: prefer cqdx's
-/// authoritative `DxStation.entity_name` (already known for anyone who's
-/// appeared in DX Hunter as a network/Both spot) and fall back to the
-/// offline prefix table for locally-decoded-only stations, matching the
-/// pattern `dx_hunter.rs::create_dx_row` and `station_card.rs::render_line1`
-/// already use. `None` when neither resolves. The station's US
+/// Resolve a DX station's DXCC entity name for display: when the partner has
+/// a DX Hunter row, read its `DxStation::display_entity` (cqdx's
+/// authoritative `entity_name` first, then the offline entity the row
+/// resolved at creation, PAN-284), matching `dx_hunter.rs::create_dx_row`.
+/// Only a partner with no DX row resolves through the offline prefix table.
+/// `None` when neither resolves. The station's US
 /// state/territory is appended when known (PAN-85), matching DX Hunter.
 fn resolve_entity(app: &App, call_sign: &str) -> Option<String> {
-    app.dx_stations
-        .get(call_sign)
-        .and_then(|d| d.entity_name.clone())
-        .or_else(|| crate::dxcc::entity_for_callsign(call_sign).map(str::to_string))
-        .map(|e| crate::dxcc::format_entity_with_state(&e, app.station_state_for(call_sign)))
+    let entity = match app.dx_stations.get(call_sign) {
+        // PAN-284: the DX row carries the entity it resolved at creation.
+        Some(row) => row.display_entity().map(str::to_string),
+        // A QSO partner with no DX Hunter row: a handful of rows at most.
+        None => pancetta_core::dxcc::entity_for_callsign(call_sign).map(str::to_string),
+    };
+    entity.map(|e| {
+        pancetta_core::dxcc::format_entity_with_state(&e, app.station_state_for(call_sign))
+    })
 }
 
 pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
@@ -1202,6 +1206,7 @@ mod tests {
             network_rank: None,
             source: crate::app::SpotSource::Local,
             entity_name: None,
+            offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
             rarity_tier: None,
             reporter_count: None,
             is_notable: false,
@@ -1245,6 +1250,21 @@ mod tests {
         app.dx_stations
             .insert("JA1ABC".to_string(), test_dx_station("JA1ABC"));
         assert_eq!(resolve_entity(&app, "JA1ABC").as_deref(), Some("Japan"));
+    }
+
+    /// PAN-284: a partner with a DX Hunter row reads the entity that row
+    /// resolved at creation; only a partner with no row resolves.
+    #[tokio::test]
+    async fn resolve_entity_uses_the_dx_rows_carried_entity() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(resolve_entity(&app, "JA1ABC").as_deref(), Some("Japan"));
+        let mut row = test_dx_station("JA1ABC");
+        row.offline_entity = Some("Sentinel");
+        row.entity_name = None;
+        app.dx_stations.insert("JA1ABC".to_string(), row);
+        assert_eq!(resolve_entity(&app, "JA1ABC").as_deref(), Some("Sentinel"));
     }
 
     #[tokio::test]

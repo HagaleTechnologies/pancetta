@@ -148,7 +148,7 @@ impl AlertDispatcher {
             "type": "decode_alert", "source": "pancetta", "version": 1,
             "utc_time": chrono::DateTime::<chrono::Utc>::from(decoded.timestamp).to_rfc3339(),
             "callsign": call,
-            "entity": pancetta_tui::dxcc::entity_for_callsign(&call).unwrap_or("unknown entity"),
+            "entity": pancetta_core::dxcc::entity_for_callsign(&call).unwrap_or("unknown entity"),
             "band": band, "audio_offset_hz": decoded.frequency_offset,
             "snr_db": decoded.snr_db, "tier": tier_name(tier),
             "tier_rank": 6 - tier as u8,
@@ -372,7 +372,7 @@ mod tests {
                 .on_decode(&decode("QZ9ZZ", false), 14_074_000, &["QZ9ZZ".into()])
                 .0
         );
-        assert_eq!(pancetta_tui::dxcc::entity_for_callsign("QZ9ZZ"), None);
+        assert_eq!(pancetta_core::dxcc::entity_for_callsign("QZ9ZZ"), None);
     }
     #[tokio::test]
     async fn alerts_delivery_three_failures_pause_and_resume_without_retry() {
