@@ -1309,8 +1309,6 @@ mod tests {
             None,
             true,
             true,
-            false,
-            9090,
             None,
             Some(std::path::PathBuf::from("/some/capture/dir")),
             None,

@@ -83,10 +83,6 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 num_cpus = "1.0"
 
-# Performance monitoring
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", optional = true }
-
 # Audio output for examples
 cpal = { workspace = true }
 
@@ -120,10 +116,15 @@ pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
 wiremock = "0.6"
 
 [features]
+<<<<<<< HEAD
 default = ["metrics"]
 metrics = []
 prometheus = ["metrics-exporter-prometheus"]
 tracing-json = []
+=======
+default = ["pancetta-hamlib"]
+pancetta-hamlib = ["dep:pancetta-hamlib"]
+>>>>>>> 8d1f0552fe084da74f2915d0671c06f6ba3815e1
 # Experimental FT2 digital mode (forwards to pancetta-ft8/ft2). Off by default;
 # when off, a configured FT2 mode falls back to FT8 timing in the coordinator.
 ft2 = ["pancetta-ft8/ft2"]

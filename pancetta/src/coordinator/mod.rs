@@ -50,6 +50,7 @@ mod tui_relay;
 mod tx;
 mod tx_halt;
 mod tx_log;
+mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;
 mod wav_playback;
@@ -1290,8 +1291,6 @@ pub struct ApplicationCoordinator {
     /// remain intentional.
     pub(crate) audio_path_supervised: bool,
     headless: bool,
-    enable_metrics: bool,
-    metrics_port: u16,
 
     /// WAV file playback path (if set, runs in playback mode)
     wav_path: Option<PathBuf>,
@@ -2124,8 +2123,6 @@ impl ApplicationCoordinator {
         audio_device: Option<String>,
         no_audio: bool,
         headless: bool,
-        enable_metrics: bool,
-        metrics_port: u16,
         wav_path: Option<PathBuf>,
         replay_path: Option<PathBuf>,
         test_tx: Option<String>,
@@ -2433,8 +2430,6 @@ impl ApplicationCoordinator {
             no_audio,
             audio_path_supervised: false,
             headless,
-            enable_metrics,
-            metrics_port,
             wav_path,
             replay_path,
             config_path,
@@ -2605,11 +2600,6 @@ impl ApplicationCoordinator {
         if let Some(ref wav_path) = self.wav_path {
             let path = wav_path.clone();
             return self.run_wav_playback(path).await;
-        }
-
-        // Initialize metrics if enabled
-        if self.enable_metrics {
-            self.init_metrics().await?;
         }
 
         // Start all components in dependency order using point-to-point channels
@@ -2908,31 +2898,6 @@ impl ApplicationCoordinator {
         let sweep_result = self.shutdown_with_gain_sweep(sweep_handle).await;
         main_loop_result?;
         sweep_result?;
-
-        Ok(())
-    }
-
-    /// Initialize metrics collection
-    async fn init_metrics(&self) -> Result<()> {
-        info!("Initializing metrics on port {}", self.metrics_port);
-
-        #[cfg(feature = "prometheus")]
-        {
-            // `.context()` on the exporter's `Result<(), BuildError>` needs the
-            // anyhow extension trait in scope (only `anyhow::Result` is imported
-            // at module level). BuildError: std::error::Error, so Context applies.
-            use anyhow::Context as _;
-            use metrics_exporter_prometheus::PrometheusBuilder;
-
-            let builder =
-                PrometheusBuilder::new().with_http_listener(([0, 0, 0, 0], self.metrics_port));
-
-            builder
-                .install()
-                .context("Failed to install Prometheus metrics exporter")?;
-
-            info!("Metrics server started on port {}", self.metrics_port);
-        }
 
         Ok(())
     }
@@ -3870,10 +3835,8 @@ mod tests {
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -3904,10 +3867,8 @@ mod tests {
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -4098,10 +4059,8 @@ mod tests {
         let coordinator = ApplicationCoordinator::new(
             Config::default(),
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -4171,10 +4130,8 @@ mod tests {
         ApplicationCoordinator::new(
             Config::default(),
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             replay,
             None, // no test-tx
@@ -4200,10 +4157,8 @@ mod tests {
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             replay,
             None, // no test-tx
@@ -4787,10 +4742,8 @@ mod tests {
         let coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -4827,10 +4780,8 @@ mod tests {
         let coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -4874,10 +4825,8 @@ mod tests {
         let coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -4963,10 +4912,8 @@ mod tests {
         let coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // no metrics
-            9090,
+            true, // no_audio
+            true, // headless
             Some(wav_path),
             None, // no replay
             None, // no test-tx

@@ -5081,10 +5081,8 @@ mod restart_orphan_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -5568,10 +5566,8 @@ mod teardown_stall_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -5662,10 +5658,8 @@ mod ptt_off_unconfirmed_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -5885,10 +5879,8 @@ mod teardown_replay_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -7824,10 +7816,8 @@ mod pan_59_reconnect_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -8871,10 +8861,8 @@ mod pan206_split_poll_tests {
         let mut coordinator = super::super::ApplicationCoordinator::new(
             pancetta_config::Config::default(),
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -9534,10 +9522,8 @@ mod pan251_swr_protection_tests {
         super::super::ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx

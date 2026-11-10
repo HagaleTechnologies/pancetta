@@ -47,10 +47,22 @@ Ship-provided units (edit the binary path inside each):
 - **Linux / MiniPC:** `packaging/systemd/pancetta.service` — `Restart=always`,
   `RestartSec=2`, crash-loop rate limit. Install as a `--user` service and
   `loginctl enable-linger`. Watch with `journalctl --user -u pancetta -f`.
+  For structured logs, add `--log-format json` to `ExecStart`: each journal
+  line and each `~/.pancetta/logs/pancetta.log.*` line is then one JSON object
+  (`timestamp`, `level`, `target`, `threadId`, `fields`). Pick out warnings
+  with `journalctl --user -u pancetta -o cat | jq -rR 'fromjson? | select(.level=="WARN") | .fields.message'`.
+  `-R` with `fromjson?` skips the few plain lines that can still reach stderr:
+  a panic is logged as a JSON event with target `panic` and Rust's plain panic
+  message (with any backtrace) follows it, a fatal startup error ends with a
+  plain `Error: ...` line, and a managed `rigctld` killed outside the normal
+  shutdown prints one plain line. The daily log file keeps its name, so the
+  day you switch formats holds both text and JSON lines.
 - **macOS:** `packaging/launchd/net.hagale.pancetta.plist` — `KeepAlive` with a
   `ThrottleInterval`. The supervisor's stdout and stderr go to
   `~/.pancetta/logs/launchd.out.log` and `~/.pancetta/logs/launchd.err.log`,
-  which live in your home directory and so survive a reboot. Install from the
+  which live in your home directory and so survive a reboot. With
+  `--log-format json` in `ProgramArguments`, the log lines go to
+  `launchd.err.log` instead of `launchd.out.log`. Install from the
   repository root:
 
     ```bash
@@ -295,6 +307,8 @@ operator-supervised.
   ```bash
   grep -E "WARN|ERROR" ~/.pancetta/logs/pancetta.log.$(date -u +%Y-%m-%d) | head -50
   ```
+  The same command matches JSON lines from `--log-format json`
+  (`"level":"WARN"`).
   Logs rotate daily (UTC) and pancetta keeps the newest 14 files — this
   retention applies only to the daily application logs (`pancetta.log.*`),
   not to the unrotated launchd supervisor files (`launchd.out.log`,
