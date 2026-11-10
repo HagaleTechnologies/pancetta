@@ -465,7 +465,13 @@ async fn run_cell(cell: Cell) -> Recorded {
             .await;
         assert!(sent, "{label}: the superseder never aired");
     } else {
-        rec.drain_until(Duration::from_secs(4), |_| false).await;
+        // A pre-PTT abort lands up to 9 s before the PTT instant, so watch
+        // past it: a frame that still keyed would show up in the transcript.
+        let observe = match cell.phase {
+            Phase::PrePtt => Duration::from_secs(11),
+            Phase::PreSlot | Phase::Playback => Duration::from_secs(4),
+        };
+        rec.drain_until(observe, |_| false).await;
     }
     rec.drain_until(Duration::from_millis(300), |_| false).await;
     rec.drain();
@@ -558,7 +564,8 @@ async fn abort_transcripts_match_golden() {
     let recorded = futures_util::future::join_all(cells().into_iter().map(run_cell)).await;
     assert_orders(&recorded);
     let rendered = render(&recorded);
-    if std::env::var(BLESS_VAR).is_ok() {
+    // Only `=1` blesses, so a `=0` or empty value cannot rewrite the golden.
+    if std::env::var(BLESS_VAR).as_deref() == Ok("1") {
         std::fs::write(GOLDEN, &rendered).expect("write tx_abort_transcripts.golden");
         return;
     }
