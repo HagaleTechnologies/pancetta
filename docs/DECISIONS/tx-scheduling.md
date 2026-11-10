@@ -1105,6 +1105,46 @@ tune in the same state played a tone with no carrier.
   It covers single TX, a two-item bundle, a tune, and the no-route proceed path on
   `worker_harness_without_rig`.
 
+## A failed PTT-off keeps the PTT watchdog armed (PAN-272, 2026-11-10)
+
+Hamlib's command loop cleared its PTT watchdog tracker (`ptt_on_since`) before it sent
+`set_ptt(Off)`, and its `Err` arm only logged. When rigctld rejected the unkey, the watchdog had
+nothing to act on, so the radio stayed keyed while every indicator said unkeyed.
+
+- **Clear on `Ok` only.** The command loop clears the tracker after the rig acknowledges the
+  unkey, never before the CAT call. A key-down still arms the tracker before the CAT call, so a
+  key-down whose `set_ptt(On)` fails is still watched.
+- **A failed unkey keeps the tracker.** The `Err` arm never writes `ptt_on_since`, so the
+  original key-down time is kept. If the tracker is armed, it sets `ptt_unkey_failed` and
+  latches `ptt_off_unconfirmed` through `latch_ptt_off_unconfirmed_unless_confirmed_since`,
+  which raises the readiness strip's "⚠ PTT MAY STILL BE KEYED — check radio" blocker.
+- **Latch only when armed.** A `None` tracker means no key-down was recorded, or the watchdog
+  already confirmed an unkey while this one was failing. There is no evidence the rig is keyed,
+  so a spurious unkey on a dead link raises no blocker. The `ptt_off_confirmations` snapshot
+  taken before the CAT call lets a racing watchdog confirmation win, as in teardown.
+- **A failed unkey is overdue.** The watchdog fires when `ptt_unkey_failed` is set, not only
+  after the 14 s ceiling, so it retries the unkey on its next 1 s tick. Without this the retry
+  waited for 14 s after key-down. `ptt_off_unconfirmed` is not reused as that signal: it is
+  coordinator-wide, teardown also sets it, and it never clears on a mock rig.
+- **One lock for both values.** `ptt_unkey_failed` is a separate flag instead of a new tracker
+  type, so `ptt_on_since`'s readers (`swr_guard::poll_sees_keyed`, the PAN-252 refusal, the
+  startup seed) are unchanged. It is read and written only under the `ptt_on_since` lock.
+- **Compare-and-clear.** The watchdog's `Ok` arm clears the tracker and the flag only when the
+  tracker still holds the key-down time it read. A key-down recorded during the watchdog's
+  in-flight `set_ptt` keeps its own timer.
+- **A new key-down supersedes a failed unkey.** Every accepted key-down swaps the flag off and,
+  when it was set, restarts the timer. Otherwise the new transmission inherits the old, expired
+  deadline and the watchdog cuts it within a second. Duplicate key-downs still cannot extend a
+  live timer. Accepted trade-off: the backstop for the old transmission becomes the new one's
+  unkey plus a fresh 14 s.
+- **No TX gating change.** `tx_hard_mute_reason` and `tx_mute_causes` are unchanged; the latch
+  stays display-only (PAN-89). A failed live unkey writes no Shift+D diagnostic; the strip item
+  and the `error!` log are the signal.
+- **Tests.** `pan272_ptt_off_watchdog_tests` drives the real command loop and watchdog with a
+  `MockRig` whose `disconnect()` makes `set_ptt` fail. It covers the retry within one tick of the
+  link returning, the fresh timer for a key-down after a failed unkey, no latch without a
+  recorded key-down, and a confirmed unkey clearing the timer (a 16 s real-time wait).
+
 ## High SWR halts the station (PAN-251), 2026-11-01
 
 `[rig.power_control.protection] swr_protection` (default on) and `max_swr` (default 3.0) were
