@@ -1121,6 +1121,15 @@ external keys. Preserve the whole stopped installation and data directory.
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
 | `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
 
+Durability: each `qsos.adi` record is one `write_all`, a flush and a
+`sync_all` before the write returns, so a logged QSO survives a pancetta
+crash immediately afterwards, and an fsync is requested for OS crash or
+power loss (a disk's own write cache is outside that promise). This costs
+about 1 ms per QSO. Every `qso.db` connection syncs its write-ahead log at
+each commit (`synchronous = FULL`); if a power cut still leaves `qso.db`
+without a QSO that `qsos.adi` holds, the next start rebuilds it from
+`qsos.adi`. There are no settings for this (PAN-281).
+
 **Migration note:** if you are upgrading from an earlier release that wrote only
 `qso.db`, the first startup will automatically export every row from the old database
 into a fresh `qsos.adi` before switching over. No manual action required.

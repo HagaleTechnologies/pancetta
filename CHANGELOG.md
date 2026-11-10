@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-281: A QSO written to `qsos.adi` now survives a power cut or OS crash right after it is logged. Each record is synced to disk before the write returns, about 1 ms per QSO. Every connection to `qso.db` now syncs its commits too; before, one of its five connections did not.
 - PAN-356: In FT4, the autonomous operator now acts on every other 7.5 s slot, matching its configured parity. Before, it acted on two slots in a row and then skipped two.
 - PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
 - PAN-279: A frame that arrives too late to replace the one on air now goes out in its own next slot instead of being lost. Replacing an autonomous CQ with a newer frame for the same QSO no longer undoes the CQ. A multi-TX stream left out of a bundle now gives back its call count.

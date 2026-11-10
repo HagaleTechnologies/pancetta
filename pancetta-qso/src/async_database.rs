@@ -8,11 +8,15 @@ use crate::states::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+        SqliteSynchronous,
+    },
     Row,
 };
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -307,9 +311,16 @@ impl QsoDatabase {
             format!("sqlite:{}?mode=rwc", path.as_ref().display())
         };
 
+        // `synchronous` is a per-connection setting, so it goes in the connect
+        // options, which every pooled connection runs (PAN-281). `from_str`
+        // parses the URL exactly as `connect(&database_url)` did.
+        let options = SqliteConnectOptions::from_str(&database_url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&database_url)
+            .connect_with(options)
             .await?;
 
         let mut db = Self {
@@ -329,14 +340,11 @@ impl QsoDatabase {
 
     /// Initialize database schema
     async fn initialize_schema(&mut self) -> Result<(), AsyncDatabaseError> {
-        // Enable WAL mode and relaxed synchronous for better concurrent performance.
-        // WAL mode allows readers and writers to operate concurrently without blocking.
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&self.pool)
-            .await?;
+        // WAL and `synchronous = FULL` are connect options (see `open`), not
+        // PRAGMAs here: `synchronous` is per connection, and a PRAGMA through
+        // the pool reaches only one of its connections. WAL lets readers and
+        // writers run concurrently; FULL syncs the WAL at every commit, so a
+        // completed QSO's row survives a power cut (PAN-281).
 
         let schema = r#"
             CREATE TABLE IF NOT EXISTS qsos (
@@ -1446,6 +1454,38 @@ impl QsoDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-281: every connection the pool can hand out commits durably. Five
+    /// connections held at once (the pool's max) are five distinct ones; when
+    /// one PRAGMA through the pool set `synchronous` to NORMAL, one of them
+    /// reported 1 instead of 2.
+    #[tokio::test]
+    async fn every_pooled_connection_is_wal_and_synchronous_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.pool.acquire().await.unwrap());
+        }
+        let mut seen = Vec::new();
+        for conn in &mut held {
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            seen.push((synchronous, journal_mode));
+        }
+
+        let expected = vec![(2, "wal".to_string()); 5];
+        assert_eq!(seen, expected, "(synchronous, journal_mode) per connection");
+        drop(held);
+        db.close().await;
+    }
 
     // --- Security: I-8 (VACUUM INTO path escaping) -------------------------
 
