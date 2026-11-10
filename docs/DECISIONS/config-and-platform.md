@@ -331,6 +331,7 @@ to on-air**, not from download to decode — per
 - **README CLI surface documented + GUIDE.md linked.** Deliberately omits `benchmark` (bare) and
   `test-audio --device`/`--duration` — both still print "not yet implemented" and exit 1;
   documenting them would recreate exactly the kind of dead end this initiative exists to close.
+  (Superseded by PAN-334, 2026-11-09: both are gone.)
 - **`scripts/five-minute-drill.sh`:** the phase's actual exit criterion — a stopwatch-timed
   acceptance script (wizard → doctor-green → first decode, ≤300s) for the operator to run at the
   rig. Syntax-verified; the real timed run needs the FTdx10 attached (operator-gated,
@@ -951,3 +952,55 @@ ID and alias list with no callers, were removed.
 A rig capability (CAT, audio, TX) becomes `Tested` only when the repository
 records a hardware test, and the entry must name that record in `evidence`
 (`tested_requires_evidence`). Today only the FTdx10 is tested.
+
+## Every listed CLI flag does something (PAN-334, 2026-11-09)
+
+Every flag and subcommand `pancetta --help` lists either works or is gone.
+
+- **`--log-format json`** is built from tracing-subscriber's JSON formatter.
+  `init_logging` keeps one text `Option` and one JSON `Option` layer per sink
+  (the formatters are different types), and exactly one is `Some`. The log file
+  and, with `--headless`, the console write one JSON object per line:
+  `timestamp`, `level`, `target`, `threadId`, `fields` (with `message` and the
+  event's other fields) and, inside a span, `span` and `spans`. The message
+  stays in `fields.message`; flattening would drop the `fields` object and let
+  an event field called `level` or `target` repeat a top-level key. Headless
+  JSON goes to stderr, so stdout keeps only command output (the `--wav` decode
+  lines, the gain-sweep report); journald and launchd capture both streams.
+  Headless text stays on stdout and byte-identical. With a JSON console the
+  plain `WARNING:` copy of each config-load warning is not printed, because the
+  `warn!` already appears as JSON. The panic hook still chains Rust's default
+  hook, so a crash prints its plain message after the JSON `panic` event.
+- **Metrics are removed** (Tony, 2026-11-07): `--metrics`, `--metrics-port`,
+  `init_metrics`, the coordinator's metrics fields and parameters, the
+  `metrics` and `metrics-exporter-prometheus` dependencies, and the `metrics`,
+  `prometheus` and `tracing-json` features. The exporter was behind an
+  off-by-default feature and nothing recorded a metric, so the flags bound
+  nothing.
+- **`run` is a plain alias** of the bare command. `--callsign`, `--frequency`
+  and `--power` were never read; a callsign override would let one process
+  identify as a call that differs from its upload accounts, and `--frequency`
+  had no config key (the dial is rig state from CAT).
+- **`test-audio` lists devices** with or without `--list`. `--device` and
+  `--duration` are gone: a capture test would need a PAN-264 macOS relaunch
+  decision, and `pancetta doctor` already checks the input level.
+- **`benchmark` is gone.** `benchmark-decode` and `cargo bench` cover it.
+  `benchmark-decode --format` accepts only `text` and `json`.
+- **Run-only flags are rejected elsewhere.** `--audio-device`, `--no-audio`,
+  `--wav`, `--replay` and `--test-tx` are `global`, so every subcommand's
+  `--help` lists them; `receiving_service_flag_on_subcommand` in `main()` exits
+  2 when one is given to a subcommand other than `run`, before the macOS
+  responsibility relaunch. `--test-tx-offset` without `--test-tx` exits 2
+  from `test_tx_offset_without_test_tx` in `main()`, which runs after clap
+  propagates globals; clap's `requires` checks each command level before
+  propagation and so rejected `pancetta --test-tx X run --test-tx-offset 900`.
+  The gain-sweep guard keeps its own message.
+- **Follow-up, not done here:** `--config` on subcommands that never read it
+  (`info`, `test-audio`, `benchmark-decode`, `export`, `import`, `setup`).
+  `setup` always writes `~/.pancetta/pancetta.toml`, so honouring `--config`
+  there needs its own design, and rejecting `--config` elsewhere would break
+  shell aliases that pass it to every command.
+
+`pancetta/tests/cli_surface.rs` checks every help screen (found from the live
+`--help` output, so a new subcommand is covered), the removed flags' exit 2,
+the guard, and both JSON sinks.

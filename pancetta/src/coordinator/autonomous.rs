@@ -7159,8 +7159,6 @@ mod fq_f9_placement_feed_when_disabled_tests {
             None,
             true, // no_audio
             headless,
-            false, // metrics
-            9090,
             None, // no WAV
             None, // no replay
             None, // no test-tx

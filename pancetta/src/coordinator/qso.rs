@@ -13099,10 +13099,8 @@ mod replay_history_seed_tests {
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true,                                                // no_audio
+            true,                                                // headless
             None,                                                // no WAV
             Some(std::path::PathBuf::from("/some/capture/dir")), // --replay
             None,                                                // no test-tx
@@ -13189,10 +13187,8 @@ mod replay_history_seed_tests {
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // live, not --replay
             None, // no test-tx
@@ -13905,10 +13901,8 @@ mod respond_to_caller_admission_tests {
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true,                                                // no_audio
+            true,                                                // headless
             None,                                                // no WAV
             Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
             None,                                                // no test-tx
@@ -17075,10 +17069,8 @@ mod manual_capacity_admission_tests {
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true,                                                // no_audio
+            true,                                                // headless
             None,                                                // no WAV
             Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
             None,                                                // no test-tx
@@ -17636,10 +17628,8 @@ mod remote_controller_change_tests {
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true,                                                // no_audio
+            true,                                                // headless
             None,                                                // no WAV
             Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
             None,                                                // no test-tx
@@ -18567,8 +18557,6 @@ mod pan120_tests {
                 None,
                 true,
                 true,
-                false,
-                0,
                 None,
                 Some(home.path().join("replay")),
                 None,

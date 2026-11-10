@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
 - PAN-279: A frame that arrives too late to replace the one on air now goes out in its own next slot instead of being lost. Replacing an autonomous CQ with a newer frame for the same QSO no longer undoes the CQ. A multi-TX stream left out of a bundle now gives back its call count.
 - PAN-280: A QSO is logged (ADIF, uploads, WSJT-X `QSOLogged`) only after its closing 73 has aired. A 73 the transmitter drops or refuses leaves the QSO open in its pre-73 state for 45 s, with no timeout, and says `73 to <call> was not sent; QSO not logged, still open`; a QSO opened directly at 73 is marked `closing 73 not sent, not logged`. A 73 with no transmit outcome is treated as not sent after six slots (FT8 90 s, FT4 45 s, FT2 30 s). A dropped auto-73 resend no longer uses up one of the three auto-73 resends. A remote client's brand-new QSO opened at 73 or RR73 now checks the client's TX permission, retires any older same-call QSO and creates the new QSO under one lock; a disarm or arm expiry after that check is caught when the 73 would key, and the QSO is then not logged.
 - PAN-275: When a station repeats RR73 more than 45 s after a manual QSO completed, but inside the 3-minute auto-73 window, Pancetta re-sends 73 for the existing QSO. It no longer logs a second contact in `qsos.adi`, the QSO database, logbook uploads or the WSJT-X relay, and the limit of three automatic 73 re-sends holds. Automatic caller answering no longer opens a new QSO for such an RR73 either.
@@ -28,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- PAN-334: `--metrics` and `--metrics-port` are gone. They never served metrics: the Prometheus exporter sat behind the off-by-default `prometheus` feature, and nothing recorded a metric. A service unit or script that passes either flag now fails at startup with exit 2, so remove the flag (under `Restart=always` a unit would restart until its start limit). The `metrics`, `prometheus` and `tracing-json` cargo features are gone too.
+- PAN-334: `pancetta benchmark` is gone. It printed "not yet implemented" and exited 1, so use `pancetta benchmark-decode` or `cargo bench`. `run --callsign`, `--frequency` and `--power` are gone. They were ignored, so set the station in the config file or pass `--config`. `test-audio --device` and `--duration` are gone. `pancetta test-audio` now lists devices with or without `--list`, and `pancetta doctor` checks the input level.
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field
   (PAN-247). Legacy sections still load with one warning that the setting
   no longer exists and has no effect. Manual `audio.levels.input_gain_db`
@@ -35,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-334: `--log-format json` now works. Each log line in `~/.pancetta/logs/pancetta.log.*` and, with `--headless`, on stderr is one JSON object: `timestamp`, `level`, `target`, `threadId`, `fields` (the message and the event's other fields) and, inside a span, `span` and `spans`. Headless text logs stay on stdout and are unchanged. The daily file keeps its name, so the day you switch formats holds both.
 - PAN-271: `docs/SUPPORTED_RIGS.md` lists every rig Pancetta starts `rigctld` for, with its `rig.model` names, Hamlib model and CAT, audio and TX test status. It is generated from the rig table in `pancetta-hamlib/src/models.rs` and drift-tested. The Yaesu FTdx10 is the only rig with a recorded hardware test. `pancetta doctor` points an unknown `rig.model` at the page.
 - PAN-261: optional `autonomous.pounce_min_tier` admits pounce targets by DX tier and uses the weighted score within each tier. Opt-in bell, ntfy and webhook decode alerts have independent tier thresholds. `Shift+W` edits persistent watchlist pins, which alert when heard and disappear when removed or worked. Auto watchlist expiry is configurable.
 - PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.

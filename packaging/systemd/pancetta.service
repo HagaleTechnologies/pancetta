@@ -27,6 +27,7 @@ Type=simple
 # Adjust to your installed binary path (e.g. /usr/local/bin/pancetta or
 # %h/.cargo/bin/pancetta). %h expands to the user's home directory.
 ExecStart=%h/.cargo/bin/pancetta --headless
+# For one JSON object per log line in the journal, use: ExecStart=%h/.cargo/bin/pancetta --headless --log-format json
 # Send SIGTERM only to Pancetta so managed rigctld remains available for PTT-off.
 # Force-kill remaining children if Pancetta exits or the stop timeout expires.
 KillMode=mixed
