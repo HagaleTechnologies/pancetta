@@ -2517,8 +2517,11 @@ impl AutonomousOperator {
                     // evaluate against the slot's virtual `now`, derived
                     // from the `unix_secs` this cycle runs at, so the sim
                     // harness drives them deterministically. Production
-                    // calls `decide()` which passes `Utc::now().timestamp()`,
-                    // so the derived `now` equals real now to the second.
+                    // calls `decide()` with `Utc::now()`, so the derived
+                    // `now` equals real now to the second. It shadows the
+                    // full-precision `now` on purpose: these gates keep
+                    // whole-second resolution; only the slot gate above
+                    // needs sub-second time (PAN-356).
                     let now =
                         DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now);
                     // Phase-5 hardening #1: TX-side FP gate. If a
