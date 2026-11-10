@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-393: `[audio.recording] raw_capture_minutes` records one raw 48 kHz WAV per FT8 slot for that many minutes after start, into `raw48/` inside the recording directory, so decimation changes can be tested on real captures. It is off by default (0) and needs `auto_record = true` and a 48 kHz capture device. Files are named with the UTC slot time and band, `_tx` marks a slot our transmission overlapped, and `raw48/` stops at its own 2 GB cap while decode-window recording continues.
+
 - PAN-271: `docs/SUPPORTED_RIGS.md` lists every rig Pancetta starts `rigctld` for, with its `rig.model` names, Hamlib model and CAT, audio and TX test status. It is generated from the rig table in `pancetta-hamlib/src/models.rs` and drift-tested. The Yaesu FTdx10 is the only rig with a recorded hardware test. `pancetta doctor` points an unknown `rig.model` at the page.
 - PAN-261: optional `autonomous.pounce_min_tier` admits pounce targets by DX tier and uses the weighted score within each tier. Opt-in bell, ntfy and webhook decode alerts have independent tier thresholds. `Shift+W` edits persistent watchlist pins, which alert when heard and disappear when removed or worked. Auto watchlist expiry is configurable.
 - PAN-50: opt-in contest-period scoring, multiplier and duplicate tracking for Kansas FT4/FT8 and SC fixed digital, with durable ADIF identity and a TUI score strip. Missing SC county evidence stays pending.

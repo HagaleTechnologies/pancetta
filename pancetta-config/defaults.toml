@@ -114,6 +114,7 @@ directory = "~/Documents/Pancetta/Recordings"
 filename_pattern = "pancetta_%Y%m%d_%H%M%S"
 format = "wav"
 max_length_minutes = 60
+raw_capture_minutes = 0
 sample_rate = 44100
 
 [audio.routing]

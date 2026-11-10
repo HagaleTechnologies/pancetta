@@ -723,6 +723,68 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   supervisor restarts, because the running config snapshot is patched only
   for security fields.
 
+## Timed raw 48 kHz capture (PAN-393, 2026-11-10)
+
+PAN-320's decimation A/B needs raw, undecimated windows from real bands.
+`[audio.recording] raw_capture_minutes` (default 0, off) cuts the capture
+stream into one WAV per FT8 slot for that many minutes after start. Code:
+`pancetta/src/coordinator/raw_capture.rs`; the DSP worker feeds it.
+
+1. **Gate.** Key 0 first (silent), then the PAN-125 recording decision
+   (`WavRecording::Enabled`; info line otherwise), then the capture rate
+   (48000 Hz only; warn line otherwise). `max_length_minutes` was not
+   reused: its default of 60 would have turned capture on for everyone.
+2. **Rate and channels.** The configured `input_channels` at 48 kHz,
+   16-bit. No resampling.
+3. **FT8 only.** Slots are fixed at 15 s. FT4/FT2 abandon the slot in
+   progress and pause capture with one line per transition; FT4 boundaries
+   fall on half seconds the name cannot carry.
+4. **Placement.** The hook runs on the DSP thread after the dial and mode
+   flush guards, so their flushes abandon the raw slot and the band label
+   is the DSP's reference dial. The mono extraction became a `Cow` so the
+   interleaved batch stays borrowable; the decoder sees the same values.
+5. **Per-slot anchoring.** Each slot's span start (boundary minus the
+   window lead) is located in the batch whose wall-clock range contains it,
+   then the slot takes exactly 720,000 frames. Slots are anchored one by
+   one, so sound-card drift never accumulates; adjacent files may overlap
+   or leave a gap of a few milliseconds.
+6. **Continuity.** A slot whose wall-clock and sample positions part by
+   more than 250 ms is abandoned (dropped batches, stalls, device reopens,
+   clock jumps). Span starts only increase, so a backward clock step never
+   overwrites a file. Residual: a gap under 250 ms is not detected.
+7. **Window and restarts.** The start time is a `OnceLock` on
+   `DecodePipelineHandles`, which every DSP supervisor restart reuses, so
+   a restart neither extends nor restarts the capture. A partial first
+   slot is skipped.
+8. **Writer thread.** `sync_channel(2)` plus `try_send`; a full queue drops
+   the slot with a warning at most once per 60 s. Files are written as
+   `.part` and renamed; stale `.part` files are removed at open. Dropping
+   the handle joins the thread, so queued slots are written first.
+9. **Dead air.** Skipped by the 12 kHz recorder's peak rule.
+10. **Name.** `raw48_<YYYYMMDD>_<HHMMSS>[_<band>][_tx].wav` at the slot
+    boundary. The 12 kHz files carry the emit time (boundary + 12.5 to 14 s),
+    so the docs give the pairing rule.
+11. **TX marker.** A per-batch latch over the shared `last_ptt_on_ms` /
+    `last_ptt_off_ms` stamps: a check made only at completion misses TX in
+    back-to-back slots when the DSP runs late. Residual: manual TUI PTT does
+    not stamp those atomics, so it is not marked; a TX-worker key-down
+    refused before RF still marks its slot (the safe direction).
+12. **Cap.** 2 GiB of top-level `*.wav` in `raw48/`, rescanned at open.
+    Before each write, if the next file would pass it, capture stops with
+    one warning and writes nothing more this run. Nothing in `raw48/` is
+    ever deleted; the 12 kHz recorder's cap and eviction only see top-level
+    files, so `raw48/` is outside them.
+13. **Logging.** Every operator-facing line is built by one function in
+    `raw_capture.rs` and pinned by a unit test.
+14. **Off is unchanged.** With the key at 0 the DSP holds no capture; the
+    hot path gains only the `Cow` and one `bool`.
+
+Measured sizes: 2,880,044 bytes per stereo slot, 1,440,044 per mono slot;
+30 minutes is 120 files, about 346 MB in stereo (the ticket's 690 MB
+estimate was double); 2 GiB holds 745 stereo files (186 minutes). Stub
+audio only paces close to real time with `input_channels = 1` and
+`buffer_size = 4096`, which the end-to-end tests use.
+
 ## `--replay` feed waits for the QSO history seed (PAN-42, 2026-10-21)
 
 - `run()` starts the replay feeder (`start_pipeline()`) before the QSO

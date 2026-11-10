@@ -1,6 +1,7 @@
 //! PAN-125 end-to-end: WAV recording of decode windows is off unless the
 //! operator turns it on with `[audio.recording] auto_record = true`, and
-//! `--no-audio` never records regardless of config. (The `--replay` half of
+//! `--no-audio` never records regardless of config. PAN-393 adds the timed
+//! raw 48 kHz capture (`raw_capture_minutes`) into `raw48/`. (The `--replay` half of
 //! the never-record scenario lives in `tests/replay_mode.rs`, which already
 //! owns the corpus harness.)
 //!
@@ -37,7 +38,18 @@ struct ScratchRun {
 impl ScratchRun {
     /// `extra_toml` is appended to the minimal station config.
     fn spawn(extra_toml: &str, args: &[&str], stub_audio: bool) -> Self {
+        Self::spawn_with_setup(extra_toml, args, stub_audio, |_| {})
+    }
+
+    /// As [`Self::spawn`], with `setup` run on the scratch home first.
+    fn spawn_with_setup(
+        extra_toml: &str,
+        args: &[&str],
+        stub_audio: bool,
+        setup: impl FnOnce(&Path),
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
+        setup(home.path());
         let dot_pancetta = home.path().join(".pancetta");
         fs::create_dir_all(&dot_pancetta).unwrap();
         let config = dot_pancetta.join("pancetta.toml");
@@ -214,6 +226,16 @@ fn enabled_recording_writes_windows_into_the_configured_directory() {
     );
     assert!(!run.home.path().join(".pancetta/recordings").exists());
 
+    // PAN-393: no `raw_capture_minutes`, so no raw capture and no line.
+    assert!(
+        !rec_dir.join("raw48").exists(),
+        "raw capture is off unless raw_capture_minutes is set"
+    );
+    assert!(
+        !log.contains("Raw 48 kHz capture"),
+        "an unset raw_capture_minutes logs nothing:\n{log}"
+    );
+
     // The recording is a 12 kHz mono 16-bit WAV of one decode window.
     let recorded = wavs_under(&rec_dir, None);
     assert!(!recorded.is_empty());
@@ -246,4 +268,158 @@ fn no_audio_never_records_even_when_enabled() {
         wavs_under(home, None).is_empty(),
         "--no-audio must not write any WAV"
     );
+}
+
+/// PAN-393: the stub sends `buffer_size` frames every
+/// `floor(buffer_size * 1000 / rate)` ms; only mono at 4096 frames is close
+/// enough to real time for raw capture's continuity check
+/// (wiki/pages/audio-channel-framing.md).
+const RAW_CAPTURE_TOML: &str = "[audio]\ninput_channels = 1\nbuffer_size = 4096\n\
+                                [audio.recording]\nauto_record = true\n\
+                                directory = \"~/rec\"\nraw_capture_minutes = 5\n";
+
+/// Names of the files directly in `dir` that start with `prefix` and end
+/// in `.wav` (finished files only: the writer renames `.part` at the end).
+fn wav_names_with_prefix(dir: &Path, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(prefix) && n.ends_with(".wav"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The band token of `<prefix><date>_<time>[_<band>]...wav`, if any.
+fn band_token(name: &str, prefix: &str) -> Option<String> {
+    let stem = name.strip_prefix(prefix)?.strip_suffix(".wav")?;
+    stem.split('_')
+        .nth(2)
+        .filter(|t| *t != "tx")
+        .map(str::to_string)
+}
+
+/// PAN-393 scenario 1: a timed raw capture writes one 48 kHz WAV per FT8
+/// slot into `raw48/` while decode-window recording and decoding go on.
+#[test]
+fn raw_capture_writes_48k_slot_files_into_raw48_while_decoding_continues() {
+    let mut run = ScratchRun::spawn(RAW_CAPTURE_TOML, &[], true);
+    let rec = run.home.path().join("rec");
+    let raw = rec.join("raw48");
+    run.wait_for(
+        "a raw48_*.wav in ~/rec/raw48",
+        Duration::from_secs(90),
+        |_| !wav_names_with_prefix(&raw, "raw48_").is_empty(),
+    );
+    let log = run.wait_for("two decode windows", Duration::from_secs(60), |r| {
+        r.log().matches("DSP: FT8 window #").count() >= 2
+            && !wav_names_with_prefix(&rec, "ft8_").is_empty()
+    });
+
+    assert!(
+        log.contains(&format!(
+            "Raw 48 kHz capture enabled: dir={}",
+            raw.display()
+        )),
+        "the enabled line must name raw48/ inside the recording dir:\n{log}"
+    );
+    assert!(log.contains("length=5 min"), "{log}");
+
+    let raw_names = wav_names_with_prefix(&raw, "raw48_");
+    let first = &raw_names[0];
+    let reader = hound::WavReader::open(raw.join(first)).unwrap();
+    let spec = reader.spec();
+    assert_eq!(spec.sample_rate, 48_000);
+    assert_eq!(spec.channels, 1);
+    assert_eq!(spec.bits_per_sample, 16);
+    assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+    assert_eq!(reader.duration(), 720_000);
+    assert_eq!(fs::metadata(raw.join(first)).unwrap().len(), 1_440_044);
+
+    // raw48_<YYYYMMDD>_<HHMM><00|15|30|45>[_<band>].wav
+    let stem = first
+        .strip_prefix("raw48_")
+        .and_then(|s| s.strip_suffix(".wav"))
+        .unwrap();
+    let parts: Vec<&str> = stem.split('_').collect();
+    assert!(parts.len() == 2 || parts.len() == 3, "{first}");
+    assert!(
+        parts[0].len() == 8 && parts[0].bytes().all(|b| b.is_ascii_digit()),
+        "{first}"
+    );
+    assert!(
+        parts[1].len() == 6 && parts[1].bytes().all(|b| b.is_ascii_digit()),
+        "{first}"
+    );
+    assert!(
+        ["00", "15", "30", "45"].contains(&&parts[1][4..]),
+        "{first}"
+    );
+    if let Some(band) = parts.get(2) {
+        let digits = band.trim_end_matches('m').trim_end_matches('c');
+        assert!(
+            band.ends_with('m') && digits.bytes().all(|b| b.is_ascii_digit()),
+            "{first}"
+        );
+    }
+    let ft8_names = wav_names_with_prefix(&rec, "ft8_");
+    assert_eq!(
+        band_token(first, "raw48_"),
+        band_token(&ft8_names[0], "ft8_"),
+        "raw and 12 kHz files read the same dial: {first} vs {}",
+        ft8_names[0]
+    );
+
+    assert!(!log.contains("DSP stage not draining"), "{log}");
+    assert!(!log.contains("FT8 stage not draining"), "{log}");
+    assert!(
+        wavs_under(run.home.path(), Some(&rec)).is_empty(),
+        "nothing may be written outside the recording directory"
+    );
+}
+
+/// PAN-393 scenario 4: `raw48/` has its own cap; reaching it stops raw
+/// capture with a reason, and decode-window recording keeps going.
+#[cfg(unix)]
+#[test]
+fn raw_capture_stops_at_its_cap_and_decode_recording_continues() {
+    // Seed raw48/ to 1 MB under the 2 GiB cap before the binary starts. The
+    // file is sparse (set_len), so it costs no real disk; one mono slot
+    // (1,440,044 bytes) would pass the cap.
+    let mut run = ScratchRun::spawn_with_setup(RAW_CAPTURE_TOML, &[], true, |home| {
+        let raw = home.join("rec").join("raw48");
+        fs::create_dir_all(&raw).unwrap();
+        let seed = File::create(raw.join("seed.wav")).unwrap();
+        seed.set_len(2 * 1024 * 1024 * 1024 - 1_000_000).unwrap();
+    });
+    let rec = run.home.path().join("rec");
+    let raw = rec.join("raw48");
+    let log = run.wait_for("the raw capture cap line", Duration::from_secs(90), |r| {
+        r.log().contains("Raw 48 kHz capture stopped:")
+    });
+    assert!(
+        log.contains(
+            "and the next file would pass the 2.0 GB cap. Decode-window recording continues."
+        ),
+        "{log}"
+    );
+    assert!(
+        wav_names_with_prefix(&raw, "raw48_").is_empty(),
+        "nothing is written past the cap"
+    );
+
+    let before = wav_names_with_prefix(&rec, "ft8_");
+    run.wait_for(
+        "a new decode-window WAV after the cap",
+        Duration::from_secs(30),
+        |_| {
+            wav_names_with_prefix(&rec, "ft8_")
+                .iter()
+                .any(|n| !before.contains(n))
+        },
+    );
+    assert!(wav_names_with_prefix(&raw, "raw48_").is_empty());
 }
