@@ -10,7 +10,9 @@ raise 'no windows-gnu leg' unless legs.include?('os' => 'windows-latest', 'targe
 raise 'macos leg lost' unless legs.any? { |l| l['os'] == 'macos-latest' }
 raise 'not required by ci' unless jobs.fetch('ci').fetch('needs').include?('cross-platform-check')
 steps = job.fetch('steps')
-on_windows = steps.select { |s| s['if'].nil? || s['if'] == "runner.os == 'Windows'" }
+# Every step may run on Windows unless its `if` is one of the known non-Windows guards.
+non_windows = ["runner.os == 'macOS'", "runner.os != 'Windows'"]
+on_windows = steps.reject { |s| non_windows.include?(s['if']) }
 on_windows.each { |s| raise "#{s['name']}: multi-line run needs shell: bash on Windows" if s['run']&.include?("\n") && s['shell'] != 'bash' }
 toolchain = steps.find { |s| s['uses']&.start_with?('dtolnay/rust-toolchain@') } || raise('no toolchain step')
 raise 'toolchain lacks matrix target' unless toolchain.dig('with', 'targets') == '${{ matrix.target }}'
