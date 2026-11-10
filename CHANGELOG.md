@@ -13,11 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - PAN-272: When the radio does not acknowledge a PTT-off, Pancetta now keeps its PTT watchdog running and retries the unkey every second until the rig confirms it or a new transmission takes over with its own unkey and a fresh timer, and the readiness strip shows "⚠ PTT MAY STILL BE KEYED — check radio". Before, the watchdog stopped as soon as the PTT-off was sent, so a rejected unkey left the radio transmitting with every indicator saying it was not.
-=======
 - PAN-356: In FT4, the autonomous operator now acts on every other 7.5 s slot, matching its configured parity. Before, it acted on two slots in a row and then skipped two.
->>>>>>> f91f3e852b64701ca970f398757f2d3f87c2de67
 - PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
 - PAN-279: A frame that arrives too late to replace the one on air now goes out in its own next slot instead of being lost. Replacing an autonomous CQ with a newer frame for the same QSO no longer undoes the CQ. A multi-TX stream left out of a bundle now gives back its call count.
 - PAN-280: A QSO is logged (ADIF, uploads, WSJT-X `QSOLogged`) only after its closing 73 has aired. A 73 the transmitter drops or refuses leaves the QSO open in its pre-73 state for 45 s, with no timeout, and says `73 to <call> was not sent; QSO not logged, still open`; a QSO opened directly at 73 is marked `closing 73 not sent, not logged`. A 73 with no transmit outcome is treated as not sent after six slots (FT8 90 s, FT4 45 s, FT2 30 s). A dropped auto-73 resend no longer uses up one of the three auto-73 resends. A remote client's brand-new QSO opened at 73 or RR73 now checks the client's TX permission, retires any older same-call QSO and creates the new QSO under one lock; a disarm or arm expiry after that check is caught when the 73 would key, and the QSO is then not logged.

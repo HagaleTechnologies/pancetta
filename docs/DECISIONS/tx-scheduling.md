@@ -1129,9 +1129,19 @@ nothing to act on, so the radio stayed keyed while every indicator said unkeyed.
 - **One lock for both values.** `ptt_unkey_failed` is a separate flag instead of a new tracker
   type, so `ptt_on_since`'s readers (`swr_guard::poll_sees_keyed`, the PAN-252 refusal, the
   startup seed) are unchanged. It is read and written only under the `ptt_on_since` lock.
-- **Compare-and-clear.** The watchdog's `Ok` arm clears the tracker and the flag only when the
-  tracker still holds the key-down time it read. A key-down recorded during the watchdog's
-  in-flight `set_ptt` keeps its own timer.
+- **A watchdog PTT-off and a key-down are serialized.** The watchdog holds the `ptt_on_since`
+  write lock from its eligibility check until its `set_ptt(Off)` returns, and clears the tracker
+  and the flag under that same lock. A command-loop key-down takes the lock before
+  `ptt_command_consumed` and releases it after its tracker update, before its `set_ptt(On)`. So
+  a retry of a failed unkey either sees the key-down's fresh timer and cleared flag and stands
+  down, or finishes before the key-down is sent; it cannot land after a superseding key-down from
+  the same Hamlib generation's command loop and cut it off (PR #612 review). The real
+  `RigctldClient` releases its connection mutex between retry attempts, so serializing at the
+  client would not be enough. A retry also leaves `ptt_active` alone: the failed unkey was
+  delivered, so its TX worker guard already cleared it, and a set flag belongs to the next
+  transmission. Only an overdue (14 s) forced unkey clears it. Cost: a key-down that arrives
+  while a watchdog PTT-off is in flight waits for that CAT call to return. Not covered: a
+  watchdog retained in `hamlib_orphans` after a failed teardown uses its own generation's lock.
 - **A new key-down supersedes a failed unkey.** Every accepted key-down swaps the flag off and,
   when it was set, restarts the timer. Otherwise the new transmission inherits the old, expired
   deadline and the watchdog cuts it within a second. Duplicate key-downs still cannot extend a
@@ -1143,7 +1153,9 @@ nothing to act on, so the radio stayed keyed while every indicator said unkeyed.
 - **Tests.** `pan272_ptt_off_watchdog_tests` drives the real command loop and watchdog with a
   `MockRig` whose `disconnect()` makes `set_ptt` fail. It covers the retry within one tick of the
   link returning, the fresh timer for a key-down after a failed unkey, no latch without a
-  recorded key-down, and a confirmed unkey clearing the timer (a 16 s real-time wait).
+  recorded key-down, and a confirmed unkey clearing the timer (a 16 s real-time wait). A
+  `GatedOffRig` wrapper holds the watchdog's retry in flight while a new key-down arrives, and
+  the test checks that the rig ends keyed.
 
 ## High SWR halts the station (PAN-251), 2026-11-01
 
