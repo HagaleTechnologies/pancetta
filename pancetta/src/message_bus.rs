@@ -976,6 +976,11 @@ pub enum QsoMessage {
         /// identical keep-call frame reports before the trigger's own slot
         /// starts, so it cannot release the hold.
         aired_at: chrono::DateTime<chrono::Utc>,
+        /// PAN-280: the aired frame's attempt (the pivot target's, after a
+        /// pivot), so Qso can settle the TX report against the call that
+        /// charged it (the auto-73 resend marker). `None` when the frame
+        /// carried none.
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
