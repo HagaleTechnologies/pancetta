@@ -8,12 +8,19 @@
 //!
 //! - A dial change never happens while the rig is keyed: the final
 //!   [`rig_is_keyed`] recheck and the `SetFrequency` enqueue run under
-//!   `ptt_sync_gate`, so `PttGuard::new` cannot key in between. The
+//!   `ptt_sync_gate`, so neither `PttGuard::new` nor the TUI's manual
+//!   key-down (`tui_relay::manual_key_down`) can key in between. The
 //!   autonomous operator is **never** locked while that gate is held (the
 //!   Autonomous task holds the operator lock while its offset drain takes
 //!   `ptt_sync_gate` — the opposite order would deadlock).
-//! - A dial change never ends an exchange in progress (a QSO whose partner
-//!   has answered), and never happens without a Hamlib route.
+//! - A dial change is refused when the admission read finds an exchange in
+//!   progress (a QSO whose partner has answered), and never happens without
+//!   a Hamlib route. That read is a snapshot taken just before
+//!   `ptt_sync_gate`, not serialized with the QSO task: a partner reply the
+//!   QSO task applies after it and before [`qsy_send`] stores the new dial
+//!   is still torn down by the `BandChanged`. The read cannot move under the
+//!   gate, because `QsoManager::apply_tx_offset_switch` takes the manager's
+//!   `qsos` lock before `ptt_sync_gate`.
 //! - A call that needs a QSY while keyed is parked (latest wins) and runs
 //!   after PTT-off. It is dropped after [`SPOT_QSY_WAIT_CAP`], on any
 //!   operator frequency change, by a newer spot call, or when the TX policy,
@@ -470,6 +477,12 @@ async fn execute_spot_call(
     };
     if qsy {
         {
+            // Every key-down passes this gate before its PTT-on enqueue
+            // (`PttGuard::new` stores `ptt_active` under it;
+            // `tui_relay::manual_key_down` holds it across the enqueue), so no
+            // PTT-on can be enqueued between this recheck and `SetFrequency`.
+            // Never read the QSO manager here: `apply_tx_offset_switch` takes
+            // its `qsos` lock before this gate.
             let _gate = ctx.ptt_sync_gate.lock().await;
             if ctx.keyed() {
                 return ExecOutcome::Defer;

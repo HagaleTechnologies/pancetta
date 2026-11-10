@@ -2697,7 +2697,7 @@ impl super::ApplicationCoordinator {
                             // operator hit Shift+Q / cycled to Disabled.
                             // PTT-OFF (state=false) is ALWAYS allowed: it can
                             // only ever stop TX, never start it.
-                            if new_state {
+                            let outcome = if new_state {
                                 // PAN-19 round-12 review (Codex P1): route
                                 // through `ptt_on_refusal`, which itself
                                 // routes through the SAME shared gate the
@@ -2711,62 +2711,66 @@ impl super::ApplicationCoordinator {
                                 // only consumed once it became ready,
                                 // unexpectedly keying the radio well after
                                 // the operator's actual keypress.
-                                if let Some(status) = ptt_on_refusal(
-                                    &cmd_tx_policy,
-                                    &cmd_tx_restart_inhibit,
-                                    &cmd_hamlib_command_loop_ready,
-                                    &cmd_hamlib_pending_frequency,
-                                    &cmd_hamlib_pending_split,
-                                    &cmd_hamlib_command_in_flight,
-                                    &cmd_rig_conn_state,
-                                    &cmd_audio_output_alive,
-                                    &cmd_message_bus.receive_gain,
-                                ) {
-                                    warn!(
-                                        target: "tx.policy",
-                                        "Refusing PTT key-up: {status}"
-                                    );
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "TX".to_string(),
-                                            status,
-                                        },
-                                    );
-                                    continue;
-                                }
+                                //
                                 // PAN-118: frequency-aware sibling of the gate
                                 // above — a manual PTT key-up is a raw carrier on
                                 // the effective TX dial, so refuse it while that
                                 // dial sits outside the configured amateur band
                                 // plan. Same status channel as every other PTT
                                 // refusal; PTT-off remains always allowed below.
-                                if let Some(status) = ptt_band_plan_refusal(
-                                    &cmd_operating_freq_hz,
-                                    &cmd_split_tx_hz,
-                                    &cmd_band_plan,
-                                ) {
-                                    warn!(
-                                        target: "tx.policy",
-                                        "Refusing PTT key-up: {status}"
-                                    );
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "TX".to_string(),
-                                            status,
-                                        },
-                                    );
-                                    continue;
+                                //
+                                // PAN-287: both gates and the enqueue run under
+                                // `ptt_sync_gate` (see `manual_key_down`), so a
+                                // parked spot-call QSY cannot retune between
+                                // its keyed recheck and its `SetFrequency`.
+                                match manual_key_down(&cmd_message_bus, &cmd_ptt_sync_gate, || {
+                                    ptt_on_refusal(
+                                        &cmd_tx_policy,
+                                        &cmd_tx_restart_inhibit,
+                                        &cmd_hamlib_command_loop_ready,
+                                        &cmd_hamlib_pending_frequency,
+                                        &cmd_hamlib_pending_split,
+                                        &cmd_hamlib_command_in_flight,
+                                        &cmd_rig_conn_state,
+                                        &cmd_audio_output_alive,
+                                        &cmd_message_bus.receive_gain,
+                                    )
+                                    .or_else(|| {
+                                        ptt_band_plan_refusal(
+                                            &cmd_operating_freq_hz,
+                                            &cmd_split_tx_hz,
+                                            &cmd_band_plan,
+                                        )
+                                    })
+                                })
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(status) => {
+                                        warn!(
+                                            target: "tx.policy",
+                                            "Refusing PTT key-up: {status}"
+                                        );
+                                        let _ = cmd_tui_msg_tx.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "TX".to_string(),
+                                                status,
+                                            },
+                                        );
+                                        continue;
+                                    }
                                 }
-                            }
+                            } else {
+                                super::tx::send_ptt_command(
+                                    &cmd_message_bus,
+                                    ComponentId::Tui,
+                                    false,
+                                    || true,
+                                )
+                            };
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
-                            if super::tx::send_ptt_command(
-                                &cmd_message_bus,
-                                ComponentId::Tui,
-                                new_state,
-                                || true,
-                            ) != crate::message_bus::SendIfOutcome::Enqueued
-                            {
+                            if outcome != crate::message_bus::SendIfOutcome::Enqueued {
                                 warn!("Failed to toggle PTT: message dropped");
                             }
                         }
@@ -4076,6 +4080,31 @@ fn ptt_band_plan_refusal(
             None
         }
     })
+}
+
+/// PAN-287 (Codex P1, PR #613): the TUI's manual key-down (Shift+T). Holds
+/// `ptt_sync_gate` across `refusal` (the last pre-PTT gates) and the PTT-on
+/// enqueue, so a spot-call QSY, whose final `spot_call::rig_is_keyed`
+/// recheck and `SetFrequency` enqueue run under the same gate, cannot
+/// interleave: Hamlib receives either this PTT-on first (the QSY sees the
+/// rig keyed and keeps waiting) or the retune first. The gate is taken
+/// before `refusal` runs, so nothing suspends between the last gate and the
+/// enqueue (PAN-202). `Err` carries `refusal`'s status line.
+async fn manual_key_down(
+    bus: &crate::message_bus::MessageBus,
+    ptt_sync_gate: &tokio::sync::Mutex<()>,
+    refusal: impl FnOnce() -> Option<String>,
+) -> Result<crate::message_bus::SendIfOutcome, String> {
+    let _ptt_sync = ptt_sync_gate.lock().await;
+    if let Some(status) = refusal() {
+        return Err(status);
+    }
+    Ok(super::tx::send_ptt_command(
+        bus,
+        ComponentId::Tui,
+        true,
+        || true,
+    ))
 }
 
 /// Upsert a bookmark into a list by name (PAN-61: save-as, overwrite if the
@@ -6645,6 +6674,85 @@ mod tui_relay_tests {
                 &pancetta_config::BandPlanConfig::default(),
             ),
             None
+        );
+    }
+
+    /// PAN-287 (Codex P1, PR #613): a manual key-down waits while the
+    /// spot-call QSY holds `ptt_sync_gate`, so the QSY's `SetFrequency`
+    /// reaches Hamlib before the PTT-on and a keyed rig is never retuned.
+    #[tokio::test]
+    async fn manual_key_down_waits_for_ptt_sync_gate() {
+        use crate::message_bus::{MessageBus, RigControlMessage, SendIfOutcome};
+        let bus = MessageBus::new(16).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let task = {
+            let (bus, gate) = (bus.clone(), gate.clone());
+            tokio::spawn(async move { manual_key_down(&bus, &gate, || None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "no PTT-on may be enqueued while ptt_sync_gate is held"
+        );
+        // Stand-in for the spot QSY's enqueue under the gate.
+        bus.send_message(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000,
+            }),
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+        drop(held);
+        assert_eq!(task.await.unwrap(), Ok(SendIfOutcome::Enqueued));
+        assert!(matches!(
+            hamlib_rx.try_recv().unwrap().message_type,
+            MessageType::RigControl(RigControlMessage::SetFrequency { .. })
+        ));
+        assert!(matches!(
+            hamlib_rx.try_recv().unwrap().message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        ));
+    }
+
+    /// PAN-287 / PAN-202: the manual key-down's refusal runs after the
+    /// `ptt_sync_gate` wait, never before it, so a gate another task flips
+    /// while the key-down waits (an SWR trip's `tx_halt`, a supervisor
+    /// restart inhibit) still refuses it.
+    #[tokio::test]
+    async fn manual_key_down_evaluates_its_refusal_after_the_gate_wait() {
+        use crate::message_bus::MessageBus;
+        let bus = MessageBus::new(16).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let refuse = Arc::new(AtomicBool::new(false));
+        let held = gate.clone().lock_owned().await;
+        let task = {
+            let (bus, gate, refuse) = (bus.clone(), gate.clone(), refuse.clone());
+            tokio::spawn(async move {
+                manual_key_down(&bus, &gate, || {
+                    refuse
+                        .load(Ordering::Acquire)
+                        .then(|| "Can't key PTT — TX policy is Disabled".to_string())
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        refuse.store(true, Ordering::Release);
+        drop(held);
+        assert_eq!(
+            task.await.unwrap(),
+            Err("Can't key PTT — TX policy is Disabled".to_string())
+        );
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a refused key-down enqueues nothing"
         );
     }
 

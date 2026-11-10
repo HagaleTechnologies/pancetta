@@ -1594,8 +1594,10 @@ pub struct ApplicationCoordinator {
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
     ///
     /// PAN-287: the TUI relay's spot-call QSY also holds it for its final
-    /// `spot_call::rig_is_keyed` recheck and the `SetFrequency` enqueue, so a
-    /// spot QSY can never land while PTT is keyed. Rule: never lock the
+    /// `spot_call::rig_is_keyed` recheck and the `SetFrequency` enqueue, and
+    /// the TUI's manual key-down (`tui_relay::manual_key_down`) holds it across
+    /// its last pre-PTT gates and the PTT-on enqueue, so a spot QSY can never
+    /// land while PTT is keyed. Rule: never lock the
     /// autonomous operator while holding this gate — the Autonomous task holds
     /// the operator lock while its offset drain takes this gate.
     pub(crate) ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,

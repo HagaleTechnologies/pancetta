@@ -80,6 +80,11 @@
   - The Hamlib loop has no keyed recheck for TUI-sourced `SetFrequency`; the relay's
     `rig_is_keyed` recheck under `ptt_sync_gate` is the guard for spot QSYs, and band keys
     have never had one.
+  - The exchange-in-progress check is a snapshot taken before `ptt_sync_gate`, not serialized
+    with the QSO task's decode loop. A partner reply the QSO task applies between that read and
+    the dial store is still torn down by `BandChanged` (Codex P1 on PR #613). The read cannot
+    move under the gate (`apply_tx_offset_switch` takes `qsos` before `ptt_sync_gate`); closing
+    it needs the QSO task to arbitrate the QSY, for example a request/ack through its message loop.
 
 ## Missing-docs lint status (verified 2026-07-17)
 
