@@ -20,15 +20,6 @@
   and a `TxFrameSent` that arrives after the record expired (six slots,
   at least 30 s) does not log it. (Surfaced by PAN-280, 2026-11-08.)
 
-- **Supersede abandonment still sends Autonomous an early failure.** A
-  single-frame `Replace`/`NotViable` supersede and a multi-TX abandoned item
-  (`report_abandoned_bundle_item`) report a failed `TransmitComplete` for the
-  abandoned frame even when the superseding request later airs, so a tracked
-  self-CQ can settle as failed first. The pivot ownership rule does not cover
-  supersedes: a superseding request a supersede drops is not reported, so
-  making these exactly-once needs its own audit of those drops.
-  (Surfaced by PAN-185, 2026-10-23.)
-
 - **A mid-TX pivot-duplicate drop keeps its tombstone and skips the
   replaced-frame rollback.** `IncomingDuringTx::Drop` discards a queued
   request whose payload is already airing through a pivot, but it neither

@@ -86,6 +86,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - Every acting consumer of `MessageType::DecodedMessage` (QSO, autonomous, WSJT-X relay) drops a decode whose `captured_dial_hz` maps to a different band than the live dial (fail-open on unknown dials) — a decode captured before a band switch is never acted on after it (PAN-69).
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
+- A TX frame that will not air as itself settles through `coordinator::tx_outcome::settle_unaired_frame`: the QSO engine always gets `TxFrameNotSent` with the frame's attempt id, and Autonomous gets a failed `TransmitComplete` only when no same-QSO successor (re-key, requeue, carried bundle item, pivot) will report. A not-viable superseder is requeued, never dropped (PAN-279).
 - Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted, and the bus accepted, for that qso_id at key-time, or at the moment of an operator-triggered mid-TX abort+re-key, whichever is later.
 - TX outcome reports — `TransmitComplete` (→ Autonomous), `TxFrameScheduled`/`TxFrameNotSent`/`TxFrameSent` (→ Qso) — go through `MessageBus::send_message_durable`, and those components read through a `DurableInbox`; a full channel parks them, never drops them (PAN-185).
 - At most one QSO object exists per (callsign, band) among active-or-recently-completed QSOs; repeated manual actions resolve to it, never spawn a sibling.
