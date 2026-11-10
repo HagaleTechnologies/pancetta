@@ -425,8 +425,7 @@ mod hb243_baseband_tests {
 
     /// Full-signal parity: encode + modulate a real FT8 message, then confirm
     /// the baseband recovers the transmitted 8-FSK tone sequence per symbol.
-    /// Requires the encoder/modulator (transmit feature).
-    #[cfg(feature = "transmit")]
+    /// Uses the encoder/modulator (in every build since PAN-331).
     #[test]
     fn full_ft8_signal_per_symbol_tone_recovery() {
         use crate::{Ft8Encoder, Ft8Modulator};
@@ -498,7 +497,6 @@ mod hb243_baseband_tests {
     /// boundary. A bug in the start_sample/margin bookkeeping (as opposed
     /// to a zero-offset bug that a dt=0 test would miss) would desync every
     /// symbol frame and collapse the recovered-tone fraction.
-    #[cfg(feature = "transmit")]
     #[test]
     fn extract_candidate_baseband_recovers_symbols_at_nonzero_dt() {
         use crate::{Ft8Encoder, Ft8Modulator};

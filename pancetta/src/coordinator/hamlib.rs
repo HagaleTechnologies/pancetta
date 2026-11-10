@@ -1655,7 +1655,6 @@ impl super::ApplicationCoordinator {
     /// `docs/SUPPORTED_RIGS.md`. Public so `pancetta doctor` (in the bin crate)
     /// can pre-validate the configured model against the same table the
     /// spawner uses.
-    #[cfg(feature = "pancetta-hamlib")]
     pub fn hamlib_model_id(model: &str) -> Option<u32> {
         pancetta_hamlib::find_supported_rig(model).map(|rig| rig.hamlib_id)
     }
@@ -1705,7 +1704,6 @@ impl super::ApplicationCoordinator {
         false
     }
 
-    #[cfg(feature = "pancetta-hamlib")]
     /// The rig used while rig control is off: `MockRig::default()`, or the
     /// PAN-251 test seam's injected rig.
     fn rig_control_disabled_rig(&self) -> Arc<dyn pancetta_hamlib::RigControl + Send + Sync> {
@@ -3585,29 +3583,19 @@ pub struct HamlibReconnectRequest {
 }
 
 /// PAN-59 final-review fix (I-1a): thin wrapper the TUI command-relay task
-/// (`tui_relay.rs`'s `TuiCommand::SelectRig` arm, which runs regardless of
-/// whether `pancetta-hamlib` is compiled in) can call to validate a rig
+/// (`tui_relay.rs`'s `TuiCommand::SelectRig` arm) can call to validate a rig
 /// model BEFORE persisting anything or requesting a live reconnect.
 /// Without this, an unrecognized `rig.model` string was silently persisted
 /// and `start_hamlib_component` would fall through to build a
 /// `RigctldClient` pointing at a port nothing is listening on, still
 /// reporting success.
 ///
-/// When `pancetta-hamlib` IS compiled in, this defers to the same
-/// recognized-model table `start_hamlib_component` itself uses
-/// ([`ApplicationCoordinator::hamlib_model_id`]), so the two can never
-/// silently disagree. When it is NOT compiled in, there's no model table
-/// to check against and the reconnect will already fail with "rig control
-/// not compiled in" regardless of the model string -- persisting a model
-/// name by itself isn't unsafe, so this permissively returns `true`.
-#[cfg(feature = "pancetta-hamlib")]
+/// This defers to the same recognized-model table `start_hamlib_component`
+/// itself uses ([`ApplicationCoordinator::hamlib_model_id`]), so the two
+/// can never silently disagree. (PAN-331 removed the `pancetta-hamlib`
+/// feature, so rig control is always compiled in.)
 pub(crate) fn model_recognized(model: &str) -> bool {
     super::ApplicationCoordinator::hamlib_model_id(model).is_some()
-}
-
-#[cfg(not(feature = "pancetta-hamlib"))]
-pub(crate) fn model_recognized(_model: &str) -> bool {
-    true
 }
 
 impl super::ApplicationCoordinator {
@@ -3617,7 +3605,6 @@ impl super::ApplicationCoordinator {
     /// `TxInhibitGuard`), otherwise reconnect via the same
     /// teardown/restart pair the crash-restart path already uses so the
     /// freshly-persisted `self.config.rig` takes effect.
-    #[cfg(feature = "pancetta-hamlib")]
     pub(crate) async fn handle_hamlib_reconnect_request(&mut self, req: HamlibReconnectRequest) {
         if self.ptt_active.load(Ordering::Acquire) {
             let _ = req.respond.send(Err(anyhow::anyhow!(
@@ -3787,13 +3774,6 @@ impl super::ApplicationCoordinator {
         }
 
         let _ = req.respond.send(result);
-    }
-
-    #[cfg(not(feature = "pancetta-hamlib"))]
-    pub(crate) async fn handle_hamlib_reconnect_request(&mut self, req: HamlibReconnectRequest) {
-        let _ = req.respond.send(Err(anyhow::anyhow!(
-            "rig control not compiled in (pancetta-hamlib feature disabled)"
-        )));
     }
 }
 
@@ -4758,7 +4738,7 @@ mod child_task_crashed_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod children_publish_race_tests {
     //! PAN-19 HIGH regression guard.
     //!
@@ -5081,7 +5061,7 @@ mod children_publish_race_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod restart_orphan_tests {
     //! PAN-19 MEDIUM #2: a watchdog orphaned by a teardown whose 3 PTT-off
     //! attempts all failed (see `teardown_hamlib`'s `hamlib_orphans.push`)
@@ -5319,7 +5299,7 @@ mod restart_orphan_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod orphan_ptt_confirmation_tests {
     //! PAN-19 round-12 review (Codex P1) regression guard: "retain the old
     //! watchdog until PTT-off is confirmed". `restart_orphan_tests` above
@@ -5555,7 +5535,7 @@ mod orphan_ptt_confirmation_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod teardown_stall_tests {
     //! PAN-19 LOW / round-2 review (Codex P1): `teardown_hamlib`'s PTT-off
     //! retry loop runs on the coordinator's main supervision task, so its
@@ -5661,7 +5641,7 @@ mod teardown_stall_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod ptt_off_unconfirmed_tests {
     //! PAN-89: `ptt_off_unconfirmed` latches exactly where teardown retains
     //! the PTT watchdog ("watchdog retained") and clears only on a
@@ -5857,7 +5837,7 @@ mod ptt_off_unconfirmed_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod teardown_replay_tests {
     //! PAN-19 LOW / round-2 review (Codex P1): the message re-injection
     //! loop at the end of `teardown_hamlib` originally used a *blocking*
@@ -6070,7 +6050,6 @@ mod teardown_replay_tests {
     /// directly does exactly that: nothing else touches this channel
     /// during the isolated call, so it's provably full for the entire
     /// ~100ms bounded retry window -- no race required.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_commands_ptt_off_directly_when_channel_stays_full() {
         use pancetta_hamlib::{PttState, RigControl, Vfo};
@@ -6132,7 +6111,6 @@ mod teardown_replay_tests {
     /// for the entire retry window -- it must not block indefinitely
     /// either, and it must not spuriously touch the rig (no PTT-off
     /// fallback for a non-PTT message).
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_drops_non_ptt_messages_after_exhausting_retries() {
         let mut coordinator = test_coordinator().await;
@@ -6173,7 +6151,6 @@ mod teardown_replay_tests {
     /// it must be queued in `self.hamlib_pending_frequency` for delivery
     /// to the next Hamlib generation (see `deliver_pending_hamlib_state`
     /// below).
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_queues_a_stuck_set_frequency_instead_of_dropping_it() {
         let mut coordinator = test_coordinator().await;
@@ -6206,7 +6183,6 @@ mod teardown_replay_tests {
     /// case Codex specifically flagged: nothing else in this codebase
     /// re-asserts split state, so a dropped `SetSplit` could leave the rig
     /// silently holding stale split config.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_queues_a_stuck_set_split_instead_of_dropping_it() {
         let mut coordinator = test_coordinator().await;
@@ -6249,7 +6225,6 @@ mod teardown_replay_tests {
     /// the correct state was lost. This proves the fallback now reuses
     /// the SAME newest-wins comparison `finish_rig_command` uses: the
     /// pending slot must still hold the NEWER split afterward, untouched.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_never_lets_an_older_split_clobber_a_newer_retained_one() {
         let mut coordinator = test_coordinator().await;
@@ -6318,7 +6293,6 @@ mod teardown_replay_tests {
     /// whatever's retained (or nothing is retained), it must still
     /// replace it -- the fix must not become a one-way ratchet that stops
     /// updating the slot.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn replay_or_fallback_still_replaces_an_older_retained_split_with_a_newer_one() {
         let mut coordinator = test_coordinator().await;
@@ -6369,7 +6343,6 @@ mod teardown_replay_tests {
     /// ready -- not just held forever. Covers both `SetFrequency` and
     /// `SetSplit`, and confirms the pending slots are cleared (drained,
     /// not duplicated on a later call) once delivered.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_sends_queued_commands_to_the_new_generation() {
         let coordinator = test_coordinator().await;
@@ -6451,7 +6424,6 @@ mod teardown_replay_tests {
     /// `HamlibCommandInFlightGuard` -- so there is no gap between "no
     /// longer pending" and "marked in-flight" for a concurrent PTT-on's
     /// gate-check to slip through.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_marks_in_flight_on_successful_handoff() {
         let coordinator = test_coordinator().await;
@@ -6483,7 +6455,6 @@ mod teardown_replay_tests {
     /// in-flight -- nothing was actually enqueued, so there is nothing in
     /// flight; the pending slot itself (already correctly repopulated)
     /// remains the source of truth for "still needs delivery".
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_does_not_mark_in_flight_on_failed_handoff() {
         let coordinator = test_coordinator().await;
@@ -6532,7 +6503,6 @@ mod teardown_replay_tests {
     /// ever clear it -- permanently muting an otherwise healthy
     /// generation. With the fix (mark BEFORE `try_send`), the flag must
     /// reliably end up `false` regardless of how fast the consumer is.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_does_not_strand_in_flight_true_for_a_fast_consumer() {
         let coordinator = test_coordinator().await;
@@ -6594,7 +6564,6 @@ mod teardown_replay_tests {
     /// so with the fix, ANY receiver that successfully receives the
     /// message is GUARANTEED to see `hamlib_command_in_flight == true`
     /// the instant it checks -- regardless of real-time scheduling.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_marks_in_flight_before_the_channel_send_not_after() {
         let coordinator = test_coordinator().await;
@@ -6784,7 +6753,6 @@ mod teardown_replay_tests {
     /// channel at delivery time must leave the pending command still
     /// queued afterward (not silently gone), and it must succeed once
     /// delivered again with room in the channel.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_requeues_on_a_full_channel_and_delivers_later() {
         let coordinator = test_coordinator().await;
@@ -6864,7 +6832,6 @@ mod teardown_replay_tests {
     /// processes a normal command. The stale pending command must NEVER
     /// be delivered afterward: it must be dropped, so the rig ends up in
     /// the newer, correct state (not reverted to a stale TX frequency).
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_drops_a_stale_split_superseded_by_a_newer_one() {
         let coordinator = test_coordinator().await;
@@ -6927,7 +6894,6 @@ mod teardown_replay_tests {
     /// newer has been applied) must still deliver normally -- the
     /// supersession check must not become overly conservative and start
     /// dropping legitimate, still-current pending commands.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_still_delivers_when_not_superseded() {
         let coordinator = test_coordinator().await;
@@ -6978,7 +6944,6 @@ mod teardown_replay_tests {
     /// single shared slot/tracker conflated the two VFOs, so this exact
     /// scenario would have wrongly dropped the still-correct pending
     /// VFO-B command as "superseded".
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_does_not_let_vfo_a_supersede_a_pending_vfo_b_command() {
         let coordinator = test_coordinator().await;
@@ -7053,7 +7018,6 @@ mod teardown_replay_tests {
 
     /// The mirror image of the test above: a pending VFO-A command must
     /// survive a newer VFO-B command already having been applied.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_does_not_let_vfo_b_supersede_a_pending_vfo_a_command() {
         let coordinator = test_coordinator().await;
@@ -7127,7 +7091,6 @@ mod teardown_replay_tests {
     /// the original round-11/12 supersession protection. A pending VFO-A
     /// command must still be dropped once a NEWER command for that SAME
     /// VFO-A has already been applied.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_still_drops_a_stale_same_vfo_frequency_command() {
         let coordinator = test_coordinator().await;
@@ -7504,7 +7467,6 @@ mod teardown_replay_tests {
     /// End-to-end shape of the fix: a `SetSplit` that fails to replay
     /// during one generation's teardown is later delivered once the NEXT
     /// generation's channel is available -- not lost in between.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn a_stuck_set_split_survives_to_be_delivered_to_the_next_generation() {
         let mut coordinator = test_coordinator().await;
@@ -7571,7 +7533,6 @@ mod teardown_replay_tests {
     /// the current generation (the polling task's ~500ms tick, mirrored
     /// here) rather than requiring a brand new `start_hamlib_component`
     /// call.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn a_pending_command_gets_more_than_one_delivery_attempt_within_one_generation() {
         let coordinator = test_coordinator().await;
@@ -7659,7 +7620,6 @@ mod teardown_replay_tests {
     /// channel likely has room again a moment later" from the finding --
     /// and polls for the real polling task's own ~500ms tick to pick it up
     /// on its own.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn poll_loop_automatically_retries_a_pending_command_within_the_same_generation() {
         let mut coordinator = test_coordinator().await;
@@ -7809,7 +7769,7 @@ mod device_path_tests {
 /// `hamlib_model_id`'s recognized-model table (the one
 /// `start_hamlib_component` itself uses), since the whole point is to
 /// catch a bad model BEFORE the live-switch attempt.
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod model_recognized_tests {
     use super::*;
 
@@ -7838,7 +7798,7 @@ mod model_recognized_tests {
     }
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod pan_59_reconnect_tests {
     //! PAN-59: `handle_hamlib_reconnect_request` is the coordinator-side
     //! handler for a live rig-config switch. Two things must hold: it must
@@ -8896,7 +8856,6 @@ mod pan206_split_poll_tests {
     /// must already see the rig's split by then. The disabled-rig path starts
     /// a fresh simplex MockRig, so a split value left in the atomic stands in
     /// for one the radio no longer has.
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test(flavor = "current_thread")]
     async fn pan206_startup_reconciles_split_before_publishing_readiness() {
         let mut coordinator = super::super::ApplicationCoordinator::new(
@@ -9252,7 +9211,6 @@ mod receive_overload_notice_tests {
         );
     }
 
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test(flavor = "current_thread")]
     async fn receive_overload_unavailable_is_warned_once_per_connection_generation() {
         use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
@@ -9324,7 +9282,6 @@ mod receive_overload_notice_tests {
         );
     }
 
-    #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test(flavor = "current_thread")]
     async fn poll_observes_external_ptt_and_discards_earlier_overload_work() {
         use crate::coordinator::receive_overload::{GainSafety, WindowValidity};
