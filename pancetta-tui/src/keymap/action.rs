@@ -3,8 +3,7 @@
 //! `keymap::resolve` maps a key event to exactly one `Action` through the
 //! chords on the `KEYBINDINGS` rows; `TuiRunner::handle_key_event` then runs
 //! `match action`. Each variant's doc names the key and the legacy behaviour.
-//! Dialog-internal keys still dispatch in their own blocks in
-//! `handle_key_event` and have no variant yet.
+//! Dialog chords and character-entry rules resolve through the same enum.
 
 /// One operator intent a key press can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,11 +144,141 @@ pub enum Action {
     ToggleMonitoring,
     /// `x`: arm, then confirm, clearing decodes.
     ClearDecodes,
+    /// OutOfBandAck Enter, OutOfBandAck Esc: ack out of band.
+    AckOutOfBand,
+    /// QuitConfirm Char('y'), QuitConfirm Char('Y'), QuitConfirm Enter: confirm quit.
+    ConfirmQuit,
+    /// QuitConfirm Char('n'), QuitConfirm Char('N'), QuitConfirm Esc, QuitConfirm Char('q'): cancel quit.
+    CancelQuit,
+    /// Help Up: help scroll up.
+    HelpScrollUp,
+    /// Help Down: help scroll down.
+    HelpScrollDown,
+    /// Help PageUp: help page up.
+    HelpPageUp,
+    /// Help PageDown: help page down.
+    HelpPageDown,
+    /// Help Home: help top.
+    HelpTop,
+    /// Help End: help bottom.
+    HelpBottom,
+    /// DevicePicker Esc: cancel device picker.
+    CancelDevicePicker,
+    /// DevicePicker Tab, DevicePicker BackTab: device picker switch list.
+    DevicePickerSwitchList,
+    /// DevicePicker Up: device picker up.
+    DevicePickerUp,
+    /// DevicePicker Down: device picker down.
+    DevicePickerDown,
+    /// DevicePicker Enter: apply devices.
+    ApplyDevices,
+    /// RigBookmarkName Esc: cancel bookmark name.
+    CancelBookmarkName,
+    /// RigBookmarkName Backspace: bookmark name backspace.
+    BookmarkNameBackspace,
+    /// RigBookmarkName character input: bookmark name char.
+    BookmarkNameChar(char),
+    /// RigBookmarkName Enter: save bookmark.
+    SaveBookmark,
+    /// RigBookmarkList Esc: cancel bookmark list.
+    CancelBookmarkList,
+    /// RigBookmarkList Up: bookmark list up.
+    BookmarkListUp,
+    /// RigBookmarkList Down: bookmark list down.
+    BookmarkListDown,
+    /// RigBookmarkList Enter: load bookmark.
+    LoadBookmark,
+    /// RigBookmarkList Char('x'): delete bookmark.
+    DeleteBookmark,
+    /// RigForm Esc: cancel rig picker.
+    CancelRigPicker,
+    /// RigForm Tab: rig next field.
+    RigNextField,
+    /// RigForm Up: rig field up.
+    RigFieldUp,
+    /// RigForm Down: rig field down.
+    RigFieldDown,
+    /// RigForm Backspace: rig model backspace.
+    RigModelBackspace,
+    /// RigForm character input: rig model char.
+    RigModelChar(char),
+    /// RigForm F(2): open bookmark list.
+    OpenBookmarkList,
+    /// RigForm F(3): start bookmark name.
+    StartBookmarkName,
+    /// RigForm Enter: apply rig.
+    ApplyRig,
+    /// WatchlistModal Esc: close watchlist modal.
+    CloseWatchlistModal,
+    /// WatchlistModal Backspace: watchlist backspace.
+    WatchlistBackspace,
+    /// WatchlistModal character input: watchlist char.
+    WatchlistChar(char),
+    /// WatchlistModal Enter: submit watchlist.
+    SubmitWatchlist,
+    /// FreqModal Esc: cancel freq modal.
+    CancelFreqModal,
+    /// FreqModal Tab, FreqModal BackTab: freq modal switch field.
+    FreqModalSwitchField,
+    /// FreqModal character input: freq modal char.
+    FreqModalChar(char),
+    /// FreqModal Backspace: freq modal backspace.
+    FreqModalBackspace,
+    /// FreqModal Enter: submit freq modal.
+    SubmitFreqModal,
+    /// OffsetModal Esc: cancel offset modal.
+    CancelOffsetModal,
+    /// OffsetModal character input: offset modal char.
+    OffsetModalChar(char),
+    /// OffsetModal Backspace: offset modal backspace.
+    OffsetModalBackspace,
+    /// OffsetModal Enter: submit offset modal.
+    SubmitOffsetModal,
+    /// Compose Esc: cancel compose.
+    CancelCompose,
+    /// Compose Enter: send compose.
+    SendCompose,
+    /// Compose Backspace: compose backspace.
+    ComposeBackspace,
+    /// Compose character input: compose char.
+    ComposeChar(char),
+    /// Diagnostics Esc, Diagnostics Char('D'): close diagnostics.
+    CloseDiagnostics,
+    /// Diagnostics Up: diagnostics up.
+    DiagnosticsUp,
+    /// Diagnostics Down: diagnostics down.
+    DiagnosticsDown,
+    /// Health Esc, Health Char('S'): close health.
+    CloseHealth,
+    /// Health Up: health scroll up.
+    HealthScrollUp,
+    /// Health Down: health scroll down.
+    HealthScrollDown,
+    /// Health PageUp: health page up.
+    HealthPageUp,
+    /// Health PageDown: health page down.
+    HealthPageDown,
+    /// Health Home: health top.
+    HealthTop,
+    /// Health End: health bottom.
+    HealthBottom,
+    /// RecentQsos Esc, RecentQsos Char('R'): close recent qsos.
+    CloseRecentQsos,
+    /// RecentQsos Up: recent qsos up.
+    RecentQsosUp,
+    /// RecentQsos Down: recent qsos down.
+    RecentQsosDown,
+    /// Why Esc, Why Char('w'): close why.
+    CloseWhy,
+    /// Why Up: why up.
+    WhyUp,
+    /// Why Down: why down.
+    WhyDown,
 }
 
 impl Action {
     /// Every variant once, in declaration order (`ALL[i].ordinal() == i`).
-    pub const ALL: [Action; 68] = [
+    pub const ALL: [Action; 133] = [
         Action::EmergencyStop,
         Action::OpenQuitConfirm,
         Action::ToggleHelp,
@@ -218,6 +347,71 @@ impl Action {
         Action::ParkAtPlacement,
         Action::ToggleMonitoring,
         Action::ClearDecodes,
+        Action::AckOutOfBand,
+        Action::ConfirmQuit,
+        Action::CancelQuit,
+        Action::HelpScrollUp,
+        Action::HelpScrollDown,
+        Action::HelpPageUp,
+        Action::HelpPageDown,
+        Action::HelpTop,
+        Action::HelpBottom,
+        Action::CancelDevicePicker,
+        Action::DevicePickerSwitchList,
+        Action::DevicePickerUp,
+        Action::DevicePickerDown,
+        Action::ApplyDevices,
+        Action::CancelBookmarkName,
+        Action::BookmarkNameBackspace,
+        Action::BookmarkNameChar('a'),
+        Action::SaveBookmark,
+        Action::CancelBookmarkList,
+        Action::BookmarkListUp,
+        Action::BookmarkListDown,
+        Action::LoadBookmark,
+        Action::DeleteBookmark,
+        Action::CancelRigPicker,
+        Action::RigNextField,
+        Action::RigFieldUp,
+        Action::RigFieldDown,
+        Action::RigModelBackspace,
+        Action::RigModelChar('a'),
+        Action::OpenBookmarkList,
+        Action::StartBookmarkName,
+        Action::ApplyRig,
+        Action::CloseWatchlistModal,
+        Action::WatchlistBackspace,
+        Action::WatchlistChar('a'),
+        Action::SubmitWatchlist,
+        Action::CancelFreqModal,
+        Action::FreqModalSwitchField,
+        Action::FreqModalChar('a'),
+        Action::FreqModalBackspace,
+        Action::SubmitFreqModal,
+        Action::CancelOffsetModal,
+        Action::OffsetModalChar('a'),
+        Action::OffsetModalBackspace,
+        Action::SubmitOffsetModal,
+        Action::CancelCompose,
+        Action::SendCompose,
+        Action::ComposeBackspace,
+        Action::ComposeChar('a'),
+        Action::CloseDiagnostics,
+        Action::DiagnosticsUp,
+        Action::DiagnosticsDown,
+        Action::CloseHealth,
+        Action::HealthScrollUp,
+        Action::HealthScrollDown,
+        Action::HealthPageUp,
+        Action::HealthPageDown,
+        Action::HealthTop,
+        Action::HealthBottom,
+        Action::CloseRecentQsos,
+        Action::RecentQsosUp,
+        Action::RecentQsosDown,
+        Action::CloseWhy,
+        Action::WhyUp,
+        Action::WhyDown,
     ];
 
     /// Position in [`Action::ALL`]. Exhaustive with no `_` arm, so a new
@@ -293,6 +487,71 @@ impl Action {
             Action::ParkAtPlacement => 65,
             Action::ToggleMonitoring => 66,
             Action::ClearDecodes => 67,
+            Action::AckOutOfBand => 68,
+            Action::ConfirmQuit => 69,
+            Action::CancelQuit => 70,
+            Action::HelpScrollUp => 71,
+            Action::HelpScrollDown => 72,
+            Action::HelpPageUp => 73,
+            Action::HelpPageDown => 74,
+            Action::HelpTop => 75,
+            Action::HelpBottom => 76,
+            Action::CancelDevicePicker => 77,
+            Action::DevicePickerSwitchList => 78,
+            Action::DevicePickerUp => 79,
+            Action::DevicePickerDown => 80,
+            Action::ApplyDevices => 81,
+            Action::CancelBookmarkName => 82,
+            Action::BookmarkNameBackspace => 83,
+            Action::BookmarkNameChar(_) => 84,
+            Action::SaveBookmark => 85,
+            Action::CancelBookmarkList => 86,
+            Action::BookmarkListUp => 87,
+            Action::BookmarkListDown => 88,
+            Action::LoadBookmark => 89,
+            Action::DeleteBookmark => 90,
+            Action::CancelRigPicker => 91,
+            Action::RigNextField => 92,
+            Action::RigFieldUp => 93,
+            Action::RigFieldDown => 94,
+            Action::RigModelBackspace => 95,
+            Action::RigModelChar(_) => 96,
+            Action::OpenBookmarkList => 97,
+            Action::StartBookmarkName => 98,
+            Action::ApplyRig => 99,
+            Action::CloseWatchlistModal => 100,
+            Action::WatchlistBackspace => 101,
+            Action::WatchlistChar(_) => 102,
+            Action::SubmitWatchlist => 103,
+            Action::CancelFreqModal => 104,
+            Action::FreqModalSwitchField => 105,
+            Action::FreqModalChar(_) => 106,
+            Action::FreqModalBackspace => 107,
+            Action::SubmitFreqModal => 108,
+            Action::CancelOffsetModal => 109,
+            Action::OffsetModalChar(_) => 110,
+            Action::OffsetModalBackspace => 111,
+            Action::SubmitOffsetModal => 112,
+            Action::CancelCompose => 113,
+            Action::SendCompose => 114,
+            Action::ComposeBackspace => 115,
+            Action::ComposeChar(_) => 116,
+            Action::CloseDiagnostics => 117,
+            Action::DiagnosticsUp => 118,
+            Action::DiagnosticsDown => 119,
+            Action::CloseHealth => 120,
+            Action::HealthScrollUp => 121,
+            Action::HealthScrollDown => 122,
+            Action::HealthPageUp => 123,
+            Action::HealthPageDown => 124,
+            Action::HealthTop => 125,
+            Action::HealthBottom => 126,
+            Action::CloseRecentQsos => 127,
+            Action::RecentQsosUp => 128,
+            Action::RecentQsosDown => 129,
+            Action::CloseWhy => 130,
+            Action::WhyUp => 131,
+            Action::WhyDown => 132,
         }
     }
 
@@ -312,7 +571,8 @@ impl Action {
             | Action::ToggleFoxMode
             | Action::ResendLastTx
             | Action::CallOrReplySelected
-            | Action::ReplyToSelectedCaller => true,
+            | Action::ReplyToSelectedCaller
+            | Action::SendCompose => true,
             Action::EmergencyStop
             | Action::OpenQuitConfirm
             | Action::ToggleHelp
@@ -369,7 +629,71 @@ impl Action {
             | Action::AbortSelectedQso
             | Action::ParkAtPlacement
             | Action::ToggleMonitoring
-            | Action::ClearDecodes => false,
+            | Action::ClearDecodes
+            | Action::AckOutOfBand
+            | Action::ConfirmQuit
+            | Action::CancelQuit
+            | Action::HelpScrollUp
+            | Action::HelpScrollDown
+            | Action::HelpPageUp
+            | Action::HelpPageDown
+            | Action::HelpTop
+            | Action::HelpBottom
+            | Action::CancelDevicePicker
+            | Action::DevicePickerSwitchList
+            | Action::DevicePickerUp
+            | Action::DevicePickerDown
+            | Action::ApplyDevices
+            | Action::CancelBookmarkName
+            | Action::BookmarkNameBackspace
+            | Action::BookmarkNameChar(_)
+            | Action::SaveBookmark
+            | Action::CancelBookmarkList
+            | Action::BookmarkListUp
+            | Action::BookmarkListDown
+            | Action::LoadBookmark
+            | Action::DeleteBookmark
+            | Action::CancelRigPicker
+            | Action::RigNextField
+            | Action::RigFieldUp
+            | Action::RigFieldDown
+            | Action::RigModelBackspace
+            | Action::RigModelChar(_)
+            | Action::OpenBookmarkList
+            | Action::StartBookmarkName
+            | Action::ApplyRig
+            | Action::CloseWatchlistModal
+            | Action::WatchlistBackspace
+            | Action::WatchlistChar(_)
+            | Action::SubmitWatchlist
+            | Action::CancelFreqModal
+            | Action::FreqModalSwitchField
+            | Action::FreqModalChar(_)
+            | Action::FreqModalBackspace
+            | Action::SubmitFreqModal
+            | Action::CancelOffsetModal
+            | Action::OffsetModalChar(_)
+            | Action::OffsetModalBackspace
+            | Action::SubmitOffsetModal
+            | Action::CancelCompose
+            | Action::ComposeBackspace
+            | Action::ComposeChar(_)
+            | Action::CloseDiagnostics
+            | Action::DiagnosticsUp
+            | Action::DiagnosticsDown
+            | Action::CloseHealth
+            | Action::HealthScrollUp
+            | Action::HealthScrollDown
+            | Action::HealthPageUp
+            | Action::HealthPageDown
+            | Action::HealthTop
+            | Action::HealthBottom
+            | Action::CloseRecentQsos
+            | Action::RecentQsosUp
+            | Action::RecentQsosDown
+            | Action::CloseWhy
+            | Action::WhyUp
+            | Action::WhyDown => false,
         }
     }
 }

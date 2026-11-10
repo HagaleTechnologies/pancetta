@@ -1161,7 +1161,37 @@ impl TuiRunner {
         Ok(())
     }
 
-    /// Handle keyboard events
+    /// Current terminal viewport, with the legacy headless fallback.
+    fn overlay_viewport(&self) -> Rect {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.size().ok())
+            .map(|s| Rect::new(0, 0, s.width, s.height))
+            .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24))
+    }
+
+    fn help_scroll_bounds(&self) -> (u16, u16) {
+        let geom = help_overlay_geometry(self.overlay_viewport());
+        (geom.max_scroll, geom.body_height.max(1))
+    }
+
+    fn health_scroll_bounds(&self, app: &App) -> (u16, u16) {
+        crate::ui::health_panel_scroll_bounds(self.overlay_viewport(), app)
+    }
+
+    fn clamp_overlay_scroll(&self, scope: crate::keymap::Scope, app: &mut App) {
+        match scope {
+            crate::keymap::Scope::Help => {
+                app.help_scroll = app.help_scroll.min(self.help_scroll_bounds().0)
+            }
+            crate::keymap::Scope::Health => {
+                app.health_scroll = app.health_scroll.min(self.health_scroll_bounds(app).0)
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve a key once and dispatch exactly one operator action.
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         // Operator-presence stamp (FCC §97.221): ANY key the operator presses is
         // proof they are at the console, which lets the autonomous engine
@@ -1176,652 +1206,496 @@ impl TuiRunner {
 
         let mut app = self.app.write().await;
 
-        // === Emergency stop (hb-161: Phase 5 safety driver) ===
-        // Shift+Q halts the station without exiting. Distinct from
-        // lowercase `q` (quit-confirm). Checked before every modal and
-        // overlay below, because each of those ends in `_ => {}` +
-        // `return Ok(true)` and would otherwise swallow it (PAN-113). Any
-        // modifiers are accepted, and the open dialog is left as it is. In
-        // the text-entry modals (compose, rig model, bookmark name) this
-        // means Shift+Q stops the station instead of typing `Q`.
-        // The coordinator handles the event: aborts in-flight TX, disables
-        // autonomous at runtime, stops the repeating CQ + active tune, and
-        // logs at WARN. The TUI also flips `stopped_by_operator` locally so
-        // the banner appears immediately — no round-trip needed for the
-        // visual signal.
-        // The key resolves through the `KEYBINDINGS` Global-scope chord
-        // (PAN-327), so no dialog below can forget it.
-        if crate::keymap::resolve_global(key) == Some(Action::EmergencyStop) {
-            #[cfg(test)]
-            self.dispatched.push(Action::EmergencyStop);
-            self.emergency_stop(&mut app)?;
-            return Ok(true);
+        // Global emergency stop precedes all dialog chords and text entry.
+        let ctx = crate::keymap::KeyContext::from_app(&app);
+        let action = crate::keymap::resolve(&ctx, key);
+        // Help and Health clamp even swallowed keys, except emergency stop.
+        if action != Some(Action::EmergencyStop) {
+            self.clamp_overlay_scroll(ctx.scope, &mut app);
         }
-
-        // Required out-of-band acknowledgment modal — must be dismissed first.
-        if app.out_of_band_ack_visible {
-            match key.code {
-                KeyCode::Enter | KeyCode::Esc => {
-                    app.out_of_band_ack_visible = false;
-                    app.status_message = "Out-of-band TX acknowledged".to_string();
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // If quit-confirm modal is visible, route keys there
-        if app.quit_confirm_visible {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    app.quit_confirm_visible = false;
-                    let _ = self.message_tx.send(TuiCommand::Quit);
-                    return Ok(false);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
-                    app.quit_confirm_visible = false;
-                    app.status_message = "Quit cancelled".to_string();
-                }
-                _ => {} // swallow all other keys
-            }
-            return Ok(true);
-        }
-
-        // If help overlay is visible, route keys to help handler. Same
-        // read-only-overlay rationale as the Diagnostics/Recent-QSOs/
-        // station-health overlays below: `k` falls through to the global
-        // QSO-abort even while help is open (PAN-24) — otherwise the help
-        // text's own "k — abort QSO (any panel)" line would be false while
-        // the panel advertising it is on screen.
-        if app.help_visible {
-            // PAN-88: scroll keys, clamped against the real terminal size so
-            // no press is wasted after overshooting (80×24 in unit tests,
-            // which have no terminal).
-            let viewport = self
-                .terminal
-                .as_ref()
-                .and_then(|t| t.size().ok())
-                .map(|s| Rect::new(0, 0, s.width, s.height))
-                .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24));
-            let geom = help_overlay_geometry(viewport);
-            let page = geom.body_height.max(1);
-            // A resize since the last key can leave the stored offset past
-            // the new maximum; clamp it so Up/PageUp move on the first press.
-            app.help_scroll = app.help_scroll.min(geom.max_scroll);
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => {
-                    app.toggle_help();
-                }
-                KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
-                KeyCode::Down => {
-                    app.help_scroll = app.help_scroll.saturating_add(1).min(geom.max_scroll)
-                }
-                KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(page),
-                KeyCode::PageDown => {
-                    app.help_scroll = app.help_scroll.saturating_add(page).min(geom.max_scroll)
-                }
-                KeyCode::Home => app.help_scroll = 0,
-                KeyCode::End => app.help_scroll = geom.max_scroll,
-                // Bare `k` only — see the modifier-guard comment on the
-                // global abort handler below for why.
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
-                }
-                _ => {} // swallow all other keys while help is open
-            }
-            return Ok(true);
-        }
-
-        // If device selection modal is visible, route keys there
-        if app.device_selection.visible {
-            match key.code {
-                KeyCode::Esc => {
-                    app.device_selection.visible = false;
-                    app.status_message = "Device selection cancelled".to_string();
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    app.device_selection.toggle_panel();
-                }
-                KeyCode::Up => {
-                    app.device_selection.move_up();
-                }
-                KeyCode::Down => {
-                    app.device_selection.move_down();
-                }
-                KeyCode::Enter => {
-                    let input = app.device_selection.selected_input_name();
-                    let output = app.device_selection.selected_output_name();
-                    app.device_selection.visible = false;
-
-                    let msg = format!(
-                        "Devices: IN={} OUT={}",
-                        input.as_deref().unwrap_or("(none)"),
-                        output.as_deref().unwrap_or("(none)")
-                    );
-                    app.status_message = msg;
-
-                    self.message_tx.send(TuiCommand::SelectDevice {
-                        input_device: input,
-                        output_device: output,
-                    })?;
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // If rig config picker modal is visible, route keys there (PAN-59;
-        // bookmark overlay/name-input sub-states added PAN-61)
-        if app.rig_selection.visible {
-            if app.rig_selection.naming_bookmark {
-                match key.code {
-                    KeyCode::Esc => {
-                        app.rig_selection.naming_bookmark = false;
-                        app.rig_selection.bookmark_name_input.clear();
-                        app.status_message = "Save bookmark cancelled".to_string();
-                    }
-                    KeyCode::Backspace => {
-                        app.rig_selection.pop_bookmark_name_char();
-                    }
-                    KeyCode::Char(c) if !c.is_control() => {
-                        app.rig_selection.push_bookmark_name_char(c);
-                    }
-                    KeyCode::Enter => {
-                        let name = app.rig_selection.bookmark_name_input.trim().to_string();
-                        let port = app.rig_selection.selected_port();
-                        if name.is_empty() {
-                            app.status_message = "Bookmark name cannot be empty".to_string();
-                        } else if port.is_empty() {
-                            // Mirrors the I-2b fix on the main form's Enter
-                            // key (below): an empty port would silently
-                            // reselect whatever device happens to be first
-                            // in `available_ports` on load. Refuse instead.
-                            app.status_message =
-                                "No port selected — cannot save bookmark".to_string();
-                        } else {
-                            app.rig_selection.naming_bookmark = false;
-                            app.rig_selection.bookmark_name_input.clear();
-                            self.message_tx.send(TuiCommand::SaveRigBookmark {
-                                name,
-                                model: app.rig_selection.model.clone(),
-                                port,
-                                baud_rate: app.rig_selection.selected_baud(),
-                                ptt_method: app.rig_selection.selected_ptt(),
-                            })?;
-                            app.status_message = "Saving bookmark…".to_string();
-                        }
-                    }
-                    _ => {}
-                }
-                return Ok(true);
-            }
-
-            if app.rig_selection.bookmark_overlay_visible {
-                match key.code {
-                    KeyCode::Esc => {
-                        app.rig_selection.bookmark_overlay_visible = false;
-                        app.status_message = "Load bookmark cancelled".to_string();
-                    }
-                    KeyCode::Up => {
-                        app.rig_selection.move_bookmark_selection_up();
-                    }
-                    KeyCode::Down => {
-                        app.rig_selection.move_bookmark_selection_down();
-                    }
-                    KeyCode::Enter => {
-                        if app.rig_selection.bookmarks.is_empty() {
-                            app.status_message = "No saved bookmarks".to_string();
-                        } else {
-                            let idx = app.rig_selection.selected_bookmark_idx;
-                            // I-12 fix (PAN-61 review round 5): load_bookmark
-                            // now rejects (rather than partially applying)
-                            // a bookmark with an unrepresentable baud/PTT
-                            // value -- surface that reason and keep the
-                            // overlay open so the operator can pick a
-                            // different bookmark or Esc out, instead of
-                            // silently closing on a load that didn't fully
-                            // happen.
-                            match app.rig_selection.load_bookmark(idx) {
-                                Ok(()) => {
-                                    app.rig_selection.bookmark_overlay_visible = false;
-                                    app.status_message =
-                                        "Bookmark loaded — Enter to apply".to_string();
-                                }
-                                Err(reason) => {
-                                    app.status_message = reason;
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('x') => {
-                        if let Some(bookmark) = app
-                            .rig_selection
-                            .bookmarks
-                            .get(app.rig_selection.selected_bookmark_idx)
-                        {
-                            let name = bookmark.name.clone();
-                            self.message_tx
-                                .send(TuiCommand::DeleteRigBookmark { name })?;
-                            app.status_message = "Deleting bookmark…".to_string();
-                        }
-                    }
-                    _ => {}
-                }
-                return Ok(true);
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    // I-3 fix (PAN-59 final review): restore the live
-                    // fields from the committed snapshot BEFORE hiding the
-                    // modal, so an abandoned edit (e.g. garbage typed into
-                    // Model) doesn't linger in `RigSelectionState` to be
-                    // picked up by a LATER, unrelated Enter press the next
-                    // time the modal opens.
-                    app.rig_selection.restore_committed();
-                    app.rig_selection.visible = false;
-                    app.status_message = "Rig config picker cancelled".to_string();
-                }
-                KeyCode::Tab => {
-                    app.rig_selection.next_field();
-                }
-                KeyCode::Up => {
-                    app.rig_selection.move_up();
-                }
-                KeyCode::Down => {
-                    app.rig_selection.move_down();
-                }
-                KeyCode::Backspace
-                    if app.rig_selection.active_field == crate::app::RigField::Model =>
-                {
-                    app.rig_selection.pop_model_char();
-                }
-                KeyCode::Char(c)
-                    if app.rig_selection.active_field == crate::app::RigField::Model
-                        && !c.is_control() =>
-                {
-                    app.rig_selection.push_model_char(c);
-                }
-                KeyCode::F(2) => {
-                    app.rig_selection.bookmark_overlay_visible = true;
-                    app.rig_selection.selected_bookmark_idx = 0;
-                    app.status_message =
-                        "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
-                            .to_string();
-                }
-                KeyCode::F(3) => {
-                    app.rig_selection.naming_bookmark = true;
-                    app.rig_selection.bookmark_name_input.clear();
-                    app.status_message =
-                        "Name this bookmark (Enter: save, Esc: cancel)".to_string();
-                }
-                KeyCode::Enter => {
-                    let port = app.rig_selection.selected_port();
-                    if port.is_empty() {
-                        // I-2b fix (PAN-59 final review): no ports were
-                        // enumerated (or none is selected) -- submitting
-                        // now would persist `port = ""` into
-                        // ~/.pancetta/pancetta.toml, destroying whatever
-                        // was previously configured there. Refuse and keep
-                        // the modal open instead.
-                        app.status_message = "No port selected — cannot apply".to_string();
-                    } else {
-                        app.rig_selection.visible = false;
-                        self.message_tx.send(TuiCommand::SelectRig {
-                            model: app.rig_selection.model.clone(),
-                            port,
-                            baud_rate: app.rig_selection.selected_baud(),
-                            ptt_method: app.rig_selection.selected_ptt(),
-                        })?;
-                        // I-3 fix (PAN-59 final review): sync the committed
-                        // snapshot to the just-applied values so a later
-                        // open/cancel cycle doesn't revert past them.
-                        app.rig_selection.snapshot_committed();
-                        // PAN-60 review: replies read before the coordinator
-                        // handles this SelectRig must not revert the form.
-                        app.rig_selection.submits_sent += 1;
-                        app.status_message = "Applying rig config…".to_string();
-                    }
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        if app.watchlist_modal.visible {
-            match key.code {
-                KeyCode::Esc => app.watchlist_modal.visible = false,
-                KeyCode::Backspace => {
-                    app.watchlist_modal.buffer.pop();
-                }
-                KeyCode::Char(c) => app.watchlist_modal.buffer.push(c),
-                KeyCode::Enter => {
-                    let callsign = app.watchlist_modal.buffer.trim().to_uppercase();
-                    if callsign.is_empty() {
-                        app.status_message = "Enter a callsign to watch".into();
-                    } else {
-                        let action = if app.pinned_callsigns.contains(&callsign) {
-                            "removed from"
-                        } else {
-                            "added to"
-                        };
-                        app.status_message = format!("{callsign} {action} watchlist");
-                        self.message_tx
-                            .send(TuiCommand::WatchlistToggle { callsign })?;
-                        app.watchlist_modal.visible = false;
-                    }
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // Frequency-entry modal (Shift+F): two MHz text fields.
-        if app.freq_modal.visible {
-            match key.code {
-                KeyCode::Esc => {
-                    app.freq_modal.visible = false;
-                    app.status_message = "Frequency entry cancelled".to_string();
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    app.freq_modal.field = match app.freq_modal.field {
-                        crate::app::FreqModalField::RxDial => crate::app::FreqModalField::TxSplit,
-                        crate::app::FreqModalField::TxSplit => crate::app::FreqModalField::RxDial,
-                    };
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => match app.freq_modal.field {
-                    crate::app::FreqModalField::RxDial => app.freq_modal.rx_buffer.push(c),
-                    crate::app::FreqModalField::TxSplit => app.freq_modal.tx_buffer.push(c),
-                },
-                KeyCode::Backspace => match app.freq_modal.field {
-                    crate::app::FreqModalField::RxDial => {
-                        app.freq_modal.rx_buffer.pop();
-                    }
-                    crate::app::FreqModalField::TxSplit => {
-                        app.freq_modal.tx_buffer.pop();
-                    }
-                },
-                KeyCode::Enter => {
-                    let rx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.rx_buffer);
-                    let tx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.tx_buffer); // None = simplex
-                    match rx_hz {
-                        None => {
-                            app.status_message =
-                                "Invalid RX dial — enter MHz e.g. 14.085".to_string();
-                        }
-                        Some(rx) => {
-                            app.freq_modal.visible = false;
-                            self.message_tx.send(TuiCommand::SetFrequency {
-                                vfo: 0,
-                                frequency: rx,
-                            })?;
-                            let (split_enabled, split_freq) = match tx_hz {
-                                Some(tx) => (true, tx),
-                                None => (false, 0),
-                            };
-                            app.split_tx_hz = split_freq;
-                            self.message_tx.send(TuiCommand::SetSplit {
-                                enabled: split_enabled,
-                                tx_frequency: split_freq,
-                            })?;
-                            // Out-of-band check on the effective TX RF + current offset.
-                            let tx_dial = if split_enabled { split_freq } else { rx };
-                            let tx_rf = tx_dial + app.tx_frequency_offset as u64;
-                            if crate::app::tx_rf_out_of_band_plan(tx_rf, &app.config.band_plan)
-                                && !app.out_of_band_warned
-                            {
-                                app.out_of_band_warned = true;
-                                app.out_of_band_ack_visible = true;
-                                app.out_of_band_rf_hz = tx_rf;
-                            }
-                            app.status_message = if split_enabled {
-                                format!(
-                                    "Dial {:.3} MHz, SPLIT TX {:.3} MHz",
-                                    rx as f64 / 1e6,
-                                    split_freq as f64 / 1e6
-                                )
-                            } else {
-                                format!("Dial {:.3} MHz (simplex)", rx as f64 / 1e6)
-                            };
-                            app.freq_modal.rx_buffer.clear();
-                            app.freq_modal.tx_buffer.clear();
-                            app.freq_modal.field = crate::app::FreqModalField::RxDial;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // TX-audio-offset modal (`o`): single integer Hz field, range 200–2900.
-        // Blank Enter = clear → Auto; valid number → SetTxOffset{Some(hz)};
-        // out-of-range → reject with status message; Esc = cancel.
-        if app.offset_modal.visible {
-            match key.code {
-                KeyCode::Esc => {
-                    app.offset_modal.visible = false;
-                    app.status_message = "TX offset entry cancelled".to_string();
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    app.offset_modal.buffer.push(c);
-                }
-                KeyCode::Backspace => {
-                    app.offset_modal.buffer.pop();
-                }
-                KeyCode::Enter => {
-                    let trimmed = app.offset_modal.buffer.trim().to_string();
-                    if trimmed.is_empty() {
-                        // Blank → clear held offset → Auto
-                        app.offset_modal.visible = false;
-                        app.offset_modal.buffer.clear();
-                        app.tx_offset_hold_hz = None;
-                        app.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
-                        app.status_message = "TX offset auto (Tx=Rx)".to_string();
-                        self.message_tx
-                            .send(TuiCommand::SetTxOffset { offset_hz: None })?;
-                    } else {
-                        match crate::app::parse_hz(&trimmed) {
-                            Some(hz)
-                                if (crate::app::TX_OFFSET_MIN_HZ
-                                    ..=crate::app::TX_OFFSET_MAX_HZ)
-                                    .contains(&hz) =>
-                            {
-                                app.offset_modal.visible = false;
-                                app.offset_modal.buffer.clear();
-                                app.tx_offset_hold_hz = Some(hz);
-                                app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                                app.status_message = format!("TX offset held @ {} Hz", hz);
-                                self.message_tx.send(TuiCommand::SetTxOffset {
-                                    offset_hz: Some(hz),
-                                })?;
-                            }
-                            _ => {
-                                app.status_message = format!(
-                                    "Invalid offset — enter {} to {} Hz (blank = Auto)",
-                                    crate::app::TX_OFFSET_MIN_HZ,
-                                    crate::app::TX_OFFSET_MAX_HZ
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // Compose (free-text TX) mode. While active, the keyboard is a text
-        // editor — Char/Backspace edit the TX buffer, Enter sends + exits, Esc
-        // cancels + exits. Command letters are intentionally inert here so the
-        // operator can type a callsign/message without firing c/s/k/g. This is
-        // the explicit command-vs-text-input split (UX audit Batch 1).
-        if app.compose_mode {
-            match key.code {
-                KeyCode::Esc => {
-                    app.cancel_compose_mode();
-                }
-                KeyCode::Enter => {
-                    let text = app.get_input_text();
-                    if text.trim().is_empty() {
-                        app.cancel_compose_mode();
-                    } else {
-                        self.message_tx.send(TuiCommand::SendMessage {
-                            text: text.clone(),
-                            frequency_offset: app.tx_frequency_offset,
-                        })?;
-                        app.clear_input();
-                        app.compose_mode = false;
-                        app.status_message = format!("TX sent: {}", text);
-                    }
-                }
-                KeyCode::Backspace => {
-                    app.delete_char();
-                }
-                KeyCode::Char(c) => {
-                    app.input_char(c);
-                }
-                _ => {} // swallow other keys while composing
-            }
-            return Ok(true);
-        }
-
-        // Diagnostics overlay (docs/observability-diagnostics-plan.md). A
-        // read-only scrollback of retained DiagnosticEvents, so unlike the
-        // input modals above there is no text-entry surface — just dismiss
-        // (Esc or the same Shift+D toggle) and scroll (Up/Down). PAN-21
-        // dropped the j/k vim-scroll aliases (the only real `k`-collision in
-        // the app — see the global-abort comment below) so `k` here falls
-        // through to the same global QSO-abort as everywhere else: this is a
-        // read-only informational view, not a modal the operator is editing,
-        // so "abort from any panel" should include "abort while this is open".
-        if app.show_diagnostics {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('D') => {
-                    app.show_diagnostics = false;
-                }
-                KeyCode::Up => {
-                    app.diagnostics_scroll = app.diagnostics_scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    let max = app.diagnostic_events.len().saturating_sub(1);
-                    app.diagnostics_scroll = (app.diagnostics_scroll + 1).min(max);
-                }
-                // Bare `k` only — see the modifier-guard comment on the
-                // global abort handler below for why.
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
-                }
-                _ => {} // swallow other keys while the overlay is open
-            }
-            return Ok(true);
-        }
-
-        // Station-health panel (docs/observability-diagnostics-plan.md Layer
-        // 3). A read-only snapshot. Same as the Diagnostics/Recent-QSOs
-        // overlays, it's a read-only informational view rather than a modal
-        // the operator is editing, so `k` falls through to the global
-        // QSO-abort here too (PAN-21 round-1 remediation).
-        if app.show_health {
-            // PAN-89: the readiness section can outgrow the panel, so it
-            // scrolls; clamped against the real terminal size like the `?`
-            // overlay (80×24 in unit tests, which have no terminal).
-            let viewport = self
-                .terminal
-                .as_ref()
-                .and_then(|t| t.size().ok())
-                .map(|s| Rect::new(0, 0, s.width, s.height))
-                .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24));
-            let (max_scroll, page) = crate::ui::health_panel_scroll_bounds(viewport, &app);
-            app.health_scroll = app.health_scroll.min(max_scroll);
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('S') => {
-                    app.show_health = false;
-                }
-                KeyCode::Up => app.health_scroll = app.health_scroll.saturating_sub(1),
-                KeyCode::Down => {
-                    app.health_scroll = app.health_scroll.saturating_add(1).min(max_scroll)
-                }
-                KeyCode::PageUp => app.health_scroll = app.health_scroll.saturating_sub(page),
-                KeyCode::PageDown => {
-                    app.health_scroll = app.health_scroll.saturating_add(page).min(max_scroll)
-                }
-                KeyCode::Home => app.health_scroll = 0,
-                KeyCode::End => app.health_scroll = max_scroll,
-                // Bare `k` only — see the modifier-guard comment on the
-                // global abort handler below for why.
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
-                }
-                _ => {} // swallow other keys while the overlay is open
-            }
-            return Ok(true);
-        }
-
-        // Recent-QSOs panel (docs/observability-diagnostics-plan.md Layer
-        // 2). Same read-only-scrollback shape as the Diagnostics overlay
-        // above — dismiss (Esc or the same Shift+R toggle) and scroll
-        // (Up/Down); j/k dropped and `k` falls through to global QSO-abort,
-        // same rationale as the Diagnostics overlay above.
-        if app.show_recent_qsos {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('R') => {
-                    app.show_recent_qsos = false;
-                }
-                KeyCode::Up => {
-                    app.recent_qsos_scroll = app.recent_qsos_scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    let max = app.recent_qsos.len().saturating_sub(1);
-                    app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
-                }
-                // Bare `k` only — see the modifier-guard comment on the
-                // global abort handler below for why.
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?;
-                }
-                _ => {} // swallow other keys while the overlay is open
-            }
-            return Ok(true);
-        }
-
-        if app.show_why {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('w') => app.show_why = false,
-                KeyCode::Up => app.why_scroll = app.why_scroll.saturating_sub(1),
-                KeyCode::Down => app.why_scroll = app.why_scroll.saturating_add(1),
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    self.abort_selected_qso(&mut app)?
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-
-        // Main view: the key resolves through the `KEYBINDINGS` chord table
-        // into one `Action` (PAN-327). Modifier guards (PAN-112) live on
-        // each chord as `keymap::Mods`: TX-starting chords refuse Ctrl/Alt
-        // (crossterm delivers Ctrl+C as Char('c') + CONTROL), and Ctrl+C is
-        // swallowed rather than mapped to quit-confirm (`q`); the keyboard
-        // remap spec (2026-04-29) moved bindings off Ctrl chords.
-        //
-        // NOTE: there is intentionally NO `Char(c)` text catch-all here.
-        // Outside compose mode every letter is a command; free-text input
-        // is reachable only via `/` (compose mode), so a stray keystroke
-        // can never silently fill the TX buffer or fire a command while the
-        // operator means to type. A key with no chord does nothing.
-        let ctx = crate::keymap::KeyContext::main_view(&app);
-        let Some(action) = crate::keymap::resolve(&ctx, key) else {
+        let Some(action) = action else {
             return Ok(true);
         };
         #[cfg(test)]
         self.dispatched.push(action);
 
         match action {
-            // hb-161: Esc clears the operator-stop banner without re-enabling
-            // anything. Re-enabling autonomous still requires `a`. Bound here
-            // (not in a modal-style early-return block) so other keys keep
-            // working — the banner is informational, not blocking.
+            Action::AckOutOfBand => {
+                app.out_of_band_ack_visible = false;
+                app.status_message = "Out-of-band TX acknowledged".to_string();
+            }
+
+            Action::ConfirmQuit => {
+                app.quit_confirm_visible = false;
+                let _ = self.message_tx.send(TuiCommand::Quit);
+                return Ok(false);
+            }
+
+            Action::CancelQuit => {
+                app.quit_confirm_visible = false;
+                app.status_message = "Quit cancelled".to_string();
+            }
+
+            Action::HelpScrollUp => app.help_scroll = app.help_scroll.saturating_sub(1),
+
+            Action::HelpScrollDown => {
+                let (max_scroll, _) = self.help_scroll_bounds();
+                app.help_scroll = app.help_scroll.saturating_add(1).min(max_scroll)
+            }
+
+            Action::HelpPageUp => {
+                let (_, page) = self.help_scroll_bounds();
+                app.help_scroll = app.help_scroll.saturating_sub(page)
+            }
+
+            Action::HelpPageDown => {
+                let (max_scroll, page) = self.help_scroll_bounds();
+                app.help_scroll = app.help_scroll.saturating_add(page).min(max_scroll)
+            }
+
+            Action::HelpTop => app.help_scroll = 0,
+
+            Action::HelpBottom => {
+                let (max_scroll, _) = self.help_scroll_bounds();
+                app.help_scroll = max_scroll
+            }
+
+            Action::CancelDevicePicker => {
+                app.device_selection.visible = false;
+                app.status_message = "Device selection cancelled".to_string();
+            }
+
+            Action::DevicePickerSwitchList => {
+                app.device_selection.toggle_panel();
+            }
+
+            Action::DevicePickerUp => {
+                app.device_selection.move_up();
+            }
+
+            Action::DevicePickerDown => {
+                app.device_selection.move_down();
+            }
+
+            Action::ApplyDevices => {
+                let input = app.device_selection.selected_input_name();
+                let output = app.device_selection.selected_output_name();
+                app.device_selection.visible = false;
+
+                let msg = format!(
+                    "Devices: IN={} OUT={}",
+                    input.as_deref().unwrap_or("(none)"),
+                    output.as_deref().unwrap_or("(none)")
+                );
+                app.status_message = msg;
+
+                self.message_tx.send(TuiCommand::SelectDevice {
+                    input_device: input,
+                    output_device: output,
+                })?;
+            }
+
+            Action::CancelBookmarkName => {
+                app.rig_selection.naming_bookmark = false;
+                app.rig_selection.bookmark_name_input.clear();
+                app.status_message = "Save bookmark cancelled".to_string();
+            }
+
+            Action::BookmarkNameBackspace => {
+                app.rig_selection.pop_bookmark_name_char();
+            }
+
+            Action::BookmarkNameChar(c) => {
+                app.rig_selection.push_bookmark_name_char(c);
+            }
+
+            Action::SaveBookmark => {
+                let name = app.rig_selection.bookmark_name_input.trim().to_string();
+                let port = app.rig_selection.selected_port();
+                if name.is_empty() {
+                    app.status_message = "Bookmark name cannot be empty".to_string();
+                } else if port.is_empty() {
+                    // Mirrors the I-2b fix on the main form's Enter
+                    // key (below): an empty port would silently
+                    // reselect whatever device happens to be first
+                    // in `available_ports` on load. Refuse instead.
+                    app.status_message = "No port selected — cannot save bookmark".to_string();
+                } else {
+                    app.rig_selection.naming_bookmark = false;
+                    app.rig_selection.bookmark_name_input.clear();
+                    self.message_tx.send(TuiCommand::SaveRigBookmark {
+                        name,
+                        model: app.rig_selection.model.clone(),
+                        port,
+                        baud_rate: app.rig_selection.selected_baud(),
+                        ptt_method: app.rig_selection.selected_ptt(),
+                    })?;
+                    app.status_message = "Saving bookmark…".to_string();
+                }
+            }
+
+            Action::CancelBookmarkList => {
+                app.rig_selection.bookmark_overlay_visible = false;
+                app.status_message = "Load bookmark cancelled".to_string();
+            }
+
+            Action::BookmarkListUp => {
+                app.rig_selection.move_bookmark_selection_up();
+            }
+
+            Action::BookmarkListDown => {
+                app.rig_selection.move_bookmark_selection_down();
+            }
+
+            Action::LoadBookmark => {
+                if app.rig_selection.bookmarks.is_empty() {
+                    app.status_message = "No saved bookmarks".to_string();
+                } else {
+                    let idx = app.rig_selection.selected_bookmark_idx;
+                    // I-12 fix (PAN-61 review round 5): load_bookmark
+                    // now rejects (rather than partially applying)
+                    // a bookmark with an unrepresentable baud/PTT
+                    // value -- surface that reason and keep the
+                    // overlay open so the operator can pick a
+                    // different bookmark or Esc out, instead of
+                    // silently closing on a load that didn't fully
+                    // happen.
+                    match app.rig_selection.load_bookmark(idx) {
+                        Ok(()) => {
+                            app.rig_selection.bookmark_overlay_visible = false;
+                            app.status_message = "Bookmark loaded — Enter to apply".to_string();
+                        }
+                        Err(reason) => {
+                            app.status_message = reason;
+                        }
+                    }
+                }
+            }
+
+            Action::DeleteBookmark => {
+                if let Some(bookmark) = app
+                    .rig_selection
+                    .bookmarks
+                    .get(app.rig_selection.selected_bookmark_idx)
+                {
+                    let name = bookmark.name.clone();
+                    self.message_tx
+                        .send(TuiCommand::DeleteRigBookmark { name })?;
+                    app.status_message = "Deleting bookmark…".to_string();
+                }
+            }
+
+            Action::CancelRigPicker => {
+                // I-3 fix (PAN-59 final review): restore the live
+                // fields from the committed snapshot BEFORE hiding the
+                // modal, so an abandoned edit (e.g. garbage typed into
+                // Model) doesn't linger in `RigSelectionState` to be
+                // picked up by a LATER, unrelated Enter press the next
+                // time the modal opens.
+                app.rig_selection.restore_committed();
+                app.rig_selection.visible = false;
+                app.status_message = "Rig config picker cancelled".to_string();
+            }
+
+            Action::RigNextField => {
+                app.rig_selection.next_field();
+            }
+
+            Action::RigFieldUp => {
+                app.rig_selection.move_up();
+            }
+
+            Action::RigFieldDown => {
+                app.rig_selection.move_down();
+            }
+
+            Action::RigModelBackspace => {
+                app.rig_selection.pop_model_char();
+            }
+
+            Action::RigModelChar(c) => {
+                app.rig_selection.push_model_char(c);
+            }
+
+            Action::OpenBookmarkList => {
+                app.rig_selection.bookmark_overlay_visible = true;
+                app.rig_selection.selected_bookmark_idx = 0;
+                app.status_message =
+                    "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
+                        .to_string();
+            }
+
+            Action::StartBookmarkName => {
+                app.rig_selection.naming_bookmark = true;
+                app.rig_selection.bookmark_name_input.clear();
+                app.status_message = "Name this bookmark (Enter: save, Esc: cancel)".to_string();
+            }
+
+            Action::ApplyRig => {
+                let port = app.rig_selection.selected_port();
+                if port.is_empty() {
+                    // I-2b fix (PAN-59 final review): no ports were
+                    // enumerated (or none is selected) -- submitting
+                    // now would persist `port = ""` into
+                    // ~/.pancetta/pancetta.toml, destroying whatever
+                    // was previously configured there. Refuse and keep
+                    // the modal open instead.
+                    app.status_message = "No port selected — cannot apply".to_string();
+                } else {
+                    app.rig_selection.visible = false;
+                    self.message_tx.send(TuiCommand::SelectRig {
+                        model: app.rig_selection.model.clone(),
+                        port,
+                        baud_rate: app.rig_selection.selected_baud(),
+                        ptt_method: app.rig_selection.selected_ptt(),
+                    })?;
+                    // I-3 fix (PAN-59 final review): sync the committed
+                    // snapshot to the just-applied values so a later
+                    // open/cancel cycle doesn't revert past them.
+                    app.rig_selection.snapshot_committed();
+                    // PAN-60 review: replies read before the coordinator
+                    // handles this SelectRig must not revert the form.
+                    app.rig_selection.submits_sent += 1;
+                    app.status_message = "Applying rig config…".to_string();
+                }
+            }
+
+            Action::CloseWatchlistModal => app.watchlist_modal.visible = false,
+
+            Action::WatchlistBackspace => {
+                app.watchlist_modal.buffer.pop();
+            }
+
+            Action::WatchlistChar(c) => app.watchlist_modal.buffer.push(c),
+
+            Action::SubmitWatchlist => {
+                let callsign = app.watchlist_modal.buffer.trim().to_uppercase();
+                if callsign.is_empty() {
+                    app.status_message = "Enter a callsign to watch".into();
+                } else {
+                    let action = if app.pinned_callsigns.contains(&callsign) {
+                        "removed from"
+                    } else {
+                        "added to"
+                    };
+                    app.status_message = format!("{callsign} {action} watchlist");
+                    self.message_tx
+                        .send(TuiCommand::WatchlistToggle { callsign })?;
+                    app.watchlist_modal.visible = false;
+                }
+            }
+
+            Action::CancelFreqModal => {
+                app.freq_modal.visible = false;
+                app.status_message = "Frequency entry cancelled".to_string();
+            }
+
+            Action::FreqModalSwitchField => {
+                app.freq_modal.field = match app.freq_modal.field {
+                    crate::app::FreqModalField::RxDial => crate::app::FreqModalField::TxSplit,
+                    crate::app::FreqModalField::TxSplit => crate::app::FreqModalField::RxDial,
+                };
+            }
+
+            Action::FreqModalChar(c) => match app.freq_modal.field {
+                crate::app::FreqModalField::RxDial => app.freq_modal.rx_buffer.push(c),
+                crate::app::FreqModalField::TxSplit => app.freq_modal.tx_buffer.push(c),
+            },
+
+            Action::FreqModalBackspace => match app.freq_modal.field {
+                crate::app::FreqModalField::RxDial => {
+                    app.freq_modal.rx_buffer.pop();
+                }
+                crate::app::FreqModalField::TxSplit => {
+                    app.freq_modal.tx_buffer.pop();
+                }
+            },
+
+            Action::SubmitFreqModal => {
+                let rx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.rx_buffer);
+                let tx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.tx_buffer); // None = simplex
+                match rx_hz {
+                    None => {
+                        app.status_message = "Invalid RX dial — enter MHz e.g. 14.085".to_string();
+                    }
+                    Some(rx) => {
+                        app.freq_modal.visible = false;
+                        self.message_tx.send(TuiCommand::SetFrequency {
+                            vfo: 0,
+                            frequency: rx,
+                        })?;
+                        let (split_enabled, split_freq) = match tx_hz {
+                            Some(tx) => (true, tx),
+                            None => (false, 0),
+                        };
+                        app.split_tx_hz = split_freq;
+                        self.message_tx.send(TuiCommand::SetSplit {
+                            enabled: split_enabled,
+                            tx_frequency: split_freq,
+                        })?;
+                        // Out-of-band check on the effective TX RF + current offset.
+                        let tx_dial = if split_enabled { split_freq } else { rx };
+                        let tx_rf = tx_dial + app.tx_frequency_offset as u64;
+                        if crate::app::tx_rf_out_of_band_plan(tx_rf, &app.config.band_plan)
+                            && !app.out_of_band_warned
+                        {
+                            app.out_of_band_warned = true;
+                            app.out_of_band_ack_visible = true;
+                            app.out_of_band_rf_hz = tx_rf;
+                        }
+                        app.status_message = if split_enabled {
+                            format!(
+                                "Dial {:.3} MHz, SPLIT TX {:.3} MHz",
+                                rx as f64 / 1e6,
+                                split_freq as f64 / 1e6
+                            )
+                        } else {
+                            format!("Dial {:.3} MHz (simplex)", rx as f64 / 1e6)
+                        };
+                        app.freq_modal.rx_buffer.clear();
+                        app.freq_modal.tx_buffer.clear();
+                        app.freq_modal.field = crate::app::FreqModalField::RxDial;
+                    }
+                }
+            }
+
+            Action::CancelOffsetModal => {
+                app.offset_modal.visible = false;
+                app.status_message = "TX offset entry cancelled".to_string();
+            }
+
+            Action::OffsetModalChar(c) => {
+                app.offset_modal.buffer.push(c);
+            }
+
+            Action::OffsetModalBackspace => {
+                app.offset_modal.buffer.pop();
+            }
+
+            Action::SubmitOffsetModal => {
+                let trimmed = app.offset_modal.buffer.trim().to_string();
+                if trimmed.is_empty() {
+                    // Blank → clear held offset → Auto
+                    app.offset_modal.visible = false;
+                    app.offset_modal.buffer.clear();
+                    app.tx_offset_hold_hz = None;
+                    app.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
+                    app.status_message = "TX offset auto (Tx=Rx)".to_string();
+                    self.message_tx
+                        .send(TuiCommand::SetTxOffset { offset_hz: None })?;
+                } else {
+                    match crate::app::parse_hz(&trimmed) {
+                        Some(hz)
+                            if (crate::app::TX_OFFSET_MIN_HZ..=crate::app::TX_OFFSET_MAX_HZ)
+                                .contains(&hz) =>
+                        {
+                            app.offset_modal.visible = false;
+                            app.offset_modal.buffer.clear();
+                            app.tx_offset_hold_hz = Some(hz);
+                            app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+                            app.status_message = format!("TX offset held @ {} Hz", hz);
+                            self.message_tx.send(TuiCommand::SetTxOffset {
+                                offset_hz: Some(hz),
+                            })?;
+                        }
+                        _ => {
+                            app.status_message = format!(
+                                "Invalid offset — enter {} to {} Hz (blank = Auto)",
+                                crate::app::TX_OFFSET_MIN_HZ,
+                                crate::app::TX_OFFSET_MAX_HZ
+                            );
+                        }
+                    }
+                }
+            }
+
+            Action::CancelCompose => {
+                app.cancel_compose_mode();
+            }
+
+            Action::SendCompose => {
+                let text = app.get_input_text();
+                if text.trim().is_empty() {
+                    app.cancel_compose_mode();
+                } else {
+                    self.message_tx.send(TuiCommand::SendMessage {
+                        text: text.clone(),
+                        frequency_offset: app.tx_frequency_offset,
+                    })?;
+                    app.clear_input();
+                    app.compose_mode = false;
+                    app.status_message = format!("TX sent: {}", text);
+                }
+            }
+
+            Action::ComposeBackspace => {
+                app.delete_char();
+            }
+
+            Action::ComposeChar(c) => {
+                app.input_char(c);
+            }
+
+            Action::CloseDiagnostics => {
+                app.show_diagnostics = false;
+            }
+
+            Action::DiagnosticsUp => {
+                app.diagnostics_scroll = app.diagnostics_scroll.saturating_sub(1);
+            }
+
+            Action::DiagnosticsDown => {
+                let max = app.diagnostic_events.len().saturating_sub(1);
+                app.diagnostics_scroll = (app.diagnostics_scroll + 1).min(max);
+            }
+
+            Action::CloseHealth => {
+                app.show_health = false;
+            }
+
+            Action::HealthScrollUp => app.health_scroll = app.health_scroll.saturating_sub(1),
+
+            Action::HealthScrollDown => {
+                let (max_scroll, _) = self.health_scroll_bounds(&app);
+                app.health_scroll = app.health_scroll.saturating_add(1).min(max_scroll)
+            }
+
+            Action::HealthPageUp => {
+                let (_, page) = self.health_scroll_bounds(&app);
+                app.health_scroll = app.health_scroll.saturating_sub(page)
+            }
+
+            Action::HealthPageDown => {
+                let (max_scroll, page) = self.health_scroll_bounds(&app);
+                app.health_scroll = app.health_scroll.saturating_add(page).min(max_scroll)
+            }
+
+            Action::HealthTop => app.health_scroll = 0,
+
+            Action::HealthBottom => {
+                let (max_scroll, _) = self.health_scroll_bounds(&app);
+                app.health_scroll = max_scroll
+            }
+
+            Action::CloseRecentQsos => {
+                app.show_recent_qsos = false;
+            }
+
+            Action::RecentQsosUp => {
+                app.recent_qsos_scroll = app.recent_qsos_scroll.saturating_sub(1);
+            }
+
+            Action::RecentQsosDown => {
+                let max = app.recent_qsos.len().saturating_sub(1);
+                app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
+            }
+
+            Action::CloseWhy => app.show_why = false,
+
+            Action::WhyUp => app.why_scroll = app.why_scroll.saturating_sub(1),
+
+            Action::WhyDown => app.why_scroll = app.why_scroll.saturating_add(1),
+
             Action::ClearStopBanner => {
                 app.stopped_by_operator = false;
                 app.status_message = "Operator-stop banner cleared".to_string();
@@ -2007,9 +1881,10 @@ impl TuiRunner {
                     "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
             }
 
-            // Shift+Q (emergency stop) is dispatched at the top of this
-            // function, ahead of every modal (PAN-113); this arm only keeps
-            // the match exhaustive.
+            // Shift+Q (emergency stop) resolves in the Global scope, ahead of
+            // every dialog chord and text-entry rule (PAN-113). This arm is
+            // the only emergency-stop path in every scope: never make it a
+            // no-op.
             Action::EmergencyStop => {
                 self.emergency_stop(&mut app)?;
             }
@@ -2180,7 +2055,7 @@ impl TuiRunner {
             //
             // Guarded to a BARE `k` (`keymap::Mods::Bare`, PAN-21
             // round-2 remediation): crossterm reports Ctrl+K / Alt+K as the
-            // same `KeyCode::Char('k')` with the modifier carried separately
+            // same `Char('k')` with the modifier carried separately
             // in `key.modifiers`, so without this guard an operator's
             // Ctrl+K readline/terminal muscle memory (kill-line — nothing to
             // do with this app) would ALSO abort the QSO. That's exactly the
@@ -3530,12 +3405,37 @@ mod key_tests {
             .expect("some panel satisfies the condition")
         };
         match when {
+            When::RigModelField => app.rig_selection.active_field = crate::app::RigField::Model,
             When::Always => {}
             When::Panel(p) => app.active_panel = p,
             When::NotPanel(p) => app.active_panel = first_panel(&|q| q != p),
             When::NeitherPanel(a, b) => app.active_panel = first_panel(&|q| q != a && q != b),
             When::StopBanner => app.stopped_by_operator = true,
             When::ZoomNoBanner => app.zoomed = true,
+        }
+    }
+
+    fn enter_scope(app: &mut App, scope: crate::keymap::Scope) {
+        use crate::keymap::Scope;
+        match scope {
+            Scope::Global | Scope::Main => {}
+            Scope::OutOfBandAck => app.out_of_band_ack_visible = true,
+            Scope::QuitConfirm => app.quit_confirm_visible = true,
+            Scope::Help => app.help_visible = true,
+            Scope::DevicePicker => app.device_selection.visible = true,
+            Scope::RigBookmarkName | Scope::RigBookmarkList | Scope::RigForm => {
+                app.rig_selection.visible = true;
+                app.rig_selection.naming_bookmark = scope == Scope::RigBookmarkName;
+                app.rig_selection.bookmark_overlay_visible = scope == Scope::RigBookmarkList;
+            }
+            Scope::WatchlistModal => app.watchlist_modal.visible = true,
+            Scope::FreqModal => app.freq_modal.visible = true,
+            Scope::OffsetModal => app.offset_modal.visible = true,
+            Scope::Compose => app.compose_mode = true,
+            Scope::Diagnostics => app.show_diagnostics = true,
+            Scope::Health => app.show_health = true,
+            Scope::RecentQsos => app.show_recent_qsos = true,
+            Scope::Why => app.show_why = true,
         }
     }
 
@@ -3561,12 +3461,16 @@ mod key_tests {
                 };
                 for &mods in admitted {
                     let (mut runner, _cmd_rx, app) = make_runner().await;
-                    enter_context(&mut *app.write().await, chord.when);
+                    {
+                        let mut app = app.write().await;
+                        enter_scope(&mut app, chord.scope);
+                        enter_context(&mut app, chord.when);
+                    }
                     let result = runner
                         .handle_key_event(KeyEvent::new(chord.code, mods))
                         .await;
                     assert!(
-                        matches!(result, Ok(true)),
+                        result.is_ok(),
                         "row {:?}: {:?}+{mods:?} returned {result:?}",
                         row.key,
                         chord.code
@@ -3582,12 +3486,16 @@ mod key_tests {
                 }
                 for &mods in refused {
                     let (mut runner, _cmd_rx, app) = make_runner().await;
-                    enter_context(&mut *app.write().await, chord.when);
+                    {
+                        let mut app = app.write().await;
+                        enter_scope(&mut app, chord.scope);
+                        enter_context(&mut app, chord.when);
+                    }
                     let result = runner
                         .handle_key_event(KeyEvent::new(chord.code, mods))
                         .await;
                     assert!(
-                        matches!(result, Ok(true)),
+                        result.is_ok(),
                         "row {:?}: {:?}+{mods:?} returned {result:?}",
                         row.key,
                         chord.code
@@ -3599,6 +3507,92 @@ mod key_tests {
                         chord.code,
                         chord.action
                     );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_modal_key_fires_its_action_and_no_other() {
+        use crate::keymap::{Mods, MODAL_BINDINGS};
+        for chord in MODAL_BINDINGS {
+            for mods in [
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+            ] {
+                assert_eq!(chord.mods, Mods::Any);
+                let (mut runner, _rx, app) = make_runner().await;
+                {
+                    let mut app = app.write().await;
+                    enter_scope(&mut app, chord.scope);
+                    enter_context(&mut app, chord.when);
+                }
+                runner
+                    .handle_key_event(KeyEvent::new(chord.code, mods))
+                    .await
+                    .unwrap();
+                assert_eq!(runner.dispatched, vec![chord.action], "{chord:?} {mods:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_text_entry_scope_dispatches_its_char_action() {
+        use crate::keymap::Scope;
+        for scope in [
+            Scope::RigBookmarkName,
+            Scope::RigForm,
+            Scope::WatchlistModal,
+            Scope::FreqModal,
+            Scope::OffsetModal,
+            Scope::Compose,
+        ] {
+            for model in [false, true] {
+                for c in ['a', '7', '.', '\n', 'Q'] {
+                    for mods in [KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                        let (mut runner, _rx, app) = make_runner().await;
+                        let expected = {
+                            let mut app = app.write().await;
+                            enter_scope(&mut app, scope);
+                            app.rig_selection.active_field = if model {
+                                crate::app::RigField::Model
+                            } else {
+                                crate::app::RigField::Port
+                            };
+                            if c == 'Q' {
+                                Some(Action::EmergencyStop)
+                            } else {
+                                match scope {
+                                    Scope::RigBookmarkName if !c.is_control() => {
+                                        Some(Action::BookmarkNameChar(c))
+                                    }
+                                    Scope::RigForm if model && !c.is_control() => {
+                                        Some(Action::RigModelChar(c))
+                                    }
+                                    Scope::WatchlistModal => Some(Action::WatchlistChar(c)),
+                                    Scope::FreqModal if c.is_ascii_digit() || c == '.' => {
+                                        Some(Action::FreqModalChar(c))
+                                    }
+                                    Scope::OffsetModal if c.is_ascii_digit() => {
+                                        Some(Action::OffsetModalChar(c))
+                                    }
+                                    Scope::Compose => Some(Action::ComposeChar(c)),
+                                    _ => None,
+                                }
+                            }
+                        };
+                        runner
+                            .handle_key_event(KeyEvent::new(KeyCode::Char(c), mods))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            runner.dispatched,
+                            expected.into_iter().collect::<Vec<_>>(),
+                            "{scope:?} {c:?} {mods:?}"
+                        );
+                    }
                 }
             }
         }
@@ -3648,12 +3642,7 @@ mod key_tests {
         }
     }
 
-    /// PAN-327: across every key-effect golden scenario, key and modifier
-    /// set, a main-view press that has any effect dispatched exactly one
-    /// action (so no legacy behaviour lacks a chord), and no press
-    /// dispatches more than one. With a dialog open only Shift+Q dispatches
-    /// through the table (the dialogs keep their own blocks), so every other
-    /// dialog press dispatches nothing.
+    /// Every effectful golden press dispatches exactly one action in every scope.
     #[tokio::test]
     async fn every_effectful_key_resolves_to_an_action() {
         use super::key_effects::{key_universe, press, scratch_dir, MOD_SETS, SCENARIOS};
@@ -3667,7 +3656,7 @@ mod key_tests {
                     let what = format!("{} | {code:?} | {mod_name}", scenario.name);
                     if code == KeyCode::Char('Q') {
                         assert_eq!(runner.dispatched, vec![Action::EmergencyStop], "{what}");
-                    } else if scenario.is_main_view() {
+                    } else {
                         assert!(
                             runner.dispatched.len() <= 1,
                             "{what}: {:?}",
@@ -3677,8 +3666,6 @@ mod key_tests {
                             effect.is_empty() || runner.dispatched.len() == 1,
                             "{what}: effect {effect:?} but no action dispatched"
                         );
-                    } else {
-                        assert!(runner.dispatched.is_empty(), "{what}");
                     }
                 }
             }
