@@ -3215,7 +3215,6 @@ async fn report_played_transmit_complete(
         qso_id,
         message_text,
         attempt_id,
-<<<<<<< HEAD
     };
     if success {
         tx_outcome::settle_aired_frame(message_bus, frame, duration_ms, Some(aired)).await;
@@ -3223,40 +3222,6 @@ async fn report_played_transmit_complete(
         settle_unaired(message_bus, frame, None, AutonomousOutcome::Report).await;
     }
     Ok(())
-=======
-    )
-    .await;
-    if let Some((qso_id, message_text)) = sent {
-        report_frame_sent(message_bus, qso_id, message_text, aired, attempt_id).await;
-    }
-    result
-}
-
-/// PAN-182: tell the QSO engine `message_text` aired for `qso_id`, stamped
-/// with the post-playback report time. Durable (PAN-185): a full Qso channel
-/// parks the report on the Qso inbox's lane instead of dropping it.
-async fn report_frame_sent(
-    message_bus: &MessageBus,
-    qso_id: String,
-    message_text: String,
-    aired: pancetta_qso::UnsentAttemptPayload,
-    attempt_id: Option<pancetta_qso::TxAttemptId>,
-) {
-    message_bus
-        .send_message_durable(ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Qso,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
-                qso_id,
-                message_text,
-                aired,
-                aired_at: chrono::Utc::now(),
-                attempt_id,
-            }),
-            Instant::now(),
-        ))
-        .await;
->>>>>>> 7eccb2157797e2e56dd9ef7e1850d497a4cf04ed
 }
 
 /// PAN-223: tell the QSO engine which slot this frame was scheduled into.

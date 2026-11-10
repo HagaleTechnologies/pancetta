@@ -118,6 +118,7 @@ pub(super) async fn settle_aired_frame(
                 message_text,
                 aired,
                 aired_at: chrono::Utc::now(),
+                attempt_id,
             }),
             Instant::now(),
         ))
