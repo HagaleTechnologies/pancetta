@@ -1,5 +1,4 @@
 //! Offline acceptance tests drive the production policy and CAT transaction.
-#![cfg(feature = "pancetta-hamlib")]
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use pancetta_hamlib::{Mode, PttState, RigControl, RigStatus, Vfo};

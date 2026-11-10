@@ -2718,9 +2718,8 @@ enum PttRelease {
     Delivered,
     /// Every attempt dropped; the guard stays armed.
     Undelivered,
-    /// PAN-273: no Hamlib channel is registered (`--replay`, or a build
-    /// without `pancetta-hamlib`), so no PTT-on was ever enqueued; the guard
-    /// stood down without sending.
+    /// PAN-273: no Hamlib channel is registered (`--replay`), so no PTT-on
+    /// was ever enqueued; the guard stood down without sending.
     NoRig,
 }
 
@@ -10159,9 +10158,8 @@ impl super::ApplicationCoordinator {
                                             // never keyed. Unwind like a pre-PTT refusal:
                                             // nothing entered Hamlib's queue, so there is no
                                             // PTT-off to send. Report the frame as not sent and
-                                            // play no audio. Without a Hamlib route (`--replay`,
-                                            // builds without `pancetta-hamlib`) every PTT-on is
-                                            // dropped by design and the audio still goes out,
+                                            // play no audio. Without a Hamlib route (`--replay`)
+                                            // every PTT-on is dropped by design and the audio still goes out,
                                             // so that case keeps the arm below.
                                             SendIfOutcome::Dropped
                                                 if message_bus.has_rig_route() =>
@@ -10209,7 +10207,7 @@ impl super::ApplicationCoordinator {
                                                 continue 'worker;
                                             }
                                             SendIfOutcome::Dropped => {
-                                                warn!("PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)");
+                                                warn!("PTT ON not sent: no Hamlib route registered (replay mode)");
                                             }
                                         }
 
@@ -13208,8 +13206,7 @@ impl super::ApplicationCoordinator {
                                         // was never keyed. Unwind like the `Denied` arm, with
                                         // no PTT-off (nothing entered Hamlib's queue), and
                                         // settle every item as not sent. Without a Hamlib
-                                        // route (`--replay`, builds without
-                                        // `pancetta-hamlib`) the drop is by design and the
+                                        // route (`--replay`) the drop is by design and the
                                         // audio still goes out, so that case keeps the arm
                                         // below.
                                         SendIfOutcome::Dropped if message_bus.has_rig_route() => {
@@ -13256,7 +13253,7 @@ impl super::ApplicationCoordinator {
                                             continue;
                                         }
                                         SendIfOutcome::Dropped => {
-                                            warn!("PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)");
+                                            warn!("PTT ON not sent: no Hamlib route registered (replay mode)");
                                         }
                                     }
 
@@ -13980,9 +13977,8 @@ impl super::ApplicationCoordinator {
                                         // carrier. Unwind the in-process flag like the
                                         // band-plan refusal above: nothing entered
                                         // Hamlib's queue, so there is no PTT-off to send.
-                                        // Without a route (`--replay`, builds without
-                                        // `pancetta-hamlib`) the drop is by design and the
-                                        // tone still plays.
+                                        // Without a route (`--replay`) the drop is by design
+                                        // and the tone still plays.
                                         if message_bus.has_rig_route() {
                                             last_ptt_off_ms
                                                 .store(super::now_epoch_ms(), Ordering::Release);
@@ -14008,7 +14004,7 @@ impl super::ApplicationCoordinator {
                                         }
                                         if dropped {
                                             warn!(
-                                                "Tune: PTT ON not sent: no Hamlib route registered (replay mode or a build without pancetta-hamlib)"
+                                                "Tune: PTT ON not sent: no Hamlib route registered (replay mode)"
                                             );
                                         } else {
                                             warn!("Tune: PTT ON refused (rig not keyed)");
@@ -23039,8 +23035,7 @@ mod pan115_worker_gate_tests {
     }
 
     /// [`worker_harness`] with no Hamlib channel registered, as in
-    /// `--replay` or a build without `pancetta-hamlib`: the bus has no rig
-    /// route, so every PTT-on comes back `Dropped` by design (PAN-278).
+    /// `--replay`: the bus has no rig route, so every PTT-on comes back `Dropped` by design (PAN-278).
     /// `hamlib_rx` is a detached receiver that never sees a message.
     pub(crate) async fn worker_harness_without_rig() -> Harness {
         build_worker_harness(
@@ -25988,8 +25983,7 @@ mod pan135_ptt_release_tests {
         assert!(pending.0.lock().unwrap().is_none());
     }
 
-    /// PAN-273: with no Hamlib channel (`--replay`, a build without
-    /// `pancetta-hamlib`) nothing was keyed, so `release` stands the guard
+    /// PAN-273: with no Hamlib channel (`--replay`) nothing was keyed, so `release` stands the guard
     /// down without a send. Before, it stalled ~78 ms, logged an error and
     /// left the guard armed with 4 drops.
     #[tokio::test(flavor = "current_thread")]
@@ -27498,8 +27492,8 @@ mod pan182_audio_delivery_tests {
 /// PAN-278: a PTT-on that `send_ptt_command` returns `Dropped` while Hamlib's
 /// route is registered (here: Hamlib's channel is full) never keyed the rig.
 /// The worker must unwind like a pre-PTT refusal, play no audio, and settle
-/// the frame as not sent. Without a route (`--replay`, builds without
-/// `pancetta-hamlib`) the drop is by design and the frame still plays.
+/// the frame as not sent. Without a route (`--replay`) the drop is by
+/// design and the frame still plays.
 ///
 /// Hamlib's backlog is read only after the completion: draining it earlier
 /// (as `await_completion` does) un-saturates the channel and lets the

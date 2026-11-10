@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`) and turns on the `serde` feature, so a `transmit` build also gets the crate's serde derives. `decode_cycle` output is unchanged (PAN-331).
+
 ### Fixed
 
 - PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
@@ -29,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `pancetta-hamlib` Cargo feature of the `pancetta` crate. Rig control is always built in, and `cargo build -p pancetta --no-default-features` compiles again (it failed with 77 errors, GitHub #270). Release builds are unchanged (PAN-331).
 - PAN-334: `--metrics` and `--metrics-port` are gone. They never served metrics: the Prometheus exporter sat behind the off-by-default `prometheus` feature, and nothing recorded a metric. A service unit or script that passes either flag now fails at startup with exit 2, so remove the flag (under `Restart=always` a unit would restart until its start limit). The `metrics`, `prometheus` and `tracing-json` cargo features are gone too.
 - PAN-334: `pancetta benchmark` is gone. It printed "not yet implemented" and exited 1, so use `pancetta benchmark-decode` or `cargo bench`. `run --callsign`, `--frequency` and `--power` are gone. They were ignored, so set the station in the config file or pass `--config`. `test-audio --device` and `--duration` are gone. `pancetta test-audio` now lists devices with or without `--list`, and `pancetta doctor` checks the input level.
 - Removed the unused `[audio.agc]` configuration and TUI `auto_gain` field

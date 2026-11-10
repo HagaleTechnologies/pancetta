@@ -23,12 +23,14 @@ A Cargo dependency declaration (not pancetta config):
 <!-- docs-snippets: skip -->
 ```toml
 [dependencies]
-pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.7" }
 ```
 
-Default features only. Opt-in features stay off: `transmit` (pulls
-`cpal`, `serialport`, `chrono`, `parking_lot`, `tokio`, `serde`, `serde_json`,
-`sha2`), `gpio` (`rppal`), `benchmark` (`hound`, `serde`, `serde_json`,
+Default features only. The default build includes the encoder and modulator
+(`Ft8Encoder`, `Ft8Modulator`) and every decoder pass the station runs
+(PAN-331). Opt-in features stay off: `transmit` (adds the audio/PTT
+transmitter, `Ft8Transmitter`, turns on the `serde` feature, and pulls `cpal`, `serialport`, `chrono`,
+`parking_lot`, `tokio`, `serde`, `serde_json`, `sha2`), `gpio` (`rppal`), `benchmark` (`hound`, `serde`, `serde_json`,
 `sha2`), `ft2`, `ffi`, `debug-decode`, `serde`. Default is `std` +
 `neural_osd`.
 

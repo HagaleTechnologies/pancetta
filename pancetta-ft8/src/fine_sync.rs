@@ -244,7 +244,7 @@ fn correlate_tone(
     acc
 }
 
-#[cfg(all(test, feature = "transmit"))]
+#[cfg(test)]
 mod w32_fine_sync_tests {
     use super::*;
     use crate::baseband::{extract_candidate_baseband, DECIM, FS, FS_BB};
