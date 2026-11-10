@@ -7,7 +7,7 @@
 #![allow(dead_code, unused_imports)]
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use pancetta_config::Config;
 use pancetta_qso::logbook_lock::{LogbookGuard, LogbookLock};
 use std::io::IsTerminal;
@@ -137,7 +137,11 @@ struct Cli {
     test_tx: Option<String>,
 
     /// Audio frequency offset (Hz) for --test-tx
-    #[arg(long, default_value_t = 1500.0, global = true, requires = "test_tx")]
+    // No `requires = "test_tx"`: clap checks `requires` per command level
+    // before it propagates globals, so it rejected
+    // `pancetta --test-tx X run --test-tx-offset 900`. `main()` checks
+    // `test_tx_offset_without_test_tx` after propagation instead (PAN-334).
+    #[arg(long, default_value_t = 1500.0, global = true)]
     test_tx_offset: f64,
 }
 
@@ -324,7 +328,16 @@ impl std::fmt::Display for LogFormat {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli =
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit());
+    if test_tx_offset_without_test_tx(&cli, &matches) {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--test-tx-offset requires --test-tx\n",
+        )
+        .exit();
+    }
     if cli.gain_sweep_seconds.is_some()
         && cli
             .command
@@ -355,7 +368,8 @@ fn main() -> Result<()> {
 /// The first receiving-service flag given with a subcommand that never reads
 /// it. These flags are `global`, so every subcommand's `--help` lists them;
 /// rejecting them keeps `pancetta info --wav x.wav` from silently ignoring
-/// `--wav` (PAN-334). `--test-tx-offset` is covered by `requires = "test_tx"`.
+/// `--wav` (PAN-334). A lone `--test-tx-offset` is caught first by
+/// `test_tx_offset_without_test_tx`.
 fn receiving_service_flag_on_subcommand(cli: &Cli) -> Option<&'static str> {
     if cli
         .command
@@ -373,6 +387,15 @@ fn receiving_service_flag_on_subcommand(cli: &Cli) -> Option<&'static str> {
     ]
     .into_iter()
     .find_map(|(given, flag)| given.then_some(flag))
+}
+
+/// `--test-tx-offset` typed without `--test-tx`, at any position. Clap has
+/// already copied global values between the top level and the subcommand, so
+/// `--test-tx` before `run` and `--test-tx-offset` after it (or the reverse)
+/// is accepted.
+fn test_tx_offset_without_test_tx(cli: &Cli, matches: &clap::ArgMatches) -> bool {
+    cli.test_tx.is_none()
+        && matches.value_source("test_tx_offset") == Some(clap::parser::ValueSource::CommandLine)
 }
 
 /// `PANCETTA_STUB_AUDIO` makes the audio pipeline synthesize a tone instead

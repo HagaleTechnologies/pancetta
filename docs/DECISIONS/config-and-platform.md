@@ -990,8 +990,11 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
   `--wav`, `--replay` and `--test-tx` are `global`, so every subcommand's
   `--help` lists them; `receiving_service_flag_on_subcommand` in `main()` exits
   2 when one is given to a subcommand other than `run`, before the macOS
-  responsibility relaunch. `--test-tx-offset` `requires = "test_tx"`. The
-  gain-sweep guard keeps its own message.
+  responsibility relaunch. `--test-tx-offset` without `--test-tx` exits 2
+  from `test_tx_offset_without_test_tx` in `main()`, which runs after clap
+  propagates globals; clap's `requires` checks each command level before
+  propagation and so rejected `pancetta --test-tx X run --test-tx-offset 900`.
+  The gain-sweep guard keeps its own message.
 - **Follow-up, not done here:** `--config` on subcommands that never read it
   (`info`, `test-audio`, `benchmark-decode`, `export`, `import`, `setup`).
   `setup` always writes `~/.pancetta/pancetta.toml`, so honouring `--config`

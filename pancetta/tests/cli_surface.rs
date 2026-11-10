@@ -305,6 +305,49 @@ fn receiving_service_flags_are_rejected_on_other_subcommands() {
     }
 }
 
+/// `--test-tx` and `--test-tx-offset` are both global, so either may sit on
+/// either side of `run`; only an offset with no `--test-tx` anywhere fails.
+#[test]
+fn test_tx_offset_needs_test_tx_on_either_side_of_run() {
+    for args in [
+        vec![
+            "--test-tx",
+            "N0CALL N0CALL 73",
+            "run",
+            "--test-tx-offset",
+            "900",
+        ],
+        vec![
+            "--test-tx-offset",
+            "900",
+            "run",
+            "--test-tx",
+            "N0CALL N0CALL 73",
+        ],
+    ] {
+        Scratch::new()
+            .command()
+            .args(&args)
+            .args(["--headless", "--wav", DEMO_WAV])
+            .assert()
+            .success();
+    }
+    for args in [
+        vec!["--test-tx-offset", "900"],
+        vec!["run", "--test-tx-offset", "900"],
+    ] {
+        Scratch::new()
+            .command()
+            .args(&args)
+            .args(["--headless", "--wav", DEMO_WAV])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "--test-tx-offset requires --test-tx",
+            ));
+    }
+}
+
 #[test]
 fn test_audio_lists_devices_with_or_without_list() {
     for args in [vec!["test-audio"], vec!["test-audio", "--list"]] {
