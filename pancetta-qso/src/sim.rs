@@ -910,7 +910,8 @@ impl Sim {
         evaluator: Box<dyn DxEvaluator>,
     ) -> Self {
         // Anchor the virtual clock to a wall-clock Even-parity slot boundary so
-        // the operator's slot-parity TX gating (`SlotParity::from_unix_secs`)
+        // the operator's slot-parity TX gating (the sim never wires a
+        // slot-period source, so it runs on the default FT8 15 s grid)
         // is deterministic — slot 0 Even, slot 1 Odd, … — while keeping `base`
         // within ~one slot of real `now`. (The latter matters because the QSO
         // engine stamps `started_at`/`first_call_at` with the REAL clock; an

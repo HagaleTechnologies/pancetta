@@ -2064,6 +2064,8 @@ impl super::ApplicationCoordinator {
             // parked offset, not just the static config value baked in at
             // construction.
             guard.set_tx_offset_hold_source(self.tx_offset_hold_hz());
+            // PAN-356: the slot gate alternates parity at the live mode's slot length.
+            guard.set_active_slot_ns_source(self.active_slot_ns());
         }
 
         // Phase-5 hardening #1: install the same callsign-continuity FP
