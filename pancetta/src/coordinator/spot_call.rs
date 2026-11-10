@@ -59,15 +59,17 @@ pub(crate) fn rig_is_keyed(ptt_active: &AtomicBool, bus: &MessageBus) -> bool {
 
 /// Partners of every active QSO whose exchange is in progress (the partner
 /// has answered). `CallingCq` and `RespondingToCq` are not exchanges: a band
-/// change ends them exactly like a band key does. Terminal QSOs are ignored.
+/// change ends them exactly like a band key does. A `Completed` QSO whose
+/// closing RR73/73 is queued but not yet aired (PAN-280) still counts: a QSY
+/// would air that frame on the new band. Other terminal QSOs are ignored.
 pub(crate) async fn exchange_in_progress(manager: Option<pancetta_qso::QsoManager>) -> Vec<String> {
     use pancetta_qso::states::{ContestState, QsoState};
     let Some(manager) = manager else {
         return Vec::new();
     };
-    manager
-        .get_active_qsos()
-        .await
+    let (active, pending_close_partners) =
+        manager.active_qsos_and_pending_completion_partners().await;
+    let mut partners: Vec<String> = active
         .into_iter()
         .filter_map(|(_, progress)| match progress.state {
             QsoState::WaitingForReport { their_callsign, .. }
@@ -79,7 +81,9 @@ pub(crate) async fn exchange_in_progress(manager: Option<pancetta_qso::QsoManage
             }
             _ => None,
         })
-        .collect()
+        .collect();
+    partners.extend(pending_close_partners);
+    partners
 }
 
 /// `true` when the rig is already on `target_hz` (within
@@ -779,6 +783,38 @@ mod tests {
             m.cancel_qso(id).await.unwrap();
         }
         assert!(exchange_in_progress(Some(m)).await.is_empty());
+    }
+
+    /// Validate finding: a QSO that completed but whose closing 73 has not
+    /// aired (PAN-280) is `Completed`, yet a QSY would air that 73 on the
+    /// new band. It must block a dial-changing spot call.
+    #[tokio::test]
+    async fn exchange_in_progress_names_partner_whose_close_has_not_aired() {
+        let m = manager();
+        m.respond_to_caller(
+            "K1XYZ".into(),
+            1200.0,
+            None,
+            pancetta_core::ResponseStep::SeventyThree,
+            Some(-10.0),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            m.get_active_qsos().await.is_empty(),
+            "the QSO is Completed, waiting on its 73"
+        );
+        let exchanges = exchange_in_progress(Some(m.clone())).await;
+        assert_eq!(exchanges, vec!["K1XYZ"]);
+        let refusal = admit_spot_call(&inputs(&exchanges));
+        assert!(
+            matches!(refusal, SpotAdmission::Refuse(_)),
+            "a pending close refuses the QSY: {refusal:?}"
+        );
     }
 
     // ---- admit_spot_call ----------------------------------------------

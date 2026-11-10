@@ -2396,7 +2396,6 @@ impl AutonomousOperator {
         }
     }
 
-<<<<<<< HEAD
     /// Clear every piece of allocator state scoped to the current dial's
     /// audio-offset space. Called by the autonomous band hop and (PAN-287)
     /// by the coordinator after any commanded dial change (band keys,
@@ -2418,11 +2417,10 @@ impl AutonomousOperator {
         // restore of a pre-hop snapshot must not resurrect it.
         self.offset_generation = self.offset_generation.wrapping_add(1);
     }
-=======
+
     /// Run one cycle at a whole unix second (for testing and the sim harness).
     /// Equivalent to [`AutonomousOperator::decide_at_time`] at `unix_secs`
     /// with a zero sub-second part.
->>>>>>> f91f3e852b64701ca970f398757f2d3f87c2de67
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.decide_at_time(DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now))
     }
