@@ -43,9 +43,10 @@ cargo build
 # Run all workspace tests
 cargo test --workspace --features transmit
 
-# FT8 tests (encoder is feature-gated behind `transmit`)
+# FT8 tests: default features are the standalone (manta) build and include the
+# encoder; the `transmit` feature adds the audio/PTT transmitter (and turns on `serde`)
+cargo test -p pancetta-ft8                         # standalone build; skips test files still gated on `transmit`
 cargo test --features transmit -p pancetta-ft8    # all FT8 tests
-cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
 cargo test -p pancetta --test loopback_qso

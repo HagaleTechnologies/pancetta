@@ -1950,7 +1950,7 @@ impl MessageBus {
     /// channel entries are insert-once and never removed, so a `false` here
     /// stays `false` for every send that happened before it: no PTT-on could
     /// have been enqueued (`send_rig_command_if` drops without a route). This
-    /// is how `--replay` and builds without `pancetta-hamlib` run.
+    /// is how `--replay` runs.
     pub fn has_rig_route(&self) -> bool {
         self.rig_route.get().is_some()
     }

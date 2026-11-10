@@ -40,15 +40,32 @@ pub enum AutonomousError {
 // Slot management
 // ---------------------------------------------------------------------------
 
-/// Even or odd 15-second FT8 time-slot parity.
+/// Even or odd transmit-slot parity. The slot length is the active mode's:
+/// FT8 15 s, FT4 7.5 s, FT2 3.2 s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotParity {
     Even,
     Odd,
 }
 
+/// Slot length to compute parity with: `raw`, or the FT8 15 s
+/// [`pancetta_core::slot::SLOT_NS`] when `raw` is not positive (a zero
+/// divisor would panic in `div_euclid`). Same fallback as `QsoManager`'s
+/// `rearm_slot_millis_from_ns`.
+fn effective_slot_ns(raw: i64) -> i64 {
+    if raw <= 0 {
+        pancetta_core::slot::SLOT_NS
+    } else {
+        raw
+    }
+}
+
 impl SlotParity {
-    /// Derive the current parity from a unix timestamp.
+    /// Parity on the FT8 15 s grid, from whole unix seconds.
+    ///
+    /// Kept for FT8-grid callers (the sim harness and tests). The live slot
+    /// gate uses [`SlotParity::of_time_with_period`], because a 7.5 s FT4
+    /// boundary cannot be expressed in whole seconds (PAN-356).
     pub fn from_unix_secs(secs: i64) -> Self {
         let slot_number = secs / 15;
         if slot_number % 2 == 0 {
@@ -58,9 +75,24 @@ impl SlotParity {
         }
     }
 
-    /// Return the current parity right now.
+    /// Parity right now on the FT8 15 s grid, in whole seconds. Kept for
+    /// FT8-grid callers; the live slot gate uses
+    /// [`SlotParity::of_time_with_period`].
     pub fn current() -> Self {
         Self::from_unix_secs(Utc::now().timestamp())
+    }
+
+    /// Parity of the slot containing `t`, for a slot length of `slot_ns`
+    /// nanoseconds (the active mode's `active_slot_ns`). A non-positive
+    /// `slot_ns` falls back to the FT8 15 s slot. Delegates to
+    /// [`pancetta_core::slot::SlotParity::of_with_period`], the helper the TX
+    /// scheduler, `QsoManager` and decode stamping use, so the operator's gate
+    /// and the scheduler agree on which slot is which (PAN-356).
+    pub fn of_time_with_period(t: DateTime<Utc>, slot_ns: i64) -> Self {
+        match pancetta_core::slot::SlotParity::of_with_period(t, effective_slot_ns(slot_ns)) {
+            pancetta_core::slot::SlotParity::Even => SlotParity::Even,
+            pancetta_core::slot::SlotParity::Odd => SlotParity::Odd,
+        }
     }
 }
 
@@ -139,7 +171,7 @@ impl ListenPolicy {
     }
 }
 
-/// Tracks the FT8 15-second time slots and our TX parity.
+/// Tracks the active mode's transmit slots and our TX parity.
 #[derive(Debug, Clone)]
 pub struct SlotManager {
     pub our_slot: Option<SlotParity>,
@@ -204,10 +236,21 @@ impl SlotManager {
         self.should_transmit_at(Utc::now().timestamp())
     }
 
-    /// Decide what to do at a given unix timestamp (testable).
+    /// Decide what to do at a given unix timestamp, on the FT8 15 s grid
+    /// (testable). The live gate uses [`SlotManager::should_transmit_at_time`].
     pub fn should_transmit_at(&mut self, unix_secs: i64) -> SlotDecision {
-        let current_parity = SlotParity::from_unix_secs(unix_secs);
+        self.decide_for_parity(SlotParity::from_unix_secs(unix_secs))
+    }
 
+    /// Decide what to do at `now`, with slots `slot_ns` nanoseconds long (the
+    /// active mode's slot length). Takes full-precision time because a 7.5 s
+    /// FT4 boundary cannot be expressed in whole seconds (PAN-356).
+    pub fn should_transmit_at_time(&mut self, now: DateTime<Utc>, slot_ns: i64) -> SlotDecision {
+        self.decide_for_parity(SlotParity::of_time_with_period(now, slot_ns))
+    }
+
+    /// Shared body of the slot gate, given the parity of the current slot.
+    fn decide_for_parity(&mut self, current_parity: SlotParity) -> SlotDecision {
         let Some(our_parity) = self.our_slot else {
             // Still auto-detecting — don't transmit.
             return SlotDecision::NotOurSlot;
@@ -1079,6 +1122,11 @@ pub struct AutonomousOperator {
     /// Hold-mode falls back to the static `config.tx_offset_hz` — today's
     /// behavior is preserved byte-for-byte.
     tx_offset_hold_hz: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Active mode's slot length in nanoseconds, shared from the coordinator's
+    /// `active_slot_ns` atomic (PAN-356). The slot gate computes parity with
+    /// it. Defaults to the FT8 15 s [`pancetta_core::slot::SLOT_NS`] until
+    /// [`AutonomousOperator::set_active_slot_ns_source`] wires the live one.
+    active_slot_ns: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// DX watchlist (#197): short-lived memory of `PerBandDxccNew`+/`Atno`
     /// CQs heard but not pounced on. See `pancetta_qso::watchlist`.
     watchlist: DxWatchlist,
@@ -1136,6 +1184,9 @@ impl AutonomousOperator {
             offset_generation: 0,
             streak_generation: 0,
             tx_offset_hold_hz: None,
+            active_slot_ns: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                pancetta_core::slot::SLOT_NS,
+            )),
             watchlist,
             skip_log: Vec::new(),
         }
@@ -1444,6 +1495,27 @@ impl AutonomousOperator {
         self.tx_offset_hold_hz = Some(hold_hz);
     }
 
+    /// Share the coordinator's live slot-length atomic (`active_slot_ns`,
+    /// nanoseconds) so the slot gate alternates parity at the active mode's
+    /// slot length (FT8 15 s, FT4 7.5 s) and follows a runtime mode switch
+    /// (PAN-356). Pass the same `Arc<AtomicI64>` the coordinator's
+    /// `active_slot_ns()` accessor returns. If never called, the gate uses the
+    /// FT8 15 s slot — today's behavior.
+    pub fn set_active_slot_ns_source(
+        &mut self,
+        source: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        self.active_slot_ns = source;
+    }
+
+    /// Live slot length (ns) for parity, with the non-positive fallback.
+    fn slot_ns(&self) -> i64 {
+        effective_slot_ns(
+            self.active_slot_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// Current TX-frequency mode (decoded from the shared atomic).
     /// PAN-38 round 3 (Codex): `SeqCst`, paired with `SeqCst` on the
     /// generation counter below and on `tui_relay.rs`'s writer side (which
@@ -1568,7 +1640,7 @@ impl AutonomousOperator {
         // a tracked parity (test scaffolding / untracked decodes) fall back
         // to the wall-clock parity, preserving existing behavior for callers
         // that don't set `slot_parity`.
-        let current_parity = SlotParity::current();
+        let current_parity = SlotParity::of_time_with_period(Utc::now(), self.slot_ns());
         let mut even_count: u32 = 0;
         let mut odd_count: u32 = 0;
         let mut untracked_count: u32 = 0;
@@ -2250,7 +2322,7 @@ impl AutonomousOperator {
 
     /// Run one cycle of the decision engine. Returns zero or more actions.
     pub fn decide(&mut self) -> Vec<OperatorAction> {
-        self.decide_at(Utc::now().timestamp())
+        self.decide_at_time(Utc::now())
     }
 
     /// Run one cycle at a specific unix timestamp (for testing).
@@ -2324,6 +2396,7 @@ impl AutonomousOperator {
         }
     }
 
+<<<<<<< HEAD
     /// Clear every piece of allocator state scoped to the current dial's
     /// audio-offset space. Called by the autonomous band hop and (PAN-287)
     /// by the coordinator after any commanded dial change (band keys,
@@ -2345,7 +2418,20 @@ impl AutonomousOperator {
         // restore of a pre-hop snapshot must not resurrect it.
         self.offset_generation = self.offset_generation.wrapping_add(1);
     }
+=======
+    /// Run one cycle at a whole unix second (for testing and the sim harness).
+    /// Equivalent to [`AutonomousOperator::decide_at_time`] at `unix_secs`
+    /// with a zero sub-second part.
+>>>>>>> f91f3e852b64701ca970f398757f2d3f87c2de67
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
+        self.decide_at_time(DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now))
+    }
+
+    /// Run one cycle at `now`. The slot gate uses `now` at full precision with
+    /// the live slot length (PAN-356); the time-dependent gates below keep
+    /// whole-second resolution.
+    pub fn decide_at_time(&mut self, now: DateTime<Utc>) -> Vec<OperatorAction> {
+        let unix_secs = now.timestamp();
         self.skip_log.clear();
         let mut actions = Vec::new();
         // PAN-72: consumed unconditionally, before any state-dependent
@@ -2369,7 +2455,10 @@ impl AutonomousOperator {
         }
 
         // Step 1: slot manager
-        let decision = self.slot_manager.should_transmit_at(unix_secs);
+        // PAN-356: parity at the active mode's slot length, sub-second time.
+        let decision = self
+            .slot_manager
+            .should_transmit_at_time(now, self.slot_ns());
 
         match decision {
             SlotDecision::NotOurSlot => {
@@ -2439,8 +2528,11 @@ impl AutonomousOperator {
                     // evaluate against the slot's virtual `now`, derived
                     // from the `unix_secs` this cycle runs at, so the sim
                     // harness drives them deterministically. Production
-                    // calls `decide()` which passes `Utc::now().timestamp()`,
-                    // so the derived `now` equals real now to the second.
+                    // calls `decide()` with `Utc::now()`, so the derived
+                    // `now` equals real now to the second. It shadows the
+                    // full-precision `now` on purpose: these gates keep
+                    // whole-second resolution; only the slot gate above
+                    // needs sub-second time (PAN-356).
                     let now =
                         DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now);
                     // Phase-5 hardening #1: TX-side FP gate. If a
@@ -3173,6 +3265,130 @@ mod tests {
         assert_eq!(SlotParity::from_unix_secs(29), SlotParity::Odd);
         // Slot 2 (t=30..44) -> Even
         assert_eq!(SlotParity::from_unix_secs(30), SlotParity::Even);
+    }
+
+    // PAN-356: 2026-01-01T00:00:00Z. Divisible by both 15 s and 7.5 s, so
+    // slot 0 is Even in FT8 and FT4.
+    const PAN356_BASE_UNIX: i64 = 1_767_225_600;
+    /// Tick latencies after the slot boundary: on time, typical, and the
+    /// coordinator ticker's 250 ms worst-case poll delay.
+    const PAN356_LATENCIES_MS: [i64; 3] = [0, 20, 250];
+    const PAN356_FT4_SLOT_NS: i64 = 7_500_000_000;
+    const PAN356_FT8_SLOT_NS: i64 = 15_000_000_000;
+
+    /// The `k`th FT4 slot tick after the base, `latency_ms` late.
+    fn pan356_ft4_tick(k: i64, latency_ms: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(PAN356_BASE_UNIX, 0).expect("valid base")
+            + ChronoDuration::milliseconds(k * 7_500 + latency_ms)
+    }
+
+    fn pan356_has_transmit(actions: &[OperatorAction]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, OperatorAction::Transmit { .. }))
+    }
+
+    #[test]
+    fn ft4_slot_parity_flips_every_7_5_s() {
+        for latency_ms in PAN356_LATENCIES_MS {
+            for k in 0..8i64 {
+                let t = pan356_ft4_tick(k, latency_ms);
+                let expected = if k % 2 == 0 {
+                    SlotParity::Even
+                } else {
+                    SlotParity::Odd
+                };
+                assert_eq!(
+                    SlotParity::of_time_with_period(t, PAN356_FT4_SLOT_NS),
+                    expected,
+                    "FT4 tick {k} at +{latency_ms} ms"
+                );
+                // FT8 15 s through the period-aware path is the old grid.
+                assert_eq!(
+                    SlotParity::of_time_with_period(t, PAN356_FT8_SLOT_NS),
+                    SlotParity::from_unix_secs(t.timestamp()),
+                    "FT8 grid at FT4 tick {k} +{latency_ms} ms"
+                );
+                // A non-positive slot length falls back to FT8 15 s.
+                assert_eq!(
+                    SlotParity::of_time_with_period(t, 0),
+                    SlotParity::from_unix_secs(t.timestamp()),
+                    "zero slot length at FT4 tick {k} +{latency_ms} ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slot_manager_ft4_gates_on_alternate_7_5_s_ticks() {
+        let listen = ListenCycleConfig {
+            initial_interval: u32::MAX,
+            ..ListenCycleConfig::default()
+        };
+        for latency_ms in PAN356_LATENCIES_MS {
+            for (parity_config, our_rem) in
+                [(SlotParityConfig::Even, 0), (SlotParityConfig::Odd, 1)]
+            {
+                let mut sm = SlotManager::new(parity_config, &listen);
+                for k in 0..8i64 {
+                    let decision = sm.should_transmit_at_time(
+                        pan356_ft4_tick(k, latency_ms),
+                        PAN356_FT4_SLOT_NS,
+                    );
+                    let expected = if k % 2 == our_rem {
+                        SlotDecision::Transmit
+                    } else {
+                        SlotDecision::NotOurSlot
+                    };
+                    assert_eq!(
+                        decision, expected,
+                        "{parity_config:?} operator, FT4 tick {k} at +{latency_ms} ms"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn operator_follows_live_active_slot_ns_source() {
+        for latency_ms in PAN356_LATENCIES_MS {
+            let mut config = AutonomousConfig::default();
+            config.enabled = true;
+            config.slot_parity = SlotParityConfig::Even;
+            config.cq_after_idle_cycles = 1;
+            config.listen_cycle.initial_interval = u32::MAX;
+            let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+            let slot_ns =
+                std::sync::Arc::new(std::sync::atomic::AtomicI64::new(PAN356_FT4_SLOT_NS));
+            op.set_active_slot_ns_source(slot_ns.clone());
+
+            let ft4_tx_ticks: Vec<i64> = (0..8i64)
+                .filter(|&k| {
+                    pan356_has_transmit(&op.decide_at_time(pan356_ft4_tick(k, latency_ms)))
+                })
+                .collect();
+            assert_eq!(
+                ft4_tx_ticks,
+                vec![0, 2, 4, 6],
+                "FT4 Even operator must act on alternate 7.5 s ticks (+{latency_ms} ms)"
+            );
+
+            // Runtime switch to FT8 through the same atomic: no rebuild.
+            slot_ns.store(PAN356_FT8_SLOT_NS, std::sync::atomic::Ordering::Relaxed);
+            let ft8_tx_ticks: Vec<i64> = (0..4i64)
+                .filter(|&j| {
+                    let t = DateTime::<Utc>::from_timestamp(PAN356_BASE_UNIX + 60 + j * 15, 0)
+                        .expect("valid tick")
+                        + ChronoDuration::milliseconds(latency_ms);
+                    pan356_has_transmit(&op.decide_at_time(t))
+                })
+                .collect();
+            assert_eq!(
+                ft8_tx_ticks,
+                vec![0, 2],
+                "after the switch to FT8 the operator must act on alternate 15 s ticks (+{latency_ms} ms)"
+            );
+        }
     }
 
     #[test]

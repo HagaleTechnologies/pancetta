@@ -2064,6 +2064,8 @@ impl super::ApplicationCoordinator {
             // parked offset, not just the static config value baked in at
             // construction.
             guard.set_tx_offset_hold_source(self.tx_offset_hold_hz());
+            // PAN-356: the slot gate alternates parity at the live mode's slot length.
+            guard.set_active_slot_ns_source(self.active_slot_ns());
         }
         // PAN-287: publish the operator so the TUI relay's spot call can ask
         // the allocator for a TX offset and clear old-band data after a QSY.

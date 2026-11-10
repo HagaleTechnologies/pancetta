@@ -401,7 +401,7 @@ dry_run = false            # Log autonomous TX decisions without keying the rig
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
 | `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
-| `slot_parity` | enum | `"auto"` | FT8 alternates even/odd 15 s slots; `auto` picks per conditions. |
+| `slot_parity` | enum | `"auto"` | Slots alternate even/odd at the active mode's slot length (FT8 15 s, FT4 7.5 s); `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
 | `cq_no_response_switch_after` | integer | `4` | Consecutive self-CQs with zero responses before switching TX frequency. Auto mode only (Hold mode tracks but never acts). Must be ≥ 1. |
 | `qso_stall_switch_after` | integer | `4` | Consecutive stalled mid-QSO cycles before switching/reverting the QSO's TX offset. Auto mode only. Threaded into `pancetta_qso::QsoManagerConfig::TimeoutConfig::qso_stall_switch_after` by the coordinator. Must be ≥ 1. |
