@@ -1102,9 +1102,9 @@ impl Ft8Message {
 /// was letting free-text-shaped CRC-valid garbage (e.g. `"ABC1D"`) get
 /// learned as a "real" callsign, so a LATER frame sharing its 12-bit hash
 /// rendered as that bogus identity instead of resolving correctly.
-/// `encoder.rs` is feature-gated behind `transmit`, but `decoder.rs` is not
-/// — living here (always compiled) lets both call the identical function
-/// instead of the decoder duplicating a second, possibly-diverging check.
+/// Living here gives one function for the encoder and the decoder, so the
+/// decoder never duplicates a second, possibly-diverging check (PAN-331
+/// compiles the encoder in every build; the single home still holds).
 ///
 /// PAN-17 round 2 (Codex review): the original version of this check (≥3
 /// chars, has a digit AND a letter, in any position) was too loose —
@@ -2355,7 +2355,7 @@ impl MessageParser {
     /// Reverse of encoder's `packgrid()`.
     /// Returns (grid, report, token).
     fn unpackgrid(igrid4: u16, ir: u8) -> (Option<String>, Option<i8>, Option<String>) {
-        const MAXGRID4: u16 = 32400;
+        use crate::encoder::MAXGRID4;
 
         if igrid4 < MAXGRID4 {
             // Grid square: mixed-radix 18 × 18 × 10 × 10
@@ -3440,12 +3440,8 @@ mod tests {
 
     // Pre-existing gap found while verifying Task 1 of
     // docs/superpowers/plans/2026-07-25-ap-content-decoding.md: this test
-    // calls `crate::encoder::pack28`, but `encoder` is gated behind the
-    // `transmit` feature while this module (and its `#[cfg(test)] mod
-    // tests`) is not -- `cargo test -p pancetta-ft8 --lib` with default
-    // features failed to compile before this fix, unrelated to anything
-    // else in that task.
-    #[cfg(feature = "transmit")]
+    // calls `crate::encoder::pack28`, which was once feature-gated while
+    // this module was not (the encoder is in every build since PAN-331).
     #[test]
     fn test_ip_flag_renders_as_slash_p_not_slash_r() {
         // Batch 35 (hb-219): a Standard message with ip=1 must render

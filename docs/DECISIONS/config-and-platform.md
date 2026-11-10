@@ -953,8 +953,7 @@ A rig capability (CAT, audio, TX) becomes `Tested` only when the repository
 records a hardware test, and the entry must name that record in `evidence`
 (`tested_requires_evidence`). Today only the FTdx10 is tested.
 
-<<<<<<< HEAD
-## Cargo features: hamlib always built (PAN-331, 2026-11-09)
+## Cargo features: hamlib always built, encoder in every pancetta-ft8 build (PAN-331, 2026-11-09)
 
 The `pancetta` crate no longer has a `pancetta-hamlib` feature; the
 dependency is mandatory. The hamlib-off build had been broken since at least
@@ -962,26 +961,45 @@ GitHub #270 (20 errors then, 77 by PAN-331) because no CI lane built it, and
 the default and release builds already included hamlib. Repairing it would
 have kept a second build of the TX-safety code (the PAN-115 hard mute takes a
 `pancetta_hamlib::Vfo`) that nothing ships. CI's `workspace-check` job now
-runs `cargo check -p pancetta --no-default-features` (the `metrics`-off
-build), so the station crate stays compiled without its default features.
-`metrics` gates no code today, so that build differs from the default one
-only if a default feature gains cfg sites. The opt-in `ft2`, `prometheus` and
-`tracing-json` cfg arms are still built by no CI lane. Replay mode still
-starts no Hamlib, so the "no Hamlib route" paths remain.
+runs `cargo check -p pancetta --no-default-features`, so the station crate
+stays compiled without its default features. Since PAN-334 removed `metrics`
+the crate has no default features, so that build equals the default one until
+a default feature gains cfg sites. The opt-in `ft2` cfg arms are still built
+by no CI lane. Replay mode still starts no Hamlib, so the "no Hamlib route"
+paths remain.
 
-Deferred to one follow-up: PAN-331's other two scenarios, compiling
-`encoder.rs` and `modulator.rs` in every `pancetta-ft8` build (so the default
-build manta uses runs the A7, cross-sequence A7 and GFSK passes the station
-runs) and deleting the `pack28` copy in `ap.rs`. That change touches about 40
-files on its own, so it could not ship in the same pull request under the
-40-file limit. Until it lands, `transmit` still gates the encoder and
-modulator, and the default `pancetta-ft8` build still lacks those passes.
-Its examples and tests also do not compile without `transmit`
-(`examples/snr_calibration.rs` imports `Ft8Encoder`), and no lane builds
-them, because workspace builds turn `transmit` on for every crate. The
-full implementation of the deferred work is in commit `ceff2c0` on the
+`pancetta-ft8` compiles `encoder.rs` and `modulator.rs` in every build.
+`transmit` gates only `transmit.rs`, the audio/PTT transmitter, with its
+`cpal`/`serialport`/`tokio` stack. Before, the default build (the one manta
+uses) compiled out the A7 templates, cross-sequence A7 and the GFSK
+subtraction reference, so turning those flags on silently did nothing, and
+`ap.rs` carried a private copy of `pack28`. There is no opt-out `encode`
+feature: a cfg-gated module forces a cfg at every caller, which is how
+`ap.rs` got its copy. Gate only device stacks. The cost is about 56 KB on the
+`decode_cycle` binary and no new crate. `ap.rs` now calls
+`encoder::pack28` and the fallible `encoder::try_packgrid`.
+
+`serde` stays an opt-in feature. The encoder and modulator derives moved to
+`#[cfg_attr(feature = "serde", ...)]` like every other derive in the crate,
+and `transmit` enables `serde`.
+
+CI's `ft8-tests` job runs `cargo test -p pancetta-ft8` with default features
+(the standalone build) and checks `--no-default-features`; the `transmit`
+configuration of every pancetta-ft8 test still runs in `workspace-check`'s
+`--features transmit` test step. The default-features test build had been
+broken by `examples/snr_calibration.rs` (it imports `Ft8Encoder`) without
+anyone noticing, because workspace feature unification turns on
+`pancetta-ft8/transmit` for every workspace build. `scripts/check.sh` now
+checks `-p pancetta-ft8 --all-targets` on its own for the same reason.
+
+Not done here: 16 `pancetta-ft8/tests/` files keep their `transmit` cfg
+gates (whole-file or per-test) although the encoder and modulator they use
+are no longer gated. Removing them touches 16 more files, which would take
+this pull request past the 40-file limit. Those tests still run in
+`workspace-check`'s `--features transmit` step, but the default-features
+`ft8-tests` run skips them. The gate removals are in commit `ceff2c0` on the
 PAN-331 branch.
-=======
+
 ## Every listed CLI flag does something (PAN-334, 2026-11-09)
 
 Every flag and subcommand `pancetta --help` lists either works or is gone.
@@ -1033,4 +1051,3 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `pancetta/tests/cli_surface.rs` checks every help screen (found from the live
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
->>>>>>> 8d1f0552fe084da74f2915d0671c06f6ba3815e1

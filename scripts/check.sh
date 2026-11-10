@@ -130,9 +130,13 @@ run "research guard-ci" ./scripts/research-env.sh --guard-ci
 # closes that gap.) We `check` (not `build`/`test`): no codegen/linking of the
 # dozens of example/test binaries and no test RUN (that's the FULL lane / CI).
 run "compile all-targets (check)" cargo check --workspace --all-targets
-# PAN-331: the station crate compiles without its default features too. The
-# workspace build only ever builds `pancetta` with its default features.
+# PAN-331: the station crate compiles without its default features, and the
+# pancetta-ft8 default build (the one manta uses) compiles with its tests and
+# examples. The workspace build above turns on `pancetta-ft8/transmit` for
+# every crate (feature unification via pancetta-research), so it never builds
+# pancetta-ft8 without it.
 run "pancetta without default features (check)" cargo check -p pancetta --no-default-features
+run "pancetta-ft8 default build, all targets (check)" cargo check -p pancetta-ft8 --all-targets
 
 # --- Test lane (FULL only; CI runs this on every PR + main push) ------------
 #

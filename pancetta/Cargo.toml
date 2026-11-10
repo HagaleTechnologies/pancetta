@@ -23,7 +23,7 @@ path = "src/main.rs"
 pancetta-core = { path = "../pancetta-core" }
 pancetta-audio = { path = "../pancetta-audio" }
 pancetta-dsp = { path = "../pancetta-dsp" }
-pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit", "benchmark"] }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["benchmark"] }
 pancetta-tui = { path = "../pancetta-tui" }
 pancetta-config = { path = "../pancetta-config" }
 pancetta-hamlib = { path = "../pancetta-hamlib" }
@@ -116,15 +116,7 @@ pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
 wiremock = "0.6"
 
 [features]
-<<<<<<< HEAD
-default = ["metrics"]
-metrics = []
-prometheus = ["metrics-exporter-prometheus"]
-tracing-json = []
-=======
-default = ["pancetta-hamlib"]
-pancetta-hamlib = ["dep:pancetta-hamlib"]
->>>>>>> 8d1f0552fe084da74f2915d0671c06f6ba3815e1
+default = []
 # Experimental FT2 digital mode (forwards to pancetta-ft8/ft2). Off by default;
 # when off, a configured FT2 mode falls back to FT8 timing in the coordinator.
 ft2 = ["pancetta-ft8/ft2"]

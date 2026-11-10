@@ -77,7 +77,7 @@ cargo build --workspace
 # Build in release mode
 cargo build --release
 
-# Run tests (the encoder is behind the `transmit` feature)
+# Run tests (`transmit` adds pancetta-ft8's transmitter and the tests still gated on it)
 cargo test --workspace --features transmit
 
 # Run with debug logging
