@@ -64,6 +64,23 @@
   fixed 2026-07-31: consolidated into `pancetta_research::noise::gaussian_noise`, all 25
   call sites updated. (Surfaced by PAN-1, 2026-07-29.)
 
+- **Spot-call QSY follow-ups (PAN-287, 2026-11).** Space on a DX Hunter network spot now QSYs
+  the rig and calls at the spot's offset (`docs/DECISIONS/tui.md`). Left open:
+  - The rig's data mode is not set on a QSY (A13 / review L4-24). The seam is marked in
+    `qsy_send` in `pancetta/src/coordinator/spot_call.rs`.
+  - cqdx spots do not reach DX Hunter yet (`spawn_spot_poller(…, None, None)`, review L4-10);
+    once wired they take the same path.
+  - DX Hunter rows on another band carry no band tag, so the operator learns that Space will QSY
+    only from the keypress status line.
+  - An autonomous band hop can undo a manual spot QSY.
+  - Cluster rows are labelled `RX` (`source = Local`), `DxStation.frequency` holds Hz for cluster
+    rows and MHz for cqdx rows, and `add_dx_spot` replaces a locally heard row. The spot path
+    reads only `spot_rf_hz`.
+  - The TUI's band state does not follow autonomous band hops.
+  - The Hamlib loop has no keyed recheck for TUI-sourced `SetFrequency`; the relay's
+    `rig_is_keyed` recheck under `ptt_sync_gate` is the guard for spot QSYs, and band keys
+    have never had one.
+
 ## Missing-docs lint status (verified 2026-07-17)
 
 Per-crate `#![...(missing_docs)]` levels, dropped from CLAUDE.md's "Documentation Policy" section

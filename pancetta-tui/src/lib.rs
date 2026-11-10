@@ -41,6 +41,7 @@ pub mod dx_need;
 pub mod dx_reason;
 pub mod keymap;
 pub mod readiness;
+pub mod spot_call;
 pub mod tui_runner;
 pub mod ui;
 pub mod view;

@@ -2324,6 +2324,27 @@ impl AutonomousOperator {
         }
     }
 
+    /// Clear every piece of allocator state scoped to the current dial's
+    /// audio-offset space. Called by the autonomous band hop and (PAN-287)
+    /// by the coordinator after any commanded dial change (band keys,
+    /// Shift+F, spot-call QSY): audio offsets shift with the dial, so old
+    /// spectral data and decode history are wrong after any move.
+    pub fn invalidate_band_scoped_state(&mut self) {
+        // Codex review (PR #276): decode_history/spectral_snapshot/
+        // current_cq_offset_hz are all scoped to the OLD band's audio-
+        // offset space — a dial change makes them meaningless (and, for
+        // the no-response-streak freshness check below, misleadingly
+        // "fresh") for ranking on the new band. Clear them so both the
+        // ordinary allocator and the streak-switch logic wait for real
+        // data from the new band before trusting any ranking.
+        self.decode_history = DecodeHistory::new(self.config.frequency.decode_history_cycles);
+        self.spectral_snapshot = None;
+        self.current_cq_offset_hz = None;
+        // PAN-38 round 3/4: a band hop invalidates the old band's sticky
+        // offset exactly like a mode transition does -- a pending
+        // restore of a pre-hop snapshot must not resurrect it.
+        self.offset_generation = self.offset_generation.wrapping_add(1);
+    }
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
@@ -2344,20 +2365,7 @@ impl AutonomousOperator {
             actions.push(OperatorAction::ChangeBand {
                 dial_frequency: new_freq,
             });
-            // Codex review (PR #276): decode_history/spectral_snapshot/
-            // current_cq_offset_hz are all scoped to the OLD band's audio-
-            // offset space — a dial change makes them meaningless (and, for
-            // the no-response-streak freshness check below, misleadingly
-            // "fresh") for ranking on the new band. Clear them so both the
-            // ordinary allocator and the streak-switch logic wait for real
-            // data from the new band before trusting any ranking.
-            self.decode_history = DecodeHistory::new(self.config.frequency.decode_history_cycles);
-            self.spectral_snapshot = None;
-            self.current_cq_offset_hz = None;
-            // PAN-38 round 3/4: a band hop invalidates the old band's sticky
-            // offset exactly like a mode transition does -- a pending
-            // restore of a pre-hop snapshot must not resurrect it.
-            self.offset_generation = self.offset_generation.wrapping_add(1);
+            self.invalidate_band_scoped_state();
         }
 
         // Step 1: slot manager
@@ -7434,6 +7442,65 @@ mod tests {
         assert_eq!(
             snap.openness[bin_1500], 1,
             "busy in First -> second-only-clear"
+        );
+    }
+
+    /// PAN-287: `invalidate_band_scoped_state` (run by the coordinator after
+    /// any commanded dial change, and by the band hop) drops the old dial's
+    /// spectral snapshot, so the TX Placement panel goes empty until the new
+    /// dial's first snapshot.
+    #[test]
+    fn invalidate_band_scoped_state_clears_the_spectral_snapshot() {
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 200.0,
+            freq_max_hz: 3000.0,
+        });
+        assert!(op.placement_snapshot(10).is_some());
+
+        op.invalidate_band_scoped_state();
+
+        assert!(op.placement_snapshot(10).is_none());
+    }
+
+    /// PAN-287: after `invalidate_band_scoped_state`, the Auto-mode allocator
+    /// ranks exactly like a freshly constructed operator (the no-snapshot
+    /// path): no old-dial spectral data or decode history leaks into the pick.
+    #[test]
+    fn invalidate_band_scoped_state_allocates_like_a_fresh_operator() {
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let fresh = AutonomousOperator::new(config.clone(), "W1ABC".into(), Some("FN42".into()));
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        let mut bins = vec![0.0; 128];
+        // Make most of the old dial's passband look busy so the old snapshot
+        // would steer the pick away from the fresh operator's choice.
+        for b in bins.iter_mut().take(100) {
+            *b = 50.0;
+        }
+        op.update_spectral(SpectralSnapshot {
+            power_bins: bins,
+            freq_min_hz: 200.0,
+            freq_max_hz: 3000.0,
+        });
+        op.decode_history_mut_for_test()
+            .push_cycle(vec![DecodeRecord {
+                frequency_hz: fresh.allocate_smart_frequency(None, None, None),
+                time_slot: TimeSlot::First,
+            }]);
+
+        op.invalidate_band_scoped_state();
+
+        assert_eq!(
+            op.allocate_smart_frequency(None, None, None),
+            fresh.allocate_smart_frequency(None, None, None)
         );
     }
 

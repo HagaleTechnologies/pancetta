@@ -2065,6 +2065,11 @@ impl super::ApplicationCoordinator {
             // construction.
             guard.set_tx_offset_hold_source(self.tx_offset_hold_hz());
         }
+        // PAN-287: publish the operator so the TUI relay's spot call can ask
+        // the allocator for a TX offset and clear old-band data after a QSY.
+        // Runs on every (re)start; `send_replace` for the zero-receiver case.
+        self.autonomous_operator_watch
+            .send_replace(Some(operator.clone()));
 
         // Phase-5 hardening #1: install the same callsign-continuity FP
         // filter the decoder uses, so the TX decision path can reject

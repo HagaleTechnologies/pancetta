@@ -1295,6 +1295,30 @@ impl super::ApplicationCoordinator {
         // immediately (the structured panel update follows on the next
         // autonomous slot tick, ≤15s later).
         let cmd_tui_msg_tx = tui_msg_tx.clone();
+        // PAN-287: Space on a DX Hunter network spot (`CallNetworkSpot`) and
+        // the operator's `SetFrequency` share one QSY helper and one lock, so
+        // a band key cannot interleave between a spot QSY and its call. See
+        // `coordinator/spot_call.rs`.
+        let spot_ctx = super::spot_call::SpotCallCtx {
+            qsy: super::spot_call::QsyCtx {
+                bus: cmd_message_bus.clone(),
+                operating_freq_hz: cmd_operating_freq_hz.clone(),
+                last_freq_command: cmd_last_freq_command.clone(),
+                split_tx_hz: cmd_split_tx_hz.clone(),
+                tui_msg_tx: cmd_tui_msg_tx.clone(),
+                operator_watch: self.autonomous_operator_watch.subscribe(),
+            },
+            ptt_active: self.ptt_active.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            our_callsign: cmd_our_callsign.clone(),
+            qso_manager_watch: cmd_qso_manager_watch.clone(),
+            active_tx_offsets: cmd_active_tx_offsets.clone(),
+            ptt_sync_gate: cmd_ptt_sync_gate.clone(),
+            spot_qsy_lock: Arc::new(tokio::sync::Mutex::new(())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            parked_call: Arc::new(std::sync::Mutex::new(None)),
+            wait_cap: super::spot_call::SPOT_QSY_WAIT_CAP,
+        };
         // Shared config — the SelectDevice handler persists the operator's
         // chosen output device into it (and into `cmd_config_path`).
         let cmd_config = self.config.clone();
@@ -1635,12 +1659,32 @@ impl super::ApplicationCoordinator {
                                     // TUI-initiated call is LOCAL (byte-identical to prior).
                                     remote_origin: false,
                                     remote_client_key_id: None,
+                                    dx_offset_unknown: false,
                                 }),
                                 Instant::now(),
                             );
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::CallNetworkSpot {
+                            callsign,
+                            band,
+                            dial_hz,
+                            audio_offset_hz,
+                        } => {
+                            // PAN-287: admit, QSY when needed (after PTT-off), then call.
+                            info!(
+                                "TUI CallNetworkSpot: {} {} Hz offset {:?}",
+                                callsign, dial_hz, audio_offset_hz
+                            );
+                            let call = super::spot_call::SpotCall {
+                                callsign,
+                                band,
+                                dial_hz,
+                                audio_offset_hz,
+                            };
+                            super::spot_call::handle_spot_call(&spot_ctx, call).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::EngageHound {
                             callsign,
@@ -1817,71 +1861,19 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::SetFrequency { vfo, frequency } => {
                             info!("TUI SetFrequency: VFO {} -> {} Hz", vfo, frequency);
-                            // C9 — band change mid-QSO: tear down active QSOs so no
-                            // stale keep-call keeps TXing on the new band. Capture the
-                            // *old* dial frequency BEFORE we overwrite the atomic, then
-                            // decide whether this dial move is a genuine band change.
-                            let old_freq_hz = cmd_operating_freq_hz.load(Ordering::Relaxed);
-                            cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
-                            // Stamp the C9 dedup anchor: pancetta commanded this
-                            // freq, so the hamlib poll loop suppresses its own
-                            // teardown (here and during the rig settle window).
-                            if let Ok(mut anchor) = cmd_last_freq_command.lock() {
-                                *anchor = Some((frequency, Instant::now()));
-                            }
-                            if super::is_band_change(old_freq_hz, frequency) {
-                                info!(
-                                    target: "operator.override",
-                                    "Band change {} Hz -> {} Hz — tearing down active QSOs",
-                                    old_freq_hz, frequency
-                                );
-                                let teardown = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(
-                                        crate::message_bus::QsoMessage::BandChanged {
-                                            previous_hz: old_freq_hz,
-                                            new_hz: frequency,
-                                        },
-                                    ),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(teardown).await {
-                                    warn!("Band change: failed to send teardown: {}", e);
-                                }
-                                // A band change invalidates any split TX freq.
-                                if cmd_split_tx_hz.load(Ordering::Relaxed) != 0 {
-                                    let store = super::forward_split_change(
-                                        &cmd_message_bus,
-                                        ComponentId::Tui,
-                                        &cmd_split_tx_hz,
-                                        false,
-                                        0,
-                                    )
-                                    .await;
-                                    // Push authoritative split state to the TUI chip.
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::SplitUpdate {
-                                            tx_hz: store,
-                                        },
-                                    );
-                                }
-                            }
-                            // Forward to hamlib if available
-                            let msg = ComponentMessage::new(
+                            // C9 band-change teardown, split clear and the rig
+                            // command live in `spot_call::qsy_send` (PAN-287); a
+                            // commanded dial change also clears the allocator's
+                            // old-band data and cancels a parked spot call.
+                            let _spot_lock = spot_ctx.spot_qsy_lock.lock().await;
+                            super::spot_call::note_operator_frequency_change(&spot_ctx);
+                            super::spot_call::qsy_to(
+                                &spot_ctx.qsy,
                                 ComponentId::Tui,
-                                ComponentId::Hamlib,
-                                MessageType::RigControl(
-                                    crate::message_bus::RigControlMessage::SetFrequency {
-                                        vfo,
-                                        frequency,
-                                    },
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                debug!("Failed to forward SetFrequency to hamlib: {}", e);
-                            }
+                                vfo,
+                                frequency,
+                            )
+                            .await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::SetSplit {
                             enabled,
