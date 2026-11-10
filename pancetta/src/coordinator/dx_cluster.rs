@@ -8,11 +8,35 @@
 //! No-op when `[network.dx_cluster].enabled = false` (the default).
 
 use anyhow::Result;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, span, warn, Level};
+use pancetta_dx::cluster::{ClusterConfig, DxClusterClient};
+use std::time::Instant;
+use tracing::{debug, info};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+/// Client settings for the DX-cluster worker: the first configured server
+/// (or `dxc.nc7j.com:23`), and `[network.dx_cluster.connection]`'s connect
+/// timeout (at least 1 s) and reconnect delay. The worker always reconnects
+/// (PAN-288).
+fn dx_cluster_client_config(
+    dx: &pancetta_config::DxClusterConfig,
+    callsign: &str,
+) -> ClusterConfig {
+    let server = dx.servers.first();
+    ClusterConfig {
+        hostname: server
+            .map(|s| s.hostname.clone())
+            .unwrap_or_else(|| "dxc.nc7j.com".to_string()),
+        port: server.map(|s| s.port).unwrap_or(23),
+        callsign: callsign.to_string(),
+        timeout_seconds: u64::from(dx.connection.timeout_seconds.max(1)),
+        reconnect_delay_seconds: dx.connection.reconnect_delay_seconds,
+        auto_reconnect: true,
+        filter_settings: Default::default(),
+        use_websocket: false,
+        websocket_url: None,
+    }
+}
 
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_dx_cluster_component(&mut self) -> Result<()> {
@@ -28,26 +52,13 @@ impl super::ApplicationCoordinator {
             return Ok(());
         }
 
-        let cluster_hostname = config
-            .network
-            .dx_cluster
-            .servers
-            .first()
-            .map(|s| s.hostname.clone())
-            .unwrap_or_else(|| "dxc.nc7j.com".to_string());
-        let cluster_port = config
-            .network
-            .dx_cluster
-            .servers
-            .first()
-            .map(|s| s.port)
-            .unwrap_or(23);
-        let our_callsign = config.station.callsign.clone();
+        let client_config =
+            dx_cluster_client_config(&config.network.dx_cluster, &config.station.callsign);
         drop(config);
 
         info!(
             "Starting DX cluster component ({}:{})",
-            cluster_hostname, cluster_port
+            client_config.hostname, client_config.port
         );
 
         let (_dx_tx, _dx_rx) = self
@@ -60,78 +71,40 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_dx::cluster::{ClusterConfig, DxClusterClient};
+                let mut client = DxClusterClient::with_config(client_config);
 
-                let mut client = DxClusterClient::with_config(ClusterConfig {
-                    hostname: cluster_hostname.clone(),
-                    port: cluster_port,
-                    callsign: our_callsign.clone(),
-                    timeout_seconds: 30,
-                    reconnect_delay_seconds: 30,
-                    auto_reconnect: true,
-                    filter_settings: Default::default(),
-                    use_websocket: false,
-                    websocket_url: None,
-                });
+                // Connects, forwards spots, and reconnects with capped backoff
+                // after every disconnect until shutdown (PAN-288).
+                client
+                    .run_until_shutdown(&shutdown, |spot| {
+                        let message_bus = message_bus.clone();
+                        async move {
+                            debug!(
+                                "DX spot: {} on {} Hz by {}",
+                                spot.callsign, spot.frequency, spot.spotter
+                            );
 
-                match client.connect().await {
-                    Ok(_) => {
-                        info!("Connected to DX cluster");
-
-                        // Login with our callsign
-                        if let Err(e) = client.login().await {
-                            warn!("DX cluster login failed: {}. Continuing without.", e);
-                        }
-
-                        // Monitor spots and forward to TUI
-                        while !shutdown.load(Ordering::Acquire) {
-                            match tokio::time::timeout(
-                                Duration::from_secs(5),
-                                client.receive_spot(),
-                            )
-                            .await
-                            {
-                                Ok(Some(spot)) => {
-                                    debug!(
-                                        "DX spot: {} on {} Hz by {}",
-                                        spot.callsign, spot.frequency, spot.spotter
-                                    );
-
-                                    let msg = ComponentMessage::new(
-                                        ComponentId::DxCluster,
-                                        ComponentId::Tui,
-                                        MessageType::DxMessage(
-                                            crate::message_bus::DxMessage::Spot {
-                                                callsign: spot.callsign,
-                                                frequency: spot.frequency,
-                                                spotter: spot.spotter,
-                                                comment: spot.comment.unwrap_or_default(),
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(msg).await {
-                                        debug!("Failed to forward DX spot: {}", e);
-                                    }
-                                }
-                                Ok(None) => {
-                                    // No spot available, yield
-                                    tokio::task::yield_now().await;
-                                }
-                                Err(_) => {
-                                    // Timeout -- normal, just loop
-                                }
+                            let msg = ComponentMessage::new(
+                                ComponentId::DxCluster,
+                                ComponentId::Tui,
+                                MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
+                                    callsign: spot.callsign,
+                                    frequency: spot.frequency,
+                                    spotter: spot.spotter,
+                                    comment: spot.comment.unwrap_or_default(),
+                                }),
+                                Instant::now(),
+                            );
+                            if let Err(e) = message_bus.send_message(msg).await {
+                                debug!("Failed to forward DX spot: {}", e);
                             }
                         }
+                    })
+                    .await;
 
-                        let dropped = client.dropped_spot_count();
-                        if dropped > 0 {
-                            info!("DX cluster dropped {dropped} spot(s) while its queue was full");
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to connect to DX cluster: {}. Feature disabled.", e);
-                    }
+                let dropped = client.dropped_spot_count();
+                if dropped > 0 {
+                    info!("DX cluster dropped {dropped} spot(s) while its queue was full");
                 }
 
                 info!("DX cluster component stopped");
@@ -143,5 +116,32 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::DxCluster, dx_handle));
         info!("DX cluster component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dx_cluster_client_config_reads_connection_settings() {
+        let mut dx = pancetta_config::DxClusterConfig::default();
+        dx.connection.reconnect_delay_seconds = 7;
+        dx.connection.timeout_seconds = 0;
+        let cfg = dx_cluster_client_config(&dx, "N0CALL");
+        assert_eq!(cfg.reconnect_delay_seconds, 7);
+        assert_eq!(cfg.timeout_seconds, 1);
+        assert!(cfg.auto_reconnect);
+        assert_eq!(cfg.callsign, "N0CALL");
+
+        let defaults =
+            dx_cluster_client_config(&pancetta_config::DxClusterConfig::default(), "N0CALL");
+        assert_eq!(defaults.reconnect_delay_seconds, 30);
+        assert_eq!(defaults.timeout_seconds, 30);
+        assert!(defaults.auto_reconnect);
+        assert_eq!(
+            (defaults.hostname.as_str(), defaults.port),
+            ("dxc.nc7j.com", 23)
+        );
     }
 }
