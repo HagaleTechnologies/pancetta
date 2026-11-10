@@ -8,27 +8,10 @@
 
 # Known gaps and TODOs
 
-<<<<<<< HEAD
-- **Auto-73 after the 45-second rework grace can reset the resend cap.**
-  Without a QSO inside `COMPLETED_QSO_REWORK_GRACE`, an auto-73 opens a new
-  completed QSO and emits `QsoCompleted`. The completion handler then
-  replaces the callsign's cache entry with `resends: 0`, although
-  `AUTO_73_WINDOW` lasts three minutes. The engine event was reproduced
-  during planning; the resulting reset and any duplicate ADIF write still
-  need an end-to-end test. (Surfaced by PAN-138, 2026-10-20.)
-
 - **A non-completing ladder advance whose frame is dropped keeps its
   advanced state.** Advances record no PAN-75 attempt, so a dropped frame
   from a step that does not complete the QSO is not undone. (Surfaced by
   PAN-138 review on PR #483, 2026-10-20.)
-=======
-- **Completed-QSO resends denied at key time are not compensated.** A
-  disarm after the engine's in-lock check makes the TX worker report
-  `TxFrameNotSent`, but `roll_back_unsent_attempt` returns `QsoNotActive`
-  for a completed QSO and the auto-73 counter stays charged. Compensation
-  needs a per-entry pending-attempt marker to distinguish an auto-73 from
-  an operator's same-text FIX B re-key. (Surfaced by PAN-138, 2026-10-20.)
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
 
 - **A completion whose 73 aired can still go unlogged.** Since PAN-280 a
   completion that queues a closing frame is held until that frame's

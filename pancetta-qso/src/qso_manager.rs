@@ -5222,7 +5222,6 @@ impl QsoManager {
                 remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
             },
         );
-<<<<<<< HEAD
         // PAN-280: a FIX B re-key of a completion still waiting on its 73
         // joins the pending set; whichever of them airs logs the QSO.
         if let Some(pending) = self
@@ -5233,10 +5232,7 @@ impl QsoManager {
         {
             pending.attempt_ids.push(attempt_id);
         }
-        Some((message, frequency, attempt_id))
-=======
         (message, frequency, attempt_id)
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
     }
 
     /// PAN-280: store a completion that queued a closing frame. Called under
@@ -28884,7 +28880,6 @@ mod pan260 {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pending_completion_tests {
     //! PAN-280: a completion that queues a closing frame emits `QsoCompleted`
     //! only when that frame airs; a frame that never airs reverts it.
@@ -28926,31 +28921,6 @@ mod pending_completion_tests {
             )
             .await
             .unwrap()
-=======
-mod pan275_completed_close_tests {
-    //! PAN-275: the coordinator's auto-73 re-keys a COMPLETED manual QSO by
-    //! id through `resend_completed_close`, however long ago it completed,
-    //! and never opens a second QSO or emits a second `QsoCompleted`.
-    use super::*;
-    use pancetta_core::slot::SlotParity;
-    use pancetta_core::ResponseStep;
-    use std::sync::atomic::AtomicBool;
-
-    const OUR: &str = "K5ARH";
-    const DX: &str = "DL1ABC";
-    const FREQ: f64 = 1500.0;
-
-    fn config() -> QsoManagerConfig {
-        QsoManagerConfig {
-            our_callsign: OUR.into(),
-            our_grid: Some("EM12".into()),
-            ..Default::default()
-        }
-    }
-
-    fn manager() -> QsoManager {
-        QsoManager::new(config())
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
     }
 
     fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
@@ -28961,37 +28931,13 @@ mod pan275_completed_close_tests {
         out
     }
 
-<<<<<<< HEAD
     fn completions(events: &[QsoEvent]) -> usize {
-=======
-    fn sends_for(events: &[QsoEvent], id: QsoId) -> Vec<MessageType> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                QsoEvent::MessageToSend {
-                    qso_id, message, ..
-                } if *qso_id == id => Some(message.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn count_sends(events: &[QsoEvent]) -> usize {
-        events
-            .iter()
-            .filter(|e| matches!(e, QsoEvent::MessageToSend { .. }))
-            .count()
-    }
-
-    fn count_completed(events: &[QsoEvent]) -> usize {
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
         events
             .iter()
             .filter(|e| matches!(e, QsoEvent::QsoCompleted { .. }))
             .count()
     }
 
-<<<<<<< HEAD
     fn payload() -> UnsentAttemptPayload {
         UnsentAttemptPayload {
             frequency_hz: FREQ,
@@ -29031,51 +28977,10 @@ mod pan275_completed_close_tests {
         let attempt = advanced.attempt_id().expect("the advance emitted a 73");
         let events = drain(&mut rx);
         assert_eq!(completions(&events), 0, "nothing logs at queue time");
-=======
-    fn count_state_changes(events: &[QsoEvent]) -> usize {
-        events
-            .iter()
-            .filter(|e| matches!(e, QsoEvent::StateChanged { .. }))
-            .count()
-    }
-
-    async fn complete_manual(
-        manager: &QsoManager,
-        remote_origin: bool,
-        remote_client_key_id: Option<String>,
-    ) -> QsoId {
-        manager
-            .respond_to_caller(
-                DX.into(),
-                FREQ,
-                Some(SlotParity::Even),
-                ResponseStep::SeventyThree,
-                Some(-10.0),
-                Some(-12),
-                None,
-                remote_origin,
-                remote_client_key_id,
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn call_count(manager: &QsoManager, id: QsoId) -> u32 {
-        manager.get_qso(id).await.unwrap().metadata.call_count
-    }
-
-    #[tokio::test]
-    async fn resend_completed_close_past_the_grace_rekeys_the_same_qso() {
-        let manager = manager();
-        let mut rx = manager.subscribe();
-        let id = complete_manual(&manager, false, None).await;
-        drain(&mut rx);
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
         assert!(matches!(
             manager.get_qso(id).await.unwrap().state,
             QsoState::Completed { .. }
         ));
-<<<<<<< HEAD
 
         permitted.store(false, SeqCst);
         assert_eq!(
@@ -29483,7 +29388,111 @@ mod pan275_completed_close_tests {
             ));
             assert_eq!(completions(&drain(&mut rx)), 0);
         }
-=======
+    }
+}
+
+#[cfg(test)]
+mod pan275_completed_close_tests {
+    //! PAN-275: the coordinator's auto-73 re-keys a COMPLETED manual QSO by
+    //! id through `resend_completed_close`, however long ago it completed,
+    //! and never opens a second QSO or emits a second `QsoCompleted`.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::AtomicBool;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "DL1ABC";
+    const FREQ: f64 = 1500.0;
+
+    fn config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            ..Default::default()
+        }
+    }
+
+    fn manager() -> QsoManager {
+        QsoManager::new(config())
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn sends_for(events: &[QsoEvent], id: QsoId) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend {
+                    qso_id, message, ..
+                } if *qso_id == id => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count_sends(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::MessageToSend { .. }))
+            .count()
+    }
+
+    fn count_completed(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::QsoCompleted { .. }))
+            .count()
+    }
+
+    fn count_state_changes(events: &[QsoEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, QsoEvent::StateChanged { .. }))
+            .count()
+    }
+
+    async fn complete_manual(
+        manager: &QsoManager,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> QsoId {
+        manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                ResponseStep::SeventyThree,
+                Some(-10.0),
+                Some(-12),
+                None,
+                remote_origin,
+                remote_client_key_id,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn call_count(manager: &QsoManager, id: QsoId) -> u32 {
+        manager.get_qso(id).await.unwrap().metadata.call_count
+    }
+
+    #[tokio::test]
+    async fn resend_completed_close_past_the_grace_rekeys_the_same_qso() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let id = complete_manual(&manager, false, None).await;
+        drain(&mut rx);
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
         assert!(
             manager
                 .backdate_completion_for_test(id, Duration::seconds(60))
@@ -29493,7 +29502,10 @@ mod pan275_completed_close_tests {
         assert!(manager.completed_close_rekeyable_now(id, FREQ).await);
 
         let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
-        assert_eq!(outcome, ManualCallOutcome::Resent);
+        assert!(
+            matches!(outcome, ManualCallOutcome::Resent(_)),
+            "{outcome:?}"
+        );
         let events = drain(&mut rx);
         let sends = sends_for(&events, id);
         assert_eq!(sends.len(), 1, "exactly one MessageToSend for the QSO");
@@ -29526,7 +29538,10 @@ mod pan275_completed_close_tests {
             )
             .await
             .unwrap();
-        assert_eq!(outcome, ManualCallOutcome::Opened);
+        assert!(
+            matches!(outcome, ManualCallOutcome::Opened(_)),
+            "{outcome:?}"
+        );
         assert_ne!(new_id, id);
     }
 
@@ -29564,7 +29579,10 @@ mod pan275_completed_close_tests {
         let mut rx = manager.subscribe();
 
         let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
-        assert_eq!(outcome, ManualCallOutcome::Resent);
+        assert!(
+            matches!(outcome, ManualCallOutcome::Resent(_)),
+            "{outcome:?}"
+        );
         let sends = sends_for(&drain(&mut rx), id);
         assert_eq!(
             sends,
@@ -29598,7 +29616,10 @@ mod pan275_completed_close_tests {
         let mut rx = manager.subscribe();
 
         let outcome = manager.resend_completed_close(id, FREQ, false, None).await;
-        assert_eq!(outcome, ManualCallOutcome::Resent);
+        assert!(
+            matches!(outcome, ManualCallOutcome::Resent(_)),
+            "{outcome:?}"
+        );
         assert_eq!(
             sends_for(&drain(&mut rx), id),
             vec![MessageType::SeventyThree {
@@ -29692,10 +29713,10 @@ mod pan275_completed_close_tests {
         assert_refused(&manager, id, FREQ).await;
         // Same QSO, back on its own band: it re-keys.
         dial.store(14_074_000, Ordering::Relaxed);
-        assert_eq!(
+        assert!(matches!(
             manager.resend_completed_close(id, FREQ, false, None).await,
-            ManualCallOutcome::Resent
-        );
+            ManualCallOutcome::Resent(_)
+        ));
     }
 
     #[tokio::test]
@@ -29781,7 +29802,6 @@ mod pan275_completed_close_tests {
                 .await,
             None
         );
->>>>>>> 29807aa804c8cd6705f01612ac049bd3c4a62eb6
     }
 }
 
