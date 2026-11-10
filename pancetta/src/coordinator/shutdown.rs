@@ -141,7 +141,6 @@ impl super::ApplicationCoordinator {
             Ok(())
         };
 
-        #[cfg(feature = "pancetta-hamlib")]
         {
             let original = *self
                 .gain_sweep_original
@@ -226,7 +225,6 @@ impl super::ApplicationCoordinator {
         }
 
         // Kill managed rigctld process
-        #[cfg(feature = "pancetta-hamlib")]
         if let Some(mut child) = self.rigctld_process.take() {
             info!("Stopping managed rigctld (PID {})", child.id());
             let _ = child.kill();

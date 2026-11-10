@@ -45,7 +45,7 @@ publish = false
 # Real-time audio processing
 cpal = "0.18"
 # Lock-free data structures for real-time communication
-ringbuf = "0.5"
+ringbuf = "0.6"
 # High-precision timing
 instant = "0.1"
 # Atomic operations for real-time coordination
@@ -86,9 +86,6 @@ num_cpus = "1.0"
 
 # Signal handling
 signal-hook = "0.4"
-
-# Performance monitoring
-metrics = "0.24"
 
 # HTTP client and networking
 reqwest = { version = "0.13", features = ["json", "stream", "multipart", "cookies", "query", "form"] }

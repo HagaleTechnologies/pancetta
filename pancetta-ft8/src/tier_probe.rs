@@ -14,7 +14,7 @@
 //! - `HardwareTier` enum (Fast | Moderate | Slow).
 //! - `classify_tier(p95_ms)` — pure function mapping wall-clock to tier.
 //! - `recommend_actions(tier)` — per-tier runtime recommendations.
-//! - `probe_hardware_tier(n)` — gated on `transmit` feature; generates a
+//! - `probe_hardware_tier(n)` — generates a
 //!   synthetic FT8 signal, decodes N times, returns percentile stats +
 //!   classification + recommendations.
 //!
@@ -192,7 +192,6 @@ pub fn summarize_samples(mut samples: Vec<Duration>) -> TierProbeResult {
 ///
 /// `n` should be ≥ 3 for stable p95; ≥ 10 for stable p99. The first
 /// decode is treated as a warmup and discarded.
-#[cfg(feature = "transmit")]
 pub fn probe_hardware_tier(n: usize) -> crate::Ft8Result<TierProbeResult> {
     use crate::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
     use std::time::Instant;
@@ -309,7 +308,6 @@ mod tests {
         assert_eq!(result.recommendations.len(), 1);
     }
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn probe_hardware_tier_smoke_yields_sane_stats() {
         let result = probe_hardware_tier(2).expect("probe");

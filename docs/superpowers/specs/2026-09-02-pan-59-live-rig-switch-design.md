@@ -86,13 +86,14 @@ Some(req) = hamlib_reconnect_rx.recv() => {
 }
 ```
 
-`handle_hamlib_reconnect_request` (new, `hamlib.rs`, `#[cfg(feature = "pancetta-hamlib")]`):
+`handle_hamlib_reconnect_request` (new, `hamlib.rs`, `#[cfg(feature = "pancetta-hamlib")]`; PAN-331: no longer gated):
 refuses (responds with an `Err`, does **not** tear down) while `self.ptt_active.load(Ordering::Acquire)`
 is true — tearing down Hamlib mid-key-down would yank CAT/PTT control out from under an active
 transmission — otherwise runs `self.teardown_hamlib().await; let result =
 self.start_hamlib_component().await; let _ = req.respond.send(result);`. A
 `#[cfg(not(feature = "pancetta-hamlib"))]` stub immediately responds with an error ("rig control not
-compiled in"). This mirrors the codebase's existing safety instinct around Hamlib/PTT (see
+compiled in"). (PAN-331: the `pancetta-hamlib` feature and this stub were removed; rig control is
+always compiled in.) This mirrors the codebase's existing safety instinct around Hamlib/PTT (see
 `TxInhibitGuard`, `hamlib_command_loop_ready`) rather than inventing a new pattern.
 
 `SelectRig`'s handler in `tui_relay.rs` sends a `HamlibReconnectRequest`, awaits the oneshot with a

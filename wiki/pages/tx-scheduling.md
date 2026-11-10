@@ -78,6 +78,13 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   Autonomous: a refused pivot stays silent and its queued request reports; a
   keyed pivot reports and its absorbed request drops silently. See
   `docs/DECISIONS/tx-scheduling.md`.
+- **Supersede ownership (PAN-279):** every unaired frame settles through
+  `coordinator::tx_outcome::settle_unaired_frame`. A supersede's abandoned
+  frame always rolls back its own attempt with the QSO engine, and fails to
+  Autonomous only when no same-QSO successor (re-key, requeued superseder,
+  carried bundle item) will report. A `NotViable` superseder is requeued at the
+  front of the inbox, never dropped. Coalescer-excluded entries report to both
+  consumers; folded entries with an attempt id roll back their own attempt.
 
 A registered self-CQ opening has no accepted predecessor. The QSO forwarder
 marks it before starting the CQ and consumes that marker on its first

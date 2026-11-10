@@ -25,17 +25,12 @@
 //! - Bit 57:     from_callsign suffix flag
 //! - Bits 58-76: ir + grid/report + i3 (19 bits)
 
-#![allow(dead_code)]
 // rationale: AP LLR-injection loops index the 77-bit payload positions; the
 // index is load-bearing for the protocol bit layout.
 #![allow(clippy::needless_range_loop)]
 
 /// High-confidence LLR magnitude for known AP bits.
 const AP_LLR_MAGNITUDE: f32 = 15.0;
-
-/// WSJT-X constants for callsign encoding (same as encoder.rs)
-const NTOKENS: u32 = 2_063_592;
-const MAX22: u32 = 4_194_304;
 
 // ---------------------------------------------------------------------------
 // Ap5 attempt instrumentation (Task 7 eval-harness follow-up)
@@ -70,147 +65,6 @@ pub fn reset_ap5_attempt_count() {
 /// not part of the public API surface used outside this crate.
 pub(crate) fn record_ap5_attempt() {
     AP5_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-// ---------------------------------------------------------------------------
-// Standalone pack28 (avoids dependency on transmit-gated encoder module)
-// ---------------------------------------------------------------------------
-
-/// Pack a callsign into a 28-bit integer, matching WSJT-X encoding.
-/// Returns `(packed_value, suffix_flag)` or `None` on failure.
-fn pack28(callsign: &str) -> Option<(u32, u8)> {
-    // Special tokens
-    match callsign {
-        "DE" => return Some((0, 0)),
-        "QRZ" => return Some((1, 0)),
-        "CQ" => return Some((2, 0)),
-        _ => {}
-    }
-
-    // CQ with modifier
-    if callsign.starts_with("CQ ") && callsign.len() < 8 {
-        let modifier = &callsign[3..];
-        if let Some(v) = parse_cq_modifier(modifier) {
-            return Some((3 + v, 0));
-        }
-        return None;
-    }
-
-    // Detect /R or /P suffix
-    let (base, ip) = if callsign.ends_with("/P") || callsign.ends_with("/R") {
-        (&callsign[..callsign.len() - 2], 1u8)
-    } else {
-        (callsign, 0u8)
-    };
-
-    let n28 = pack_basecall(base)?;
-    Some((NTOKENS + MAX22 + n28, ip))
-}
-
-fn parse_cq_modifier(modifier: &str) -> Option<u32> {
-    if modifier.is_empty() || modifier.len() > 4 {
-        return None;
-    }
-    let bytes = modifier.as_bytes();
-    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
-    let all_letters = bytes.iter().all(|b| b.is_ascii_uppercase());
-
-    if all_digits && modifier.len() == 3 {
-        let nnn: u32 = modifier.parse().ok()?;
-        Some(nnn)
-    } else if all_letters && modifier.len() <= 4 {
-        let mut m: u32 = 0;
-        for &b in bytes {
-            m = 27 * m + ((b - b'A') as u32 + 1);
-        }
-        Some(1000 + m)
-    } else {
-        None
-    }
-}
-
-fn pack_basecall(callsign: &str) -> Option<u32> {
-    let length = callsign.len();
-    if !(3..=6).contains(&length) {
-        return None;
-    }
-    let bytes = callsign.as_bytes();
-    let mut c6 = [b' '; 6];
-
-    if callsign.starts_with("3DA0") && length > 4 && length <= 7 {
-        c6[0] = b'3';
-        c6[1] = b'D';
-        c6[2] = b'0';
-        for (i, &b) in bytes[4..].iter().enumerate() {
-            if i + 3 < 6 {
-                c6[i + 3] = b;
-            }
-        }
-    } else if callsign.starts_with("3X")
-        && length > 2
-        && bytes[2].is_ascii_alphabetic()
-        && length <= 7
-    {
-        c6[0] = b'Q';
-        for (i, &b) in bytes[2..].iter().enumerate() {
-            if i + 1 < 6 {
-                c6[i + 1] = b;
-            }
-        }
-    } else if length >= 3 && bytes[2].is_ascii_digit() && length <= 6 {
-        c6[..length].copy_from_slice(&bytes[..length]);
-    } else if length >= 2 && bytes[1].is_ascii_digit() && length <= 5 {
-        c6[1..1 + length].copy_from_slice(&bytes[..length]);
-    } else {
-        return None;
-    }
-
-    let i0 = nchar_alphanum_space(c6[0])?;
-    let i1 = nchar_alphanum(c6[1])?;
-    let i2 = nchar_numeric(c6[2])?;
-    let i3 = nchar_letters_space(c6[3])?;
-    let i4 = nchar_letters_space(c6[4])?;
-    let i5 = nchar_letters_space(c6[5])?;
-
-    let mut n: u32 = i0;
-    n = n * 36 + i1;
-    n = n * 10 + i2;
-    n = n * 27 + i3;
-    n = n * 27 + i4;
-    n = n * 27 + i5;
-    Some(n)
-}
-
-fn nchar_alphanum_space(c: u8) -> Option<u32> {
-    match c {
-        b' ' => Some(0),
-        b'0'..=b'9' => Some((c - b'0') as u32 + 1),
-        b'A'..=b'Z' => Some((c - b'A') as u32 + 11),
-        _ => None,
-    }
-}
-
-fn nchar_alphanum(c: u8) -> Option<u32> {
-    match c {
-        b'0'..=b'9' => Some((c - b'0') as u32),
-        b'A'..=b'Z' => Some((c - b'A') as u32 + 10),
-        _ => None,
-    }
-}
-
-fn nchar_numeric(c: u8) -> Option<u32> {
-    match c {
-        b'0'..=b'9' => Some((c - b'0') as u32),
-        _ => None,
-    }
-}
-
-fn nchar_letters_space(c: u8) -> Option<u32> {
-    match c {
-        b' ' => Some(0),
-        b'A'..=b'Z' => Some((c - b'A') as u32 + 1),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +176,7 @@ impl ConfirmationToken {
 
     /// The 15-bit `igrid4` field value this token packs to.
     fn igrid4_value(self) -> u16 {
-        const MAXGRID4: u16 = 32400;
+        use crate::encoder::MAXGRID4;
         match self {
             ConfirmationToken::Rrr => MAXGRID4 + 2,
             ConfirmationToken::RR73 => MAXGRID4 + 3,
@@ -352,7 +206,7 @@ impl MyCallAp {
     /// Create from a callsign string. Returns `None` if the callsign cannot be
     /// encoded with the standard 28-bit packing.
     pub fn new(callsign: &str) -> Option<Self> {
-        let (packed, _ip) = pack28(callsign)?;
+        let (packed, _ip) = crate::encoder::pack28(callsign).ok()?;
         Some(Self {
             callsign: callsign.to_string(),
             packed_28: packed,
@@ -374,7 +228,7 @@ impl RecentCallAp {
     /// Create from a callsign and its last observed SNR.
     /// Returns `None` if the callsign cannot be encoded.
     pub fn new(callsign: &str, snr: f32) -> Option<Self> {
-        let (packed, _ip) = pack28(callsign)?;
+        let (packed, _ip) = crate::encoder::pack28(callsign).ok()?;
         Some(Self {
             callsign: callsign.to_string(),
             packed_28: packed,
@@ -415,7 +269,7 @@ impl QsoAp {
     /// `expected_next_message_texts` starts empty. The coordinator may
     /// populate it via [`QsoAp::with_expected_texts`] after construction.
     pub fn new(their_call: &str, progress: QsoApProgress) -> Option<Self> {
-        let (packed, _ip) = pack28(their_call)?;
+        let (packed, _ip) = crate::encoder::pack28(their_call).ok()?;
         Some(Self {
             their_call: their_call.to_string(),
             their_packed_28: packed,
@@ -560,53 +414,26 @@ pub struct ContentHypothesis {
 }
 
 /// Pack a standard message's third whitespace-separated token (the
-/// `extra` field: empty, a signal report, or a confirmation token) into
-/// `(ir, igrid4)`.
+/// `extra` field: empty, a grid, a signal report, or a confirmation
+/// token) into `(ir, igrid4)`.
 ///
-/// Mirrors `encoder.rs::packgrid`'s token/report branches bit-for-bit
-/// (grid-square packing is intentionally omitted: `enumerate_a8_expected
-/// _texts` — the only populator of `QsoAp::expected_next_message_texts`
-/// today — never produces one). Duplicated here rather than calling
-/// `encoder::packgrid` directly because the `encoder` module is gated
-/// behind the `transmit` feature and this module (used on every decode,
-/// AP or not) is not — the same precedent as the standalone `pack28`
-/// above and `ConfirmationToken::igrid4_value` below. Cross-checked
-/// against the real encoder in
-/// `content_hypotheses_match_real_encoder_ground_truth` (`--features
-/// transmit`).
+/// Decomposes the encoder's own packer, `encoder::try_packgrid` (PAN-331),
+/// into its `ir` bit (bit 15) and 15-bit `igrid4` value, so the AP content
+/// hypotheses and the transmitted frames pack identically. Grids and
+/// `R`+digits pack as the real encoder packs them.
 ///
-/// Returns `None` if `extra` isn't a recognized token/report — the
-/// caller treats that as an enumerator bug (log + skip), not a runtime
-/// condition to recover from.
+/// Returns `None` where the encoder would fall back to "no grid"
+/// (unparseable text, or a report outside -35..=30). The caller treats
+/// that as an enumerator bug (log + skip), not a runtime condition to
+/// recover from.
 fn pack_extra_field(extra: &str) -> Option<(bool, u16)> {
-    const MAXGRID4: u16 = 32400;
-
-    if extra.is_empty() {
-        return Some((false, MAXGRID4 + 1));
-    }
-    match extra {
-        "RRR" => return Some((false, ConfirmationToken::Rrr.igrid4_value())),
-        "RR73" => return Some((false, ConfirmationToken::RR73.igrid4_value())),
-        "73" => return Some((false, ConfirmationToken::Final73.igrid4_value())),
-        _ => {}
-    }
-
-    // Signal report: "R+dd"/"R-dd" (ir=1) or bare "+dd"/"-dd" (ir=0).
-    let (ir, report_str) = match extra.strip_prefix('R') {
-        Some(rest) if rest.starts_with('+') || rest.starts_with('-') => (true, rest),
-        _ => (false, extra),
-    };
-    let dd: i32 = report_str.parse().ok()?;
-    if !(-35..=30).contains(&dd) {
-        return None;
-    }
-    let igrid4 = MAXGRID4 + (35 + dd) as u16;
-    Some((ir, igrid4))
+    let packed = crate::encoder::try_packgrid(extra)?;
+    Some((packed & 0x8000 != 0, packed & 0x7FFF))
 }
 
 /// Encode each of `qso.expected_next_message_texts` (via
-/// [`pack_extra_field`], the standalone mirror of this crate's canonical
-/// `encoder.rs::packgrid` content-packing) and extract the content-field
+/// [`pack_extra_field`], which calls this crate's canonical
+/// `encoder::try_packgrid` content-packing) and extract the content-field
 /// bits (payload bits 58-76 — see [`ContentHypothesis`]'s doc for why
 /// this isn't 56-76). Returns hypotheses in the SAME order as the input
 /// `Vec<String>` — ordering by SNR-seeded likelihood is the caller's job
@@ -830,7 +657,7 @@ pub fn inject_ap_llrs(
         ApLevel::Cq => {
             // Context-free: "CQ" is a fixed protocol token, not a personal
             // callsign, so `context` is intentionally unused here.
-            if let Some((cq_packed, cq_ip)) = pack28("CQ") {
+            if let Ok((cq_packed, cq_ip)) = crate::encoder::pack28("CQ") {
                 let cq_bits = u32_to_bits_28(cq_packed);
                 inject_28_bits(llrs, 0, &cq_bits, xor_sequence);
                 // Bit 28: to_callsign suffix flag. pack28("CQ") always
@@ -1149,7 +976,7 @@ mod tests {
     fn test_inject_cq_uses_pack28_cq_token_at_called_position() {
         // "CQ" special token per pack28 is packed value 2 (see the `match
         // callsign { "CQ" => return Some((2, 0)), ... }` arm above).
-        let (cq_packed, cq_ip) = pack28("CQ").expect("CQ must encode");
+        let (cq_packed, cq_ip) = crate::encoder::pack28("CQ").expect("CQ must encode");
         assert_eq!(cq_packed, 2);
         assert_eq!(cq_ip, 0);
 
@@ -1224,7 +1051,7 @@ mod tests {
     #[test]
     fn test_inject_confirmation_token_bits_rr73() {
         // MAXGRID4 = 32400; RR73 = +3 = 32403.
-        const MAXGRID4: u16 = 32400;
+        use crate::encoder::MAXGRID4;
         let mut llrs = vec![0.0f32; 77];
         inject_confirmation_token_bits(&mut llrs, ConfirmationToken::RR73, None);
 
@@ -1254,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_confirmation_token_igrid4_values_match_maxgrid4_offsets() {
-        const MAXGRID4: u16 = 32400;
+        use crate::encoder::MAXGRID4;
         assert_eq!(ConfirmationToken::Rrr.igrid4_value(), MAXGRID4 + 2);
         assert_eq!(ConfirmationToken::RR73.igrid4_value(), MAXGRID4 + 3);
         assert_eq!(ConfirmationToken::Final73.igrid4_value(), MAXGRID4 + 4);
@@ -1277,7 +1104,7 @@ mod tests {
         // test_confirmation_token_igrid4_values_match_maxgrid4_offsets /
         // ap_i3_tests.rs): ir=0 for all three tokens (no R-prefix), i3=1
         // (standard message family) for all three.
-        const MAXGRID4: u16 = 32400;
+        use crate::encoder::MAXGRID4;
         let expected = |igrid4: u16| -> [bool; CONTENT_FIELD_LEN] {
             let mut bits = [false; CONTENT_FIELD_LEN];
             bits[1..16].copy_from_slice(&u16_to_bits_15(igrid4));
@@ -1321,6 +1148,26 @@ mod tests {
     }
 
     #[test]
+    fn pack_extra_field_is_the_encoders_packgrid() {
+        use crate::encoder::{packgrid, try_packgrid, MAXGRID4};
+        for extra in [
+            "", "RRR", "RR73", "73", "+05", "-12", "R+05", "R-12", "5", "R5", "FN42",
+        ] {
+            let packed = try_packgrid(extra).expect("encodable");
+            assert_eq!(
+                pack_extra_field(extra),
+                Some((packed & 0x8000 != 0, packed & 0x7FFF)),
+                "{extra:?}"
+            );
+        }
+        // Where the encoder falls back to "no grid", the AP builder skips.
+        for extra in ["+99", "R+99", "-36", "GARBAGE123"] {
+            assert_eq!(pack_extra_field(extra), None, "{extra:?}");
+            assert_eq!(packgrid(extra), MAXGRID4 + 1, "{extra:?}");
+        }
+    }
+
+    #[test]
     fn build_content_hypotheses_skips_unencodable_extra_and_warns() {
         // Not produced by enumerate_a8_expected_texts, but with_expected_texts
         // accepts arbitrary caller text -- an unencodable `extra` token must
@@ -1336,13 +1183,11 @@ mod tests {
         assert_eq!(hyps[0].text, "K1ABC W1AW RR73");
     }
 
-    /// Ground-truth cross-check: `pack_extra_field`'s standalone mirror of
-    /// `encoder.rs::packgrid` must match the REAL encoder byte-for-byte at
-    /// payload bits 58-76, for both the fixed-token and numeric-report
-    /// paths. Guards against `pack_extra_field` silently drifting from the
-    /// canonical encode path it duplicates (see its doc comment for why it
-    /// can't just call `encoder::packgrid` -- the `transmit` feature gate).
-    #[cfg(feature = "transmit")]
+    /// Ground-truth cross-check: `build_content_hypotheses` must match the
+    /// REAL encoder byte-for-byte at payload bits 58-76, for the
+    /// fixed-token, numeric-report and grid paths. `pack_extra_field` calls
+    /// the encoder's own packer (PAN-331), so this guards the adapter's
+    /// `ir`/`igrid4` bit split and the content-field bit extraction.
     #[test]
     fn content_hypotheses_match_real_encoder_ground_truth() {
         use crate::ldpc::gray_to_binary;
@@ -1382,6 +1227,7 @@ mod tests {
             "K1ABC W1AW R-12",
             "K1ABC W1AW -12",
             "K1ABC W1AW R+05",
+            "K1ABC W1AW FN42",
         ] {
             let mut qso = QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap();
             qso = qso.with_expected_texts([text]);

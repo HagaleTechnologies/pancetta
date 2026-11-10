@@ -2357,10 +2357,8 @@ mod replay_gate_tests {
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             replay,
             None, // no test-tx
@@ -2437,10 +2435,8 @@ mod replay_gate_tests {
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
-            false, // metrics
-            9090,
+            true, // no_audio
+            true, // headless
             None, // no WAV
             None, // no replay
             None, // no test-tx

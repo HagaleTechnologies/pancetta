@@ -21,8 +21,10 @@ pub(super) async fn settle_self_cq_completion(
     pending_self_cq_qsos: &mut std::collections::HashMap<String, u64>,
     qso_id: &str,
     success: bool,
+    tx_attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
     if let Some(attempt_id) = pending_self_cq_qsos.remove(qso_id) {
+        debug!("self-CQ {qso_id} settled by attempt {tx_attempt_id:?}: success={success}");
         if !success {
             operator
                 .lock()
@@ -2062,6 +2064,8 @@ impl super::ApplicationCoordinator {
             // parked offset, not just the static config value baked in at
             // construction.
             guard.set_tx_offset_hold_source(self.tx_offset_hold_hz());
+            // PAN-356: the slot gate alternates parity at the live mode's slot length.
+            guard.set_active_slot_ns_source(self.active_slot_ns());
         }
 
         // Phase-5 hardening #1: install the same callsign-continuity FP
@@ -3534,6 +3538,7 @@ impl super::ApplicationCoordinator {
                                             MessageType::TransmitComplete {
                                                 success,
                                                 qso_id: Some(qso_id),
+                                                attempt_id,
                                                 ..
                                             } => {
                                                 settle_self_cq_completion(
@@ -3541,6 +3546,7 @@ impl super::ApplicationCoordinator {
                                                     &mut pending_self_cq_qsos,
                                                     &qso_id,
                                                     success,
+                                                    attempt_id,
                                                 ).await;
                                             }
                                             _ => {}
@@ -7155,8 +7161,6 @@ mod fq_f9_placement_feed_when_disabled_tests {
             None,
             true, // no_audio
             headless,
-            false, // metrics
-            9090,
             None, // no WAV
             None, // no replay
             None, // no test-tx
@@ -7312,6 +7316,7 @@ mod fq_f9_placement_feed_when_disabled_tests {
                 message_text: "CQ N0CALL FN20".into(),
                 duration_ms: 0,
                 qso_id: Some("q1".into()),
+                attempt_id: None,
             },
             Instant::now(),
         ));

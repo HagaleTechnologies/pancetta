@@ -31,6 +31,13 @@ that autonomously writes a live TX atomic (opt-in auto-repark) is gated by a
 5-case safety contract and fails closed. Constants and the full key map are
 normative in the digest — not restated here.
 
+Key handling in every scope is `keymap::resolve` plus `match action`: every bound key
+resolves through its `KEYBINDINGS` or `MODAL_BINDINGS` chord, or a text-entry rule, into one `Action`. A
+table test fails when a chord is ambiguous, unreachable, unnamed by its row or
+Ctrl-reachable for a TX action. `tests/fixtures/key_effects.golden` fails a
+test whenever what a key does changes. See
+[the PAN-327 decision](../../docs/DECISIONS/tui.md#key-dispatch-through-the-keymap-table-pan-327-2026-11).
+
 A bare `k` aborts the selected QSO at once, with no confirmation (PAN-263,
 which removed the PAN-121 confirm modal). See
 [the PAN-263 decision](../../docs/DECISIONS/tui.md#bare-k-aborts-at-once-no-confirmation-pan-263-2026-11-03).
