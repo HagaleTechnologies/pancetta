@@ -1254,3 +1254,56 @@ support. The separate `pancetta_ft8::transmit::PttMethod` enum is not fed by thi
 Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime path, is separate
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
+
+## One handler per TX-worker abort outcome (PAN-322, 2026-11-10)
+
+The TX worker matched every abort outcome inline: 20 `SleepOutcome` arms across the four Step 6
+and Step 8 sleep sites, 6 `PttWait` arms across the two Step 4 sites, and 8 late-cap computations.
+PAN-322 moves each outcome into one handler. Behaviour and log lines do not change.
+
+- **`SlotTimingContext`.** One request's slot and PTT timing: active protocol, raw
+  `tx_late_max_ms`, `tx_self_parity`, `ptt_lead_ms`, sample rate, `slot_ns` and
+  `request_received_at`. Each arm builds it at Step 2, where it used to load `slot_ns`, so a
+  single-frame re-key pass rebuilds it. `late_cap_ms()` is the per-mode late cap and
+  `ptt_target(target_slot)` is the slot start minus the PTT lead. The two supersede helpers take it
+  plus `SupersedeInFlight`, `WorkingFrame` and `SupersedeIo`, which removed their
+  `too_many_arguments` allows.
+- **`on_sleep_outcome`** handles the Step 6 (pre-slot) and Step 8 (playback) `SleepOutcome` of both
+  arms and returns `ControlFlow<SleepBreak>`. A helper cannot jump to a loop label, so each call
+  site has a short `match` that turns `TxExit` into its own `break` or `continue`. A `Superseded`
+  outcome goes back to the call site's existing supersede handling. The single-frame supersede
+  bodies stay inline at the two single-frame sleep sites.
+- **`on_ptt_wait`** handles the Step 4 `PttWait` of both arms and returns `ControlFlow<TxExit>`.
+  `ClockJumped` drops every frame through `drop_frames_for_clock_jump`. `Interrupted` stops the
+  worker on shutdown and sends nothing, and on an F8 abort it fails each frame's `TransmitComplete`.
+- **The golden.** `pancetta/tests/fixtures/tx_abort_transcripts.golden` has 20 cells: a single
+  frame and a two-item bundle, aborted before PTT (shutdown, operator) and in the PTT lead and
+  during playback (shutdown, operator, disarm, supersede). Before PTT, `wait_for_ptt_instant`
+  watches only shutdown and the abort flag, so disarm and supersede have no cell there. Service
+  stops (`tx_halt`, the SWR guard, the WSJT-X and TUI relays) set `abort_current_tx`, so the
+  operator cells cover them. `coordinator::tx::abort_transcripts::abort_transcripts_match_golden`
+  runs all 20 at once in 35 to 45 s. Bless with `PANCETTA_BLESS_TX_ABORT=1` (only `=1` writes)
+  from the base commit only, never on refactored code. The module uses only pre-PAN-322 items, so
+  it can be copied into a worktree at `git merge-base origin/main HEAD` and run there.
+- **The real worker, not `coord_sim`.** `pancetta/tests/coord_sim.rs` copies the decision chain and
+  never starts the TX worker. The cells run the real worker on a real `MessageBus` through
+  `pan115_worker_gate_tests::worker_harness_with_clock`, with `ptt_lead_ms = 2000`, a clock offset
+  that expires the remote arm, and `max_concurrent_qsos = 2` for bundles.
+- **Per-channel format.** Each cell lists `pre|post <channel> <event>`, split at a marker id from
+  the bus's global counter. Channels go in the order hamlib, autonomous, qso, tui, audio, each in
+  arrival order. One merged order changed between runs in the shutdown cells, because the
+  `PttGuard` drop task's PTT-off races the TUI messages. Per-channel order was stable in 5 runs.
+  The test checks order directly where the code awaits in sequence: in every disarm and supersede
+  cell the first post-action `SetPtt(false)` precedes every post-action Autonomous, Qso and
+  diagnostic message, and in playback disarm it also precedes `AudioFlush` (PAN-91).
+- **Asymmetries kept on purpose.** After an F8 abort before PTT the single-frame arm clears the TX
+  strip, but the bundle arm sends nothing, so its deferred rows stay on screen. A pre-slot
+  supersede is always `NotViable`. `schedule_tx` marks any slot but the current one `deferred`,
+  and before the target slot starts the current slot is the previous one. The superseder is
+  requeued for its own slot. In a two-item bundle the other QSO's frame is abandoned with a
+  failed `TransmitComplete`, the PAN-279 rule.
+- **Unit tests only.** `PttWait::ClockJumped` has no wall-clock seam in the worker, so only
+  `on_ptt_wait_tests` reaches it. The golden's cells take no pivot, so unit tests on
+  `on_sleep_outcome` cover pivot unwinding on a pre-slot disarm, for both shapes. The real worker
+  cannot reach the single-frame Step 6 `Replace` and `Bundle` handling, and only
+  `supersede_rekey_tests` exercises those outcomes, on `supersede_and_rekey_or_bundle` itself.
