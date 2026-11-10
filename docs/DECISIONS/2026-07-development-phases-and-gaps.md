@@ -8,34 +8,17 @@
 
 # Known gaps and TODOs
 
-- **Completed-QSO resends denied at key time are not compensated.** A
-  disarm after the engine's in-lock check makes the TX worker report
-  `TxFrameNotSent`, but `roll_back_unsent_attempt` returns `QsoNotActive`
-  for a completed QSO and the auto-73 counter stays charged. Compensation
-  needs a per-entry pending-attempt marker to distinguish an auto-73 from
-  an operator's same-text FIX B re-key. (Surfaced by PAN-138, 2026-10-20.)
+- **A non-completing ladder advance whose frame is dropped keeps its
+  advanced state.** Advances record no PAN-75 attempt, so a dropped frame
+  from a step that does not complete the QSO is not undone. (Surfaced by
+  PAN-138 review on PR #483, 2026-10-20.)
 
-- **A completion stays logged when the TX worker drops its closing 73.**
-  The engine records `Completed` and emits `QsoCompleted` (ADIF write,
-  uploads) when it queues the 73, not when the 73 keys. A remote client that
-  disarms, loses control or whose arm expires after the in-lock permission
-  check of a ladder advance to 73 still gets the contact logged while the
-  TX worker drops the frame. The auto-sequenced completion in
-  `process_message_for_qso` that answers the DX's RR73 with a 73 is recorded
-  the same way, and that path does not consult the permission predicate.
-  Holding the arm mutex across the engine mutation would not close this:
-  expiry is clock-based and the frame keys seconds later, in its own slot.
-  Closing it needs a completion confirmed at key time, or compensation on
-  `TxFrameNotSent` for a completed QSO. A non-completing ladder advance whose
-  frame is dropped also keeps its advanced state, because advances record no
-  PAN-75 attempt. (Surfaced by PAN-138 review on PR #483, 2026-10-20.)
-
-- **Brand-new close-step opens still have an authorization await gap.**
-  `respond_to_caller_with_outcome` checks remote permission before
-  `supersede_active_qsos_for(...).await` and the subsequent insert. A disarm
-  between those operations can still create a completed QSO and emit
-  `QsoCompleted` for a frame the TX worker rejects. Closing this window
-  requires supersede and insert under one guard. (Surfaced by PAN-138, 2026-10-20.)
+- **A completion whose 73 aired can still go unlogged.** Since PAN-280 a
+  completion that queues a closing frame is held until that frame's
+  `TxFrameSent`. The held record is not persisted, so a Qso-task restart or
+  a process stop between the queue and the air report loses the log entry,
+  and a `TxFrameSent` that arrives after the record expired (six slots,
+  at least 30 s) does not log it. (Surfaced by PAN-280, 2026-11-08.)
 
 - **Supersede abandonment still sends Autonomous an early failure.** A
   single-frame `Replace`/`NotViable` supersede and a multi-TX abandoned item

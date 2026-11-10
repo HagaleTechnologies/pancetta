@@ -13,7 +13,7 @@
 //! - Pump the **real** coordinator active-set populater logic
 //!   ([`CoordSim::pump_qso_events`]), which mirrors
 //!   `coordinator/qso.rs`: insert a `qso_id` into `active_tx_qsos` on a
-//!   `StateChanged` into an active state (and on `QsoCompleted`); remove it on
+//!   `StateChanged` into an active state (and into `Completed`); remove it on
 //!   `StateChanged → Failed` / `QsoFailed`; forward each `MessageToSend` to the
 //!   TX worker as a `TransmitRequest`.
 //! - **Drive transmit slots deterministically** and **assert at the rig level**:
@@ -358,6 +358,9 @@ pub struct CoordSim {
     /// Completed-QSO metadata collected by `pump_qso_events` from
     /// `QsoEvent::QsoCompleted`. Keyed by `qso_id.to_string()`.
     pub completed: Vec<QsoMetadata>,
+    /// PAN-280: frames a post-key pump picked up, returned by the next
+    /// [`CoordSim::pump_qso_events`].
+    deferred_pending: Vec<PendingTx>,
     /// Station-agent remote-TX arm gate, exactly as the coordinator holds it.
     /// `drive_slot` consults it (via the real `remote_tx_permitted`) for any
     /// `TxOrigin::Remote` pending item before keying PTT. Fresh = unarmed = deny.
@@ -427,6 +430,7 @@ impl CoordSim {
             dial_frequency_hz,
             split_tx_frequency_hz,
             completed: Vec::new(),
+            deferred_pending: Vec::new(),
             // Fresh (unarmed) arm — remote TX is denied until a scenario arms it.
             remote_tx_arm: Arc::new(Mutex::new(pancetta_agent::arm::ArmState::new())),
             // PAN-118: default band plan (region 2, edge warnings on) — what
@@ -496,8 +500,9 @@ impl CoordSim {
     /// This is a faithful mirror of `coordinator/qso.rs`'s event loop:
     /// - `StateChanged → active`: insert qso_id into `active_tx_qsos`
     /// - `StateChanged → Failed`: remove qso_id
-    /// - `QsoCompleted`: insert qso_id (grace window — we keep it live; the
-    ///   scenario controls removal)
+    /// - `StateChanged → Completed`: insert qso_id (grace window — we keep it
+    ///   live; the scenario controls removal; PAN-280)
+    /// - `QsoCompleted`: record the metadata (fires once the 73 aired)
     /// - `QsoFailed`: remove qso_id
     /// - `MessageToSend`: emit a `TransmitRequest` carrying the latched
     ///   `tx_parity`
@@ -506,7 +511,7 @@ impl CoordSim {
     /// of the `TransmitRequest` it enables — the exact ordering the
     /// StateChanged-at-QSO-start fix guarantees.
     pub fn pump_qso_events(&mut self) -> Vec<PendingTx> {
-        let mut pending = Vec::new();
+        let mut pending = std::mem::take(&mut self.deferred_pending);
         loop {
             match self.qso_rx.try_recv() {
                 Ok(ev) => self.apply_event(ev, &mut pending),
@@ -531,23 +536,23 @@ impl CoordSim {
                     if let Some(freq) = new_state.frequency() {
                         self.active_tx_offsets.write().unwrap().insert(key, freq);
                     }
+                } else if let QsoState::Completed { frequency, .. } = &new_state {
+                    // PAN-280 mirror: grace window on entering `Completed`,
+                    // so the closing 73 still keys (the coordinator no longer
+                    // does this on `QsoCompleted`, which waits for the 73 to
+                    // air). The scenario removes it explicitly via
+                    // `expire_qso` when it wants to model grace elapsing.
+                    self.active_tx_qsos.write().unwrap().insert(key.clone());
+                    self.active_tx_offsets
+                        .write()
+                        .unwrap()
+                        .insert(key, *frequency);
                 } else if matches!(new_state, QsoState::Failed { .. }) {
                     self.active_tx_qsos.write().unwrap().remove(&key);
                     self.active_tx_offsets.write().unwrap().remove(&key);
                 }
             }
-            QsoEvent::QsoCompleted {
-                qso_id, metadata, ..
-            } => {
-                // Grace window: keep the key live so the final 73 still keys.
-                // The scenario removes it explicitly via `expire_qso` when it
-                // wants to model grace elapsing.
-                let key = active_tx_qso_key(&qso_id.to_string());
-                self.active_tx_qsos.write().unwrap().insert(key.clone());
-                self.active_tx_offsets
-                    .write()
-                    .unwrap()
-                    .insert(key, metadata.frequency);
+            QsoEvent::QsoCompleted { metadata, .. } => {
                 // Capture the completed metadata so scenarios can assert on the
                 // stamped RF frequency (dial + audio offset).
                 self.completed.push(metadata);
@@ -558,7 +563,7 @@ impl CoordSim {
                 self.active_tx_offsets.write().unwrap().remove(&key);
             }
             QsoEvent::MessageToSend {
-                attempt_id: _,
+                attempt_id,
                 qso_id,
                 message,
                 frequency,
@@ -589,6 +594,7 @@ impl CoordSim {
                         pancetta_lib::message_bus::TxOrigin::Local
                     },
                     remote_client_key_id,
+                    attempt_id,
                 });
             }
             _ => {}
@@ -615,6 +621,7 @@ impl CoordSim {
             tx_parity: None,
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            attempt_id: None,
         }
     }
 
@@ -628,6 +635,7 @@ impl CoordSim {
             tx_parity: None,
             origin: pancetta_lib::message_bus::TxOrigin::Remote,
             remote_client_key_id: None,
+            attempt_id: None,
         }
     }
 
@@ -636,6 +644,7 @@ impl CoordSim {
     pub fn remote_tx_as(&self, text: &str, freq_hz: f64, client_key_id: &str) -> PendingTx {
         PendingTx {
             remote_client_key_id: Some(client_key_id.to_string()),
+            attempt_id: None,
             ..self.remote_tx(text, freq_hz)
         }
     }
@@ -700,7 +709,7 @@ impl CoordSim {
         let drained: Vec<CoalesceEntry> = pending
             .iter()
             .map(|p| CoalesceEntry {
-                attempt_id: None,
+                attempt_id: p.attempt_id,
                 message_text: p.text.clone(),
                 frequency_offset: p.frequency_offset,
                 qso_id: p.qso_id.clone(),
@@ -775,7 +784,33 @@ impl CoordSim {
                 ptt_keyed: keyed,
                 ptt_released: released,
             });
+            // PAN-280 mirror of the Qso task's `TxFrameSent` handling: a keyed
+            // frame aired, so a completion held on it logs now.
+            if keyed {
+                if let Some(id) = entry
+                    .qso_id
+                    .as_deref()
+                    .and_then(|id| id.parse::<pancetta_qso::QsoId>().ok())
+                {
+                    self.manager
+                        .confirm_completion_aired(
+                            id,
+                            entry.attempt_id,
+                            &entry.message_text,
+                            &pancetta_qso::UnsentAttemptPayload {
+                                frequency_hz: entry.frequency_offset,
+                                remote_binding: None,
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .await;
+                }
+            }
         }
+        // Record any `QsoCompleted` that produced; keep any other frame for
+        // the next pump.
+        let more = self.pump_qso_events();
+        self.deferred_pending = more;
 
         slot
     }
@@ -923,6 +958,9 @@ pub struct PendingTx {
     pub origin: pancetta_lib::message_bus::TxOrigin,
     /// Client this request is bound to, iff `origin == Remote` (PAN-91).
     pub remote_client_key_id: Option<String>,
+    /// The engine's attempt id for this frame (PAN-280), when it came from a
+    /// `MessageToSend`.
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1223,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            attempt_id: None,
         },
         PendingTx {
             text: "KEEPCALL-OLD-2".to_string(),
@@ -1193,6 +1232,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            attempt_id: None,
         },
         PendingTx {
             text: "KEEPCALL-NEWEST".to_string(),
@@ -1201,6 +1241,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            attempt_id: None,
         },
     ];
 
@@ -3054,5 +3095,71 @@ async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_on
     assert!(
         !sim.active_tx_offsets.read().unwrap().contains_key(&key),
         "active_tx_offsets must be empty after a timeout retirement that emits both events"
+    );
+}
+
+/// PAN-280: the DX's RR73 completes the QSO, our 73 is dropped before it
+/// keys, and nothing is logged; the QSO is open again in SendingReport.
+#[tokio::test]
+async fn dropped_closing_73_is_not_logged_and_reopens() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.set_rx_dial(14_074_000);
+    let audio_offset = 1500.0_f64;
+
+    let qso_id = sim
+        .autonomous_pounce("VB7F", audio_offset, Some(SlotParity::Odd))
+        .await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+    sim.inject_decode("K5ARH VB7F -12", audio_offset).await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    // The DX's RR73: the QSO completes and our 73 is queued.
+    sim.inject_decode("K5ARH VB7F RR73", audio_offset).await;
+    let pending = sim.pump_qso_events();
+    let seventy_three = pending
+        .iter()
+        .rev()
+        .find(|p| p.text == "SeventyThree")
+        .cloned()
+        .unwrap_or_else(|| panic!("our 73 is queued, got {pending:?}"));
+    assert!(
+        sim.completed.is_empty(),
+        "nothing is logged at queue time.\n{}",
+        sim.timeline
+    );
+
+    // The TX worker drops the 73 (e.g. a late slot): the Qso task's
+    // `TxFrameNotSent` handling runs these engine calls in this order.
+    let id: pancetta_qso::QsoId = qso_id.to_string().parse().unwrap();
+    assert_eq!(
+        sim.manager
+            .resolve_unsent_completion(id, seventy_three.attempt_id)
+            .await,
+        pancetta_qso::UnsentCompletion::Reverted(pancetta_qso::RevertedTo::Reopened)
+    );
+    let _ = sim
+        .manager
+        .roll_back_unsent_attempt(id, &seventy_three.text, None, seventy_three.attempt_id)
+        .await;
+    let _ = sim.pump_qso_events();
+
+    assert!(
+        sim.completed.is_empty(),
+        "a dropped 73 logs nothing.\n{}",
+        sim.timeline
+    );
+    let state = sim.manager.get_qso(id).await.unwrap().state;
+    assert!(
+        matches!(state, QsoState::SendingReport { .. }),
+        "the QSO is open again in its pre-73 state, got {state:?}"
+    );
+    assert!(
+        sim.active_tx_qsos
+            .read()
+            .unwrap()
+            .contains(&active_tx_qso_key(&qso_id.to_string())),
+        "the reopened QSO is live for TX again"
     );
 }
