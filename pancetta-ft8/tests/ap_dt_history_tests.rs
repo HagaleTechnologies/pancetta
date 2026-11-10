@@ -1,3 +1,4 @@
+#![cfg(feature = "transmit")]
 use pancetta_ft8::{
     ap::{ApContext, MyCallAp, RecentCallAp},
     DecodeBudget, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, InMemoryDtHistory,

@@ -515,3 +515,16 @@ fn test_ft8_transmission_constants() {
     let symbol_duration = MESSAGE_DURATION / NUM_SYMBOLS as f64;
     assert!((symbol_duration - 0.16).abs() < 0.001); // Should be 160ms per symbol
 }
+
+#[cfg(not(feature = "transmit"))]
+#[test]
+fn test_transmission_feature_disabled() {
+    // When transmit feature is disabled, transmission modules should not be available
+    // This test just verifies the feature system works correctly
+
+    // The encoder, modulator, and transmit modules should not be compiled
+    // We can't directly test this, but the fact that this test compiles
+    // without the transmit feature indicates the conditional compilation works
+
+    println!("Transmission feature is disabled - transmission modules not available");
+}

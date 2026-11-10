@@ -1737,10 +1737,9 @@ pub struct ApplicationCoordinator {
     /// handles, never `&mut ApplicationCoordinator` — Hamlib's reconnect
     /// (`teardown_hamlib`/`start_hamlib_component`) needs `&mut self`, so
     /// the request routes through here into `run_main_loop`, the only place
-    /// already holding `&mut self` in a loop. Not feature-gated (unlike the
-    /// Hamlib-only fields above): the sender must always exist so
-    /// `tui_relay.rs`'s unconditionally-compiled command-relay task can
-    /// clone it.
+    /// already holding `&mut self` in a loop. The sender always exists (also
+    /// in replay mode, which starts no Hamlib) so `tui_relay.rs`'s
+    /// command-relay task can clone it.
     pub(crate) hamlib_reconnect_tx:
         tokio::sync::mpsc::Sender<crate::coordinator::hamlib::HamlibReconnectRequest>,
     hamlib_reconnect_rx:

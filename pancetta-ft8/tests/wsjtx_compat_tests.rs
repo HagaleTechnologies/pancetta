@@ -8,6 +8,7 @@
 // rationale: test/bench loops index buffers by position; the index is
 // load-bearing and an iterator rewrite would obscure intent.
 #![allow(clippy::needless_range_loop)]
+#![cfg(feature = "transmit")]
 
 use bitvec::prelude::*;
 use pancetta_ft8::ldpc::{gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS};

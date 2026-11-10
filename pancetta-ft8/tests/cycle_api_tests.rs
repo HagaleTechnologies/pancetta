@@ -304,9 +304,10 @@ fn cycle_input_length_contract() {
 /// The station coordinator runs the SAME two-pass composition for FT4 slots
 /// as for FT8 (see `cycle.rs`'s composition comment): the C pass is
 /// protocol-aware and the native decoder is rebuilt from a config whose
-/// `protocol` is `Protocol::Ft4`. Synthesis helpers use `Ft8Encoder`/`Ft8Modulator`
-/// (in every build since PAN-331), exactly like the `round_trip_tests.rs`
-/// precedent this mirrors.
+/// `protocol` is `Protocol::Ft4`. Synthesis helpers need the `transmit`
+/// feature (`Ft8Encoder`/`Ft8Modulator`), exactly like the
+/// `round_trip_tests.rs` precedent this mirrors.
+#[cfg(feature = "transmit")]
 #[test]
 fn ft4_cycle_round_trips_and_matches_station_composition() {
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator, ProtocolParams, PulseShape, BASE_FREQUENCY};
@@ -356,7 +357,8 @@ fn ft4_cycle_round_trips_and_matches_station_composition() {
 
 /// A signal placed at +1.0 s inside the cycle reports time_offset ≈ 1.0 s
 /// (sample 0 of the cycle IS the slot boundary, so no lead subtraction is
-/// needed).
+/// needed). Synthesis needs the `transmit` feature.
+#[cfg(feature = "transmit")]
 #[test]
 fn cycle_dt_is_slot_boundary_relative() {
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator, NUM_SYMBOLS};
@@ -417,7 +419,9 @@ fn cycle_dt_is_slot_boundary_relative() {
 /// physical signal. The station removes exactly these duplicates with
 /// `drop_unresolved_hash_twins` (`pancetta/src/coordinator/ft8.rs`), and
 /// `decode_cycle` must apply the same pass. Recipe mirrors the decoder unit
-/// test `decoder_seeds_hash_table_from_nonstdcall_exact_field_too`.
+/// test `decoder_seeds_hash_table_from_nonstdcall_exact_field_too` (needs
+/// `transmit` for the synthesis helpers).
+#[cfg(feature = "transmit")]
 #[test]
 fn cycle_suppresses_unresolved_hash_twins_on_reused_decoder() {
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator};
@@ -502,6 +506,7 @@ fn cycle_decoder_is_stateless_across_cycles() {
 }
 
 /// Audio after the first FT4 cycle must never reach either decoder pass.
+#[cfg(feature = "transmit")]
 #[test]
 fn ft4_cycle_ignores_next_slot_audio() {
     use pancetta_ft8::{Ft8Encoder, Ft8Modulator, PulseShape, BASE_FREQUENCY};

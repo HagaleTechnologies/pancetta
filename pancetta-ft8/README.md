@@ -13,13 +13,11 @@ decodes Pancetta's own station gets for that audio.
 
 ```toml
 [dependencies]
-pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.7" }
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.6" }
 ```
 
-Default features only. The default build already includes the encoder and
-modulator and every decoder pass the station runs. `transmit` adds only the
-audio/PTT transmitter (`Ft8Transmitter`), which alone pulls `cpal`,
-`serialport`, `tokio`; it, `gpio`, `benchmark` and `ft2` stay opt-in and off.
+Default features only. `transmit` (which alone pulls `cpal`, `serialport`,
+`tokio`), `gpio`, `benchmark` and `ft2` stay opt-in and off.
 
 ```rust
 use pancetta_ft8::{decode_cycle, Protocol};

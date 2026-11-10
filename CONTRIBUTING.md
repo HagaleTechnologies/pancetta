@@ -77,7 +77,7 @@ cargo build --workspace
 # Build in release mode
 cargo build --release
 
-# Run tests (`transmit` adds pancetta-ft8's audio/PTT transmitter tests)
+# Run tests (the encoder is behind the `transmit` feature)
 cargo test --workspace --features transmit
 
 # Run with debug logging

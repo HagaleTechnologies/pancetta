@@ -1517,6 +1517,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "transmit")]
     mod osd_decode_tests {
         use super::*;
         use crate::ldpc::LdpcEncoder;
@@ -2380,6 +2381,7 @@ mod npre2_tests {
         );
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn test_npre2_default_off_preserves_osd_decode_results() {
         // Verify that with `npre2_preprocessing_enabled = false`,

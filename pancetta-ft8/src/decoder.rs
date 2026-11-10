@@ -1825,9 +1825,12 @@ pub struct Ft8Config {
     /// trajectory over the same aligned signal (now referenced against
     /// the true GFSK waveform) and subtracts that instead.
     ///
-    /// Available in every build: `generate_gfsk_reference` and
-    /// `Ft8Modulator` are compiled unconditionally (PAN-331), so the
-    /// standalone decoder honours this flag exactly as the station does.
+    /// Gated behind the `transmit` feature (same gate as
+    /// `generate_gfsk_reference`/`Ft8Modulator` themselves) — a
+    /// non-`transmit` build of `pancetta-ft8` alone always takes the
+    /// legacy path regardless of this flag's value (harmless: every
+    /// production/decode consumer in this workspace already builds with
+    /// `transmit` enabled).
     ///
     /// **This flag ONLY controls per-block vs. whole-signal fitting.**
     /// The subtraction *scale* (whether the fitted estimate is subtracted
@@ -2551,6 +2554,7 @@ fn select_top_k_per_bin(
 /// refined (unquantized) frequency/time estimate.
 ///
 /// [BIT-EXACT]: new, presently-unused type — see the function doc.
+#[cfg(feature = "transmit")]
 #[derive(Clone, Debug)]
 struct GfskReference {
     /// Synthesized real-valued reference audio samples
@@ -5063,125 +5067,142 @@ impl Ft8Decoder {
             });
         }
 
-        // 1. Spectrogram + sync candidates on the fresh audio. We do
-        //    not reuse any in-flight residual; cross-sequence A7
-        //    operates on the same fresh window the standard pipeline
-        //    saw. Spec §5 calls for the post-subtraction residual; a
-        //    follow-on session can thread that through. For Session
-        //    2 the fresh-spectrogram path is sufficient to exercise
-        //    the consumer end-to-end.
-        let audio = self.preprocess_audio(samples)?;
-        let spectrogram = self.compute_spectrogram(&audio)?;
-        let sync_candidates = self.costas_sync_search(&spectrogram, None)?;
-        if sync_candidates.is_empty() {
+        // Without the `transmit` feature the FT8 encoder isn't compiled
+        // and `a7::generate_templates` returns an empty vec — the pass
+        // would be a guaranteed no-op. Short-circuit early to avoid the
+        // spectrogram + sync cost.
+        #[cfg(not(feature = "transmit"))]
+        {
             return Ok(Vec::new());
         }
 
-        let pp = &self.protocol_params;
-        let tone_spacing = pp.tone_spacing;
-        let sps = pp.samples_per_symbol(SAMPLE_RATE);
-        let spec_step = sps / TIME_OSR;
-        let lin = self.config.sync_time_interp_linear_power;
-        let avg_lin = self.config.linear_power_averaging;
-        let freq_window_hz = self.config.a7_freq_window_hz;
-        let snr7_threshold = self.config.a7_snr7_threshold;
-        let snr7b_threshold = self.config.a7_snr7b_threshold;
-        let llr_target_variance = self.config.llr_target_variance;
-
-        let mut decoded_new: Vec<DecodedMessage> = Vec::new();
-        let mut emitted_texts: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_seeds: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for seed in seeds {
-            let bare = seed
-                .callsign
-                .split('/')
-                .next()
-                .unwrap_or(&seed.callsign)
-                .to_uppercase();
-            if bare.is_empty() {
-                continue;
+        #[cfg(feature = "transmit")]
+        {
+            // 1. Spectrogram + sync candidates on the fresh audio. We do
+            //    not reuse any in-flight residual; cross-sequence A7
+            //    operates on the same fresh window the standard pipeline
+            //    saw. Spec §5 calls for the post-subtraction residual; a
+            //    follow-on session can thread that through. For Session
+            //    2 the fresh-spectrogram path is sufficient to exercise
+            //    the consumer end-to-end.
+            let audio = self.preprocess_audio(samples)?;
+            let spectrogram = self.compute_spectrogram(&audio)?;
+            let sync_candidates = self.costas_sync_search(&spectrogram, None)?;
+            if sync_candidates.is_empty() {
+                return Ok(Vec::new());
             }
-            if !seen_seeds.insert(bare.clone()) {
-                continue;
-            }
-            let mut ec = crate::a7::A7ExpectedCall::new(
-                bare.clone(),
-                seed.freq_hz as f32,
-                // Parity is unused by template generation; pick a
-                // canonical value.
-                crate::a7::A7SlotParity::Even,
-            );
-            if let Some(ref other) = seed.partner_callsign {
-                if !other.is_empty() {
-                    ec = ec.with_heard_with(other.clone());
-                }
-            }
-            let templates = crate::a7::generate_templates(&ec);
-            if templates.is_empty() {
-                continue;
-            }
-            let seed_freq = seed.freq_hz;
 
-            for cand in &sync_candidates {
-                let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
-                if (cand_freq - seed_freq).abs() > freq_window_hz {
+            let pp = &self.protocol_params;
+            let tone_spacing = pp.tone_spacing;
+            let sps = pp.samples_per_symbol(SAMPLE_RATE);
+            let spec_step = sps / TIME_OSR;
+            let lin = self.config.sync_time_interp_linear_power;
+            let avg_lin = self.config.linear_power_averaging;
+            let freq_window_hz = self.config.a7_freq_window_hz;
+            let snr7_threshold = self.config.a7_snr7_threshold;
+            let snr7b_threshold = self.config.a7_snr7b_threshold;
+            let llr_target_variance = self.config.llr_target_variance;
+
+            let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+            let mut emitted_texts: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut seen_seeds: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for seed in seeds {
+                let bare = seed
+                    .callsign
+                    .split('/')
+                    .next()
+                    .unwrap_or(&seed.callsign)
+                    .to_uppercase();
+                if bare.is_empty() {
                     continue;
                 }
-
-                let tone_mags =
-                    par_extract_symbols_from_spectrogram(pp, &spectrogram, cand, lin, avg_lin);
-                let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
-                normalize_llrs(&mut llrs, llr_target_variance);
-
-                let Some((best_idx, snr7, snr7b)) =
-                    crate::a7::best_template_score(&templates, &llrs)
-                else {
-                    continue;
-                };
-                if !snr7.is_finite() || snr7 < snr7_threshold {
+                if !seen_seeds.insert(bare.clone()) {
                     continue;
                 }
-                if !snr7b.is_finite() || snr7b < snr7b_threshold {
-                    continue;
-                }
-
-                let template_text = templates[best_idx].message_text.clone();
-                // Spec §10: A7 is for replies, never CQs.
-                if template_text.starts_with("CQ ") || template_text == "CQ" {
-                    continue;
-                }
-                if !emitted_texts.insert(template_text.clone()) {
-                    continue;
-                }
-
-                let ft8_message = crate::message::Ft8Message::from_text(&template_text);
-                if !self.message_parser.is_plausible(&ft8_message) {
-                    continue;
-                }
-
-                let base_frequency = cand_freq;
-                let coarse_offset =
-                    candidate_offset_samples(cand.time_step, spectrogram.time_padding, spec_step);
-                let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
-                let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
-                let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
-
-                let mut msg = DecodedMessage::new(
-                    ft8_message,
-                    snr_db,
-                    confidence,
-                    base_frequency,
-                    time_offset_s,
+                let mut ec = crate::a7::A7ExpectedCall::new(
+                    bare.clone(),
+                    seed.freq_hz as f32,
+                    // Parity is unused by template generation; pick a
+                    // canonical value.
+                    crate::a7::A7SlotParity::Even,
                 );
-                msg.via_cross_sequence_a7 = true;
-                msg.time_refinement = cand.time_refinement;
-                decoded_new.push(msg);
-            }
-        }
+                if let Some(ref other) = seed.partner_callsign {
+                    if !other.is_empty() {
+                        ec = ec.with_heard_with(other.clone());
+                    }
+                }
+                let templates = crate::a7::generate_templates(&ec);
+                if templates.is_empty() {
+                    continue;
+                }
+                let seed_freq = seed.freq_hz;
 
-        Ok(decoded_new)
+                for cand in &sync_candidates {
+                    let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                    let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                    if (cand_freq - seed_freq).abs() > freq_window_hz {
+                        continue;
+                    }
+
+                    let tone_mags =
+                        par_extract_symbols_from_spectrogram(pp, &spectrogram, cand, lin, avg_lin);
+                    let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+                    normalize_llrs(&mut llrs, llr_target_variance);
+
+                    let Some((best_idx, snr7, snr7b)) =
+                        crate::a7::best_template_score(&templates, &llrs)
+                    else {
+                        continue;
+                    };
+                    if !snr7.is_finite() || snr7 < snr7_threshold {
+                        continue;
+                    }
+                    if !snr7b.is_finite() || snr7b < snr7b_threshold {
+                        continue;
+                    }
+
+                    let template_text = templates[best_idx].message_text.clone();
+                    // Spec §10: A7 is for replies, never CQs.
+                    if template_text.starts_with("CQ ") || template_text == "CQ" {
+                        continue;
+                    }
+                    if !emitted_texts.insert(template_text.clone()) {
+                        continue;
+                    }
+
+                    let ft8_message = crate::message::Ft8Message::from_text(&template_text);
+                    if !self.message_parser.is_plausible(&ft8_message) {
+                        continue;
+                    }
+
+                    let base_frequency = cand_freq;
+                    let coarse_offset = candidate_offset_samples(
+                        cand.time_step,
+                        spectrogram.time_padding,
+                        spec_step,
+                    );
+                    let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                    let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+                    let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+
+                    let mut msg = DecodedMessage::new(
+                        ft8_message,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
+                    );
+                    msg.via_cross_sequence_a7 = true;
+                    msg.time_refinement = cand.time_refinement;
+                    decoded_new.push(msg);
+                }
+            }
+
+            Ok(decoded_new)
+        }
     }
 
     /// Reconstruct FT8 tone symbols from LDPC codeword bits.
@@ -5462,8 +5483,15 @@ impl Ft8Decoder {
     /// decode path. W4.2 (audio-domain subtraction) and W4.3 (real
     /// multipass) are the intended future callers.
     ///
-    /// Compiled in every build, like `crate::modulator::Ft8Modulator`
-    /// itself (PAN-331).
+    /// Gated behind the `transmit` feature (same gate as
+    /// `crate::modulator::Ft8Modulator` itself): every production/decode
+    /// consumer of `pancetta-ft8` in this workspace (the `pancetta` binary,
+    /// `pancetta-qso`'s `sim-hifi` feature, `pancetta-research`) already
+    /// builds this crate with `transmit` enabled, so this does not reduce
+    /// subtraction capability anywhere it currently matters. A default
+    /// (non-`transmit`) build of `pancetta-ft8` alone simply does not
+    /// compile this function in — harmless, since nothing calls it yet.
+    #[cfg(feature = "transmit")]
     fn generate_gfsk_reference(
         tone_symbols: &[u8],
         pp: &ProtocolParams,
@@ -5520,6 +5548,7 @@ impl Ft8Decoder {
     /// plays for the legacy CPFSK reference). This function recovers
     /// that missing orthogonal companion from the real reference alone,
     /// so the modulator itself never needs to be touched.
+    #[cfg(feature = "transmit")]
     fn hilbert_quadrature(real_signal: &[f64]) -> Vec<f64> {
         let n = real_signal.len();
         if n < 2 {
@@ -5586,6 +5615,7 @@ impl Ft8Decoder {
     /// `subtract_signal`). Callers should pass `0.0` rather than
     /// threading a real offset through here, to avoid implying it does
     /// something it doesn't.
+    #[cfg(feature = "transmit")]
     fn build_gfsk_iq_pair(
         symbols: &[u8],
         pp: &ProtocolParams,
@@ -5787,8 +5817,12 @@ impl Ft8Decoder {
     /// samples than the full `tone_symbols.len() * sps` reference needs --
     /// same fallback discipline as `subtract_signal`'s own GFSK path
     /// (never leave a candidate un-subtracted just because the richer
-    /// reference wasn't available). Every build has the GFSK reference:
-    /// the modulator is compiled unconditionally (PAN-331).
+    /// reference wasn't available). `#[cfg(not(feature = "transmit"))]`
+    /// builds always use CPFSK: `generate_gfsk_reference`'s own doc notes
+    /// every production/decode consumer of this crate already builds with
+    /// `transmit` enabled, so this doesn't reduce subtraction quality
+    /// anywhere it currently matters.
+    #[cfg(feature = "transmit")]
     fn reconstruction_iq_pair(
         tone_symbols: &[u8],
         pp: &ProtocolParams,
@@ -5804,6 +5838,17 @@ impl Ft8Decoder {
                 return (gfsk_i, gfsk_q);
             }
         }
+        Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
+    }
+
+    #[cfg(not(feature = "transmit"))]
+    fn reconstruction_iq_pair(
+        tone_symbols: &[u8],
+        _pp: &ProtocolParams,
+        base_frequency: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
         Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
     }
 
@@ -6038,7 +6083,10 @@ impl Ft8Decoder {
         // (which stays as-is for the fine alignment search — only the
         // FINAL subtraction reference/amplitude-fit changes here). See
         // `Ft8Config::time_varying_subtraction_enabled`'s doc for the
-        // production-dead-path/default-off rationale.
+        // production-dead-path/default-off rationale. Gated behind
+        // `transmit` (same gate as `generate_gfsk_reference`/
+        // `Ft8Modulator` themselves).
+        #[cfg(feature = "transmit")]
         if self.config.time_varying_subtraction_enabled {
             // `time_offset_samples = 0.0`: `build_gfsk_iq_pair` only ever
             // reads `GfskReference::samples` (never `::start_sample`), so
@@ -9257,237 +9305,252 @@ impl Ft8Decoder {
             return Vec::new();
         }
 
-        let pp = &self.protocol_params;
-        let tone_spacing = pp.tone_spacing;
-        let sps = pp.samples_per_symbol(SAMPLE_RATE);
-        let spec_step = sps / TIME_OSR;
-        let lin = self.config.sync_time_interp_linear_power;
-        let avg_lin = self.config.linear_power_averaging;
-
-        // Build the set of (callsign, freq_hz, source) tuples for the
-        // template generator. Sources:
-        //   1. Within-WAV decodes from `pass_decoded` — these carry a
-        //      known audio frequency (probe within ±freq_window_hz).
-        //   2. Cross-slot recent calls from `cross_slot_recent_calls`
-        //      — no known audio frequency (probe ALL sync_candidates).
-        //
-        // We track the freq-known-ness alongside each expected call so
-        // the probe loop below can skip the freq filter when no
-        // frequency is associated.
-        //
-        // Dedup by bare callsign (case-insensitive) so a callsign that
-        // appears both in the snapshot AND in this window doesn't get
-        // double-templated. Within-WAV entries (with known freq) win
-        // on collision — they have the tighter probe window.
-        struct A7ProbeEntry {
-            ec: crate::a7::A7ExpectedCall,
-            has_known_freq: bool,
-        }
-        let mut expected_calls: Vec<A7ProbeEntry> = Vec::new();
-        let mut seen_calls: HashSet<String> = HashSet::new();
-
-        for msg in pass_decoded {
-            let Some(ref from_call) = msg.message.from_callsign else {
-                continue;
-            };
-            if from_call.is_empty() {
-                continue;
-            }
-            let bare = from_call
-                .split('/')
-                .next()
-                .unwrap_or(from_call)
-                .to_uppercase();
-            if !seen_calls.insert(bare) {
-                continue;
-            }
-            let heard_with = msg.message.to_callsign.clone();
-            let mut ec = crate::a7::A7ExpectedCall::new(
-                from_call.clone(),
-                msg.frequency_offset as f32,
-                // Parity is unknown at the decoder layer (the coordinator
-                // tags it post-decode); pass Even as a placeholder — the
-                // template generator doesn't gate on parity.
-                crate::a7::A7SlotParity::Even,
-            );
-            if let Some(other) = heard_with {
-                if !other.is_empty() {
-                    ec = ec.with_heard_with(other);
-                }
-            }
-            expected_calls.push(A7ProbeEntry {
-                ec,
-                has_known_freq: true,
-            });
-        }
-
-        // hb-048 S3-chrono: cross-slot recent calls (no known freq).
-        // These probe every sync_candidate in the window — the
-        // mechanism is "we heard this station before; look for any
-        // follow-up here, freq unknown". This is the WSJT-X-canonical
-        // a7 path when fed from slot N's heard-list into slot N+1.
-        for rc in cross_slot_recent_calls {
-            if rc.callsign.is_empty() {
-                continue;
-            }
-            let bare = rc
-                .callsign
-                .split('/')
-                .next()
-                .unwrap_or(&rc.callsign)
-                .to_uppercase();
-            if !seen_calls.insert(bare) {
-                continue;
-            }
-            // freq_hz placeholder (unused when has_known_freq=false).
-            let ec = crate::a7::A7ExpectedCall::new(
-                rc.callsign.clone(),
-                0.0,
-                crate::a7::A7SlotParity::Even,
-            );
-            expected_calls.push(A7ProbeEntry {
-                ec,
-                has_known_freq: false,
-            });
-        }
-
-        if expected_calls.is_empty() {
+        #[cfg(not(feature = "transmit"))]
+        {
+            // The `a7::generate_templates` family requires the FT8 encoder,
+            // which is gated behind `transmit`. Without it, the templates
+            // are always empty and the pass is a no-op.
+            let _ = (spectrogram, sync_candidates);
             return Vec::new();
         }
 
-        // Build the set of already-decoded message texts for downstream
-        // dedup (and to avoid templating the SAME message back as a
-        // "new" decode).
-        let already_decoded_texts: HashSet<String> =
-            pass_decoded.iter().map(|m| m.text.clone()).collect();
+        #[cfg(feature = "transmit")]
+        {
+            let pp = &self.protocol_params;
+            let tone_spacing = pp.tone_spacing;
+            let sps = pp.samples_per_symbol(SAMPLE_RATE);
+            let spec_step = sps / TIME_OSR;
+            let lin = self.config.sync_time_interp_linear_power;
+            let avg_lin = self.config.linear_power_averaging;
 
-        // Build a small set of "subtracted positions" so we don't
-        // re-attempt a7 at positions already cleanly decoded
-        // (otherwise we'd just re-template C's own decode).
-        let subtracted_positions: Vec<CostasCandidate> = pass_decoded
-            .iter()
-            .filter_map(|m| {
-                m.tone_symbols
-                    .as_ref()
-                    .map(|_| reverse_derive_candidate(m, pp, spectrogram.time_padding))
-            })
-            .collect();
-
-        let freq_window_hz = self.config.a7_freq_window_hz;
-        let snr7_threshold = self.config.a7_snr7_threshold;
-        let snr7b_threshold = self.config.a7_snr7b_threshold;
-        let llr_target_variance = self.config.llr_target_variance;
-
-        let mut decoded_new: Vec<DecodedMessage> = Vec::new();
-        let mut emitted_texts: HashSet<String> = HashSet::new();
-
-        // For each expected call, generate templates and probe nearby
-        // sync_candidates. Each (expected_call, candidate) pair is one
-        // cross-correlation evaluation; the bank's `best_template_score`
-        // picks the winner.
-        //
-        // Within-WAV entries (has_known_freq=true) probe only candidates
-        // within ±freq_window_hz of the expected call. Cross-slot
-        // entries (has_known_freq=false) probe ALL candidates — the
-        // canonical WSJT-X a7 path searches the whole window for a
-        // follow-up to any callsign heard in a previous slot.
-        for entry in &expected_calls {
-            let ec = &entry.ec;
-            let templates = crate::a7::generate_templates(ec);
-            if templates.is_empty() {
-                continue;
+            // Build the set of (callsign, freq_hz, source) tuples for the
+            // template generator. Sources:
+            //   1. Within-WAV decodes from `pass_decoded` — these carry a
+            //      known audio frequency (probe within ±freq_window_hz).
+            //   2. Cross-slot recent calls from `cross_slot_recent_calls`
+            //      — no known audio frequency (probe ALL sync_candidates).
+            //
+            // We track the freq-known-ness alongside each expected call so
+            // the probe loop below can skip the freq filter when no
+            // frequency is associated.
+            //
+            // Dedup by bare callsign (case-insensitive) so a callsign that
+            // appears both in the snapshot AND in this window doesn't get
+            // double-templated. Within-WAV entries (with known freq) win
+            // on collision — they have the tighter probe window.
+            struct A7ProbeEntry {
+                ec: crate::a7::A7ExpectedCall,
+                has_known_freq: bool,
             }
-            let ec_freq = ec.freq_hz as f64;
+            let mut expected_calls: Vec<A7ProbeEntry> = Vec::new();
+            let mut seen_calls: HashSet<String> = HashSet::new();
 
-            // Find candidates near this expected call's freq. We
-            // include candidates that DID decode too — for the
-            // dual-station case where a single sync position
-            // resolves to two callsigns at offset sub-bins.
-            for cand in sync_candidates {
-                // Compute candidate audio frequency.
-                let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
-                if entry.has_known_freq && (cand_freq - ec_freq).abs() > freq_window_hz {
-                    continue;
-                }
-                // Skip positions whose codeword has been subtracted —
-                // a7 against C's own already-clean decode is a no-op
-                // because the LLRs are zero-mean noise.
-                let already_subtracted = subtracted_positions.iter().any(|sp| {
-                    sp.freq_sub == cand.freq_sub
-                        && (sp.freq_bin as i64 - cand.freq_bin as i64).unsigned_abs() <= 1
-                        && (sp.time_step as i64 - cand.time_step as i64).unsigned_abs() <= 2
-                });
-                if already_subtracted {
-                    continue;
-                }
-
-                // Extract LLRs at this candidate position from the
-                // (possibly-residual) spectrogram. The decoder hands
-                // us `spectrogram` here, which IS the multipass
-                // residual once `coherent_subtract_and_repass` has
-                // run.
-                let tone_mags =
-                    par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
-                let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
-                // NOTE: JS8Call-Improved-style LLR whitening
-                // intentionally NOT applied here. a7 uses LLRs for
-                // cross-correlation against pre-encoded templates
-                // (snr7/snr7b thresholds are tuned against the
-                // legacy LLR scale); whitening would shift the
-                // distribution and require re-calibrating
-                // a7_snr7_threshold / a7_snr7b_threshold. The spec
-                // scopes whitening to LDPC BP input only.
-                normalize_llrs(&mut llrs, llr_target_variance);
-
-                let Some((best_idx, snr7, snr7b)) =
-                    crate::a7::best_template_score(&templates, &llrs)
-                else {
+            for msg in pass_decoded {
+                let Some(ref from_call) = msg.message.from_callsign else {
                     continue;
                 };
-                if snr7 < snr7_threshold {
+                if from_call.is_empty() {
                     continue;
                 }
-                if snr7b < snr7b_threshold {
+                let bare = from_call
+                    .split('/')
+                    .next()
+                    .unwrap_or(from_call)
+                    .to_uppercase();
+                if !seen_calls.insert(bare) {
                     continue;
                 }
-
-                // Build a DecodedMessage from the winning template's
-                // text. Plausibility + the production FP filter run
-                // downstream of decode_window, so we don't gate on
-                // them here (they would for an LDPC decode but a7's
-                // codeword IS the template's, by construction).
-                let template_text = &templates[best_idx].message_text;
-                if already_decoded_texts.contains(template_text) {
-                    continue;
-                }
-                if !emitted_texts.insert(template_text.clone()) {
-                    continue;
-                }
-
-                let base_frequency = cand_freq;
-                let coarse_offset =
-                    candidate_offset_samples(cand.time_step, spectrogram.time_padding, spec_step);
-                let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
-                let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
-                let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
-
-                let ft8_message = crate::message::Ft8Message::from_text(template_text);
-                if !self.message_parser.is_plausible(&ft8_message) {
-                    continue;
-                }
-                let mut new_msg = DecodedMessage::new(
-                    ft8_message,
-                    snr_db,
-                    confidence,
-                    base_frequency,
-                    time_offset_s,
+                let heard_with = msg.message.to_callsign.clone();
+                let mut ec = crate::a7::A7ExpectedCall::new(
+                    from_call.clone(),
+                    msg.frequency_offset as f32,
+                    // Parity is unknown at the decoder layer (the coordinator
+                    // tags it post-decode); pass Even as a placeholder — the
+                    // template generator doesn't gate on parity.
+                    crate::a7::A7SlotParity::Even,
                 );
-                new_msg.time_refinement = cand.time_refinement;
-                decoded_new.push(new_msg);
+                if let Some(other) = heard_with {
+                    if !other.is_empty() {
+                        ec = ec.with_heard_with(other);
+                    }
+                }
+                expected_calls.push(A7ProbeEntry {
+                    ec,
+                    has_known_freq: true,
+                });
             }
+
+            // hb-048 S3-chrono: cross-slot recent calls (no known freq).
+            // These probe every sync_candidate in the window — the
+            // mechanism is "we heard this station before; look for any
+            // follow-up here, freq unknown". This is the WSJT-X-canonical
+            // a7 path when fed from slot N's heard-list into slot N+1.
+            for rc in cross_slot_recent_calls {
+                if rc.callsign.is_empty() {
+                    continue;
+                }
+                let bare = rc
+                    .callsign
+                    .split('/')
+                    .next()
+                    .unwrap_or(&rc.callsign)
+                    .to_uppercase();
+                if !seen_calls.insert(bare) {
+                    continue;
+                }
+                // freq_hz placeholder (unused when has_known_freq=false).
+                let ec = crate::a7::A7ExpectedCall::new(
+                    rc.callsign.clone(),
+                    0.0,
+                    crate::a7::A7SlotParity::Even,
+                );
+                expected_calls.push(A7ProbeEntry {
+                    ec,
+                    has_known_freq: false,
+                });
+            }
+
+            if expected_calls.is_empty() {
+                return Vec::new();
+            }
+
+            // Build the set of already-decoded message texts for downstream
+            // dedup (and to avoid templating the SAME message back as a
+            // "new" decode).
+            let already_decoded_texts: HashSet<String> =
+                pass_decoded.iter().map(|m| m.text.clone()).collect();
+
+            // Build a small set of "subtracted positions" so we don't
+            // re-attempt a7 at positions already cleanly decoded
+            // (otherwise we'd just re-template C's own decode).
+            let subtracted_positions: Vec<CostasCandidate> = pass_decoded
+                .iter()
+                .filter_map(|m| {
+                    m.tone_symbols
+                        .as_ref()
+                        .map(|_| reverse_derive_candidate(m, pp, spectrogram.time_padding))
+                })
+                .collect();
+
+            let freq_window_hz = self.config.a7_freq_window_hz;
+            let snr7_threshold = self.config.a7_snr7_threshold;
+            let snr7b_threshold = self.config.a7_snr7b_threshold;
+            let llr_target_variance = self.config.llr_target_variance;
+
+            let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+            let mut emitted_texts: HashSet<String> = HashSet::new();
+
+            // For each expected call, generate templates and probe nearby
+            // sync_candidates. Each (expected_call, candidate) pair is one
+            // cross-correlation evaluation; the bank's `best_template_score`
+            // picks the winner.
+            //
+            // Within-WAV entries (has_known_freq=true) probe only candidates
+            // within ±freq_window_hz of the expected call. Cross-slot
+            // entries (has_known_freq=false) probe ALL candidates — the
+            // canonical WSJT-X a7 path searches the whole window for a
+            // follow-up to any callsign heard in a previous slot.
+            for entry in &expected_calls {
+                let ec = &entry.ec;
+                let templates = crate::a7::generate_templates(ec);
+                if templates.is_empty() {
+                    continue;
+                }
+                let ec_freq = ec.freq_hz as f64;
+
+                // Find candidates near this expected call's freq. We
+                // include candidates that DID decode too — for the
+                // dual-station case where a single sync position
+                // resolves to two callsigns at offset sub-bins.
+                for cand in sync_candidates {
+                    // Compute candidate audio frequency.
+                    let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                    let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                    if entry.has_known_freq && (cand_freq - ec_freq).abs() > freq_window_hz {
+                        continue;
+                    }
+                    // Skip positions whose codeword has been subtracted —
+                    // a7 against C's own already-clean decode is a no-op
+                    // because the LLRs are zero-mean noise.
+                    let already_subtracted = subtracted_positions.iter().any(|sp| {
+                        sp.freq_sub == cand.freq_sub
+                            && (sp.freq_bin as i64 - cand.freq_bin as i64).unsigned_abs() <= 1
+                            && (sp.time_step as i64 - cand.time_step as i64).unsigned_abs() <= 2
+                    });
+                    if already_subtracted {
+                        continue;
+                    }
+
+                    // Extract LLRs at this candidate position from the
+                    // (possibly-residual) spectrogram. The decoder hands
+                    // us `spectrogram` here, which IS the multipass
+                    // residual once `coherent_subtract_and_repass` has
+                    // run.
+                    let tone_mags =
+                        par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
+                    let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+                    // NOTE: JS8Call-Improved-style LLR whitening
+                    // intentionally NOT applied here. a7 uses LLRs for
+                    // cross-correlation against pre-encoded templates
+                    // (snr7/snr7b thresholds are tuned against the
+                    // legacy LLR scale); whitening would shift the
+                    // distribution and require re-calibrating
+                    // a7_snr7_threshold / a7_snr7b_threshold. The spec
+                    // scopes whitening to LDPC BP input only.
+                    normalize_llrs(&mut llrs, llr_target_variance);
+
+                    let Some((best_idx, snr7, snr7b)) =
+                        crate::a7::best_template_score(&templates, &llrs)
+                    else {
+                        continue;
+                    };
+                    if snr7 < snr7_threshold {
+                        continue;
+                    }
+                    if snr7b < snr7b_threshold {
+                        continue;
+                    }
+
+                    // Build a DecodedMessage from the winning template's
+                    // text. Plausibility + the production FP filter run
+                    // downstream of decode_window, so we don't gate on
+                    // them here (they would for an LDPC decode but a7's
+                    // codeword IS the template's, by construction).
+                    let template_text = &templates[best_idx].message_text;
+                    if already_decoded_texts.contains(template_text) {
+                        continue;
+                    }
+                    if !emitted_texts.insert(template_text.clone()) {
+                        continue;
+                    }
+
+                    let base_frequency = cand_freq;
+                    let coarse_offset = candidate_offset_samples(
+                        cand.time_step,
+                        spectrogram.time_padding,
+                        spec_step,
+                    );
+                    let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                    let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+                    let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+
+                    let ft8_message = crate::message::Ft8Message::from_text(template_text);
+                    if !self.message_parser.is_plausible(&ft8_message) {
+                        continue;
+                    }
+                    let mut new_msg = DecodedMessage::new(
+                        ft8_message,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
+                    );
+                    new_msg.time_refinement = cand.time_refinement;
+                    decoded_new.push(new_msg);
+                }
+            }
+            decoded_new
         }
-        decoded_new
     }
 
     /// Subtract-aware localized sync threshold relaxation (SHELVED).
@@ -17260,9 +17323,11 @@ mod tests {
 
     // Pre-existing gap found while verifying Task 1 of
     // docs/superpowers/plans/2026-07-25-ap-content-decoding.md: this test
-    // uses `crate::{Ft8Encoder, Ft8Modulator}`, which were once
-    // feature-gated while the test was not (both are in every build since
-    // PAN-331).
+    // uses `crate::{Ft8Encoder, Ft8Modulator}`, both gated behind the
+    // `transmit` feature, but the test itself was not -- `cargo test -p
+    // pancetta-ft8 --lib` with default features failed to compile before
+    // this fix, unrelated to anything else in that task.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decode_soft_with_features_round_trip_on_clean_signal() {
         // Encode + modulate + add light noise + decode. The features
@@ -17299,6 +17364,7 @@ mod tests {
     /// (the single choke point every public decode entry point funnels
     /// through) now seeds the hash table from every `MessageType::Standard`
     /// decode's callsigns, not just the one passed to `seed_hash_callsign`.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decoder_seeds_hash_table_from_any_standard_decode_not_just_own_callsign() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -17360,6 +17426,7 @@ mod tests {
     /// plaintext; a LATER type-4 exchange between two DIFFERENT compound
     /// stations that places "YS/WE9G" in the hashed slot must resolve it,
     /// not render the unrecoverable `<...>` placeholder.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decoder_seeds_hash_table_from_nonstdcall_exact_field_too() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -17426,6 +17493,7 @@ mod tests {
     /// table, or a LATER, unrelated frame that happens to share its 12-bit
     /// hash renders as this bogus identity instead of staying correctly
     /// unresolved.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decoder_hash_seeding_rejects_free_text_shaped_nonstdcall_exact_field() {
         use crate::message::{hash12, pack58};
@@ -18664,6 +18732,7 @@ mod tests {
     /// `decode_time_into_window` stamp. Exercises the full pipeline with a
     /// synthetic FT8 transmission, then verifies every emitted message has a
     /// non-zero stamp that does not exceed the wall-clock processing time.
+    #[cfg(feature = "transmit")]
     #[test]
     fn test_ttfd_stamping_on_synth_signal() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -19335,6 +19404,7 @@ mod tests {
         .unwrap();
 
         // Create LLRs for a known valid codeword with 2 unreliable bits
+        // We need the encoder for this, so gate behind transmit feature
         // For now, just verify construction works
         assert!(decoder.osd.is_some());
 
@@ -19606,6 +19676,7 @@ mod tests {
     /// threshold (5x looser than round 5/6's, at the current worst
     /// observed magnitude plus margin) reflects today's REAL, partial
     /// state — not a claim of full correctness.
+    #[cfg(feature = "transmit")]
     #[test]
     fn phase_drift_estimate_is_near_zero_on_a_real_clean_signal_across_time_offsets() {
         const SUBBLOCK_SIZE: usize = 960;
@@ -20194,6 +20265,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
         // Signal at 1500 + 500 = 2000 Hz → freq_bin 320. Scope 318..=322
@@ -20220,6 +20292,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_excludes_out_of_range_message() {
         // Same signal at 2000 Hz (freq_bin 320). Scope 78..=82 covers
@@ -21214,6 +21287,7 @@ mod hb230_cycle_smoothing_tests {
     /// decoded output as the prior (pre-wiring) decoder. This is the
     /// "byte-identical output" guarantee that lets us flip the default
     /// safely once corpus measurement validates.
+    #[cfg(feature = "transmit")]
     #[test]
     fn hb244_default_off_decode_output_is_unchanged() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -21249,6 +21323,7 @@ mod hb230_cycle_smoothing_tests {
     /// reception). After a successful decode at this coarse key, the
     /// combiner's mark_decoded should have evicted the bucket — verify
     /// by inspecting the combiner state.
+    #[cfg(feature = "transmit")]
     #[test]
     fn hb244_default_on_decode_marks_decoded_bucket_empty() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -21298,6 +21373,7 @@ mod hb230_cycle_smoothing_tests {
     /// left entries), and that a second pass on a noise-only WAV at
     /// the same combiner reuses the cache (entries persist across
     /// `decode_window` calls).
+    #[cfg(feature = "transmit")]
     #[test]
     fn hb244_combiner_persists_across_decode_windows() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -21769,6 +21845,7 @@ mod hb226_gaussian_ramp_tests {
 // `Ft8Config::time_varying_subtraction_enabled`'s doc).
 // ============================================================================
 #[cfg(test)]
+#[cfg(feature = "transmit")]
 mod w42_time_varying_subtraction_tests {
     use super::*;
     use crate::WINDOW_SAMPLES;
@@ -22391,6 +22468,7 @@ mod w42_time_varying_subtraction_tests {
 // `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
 // ============================================================================
 #[cfg(test)]
+#[cfg(feature = "transmit")]
 mod pan168_full_frame_time_varying_tests {
     use super::*;
     use crate::encoder::Ft8Encoder;
@@ -22763,6 +22841,7 @@ mod fourth_pass_a7_tests {
     /// Default-OFF decode of a synthetic FT8 signal must match the
     /// explicit-OFF configuration's decode output. This is the
     /// byte-identical legacy-path guarantee.
+    #[cfg(feature = "transmit")]
     #[test]
     fn fourth_pass_default_off_decode_output_unchanged() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -22813,6 +22892,7 @@ mod fourth_pass_a7_tests {
     /// because there's no second-utterance follow-up to template
     /// against; the test therefore exercises the "a7 produced 0
     /// decodes" edge case from the spec (step 4).
+    #[cfg(feature = "transmit")]
     #[test]
     fn fourth_pass_default_on_bounded_one_extra_pass() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -24882,6 +24962,7 @@ mod cross_sequence_a7_consumer_tests {
     /// to the legacy path even when the cross-sequence config flag is
     /// flipped on. The standard pipeline never consults
     /// `try_cross_sequence_decodes` — only the coordinator does.
+    #[cfg(feature = "transmit")]
     #[test]
     fn enabling_flag_does_not_perturb_standard_decode() {
         let mut encoder = crate::Ft8Encoder::new();
@@ -24950,6 +25031,7 @@ mod cross_sequence_a7_consumer_tests {
     /// enumeration generates the "C OTHER 73" shape rooted on K1ABC;
     /// cross-correlation against the WAV's sync candidate at 2000 Hz
     /// should win on the matching template.
+    #[cfg(feature = "transmit")]
     #[test]
     fn seeded_consumer_emits_cross_sequence_provenance() {
         // Synthesize the reply message at 2000 Hz (BASE 1500 + offset 500).
@@ -25014,6 +25096,7 @@ mod cross_sequence_a7_consumer_tests {
     /// decodes; A7 is for *replies* in the opposite-parity window).
     /// We seed at a freq with a CQ in the WAV; the consumer must NOT
     /// emit a CrossSequenceA7-flagged decode of the CQ.
+    #[cfg(feature = "transmit")]
     #[test]
     fn cq_messages_never_emitted_via_cross_sequence() {
         let cq_text = "CQ K5ARH EM10";
@@ -25606,6 +25689,7 @@ mod decode_origin_e2e_tests {
     /// Mirrors `test_ttfd_stamping_on_synth_signal`: a clean synthetic
     /// FT8 transmission must decode on the primary standard pass and
     /// carry `decode_origin == Some(0)`.
+    #[cfg(feature = "transmit")]
     #[test]
     fn synth_signal_decode_carries_origin_zero() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -25857,6 +25941,7 @@ mod bicm_id_tests {
     /// as `Ft8Config::default()` (which is 0), on a synthetic
     /// signal-plus-deterministic-noise window. Guards the
     /// `par_decode_candidate` restructure around the rescue gate.
+    #[cfg(feature = "transmit")]
     #[test]
     fn bicm_id_zero_is_byte_identical_to_default() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26051,6 +26136,7 @@ mod llr_metric_tests {
     /// signal-plus-deterministic-noise window. Guards the metric
     /// branch points in `par_decode_candidate` (both paths) and the
     /// rescue.
+    #[cfg(feature = "transmit")]
     #[test]
     fn dual_max_is_byte_identical_to_default() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26107,6 +26193,7 @@ mod llr_metric_tests {
     /// End-to-end: the Bessel metric must decode a clean synthetic
     /// signal (the estimator + ln I0 + LSE pipeline is wired through
     /// the parallel decode path, not just unit-correct in isolation).
+    #[cfg(feature = "transmit")]
     #[test]
     fn bessel_metric_decodes_clean_signal() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26274,6 +26361,7 @@ mod em_reestimation_tests {
     /// `bicm_id_em_reestimation: true` with everything else default
     /// (BICM-ID off, DualMax metric — the rescue never runs) must
     /// produce exactly the same decode list as `Ft8Config::default()`.
+    #[cfg(feature = "transmit")]
     #[test]
     fn em_flag_alone_is_byte_identical_to_default() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26532,6 +26620,7 @@ mod impulse_robust_llr_tests {
     /// End-to-end: `impulse_robust_llr = None` (default) must produce
     /// byte-identical decodes to `Ft8Config::default()` on a noisy
     /// synthetic signal through the full parallel decode path.
+    #[cfg(feature = "transmit")]
     #[test]
     fn none_is_byte_identical_to_default() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26588,6 +26677,7 @@ mod impulse_robust_llr_tests {
     /// End-to-end: the weighting enabled at a conservative knee must
     /// still decode a clean synthetic signal (wired through the
     /// parallel decode path, not just unit-correct in isolation).
+    #[cfg(feature = "transmit")]
     #[test]
     fn enabled_decodes_clean_signal() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -26616,8 +26706,10 @@ mod impulse_robust_llr_tests {
 #[cfg(test)]
 mod bessel_fallback_tests {
     use super::*;
+    #[cfg(feature = "transmit")]
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
+    #[cfg(feature = "transmit")]
     fn rescue_samples() -> Vec<f32> {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
         let mut encoder = Ft8Encoder::new();
@@ -26641,6 +26733,7 @@ mod bessel_fallback_tests {
         samples
     }
 
+    #[cfg(feature = "transmit")]
     fn with_context(run: impl FnOnce(DecodeContext<'_>, CostasCandidate)) {
         let decoder = Ft8Decoder::new(Ft8Config {
             bessel_fallback_enabled: true,
@@ -26664,6 +26757,7 @@ mod bessel_fallback_tests {
         assert!(!Ft8Config::default().bessel_fallback_enabled);
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn first_success_skips_bessel_and_ap() {
         with_context(|ctx, candidate| {
@@ -26687,6 +26781,7 @@ mod bessel_fallback_tests {
         });
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn retry_uses_same_candidate_and_local_metric_then_short_circuits_ap() {
         with_context(|ctx, candidate| {
@@ -26709,6 +26804,7 @@ mod bessel_fallback_tests {
         });
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn two_failures_reach_only_eligible_ap() {
         with_context(|mut ctx, candidate| {
@@ -26741,6 +26837,7 @@ mod bessel_fallback_tests {
         });
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn ineligible_or_expired_context_never_retries() {
         with_context(|ctx, candidate| {
@@ -26787,6 +26884,7 @@ mod bessel_fallback_tests {
         });
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn retry_never_counts_or_evicts_a_combiner_reception() {
         use crate::soft_combiner::{CombinerKey, Mode, LLR_LEN};
@@ -26825,6 +26923,7 @@ mod bessel_fallback_tests {
         });
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn one_candidate_retry_does_not_change_another_in_serial_or_rayon() {
         with_context(|ctx, candidate_a| {
@@ -26902,6 +27001,7 @@ mod bessel_fallback_tests {
         }
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn real_candidate_fails_dual_max_and_recovers_on_bessel_retry() {
         let decoder = Ft8Decoder::new(Ft8Config {
@@ -26957,6 +27057,7 @@ mod bessel_fallback_tests {
         );
     }
 
+    #[cfg(feature = "transmit")]
     #[test]
     fn bessel_retry_uses_the_configured_refinement_path() {
         for fine_sync_enabled in [false, true] {
@@ -27042,6 +27143,7 @@ mod w2_5_acceptance_gating_tests {
     /// just the sync tones) while its data-bearing symbols stay clean —
     /// exactly the scenario the acceptance-gating design targets, not a
     /// toy construction.
+    #[cfg(feature = "transmit")]
     pub(super) fn build_low_sync_real_signal(
         decoder: &Ft8Decoder,
     ) -> (Vec<f64>, Spectrogram, CostasCandidate) {
@@ -27091,6 +27193,7 @@ mod w2_5_acceptance_gating_tests {
     /// internals, mirroring the production `decode_window`'s ctx literal
     /// field-for-field (see the `let ctx = DecodeContext { ... }` site
     /// earlier in this file).
+    #[cfg(feature = "transmit")]
     pub(super) fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
         spectrogram: &'a Spectrogram,
@@ -27161,6 +27264,7 @@ mod w2_5_acceptance_gating_tests {
         }
     }
 
+    #[cfg(feature = "transmit")]
     fn decode_low_sync_candidate(acceptance_gating_enabled: bool) -> Option<DecodedMessage> {
         let config = Ft8Config {
             acceptance_gating_enabled,
@@ -27186,6 +27290,7 @@ mod w2_5_acceptance_gating_tests {
     /// 0.25-0.41) is rejected outright by the blunt
     /// `MIN_DECODE_CONFIDENCE = 0.41` floor — regardless of how clean its
     /// actual codeword match is.
+    #[cfg(feature = "transmit")]
     #[test]
     fn low_sync_true_signal_rejected_with_gating_disabled() {
         let result = decode_low_sync_candidate(false);
@@ -27200,6 +27305,7 @@ mod w2_5_acceptance_gating_tests {
     /// because it cleanly passes the W2.1 acceptance metric — a real,
     /// clean signal's decoded codeword genuinely matches its own channel
     /// LLRs, independent of the (artificially depressed) sync score.
+    #[cfg(feature = "transmit")]
     #[test]
     fn low_sync_true_signal_accepted_with_gating_enabled() {
         let result = decode_low_sync_candidate(true);
@@ -27336,6 +27442,7 @@ mod w26_ap_coverage_tests {
     /// candidate's real (strong) `sync_score` is left untouched — this
     /// test targets injection/decode PLUMBING correctness, not a
     /// confidence-floor edge case.
+    #[cfg(feature = "transmit")]
     fn build_clean_cq_signal(decoder: &Ft8Decoder) -> (Vec<f64>, Spectrogram, CostasCandidate) {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
 
@@ -27372,6 +27479,7 @@ mod w26_ap_coverage_tests {
     /// Mirrors `w2_5_acceptance_gating_tests::build_ctx` field-for-field
     /// (small intentional duplication across test modules, same pattern
     /// used elsewhere in this file — see that function's doc comment).
+    #[cfg(feature = "transmit")]
     fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
         spectrogram: &'a Spectrogram,
@@ -27456,6 +27564,7 @@ mod w26_ap_coverage_tests {
     /// `pancetta-ft8/tests/w26_ap_coverage_tests.rs`'s documented note)
     /// found no scenario where the CQ mask rescues a decode AP0 alone
     /// could not.
+    #[cfg(feature = "transmit")]
     #[test]
     fn cq_mask_direct_call_decodes_clean_cq_signal() {
         let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
@@ -27791,6 +27900,7 @@ mod ap5_hot_path_rescue_tests {
     /// elsewhere in this file — see that function's doc comment), with
     /// `content_ap_enabled` as an explicit parameter so the same
     /// candidate/spectrogram can be tried at both settings.
+    #[cfg(feature = "transmit")]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_ctx<'a>(
         decoder: &'a Ft8Decoder,
@@ -27923,6 +28033,7 @@ mod ap5_hot_path_rescue_tests {
     /// the much harder "beat AP3/AP4 specifically, but not Ap5" split
     /// (extensively attempted and abandoned; see the Task 6 report for
     /// why that split doesn't exist at this decoder's default config).
+    #[cfg(feature = "transmit")]
     #[test]
     fn ap5_rescues_signal_that_ap0_and_ap1_cannot_decode_via_active_qsos_alone() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -28080,6 +28191,7 @@ mod ap5_hot_path_rescue_tests {
     /// knowledge) -- this is a different regime from the "AP3/AP4 with
     /// the CORRECT callsign already rescues" cliff the sibling test's doc
     /// comment describes avoiding.
+    #[cfg(feature = "transmit")]
     #[test]
     fn ap5_rescues_via_active_qsos_index_1_not_index_0() {
         use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
@@ -28217,9 +28329,10 @@ mod ap5_hot_path_rescue_tests {
 // ============================================================================
 // Task W4.1 (decoder-true-positive-sensitivity plan, Workstream 4): TDD for
 // `Ft8Decoder::generate_gfsk_reference` — the new, still-unused real-GFSK
-// subtraction reference generator (compiled in every build since PAN-331).
+// subtraction reference generator. Requires `transmit` (the function itself
+// is gated on it; see its doc for the feature-gating rationale).
 // ============================================================================
-#[cfg(test)]
+#[cfg(all(test, feature = "transmit"))]
 mod w4_1_gfsk_reference_tests {
     use super::*;
 
@@ -28646,7 +28759,10 @@ mod ft8lib_seed_translate_tests {
 /// is indistinguishable from `Ft8Config::default()`. This module is what pins
 /// that. It becomes load-bearing once the pass-0 union block lands: it is what
 /// proves the block is gated on the flag and not merely on `pass == 0`.
-#[cfg(test)]
+///
+/// `transmit` is required — `Ft8Encoder` / `Ft8Modulator` are re-exported only
+/// under that feature.
+#[cfg(all(test, feature = "transmit"))]
 mod pan7_ft8lib_sync_seed_tests {
     use super::*;
 
@@ -30037,7 +30153,7 @@ struct ApTimingState {
     positions: HashSet<(String, usize, usize, usize)>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transmit"))]
 mod pan160_queue_tests {
     use super::*;
     #[test]

@@ -14,6 +14,7 @@ use crate::{
     protocol::ProtocolParams, Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS,
     NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
 };
+use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 /// Number of samples per FT8 symbol
@@ -39,8 +40,7 @@ pub const MAX_FREQUENCY_DEVIATION: f64 = 3100.0;
 pub const DEFAULT_BT: f64 = 2.0;
 
 /// Pulse shaping mode for FT8 modulation
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PulseShape {
     /// Rectangular pulse (pure CPFSK, no smoothing).
     /// Default for decoder compatibility; GFSK produces cleaner spectral
@@ -664,8 +664,7 @@ fn erfc(x: f64) -> f64 {
 }
 
 /// Modulator configuration
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModulatorConfig {
     /// Audio sample rate
     pub sample_rate: u32,
@@ -705,8 +704,7 @@ pub struct SymbolTiming {
 }
 
 /// Audio format specifications for FT8 transmission
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AudioFormat {
     /// Sample rate (Hz)
     pub sample_rate: u32,
@@ -719,8 +717,7 @@ pub struct AudioFormat {
 }
 
 /// Audio sample format types
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum SampleType {
     /// 32-bit floating point
     F32,

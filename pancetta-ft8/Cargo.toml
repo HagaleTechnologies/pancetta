@@ -5,7 +5,7 @@ description = "High-performance FT8 digital mode decoder for Pancetta"
 # consumers (manta) can pin by the `pancetta-ft8-v<version>` git tag. Bump
 # this independently of the workspace from now on; the release process cuts
 # the matching tag on the merge commit.
-version = "0.9.7"
+version = "0.9.6"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -93,9 +93,8 @@ std = []
 ffi = []
 # Enable GPIO support for Raspberry Pi
 gpio = ["rppal"]
-# The audio/PTT transmitter (`transmit.rs`: `Ft8Transmitter` and its device
-# stack). The encoder and modulator are in every build (PAN-331).
-transmit = ["serde", "serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde_json", "dep:sha2"]
+# Enable transmission capabilities
+transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable benchmark harness for decoder comparison
 benchmark = ["dep:hound", "dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable serde Serialize/Deserialize for config types (used by research harness)

@@ -10,6 +10,8 @@
 //! the data tones carrying the injected bits, discriminating "AP0 (or a
 //! weaker AP level) fails to converge" from "the new mask rescues it."
 
+#![cfg(feature = "transmit")]
+
 use pancetta_ft8::ap::{ApContext, MyCallAp, QsoAp, QsoApProgress};
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
 

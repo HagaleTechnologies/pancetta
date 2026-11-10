@@ -14,6 +14,7 @@ const REFERENCE_BITS: &str =
     "00001001101111011110001101010000110000101001001110111000001100100101011001000";
 
 /// The same 77 bits as 10 payload bytes (3 zero pad bits).
+#[cfg(feature = "transmit")]
 const REFERENCE_PAYLOAD: [u8; 10] = [0x09, 0xBD, 0xE3, 0x50, 0xC2, 0x93, 0xB8, 0x32, 0x56, 0x40];
 
 fn reference_bits() -> BitVec {
@@ -53,6 +54,7 @@ fn dxpedition_reference_frame_with_unknown_fox_has_no_sender() {
     assert_eq!(msg.text.as_deref(), Some("K1ABC RR73; W9XYZ <...> -08"));
 }
 
+#[cfg(feature = "transmit")]
 #[test]
 fn dxpedition_encoder_matches_independent_reference_payload() {
     use pancetta_ft8::encoder::pack_dxpedition_contacts;
@@ -77,6 +79,7 @@ fn dxpedition_encoder_matches_independent_reference_payload() {
     assert_eq!(low.dxpedition.unwrap().report_db, -30);
 }
 
+#[cfg(feature = "transmit")]
 #[test]
 fn dxpedition_encoder_refuses_invalid_calls() {
     use pancetta_ft8::encoder::Ft8Encoder;
@@ -110,6 +113,7 @@ fn dxpedition_context_accepts_structural_frames_and_clears() {
     assert!(!parser.is_plausible(&unresolved));
 }
 
+#[cfg(feature = "transmit")]
 #[test]
 fn dxpedition_reference_audio_crosses_both_production_decoders() {
     use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Modulator, Protocol, WINDOW_SAMPLES};

@@ -6,6 +6,7 @@
 // rationale: test/bench loops index buffers by position; the index is
 // load-bearing and an iterator rewrite would obscure intent.
 #![allow(clippy::needless_range_loop)]
+#![cfg(feature = "transmit")]
 
 mod test_signal_generator;
 

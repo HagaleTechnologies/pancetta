@@ -456,20 +456,14 @@ jobs:
         with:
           key: ft8-tests
 
-      - name: Check (default features)
+      - name: Check (no features)
         run: cargo check -p pancetta-ft8
-
-      - name: Check (no default features)
-        run: cargo check -p pancetta-ft8 --no-default-features
 
       - name: Check (transmit feature)
         run: cargo check --features transmit -p pancetta-ft8
 
-      - name: Run FT8 tests (default features, the standalone build)
-        # The configuration manta and other programs build (PAN-176,
-        # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
-        # run in workspace-check's `--features transmit` test step.
-        run: cargo test -p pancetta-ft8
+      - name: Run FT8 tests (all features)
+        run: cargo test --features transmit -p pancetta-ft8
 
   workspace-check:
     name: Workspace Check
@@ -534,10 +528,11 @@ jobs:
         run: cargo check --workspace --exclude pancetta-research
 
       - name: Check pancetta without default features (PAN-331)
-        # Every cfg configuration of the station crate must compile.
+        # The station crate must compile without its default features.
         # `pancetta-hamlib` is a plain dependency (PAN-331), so this is the
         # `metrics`-off build; GitHub #270 broke the old hamlib-off build
-        # silently because no lane built it.
+        # silently because no lane built it. The opt-in `ft2`, `prometheus`
+        # and `tracing-json` builds are still not checked here.
         run: cargo check -p pancetta --no-default-features
 
       - name: Build examples

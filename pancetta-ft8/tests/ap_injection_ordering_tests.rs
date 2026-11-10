@@ -72,6 +72,8 @@
 //! audio bytes, config, and everything else constant) causes the rescue to
 //! disappear.
 
+#![cfg(feature = "transmit")]
+
 use pancetta_ft8::ap::{ApContext, MyCallAp, QsoAp, QsoApProgress};
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
 

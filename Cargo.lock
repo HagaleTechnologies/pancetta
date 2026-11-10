@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-ft8"
-version = "0.9.7"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "approx",
