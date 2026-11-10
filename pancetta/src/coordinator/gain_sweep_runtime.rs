@@ -39,188 +39,183 @@ impl ApplicationCoordinator {
         let Some(options) = self.gain_sweep_options.clone() else {
             return Ok(None);
         };
-        #[cfg(not(feature = "pancetta-hamlib"))]
-        anyhow::bail!("Sweep unavailable: Hamlib is disabled");
-        #[cfg(feature = "pancetta-hamlib")]
-        {
-            let rig = self
-                .rig_handle
-                .clone()
-                .context("Sweep unavailable: no rig connection")?;
-            let config = self.config.clone();
-            let dial = self.operating_frequency_hz.clone();
-            let protocol = self.active_protocol_mode.clone();
-            let shutdown = self.shutdown_signal.clone();
-            let capture = self.sweep_capture.clone();
-            let bus = self.message_bus.clone();
-            let ptt = self.ptt_active.clone();
-            let sync = self.ptt_sync_gate.clone();
-            let policy = self.tx_policy.clone();
-            let generation = self.hamlib_generation.clone();
-            let snapshot = self.gain_sweep_original.clone();
-            Ok(Some(tokio::spawn(async move {
-                struct EndSweep(Arc<AtomicBool>);
-                impl Drop for EndSweep {
-                    fn drop(&mut self) {
-                        self.0.store(true, Ordering::Release);
-                    }
+        let rig = self
+            .rig_handle
+            .clone()
+            .context("Sweep unavailable: no rig connection")?;
+        let config = self.config.clone();
+        let dial = self.operating_frequency_hz.clone();
+        let protocol = self.active_protocol_mode.clone();
+        let shutdown = self.shutdown_signal.clone();
+        let capture = self.sweep_capture.clone();
+        let bus = self.message_bus.clone();
+        let ptt = self.ptt_active.clone();
+        let sync = self.ptt_sync_gate.clone();
+        let policy = self.tx_policy.clone();
+        let generation = self.hamlib_generation.clone();
+        let snapshot = self.gain_sweep_original.clone();
+        Ok(Some(tokio::spawn(async move {
+            struct EndSweep(Arc<AtomicBool>);
+            impl Drop for EndSweep {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
                 }
-                let _end_sweep = EndSweep(shutdown.clone());
-                let result = async {
-                    let cfg = config.read().await;
-                    anyhow::ensure!(cfg.rig.operating_mode()? == pancetta_config::OperatingMode::Ft8,
-                        "Sweep unavailable: requires FT8");
-                    let lead = super::resolve_window_lead_secs(&cfg.decoder);
-                    drop(cfg);
-                    println!("Reading rig gain settings...");
-                    let setup = async {
-                        let caps = timeout(Duration::from_secs(5), rig.receive_gain_capabilities()).await??;
-                        let original = timeout(Duration::from_secs(5), rig.get_receive_gain()).await??;
-                        let settings = candidates(&caps.preamp_db, &caps.attenuator_db).map_err(|e| anyhow!(e))?;
-                        anyhow::Ok((original, settings))
-                    }.await;
-                    let (original, settings) = match setup {
-                        Ok(value) => value,
-                        Err(error) => {
-                            println!("Sweep unavailable: the rig cannot read and set PREAMP and ATT.\nRecommendation: none");
-                            return Err(error);
-                        }
-                    };
-                    let original_gain = GainSetting { preamp_db: original.preamp_db, attenuator_db: original.attenuator_db };
-                    let frequency = dial.load(Ordering::Acquire);
-                    anyhow::ensure!(frequency != 0, "Sweep unavailable: dial frequency is unknown");
-                    let band = pancetta_qso::utils::frequency_to_band(frequency as f64);
-                    let mut report = Report::new(band, frequency, options.seconds, original_gain, settings.clone());
-                    println!("Receive-gain sweep: {}, FT8, {} seconds", report.band, options.seconds);
-                    println!("Original gain: PREAMP {} dB, ATT {} dB", original.preamp_db, original.attenuator_db);
-                    println!("Waiting for a receive window...");
-                    *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(original);
-                    let started = Instant::now();
-                    let end = started + Duration::from_secs(options.seconds);
-                    let initial_generation = generation.load(Ordering::Acquire);
-                    let initial_mode = protocol.load(Ordering::Acquire);
-                    let mut schedule = Schedule::new(settings);
-                    let mut epoch = 0;
-                    let mut failure = None;
-                    let mut current = original;
-                    println!("Measuring receive windows. Transmission windows are skipped.");
-                    while Instant::now() < end {
-                        drain(&capture, &mut report);
-                        if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); break; }
-                        if dial.load(Ordering::Acquire) != frequency || protocol.load(Ordering::Acquire) != initial_mode
-                            || generation.load(Ordering::Acquire) != initial_generation {
-                            failure = Some("Dial, mode or Hamlib generation changed".into()); break;
-                        }
-                        let now = Utc::now();
-                        let slot_secs = (now.timestamp_millis() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
-                        let slot = Utc.timestamp_opt(slot_secs, 0).single().context("Invalid source slot")?;
-                        let boundary = slot - chrono::Duration::milliseconds((lead * 1000.0) as i64);
-                        let wait = (boundary - Utc::now()).to_std().unwrap_or_default();
-                        let wake = Instant::now() + wait;
-                        while Instant::now() < wake.min(end) && !shutdown.load(Ordering::Acquire) {
-                            sleep_until((Instant::now() + Duration::from_millis(50)).min(wake).min(end)).await;
-                        }
-                        if Instant::now() >= end || shutdown.load(Ordering::Acquire) { continue; }
-                        let lateness = Utc::now().signed_duration_since(boundary).num_milliseconds();
-                        if !(0..=50).contains(&lateness) { skip(&mut report, slot_secs, "late boundary or clock discontinuity"); continue; }
-                        // Configured TX parity is reserved even with no queued frame.
-                        // Auto can choose either parity, so both remain unavailable.
-                        let cfg = config.read().await;
-                        let blocked_parity = if pancetta_core::TxPolicy::from_u8(policy.load(Ordering::Acquire)).allows_any_tx() {
-                            match cfg.station.tx_self_parity {
-                                pancetta_config::station::TxSelfParity::Even => slot_secs.div_euclid(15).rem_euclid(2) == 0,
-                                pancetta_config::station::TxSelfParity::Odd => slot_secs.div_euclid(15).rem_euclid(2) == 1,
-                                _ => false,
-                            }
-                        } else { false };
-                        drop(cfg);
-                        if blocked_parity || bus.gain_tx_intents.load(Ordering::Acquire) != 0 { skip(&mut report, slot_secs, "reserved TX parity"); continue; }
-                        if dial.load(Ordering::Acquire) != frequency || protocol.load(Ordering::Acquire) != initial_mode
-                            || generation.load(Ordering::Acquire) != initial_generation {
-                            failure = Some("Dial, mode or Hamlib generation changed".into()); break;
-                        }
-                        let admitted = {
-                            let _guard = sync.lock().await;
-                            !ptt.load(Ordering::Acquire) && bus.gain_tx_intents.load(Ordering::Acquire) == 0 && reserve(&bus.gain_tx_gate)
-                        };
-                        if !admitted { skip(&mut report, slot_secs, "PTT active or pending"); continue; }
-                        let mut trial = schedule.clone();
-                        let Some(gain) = trial.next(slot_secs) else {
-                            schedule = trial;
-                            bus.gain_tx_gate.store(0, Ordering::Release);
-                            skip(&mut report, slot_secs, "parity balance quiet slot"); continue;
-                        };
-                        let budget = (slot - chrono::Duration::milliseconds(250) - Utc::now()).to_std().unwrap_or_default();
-                        let deadline = Instant::now() + budget;
-                        let transaction = async {
-                            anyhow::ensure!(rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off, "Rig is transmitting");
-                            anyhow::ensure!(rig.get_receive_gain().await? == current, "Front-panel gain changed");
-                            rig.set_receive_gain(pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db }, deadline).await
-                        };
-                        match tokio::time::timeout_at(deadline, transaction).await {
-                            Ok(Ok(())) => {
-                                current = pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db };
-                                // Do not release TX exclusion until the 250 ms settling interval ends.
-                                let settle = (slot - Utc::now()).to_std().unwrap_or_default();
-                                sleep(settle).await;
-                                epoch += 1;
-                                let capture_admitted = capture.lock().unwrap_or_else(|e| e.into_inner()).admit(GainCaptureMetadata {
-                                    generation: initial_generation, epoch, tx_epoch: bus.gain_tx_epoch.load(Ordering::Acquire), source_slot: slot, dial_hz: frequency, gain,
-                                });
-                                if !capture_admitted { skip(&mut report, slot_secs, "sweep admission backpressure"); }
-                                schedule = trial;
-                                bus.gain_tx_gate.store(0, Ordering::Release);
-                            }
-                            error => {
-                                skip(&mut report, slot_secs, "gain transaction failed");
-                                failure = Some(format!("Gain transaction failed: {error:?}"));
-                                // A cancelled transport future must not retain a late reply.
-                                let _ = rig.disconnect().await;
-                                break;
-                            }
-                        }
+            }
+            let _end_sweep = EndSweep(shutdown.clone());
+            let result = async {
+                let cfg = config.read().await;
+                anyhow::ensure!(cfg.rig.operating_mode()? == pancetta_config::OperatingMode::Ft8,
+                    "Sweep unavailable: requires FT8");
+                let lead = super::resolve_window_lead_secs(&cfg.decoder);
+                drop(cfg);
+                println!("Reading rig gain settings...");
+                let setup = async {
+                    let caps = timeout(Duration::from_secs(5), rig.receive_gain_capabilities()).await??;
+                    let original = timeout(Duration::from_secs(5), rig.get_receive_gain()).await??;
+                    let settings = candidates(&caps.preamp_db, &caps.attenuator_db).map_err(|e| anyhow!(e))?;
+                    anyhow::Ok((original, settings))
+                }.await;
+                let (original, settings) = match setup {
+                    Ok(value) => value,
+                    Err(error) => {
+                        println!("Sweep unavailable: the rig cannot read and set PREAMP and ATT.\nRecommendation: none");
+                        return Err(error);
                     }
-                    if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); }
-                    // Retain the original pair in this coordinator-owned task until cleanup
-                    // has finished. This task is joined before Hamlib teardown, never aborted.
-                    if failure.is_none() && rig.get_receive_gain().await.ok() != Some(current) {
-                        failure = Some("Gain drift or missing final gain readback".into());
-                        capture.lock().unwrap_or_else(|e| e.into_inner()).invalidate_all("unconfirmed final gain");
-                    }
-                    println!("Restoring original gain settings...");
-                    let restored = restore(&*rig, original, &bus.gain_tx_gate, lead).await;
-                    // A reported terminal restoration failure also ends cleanup
-                    // ownership. Keep the TX inhibit, but do not restart a fresh
-                    // 30-second deadline during ordinary shutdown.
-                    *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    if restored {
-                        println!("Original gain settings restored.");
-                    }
-                    else { println!("Sweep failed: original gain settings could not be restored.\nCheck rig gain settings before continuing."); }
-                    let drain_end = Instant::now() + Duration::from_secs(15);
-                    while Instant::now() < drain_end && !shutdown.load(Ordering::Acquire) {
-                        drain(&capture, &mut report);
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    capture.lock().unwrap_or_else(|e| e.into_inner()).invalidate_all("unfinished at decode drain deadline");
+                };
+                let original_gain = GainSetting { preamp_db: original.preamp_db, attenuator_db: original.attenuator_db };
+                let frequency = dial.load(Ordering::Acquire);
+                anyhow::ensure!(frequency != 0, "Sweep unavailable: dial frequency is unknown");
+                let band = pancetta_qso::utils::frequency_to_band(frequency as f64);
+                let mut report = Report::new(band, frequency, options.seconds, original_gain, settings.clone());
+                println!("Receive-gain sweep: {}, FT8, {} seconds", report.band, options.seconds);
+                println!("Original gain: PREAMP {} dB, ATT {} dB", original.preamp_db, original.attenuator_db);
+                println!("Waiting for a receive window...");
+                *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(original);
+                let started = Instant::now();
+                let end = started + Duration::from_secs(options.seconds);
+                let initial_generation = generation.load(Ordering::Acquire);
+                let initial_mode = protocol.load(Ordering::Acquire);
+                let mut schedule = Schedule::new(settings);
+                let mut epoch = 0;
+                let mut failure = None;
+                let mut current = original;
+                println!("Measuring receive windows. Transmission windows are skipped.");
+                while Instant::now() < end {
                     drain(&capture, &mut report);
+                    if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); break; }
                     if dial.load(Ordering::Acquire) != frequency || protocol.load(Ordering::Acquire) != initial_mode
                         || generation.load(Ordering::Acquire) != initial_generation {
-                        failure = Some("Dial, mode or Hamlib generation changed".into());
+                        failure = Some("Dial, mode or Hamlib generation changed".into()); break;
                     }
-                    if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); }
-                    report.finish(restored, failure.clone());
-                    print_report(&report);
-                    save_report(&options.path, &report).context("Sweep failed: could not save report.")?;
-                    println!("Report saved: {}", options.path.display());
-                    anyhow::ensure!(restored, "Original gain restoration failed");
-                    if let Some(reason) = failure { anyhow::bail!(reason); }
-                    Ok(())
-                }.await;
-                shutdown.store(true, Ordering::Release);
-                result
-            })))
-        }
+                    let now = Utc::now();
+                    let slot_secs = (now.timestamp_millis() + (lead * 1000.0) as i64).div_euclid(15000) * 15 + 15;
+                    let slot = Utc.timestamp_opt(slot_secs, 0).single().context("Invalid source slot")?;
+                    let boundary = slot - chrono::Duration::milliseconds((lead * 1000.0) as i64);
+                    let wait = (boundary - Utc::now()).to_std().unwrap_or_default();
+                    let wake = Instant::now() + wait;
+                    while Instant::now() < wake.min(end) && !shutdown.load(Ordering::Acquire) {
+                        sleep_until((Instant::now() + Duration::from_millis(50)).min(wake).min(end)).await;
+                    }
+                    if Instant::now() >= end || shutdown.load(Ordering::Acquire) { continue; }
+                    let lateness = Utc::now().signed_duration_since(boundary).num_milliseconds();
+                    if !(0..=50).contains(&lateness) { skip(&mut report, slot_secs, "late boundary or clock discontinuity"); continue; }
+                    // Configured TX parity is reserved even with no queued frame.
+                    // Auto can choose either parity, so both remain unavailable.
+                    let cfg = config.read().await;
+                    let blocked_parity = if pancetta_core::TxPolicy::from_u8(policy.load(Ordering::Acquire)).allows_any_tx() {
+                        match cfg.station.tx_self_parity {
+                            pancetta_config::station::TxSelfParity::Even => slot_secs.div_euclid(15).rem_euclid(2) == 0,
+                            pancetta_config::station::TxSelfParity::Odd => slot_secs.div_euclid(15).rem_euclid(2) == 1,
+                            _ => false,
+                        }
+                    } else { false };
+                    drop(cfg);
+                    if blocked_parity || bus.gain_tx_intents.load(Ordering::Acquire) != 0 { skip(&mut report, slot_secs, "reserved TX parity"); continue; }
+                    if dial.load(Ordering::Acquire) != frequency || protocol.load(Ordering::Acquire) != initial_mode
+                        || generation.load(Ordering::Acquire) != initial_generation {
+                        failure = Some("Dial, mode or Hamlib generation changed".into()); break;
+                    }
+                    let admitted = {
+                        let _guard = sync.lock().await;
+                        !ptt.load(Ordering::Acquire) && bus.gain_tx_intents.load(Ordering::Acquire) == 0 && reserve(&bus.gain_tx_gate)
+                    };
+                    if !admitted { skip(&mut report, slot_secs, "PTT active or pending"); continue; }
+                    let mut trial = schedule.clone();
+                    let Some(gain) = trial.next(slot_secs) else {
+                        schedule = trial;
+                        bus.gain_tx_gate.store(0, Ordering::Release);
+                        skip(&mut report, slot_secs, "parity balance quiet slot"); continue;
+                    };
+                    let budget = (slot - chrono::Duration::milliseconds(250) - Utc::now()).to_std().unwrap_or_default();
+                    let deadline = Instant::now() + budget;
+                    let transaction = async {
+                        anyhow::ensure!(rig.get_ptt(pancetta_hamlib::Vfo::Current).await? == pancetta_hamlib::PttState::Off, "Rig is transmitting");
+                        anyhow::ensure!(rig.get_receive_gain().await? == current, "Front-panel gain changed");
+                        rig.set_receive_gain(pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db }, deadline).await
+                    };
+                    match tokio::time::timeout_at(deadline, transaction).await {
+                        Ok(Ok(())) => {
+                            current = pancetta_hamlib::ReceiveGain { preamp_db: gain.preamp_db, attenuator_db: gain.attenuator_db };
+                            // Do not release TX exclusion until the 250 ms settling interval ends.
+                            let settle = (slot - Utc::now()).to_std().unwrap_or_default();
+                            sleep(settle).await;
+                            epoch += 1;
+                            let capture_admitted = capture.lock().unwrap_or_else(|e| e.into_inner()).admit(GainCaptureMetadata {
+                                generation: initial_generation, epoch, tx_epoch: bus.gain_tx_epoch.load(Ordering::Acquire), source_slot: slot, dial_hz: frequency, gain,
+                            });
+                            if !capture_admitted { skip(&mut report, slot_secs, "sweep admission backpressure"); }
+                            schedule = trial;
+                            bus.gain_tx_gate.store(0, Ordering::Release);
+                        }
+                        error => {
+                            skip(&mut report, slot_secs, "gain transaction failed");
+                            failure = Some(format!("Gain transaction failed: {error:?}"));
+                            // A cancelled transport future must not retain a late reply.
+                            let _ = rig.disconnect().await;
+                            break;
+                        }
+                    }
+                }
+                if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); }
+                // Retain the original pair in this coordinator-owned task until cleanup
+                // has finished. This task is joined before Hamlib teardown, never aborted.
+                if failure.is_none() && rig.get_receive_gain().await.ok() != Some(current) {
+                    failure = Some("Gain drift or missing final gain readback".into());
+                    capture.lock().unwrap_or_else(|e| e.into_inner()).invalidate_all("unconfirmed final gain");
+                }
+                println!("Restoring original gain settings...");
+                let restored = restore(&*rig, original, &bus.gain_tx_gate, lead).await;
+                // A reported terminal restoration failure also ends cleanup
+                // ownership. Keep the TX inhibit, but do not restart a fresh
+                // 30-second deadline during ordinary shutdown.
+                *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                if restored {
+                    println!("Original gain settings restored.");
+                }
+                else { println!("Sweep failed: original gain settings could not be restored.\nCheck rig gain settings before continuing."); }
+                let drain_end = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < drain_end && !shutdown.load(Ordering::Acquire) {
+                    drain(&capture, &mut report);
+                    sleep(Duration::from_millis(50)).await;
+                }
+                capture.lock().unwrap_or_else(|e| e.into_inner()).invalidate_all("unfinished at decode drain deadline");
+                drain(&capture, &mut report);
+                if dial.load(Ordering::Acquire) != frequency || protocol.load(Ordering::Acquire) != initial_mode
+                    || generation.load(Ordering::Acquire) != initial_generation {
+                    failure = Some("Dial, mode or Hamlib generation changed".into());
+                }
+                if shutdown.load(Ordering::Acquire) { failure = Some("interrupted".into()); }
+                report.finish(restored, failure.clone());
+                print_report(&report);
+                save_report(&options.path, &report).context("Sweep failed: could not save report.")?;
+                println!("Report saved: {}", options.path.display());
+                anyhow::ensure!(restored, "Original gain restoration failed");
+                if let Some(reason) = failure { anyhow::bail!(reason); }
+                Ok(())
+            }.await;
+            shutdown.store(true, Ordering::Release);
+            result
+        })))
     }
 }
 
@@ -229,7 +224,6 @@ fn reserve(gate: &AtomicU64) -> bool {
         .is_ok()
 }
 
-#[cfg(feature = "pancetta-hamlib")]
 pub(super) async fn restore(
     rig: &dyn pancetta_hamlib::RigControl,
     original: pancetta_hamlib::ReceiveGain,
@@ -377,7 +371,7 @@ fn save_report(path: &std::path::Path, report: &Report) -> Result<()> {
     result
 }
 
-#[cfg(all(test, feature = "pancetta-hamlib"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use pancetta_hamlib::{MockRig, ReceiveGain, ReceiveGainCapabilities, RigControl};
@@ -402,8 +396,6 @@ mod tests {
             None,
             true,
             true,
-            false,
-            9090,
             None,
             None,
             None,

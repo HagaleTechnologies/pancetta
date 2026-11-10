@@ -43,9 +43,10 @@ cargo build
 # Run all workspace tests
 cargo test --workspace --features transmit
 
-# FT8 tests (encoder is feature-gated behind `transmit`)
+# FT8 tests: default features are the standalone (manta) build and include the
+# encoder; the `transmit` feature adds the audio/PTT transmitter (and turns on `serde`)
+cargo test -p pancetta-ft8                         # standalone build; skips test files still gated on `transmit`
 cargo test --features transmit -p pancetta-ft8    # all FT8 tests
-cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
 cargo test -p pancetta --test loopback_qso
@@ -86,14 +87,20 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - Every acting consumer of `MessageType::DecodedMessage` (QSO, autonomous, WSJT-X relay) drops a decode whose `captured_dial_hz` maps to a different band than the live dial (fail-open on unknown dials) — a decode captured before a band switch is never acted on after it (PAN-69).
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
+- A TX frame that will not air as itself settles through `coordinator::tx_outcome::settle_unaired_frame`: the QSO engine always gets `TxFrameNotSent` with the frame's attempt id, and Autonomous gets a failed `TransmitComplete` only when no same-QSO successor (re-key, requeue, carried bundle item, pivot) will report. A not-viable superseder is requeued, never dropped (PAN-279).
 - Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted, and the bus accepted, for that qso_id at key-time, or at the moment of an operator-triggered mid-TX abort+re-key, whichever is later.
 - TX outcome reports — `TransmitComplete` (→ Autonomous), `TxFrameScheduled`/`TxFrameNotSent`/`TxFrameSent` (→ Qso) — go through `MessageBus::send_message_durable`, and those components read through a `DurableInbox`; a full channel parks them, never drops them (PAN-185).
 - At most one QSO object exists per (callsign, band) among active-or-recently-completed QSOs; repeated manual actions resolve to it, never spawn a sibling.
+- A completion that queues a closing frame emits `QsoCompleted` (ADIF, uploads, WSJT-X `QSOLogged`) only when that frame's `TxFrameSent` arrives; a `TxFrameNotSent` for its last pending attempt, or expiry, reverts it to its pre-73 state (exempt from timeouts for one `COMPLETED_QSO_REWORK_GRACE`) or, for an open-at-close, to `Failed{CloseNotAired}` (PAN-280).
 - Every write to `qsos.adi` (live append, import, import undo) holds the `qsos.adi.lock` file lock (PAN-214); the live writer waits at most 60 s and then writes anyway rather than drop a QSO, and undo rewrites in place, never by rename.
 - Readiness strip: blockers and warnings render from typed state every frame. No status-line write can erase them, decodes never write the status line, and the strip's TX verdict comes from `tx_mute_causes`, which is parity-tested against `tx_hard_mute_reason` (PAN-89).
 - The coordinator supervisor auto-restarts a crashed Autonomous/DxCluster/PskReporter/RemoteGateway/Qso/Dsp/Ft8Decoder/Hamlib/StationAgent/Ft8Transmitter task (5 restarts/10min, capped-exponential backoff). Restart teardown guarantees PTT release for Hamlib and definitive disarm for StationAgent; TX stays inhibited throughout a Hamlib restart window. Audio deliberately remains `DegradeOnly`. QSO-engine loss surfaces as `SupervisorRestart`; dependency loss as `ComponentCrash` with component-specific QSO scope.
 
+- TUI keys (PAN-327): every bound key in every dialog and the main view resolves through `keymap::resolve` into exactly one `Action`; a new key is a chord on its documented `KEYBINDINGS` row (or `MODAL_BINDINGS` for dialog-internal keys) plus an `Action` variant and a `match action` arm in `handle_key_event`, Main-scope chords for `Action::starts_tx()` refuse Ctrl/Alt, Shift+Q resolves in Global scope before any dialog chord or text-entry rule, and any change to what a key does must re-bless `pancetta-tui/tests/fixtures/key_effects.golden` (`PANCETTA_BLESS_KEY_EFFECTS=1`).
+
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
+
+- TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.
 
 ## Where Things Live
 

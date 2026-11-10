@@ -23,10 +23,10 @@ path = "src/main.rs"
 pancetta-core = { path = "../pancetta-core" }
 pancetta-audio = { path = "../pancetta-audio" }
 pancetta-dsp = { path = "../pancetta-dsp" }
-pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit", "benchmark"] }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["benchmark"] }
 pancetta-tui = { path = "../pancetta-tui" }
 pancetta-config = { path = "../pancetta-config" }
-pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
+pancetta-hamlib = { path = "../pancetta-hamlib" }
 pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
 pancetta-cqdx = { path = "../pancetta-cqdx" }
@@ -83,10 +83,6 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 num_cpus = "1.0"
 
-# Performance monitoring
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", optional = true }
-
 # Audio output for examples
 cpal = { workspace = true }
 
@@ -120,11 +116,7 @@ pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
 wiremock = "0.6"
 
 [features]
-default = ["metrics", "pancetta-hamlib"]
-metrics = []
-pancetta-hamlib = ["dep:pancetta-hamlib"]
-prometheus = ["metrics-exporter-prometheus"]
-tracing-json = []
+default = []
 # Experimental FT2 digital mode (forwards to pancetta-ft8/ft2). Off by default;
 # when off, a configured FT2 mode falls back to FT8 timing in the coordinator.
 ft2 = ["pancetta-ft8/ft2"]

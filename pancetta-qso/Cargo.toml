@@ -14,10 +14,11 @@ publish.workspace = true
 # Internal dependencies
 pancetta-core = { path = "../pancetta-core" }
 # FT8 encoder/modulator/decoder — only pulled in for the high-fidelity sim
-# path (encode -> noise/fading -> real decode). Optional + the `transmit`
-# feature (the encoder/modulator are feature-gated there). The base harness
-# (direct text inject) builds without this.
-pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit"], optional = true }
+# path (encode -> noise/fading -> real decode). Optional; the encoder,
+# modulator and decoder are all in pancetta-ft8's default build, so no
+# `transmit` is needed (PAN-331). The base harness (direct text inject)
+# builds without this.
+pancetta-ft8 = { path = "../pancetta-ft8", optional = true }
 
 # Core dependencies
 tokio = { version = "1.50", features = ["full"] }
@@ -52,8 +53,8 @@ contest-mode = []
 dx-cluster = []
 # High-fidelity QSO sim: encode text -> modulate -> add calibrated AWGN +
 # fading -> decode through the REAL pancetta-ft8 pipeline, feeding the actual
-# decode (which may be MISSED at low SNR) into the QSO engine. Requires the
-# pancetta-ft8 encoder/modulator/decoder (the `transmit` feature there).
+# decode (which may be MISSED at low SNR) into the QSO engine. Uses the
+# pancetta-ft8 encoder/modulator/decoder, all in its default build (PAN-331).
 sim-hifi = ["dep:pancetta-ft8"]
 
 [[example]]

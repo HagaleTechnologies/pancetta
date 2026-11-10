@@ -761,13 +761,11 @@ mod tests {
         let mut coordinator = super::super::ApplicationCoordinator::new(
             pancetta_config::Config::default(),
             None,
-            true,  // no_audio (start_replay_pipeline is called directly below)
-            true,  // headless
-            false, // metrics
-            9090,
-            None,                           // no WAV
+            true, // no_audio (start_replay_pipeline is called directly below)
+            true, // headless
+            None, // no WAV
             Some(dir.path().to_path_buf()), // --replay
-            None,                           // no test-tx
+            None, // no test-tx
             1500.0,
             shutdown.clone(),
             Vec::new(),

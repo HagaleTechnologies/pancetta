@@ -197,6 +197,11 @@ pub enum QsoFailureReason {
     /// PAN-137: another station-agent client took control. End this client's
     /// QSO to free its TX window and capacity slot; arms never transfer.
     ControlTransferred,
+
+    /// PAN-280: the QSO opened directly at the close and its 73 never aired
+    /// (dropped or denied at key time, or no TX outcome before the pending
+    /// completion expired). Nothing was logged.
+    CloseNotAired,
 }
 
 /// Why the QSO engine refused a decoded frame on sender-verification grounds.

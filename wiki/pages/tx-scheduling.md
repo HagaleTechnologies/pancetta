@@ -78,6 +78,13 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   Autonomous: a refused pivot stays silent and its queued request reports; a
   keyed pivot reports and its absorbed request drops silently. See
   `docs/DECISIONS/tx-scheduling.md`.
+- **Supersede ownership (PAN-279):** every unaired frame settles through
+  `coordinator::tx_outcome::settle_unaired_frame`. A supersede's abandoned
+  frame always rolls back its own attempt with the QSO engine, and fails to
+  Autonomous only when no same-QSO successor (re-key, requeued superseder,
+  carried bundle item) will report. A `NotViable` superseder is requeued at the
+  front of the inbox, never dropped. Coalescer-excluded entries report to both
+  consumers; folded entries with an attempt id roll back their own attempt.
 
 A registered self-CQ opening has no accepted predecessor. The QSO forwarder
 marks it before starting the CQ and consumes that marker on its first
@@ -143,3 +150,25 @@ without a PTT option. Setup, the rig picker and bookmarks only store or print th
 method; only `test-rig --ptt` acts on it (Serial pulses RTS).
 There is no CM108 variant. See
 [the audit](../../docs/DECISIONS/tx-scheduling.md#what-the-configured-ptt-method-actually-controls-pan-121-2026-11-01).
+
+Supersede gotcha (PAN-322): a supersede that arrives in the PTT lead, after
+key-down and before the target slot starts (Step 6), is always `NotViable`.
+`schedule_tx` marks any slot but the current one `deferred`, and until the
+target slot starts the current slot is the previous one. The worker unkeys,
+settles the old frame and requeues the superseder for its own next slot. So the
+real worker never reaches the single-frame Step 6 `Replace` and `Bundle`
+handling. See
+[the decision](../../docs/DECISIONS/tx-scheduling.md#one-handler-per-tx-worker-abort-outcome-pan-322-2026-11-10).
+
+Testing gotcha (PAN-322): on a shutdown after key-down the worker sends no
+PTT-off of its own. The `PttGuard` drop spawns a task that sends it, so its
+place against the `TxStatusGuard` drop's TUI messages changes from run to run,
+and bus message ids do not order the two. Assert order per channel, as
+`pancetta/tests/fixtures/tx_abort_transcripts.golden` does, never one merged
+order across channels.
+
+Testing gotcha (PAN-322): to abort a worker test frame between key-down and the
+target slot (Step 6), set `station.ptt_lead_ms = 2000`. With the default 80 ms
+lead that window is an 80 ms race. Send the frame 4 to 10 s into a slot, so it
+targets the next slot and waits the full lead, and act on the first
+`SetPtt(true)`. `pancetta/src/coordinator/tx/abort_transcripts.rs` does this.

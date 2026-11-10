@@ -24,8 +24,8 @@
 //! - [`Ft8Config`] -- decoder configuration (SNR threshold, parallelism, AP decoding)
 //! - [`DecodedMessage`] -- single decoded FT8 message with SNR, frequency, and confidence
 //! - [`Ft8Message`] -- structured FT8 message content (callsigns, grid, report, etc.)
-//! - [`Ft8Encoder`] -- encodes message text into 174-bit LDPC codeword (feature `transmit`)
-//! - [`Ft8Modulator`] -- converts codeword to 8-GFSK audio samples (feature `transmit`)
+//! - [`Ft8Encoder`] -- encodes message text into 174-bit LDPC codeword
+//! - [`Ft8Modulator`] -- converts codeword to 8-GFSK audio samples
 //!
 //! ## Crate Relationships
 //! - Receives from: `pancetta-dsp` (processed audio windows)
@@ -171,10 +171,11 @@ pub use ft8_lib_ffi::{ft8lib_is_available, Ft8LibSeed, Ft8LibSeedSet};
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
 
-// FT8 transmission modules
-#[cfg(feature = "transmit")]
+// FT8 encoder and modulator: in every build (PAN-331), because the
+// decoder's self-encode passes (A7 templates, cross-sequence A7, the GFSK
+// subtraction reference) call them. Only the audio/PTT transmitter is
+// feature-gated.
 pub mod encoder;
-#[cfg(feature = "transmit")]
 pub mod modulator;
 #[cfg(feature = "transmit")]
 pub mod transmit;
@@ -211,14 +212,13 @@ pub use message::{ConfidenceFeatures, DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{FftProcessor, WindowFunction};
 pub use sync::{SyncResult, TimeSync};
 
-// Transmission exports (when transmit feature is enabled)
-#[cfg(feature = "transmit")]
+// Encoder and modulator exports (every build)
 pub use encoder::{Ft8Encoder, Ft8EncodingConfig};
-#[cfg(feature = "transmit")]
 pub use modulator::{
     convert_samples, modulate_multi_tx, AudioFormat, Ft8Modulator, ModulatorConfig, MultiTxItem,
     PulseShape, SampleType,
 };
+// Audio/PTT transmitter exports (`transmit` feature)
 #[cfg(feature = "transmit")]
 pub use transmit::{
     AudioConfig, BandLimits, FrequencyConfig, Ft8Transmitter, PowerConfig, PttConfig, PttMethod,

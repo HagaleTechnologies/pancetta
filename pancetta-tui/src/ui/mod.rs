@@ -1695,7 +1695,8 @@ fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
         | R::SignalLost
         | R::StationQrt
         | R::SupervisorRestart
-        | R::ComponentCrash(_) => Color::Yellow,
+        | R::ComponentCrash(_)
+        | R::CloseNotAired => Color::Yellow,
         R::InvalidCallsign
         | R::FrequencyConflict
         | R::ProtocolError(_)
@@ -2727,6 +2728,16 @@ mod view_render_tests {
         assert!(
             buffer_contains(&buf, "Station"),
             "station card should render below DX Hunter when there's room"
+        );
+    }
+
+    /// PAN-280: a QSO opened at 73 whose 73 never aired reads as a TX-timing
+    /// outcome (yellow, like `Timeout`), not a defect.
+    #[test]
+    fn close_not_aired_is_yellow() {
+        assert_eq!(
+            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::CloseNotAired),
+            Color::Yellow
         );
     }
 
