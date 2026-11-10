@@ -154,10 +154,15 @@ reduced decode recall and a loud build-script warning.
 - The crate sets its own explicit `version` in `pancetta-ft8/Cargo.toml`
   (starting at 0.9.6, the workspace number it previously inherited), bumped
   independently of the workspace.
-- External consumers pin the `pancetta-ft8-v<version>` git tag; the
-  release process cuts the tag on the merge commit, not this branch.
+- External consumers pin the `pancetta-ft8-v<version>` git tag when one
+  exists, otherwise a full 40-character `rev`; the release process cuts
+  the tag on the merge commit, not this branch.
 - `publish = false` stays (workspace-wide pre-1.0 posture); registry
   publication (which would also need a versioned, published
   `pancetta-core`) is a separate ticket.
 - `tests/versioning_contract_test.rs` pins the tag-scheme/version link and
   the README's contract section.
+- The stable item list and the compatibility policy live in
+  `pancetta-ft8/README.md` § Stable API and compatibility policy, and
+  `tests/stable_api_guard.rs` pins every listed item at compile time
+  (PAN-380).

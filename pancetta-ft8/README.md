@@ -73,7 +73,63 @@ The crate carries its own `version` in its `Cargo.toml`, bumped
 independently of the workspace. Pin it with the matching
 `pancetta-ft8-v<version>` git tag (release process cuts the tag on the
 merge commit). Registry publication stays off (`publish = false`); the pin
-is the tag/rev.
+is the tag/rev. When no `pancetta-ft8-v<version>` tag exists, pin a full
+40-character `rev`.
+
+### Stable API and compatibility policy
+
+These items are the crate's stable API: the cycle API manta calls (dispensa
+ADR-0017) and the window API the dispensa Q-0085 answer names.
+`tests/stable_api_guard.rs` pins each one at compile time, so CI fails and
+names the item when a change breaks one.
+
+- `CycleDecoder::new(Protocol) -> Ft8Result<CycleDecoder>`. `CycleDecoder`
+  is `Send`.
+- `CycleDecoder::decode_cycle(&mut self, &[f32]) -> Ft8Result<Vec<DecodedMessage>>`
+- `decode_cycle(&[f32], Protocol) -> Ft8Result<Vec<DecodedMessage>>`
+- `ft8lib_is_available() -> bool`
+- `Ft8Decoder::new(Ft8Config) -> Ft8Result<Ft8Decoder>`
+- `Ft8Decoder::decode_window(&mut self, &[f32]) -> Ft8Result<Vec<DecodedMessage>>`,
+  which takes `WINDOW_SAMPLES` (151,680) samples.
+- `Ft8Config::sample_rate: u32`, `Ft8Config::protocol: Protocol` and
+  `Ft8Config::default()`, used as
+  `Ft8Config { sample_rate, protocol, ..Ft8Config::default() }`.
+  `Ft8Config` is `Clone` and `Debug`.
+- `DecodedMessage::text: String`, `DecodedMessage::snr_db: f32`,
+  `DecodedMessage::frequency_offset: f64` and
+  `DecodedMessage::time_offset: f64`. `DecodedMessage` is `Clone` and
+  `Debug`.
+- `Protocol::Ft8` and `Protocol::Ft4`. `Protocol` is `Copy`, `Eq`, `Hash`
+  and `Debug`.
+- `Ft8Result` and `Ft8Error`, by name. `Ft8Error`'s variants are not
+  stable, so match it with a wildcard arm.
+
+Everything else is outside the promise: the other fields of `Ft8Config` and
+`DecodedMessage`, every other function and type, and the `transmit` encoder
+API.
+
+Compatibility policy:
+
+- A change that breaks a stable item bumps the crate's minor version while
+  it is below 1.0 (`0.9.x` to `0.10.0`). The same PR updates this list,
+  `tests/stable_api_guard.rs` and `CHANGELOG.md`, and the change is proposed
+  in dispensa first.
+- Any other change, including a new field on `Ft8Config` or
+  `DecodedMessage`, needs at most a patch bump. To stay compatible, build
+  `Ft8Config` only with `..Ft8Config::default()`, and only read
+  `DecodedMessage` fields: never build one, and never destructure one
+  without `..`.
+- `Ft8Config` is deliberately not `#[non_exhaustive]`. That attribute would
+  forbid the `..Ft8Config::default()` construction from outside the crate.
+- The promise covers the default-feature build. `transmit`, `gpio` and
+  `benchmark` leave these items unchanged. `ft2` adds `Protocol::Ft2`, so a
+  consumer that turns it on and matches on `Protocol` needs a wildcard arm.
+- Decode results are not part of this list. The parity tolerances above and
+  `docs/decoder-crate.md` cover them.
+- Pin a `pancetta-ft8-v<version>` tag when one exists, otherwise a full
+  40-character `rev`. `git ls-remote --tags
+  https://github.com/HagaleTechnologies/pancetta 'pancetta-ft8-v*'` lists
+  the tags.
 
 ### Parity guarantee and tolerances
 
@@ -220,21 +276,21 @@ let decoded_messages = decoder.decode_window(&samples)?;
 
 // Process results
 for message in decoded_messages {
-    println!("Decoded: {} (SNR: {:.1}dB, Confidence: {:.2})", 
-             message.text, message.snr_db, message.confidence);
+    println!("Decoded: {} (SNR: {:.1}dB, {:.0} Hz)",
+             message.text, message.snr_db, message.frequency_offset);
 }
 ```
 
 ### Advanced Configuration
 
 ```rust
-use pancetta_ft8::{Ft8Decoder, Ft8Config};
+use pancetta_ft8::{Ft8Decoder, Ft8Config, Protocol};
 
-// Configure for high-sensitivity weak signal decoding
+// Decode FT4 instead of FT8; every other setting keeps its default
 let config = Ft8Config {
-    max_candidates: 100,
-    time_range: 2.0,           // ±2 second search
-    ..Default::default()
+    sample_rate: 12_000,
+    protocol: Protocol::Ft4,
+    ..Ft8Config::default()
 };
 
 let mut decoder = Ft8Decoder::new(config)?;
@@ -354,9 +410,9 @@ Ablation env vars: `ABL_LDPC_ITERS`, `ABL_SYNC_CANDS`, `ABL_MULTIPASS`,
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sample_rate` | 12000 | Audio sample rate (Hz) |
-| `max_candidates` | 50 | Maximum decode candidates |
+| `protocol` | `Protocol::Ft8` | Protocol to decode (FT8 or FT4) |
+| `max_candidates` | 100 | Maximum decode candidates |
 | `ldpc_iterations` | 100 | LDPC decoder iterations |
-| `time_range` | 2.0 | Time search range (±seconds) |
 
 ## Error Handling
 
