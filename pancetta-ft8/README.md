@@ -90,7 +90,9 @@ names the item when a change breaks one.
 - `ft8lib_is_available() -> bool`
 - `Ft8Decoder::new(Ft8Config) -> Ft8Result<Ft8Decoder>`
 - `Ft8Decoder::decode_window(&mut self, &[f32]) -> Ft8Result<Vec<DecodedMessage>>`,
-  which takes `WINDOW_SAMPLES` (151,680) samples.
+  which takes `WINDOW_SAMPLES` (151,680) samples. For FT4, zero-pad the
+  90,000-sample cycle to that length, as `CycleDecoder` does, so the window
+  never reads audio from the next slot.
 - `Ft8Config::sample_rate: u32`, `Ft8Config::protocol: Protocol` and
   `Ft8Config::default()`, used as
   `Ft8Config { sample_rate, protocol, ..Ft8Config::default() }`.
@@ -122,8 +124,9 @@ Compatibility policy:
 - `Ft8Config` is deliberately not `#[non_exhaustive]`. That attribute would
   forbid the `..Ft8Config::default()` construction from outside the crate.
 - The promise covers the default-feature build. `transmit`, `gpio` and
-  `benchmark` leave these items unchanged. `ft2` adds `Protocol::Ft2`, so a
-  consumer that turns it on and matches on `Protocol` needs a wildcard arm.
+  `benchmark` leave these items unchanged. `ft2` adds `Protocol::Ft2`, and
+  Cargo unifies features, so any crate in the build that turns `ft2` on adds
+  the variant for every consumer. Match `Protocol` with a wildcard arm.
 - Decode results are not part of this list. The parity tolerances above and
   `docs/decoder-crate.md` cover them.
 - Pin a `pancetta-ft8-v<version>` tag when one exists, otherwise a full
@@ -430,7 +433,6 @@ The crate provides comprehensive error handling through the `Ft8Error` enum:
 
 ### Planned Features
 - **MSK144 Support**: Meteor scatter mode decoding
-- **FT4 Support**: Higher-speed digital mode
 - **GPU Acceleration**: CUDA/OpenCL processing
 - **Real-time Streaming**: Continuous audio processing
 - **Advanced LDPC**: Enhanced error correction

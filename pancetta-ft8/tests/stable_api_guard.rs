@@ -48,6 +48,11 @@ const PINNED_OTHER: &[&str] = &[
 ];
 
 const _: usize = WINDOW_SAMPLES;
+// The README states the value, so pin it as well as the type.
+const _: () = assert!(
+    WINDOW_SAMPLES == 151_680,
+    "WINDOW_SAMPLES is stable at 151,680 (README)"
+);
 const _: fn(Ft8Error) -> Ft8Result<()> = Err;
 
 fn assert_send<T: Send>() {}
