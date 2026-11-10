@@ -100,6 +100,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
 
+- TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.
+
 ## Where Things Live
 
 - `docs/superpowers/specs/` — design specs (authoritative for current behavior)
