@@ -1051,3 +1051,34 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `pancetta/tests/cli_surface.rs` checks every help screen (found from the live
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
+
+## Windows compiled on every code PR (PAN-286, 2026-11-10)
+
+Before this change only `release.yml` compiled Windows, on a `v*` tag, though
+Windows 11 is the maintainer's station platform.
+
+- **Leg and target.** `cross-platform-check` in `.github/workflows/ci.yml` has
+  a `windows-latest` leg that checks `x86_64-pc-windows-gnu`, with the same
+  runner, toolchain pin, ft8_lib submodule guard and MinGW `gcc --version`
+  assert as `release.yml`. MSVC stays out: it cannot compile the VLAs in
+  `vendor/ft8_lib/ft8/decode.c` (C2057).
+- **Check command.** `cargo check --target x86_64-pc-windows-gnu --workspace
+  --exclude pancetta-research --all-targets --features transmit`, the crate
+  scope Linux tests. `--all-targets` also compiles `cfg(test)`, `tests/`,
+  examples and benches, where three of today's five Windows-only warnings live.
+- **Gating.** `cross-platform-check` is in the `CI` aggregator's `needs`, so a
+  red Windows leg fails the required `CI` check. `needs` cannot pick one matrix
+  leg, so the macOS leg is gating too; a flaky macOS runner now blocks a merge
+  until it is re-run. On `push` and `merge_group` the job is `skipped`, which
+  the aggregator ignores.
+- **Not done.** No tests run on Windows: a bare `cargo test` on
+  `windows-latest` uses the MSVC host, and a gnu test run is unverified. No
+  `-D warnings`, because the Windows-only warnings would fail it.
+- **Follow-ups, not done here:** the `code` path filter misses `.h` files,
+  `.gitmodules` and the ft8_lib submodule; `deny.toml` lists
+  `x86_64-pc-windows-msvc`, not `-gnu`; `actions/checkout@v7` and
+  `Swatinem/rust-cache@v2` in this job stay unpinned (PAN-106).
+
+`scripts/ci/test-ci-windows-lane.sh`, run by the `research-scan-tests` job,
+pins the Windows leg, the `ci.needs` entry, the guards and the macOS-only
+microphone test.

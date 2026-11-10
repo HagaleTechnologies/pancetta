@@ -327,7 +327,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
-| Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
+| Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station; compile-checked for `x86_64-pc-windows-gnu` on every code PR). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 
 ### Platform archive evidence
 
@@ -377,8 +377,10 @@ cargo fmt --all -- --check
 ```
 
 CI runs the workspace tests and clippy with `--exclude pancetta-research`
-(the local-only harness), checks formatting, builds the examples, and adds a
-macOS `cargo check` lane; it has no separate single-threaded hamlib run.
+(the local-only harness), checks formatting, builds the examples, and adds
+macOS and Windows (`x86_64-pc-windows-gnu`, MinGW) `cargo check` lanes on code
+PRs; a failure in either fails the required `CI` check. It has no separate
+single-threaded hamlib run.
 `cargo deny check` guards advisories and license drift. The exact CI commands
 are in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The 14-crate strictly layered workspace
 is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
