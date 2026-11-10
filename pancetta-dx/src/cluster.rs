@@ -8,8 +8,10 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
@@ -28,6 +30,14 @@ const MAX_CLUSTER_LINE_BYTES: usize = 4096;
 const SPOT_QUEUE_CAPACITY: usize = 1024;
 /// Outgoing commands queued for the writer task.
 const COMMAND_QUEUE_CAPACITY: usize = 64;
+/// Longest wait between two checks of the shutdown flag in
+/// [`DxClusterClient::run_until_shutdown`], both while waiting for a spot and
+/// while sleeping before a reconnect.
+const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+/// A session at least this long resets the reconnect delay to its base.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
+/// The reconnect delay never grows past this many times its base.
+const RECONNECT_CAP_FACTOR: u32 = 10;
 
 /// Result of [`read_capped_line`].
 #[derive(Debug, PartialEq, Eq)]
@@ -68,6 +78,65 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
     }
     buf.clear();
     Ok(CappedLine::TooLong)
+}
+
+/// Capped exponential delay between DX-cluster reconnect attempts (PAN-288).
+///
+/// The first retry waits `base`, each later one doubles the wait up to
+/// `base * RECONNECT_CAP_FACTOR`, and only a session that lasted
+/// [`STABLE_SESSION`] brings it back to `base`, so a server that accepts and
+/// closes at once is not retried at the minimum delay forever. Pure state:
+/// it never sleeps.
+#[derive(Debug, Clone)]
+struct ReconnectBackoff {
+    base: Duration,
+    max: Duration,
+    next: Duration,
+}
+
+impl ReconnectBackoff {
+    fn with_base(base: Duration) -> Self {
+        Self {
+            base,
+            max: base.saturating_mul(RECONNECT_CAP_FACTOR),
+            next: base,
+        }
+    }
+
+    /// Base delay from `reconnect_delay_seconds`, at least one second so a
+    /// configured `0` cannot spin.
+    fn from_config(cfg: &ClusterConfig) -> Self {
+        Self::with_base(Duration::from_secs(cfg.reconnect_delay_seconds.max(1)))
+    }
+
+    /// The delay before the next attempt; the one after it is doubled, capped.
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        delay
+    }
+
+    /// Record how long the session that just ended lasted.
+    fn session_ended(&mut self, lasted: Duration) {
+        if lasted >= STABLE_SESSION {
+            self.next = self.base;
+        }
+    }
+}
+
+/// Sleep `delay` in slices of at most [`SHUTDOWN_POLL`]. Returns `false` as
+/// soon as `shutdown` is set, `true` once the whole delay has passed.
+async fn sleep_unless_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let slice = remaining.min(SHUTDOWN_POLL);
+        tokio::time::sleep(slice).await;
+        remaining = remaining.saturating_sub(slice);
+    }
+    !shutdown.load(Ordering::Acquire)
 }
 
 /// DX Cluster configuration
@@ -592,6 +661,84 @@ impl DxClusterClient {
         Ok(())
     }
 
+    /// Connect, forward every spot to `on_spot`, and reconnect with capped
+    /// backoff whenever the session ends, until `shutdown` is set (PAN-288).
+    ///
+    /// A session ends when [`Self::receive_spot`] returns `None`, which covers
+    /// every way the reader task stops (EOF, I/O error, invalid UTF-8, panic).
+    /// A failed connect is retried on the same schedule. The wait before a
+    /// retry starts at `reconnect_delay_seconds` (at least 1 s), doubles after
+    /// each retry up to ten times that, and returns to the base only after a
+    /// session that lasted a minute. With `auto_reconnect` off, this returns
+    /// after the first session ends or the first connect fails. `shutdown` is
+    /// checked at least once a second.
+    pub async fn run_until_shutdown<F, Fut>(&mut self, shutdown: &AtomicBool, on_spot: F)
+    where
+        F: FnMut(DxSpot) -> Fut + Send,
+        Fut: Future<Output = ()> + Send,
+    {
+        let backoff = ReconnectBackoff::from_config(&self.config);
+        self.run_with_backoff(backoff, shutdown, on_spot).await;
+    }
+
+    async fn run_with_backoff<F, Fut>(
+        &mut self,
+        mut backoff: ReconnectBackoff,
+        shutdown: &AtomicBool,
+        mut on_spot: F,
+    ) where
+        F: FnMut(DxSpot) -> Fut + Send,
+        Fut: Future<Output = ()> + Send,
+    {
+        while !shutdown.load(Ordering::Acquire) {
+            let connect_error = match self.connect().await {
+                Ok(()) => {
+                    info!("Connected to DX cluster");
+                    if let Err(e) = self.login().await {
+                        warn!("DX cluster login failed: {}. Continuing without.", e);
+                    }
+                    let started = Instant::now();
+                    loop {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match tokio::time::timeout(SHUTDOWN_POLL, self.receive_spot()).await {
+                            Ok(Some(spot)) => on_spot(spot).await,
+                            Ok(None) => break,
+                            Err(_) => {}
+                        }
+                    }
+                    backoff.session_ended(started.elapsed());
+                    None
+                }
+                Err(e) => Some(e),
+            };
+
+            if !self.config.auto_reconnect {
+                match connect_error {
+                    Some(e) => warn!(
+                        "Failed to connect to DX cluster {}:{}: {}; auto-reconnect is off",
+                        self.config.hostname, self.config.port, e
+                    ),
+                    None => warn!("DX cluster connection lost; auto-reconnect is off"),
+                }
+                return;
+            }
+
+            let delay = backoff.next_delay();
+            match connect_error {
+                Some(e) => warn!(
+                    "Failed to connect to DX cluster {}:{}: {}; retrying in {:?}",
+                    self.config.hostname, self.config.port, e, delay
+                ),
+                None => warn!("DX cluster connection lost; reconnecting in {:?}", delay),
+            }
+            if !sleep_unless_shutdown(delay, shutdown).await {
+                return;
+            }
+        }
+    }
+
     /// Disconnect from cluster
     pub async fn disconnect(&mut self) {
         if let Some(sender) = &self.command_sender {
@@ -698,6 +845,11 @@ impl DxClusterClient {
 
         // Extract time (last token ending with Z)
         let time_str = parts.last()?;
+        // A `…Z` token holding non-ASCII text is not a cluster time; the line
+        // is skipped rather than given a made-up time (PAN-288).
+        if time_str.ends_with('Z') && !time_str.is_ascii() {
+            return None;
+        }
         let time = if time_str.ends_with('Z') {
             // Parse time format like 1234Z
             Self::parse_cluster_time(time_str).unwrap_or_else(Utc::now)
@@ -717,15 +869,18 @@ impl DxClusterClient {
         })
     }
 
-    /// Parse cluster time format (HHMMZ)
+    /// Parse cluster time format (HHMMZ). Only four ASCII digits before the
+    /// `Z` are accepted, checked before any slicing, so a multibyte character
+    /// cannot land a slice mid-character (PAN-288).
     fn parse_cluster_time(time_str: &str) -> Option<DateTime<Utc>> {
-        if !time_str.ends_with('Z') || time_str.len() != 5 {
+        let digits = time_str.strip_suffix('Z')?.as_bytes();
+        if digits.len() != 4 || !digits.iter().all(u8::is_ascii_digit) {
             return None;
         }
 
-        let time_digits = &time_str[0..4];
-        let hour: u32 = time_digits[0..2].parse().ok()?;
-        let minute: u32 = time_digits[2..4].parse().ok()?;
+        let pair = |hi: u8, lo: u8| u32::from(hi - b'0') * 10 + u32::from(lo - b'0');
+        let hour = pair(digits[0], digits[1]);
+        let minute = pair(digits[2], digits[3]);
 
         if hour > 23 || minute > 59 {
             return None;
@@ -1253,5 +1408,262 @@ mod tests {
             status.contains("Message too long"),
             "unexpected error: {status}"
         );
+    }
+
+    // ---- PAN-288: non-ASCII time tokens ----
+
+    #[test]
+    fn time_token_with_multibyte_chars_returns_none() {
+        use chrono::Timelike;
+        // Each of the first three is 5 bytes ending in Z; before the fix they
+        // panicked slicing mid-character.
+        for token in ["€1Z", "1é1Z", "😀Z", "ééZ", "+123Z"] {
+            assert!(
+                DxClusterClient::parse_cluster_time(token).is_none(),
+                "{token:?} should not parse"
+            );
+        }
+        for (token, hour, minute) in [("1234Z", 12, 34), ("0000Z", 0, 0), ("2359Z", 23, 59)] {
+            let time = DxClusterClient::parse_cluster_time(token)
+                .unwrap_or_else(|| panic!("{token:?} should parse"));
+            assert_eq!((time.hour(), time.minute()), (hour, minute), "{token:?}");
+        }
+        for token in ["2560Z", "1260Z", "1234"] {
+            assert!(
+                DxClusterClient::parse_cluster_time(token).is_none(),
+                "{token:?} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn dx_spot_with_non_ascii_time_token_is_not_a_spot() {
+        let line = "DX de W1AW:     14074.0  K1ABC        FT8 test     €1Z";
+        assert!(DxClusterClient::parse_dx_spot(line).is_none());
+        assert!(!matches!(
+            DxClusterClient::parse_cluster_line(line),
+            Some(ClusterMessage::Spot(_))
+        ));
+
+        // An ASCII-malformed time keeps the lenient "now" fallback.
+        let lenient = "DX de W1AW:     14074.0  K1ABC        FT8 test     2560Z";
+        let spot = DxClusterClient::parse_dx_spot(lenient).expect("lenient line still a spot");
+        assert_eq!(spot.callsign, "K1ABC");
+        assert!(
+            Utc::now()
+                .signed_duration_since(spot.time)
+                .num_seconds()
+                .abs()
+                < 5,
+            "fallback time should be now, got {}",
+            spot.time
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telnet_reader_survives_a_non_ascii_time_token() {
+        let (port, _hold) = serve_cluster(|stream| {
+            use std::io::Write;
+            let _ = stream
+                .write_all("DX de W1AW:     14074.0  BAD1X        FT8 test     €1Z\r\n".as_bytes());
+            let _ = stream.write_all(spot_line("K1ABC", 14074).as_bytes());
+        });
+
+        let mut client = DxClusterClient::with_config(local_config(port));
+        client.connect().await.unwrap();
+
+        let spot = tokio::time::timeout(Duration::from_secs(5), client.receive_spot())
+            .await
+            .expect("a spot within 5 s")
+            .expect("spot channel open: the reader did not stop");
+        assert_eq!(spot.callsign, "K1ABC");
+    }
+
+    // ---- PAN-288: reconnect with capped backoff ----
+
+    #[test]
+    fn reconnect_backoff_doubles_to_ten_times_base() {
+        let mut backoff = ReconnectBackoff::with_base(Duration::from_secs(30));
+        let delays: Vec<u64> = (0..6).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(delays, vec![30, 60, 120, 240, 300, 300]);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_a_stable_session() {
+        let mut backoff = ReconnectBackoff::with_base(Duration::from_secs(30));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+        backoff.session_ended(Duration::from_secs(59));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(60));
+        backoff.session_ended(Duration::from_secs(59));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(120));
+        backoff.session_ended(Duration::from_secs(60));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_backoff_from_config_clamps_zero_delay() {
+        let mut config = local_config(1);
+        config.reconnect_delay_seconds = 0;
+        let mut backoff = ReconnectBackoff::from_config(&config);
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+    }
+
+    /// Local "cluster" that accepts every connection: each one is counted,
+    /// sent `Welcome\r\n`, and handed to `script` with its 1-based number on
+    /// its own thread. The connection closes when `script` returns.
+    fn serve_cluster_repeatedly<F>(script: F) -> (u16, Arc<std::sync::atomic::AtomicUsize>)
+    where
+        F: Fn(usize, &mut std::net::TcpStream) + Send + Sync + 'static,
+    {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        let script = Arc::new(script);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let script = script.clone();
+                std::thread::spawn(move || {
+                    let _ = stream.write_all(b"Welcome\r\n");
+                    script(n, &mut stream);
+                });
+            }
+        });
+        (port, accepts)
+    }
+
+    fn reconnecting_config(port: u16) -> ClusterConfig {
+        let mut config = local_config(port);
+        config.auto_reconnect = true;
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_reconnects_after_the_cluster_closes_and_forwards_the_next_spot() {
+        let (port, accepts) = serve_cluster_repeatedly(|n, stream| {
+            use std::io::Write;
+            if n >= 2 {
+                let _ = stream.write_all(spot_line("K1ABC", 14074).as_bytes());
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (spot_tx, mut spot_rx) = mpsc::channel::<String>(8);
+
+        let task = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut client = DxClusterClient::with_config(reconnecting_config(port));
+                let backoff = ReconnectBackoff::with_base(Duration::from_millis(50));
+                client
+                    .run_with_backoff(backoff, &shutdown, |spot| {
+                        let spot_tx = spot_tx.clone();
+                        async move {
+                            let _ = spot_tx.send(spot.callsign).await;
+                        }
+                    })
+                    .await;
+            })
+        };
+
+        let call = tokio::time::timeout(Duration::from_secs(5), spot_rx.recv())
+            .await
+            .expect("a spot within 5 s")
+            .expect("spot forwarded");
+        assert_eq!(call, "K1ABC");
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("run returned after shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_does_not_spin_while_the_cluster_keeps_closing() {
+        let (port, accepts) = serve_cluster_repeatedly(|_, _| {});
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut client = DxClusterClient::with_config(reconnecting_config(port));
+                let backoff = ReconnectBackoff::with_base(Duration::from_millis(50));
+                client
+                    .run_with_backoff(backoff, &shutdown, |_| async {})
+                    .await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let n = accepts.load(Ordering::SeqCst);
+        // 50, 100, 200, 400, 500, 500 ms waits: about 6 sessions in 1.5 s.
+        // The old loop made 1 accept and millions of empty turns instead.
+        assert!(
+            (2..=10).contains(&n),
+            "expected 2..=10 reconnects in 1.5 s, got {n}"
+        );
+        assert!(!task.is_finished(), "run must keep retrying");
+
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("run returned after shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_keeps_retrying_when_the_first_connect_fails_and_stops_on_shutdown() {
+        // A port that was bound and released: nothing listens on it.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut client = DxClusterClient::with_config(reconnecting_config(port));
+                let backoff = ReconnectBackoff::with_base(Duration::from_millis(50));
+                client
+                    .run_with_backoff(backoff, &shutdown, |_| async {})
+                    .await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "a failed first connect must be retried, not end the run"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("run returned within 2 s of shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_without_auto_reconnect_returns_after_the_session_ends() {
+        let (port, accepts) = serve_cluster_repeatedly(|_, _| {});
+        let shutdown = AtomicBool::new(false);
+        let mut client = DxClusterClient::with_config(local_config(port));
+        assert!(!client.config().auto_reconnect);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.run_until_shutdown(&shutdown, |_| async {}),
+        )
+        .await
+        .expect("run returned within 2 s");
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
     }
 }
