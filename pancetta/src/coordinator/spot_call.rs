@@ -267,9 +267,9 @@ pub(crate) async fn qsy_send(
         }
         return None;
     }
-    // A13 (review L4-24) seam: once `[rig] data_mode` exists, send
-    // RigControlMessage::SetMode here so every pancetta-commanded QSY also
-    // sets the rig's data mode. PAN-287 sends no mode command.
+    // A13 (review L4-24): no SetMode here. With `[rig] data_mode` set, the
+    // rigctld backend reapplies the configured mode after every commanded
+    // frequency change (PAN-276), so this QSY sets the mode too.
     Some(old_freq_hz)
 }
 

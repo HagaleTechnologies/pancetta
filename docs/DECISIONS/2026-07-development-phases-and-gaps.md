@@ -66,8 +66,8 @@
 
 - **Spot-call QSY follow-ups (PAN-287, 2026-11).** Space on a DX Hunter network spot now QSYs
   the rig and calls at the spot's offset (`docs/DECISIONS/tui.md`). Left open:
-  - The rig's data mode is not set on a QSY (A13 / review L4-24). The seam is marked in
-    `qsy_send` in `pancetta/src/coordinator/spot_call.rs`.
+  - ~~The rig's data mode is not set on a QSY (A13 / review L4-24).~~ Covered by PAN-276: with
+    `[rig] data_mode` set, rigctld reapplies the mode after every commanded frequency change.
   - cqdx spots do not reach DX Hunter yet (`spawn_spot_poller(…, None, None)`, review L4-10);
     once wired they take the same path.
   - DX Hunter rows on another band carry no band tag, so the operator learns that Space will QSY
