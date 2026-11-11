@@ -100,6 +100,14 @@ pub struct RigConfig {
     #[serde(default = "default_operating_mode")]
     pub mode: String,
 
+    /// Optional CAT data mode, separate from the station's FT protocol. Requires restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_mode: Option<String>,
+
+    /// CAT passband width in Hz. Absent or zero selects the rig default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_passband_hz: Option<u32>,
+
     /// CAT interface configuration
     pub interface: CatInterfaceConfig,
 
@@ -857,6 +865,8 @@ impl Default for RigConfig {
         Self {
             model: "Generic".to_string(),
             mode: default_operating_mode(),
+            data_mode: None,
+            data_passband_hz: None,
             interface: CatInterfaceConfig::default(),
             ptt: PttConfig::default(),
             frequency: FrequencyConfig::default(),
@@ -1062,6 +1072,23 @@ impl Default for TimingConfig {
 }
 
 impl RigConfig {
+    /// Validate and normalize the opt-in CAT token without accepting command fragments.
+    pub fn normalized_data_mode(&self) -> Result<Option<&'static str>, ConfigError> {
+        let Some(mode) = self.data_mode.as_deref() else {
+            return Ok(None);
+        };
+        match mode.to_ascii_uppercase().as_str() {
+            "PKTUSB" => Ok(Some("PKTUSB")),
+            "PKTLSB" => Ok(Some("PKTLSB")),
+            "USB" => Ok(Some("USB")),
+            "LSB" => Ok(Some("LSB")),
+            _ => Err(ConfigError::InvalidValue {
+                field: "rig.data_mode".into(),
+                value: mode.into(),
+            }),
+        }
+    }
+
     /// The saved rig-config bookmarks (PAN-61) this config layer resolved
     /// to, after merging — `bookmarks` is `None` when no config-source
     /// layer ever set any (see [`RigConfig::bookmarks`] for why that's
@@ -1093,6 +1120,17 @@ impl ConfigSection for RigConfig {
     fn validate_section(&self) -> ConfigResult<()> {
         // Reject an unrecognized operating mode at config-load time.
         self.operating_mode()?;
+        let data_mode = self.normalized_data_mode()?;
+        if let Some(width) = self.data_passband_hz {
+            if data_mode.is_none() || width > i32::MAX as u32 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rig.data_passband_hz".into(),
+                    value: format!(
+                        "{width} (requires rig.data_mode and a width from 0 to 2147483647)"
+                    ),
+                });
+            }
+        }
 
         if let Some(presets) = &self.receive_gain_presets {
             // Keep canonical band Display names at this config boundary; the
@@ -1200,6 +1238,13 @@ impl ConfigSection for RigConfig {
         }
         if !other.mode.is_empty() {
             self.mode = other.mode;
+        }
+
+        if other.data_mode.is_some() {
+            self.data_mode = other.data_mode;
+        }
+        if other.data_passband_hz.is_some() {
+            self.data_passband_hz = other.data_passband_hz;
         }
 
         // PAN-61: bookmarks replace wholesale (matches every sibling nested
@@ -1327,6 +1372,122 @@ impl RigParametersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_mode_defaults_and_documented_example() {
+        for source in ["", "model = 'Generic'"] {
+            let config: RigConfig = toml::from_str(source).unwrap();
+            assert!(config.data_mode.is_none());
+            assert!(config.data_passband_hz.is_none());
+            assert_eq!(config.normalized_data_mode().unwrap(), None);
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(!serialized.contains("data_mode"));
+            assert!(!serialized.contains("data_passband_hz"));
+            config.validate_section().unwrap();
+        }
+        for source in ["", "[rig]", include_str!("../defaults.toml")] {
+            let config: crate::Config = toml::from_str(source).unwrap();
+            assert!(config.rig.data_mode.is_none());
+            assert!(config.rig.data_passband_hz.is_none());
+            config.rig.validate_section().unwrap();
+        }
+        let config: crate::Config = toml::from_str(
+            "[rig]\nmodel = 'FTdx10'\nmode = 'FT8'\ndata_mode = 'PKTUSB'\ndata_passband_hz = 3000\n",
+        ).unwrap();
+        config.rig.validate_section().unwrap();
+        assert_eq!(config.rig.normalized_data_mode().unwrap(), Some("PKTUSB"));
+        assert_eq!(config.rig.data_passband_hz, Some(3000));
+        assert_eq!(config.rig.operating_mode().unwrap(), OperatingMode::Ft8);
+    }
+
+    #[test]
+    fn data_mode_accepts_exact_supported_tokens_case_insensitively() {
+        for mode in ["PKTUSB", "PKTLSB", "USB", "LSB"] {
+            for value in [mode.to_string(), mode.to_lowercase()] {
+                for width in [None, Some(0), Some(3000), Some(i32::MAX as u32)] {
+                    let config = RigConfig {
+                        data_mode: Some(value.clone()),
+                        data_passband_hz: width,
+                        ..Default::default()
+                    };
+                    assert_eq!(config.normalized_data_mode().unwrap(), Some(mode));
+                    config.validate_section().unwrap();
+                    let roundtrip: RigConfig =
+                        toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+                    assert_eq!(roundtrip.normalized_data_mode().unwrap(), Some(mode));
+                    assert_eq!(roundtrip.data_passband_hz, width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn data_mode_rejects_invalid_mode_and_width() {
+        for mode in [
+            "",
+            "AM",
+            "FT8",
+            " PKTUSB",
+            "PKTUSB ",
+            "PKTUSB\\nT 1",
+            "PKTUSB\nT 1",
+            "USB 3000",
+            "USB;T 1",
+        ] {
+            let config = RigConfig {
+                data_mode: Some(mode.into()),
+                ..Default::default()
+            };
+            let error = config.validate_section().unwrap_err().to_string();
+            assert!(error.contains("rig.data_mode"), "{mode:?}: {error}");
+        }
+        for config in [
+            RigConfig {
+                data_passband_hz: Some(0),
+                ..Default::default()
+            },
+            RigConfig {
+                data_mode: Some("PKTUSB".into()),
+                data_passband_hz: Some(i32::MAX as u32 + 1),
+                ..Default::default()
+            },
+        ] {
+            let error = config.validate_section().unwrap_err().to_string();
+            assert!(error.contains("rig.data_passband_hz"), "{error}");
+        }
+        for value in ["-1", "1.5", "'3000'", "4294967296"] {
+            let error = toml::from_str::<RigConfig>(&format!(
+                "data_mode = 'PKTUSB'\ndata_passband_hz = {value}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("data_passband_hz"), "{error}");
+        }
+    }
+
+    #[test]
+    fn data_mode_merge_preserves_omissions_and_replaces_supplied_values() {
+        let mut config = RigConfig {
+            data_mode: Some("PKTUSB".into()),
+            data_passband_hz: Some(3000),
+            ..Default::default()
+        };
+        config.merge_with(RigConfig::default());
+        assert_eq!(config.data_mode.as_deref(), Some("PKTUSB"));
+        assert_eq!(config.data_passband_hz, Some(3000));
+        config.merge_with(RigConfig {
+            data_mode: Some("LSB".into()),
+            ..Default::default()
+        });
+        assert_eq!(config.data_mode.as_deref(), Some("LSB"));
+        assert_eq!(config.data_passband_hz, Some(3000));
+        config.merge_with(RigConfig {
+            data_passband_hz: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(config.data_mode.as_deref(), Some("LSB"));
+        assert_eq!(config.data_passband_hz, Some(0));
+    }
 
     #[test]
     fn receive_overload_defaults_and_partial_tables() {
