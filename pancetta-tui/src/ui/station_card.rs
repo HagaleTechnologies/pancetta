@@ -690,9 +690,9 @@ pub(in crate::ui) mod tests {
 
         let buf = render(&app);
         assert!(buffer_contains(&buf, "FN42"), "missing grid");
-        // fixture_view uses distance=1234.0, which `format_distance`
-        // renders as "1.2k km" (>=1000km uses the k-scaled form).
-        assert!(buffer_contains(&buf, "1.2k"), "missing distance");
+        assert!(buffer_contains(&buf, "1234 km"), "missing distance");
+        app.decoded_messages.back_mut().unwrap().distance = Some(1834.0);
+        assert!(buffer_contains(&render(&app), "1834 km"));
         assert!(buffer_contains(&buf, "CQ N2ABC FN42"), "missing message");
         assert!(buffer_contains(&buf, "-7"), "missing snr");
     }

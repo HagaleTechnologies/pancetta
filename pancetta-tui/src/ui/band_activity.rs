@@ -50,7 +50,7 @@ impl BandActivityColumn {
             BandActivityColumn::Df => "DF",
             BandActivityColumn::Call => "Call",
             BandActivityColumn::Grid => "Grid",
-            BandActivityColumn::Dist => "Dist",
+            BandActivityColumn::Dist => "km",
             BandActivityColumn::Msg => "Msg",
         }
     }
@@ -230,6 +230,7 @@ fn create_message_row<'a>(
             None => "---".to_string(),
         }
     };
+<<<<<<< HEAD
     let call_str = if !msg.is_own_tx && msg.call_sign.is_some() {
         format!(
             "{}{}{}",
@@ -264,6 +265,10 @@ fn create_message_row<'a>(
         None => "---".into(),
     };
     let dist_str = format_distance(msg.distance);
+=======
+    let grid_str = msg.grid_square.as_deref().unwrap_or("---");
+    let dist_str = super::format_distance_cell(msg.distance);
+>>>>>>> 88af8930a9594ad8179ed41c213be781fcc1da85
 
     // Truncate long messages. Raised from 30 to 60 chars (Task 20a) — the
     // Msg column absorbed the space freed by dropping the per-row-constant
@@ -856,6 +861,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pan353_rendered_text_distance_column() {
+        let mut app = crate::app::App::new(crate::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_panel = ActivePanel::Callers;
+        for (distance, expected) in [
+            (Some(1834.0), "1834"),
+            (Some(20015.0), "20015"),
+            (None, "---"),
+        ] {
+            let mut msg = fixture_message("N2ABC");
+            msg.distance = distance;
+            app.decoded_messages.clear();
+            app.decoded_messages.push_back(msg);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+            term.draw(|f| render_band_activity(f, f.area(), &app).unwrap())
+                .unwrap();
+            let header = header_row_text(term.backend().buffer());
+            let dist_x = header.find("km").expect("distance header with units");
+            let msg_x = header.find("Msg").unwrap();
+            let row = row_text(term.backend().buffer(), 2);
+            // Before the message column every symbol is ASCII in this fixture.
+            assert_eq!(row[dist_x..dist_x + 6].trim(), expected);
+            assert_eq!(&row[msg_x..msg_x + 13], "CQ N2ABC FN42");
+            assert!(msg_x >= dist_x + 6);
+        }
+    }
+    #[tokio::test]
     async fn own_tx_row_renders_marker_and_tx_snr() {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
@@ -912,7 +946,7 @@ mod tests {
         let buf = render_panel_at_width(120).await;
         let header = header_row_text(&buf);
         assert!(header.contains("Grid"), "header: {header:?}");
-        assert!(header.contains("Dist"), "header: {header:?}");
+        assert!(header.contains("km"), "header: {header:?}");
         assert!(header.contains("DT"), "header: {header:?}");
         assert!(header.contains("DF"), "header: {header:?}");
     }
@@ -922,7 +956,7 @@ mod tests {
         let buf = render_panel_at_width(65).await;
         let header = header_row_text(&buf);
         assert!(!header.contains("Grid"), "header: {header:?}");
-        assert!(!header.contains("Dist"), "header: {header:?}");
+        assert!(!header.contains("km"), "header: {header:?}");
         assert!(header.contains("DT"), "header: {header:?}");
         assert!(header.contains("DF"), "header: {header:?}");
     }
@@ -932,7 +966,7 @@ mod tests {
         let buf = render_panel_at_width(50).await;
         let header = header_row_text(&buf);
         assert!(!header.contains("Grid"), "header: {header:?}");
-        assert!(!header.contains("Dist"), "header: {header:?}");
+        assert!(!header.contains("km"), "header: {header:?}");
         assert!(!header.contains("DT"), "header: {header:?}");
         assert!(!header.contains("DF"), "header: {header:?}");
         assert!(header.contains("Time"), "header: {header:?}");

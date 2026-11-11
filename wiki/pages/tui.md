@@ -69,7 +69,21 @@ its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
 
+<<<<<<< HEAD
 Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
 only marks a grid when both rows have the same canonical square. A later rover
 locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
 and middle width tiers start at 77/64.
+=======
+Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
+PTT and view labels are separate from Debug and persistence strings. Rarity
+cells use words in a nine-cell column. Band Activity uses integer kilometres
+under `km`; station-card prose appends the unit. TX, budget-cut and pause
+markers are the ASCII characters `*`, `!` and `|`.
+
+For display regressions, render actual buffers and concatenate complete cell
+symbols. Check positive content in a direct panel as well as scanning full
+views, since a hidden column or clipped overlay can hide a broken label.
+`pan353_rendered_text` covers labels, action messages, distance placement and
+marker widths. Its scanner is for controlled fixtures, not arbitrary radio text.
+>>>>>>> 88af8930a9594ad8179ed41c213be781fcc1da85

@@ -274,13 +274,11 @@ operator-supervised.
   ~200ms and pancetta is still up.
 
 - **`q` at any time releases PTT within ~150ms AND exits (with `[y/N]` confirm).** Three
-  independent paths fire on shutdown: (1) coordinator sends a PTT-off
-  via the message bus to Hamlib, (2) coordinator opens a fresh
-  rigctld TCP connection and sends PTT-off directly (independent of
-  the running Hamlib component), (3) the in-flight TX worker's
-  interruptible sleeps wake within one 50ms poll chunk on shutdown,
-  drop their `PttGuard` (which sends a third PTT-off as RAII cleanup),
-  and exit. Same dummy-load test applies; `h` is the lighter version.
+  paths fire on shutdown (PAN-277): (1) the TX worker wakes within one
+  50 ms chunk and its PttGuard queues PTT-off, which Hamlib executes while
+  draining its shutdown queue; (2) the coordinator queues its own PTT-off
+  for the same drain; (3) a fresh rigctld connection sends PTT-off directly
+  with a 6 s budget and up to 3 s per reply. The worker and Hamlib drain then exit. Same dummy-load test applies; `h` is the lighter version.
 
 - **Ctrl-C** also works for emergency shutdown. The signal-hook task
   triggers the same coordinator shutdown path.
@@ -461,7 +459,7 @@ the launching app's approval, as before PAN-264.
   goes to the SQLite index only. Check the log for `ADIF writer init
   failed`.
 - The SQLite index at `~/.pancetta/qso.db` is rebuildable from ADIF on
-  startup. If ADIF is the truth and the DB is stale, delete the DB and
+  startup whenever its contacts differ from the ADIF, regardless of file times. If ADIF is the truth and the DB is stale, delete the DB and
   restart — the index gets replayed from ADIF.
 
 ### Pancetta is decoding fewer signals than WSJT-X on the same band

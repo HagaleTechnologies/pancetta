@@ -1075,18 +1075,6 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Startup rebuilds the index when qsos.adi is newer than qso.db. If the
-    // index was already behind before this import, adding the new rows would
-    // make it look current and hide that, so it is kept looking behind below.
-    // An indexing that fails part-way leaves a partial index that also looks
-    // current (some rows were committed after the logbook was written), so
-    // the same marking applies: the logbook must stay newer than the index,
-    // or the next start never repairs the missing rows (PAN-127).
-    let index_was_behind = matches!(
-        (file_modified(&db), file_modified(&adif)),
-        (Some(d), Some(a)) if a > d
-    );
-
     // Back up before the first write, and check the copy really holds the
     // logbook the plan was checked against. Under the lock nothing else
     // writes it, so the copy must be exactly those bytes.
@@ -1182,13 +1170,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     drop(lock);
 
     let indexed = index_imported_contacts(&processor, &plan.to_add, &adif, &db, db_existed).await;
-    if index_was_behind || indexed.is_err() {
-        mark_newer_than(&adif, &db);
-    }
-    // An index that was already behind is still missing rows after the new
-    // ones are added: keep it marked, since a later live write can make
-    // qso.db look newer than qsos.adi again (PAN-127).
-    if marked_here && indexed.is_ok() && !index_was_behind {
+    if marked_here && indexed.is_ok() {
         clear_own_index_marker(&adif, &marker, &marker_owner).await;
     }
     print!(
@@ -1529,8 +1511,8 @@ fn format_undo_report(
 }
 
 /// Index the contacts `import_command` just appended. An existing index only
-/// gets the new rows: a running Pancetta may hold it open, and rebuilding
-/// deletes the file. A missing one is built from the whole logbook, the same
+/// gets the new rows: a running Pancetta may hold it open, and a rebuild
+/// replaces the file. A missing one is built from the whole logbook, the same
 /// way startup rebuilds it.
 async fn index_imported_contacts(
     processor: &pancetta_qso::adif::AdifProcessor,
@@ -1615,23 +1597,6 @@ async fn clear_own_index_marker(adif: &Path, marker: &Path, owner: &str) {
     if std::fs::read(marker).is_ok_and(|held| held == format!("{owner}\n").as_bytes()) {
         let _ = std::fs::remove_file(marker);
     }
-}
-
-fn file_modified(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Best effort: give `path` a modification time later than `than`'s, so the
-/// startup check still sees `path` as the newer file.
-fn mark_newer_than(path: &Path, than: &Path) {
-    let Some(than) = file_modified(than) else {
-        return;
-    };
-    let at = std::time::SystemTime::now().max(than + std::time::Duration::from_secs(1));
-    let _ = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .and_then(|f| f.set_modified(at));
 }
 
 /// One `Import file:` / `Logbook:` / `Backup:` line, values aligned.

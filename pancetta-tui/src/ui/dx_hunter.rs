@@ -100,7 +100,7 @@ impl DxHunterColumn {
             DxHunterColumn::Entity => Constraint::Min(8),
             DxHunterColumn::Grid => Constraint::Length(5),
             DxHunterColumn::Snr => Constraint::Length(4),
-            DxHunterColumn::Rarity => Constraint::Length(7),
+            DxHunterColumn::Rarity => Constraint::Length(9),
             DxHunterColumn::Rpt => Constraint::Length(3),
             DxHunterColumn::Last => Constraint::Length(5),
             DxHunterColumn::Pri => Constraint::Length(4),
@@ -372,7 +372,7 @@ fn create_dx_row<'a>(
     // doesn't read a missing value as a strong-but-zero signal. Local decodes
     // (and Both) always carry a real measured SNR.
     let snr_str = format_dx_snr(&station.source, station.snr, station.best_snr_network);
-    let rarity_str = station.rarity_tier.as_deref().unwrap_or("-").to_string();
+    let rarity_str = crate::presentation::rarity_label(station.rarity_tier.as_deref());
     let rpt_str = station
         .reporter_count
         .map(|r| r.to_string())
@@ -684,6 +684,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pan353_rendered_text_rarity_labels() {
+        let mut app = needed_app().await;
+        for (slug, label) in [
+            (Some("legendary"), "Legendary"),
+            (Some("very_rare"), "Very rare"),
+            (Some("rare"), "Rare"),
+            (Some("uncommon"), "Uncommon"),
+            (Some("common"), "Common"),
+            (Some("future_tier"), "Unknown"),
+            (None, "-"),
+        ] {
+            app.dx_stations.get_mut("W5ABC").unwrap().rarity_tier = slug.map(str::to_owned);
+            for selected in [false, true] {
+                app.active_panel = if selected {
+                    ActivePanel::DxHunter
+                } else {
+                    ActivePanel::BandActivity
+                };
+                for width in [100, 120] {
+                    let buf = render_buffer(&app, width, 8);
+                    crate::presentation::assert_readable_buffer(&buf);
+                    assert!(text(&buf).contains(label), "{label}: {}", text(&buf));
+                    if slug == Some("very_rare") {
+                        assert_eq!(cell_at_text(&buf, label).fg, app.theme.error_color());
+                    }
+                    assert!(!text(&buf).contains("very_rare"));
+                }
+            }
+        }
+    }
+    #[tokio::test]
     async fn needed_grid_and_state_render_glyphs_and_only_their_own_highlight() {
         let mut app = needed_app().await;
         let buf = render_buffer(&app, 100, 8);
@@ -728,7 +759,7 @@ mod tests {
             } else {
                 ActivePanel::BandActivity
             };
-            let buf = render_buffer(&app, 100, 8);
+            let buf = render_buffer(&app, 102, 8);
             for token in ["+EM34", "+AR"] {
                 let cell = cell_at_text(&buf, token);
                 assert_eq!(cell.fg, app.theme.muted_color());
@@ -791,10 +822,10 @@ mod tests {
 
     #[tokio::test]
     async fn five_cell_grid_is_whole_or_absent_and_empty_tiny_panels_do_not_panic() {
-        assert_eq!(visible_columns(64), DxHunterColumn::ALL[..9]);
-        assert_ne!(visible_columns(63), DxHunterColumn::ALL[..9]);
-        assert!(!visible_columns(54).contains(&DxHunterColumn::Grid));
-        assert!(visible_columns(55).contains(&DxHunterColumn::Grid));
+        assert_eq!(visible_columns(66), DxHunterColumn::ALL[..9]);
+        assert_ne!(visible_columns(65), DxHunterColumn::ALL[..9]);
+        assert!(!visible_columns(56).contains(&DxHunterColumn::Grid));
+        assert!(visible_columns(57).contains(&DxHunterColumn::Grid));
         let mut app = needed_app().await;
         app.active_panel = ActivePanel::DxHunter;
         for width in 16..=110 {
@@ -848,9 +879,9 @@ mod tests {
     }
 
     #[test]
-    fn why_column_joins_last_at_width_89() {
-        assert!(!visible_columns(88).contains(&DxHunterColumn::Why));
-        assert_eq!(visible_columns(89).last(), Some(&DxHunterColumn::Why));
+    fn why_column_joins_last_at_width_91() {
+        assert!(!visible_columns(90).contains(&DxHunterColumn::Why));
+        assert_eq!(visible_columns(91).last(), Some(&DxHunterColumn::Why));
     }
 
     #[test]
@@ -882,9 +913,9 @@ mod tests {
 
     #[test]
     fn visible_columns_wide_tier_shows_all() {
-        assert_eq!(visible_columns(64), DxHunterColumn::ALL[..9]);
+        assert_eq!(visible_columns(66), DxHunterColumn::ALL[..9]);
         assert_eq!(visible_columns(80), DxHunterColumn::ALL[..9]);
-        assert_eq!(visible_columns(89), DxHunterColumn::ALL);
+        assert_eq!(visible_columns(91), DxHunterColumn::ALL);
     }
 
     #[test]

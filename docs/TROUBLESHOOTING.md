@@ -60,13 +60,13 @@ cp ~/.pancetta/qsos.adi ~/.pancetta/qsos.adi.bak   # always keep a copy
 rm -f ~/.pancetta/qso.db                           # drop the stale index
 ```
 
-Restart Pancetta. The index is rebuilt from the ADIF on startup
-whenever it is missing or older than the ADIF, so either step alone is
-enough — editing the ADIF bumps its mtime, and deleting the index
-forces the replay outright. Doing both is the unambiguous version.
-Watch for `Index missing at ... — replaying from ADIF` (or `Index at
-... is older than ADIF at ... — replaying`) in the startup log to
-confirm the rebuild ran.
+Restart Pancetta. The index is rebuilt when missing or when its contacts
+(callsign and start time to the second, including duplicate counts) differ
+from the ADIF. Saving or touching an unchanged logbook triggers no rebuild.
+Watch for `Index missing at ... — replaying from ADIF` or
+`Index at ... differs from ADIF at ...: ...; rebuilding` in the startup log.
+Deleting a record keeps the previous index as `qso.db.pre-rebuild`, then
+`.pre-rebuild.1`, `.2`, and so on. These recovery copies are safe to delete.
 
 The duplicate check is intentional — it prevents embarrassing
 repeat-calls during a contest or grid hunt.
