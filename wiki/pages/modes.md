@@ -66,7 +66,6 @@ resolves to today's exact FT8 constants (regression-guarded). Do not change a
 slot or parity default without preserving that. See [[tx-scheduling]] for how
 the active period feeds the scheduler.
 
-<<<<<<< HEAD
 ## Companion UDP sampling
 
 PAN-349 samples the live mode when draining decodes: FT8 uses `~`, FT4 uses
@@ -78,7 +77,7 @@ RX DF uses `partner_freq.unwrap_or(frequency)`, which is an audio offset;
 TX DF uses the station's held offset. They can differ. TX text comes only from
 an accepted intent for that selected contact, and does not prove transmission.
 FT4's integer Status period is 7 seconds; its scheduler still uses 7.5 seconds.
-=======
+
 ## Rig CAT mode is separate
 
 PAN-276 adds optional `rig.data_mode` and `rig.data_passband_hz`. These do not
@@ -90,4 +89,3 @@ A rigctld command can reconnect internally. Mode readiness must therefore be
 bound to the actual connection generation inside the client, rather than only
 set during coordinator startup. Key-down must check that generation and must
 never reconnect and replay an old request. Hardware qualification is pending.
->>>>>>> 88af8930a9594ad8179ed41c213be781fcc1da85
