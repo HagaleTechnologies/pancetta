@@ -25,6 +25,7 @@ use ratatui::{
 
 use super::{create_panel_block, format_distance, format_time_ago};
 use crate::app::{App, DecodedMessageView};
+use crate::dx_need::EntityStanding;
 
 /// Render four content lines: call/entity/status, ranking reason,
 /// grid/distance/last-message, and engagement or transmit window;
@@ -107,7 +108,8 @@ fn newest_decode_for<'a>(app: &'a App, call: &str) -> Option<&'a DecodedMessageV
     })
 }
 
-/// Line 1: `"{call} — {entity|'---'} {ATNO★|needed|worked|new}"`.
+/// Line 1: `"{call} — {entity|'---'} {ATNO★|needed|confirmed|worked-unconfirmed|worked|new}"`.
+/// `confirmed` / `worked-unconfirmed` come from the local logbook (PAN-347).
 fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageView>) -> Line<'a> {
     // PAN-85: append the station's US state/territory when known, matching
     // DX Hunter. Deliberately no offline `pancetta_core::dxcc` fallback
@@ -135,6 +137,7 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
     let row_key = app
         .dx_station_for(call)
         .map_or(call, |row| row.call_sign.as_str());
+    let standing = app.dx_need_for(row_key).and_then(|n| n.entity_standing);
     let status_flag = status_decode
         .map(|m| {
             let (needed, atno) = app.dx_need_flags_shown(row_key, m.needed, m.atno);
@@ -142,6 +145,10 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
                 "ATNO\u{2605}"
             } else if needed {
                 "needed"
+            } else if standing == Some(EntityStanding::Confirmed) {
+                "confirmed"
+            } else if standing == Some(EntityStanding::WorkedUnconfirmed) {
+                "worked-unconfirmed"
             } else if m.worked_before {
                 "worked"
             } else {
@@ -516,6 +523,66 @@ pub(in crate::ui) mod tests {
     }
 
     #[tokio::test]
+    async fn card_shows_local_standing_below_atno_and_needed() {
+        // PAN-347: the local logbook's standing sits below ATNO and needed.
+        struct Local(Option<bool>, Option<EntityStanding>);
+        impl crate::dx_need::DxNeedLookup for Local {
+            fn lookup_need(
+                &self,
+                _: &str,
+                _: Option<&'static str>,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+                _mode: Option<&str>,
+            ) -> crate::dx_need::DxNeedStatus {
+                crate::dx_need::DxNeedStatus {
+                    dxcc_needed: self.0,
+                    entity_standing: self.1,
+                    ..Default::default()
+                }
+            }
+        }
+        let line1 = |app: &App| row(&render_at(app, 130, 6), 1);
+        use EntityStanding::*;
+        for (needed, atno, worked_before, verdict, standing, expected) in [
+            (
+                false,
+                false,
+                true,
+                None,
+                Some(WorkedUnconfirmed),
+                "worked-unconfirmed",
+            ),
+            (false, false, false, None, Some(Confirmed), "confirmed"),
+            (false, false, false, None, Some(NotWorked), "new"),
+            (false, false, true, None, None, "worked"),
+            (
+                true,
+                true,
+                false,
+                Some(true),
+                Some(NotWorked),
+                "ATNO\u{2605}",
+            ),
+            (false, false, false, Some(true), Some(Confirmed), "needed"),
+        ] {
+            let mut app = fixture_app().await;
+            let mut view = fixture_view("W1XYZ", -5);
+            view.needed = needed;
+            view.atno = atno;
+            view.worked_before = worked_before;
+            app.add_decoded_message(view).await.unwrap();
+            app.refresh_dx_need(Some(&Local(verdict, standing)));
+            let line = line1(&app);
+            assert!(
+                line.contains(&format!(" {expected} ")),
+                "expected {expected} for {standing:?}: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn needed_flag_follows_this_frames_cqdx_verdict() {
         // PAN-93: when the cqdx list loads or changes after the station's
         // last decode, the card agrees with DX Hunter's `+` and the Why view.
@@ -528,6 +595,7 @@ pub(in crate::ui) mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
+                _mode: Option<&str>,
             ) -> crate::dx_need::DxNeedStatus {
                 crate::dx_need::DxNeedStatus {
                     dxcc_needed: self.0,

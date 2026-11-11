@@ -272,6 +272,7 @@ frequency_accuracy_hz = 1
 include_receives = true
 include_transmits = true
 max_age_hours = 24
+max_pending_reports = 2000
 min_snr_db = -20.0
 server_url = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds = 300

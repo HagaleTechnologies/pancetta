@@ -174,6 +174,20 @@ impl SecondaryTerms {
     }
 }
 
+/// PAN-347: which source answered a score's needed-entity and ATNO inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NeedSource {
+    /// cqdx.io's needed list. The meaning of every score made before PAN-347.
+    #[default]
+    Cqdx,
+    /// No cqdx list had loaded; the local logbook (qsos.adi, through the
+    /// index) answered.
+    LocalLogbook,
+    /// Neither answered. `needed_dxcc` is the "not the home entity" guess
+    /// and ATNO is false.
+    Guess,
+}
+
 /// Inputs gathered by the same invocation that produced a tiered score.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PriorityFactors {
@@ -191,6 +205,10 @@ pub struct PriorityFactors {
     pub network_reports: Option<(u32, i32)>,
     pub network_age_secs: Option<i64>,
     pub terms: SecondaryTerms,
+    /// PAN-347: who answered `needed_dxcc` and `atno` at score time.
+    /// Factors stored before PAN-347 read as `Cqdx`.
+    #[serde(default)]
+    pub need_source: NeedSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -246,6 +264,12 @@ pub trait WorkedStationLookup: Send + Sync {
     /// band)? Defaults to `false` for lookups that don't track ATNO.
     fn is_atno(&self, _callsign: &str) -> bool {
         false
+    }
+
+    /// PAN-347: which source answers `is_needed_dxcc` / `is_atno` for this
+    /// callsign right now. Defaults to `Cqdx`, the pre-PAN-347 meaning.
+    fn need_source(&self, _callsign: &str) -> NeedSource {
+        NeedSource::Cqdx
     }
 
     /// Is this callsign's DXCC entity needed specifically on THIS band —
@@ -601,6 +625,7 @@ impl PriorityScorer {
             network_reports,
             network_age_secs,
             terms,
+            need_source: self.lookup.need_source(callsign),
         };
         // Classify into one of the 6 lexicographic tiers (#164, `Suspect`
         // added PAN-54). ATNO always wins when the entity is also needed
@@ -664,6 +689,31 @@ impl DxEvaluator for PriorityScorer {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn need_source_defaults_to_cqdx_and_rides_in_the_factors() {
+        let s = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
+        assert_eq!(
+            s.score_tiered_explained("JA1ABC", None, -10, 14_074_000.0)
+                .factors
+                .need_source,
+            NeedSource::Cqdx
+        );
+    }
+
+    #[test]
+    fn factors_without_need_source_deserialize_as_cqdx() {
+        let s = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
+        let mut factors = s
+            .score_tiered_explained("JA1ABC", None, -10, 14_074_000.0)
+            .factors;
+        factors.need_source = NeedSource::LocalLogbook;
+        let mut json = serde_json::to_value(factors).unwrap();
+        assert_eq!(json["need_source"], "LocalLogbook");
+        json.as_object_mut().unwrap().remove("need_source");
+        let back: PriorityFactors = serde_json::from_value(json).unwrap();
+        assert_eq!(back.need_source, NeedSource::Cqdx);
+    }
 
     struct TestLookup {
         duplicates: HashSet<String>,

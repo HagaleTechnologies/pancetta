@@ -773,6 +773,356 @@ async fn wait_for_ptt_instant(
     }
 }
 
+/// How a shared TX-worker step ends the current request (PAN-322). A helper
+/// cannot jump to a loop label, so each call site turns this into its own
+/// jump: `break 'worker` / `continue 'worker` in the single-frame arm,
+/// `break` / `continue` in the bundle arm.
+#[derive(Debug, PartialEq, Eq)]
+enum TxExit {
+    /// Shutdown: leave the worker loop.
+    StopWorker,
+    /// The request is settled: take the next one.
+    NextRequest,
+}
+
+/// Which worker arm a shared step runs for (PAN-322). The arms differ on
+/// purpose (log text, whether the TX strip is cleared), and the helpers
+/// pick by shape instead of folding one copy into the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxShape {
+    /// The single-frame `TransmitRequest` arm.
+    Single,
+    /// The multi-TX bundle arm.
+    Bundle,
+}
+
+/// Step 4 of both worker arms (PAN-322): act on a [`wait_for_ptt_instant`]
+/// outcome. `Reached` continues to PTT. `ClockJumped` drops every frame
+/// through [`drop_frames_for_clock_jump`]. `Interrupted` stops the worker on
+/// shutdown, sending nothing; on an F8 abort it reports every frame as a
+/// failed `TransmitComplete`. `frames` yields `(text, qso_id, attempt_id)`
+/// per frame in the arm's order, and runs only for a non-`Reached` outcome.
+async fn on_ptt_wait(
+    wait: PttWait,
+    shape: TxShape,
+    frames: impl FnOnce() -> Vec<(String, Option<String>, Option<pancetta_qso::TxAttemptId>)>,
+    message_bus: &MessageBus,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::ops::ControlFlow<TxExit> {
+    use std::ops::ControlFlow;
+    use std::sync::atomic::Ordering;
+    match wait {
+        PttWait::Reached => ControlFlow::Continue(()),
+        PttWait::ClockJumped(jump) => {
+            // One drop per frame (per bundle item), like the F8 abort below.
+            drop_frames_for_clock_jump(message_bus, &frames(), jump, &mut PivotReplaced::new())
+                .await;
+            ControlFlow::Break(TxExit::NextRequest)
+        }
+        PttWait::Interrupted => {
+            if shutdown.load(Ordering::Acquire) {
+                match shape {
+                    TxShape::Single => info!("TX aborted before PTT engage by shutdown"),
+                    TxShape::Bundle => info!("Multi-TX aborted before PTT by shutdown"),
+                }
+                return ControlFlow::Break(TxExit::StopWorker);
+            }
+            match shape {
+                TxShape::Single => {
+                    info!("TX aborted before PTT engage by operator (F8)");
+                    // This abort happens BEFORE the TxStatusGuard is
+                    // constructed, so its Drop-based clear never runs. Clear
+                    // the strip explicitly so the QUEUED row doesn't sit
+                    // stale until the next status push.
+                    send_tx_queue_status(message_bus, None, Vec::new()).await;
+                }
+                // The bundle arm has never cleared the strip here; keep it
+                // that way (PAN-322 decision 9).
+                TxShape::Bundle => info!("Multi-TX aborted before PTT by operator (F8)"),
+            }
+            // PAN-38 round 3 (Codex): an F8 abort here is the one path in
+            // this worker that previously sent NO TransmitComplete at all --
+            // for a self-CQ whose QSO was already opened (AutonomousCqOpened
+            // registered it in the coordinator's pending_self_cq_qsos map),
+            // that left the entry permanently leaked and the speculative
+            // "+1" streak (and, for a bundle, offset) never rolled back,
+            // since nothing ever told the autonomous operator this attempt
+            // did not actually transmit. Report every frame (every bundle
+            // item) exactly like the drop-stale-TX case.
+            for (text, qso_id, attempt_id) in frames() {
+                let reported =
+                    report_transmit_complete(message_bus, false, text, 0, qso_id, attempt_id).await;
+                // The single-frame arm discarded this result; the bundle arm
+                // logged a failure.
+                if let (TxShape::Bundle, Err(e)) = (shape, reported) {
+                    warn!("Failed to send TransmitComplete: {}", e);
+                }
+            }
+            ControlFlow::Break(TxExit::NextRequest)
+        }
+    }
+}
+
+#[cfg(test)]
+mod on_ptt_wait_tests {
+    use super::*;
+    use pancetta_qso::TxAttemptId;
+    use std::ops::ControlFlow;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    type Frame = (String, Option<String>, Option<TxAttemptId>);
+
+    fn frame(text: &str, qso_id: &str, attempt: u64) -> Frame {
+        (
+            text.to_string(),
+            Some(qso_id.to_string()),
+            Some(TxAttemptId(attempt)),
+        )
+    }
+
+    fn flag(set: bool) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(set))
+    }
+
+    fn forward_jump() -> pancetta_core::slot_clock::WallClockJump {
+        pancetta_core::slot_clock::WallClockJump::Forward(chrono::Duration::seconds(5))
+    }
+
+    /// A bus with the three channels Step 4 sends on.
+    struct Station {
+        bus: MessageBus,
+        tui: crossbeam_channel::Receiver<ComponentMessage>,
+        autonomous: crossbeam_channel::Receiver<ComponentMessage>,
+        qso: crossbeam_channel::Receiver<ComponentMessage>,
+    }
+
+    /// Everything one [`Station`] received, per channel, in arrival order.
+    struct Sent {
+        tui: Vec<ComponentMessage>,
+        autonomous: Vec<ComponentMessage>,
+        qso: Vec<ComponentMessage>,
+    }
+
+    impl Station {
+        async fn new() -> Self {
+            let bus = MessageBus::new(16).unwrap();
+            let (_, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
+            let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+            let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+            Self {
+                bus,
+                tui,
+                autonomous,
+                qso,
+            }
+        }
+
+        fn drain(&self) -> Sent {
+            let all = |rx: &crossbeam_channel::Receiver<ComponentMessage>| {
+                std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+            };
+            Sent {
+                tui: all(&self.tui),
+                autonomous: all(&self.autonomous),
+                qso: all(&self.qso),
+            }
+        }
+    }
+
+    impl Sent {
+        /// The payloads, per channel, for comparing two stations.
+        fn payloads(&self) -> [Vec<String>; 3] {
+            let debug = |msgs: &[ComponentMessage]| {
+                msgs.iter()
+                    .map(|m| format!("{:?}", m.message_type))
+                    .collect::<Vec<_>>()
+            };
+            [debug(&self.tui), debug(&self.autonomous), debug(&self.qso)]
+        }
+
+        fn is_empty(&self) -> bool {
+            self.tui.is_empty() && self.autonomous.is_empty() && self.qso.is_empty()
+        }
+
+        /// Every Autonomous message as a failed `TransmitComplete`.
+        fn failed_completes(&self) -> Vec<Frame> {
+            self.autonomous
+                .iter()
+                .map(|m| match &m.message_type {
+                    MessageType::TransmitComplete {
+                        success: false,
+                        message_text,
+                        duration_ms: 0,
+                        qso_id,
+                        attempt_id,
+                    } => (message_text.clone(), qso_id.clone(), *attempt_id),
+                    other => panic!("expected a failed TransmitComplete, got {other:?}"),
+                })
+                .collect()
+        }
+
+        /// Every Qso message as a `TxFrameNotSent` with nothing replaced.
+        fn frames_not_sent(&self) -> Vec<Frame> {
+            self.qso
+                .iter()
+                .map(|m| match &m.message_type {
+                    MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                        qso_id,
+                        message_text,
+                        replaced: None,
+                        attempt_id,
+                    }) => (message_text.clone(), Some(qso_id.clone()), *attempt_id),
+                    other => panic!("expected TxFrameNotSent, got {other:?}"),
+                })
+                .collect()
+        }
+    }
+
+    fn is_strip_clear(message: &ComponentMessage) -> bool {
+        matches!(
+            &message.message_type,
+            MessageType::TxQueueStatus { sending: None, queued } if queued.is_empty()
+        )
+    }
+
+    fn never_built() -> Vec<Frame> {
+        panic!("frames must not be built for this outcome")
+    }
+
+    /// Runs `on_ptt_wait` for a clock jump on one bus and
+    /// `drop_frames_for_clock_jump` on another, and checks they sent the
+    /// same thing.
+    async fn check_clock_jump(shape: TxShape, frames: Vec<Frame>) {
+        let got = Station::new().await;
+        let flow = on_ptt_wait(
+            PttWait::ClockJumped(forward_jump()),
+            shape,
+            || frames.clone(),
+            &got.bus,
+            &flag(false),
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Break(TxExit::NextRequest));
+        let want = Station::new().await;
+        drop_frames_for_clock_jump(
+            &want.bus,
+            &frames,
+            forward_jump(),
+            &mut PivotReplaced::new(),
+        )
+        .await;
+        let (got, want) = (got.drain(), want.drain());
+        assert_eq!(got.payloads(), want.payloads());
+        // One diagnostic per frame, then the strip clear.
+        assert_eq!(got.tui.len(), frames.len() + 1);
+        assert!(got.tui[..frames.len()].iter().all(|m| matches!(
+            &m.message_type,
+            MessageType::DiagnosticEvent { text, .. } if text.starts_with("dropping stale TX")
+        )));
+        assert!(is_strip_clear(&got.tui[frames.len()]));
+        assert_eq!(got.failed_completes(), frames);
+        assert_eq!(got.frames_not_sent(), frames);
+    }
+
+    #[tokio::test]
+    async fn clock_jump_settles_the_single_frame_like_drop_frames_for_clock_jump() {
+        check_clock_jump(TxShape::Single, vec![frame("K1ABC N0CALL FN20", "q1", 7)]).await;
+    }
+
+    #[tokio::test]
+    async fn clock_jump_settles_every_bundle_frame() {
+        check_clock_jump(
+            TxShape::Bundle,
+            vec![
+                frame("K1ABC N0CALL FN20", "q1", 1),
+                frame("W9XYZ N0CALL -07", "q2", 2),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn operator_abort_clears_the_strip_only_for_a_single_frame() {
+        let single = Station::new().await;
+        let frames = vec![frame("K1ABC N0CALL FN20", "q1", 3)];
+        let flow = on_ptt_wait(
+            PttWait::Interrupted,
+            TxShape::Single,
+            || frames.clone(),
+            &single.bus,
+            &flag(false),
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Break(TxExit::NextRequest));
+        let sent = single.drain();
+        assert_eq!(sent.tui.len(), 1);
+        assert!(is_strip_clear(&sent.tui[0]));
+        assert_eq!(sent.failed_completes(), frames);
+        assert_eq!(sent.frames_not_sent(), frames);
+        assert!(
+            sent.tui[0].id < sent.autonomous[0].id && sent.tui[0].id < sent.qso[0].id,
+            "the strip clears before the frame settles"
+        );
+
+        let bundle = Station::new().await;
+        let frames = vec![
+            frame("K1ABC N0CALL FN20", "q1", 1),
+            frame("W9XYZ N0CALL -07", "q2", 2),
+        ];
+        let flow = on_ptt_wait(
+            PttWait::Interrupted,
+            TxShape::Bundle,
+            || frames.clone(),
+            &bundle.bus,
+            &flag(false),
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Break(TxExit::NextRequest));
+        let sent = bundle.drain();
+        assert!(
+            sent.tui.is_empty(),
+            "a bundle F8 abort sends the TUI nothing"
+        );
+        assert_eq!(sent.failed_completes(), frames);
+        assert_eq!(sent.frames_not_sent(), frames);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupt_stops_the_worker_and_sends_nothing() {
+        for shape in [TxShape::Single, TxShape::Bundle] {
+            let station = Station::new().await;
+            let flow = on_ptt_wait(
+                PttWait::Interrupted,
+                shape,
+                never_built,
+                &station.bus,
+                &flag(true),
+            )
+            .await;
+            assert_eq!(flow, ControlFlow::Break(TxExit::StopWorker), "{shape:?}");
+            assert!(station.drain().is_empty(), "{shape:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reached_continues_without_building_frames() {
+        for shape in [TxShape::Single, TxShape::Bundle] {
+            let station = Station::new().await;
+            let flow = on_ptt_wait(
+                PttWait::Reached,
+                shape,
+                never_built,
+                &station.bus,
+                &flag(false),
+            )
+            .await;
+            assert_eq!(flow, ControlFlow::Continue(()), "{shape:?}");
+            assert!(station.drain().is_empty(), "{shape:?}");
+        }
+    }
+}
+
 /// PAN-114 (D6): slack over `ptt_lead_ms` allowed between PTT-on (Step 5)
 /// and the slot boundary (Step 6) before the hold is treated as a clock step.
 const PTT_HOLD_SLACK_MS: u64 = 1000;
@@ -1276,6 +1626,762 @@ async fn interruptible_sleep_or_supersede_with_clock(
     // and 9). A `Superseded` caller puts its own content in front of these.
     inbox.requeue_front(siphoned);
     outcome
+}
+
+/// How a shared TX-worker sleep step ends early (PAN-322): leave by a
+/// [`TxExit`], or hand a superseding request back to the call site's own
+/// supersede handler.
+/// The request is boxed so the enum stays small (`MessageType` is large).
+enum SleepBreak {
+    Exit(TxExit),
+    Superseded(Box<MessageType>),
+}
+
+/// What [`on_sleep_outcome`] returns.
+type SleepFlow = std::ops::ControlFlow<SleepBreak>;
+
+/// Which of the two pre-air waits a [`SleepOutcome`] came from (PAN-322).
+#[derive(Clone, Copy, Debug)]
+enum SleepPhase {
+    /// Step 6: PTT is keyed, the slot has not started, no audio was routed.
+    PreSlot,
+    /// Step 8: audio is playing; `playback_end` bounds an unconfirmed disarm
+    /// flush (PAN-135).
+    Playback { playback_end: tokio::time::Instant },
+}
+
+/// The frames a sleep step was guarding (PAN-322). The single arm's frame is
+/// borrowed field by field, so the sleep call still builds its own
+/// in-flight item exactly as before.
+enum SleepInFlight<'a> {
+    Single {
+        message_text: &'a str,
+        frequency_offset: f64,
+        qso_id: Option<&'a str>,
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
+        pivoted_this_key: &'a mut Option<String>,
+    },
+    Bundle {
+        items: &'a [crate::message_bus::TransmitRequestItem],
+        pivoted_this_bundle_keys: &'a [String],
+    },
+}
+
+impl SleepInFlight<'_> {
+    fn shape(&self) -> TxShape {
+        match self {
+            SleepInFlight::Single { .. } => TxShape::Single,
+            SleepInFlight::Bundle { .. } => TxShape::Bundle,
+        }
+    }
+
+    /// `(text, qso_id, attempt_id)` per frame, in the arm's order.
+    fn frames(&self) -> Vec<(String, Option<String>, Option<pancetta_qso::TxAttemptId>)> {
+        match self {
+            SleepInFlight::Single {
+                message_text,
+                qso_id,
+                attempt_id,
+                ..
+            } => vec![(
+                (*message_text).to_string(),
+                qso_id.map(str::to_owned),
+                *attempt_id,
+            )],
+            SleepInFlight::Bundle { items, .. } => items
+                .iter()
+                .map(|item| {
+                    (
+                        item.message_text.clone(),
+                        item.qso_id.clone(),
+                        item.attempt_id,
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The worker state an aborted sleep step touches (PAN-322).
+struct AbortCtx<'a> {
+    message_bus: &'a MessageBus,
+    audit_log: &'a pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+    remote_tx_arm: &'a std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&'a str>,
+    ptt_guard: &'a mut PttGuard,
+    pivoted_once: &'a mut std::collections::HashMap<String, (String, f64)>,
+    pivoted_from: &'a mut PivotReplaced,
+    shutdown: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sample_rate: u32,
+}
+
+/// Why a sleep step was cut short, for [`sleep_abort_log_line`].
+#[derive(Clone, Copy, Debug)]
+enum SleepAbort {
+    Shutdown,
+    Operator,
+    Disarm,
+}
+
+/// The log line for an aborted Step 6/8 sleep (PAN-322). These strings are
+/// what operators and log scrapers have always seen; keep them byte-identical.
+fn sleep_abort_log_line(shape: TxShape, phase: SleepPhase, abort: SleepAbort) -> &'static str {
+    match (shape, phase, abort) {
+        (TxShape::Single, SleepPhase::PreSlot, SleepAbort::Shutdown) => {
+            "TX aborted between PTT and slot by shutdown"
+        }
+        (TxShape::Single, SleepPhase::PreSlot, SleepAbort::Operator) => {
+            "TX aborted between PTT and slot by operator (F8)"
+        }
+        (TxShape::Single, SleepPhase::PreSlot, SleepAbort::Disarm) => {
+            "TX aborted between PTT and slot: remote arm no longer permits it"
+        }
+        (TxShape::Single, SleepPhase::Playback { .. }, SleepAbort::Shutdown) => {
+            "TX aborted during playback by shutdown"
+        }
+        (TxShape::Single, SleepPhase::Playback { .. }, SleepAbort::Operator) => {
+            "TX aborted during playback by operator (F8)"
+        }
+        (TxShape::Single, SleepPhase::Playback { .. }, SleepAbort::Disarm) => {
+            "TX aborted during playback: remote arm no longer permits it"
+        }
+        (TxShape::Bundle, SleepPhase::PreSlot, SleepAbort::Shutdown) => {
+            "Multi-TX aborted between PTT and slot by shutdown"
+        }
+        (TxShape::Bundle, SleepPhase::PreSlot, SleepAbort::Operator) => {
+            "Multi-TX aborted between PTT and slot by operator (F8)"
+        }
+        (TxShape::Bundle, SleepPhase::PreSlot, SleepAbort::Disarm) => {
+            "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
+        }
+        (TxShape::Bundle, SleepPhase::Playback { .. }, SleepAbort::Shutdown) => {
+            "Multi-TX aborted during playback by shutdown"
+        }
+        (TxShape::Bundle, SleepPhase::Playback { .. }, SleepAbort::Operator) => {
+            "Multi-TX aborted during playback by operator (F8)"
+        }
+        (TxShape::Bundle, SleepPhase::Playback { .. }, SleepAbort::Disarm) => {
+            "Multi-TX aborted during playback: remote arm no longer permits it"
+        }
+    }
+}
+
+/// The remote-arm gate a sleep re-checks every tick (PAN-92): the live arm
+/// and the frame's key for a `TxOrigin::Remote` frame, `None` for a local
+/// frame, which is never gated.
+fn remote_arm_gate<'a>(
+    origin: crate::message_bus::TxOrigin,
+    remote_tx_arm: &'a std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&'a str>,
+) -> Option<(
+    &'a std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    Option<&'a str>,
+)> {
+    if origin == crate::message_bus::TxOrigin::Remote {
+        Some((remote_tx_arm, remote_client_key_id))
+    } else {
+        None
+    }
+}
+
+/// Steps 6 and 8 of both worker arms (PAN-322): act on an
+/// [`interruptible_sleep_or_supersede_with_clock`] outcome. `Completed`
+/// continues. Shutdown only logs and stops the worker; the call site's
+/// `PttGuard` drop unkeys, as before. An F8 abort reports every frame as a
+/// failed `TransmitComplete`. A disarm releases PTT first, then settles every
+/// frame (see the arm). `Superseded` is handed back unchanged for the call
+/// site's supersede handler.
+async fn on_sleep_outcome(
+    outcome: SleepOutcome,
+    phase: SleepPhase,
+    mut in_flight: SleepInFlight<'_>,
+    ctx: AbortCtx<'_>,
+) -> SleepFlow {
+    use std::ops::ControlFlow;
+    let shape = in_flight.shape();
+    match outcome {
+        SleepOutcome::Completed => ControlFlow::Continue(()),
+        SleepOutcome::AbortedByShutdown => {
+            info!(
+                "{}",
+                sleep_abort_log_line(shape, phase, SleepAbort::Shutdown)
+            );
+            ControlFlow::Break(SleepBreak::Exit(TxExit::StopWorker))
+        }
+        SleepOutcome::AbortedByOperator => {
+            info!(
+                "{}",
+                sleep_abort_log_line(shape, phase, SleepAbort::Operator)
+            );
+            // PAN-38 round 4 (Codex): report the failed completion here too,
+            // for every frame (every bundle item) -- see `on_ptt_wait`'s F8
+            // abort for the full leak this closes.
+            for (text, qso_id, attempt_id) in in_flight.frames() {
+                if let Err(e) =
+                    report_transmit_complete(ctx.message_bus, false, text, 0, qso_id, attempt_id)
+                        .await
+                {
+                    warn!("Failed to send TransmitComplete: {}", e);
+                }
+            }
+            ControlFlow::Break(SleepBreak::Exit(TxExit::NextRequest))
+        }
+        SleepOutcome::AbortedByDisarm => {
+            warn!("{}", sleep_abort_log_line(shape, phase, SleepAbort::Disarm));
+            // PAN-91 review: release PTT FIRST, before any of this helper's
+            // awaits (diagnostic, audit-log I/O, relay) — a disarmed
+            // transmission must not stay keyed a moment longer than necessary.
+            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+            ctx.ptt_guard.release("Remote disarm mid-TX").await;
+            let mut single_replaced: Option<ReplacedFrame> = None;
+            let mut bundle_replaced = PivotReplaced::new();
+            match phase {
+                // Round-7 review (Codex P2): this is a PRE-SLOT abort — PTT
+                // was keyed but Step 7 never routed any audio, so nothing
+                // actually reached the air. If Step 4c (single) or Step 4b
+                // (bundle) pivoted this cycle, its tombstone must go too,
+                // exactly like the pre-PTT Step 4d-arm denial — else the
+                // genuinely fresh, still-queued request is wrongly discarded
+                // as an already-sent pivot duplicate.
+                SleepPhase::PreSlot => match &mut in_flight {
+                    SleepInFlight::Single {
+                        pivoted_this_key, ..
+                    } => {
+                        single_replaced = pivoted_this_key.take().and_then(|key| {
+                            ctx.pivoted_once.remove(&key);
+                            ctx.pivoted_from.remove(&key)
+                        });
+                    }
+                    SleepInFlight::Bundle {
+                        pivoted_this_bundle_keys,
+                        ..
+                    } => {
+                        bundle_replaced = unwind_bundle_pivots(
+                            pivoted_this_bundle_keys,
+                            ctx.pivoted_once,
+                            ctx.pivoted_from,
+                        );
+                    }
+                },
+                // Round-4 review (Codex P1): flush the already-queued remote
+                // waveform before the worker resumes pending work — a pending
+                // local TuneRequest or a fresh TX both queue with
+                // `flush_first: false`, so without this the disarmed client's
+                // remaining audio could still reach the air riding behind the
+                // next request's samples. PAN-135 waits for the audio thread
+                // to confirm the flush before proceeding.
+                SleepPhase::Playback { playback_end } => {
+                    flush_disarmed_audio_confirmed(
+                        ctx.message_bus,
+                        ctx.sample_rate,
+                        playback_end,
+                        ctx.shutdown,
+                    )
+                    .await;
+                }
+            }
+            let operator_callsign =
+                tx_denied_operator_attribution(ctx.remote_tx_arm, ctx.remote_client_key_id);
+            let (detail, signal_qso_id) = match &in_flight {
+                SleepInFlight::Single {
+                    message_text,
+                    frequency_offset,
+                    qso_id,
+                    ..
+                } => (
+                    format!(
+                        "disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"
+                    ),
+                    *qso_id,
+                ),
+                SleepInFlight::Bundle { .. } => (
+                    "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
+                    None,
+                ),
+            };
+            emit_disarm_interrupt_signals(
+                ctx.message_bus,
+                ctx.audit_log,
+                ctx.display_feed_enabled,
+                operator_callsign,
+                "interrupted",
+                detail,
+                signal_qso_id,
+            )
+            .await;
+            match phase {
+                // Nothing aired: settle through `report_unaired_frame` so a
+                // pivot's replaced frame rolls back.
+                SleepPhase::PreSlot => match &in_flight {
+                    SleepInFlight::Single {
+                        message_text,
+                        qso_id,
+                        attempt_id,
+                        ..
+                    } => {
+                        if let Err(e) = report_unaired_frame(
+                            ctx.message_bus,
+                            (*message_text).to_string(),
+                            qso_id.map(str::to_owned),
+                            *attempt_id,
+                            single_replaced,
+                        )
+                        .await
+                        {
+                            warn!("Failed to send TransmitComplete: {}", e);
+                        }
+                    }
+                    SleepInFlight::Bundle { items, .. } => {
+                        for item in items.iter() {
+                            if let Err(e) = report_unaired_frame(
+                                ctx.message_bus,
+                                item.message_text.clone(),
+                                item.qso_id.clone(),
+                                item.attempt_id,
+                                take_bundle_replaced(&mut bundle_replaced, item.qso_id.as_deref()),
+                            )
+                            .await
+                            {
+                                warn!("Failed to send TransmitComplete: {}", e);
+                            }
+                        }
+                    }
+                },
+                SleepPhase::Playback { .. } => {
+                    for (text, qso_id, attempt_id) in in_flight.frames() {
+                        if let Err(e) = report_transmit_complete(
+                            ctx.message_bus,
+                            false,
+                            text,
+                            0,
+                            qso_id,
+                            attempt_id,
+                        )
+                        .await
+                        {
+                            warn!("Failed to send TransmitComplete: {}", e);
+                        }
+                    }
+                }
+            }
+            ControlFlow::Break(SleepBreak::Exit(TxExit::NextRequest))
+        }
+        SleepOutcome::Superseded(new_request) => {
+            ControlFlow::Break(SleepBreak::Superseded(Box::new(new_request)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod on_sleep_outcome_tests {
+    use super::*;
+    use pancetta_qso::TxAttemptId;
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+
+    const CHANNELS: [ComponentId; 4] = [
+        ComponentId::Hamlib,
+        ComponentId::Tui,
+        ComponentId::Autonomous,
+        ComponentId::Qso,
+    ];
+
+    /// A bus with every channel an aborted sleep step sends on.
+    struct Station {
+        bus: MessageBus,
+        rxs: Vec<crossbeam_channel::Receiver<ComponentMessage>>,
+    }
+
+    impl Station {
+        async fn new() -> Self {
+            let bus = MessageBus::new(64).unwrap();
+            let mut rxs = Vec::new();
+            for id in CHANNELS {
+                rxs.push(bus.create_channel(id).await.unwrap().1);
+            }
+            Self { bus, rxs }
+        }
+
+        /// Every payload received, per channel (in `CHANNELS` order).
+        fn drain(&self) -> Vec<Vec<String>> {
+            self.rxs
+                .iter()
+                .map(|rx| {
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .map(|m| format!("{:?}", m.message_type))
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    /// The worker state one `on_sleep_outcome` call borrows.
+    struct World {
+        station: Station,
+        _audit_tmp: crate::coordinator::audit_test_util::TempPath,
+        audit_log: pancetta_agent::audit::AuditLog,
+        display_feed_enabled: Arc<AtomicBool>,
+        arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        guard: PttGuard,
+        pivoted_once: HashMap<String, (String, f64)>,
+        pivoted_from: PivotReplaced,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl World {
+        async fn new() -> Self {
+            let station = Station::new().await;
+            let guard = PttGuard::new(
+                station.bus.clone(),
+                Arc::new(AtomicBool::new(false)),
+                &Arc::new(tokio::sync::Mutex::new(())),
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU64::new(0)),
+                &PendingPttOff::default(),
+            )
+            .await;
+            let audit_tmp =
+                crate::coordinator::audit_test_util::TempPath::new("pancetta-tx-sleep-outcome");
+            Self {
+                station,
+                audit_log: pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
+                _audit_tmp: audit_tmp,
+                display_feed_enabled: Arc::new(AtomicBool::new(false)),
+                arm: Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new())),
+                guard,
+                pivoted_once: HashMap::new(),
+                pivoted_from: PivotReplaced::new(),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn ctx(&mut self) -> AbortCtx<'_> {
+            AbortCtx {
+                message_bus: &self.station.bus,
+                audit_log: &self.audit_log,
+                display_feed_enabled: &self.display_feed_enabled,
+                remote_tx_arm: &self.arm,
+                remote_client_key_id: None,
+                ptt_guard: &mut self.guard,
+                pivoted_once: &mut self.pivoted_once,
+                pivoted_from: &mut self.pivoted_from,
+                shutdown: &self.shutdown,
+                sample_rate: 12_000,
+            }
+        }
+
+        /// Records a Step 4b/4c pivot of `qso_id` that replaced [`replaced`].
+        fn pivot(&mut self, qso_id: &str) -> String {
+            let key = super::super::active_tx_qso_key(qso_id);
+            self.pivoted_once
+                .insert(key.clone(), ("K1ABC W9XYZ R-05".to_string(), 1500.0));
+            self.pivoted_from.insert(key.clone(), replaced());
+            key
+        }
+    }
+
+    fn replaced() -> ReplacedFrame {
+        (
+            "K1ABC W9XYZ -10".to_string(),
+            pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1500.0,
+                remote_binding: None,
+            },
+            Some(TxAttemptId(7)),
+        )
+    }
+
+    fn item(text: &str, qso_id: &str, attempt: u64) -> crate::message_bus::TransmitRequestItem {
+        crate::message_bus::TransmitRequestItem {
+            attempt_id: Some(TxAttemptId(attempt)),
+            message_text: text.to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some(qso_id.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        }
+    }
+
+    fn is_ptt_off(payload: &str) -> bool {
+        payload
+            == format!(
+                "{:?}",
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false
+                })
+            )
+    }
+
+    #[test]
+    fn abort_log_lines_are_byte_identical() {
+        let playback = SleepPhase::Playback {
+            playback_end: tokio::time::Instant::now(),
+        };
+        let cases = [
+            (
+                TxShape::Single,
+                SleepPhase::PreSlot,
+                SleepAbort::Shutdown,
+                "TX aborted between PTT and slot by shutdown",
+            ),
+            (
+                TxShape::Single,
+                SleepPhase::PreSlot,
+                SleepAbort::Operator,
+                "TX aborted between PTT and slot by operator (F8)",
+            ),
+            (
+                TxShape::Single,
+                SleepPhase::PreSlot,
+                SleepAbort::Disarm,
+                "TX aborted between PTT and slot: remote arm no longer permits it",
+            ),
+            (
+                TxShape::Single,
+                playback,
+                SleepAbort::Shutdown,
+                "TX aborted during playback by shutdown",
+            ),
+            (
+                TxShape::Single,
+                playback,
+                SleepAbort::Operator,
+                "TX aborted during playback by operator (F8)",
+            ),
+            (
+                TxShape::Single,
+                playback,
+                SleepAbort::Disarm,
+                "TX aborted during playback: remote arm no longer permits it",
+            ),
+            (
+                TxShape::Bundle,
+                SleepPhase::PreSlot,
+                SleepAbort::Shutdown,
+                "Multi-TX aborted between PTT and slot by shutdown",
+            ),
+            (
+                TxShape::Bundle,
+                SleepPhase::PreSlot,
+                SleepAbort::Operator,
+                "Multi-TX aborted between PTT and slot by operator (F8)",
+            ),
+            (
+                TxShape::Bundle,
+                SleepPhase::PreSlot,
+                SleepAbort::Disarm,
+                "Multi-TX aborted between PTT and slot: remote arm no longer permits it",
+            ),
+            (
+                TxShape::Bundle,
+                playback,
+                SleepAbort::Shutdown,
+                "Multi-TX aborted during playback by shutdown",
+            ),
+            (
+                TxShape::Bundle,
+                playback,
+                SleepAbort::Operator,
+                "Multi-TX aborted during playback by operator (F8)",
+            ),
+            (
+                TxShape::Bundle,
+                playback,
+                SleepAbort::Disarm,
+                "Multi-TX aborted during playback: remote arm no longer permits it",
+            ),
+        ];
+        for (shape, phase, abort, line) in cases {
+            assert_eq!(
+                sleep_abort_log_line(shape, phase, abort),
+                line,
+                "{shape:?} {phase:?} {abort:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preslot_disarm_unwinds_the_single_frame_pivot() {
+        let mut world = World::new().await;
+        let key = world.pivot("qso-1");
+        let mut pivoted_this_key = Some(key.clone());
+        let flow = on_sleep_outcome(
+            SleepOutcome::AbortedByDisarm,
+            SleepPhase::PreSlot,
+            SleepInFlight::Single {
+                message_text: "K1ABC W9XYZ R-05",
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1"),
+                attempt_id: Some(TxAttemptId(9)),
+                pivoted_this_key: &mut pivoted_this_key,
+            },
+            world.ctx(),
+        )
+        .await;
+        assert!(matches!(
+            flow,
+            ControlFlow::Break(SleepBreak::Exit(TxExit::NextRequest))
+        ));
+        assert!(pivoted_this_key.is_none());
+        assert!(!world.pivoted_once.contains_key(&key));
+        assert!(!world.pivoted_from.contains_key(&key));
+        assert!(
+            !world.guard.armed,
+            "PTT-off delivered stands the guard down"
+        );
+        let got = world.station.drain();
+        assert_eq!(got[0].len(), 1);
+        assert!(is_ptt_off(&got[0][0]), "Hamlib got {:?}", got[0]);
+
+        let want = Station::new().await;
+        report_unaired_frame(
+            &want.bus,
+            "K1ABC W9XYZ R-05".to_string(),
+            Some("qso-1".to_string()),
+            Some(TxAttemptId(9)),
+            Some(replaced()),
+        )
+        .await
+        .unwrap();
+        let want = want.drain();
+        assert_eq!(
+            got[2..],
+            want[2..],
+            "Autonomous and Qso settle the replaced frame"
+        );
+        assert!(
+            got[3].iter().any(|m| m.contains("K1ABC W9XYZ -10")),
+            "the QSO's rollback names the replaced frame: {:?}",
+            got[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn preslot_disarm_unwinds_bundle_pivots_per_item() {
+        let mut world = World::new().await;
+        let key = world.pivot("qso-1");
+        let items = vec![
+            item("K1ABC W9XYZ R-05", "qso-1", 9),
+            item("K2DEF W9XYZ RR73", "qso-2", 11),
+        ];
+        let keys = vec![key.clone()];
+        let flow = on_sleep_outcome(
+            SleepOutcome::AbortedByDisarm,
+            SleepPhase::PreSlot,
+            SleepInFlight::Bundle {
+                items: &items,
+                pivoted_this_bundle_keys: &keys,
+            },
+            world.ctx(),
+        )
+        .await;
+        assert!(matches!(
+            flow,
+            ControlFlow::Break(SleepBreak::Exit(TxExit::NextRequest))
+        ));
+        assert!(!world.pivoted_once.contains_key(&key));
+        assert!(!world.pivoted_from.contains_key(&key));
+        assert!(!world.guard.armed);
+        let got = world.station.drain();
+        assert_eq!(got[0].len(), 1);
+        assert!(is_ptt_off(&got[0][0]), "Hamlib got {:?}", got[0]);
+
+        let want = Station::new().await;
+        for (item, pivot) in items.iter().zip([Some(replaced()), None]) {
+            report_unaired_frame(
+                &want.bus,
+                item.message_text.clone(),
+                item.qso_id.clone(),
+                item.attempt_id,
+                pivot,
+            )
+            .await
+            .unwrap();
+        }
+        let want = want.drain();
+        assert_eq!(
+            got[2..],
+            want[2..],
+            "only the pivoted item carries the replaced frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_continues_and_sends_nothing() {
+        let mut world = World::new().await;
+        let items = vec![item("K1ABC W9XYZ R-05", "qso-1", 9)];
+        for phase in [
+            SleepPhase::PreSlot,
+            SleepPhase::Playback {
+                playback_end: tokio::time::Instant::now(),
+            },
+        ] {
+            let mut pivoted_this_key = None;
+            let flow = on_sleep_outcome(
+                SleepOutcome::Completed,
+                phase,
+                SleepInFlight::Single {
+                    message_text: "K1ABC W9XYZ R-05",
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-1"),
+                    attempt_id: Some(TxAttemptId(9)),
+                    pivoted_this_key: &mut pivoted_this_key,
+                },
+                world.ctx(),
+            )
+            .await;
+            assert!(matches!(flow, ControlFlow::Continue(())));
+            let flow = on_sleep_outcome(
+                SleepOutcome::Completed,
+                phase,
+                SleepInFlight::Bundle {
+                    items: &items,
+                    pivoted_this_bundle_keys: &[],
+                },
+                world.ctx(),
+            )
+            .await;
+            assert!(matches!(flow, ControlFlow::Continue(())));
+        }
+        assert!(world.station.drain().iter().all(Vec::is_empty));
+        assert!(world.guard.armed, "the guard stays armed");
+    }
+
+    #[tokio::test]
+    async fn superseded_is_handed_back_unchanged() {
+        let mut world = World::new().await;
+        let message = || MessageType::TxQueueStatus {
+            sending: None,
+            queued: Vec::new(),
+        };
+        let mut pivoted_this_key = None;
+        let flow = on_sleep_outcome(
+            SleepOutcome::Superseded(message()),
+            SleepPhase::PreSlot,
+            SleepInFlight::Single {
+                message_text: "K1ABC W9XYZ R-05",
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1"),
+                attempt_id: Some(TxAttemptId(9)),
+                pivoted_this_key: &mut pivoted_this_key,
+            },
+            world.ctx(),
+        )
+        .await;
+        match flow {
+            ControlFlow::Break(SleepBreak::Superseded(got)) => {
+                assert_eq!(format!("{got:?}"), format!("{:?}", message()));
+            }
+            ControlFlow::Break(SleepBreak::Exit(exit)) => {
+                panic!("expected Superseded, got {exit:?}")
+            }
+            ControlFlow::Continue(()) => panic!("expected Superseded, got Continue"),
+        }
+        assert!(world.station.drain().iter().all(Vec::is_empty));
+        assert!(world.guard.armed);
+    }
 }
 
 #[cfg(test)]
@@ -7292,38 +8398,6 @@ impl Drop for PttGuard {
     }
 }
 
-/// Recompute scheduling for a superseding request against *now* and, if
-/// still viable within `tx_late_max_ms_eff`, deassert PTT (clean stop of the
-/// aborted transmission), and mutate `message_text`/`frequency_offset`/
-/// `schedule` in place so the caller's retry loop re-runs Steps 1-10 with the
-/// new content (the caller re-encodes at Step 1, and requests an audio-buffer
-/// flush at Step 7 via the `is_rekey` flag so no stale samples from the
-/// aborted transmission bleed into the re-key).
-///
-/// Returns `true` if the caller should retry with the mutated state, `false`
-/// if re-keying isn't viable this slot (already deasserted PTT; caller
-/// should stop and let the request flow through the worker's next natural
-/// dequeue cycle for the next slot — this function does NOT re-enqueue it;
-/// see the design spec's "Error handling" section for why there's nothing
-/// to re-enqueue for a `TransmitRequest`, since dropping it here means it's
-/// simply gone — a real gap the design spec accepted for Phase 1, matching
-/// today's F8-abort behavior of not resending either).
-///
-/// Note: only `message_text`/`frequency_offset`/`schedule` are mutated —
-/// `qso_id` intentionally tracks the ORIGINAL in-flight request (Phase 1
-/// manual override; a cross-QSO supersede re-keys the new text but keeps the
-/// original request's identity for liveness/tombstone bookkeeping; see the
-/// design spec's "Known side effect" note on this cross-QSO characteristic).
-///
-/// The NEW request's `origin`, by contrast, is NOT discarded: it is returned
-/// via `SupersedeOutcome::Replace{origin}` / `Bundle{new_origin}` so the
-/// caller re-gates and emits the re-keyed frame with the superseding request's
-/// OWN origin, never the aborted transmission's (the C1 fix — an in-place
-/// re-key that reused the original `origin` would let a `Remote` supersede of a
-/// `Local` frame skip the key-time arm gate). `in_flight_origin` is the origin
-/// of the transmission being aborted, needed only to fail-safe-fold the
-/// `bundle_origin` (Remote if EITHER stream is Remote).
-#[allow(clippy::too_many_arguments)]
 /// Outcome of `supersede_and_rekey_or_bundle` — replaces Task 6's bare
 /// `bool`. A viable mid-TX supersede can now either fold the new request into
 /// a multi-TX bundle alongside the in-flight content (`Bundle`, when
@@ -7437,22 +8511,96 @@ enum SupersedeOutcome {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn supersede_and_rekey_or_bundle(
-    new_request: MessageType,
-    message_text: &mut String,
-    frequency_offset: &mut f64,
-    schedule: &mut TxSchedule,
-    ptt_guard: &mut PttGuard,
-    tx_late_max_ms_eff: u64,
+/// Slot and PTT timing for one TX request (PAN-322). Built at Step 2 of each
+/// arm, where `slot_ns` is loaded, so a single-frame re-key pass rebuilds it.
+#[derive(Debug, Clone, Copy)]
+struct SlotTimingContext {
+    active_protocol: pancetta_ft8::Protocol,
+    /// Raw `station.tx_late_max_ms`; [`Self::late_cap_ms`] scales it per mode.
+    tx_late_max_ms: u64,
+    tx_self_parity: pancetta_config::station::TxSelfParity,
+    ptt_lead_ms: u64,
     sample_rate: u32,
     slot_ns: i64,
-    tx_self_parity: pancetta_config::station::TxSelfParity,
-    _request_received_at: chrono::DateTime<chrono::Utc>,
+    /// Frozen at dequeue, before the coalesce wait.
+    request_received_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl SlotTimingContext {
+    /// The mode-scaled late cap, [`tx_late_max_ms_effective`].
+    fn late_cap_ms(&self) -> u64 {
+        tx_late_max_ms_effective(self.active_protocol, self.tx_late_max_ms)
+    }
+
+    /// The PTT engage instant: `target_slot` minus `ptt_lead_ms`.
+    fn ptt_target(
+        &self,
+        target_slot: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        target_slot - chrono::Duration::milliseconds(self.ptt_lead_ms as i64)
+    }
+}
+
+/// The frame or bundle a supersede abandons.
+struct SupersedeInFlight<'a> {
+    items: &'a [crate::message_bus::TransmitRequestItem],
+    origin: crate::message_bus::TxOrigin,
+    remote_client_key_id: Option<String>,
+    /// The in-flight request's own parity (single: its `TransmitRequest`;
+    /// bundle: its `MultiTransmitRequest`).
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
+}
+
+/// The single-TX arm's working frame, which a viable supersede rewrites.
+struct WorkingFrame<'a> {
+    message_text: &'a mut String,
+    frequency_offset: &'a mut f64,
+    schedule: &'a mut TxSchedule,
+}
+
+/// Worker state a supersede handler sends through.
+struct SupersedeIo<'a> {
+    message_bus: &'a MessageBus,
+    inbox: &'a TxInbox,
+    encoder: &'a mut Ft8Encoder,
+    ptt_guard: &'a mut PttGuard,
+}
+
+/// Recompute scheduling for a superseding request against *now* and, if
+/// still viable within `timing.late_cap_ms()`, deassert PTT (clean stop of the
+/// aborted transmission), and mutate `message_text`/`frequency_offset`/
+/// `schedule` in place so the caller's retry loop re-runs Steps 1-10 with the
+/// new content (the caller re-encodes at Step 1, and requests an audio-buffer
+/// flush at Step 7 via the `is_rekey` flag so no stale samples from the
+/// aborted transmission bleed into the re-key).
+///
+/// What the caller does next is carried by the returned [`SupersedeOutcome`].
+///
+/// Note: only `message_text`/`frequency_offset`/`schedule` are mutated —
+/// `qso_id` intentionally tracks the ORIGINAL in-flight request (Phase 1
+/// manual override; a cross-QSO supersede re-keys the new text but keeps the
+/// original request's identity for liveness/tombstone bookkeeping; see the
+/// design spec's "Known side effect" note on this cross-QSO characteristic).
+///
+/// The NEW request's `origin`, by contrast, is NOT discarded: it is returned
+/// via `SupersedeOutcome::Replace{origin}` / `Bundle{new_origin}` so the
+/// caller re-gates and emits the re-keyed frame with the superseding request's
+/// OWN origin, never the aborted transmission's (the C1 fix — an in-place
+/// re-key that reused the original `origin` would let a `Remote` supersede of a
+/// `Local` frame skip the key-time arm gate). `in_flight.origin` is the origin
+/// of the transmission being aborted, needed only to fail-safe-fold the
+/// `bundle_origin` (Remote if EITHER stream is Remote).
+async fn supersede_and_rekey_or_bundle(
+    new_request: MessageType,
+    WorkingFrame {
+        message_text,
+        frequency_offset,
+        schedule,
+    }: WorkingFrame<'_>,
+    ptt_guard: &mut PttGuard,
+    timing: &SlotTimingContext,
     max_concurrent_qsos: u32,
-    in_flight_origin: crate::message_bus::TxOrigin,
-    in_flight_remote_client_key_id: Option<String>,
-    in_flight_items: &[crate::message_bus::TransmitRequestItem],
+    in_flight: &SupersedeInFlight<'_>,
 ) -> SupersedeOutcome {
     // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
     // superseding message's type or its schedulability. EVERY return path out of
@@ -7512,13 +8660,14 @@ async fn supersede_and_rekey_or_bundle(
     };
 
     let now = chrono::Utc::now();
-    let required_parity = resolve_required_parity(new_tx_parity, tx_self_parity, now, slot_ns);
+    let required_parity =
+        resolve_required_parity(new_tx_parity, timing.tx_self_parity, now, timing.slot_ns);
     let new_schedule = schedule_tx(
         now,
         required_parity,
-        tx_late_max_ms_eff,
-        sample_rate,
-        slot_ns,
+        timing.late_cap_ms(),
+        timing.sample_rate,
+        timing.slot_ns,
     );
 
     if new_schedule.deferred {
@@ -7572,7 +8721,8 @@ async fn supersede_and_rekey_or_bundle(
         // frequency. `qso_id == None` (untracked/manual) never matches an
         // existing item, so it's still a plain append, unchanged.
         let new_key = new_qso_id.as_deref().map(super::active_tx_qso_key);
-        let mut candidate_items: Vec<crate::message_bus::TransmitRequestItem> = in_flight_items
+        let mut candidate_items: Vec<crate::message_bus::TransmitRequestItem> = in_flight
+            .items
             .iter()
             .filter(|it| {
                 new_key.is_none() || it.qso_id.as_deref().map(super::active_tx_qso_key) != new_key
@@ -7622,7 +8772,7 @@ async fn supersede_and_rekey_or_bundle(
         // key-time gate re-verifies the new request's channel and identity
         // independently before it actually keys.
         let identity_conflict = super::remote_identities_conflict(
-            (in_flight_origin, in_flight_remote_client_key_id.as_deref()),
+            (in_flight.origin, in_flight.remote_client_key_id.as_deref()),
             (new_origin, new_remote_client_key_id.as_deref()),
         );
         if identity_conflict {
@@ -7631,7 +8781,7 @@ async fn supersede_and_rekey_or_bundle(
                 "supersede: not bundling — in-flight stream is bound to a different \
                  remote client ({:?}) than the new request ({:?}); replacing the \
                  in-flight transmission with just the new request instead",
-                in_flight_remote_client_key_id, new_remote_client_key_id
+                in_flight.remote_client_key_id, new_remote_client_key_id
             );
             replace_is_identity_conflict = true;
         } else if qso_count <= max_concurrent_qsos as usize
@@ -7639,7 +8789,7 @@ async fn supersede_and_rekey_or_bundle(
         {
             // Fail-safe origin fold: the bundle carries BOTH the in-flight
             // stream and the new one, so it must be gated if EITHER is Remote.
-            let bundle_origin = if in_flight_origin == crate::message_bus::TxOrigin::Remote
+            let bundle_origin = if in_flight.origin == crate::message_bus::TxOrigin::Remote
                 || new_origin == crate::message_bus::TxOrigin::Remote
             {
                 crate::message_bus::TxOrigin::Remote
@@ -7650,7 +8800,8 @@ async fn supersede_and_rekey_or_bundle(
             // actually Remote. Safe to pick either non-`None` identity now
             // that `identity_conflict` above has already ruled out the two
             // sides disagreeing.
-            let bundle_remote_client_key_id = in_flight_remote_client_key_id
+            let bundle_remote_client_key_id = in_flight
+                .remote_client_key_id
                 .clone()
                 .or_else(|| new_remote_client_key_id.clone());
             return SupersedeOutcome::Bundle {
@@ -7685,36 +8836,6 @@ async fn supersede_and_rekey_or_bundle(
     }
 }
 
-/// Multi-TX arm's mid-TX supersede handler (Task 7 Step 4).
-///
-/// The multi-TX arm has no `'key_and_send` retry loop (unlike the single-TX
-/// arm), so on a qualifying supersede it ALWAYS abandons the current in-flight
-/// bundle and re-enqueues the resolved content back to the worker's own
-/// channel (picked up next dequeue by the unmodified Steps 1-10) rather than
-/// re-keying in place. This runs `supersede_and_rekey_or_bundle` (which
-/// deasserts PTT), then:
-///
-/// - `Bundle` + encode Ok → re-enqueue a `MultiTransmitRequest` folding the
-///   new request alongside the in-flight items.
-/// - `Bundle` + encode Err (frequency collision) → re-enqueue just the new
-///   item (the candidate bundle's last element) as a single `TransmitRequest`.
-/// - `Replace` (`max_concurrent_qsos == 1`, an edge for a bundle-in-flight) →
-///   re-enqueue the new single item, carrying the new request's own `qso_id`
-///   (PAN-38 round 4: previously dropped, re-enqueued as a manual
-///   drop-stale-ungated send).
-/// - `NotViable` (the superseding message was itself a `MultiTransmitRequest`,
-///   or a re-keyable request arrived too late for this slot) → re-enqueue the
-///   superseding message unchanged at the front of the inbox, so it airs in
-///   its own next slot (PAN-279; dropping it would lose the QSO engine's
-///   freshest frame).
-///
-/// Every abandoned in-flight item settles through
-/// [`tx_outcome::settle_unaired_frame`]; an item whose QSO the requeued
-/// successor carries leaves the Autonomous outcome to it (PAN-279).
-///
-/// In every case `supersede_and_rekey_or_bundle` has already released PTT
-/// through the caller's `PttGuard` (PAN-273), so the caller `continue`s after
-/// this returns.
 /// In-flight bundle items a `NotViable` multi-TX supersede really abandons:
 /// every item, except those `reenqueued` (the incoming bundle put back on the
 /// queue) carries unchanged for the same QSO under the same authorization,
@@ -7871,32 +8992,61 @@ async fn settle_items_abandoned_for(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Multi-TX arm's mid-TX supersede handler (Task 7 Step 4).
+///
+/// The multi-TX arm has no `'key_and_send` retry loop (unlike the single-TX
+/// arm), so on a qualifying supersede it ALWAYS abandons the current in-flight
+/// bundle and re-enqueues the resolved content back to the worker's own
+/// channel (picked up next dequeue by the unmodified Steps 1-10) rather than
+/// re-keying in place. This runs `supersede_and_rekey_or_bundle` (which
+/// deasserts PTT), then:
+///
+/// - `Bundle` + encode Ok → re-enqueue a `MultiTransmitRequest` folding the
+///   new request alongside the in-flight items.
+/// - `Bundle` + encode Err (frequency collision) → re-enqueue just the new
+///   item (the candidate bundle's last element) as a single `TransmitRequest`.
+/// - `Replace` (`max_concurrent_qsos == 1`, an edge for a bundle-in-flight) →
+///   re-enqueue the new single item, carrying the new request's own `qso_id`
+///   (PAN-38 round 4: previously dropped, re-enqueued as a manual
+///   drop-stale-ungated send).
+/// - `NotViable` (the superseding message was itself a `MultiTransmitRequest`,
+///   or a re-keyable request arrived too late for this slot) → re-enqueue the
+///   superseding message unchanged at the front of the inbox, so it airs in
+///   its own next slot (PAN-279; dropping it would lose the QSO engine's
+///   freshest frame).
+///
+/// Every abandoned in-flight item settles through
+/// [`tx_outcome::settle_unaired_frame`]; an item whose QSO the requeued
+/// successor carries leaves the Autonomous outcome to it (PAN-279).
+///
+/// In every case `supersede_and_rekey_or_bundle` has already released PTT
+/// through the caller's `PttGuard` (PAN-273), so the caller `continue`s after
+/// this returns.
 async fn supersede_multi_reenqueue(
     new_request: MessageType,
-    in_flight_items: &[crate::message_bus::TransmitRequestItem],
-    origin: crate::message_bus::TxOrigin,
-    remote_client_key_id: Option<String>,
+    in_flight: &SupersedeInFlight<'_>,
+    timing: &SlotTimingContext,
+    max_concurrent_qsos: u32,
+    io: SupersedeIo<'_>,
+) {
+    let SupersedeIo {
+        message_bus,
+        inbox,
+        encoder,
+        ptt_guard,
+    } = io;
+    let in_flight_items = in_flight.items;
+    let origin = in_flight.origin;
+    let remote_client_key_id = &in_flight.remote_client_key_id;
     // The in-flight bundle's OWN `tx_parity` (from its `MultiTransmitRequest`
     // message) — threaded through so a `Replace` outcome that preserves this
     // bundle unchanged (see that arm below) carries the SAME parity forward,
     // not `None`. `None` would let `resolve_required_parity` re-derive an
     // "Auto" parity on the next dequeue, which can pick the wrong slot for an
     // explicit-parity bundle (PR #348 review round 3).
-    bundle_tx_parity: Option<pancetta_core::slot::SlotParity>,
-    encoder: &mut Ft8Encoder,
-    active_protocol: pancetta_ft8::Protocol,
-    tx_params: &pancetta_ft8::ProtocolParams,
-    message_bus: &crate::message_bus::MessageBus,
-    inbox: &TxInbox,
-    ptt_guard: &mut PttGuard,
-    tx_late_max_ms_eff: u64,
-    sample_rate: u32,
-    slot_ns: i64,
-    tx_self_parity: pancetta_config::station::TxSelfParity,
-    request_received_at: chrono::DateTime<chrono::Utc>,
-    max_concurrent_qsos: u32,
-) {
+    let bundle_tx_parity = in_flight.tx_parity;
+    let active_protocol = timing.active_protocol;
+    let tx_params = &pancetta_ft8::ProtocolParams::from_protocol(active_protocol);
     // Scratch single-item working state: the multi-TX arm never reads it back
     // (it requeues rather than retrying in place), so these locals only
     // exist to satisfy `supersede_and_rekey_or_bundle`'s `&mut` contract and
@@ -7911,19 +9061,15 @@ async fn supersede_multi_reenqueue(
     };
     match supersede_and_rekey_or_bundle(
         new_request,
-        &mut scratch_text,
-        &mut scratch_freq,
-        &mut scratch_schedule,
+        WorkingFrame {
+            message_text: &mut scratch_text,
+            frequency_offset: &mut scratch_freq,
+            schedule: &mut scratch_schedule,
+        },
         ptt_guard,
-        tx_late_max_ms_eff,
-        sample_rate,
-        slot_ns,
-        tx_self_parity,
-        request_received_at,
+        timing,
         max_concurrent_qsos,
-        origin,
-        remote_client_key_id.clone(),
-        in_flight_items,
+        in_flight,
     )
     .await
     {
@@ -8402,6 +9548,19 @@ impl super::ApplicationCoordinator {
                 // Step 0-dup hit, so entries left behind when a tombstone is
                 // cleared are inert.
                 let mut pivoted_from = PivotReplaced::new();
+
+                // One live read of the supersede bundle cap (PAN-76 Fox raise),
+                // evaluated at each mid-TX supersede call.
+                let live_supersede_max_concurrent = || {
+                    supersede_max_concurrent_qsos(
+                        effective_max_concurrent_qsos(
+                            max_concurrent_qsos,
+                            &fox_mode,
+                            &fox_max_streams,
+                        ),
+                        live_fox_admitted_count(&fox_admitted_qsos, &active_tx_qsos),
+                    )
+                };
 
                 let inbox = TxInbox::new(tx_rx, tx_requeue);
                 'worker: while !shutdown.load(Ordering::Acquire) {
@@ -9049,11 +10208,20 @@ impl super::ApplicationCoordinator {
                                         };
 
                                         // --- Step 2: Resolve required parity ---
-                                        let slot_ns = active_slot_ns.load(Ordering::Relaxed);
+                                        let timing = SlotTimingContext {
+                                            active_protocol,
+                                            tx_late_max_ms,
+                                            tx_self_parity,
+                                            ptt_lead_ms,
+                                            sample_rate,
+                                            slot_ns: active_slot_ns.load(Ordering::Relaxed),
+                                            request_received_at,
+                                        };
+                                        let slot_ns = timing.slot_ns;
                                         let required_parity = resolve_required_parity(
                                             tx_parity,
                                             tx_self_parity,
-                                            request_received_at,
+                                            timing.request_received_at,
                                             slot_ns,
                                         );
 
@@ -9177,78 +10345,39 @@ impl super::ApplicationCoordinator {
                                         // 50 ms chunk), so a clock jump during the wait is
                                         // seen before PTT instead of keying a late or
                                         // garbage frame — see `wait_for_ptt_instant`.
-                                        let ptt_target_utc = schedule.target_slot
-                                            - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                        match wait_for_ptt_instant(
+                                        let ptt_target_utc =
+                                            timing.ptt_target(schedule.target_slot);
+                                        let ptt_wait = wait_for_ptt_instant(
                                             ptt_target_utc,
                                             schedule.target_slot,
-                                            tx_late_max_ms_effective(
-                                                active_protocol,
-                                                tx_late_max_ms,
-                                            ),
+                                            timing.late_cap_ms(),
                                             slot_ns,
                                             &shutdown,
                                             &abort_current_tx,
                                             chrono::Utc::now,
                                         )
-                                        .await
-                                        {
-                                            PttWait::Reached => {}
-                                            PttWait::ClockJumped(jump) => {
-                                                drop_frames_for_clock_jump(
-                                                    &message_bus,
-                                                    &[(
-                                                        message_text.clone(),
-                                                        qso_id.clone(),
-                                                        attempt_id,
-                                                    )],
-                                                    jump,
-                                                    &mut PivotReplaced::new(),
-                                                )
-                                                .await;
-                                                continue 'worker;
-                                            }
-                                            PttWait::Interrupted => {
-                                                if shutdown.load(Ordering::Acquire) {
-                                                    info!(
-                                                        "TX aborted before PTT engage by shutdown"
-                                                    );
-                                                    break 'worker;
-                                                }
-                                                info!(
-                                                    "TX aborted before PTT engage by operator (F8)"
-                                                );
-                                                // This abort happens BEFORE the TxStatusGuard is
-                                                // constructed, so its Drop-based clear never runs.
-                                                // Clear the strip explicitly so the QUEUED row
-                                                // doesn't sit stale until the next status push.
-                                                send_tx_queue_status(
-                                                    &message_bus,
-                                                    None,
-                                                    Vec::new(),
-                                                )
-                                                .await;
-                                                // PAN-38 round 3 (Codex): an F8 abort here is the
-                                                // one path in this worker that previously sent NO
-                                                // TransmitComplete at all -- for a self-CQ whose
-                                                // QSO was already opened (AutonomousCqOpened
-                                                // registered it in the coordinator's
-                                                // pending_self_cq_qsos map), that left the entry
-                                                // permanently leaked and the speculative "+1"
-                                                // streak never rolled back, since nothing ever
-                                                // told the autonomous operator this attempt did
-                                                // not actually transmit. Report it exactly like
-                                                // the drop-stale-TX case above.
-                                                let _ = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
+                                        .await;
+                                        match on_ptt_wait(
+                                            ptt_wait,
+                                            TxShape::Single,
+                                            || {
+                                                vec![(
                                                     message_text.clone(),
-                                                    0,
                                                     qso_id.clone(),
                                                     attempt_id,
-                                                )
-                                                .await;
-                                                continue 'worker;
+                                                )]
+                                            },
+                                            &message_bus,
+                                            &shutdown,
+                                        )
+                                        .await
+                                        {
+                                            std::ops::ControlFlow::Continue(()) => {}
+                                            std::ops::ControlFlow::Break(TxExit::StopWorker) => {
+                                                break 'worker
+                                            }
+                                            std::ops::ControlFlow::Break(TxExit::NextRequest) => {
+                                                continue 'worker
                                             }
                                         }
 
@@ -10028,10 +11157,7 @@ impl super::ApplicationCoordinator {
                                         if let Some(denial) = key_time_gate_denial(
                                             chrono::Utc::now(),
                                             schedule.target_slot,
-                                            tx_late_max_ms_effective(
-                                                active_protocol,
-                                                tx_late_max_ms,
-                                            ),
+                                            timing.late_cap_ms(),
                                         ) {
                                             last_ptt_off_ms
                                                 .store(super::now_epoch_ms(), Ordering::Release);
@@ -10260,7 +11386,7 @@ impl super::ApplicationCoordinator {
                                         // ptt_guard in scope — drop on any loop exit fires
                                         // PTT-off. A qualifying request arriving here supersedes
                                         // the in-flight frame (aborts + re-keys).
-                                        match interruptible_sleep_or_supersede_with_clock(
+                                        let outcome = interruptible_sleep_or_supersede_with_clock(
                                             to_slot,
                                             &shutdown,
                                             &abort_current_tx,
@@ -10277,98 +11403,53 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
-                                            if origin == crate::message_bus::TxOrigin::Remote {
-                                                Some((
-                                                    &remote_tx_arm,
-                                                    remote_client_key_id.as_deref(),
-                                                ))
-                                            } else {
-                                                None
-                                            },
+                                            remote_arm_gate(
+                                                origin,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            ),
                                             arm_clock.as_ref(),
+                                        )
+                                        .await;
+                                        match on_sleep_outcome(
+                                            outcome,
+                                            SleepPhase::PreSlot,
+                                            SleepInFlight::Single {
+                                                message_text: &message_text,
+                                                frequency_offset,
+                                                qso_id: qso_id.as_deref(),
+                                                attempt_id,
+                                                pivoted_this_key: &mut pivoted_this_key,
+                                            },
+                                            AbortCtx {
+                                                message_bus: &message_bus,
+                                                audit_log: &audit_log,
+                                                display_feed_enabled: &display_feed_enabled,
+                                                remote_tx_arm: &remote_tx_arm,
+                                                remote_client_key_id: remote_client_key_id
+                                                    .as_deref(),
+                                                ptt_guard: &mut ptt_guard,
+                                                pivoted_once: &mut pivoted_once,
+                                                pivoted_from: &mut pivoted_from,
+                                                shutdown: &shutdown,
+                                                sample_rate,
+                                            },
                                         )
                                         .await
                                         {
-                                            SleepOutcome::Completed => {}
-                                            SleepOutcome::AbortedByShutdown => {
-                                                info!(
-                                                    "TX aborted between PTT and slot by shutdown"
-                                                );
+                                            SleepFlow::Continue(()) => {}
+                                            SleepFlow::Break(SleepBreak::Exit(
+                                                TxExit::StopWorker,
+                                            )) => {
                                                 break 'worker;
                                             }
-                                            SleepOutcome::AbortedByOperator => {
-                                                info!("TX aborted between PTT and slot by operator (F8)");
-                                                // PAN-38 round 4 (Codex): report the failed
-                                                // completion here too -- see the "aborted before
-                                                // PTT engage" comment earlier in this worker for
-                                                // the full leak this closes.
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    message_text.clone(),
-                                                    0,
-                                                    qso_id.clone(),
-                                                    attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
+                                            SleepFlow::Break(SleepBreak::Exit(
+                                                TxExit::NextRequest,
+                                            )) => {
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm => {
-                                                warn!(
-                                                    "TX aborted between PTT and slot: remote arm no longer permits it"
-                                                );
-                                                // PAN-91 review: release PTT FIRST, before any
-                                                // of this helper's awaits (diagnostic, audit-log
-                                                // I/O, relay) — a disarmed transmission must not
-                                                // stay keyed a moment longer than necessary.
-                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
-                                                ptt_guard.release("Remote disarm mid-TX").await;
-                                                // Round-7 review (Codex P2): this is a
-                                                // PRE-SLOT abort — PTT was keyed but Step 7
-                                                // never routed any audio, so nothing actually
-                                                // reached the air. If Step 4c pivoted this
-                                                // cycle, its tombstone must go too, exactly
-                                                // like the pre-PTT Step 4d-arm denial — else
-                                                // the genuinely fresh, still-queued request is
-                                                // wrongly discarded as an already-sent pivot
-                                                // duplicate.
-                                                let pivot_replaced =
-                                                    pivoted_this_key.take().and_then(|key| {
-                                                        pivoted_once.remove(&key);
-                                                        pivoted_from.remove(&key)
-                                                    });
-                                                let operator_callsign =
-                                                    tx_denied_operator_attribution(
-                                                        &remote_tx_arm,
-                                                        remote_client_key_id.as_deref(),
-                                                    );
-                                                emit_disarm_interrupt_signals(
-                                                    &message_bus,
-                                                    &audit_log,
-                                                    &display_feed_enabled,
-                                                    operator_callsign,
-                                                    "interrupted",
-                                                    format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
-                                                    qso_id.as_deref(),
-                                                )
-                                                .await;
-                                                if let Err(e) = report_unaired_frame(
-                                                    &message_bus,
-                                                    message_text.clone(),
-                                                    qso_id.clone(),
-                                                    attempt_id,
-                                                    pivot_replaced,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                                continue 'worker;
-                                            }
-                                            SleepOutcome::Superseded(new_request) => {
+                                            SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
+                                                let new_request = *boxed;
                                                 // The current in-flight single item — passed to the
                                                 // helper so a bundle-add (max_concurrent_qsos > 1)
                                                 // can fold the new request alongside it.
@@ -10384,32 +11465,21 @@ impl super::ApplicationCoordinator {
                                                     }];
                                                 match supersede_and_rekey_or_bundle(
                                                     new_request,
-                                                    &mut message_text,
-                                                    &mut frequency_offset,
-                                                    &mut schedule,
+                                                    WorkingFrame {
+                                                        message_text: &mut message_text,
+                                                        frequency_offset: &mut frequency_offset,
+                                                        schedule: &mut schedule,
+                                                    },
                                                     &mut ptt_guard,
-                                                    tx_late_max_ms_effective(
-                                                        active_protocol,
-                                                        tx_late_max_ms,
-                                                    ),
-                                                    sample_rate,
-                                                    slot_ns,
-                                                    tx_self_parity,
-                                                    request_received_at,
-                                                    supersede_max_concurrent_qsos(
-                                                        effective_max_concurrent_qsos(
-                                                            max_concurrent_qsos,
-                                                            &fox_mode,
-                                                            &fox_max_streams,
-                                                        ),
-                                                        live_fox_admitted_count(
-                                                            &fox_admitted_qsos,
-                                                            &active_tx_qsos,
-                                                        ),
-                                                    ),
-                                                    origin,
-                                                    remote_client_key_id.clone(),
-                                                    &in_flight_items,
+                                                    &timing,
+                                                    live_supersede_max_concurrent(),
+                                                    &SupersedeInFlight {
+                                                        items: &in_flight_items,
+                                                        origin,
+                                                        remote_client_key_id: remote_client_key_id
+                                                            .clone(),
+                                                        tx_parity,
+                                                    },
                                                 )
                                                 .await
                                                 {
@@ -10738,7 +11808,7 @@ impl super::ApplicationCoordinator {
                                         // PAN-135: expected playback end bounds an unconfirmed disarm flush.
                                         let playback_end = audio_enqueued_at
                                             + Duration::from_millis(audio_duration_ms);
-                                        match interruptible_sleep_or_supersede_with_clock(
+                                        let outcome = interruptible_sleep_or_supersede_with_clock(
                                             playback_end.saturating_duration_since(
                                                 tokio::time::Instant::now(),
                                             ),
@@ -10757,100 +11827,53 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
-                                            if origin == crate::message_bus::TxOrigin::Remote {
-                                                Some((
-                                                    &remote_tx_arm,
-                                                    remote_client_key_id.as_deref(),
-                                                ))
-                                            } else {
-                                                None
-                                            },
+                                            remote_arm_gate(
+                                                origin,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            ),
                                             arm_clock.as_ref(),
+                                        )
+                                        .await;
+                                        match on_sleep_outcome(
+                                            outcome,
+                                            SleepPhase::Playback { playback_end },
+                                            SleepInFlight::Single {
+                                                message_text: &message_text,
+                                                frequency_offset,
+                                                qso_id: qso_id.as_deref(),
+                                                attempt_id,
+                                                pivoted_this_key: &mut pivoted_this_key,
+                                            },
+                                            AbortCtx {
+                                                message_bus: &message_bus,
+                                                audit_log: &audit_log,
+                                                display_feed_enabled: &display_feed_enabled,
+                                                remote_tx_arm: &remote_tx_arm,
+                                                remote_client_key_id: remote_client_key_id
+                                                    .as_deref(),
+                                                ptt_guard: &mut ptt_guard,
+                                                pivoted_once: &mut pivoted_once,
+                                                pivoted_from: &mut pivoted_from,
+                                                shutdown: &shutdown,
+                                                sample_rate,
+                                            },
                                         )
                                         .await
                                         {
-                                            SleepOutcome::Completed => {}
-                                            SleepOutcome::AbortedByShutdown => {
-                                                info!("TX aborted during playback by shutdown");
+                                            SleepFlow::Continue(()) => {}
+                                            SleepFlow::Break(SleepBreak::Exit(
+                                                TxExit::StopWorker,
+                                            )) => {
                                                 break 'worker;
                                             }
-                                            SleepOutcome::AbortedByOperator => {
-                                                info!(
-                                                    "TX aborted during playback by operator (F8)"
-                                                );
-                                                // PAN-38 round 4 (Codex): report the failed
-                                                // completion here too -- see the "aborted before
-                                                // PTT engage" comment earlier in this worker.
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    message_text.clone(),
-                                                    0,
-                                                    qso_id.clone(),
-                                                    attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
+                                            SleepFlow::Break(SleepBreak::Exit(
+                                                TxExit::NextRequest,
+                                            )) => {
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm => {
-                                                warn!(
-                                                    "TX aborted during playback: remote arm no longer permits it"
-                                                );
-                                                // PAN-91 review: release PTT FIRST, before any
-                                                // of this helper's awaits (diagnostic, audit-log
-                                                // I/O, relay) — a disarmed transmission must not
-                                                // stay keyed a moment longer than necessary.
-                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
-                                                ptt_guard.release("Remote disarm mid-TX").await;
-                                                // Round-4 review (Codex P1): flush the
-                                                // already-queued remote waveform before the
-                                                // worker resumes pending work — a pending local
-                                                // TuneRequest or a fresh TX both queue with
-                                                // `flush_first: false`, so without this the
-                                                // disarmed client's remaining audio could
-                                                // still reach the air riding behind the next
-                                                // request's samples. PAN-135 waits for the audio
-                                                // thread to confirm the flush before proceeding.
-                                                flush_disarmed_audio_confirmed(
-                                                    &message_bus,
-                                                    sample_rate,
-                                                    playback_end,
-                                                    &shutdown,
-                                                )
-                                                .await;
-                                                let operator_callsign =
-                                                    tx_denied_operator_attribution(
-                                                        &remote_tx_arm,
-                                                        remote_client_key_id.as_deref(),
-                                                    );
-                                                emit_disarm_interrupt_signals(
-                                                    &message_bus,
-                                                    &audit_log,
-                                                    &display_feed_enabled,
-                                                    operator_callsign,
-                                                    "interrupted",
-                                                    format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
-                                                    qso_id.as_deref(),
-                                                )
-                                                .await;
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    message_text.clone(),
-                                                    0,
-                                                    qso_id.clone(),
-                                                    attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                                continue 'worker;
-                                            }
-                                            SleepOutcome::Superseded(new_request) => {
+                                            SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
+                                                let new_request = *boxed;
                                                 // Same bundle-add-or-replace decision as Step 6.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
@@ -10864,32 +11887,21 @@ impl super::ApplicationCoordinator {
                                                     }];
                                                 match supersede_and_rekey_or_bundle(
                                                     new_request,
-                                                    &mut message_text,
-                                                    &mut frequency_offset,
-                                                    &mut schedule,
+                                                    WorkingFrame {
+                                                        message_text: &mut message_text,
+                                                        frequency_offset: &mut frequency_offset,
+                                                        schedule: &mut schedule,
+                                                    },
                                                     &mut ptt_guard,
-                                                    tx_late_max_ms_effective(
-                                                        active_protocol,
-                                                        tx_late_max_ms,
-                                                    ),
-                                                    sample_rate,
-                                                    slot_ns,
-                                                    tx_self_parity,
-                                                    request_received_at,
-                                                    supersede_max_concurrent_qsos(
-                                                        effective_max_concurrent_qsos(
-                                                            max_concurrent_qsos,
-                                                            &fox_mode,
-                                                            &fox_max_streams,
-                                                        ),
-                                                        live_fox_admitted_count(
-                                                            &fox_admitted_qsos,
-                                                            &active_tx_qsos,
-                                                        ),
-                                                    ),
-                                                    origin,
-                                                    remote_client_key_id.clone(),
-                                                    &in_flight_items,
+                                                    &timing,
+                                                    live_supersede_max_concurrent(),
+                                                    &SupersedeInFlight {
+                                                        items: &in_flight_items,
+                                                        origin,
+                                                        remote_client_key_id: remote_client_key_id
+                                                            .clone(),
+                                                        tx_parity,
+                                                    },
                                                 )
                                                 .await
                                                 {
@@ -11598,11 +12610,20 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Resolve required parity ---
-                                    let slot_ns = active_slot_ns.load(Ordering::Relaxed);
+                                    let timing = SlotTimingContext {
+                                        active_protocol,
+                                        tx_late_max_ms,
+                                        tx_self_parity,
+                                        ptt_lead_ms,
+                                        sample_rate,
+                                        slot_ns: active_slot_ns.load(Ordering::Relaxed),
+                                        request_received_at,
+                                    };
+                                    let slot_ns = timing.slot_ns;
                                     let required_parity = resolve_required_parity(
                                         tx_parity,
                                         tx_self_parity,
-                                        request_received_at,
+                                        timing.request_received_at,
                                         slot_ns,
                                     );
 
@@ -11882,70 +12903,40 @@ impl super::ApplicationCoordinator {
                                     // --- Step 4: Wait until PTT engage instant ---
                                     // PAN-114: wall-clock wait, same as the single-TX
                                     // arm — see `wait_for_ptt_instant`.
-                                    let ptt_target_utc = schedule.target_slot
-                                        - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                    match wait_for_ptt_instant(
+                                    let ptt_target_utc = timing.ptt_target(schedule.target_slot);
+                                    let ptt_wait = wait_for_ptt_instant(
                                         ptt_target_utc,
                                         schedule.target_slot,
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
+                                        timing.late_cap_ms(),
                                         slot_ns,
                                         &shutdown,
                                         &abort_current_tx,
                                         chrono::Utc::now,
                                     )
-                                    .await
-                                    {
-                                        PttWait::Reached => {}
-                                        PttWait::ClockJumped(jump) => {
-                                            // One drop per bundle item, like the F8
-                                            // abort below.
-                                            let frames: Vec<_> = item_texts
+                                    .await;
+                                    match on_ptt_wait(
+                                        ptt_wait,
+                                        TxShape::Bundle,
+                                        || {
+                                            item_texts
+                                                .clone()
                                                 .into_iter()
-                                                .zip(encoded_qso_ids)
+                                                .zip(encoded_qso_ids.clone())
                                                 .zip(&items)
                                                 .map(|((text, qso_id), item)| {
                                                     (text, qso_id, item.attempt_id)
                                                 })
-                                                .collect();
-                                            drop_frames_for_clock_jump(
-                                                &message_bus,
-                                                &frames,
-                                                jump,
-                                                &mut PivotReplaced::new(),
-                                            )
-                                            .await;
-                                            continue;
-                                        }
-                                        PttWait::Interrupted => {
-                                            if shutdown.load(Ordering::Acquire) {
-                                                info!("Multi-TX aborted before PTT by shutdown");
-                                                break;
-                                            }
-                                            info!("Multi-TX aborted before PTT by operator (F8)");
-                                            // PAN-38 round 3 (Codex): same gap as the single-item
-                                            // worker's F8-before-PTT path -- no TransmitComplete
-                                            // was ever sent for any bundle item, leaking a
-                                            // self-CQ's pending_self_cq_qsos entry and never
-                                            // rolling back its speculative streak/offset.
-                                            for ((text, qso_id), item) in item_texts
-                                                .into_iter()
-                                                .zip(encoded_qso_ids)
-                                                .zip(&items)
-                                            {
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    text,
-                                                    0,
-                                                    qso_id,
-                                                    item.attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                            }
-                                            continue;
+                                                .collect()
+                                        },
+                                        &message_bus,
+                                        &shutdown,
+                                    )
+                                    .await
+                                    {
+                                        std::ops::ControlFlow::Continue(()) => {}
+                                        std::ops::ControlFlow::Break(TxExit::StopWorker) => break,
+                                        std::ops::ControlFlow::Break(TxExit::NextRequest) => {
+                                            continue
                                         }
                                     }
 
@@ -13070,8 +14061,7 @@ impl super::ApplicationCoordinator {
                                     // enqueue below: `send_ptt_command` takes no lock and
                                     // no await (PAN-202).
                                     let key_time_now = chrono::Utc::now();
-                                    let key_time_late_max_ms =
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
+                                    let key_time_late_max_ms = timing.late_cap_ms();
                                     if key_time_too_late(
                                         key_time_now,
                                         schedule.target_slot,
@@ -13299,7 +14289,7 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         continue;
                                     }
-                                    match interruptible_sleep_or_supersede_with_clock(
+                                    let outcome = interruptible_sleep_or_supersede_with_clock(
                                         to_slot,
                                         &shutdown,
                                         &abort_current_tx,
@@ -13309,124 +14299,62 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
-                                        if origin == crate::message_bus::TxOrigin::Remote {
-                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
-                                        } else {
-                                            None
-                                        },
+                                        remote_arm_gate(
+                                            origin,
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        ),
                                         arm_clock.as_ref(),
+                                    )
+                                    .await;
+                                    match on_sleep_outcome(
+                                        outcome,
+                                        SleepPhase::PreSlot,
+                                        SleepInFlight::Bundle {
+                                            items: &items,
+                                            pivoted_this_bundle_keys: &pivoted_this_bundle_keys,
+                                        },
+                                        AbortCtx {
+                                            message_bus: &message_bus,
+                                            audit_log: &audit_log,
+                                            display_feed_enabled: &display_feed_enabled,
+                                            remote_tx_arm: &remote_tx_arm,
+                                            remote_client_key_id: remote_client_key_id.as_deref(),
+                                            ptt_guard: &mut ptt_guard,
+                                            pivoted_once: &mut pivoted_once,
+                                            pivoted_from: &mut pivoted_from,
+                                            shutdown: &shutdown,
+                                            sample_rate,
+                                        },
                                     )
                                     .await
                                     {
-                                        SleepOutcome::Completed => {}
-                                        SleepOutcome::AbortedByShutdown => {
-                                            info!(
-                                                "Multi-TX aborted between PTT and slot by shutdown"
-                                            );
+                                        SleepFlow::Continue(()) => {}
+                                        SleepFlow::Break(SleepBreak::Exit(TxExit::StopWorker)) => {
                                             break;
                                         }
-                                        SleepOutcome::AbortedByOperator => {
-                                            info!("Multi-TX aborted between PTT and slot by operator (F8)");
-                                            // PAN-38 round 4 (Codex): report a failed
-                                            // completion for every bundle item -- see the
-                                            // "Multi-TX aborted before PTT" comment earlier
-                                            // in this worker for the full leak this closes.
-                                            for item in &items {
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    item.message_text.clone(),
-                                                    0,
-                                                    item.qso_id.clone(),
-                                                    item.attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                            }
+                                        SleepFlow::Break(SleepBreak::Exit(TxExit::NextRequest)) => {
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm => {
-                                            warn!(
-                                                "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
-                                            );
-                                            // PAN-91 review: release PTT FIRST — see the
-                                            // single-TX arm's identical fix for why.
-                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
-                                            ptt_guard.release("Remote disarm mid-TX").await;
-                                            // Round-7 review (Codex P2): pre-slot abort —
-                                            // nothing reached the air yet (Step 7 never ran)
-                                            // — see the single-TX arm's identical fix.
-                                            let mut bundle_replaced = unwind_bundle_pivots(
-                                                &pivoted_this_bundle_keys,
-                                                &mut pivoted_once,
-                                                &mut pivoted_from,
-                                            );
-                                            let operator_callsign = tx_denied_operator_attribution(
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign,
-                                                "interrupted",
-                                                "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
-                                                None,
-                                            )
-                                            .await;
-                                            for item in &items {
-                                                if let Err(e) = report_unaired_frame(
-                                                    &message_bus,
-                                                    item.message_text.clone(),
-                                                    item.qso_id.clone(),
-                                                    item.attempt_id,
-                                                    take_bundle_replaced(
-                                                        &mut bundle_replaced,
-                                                        item.qso_id.as_deref(),
-                                                    ),
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                            }
-                                            continue;
-                                        }
-                                        SleepOutcome::Superseded(new_request) => {
+                                        SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
+                                            let new_request = *boxed;
                                             supersede_multi_reenqueue(
                                                 new_request,
-                                                &items,
-                                                origin,
-                                                remote_client_key_id.clone(),
-                                                tx_parity,
-                                                &mut encoder,
-                                                active_protocol,
-                                                &tx_params,
-                                                &message_bus,
-                                                &inbox,
-                                                &mut ptt_guard,
-                                                tx_late_max_ms_effective(
-                                                    active_protocol,
-                                                    tx_late_max_ms,
-                                                ),
-                                                sample_rate,
-                                                slot_ns,
-                                                tx_self_parity,
-                                                request_received_at,
-                                                supersede_max_concurrent_qsos(
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
-                                                    ),
-                                                    live_fox_admitted_count(
-                                                        &fox_admitted_qsos,
-                                                        &active_tx_qsos,
-                                                    ),
-                                                ),
+                                                &SupersedeInFlight {
+                                                    items: &items,
+                                                    origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
+                                                    tx_parity,
+                                                },
+                                                &timing,
+                                                live_supersede_max_concurrent(),
+                                                SupersedeIo {
+                                                    message_bus: &message_bus,
+                                                    inbox: &inbox,
+                                                    encoder: &mut encoder,
+                                                    ptt_guard: &mut ptt_guard,
+                                                },
                                             )
                                             .await;
                                             continue;
@@ -13592,7 +14520,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-135: expected playback end bounds an unconfirmed disarm flush.
                                     let playback_end = audio_enqueued_at
                                         + Duration::from_millis(audio_duration_ms);
-                                    match interruptible_sleep_or_supersede_with_clock(
+                                    let outcome = interruptible_sleep_or_supersede_with_clock(
                                         playback_end
                                             .saturating_duration_since(tokio::time::Instant::now()),
                                         &shutdown,
@@ -13603,126 +14531,62 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
-                                        if origin == crate::message_bus::TxOrigin::Remote {
-                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
-                                        } else {
-                                            None
-                                        },
+                                        remote_arm_gate(
+                                            origin,
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        ),
                                         arm_clock.as_ref(),
+                                    )
+                                    .await;
+                                    match on_sleep_outcome(
+                                        outcome,
+                                        SleepPhase::Playback { playback_end },
+                                        SleepInFlight::Bundle {
+                                            items: &items,
+                                            pivoted_this_bundle_keys: &pivoted_this_bundle_keys,
+                                        },
+                                        AbortCtx {
+                                            message_bus: &message_bus,
+                                            audit_log: &audit_log,
+                                            display_feed_enabled: &display_feed_enabled,
+                                            remote_tx_arm: &remote_tx_arm,
+                                            remote_client_key_id: remote_client_key_id.as_deref(),
+                                            ptt_guard: &mut ptt_guard,
+                                            pivoted_once: &mut pivoted_once,
+                                            pivoted_from: &mut pivoted_from,
+                                            shutdown: &shutdown,
+                                            sample_rate,
+                                        },
                                     )
                                     .await
                                     {
-                                        SleepOutcome::Completed => {}
-                                        SleepOutcome::AbortedByShutdown => {
-                                            info!("Multi-TX aborted during playback by shutdown");
+                                        SleepFlow::Continue(()) => {}
+                                        SleepFlow::Break(SleepBreak::Exit(TxExit::StopWorker)) => {
                                             break;
                                         }
-                                        SleepOutcome::AbortedByOperator => {
-                                            info!(
-                                                "Multi-TX aborted during playback by operator (F8)"
-                                            );
-                                            // PAN-38 round 4 (Codex): report a failed
-                                            // completion for every bundle item -- see the
-                                            // "Multi-TX aborted before PTT" comment earlier
-                                            // in this worker.
-                                            for item in &items {
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    item.message_text.clone(),
-                                                    0,
-                                                    item.qso_id.clone(),
-                                                    item.attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                            }
+                                        SleepFlow::Break(SleepBreak::Exit(TxExit::NextRequest)) => {
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm => {
-                                            warn!(
-                                                "Multi-TX aborted during playback: remote arm no longer permits it"
-                                            );
-                                            // PAN-91 review: release PTT FIRST — see the
-                                            // single-TX arm's identical fix for why.
-                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
-                                            ptt_guard.release("Remote disarm mid-TX").await;
-                                            // Round-4 review (Codex P1): flush the
-                                            // already-queued remote bundle waveform before
-                                            // the worker resumes pending work — see the single-TX
-                                            // arm's identical fix for why. PAN-135 confirms
-                                            // the flush in the audio thread.
-                                            flush_disarmed_audio_confirmed(
-                                                &message_bus,
-                                                sample_rate,
-                                                playback_end,
-                                                &shutdown,
-                                            )
-                                            .await;
-                                            let operator_callsign = tx_denied_operator_attribution(
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign,
-                                                "interrupted",
-                                                "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
-                                                None,
-                                            )
-                                            .await;
-                                            for item in &items {
-                                                if let Err(e) = report_transmit_complete(
-                                                    &message_bus,
-                                                    false,
-                                                    item.message_text.clone(),
-                                                    0,
-                                                    item.qso_id.clone(),
-                                                    item.attempt_id,
-                                                )
-                                                .await
-                                                {
-                                                    warn!("Failed to send TransmitComplete: {}", e);
-                                                }
-                                            }
-                                            continue;
-                                        }
-                                        SleepOutcome::Superseded(new_request) => {
+                                        SleepFlow::Break(SleepBreak::Superseded(boxed)) => {
+                                            let new_request = *boxed;
                                             supersede_multi_reenqueue(
                                                 new_request,
-                                                &items,
-                                                origin,
-                                                remote_client_key_id.clone(),
-                                                tx_parity,
-                                                &mut encoder,
-                                                active_protocol,
-                                                &tx_params,
-                                                &message_bus,
-                                                &inbox,
-                                                &mut ptt_guard,
-                                                tx_late_max_ms_effective(
-                                                    active_protocol,
-                                                    tx_late_max_ms,
-                                                ),
-                                                sample_rate,
-                                                slot_ns,
-                                                tx_self_parity,
-                                                request_received_at,
-                                                supersede_max_concurrent_qsos(
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
-                                                    ),
-                                                    live_fox_admitted_count(
-                                                        &fox_admitted_qsos,
-                                                        &active_tx_qsos,
-                                                    ),
-                                                ),
+                                                &SupersedeInFlight {
+                                                    items: &items,
+                                                    origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
+                                                    tx_parity,
+                                                },
+                                                &timing,
+                                                live_supersede_max_concurrent(),
+                                                SupersedeIo {
+                                                    message_bus: &message_bus,
+                                                    inbox: &inbox,
+                                                    encoder: &mut encoder,
+                                                    ptt_guard: &mut ptt_guard,
+                                                },
                                             )
                                             .await;
                                             continue;
@@ -14104,6 +14968,78 @@ pub fn resolve_required_parity(
             } else {
                 SlotParity::Odd
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl SlotTimingContext {
+    /// Test-only FT8 context: the supersede tests' old explicit arguments,
+    /// with the default 80 ms `ptt_lead_ms` (unused by the supersede path).
+    fn ft8_for_test(
+        tx_late_max_ms: u64,
+        sample_rate: u32,
+        slot_ns: i64,
+        tx_self_parity: pancetta_config::station::TxSelfParity,
+        request_received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            active_protocol: pancetta_ft8::Protocol::Ft8,
+            tx_late_max_ms,
+            tx_self_parity,
+            ptt_lead_ms: 80,
+            sample_rate,
+            slot_ns,
+            request_received_at,
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_timing_context_tests {
+    use super::SlotTimingContext;
+
+    fn ctx(
+        active_protocol: pancetta_ft8::Protocol,
+        tx_late_max_ms: u64,
+        ptt_lead_ms: u64,
+    ) -> SlotTimingContext {
+        SlotTimingContext {
+            active_protocol,
+            tx_late_max_ms,
+            tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
+            ptt_lead_ms,
+            sample_rate: 12_000,
+            slot_ns: pancetta_core::slot::SLOT_NS,
+            request_received_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn late_cap_matches_tx_late_max_ms_effective_for_every_protocol() {
+        assert_eq!(
+            ctx(pancetta_ft8::Protocol::Ft8, 3000, 80).late_cap_ms(),
+            3000
+        );
+        assert_eq!(
+            ctx(pancetta_ft8::Protocol::Ft4, 3000, 80).late_cap_ms(),
+            1500
+        );
+        #[cfg(feature = "ft2")]
+        assert_eq!(
+            ctx(pancetta_ft8::Protocol::Ft2, 3000, 80).late_cap_ms(),
+            super::tx_late_max_ms_effective(pancetta_ft8::Protocol::Ft2, 3000)
+        );
+    }
+
+    #[test]
+    fn ptt_target_is_target_slot_minus_ptt_lead() {
+        let target_slot = chrono::Utc::now();
+        for lead_ms in [80u64, 2000] {
+            assert_eq!(
+                ctx(pancetta_ft8::Protocol::Ft8, 3000, lead_ms).ptt_target(target_slot),
+                target_slot - chrono::Duration::milliseconds(lead_ms as i64)
+            );
         }
     }
 }
@@ -16797,19 +17733,26 @@ mod supersede_rekey_tests {
 
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             1,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -16866,19 +17809,26 @@ mod supersede_rekey_tests {
 
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             1,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -16934,19 +17884,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             1,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17049,19 +18006,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             1,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17195,19 +18159,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17288,19 +18259,26 @@ mod supersede_rekey_tests {
             let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
-                &mut message_text,
-                &mut frequency_offset,
-                &mut schedule,
+                super::WorkingFrame {
+                    message_text: &mut message_text,
+                    frequency_offset: &mut frequency_offset,
+                    schedule: &mut schedule,
+                },
                 &mut guard,
-                20_000,
-                12_000,
-                pancetta_core::slot::SLOT_NS,
-                pancetta_config::station::TxSelfParity::Auto,
-                now,
+                &super::SlotTimingContext::ft8_for_test(
+                    20_000,
+                    12_000,
+                    pancetta_core::slot::SLOT_NS,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    now,
+                ),
                 2,
-                crate::message_bus::TxOrigin::Remote,
-                in_flight_id.map(str::to_string),
-                &in_flight,
+                &super::SupersedeInFlight {
+                    items: &in_flight,
+                    origin: crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id: in_flight_id.map(str::to_string),
+                    tx_parity: None,
+                },
             )
             .await;
 
@@ -17377,19 +18355,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17468,19 +18453,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
-            crate::message_bus::TxOrigin::Remote,
-            Some("client-a".to_string()),
-            &in_flight,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17590,19 +18582,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -17702,19 +18701,27 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
-            2, // max_concurrent_qsos — already met by the 2 in-flight items
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
+            2,
+            &super::SupersedeInFlight {
+items: &in_flight,
+origin: // max_concurrent_qsos — already met by the 2 in-flight items
             crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+remote_client_key_id: None,
+tx_parity: None,
+},
         )
         .await;
 
@@ -17808,19 +18815,27 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
-            2, // max_concurrent_qsos — met by qso-1 alone; the 2 manual items must not count
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
+            2,
+            &super::SupersedeInFlight {
+items: &in_flight,
+origin: // max_concurrent_qsos — met by qso-1 alone; the 2 manual items must not count
             crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+remote_client_key_id: None,
+tx_parity: None,
+},
         )
         .await;
 
@@ -17903,19 +18918,26 @@ mod supersede_rekey_tests {
             let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
-                &mut message_text,
-                &mut frequency_offset,
-                &mut schedule,
+                super::WorkingFrame {
+                    message_text: &mut message_text,
+                    frequency_offset: &mut frequency_offset,
+                    schedule: &mut schedule,
+                },
                 &mut guard,
-                20_000,
-                12_000,
-                pancetta_core::slot::SLOT_NS,
-                pancetta_config::station::TxSelfParity::Auto,
-                now,
+                &super::SlotTimingContext::ft8_for_test(
+                    20_000,
+                    12_000,
+                    pancetta_core::slot::SLOT_NS,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    now,
+                ),
                 1,
-                in_flight_origin,
-                None,
-                &[],
+                &super::SupersedeInFlight {
+                    items: &[],
+                    origin: in_flight_origin,
+                    remote_client_key_id: None,
+                    tx_parity: None,
+                },
             )
             .await;
 
@@ -18037,19 +19059,26 @@ mod supersede_rekey_tests {
             let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
             let outcome = super::supersede_and_rekey_or_bundle(
                 new_request,
-                &mut message_text,
-                &mut frequency_offset,
-                &mut schedule,
+                super::WorkingFrame {
+                    message_text: &mut message_text,
+                    frequency_offset: &mut frequency_offset,
+                    schedule: &mut schedule,
+                },
                 &mut guard,
-                20_000,
-                12_000,
-                pancetta_core::slot::SLOT_NS,
-                pancetta_config::station::TxSelfParity::Auto,
-                now,
+                &super::SlotTimingContext::ft8_for_test(
+                    20_000,
+                    12_000,
+                    pancetta_core::slot::SLOT_NS,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    now,
+                ),
                 2,
-                in_flight_origin,
-                None,
-                &in_flight,
+                &super::SupersedeInFlight {
+                    items: &in_flight,
+                    origin: in_flight_origin,
+                    remote_client_key_id: None,
+                    tx_parity: None,
+                },
             )
             .await;
 
@@ -18105,19 +19134,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            8000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            &super::SlotTimingContext::ft8_for_test(
+                8000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                chrono::Utc::now(),
+            ),
             2,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -18161,7 +19197,6 @@ mod supersede_rekey_tests {
             .unwrap();
 
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
 
         // The bundle currently on the air.
         let in_flight = [crate::message_bus::TransmitRequestItem {
@@ -18207,22 +19242,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
-            &in_flight,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            None,
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                chrono::Utc::now(),
+            ),
             2,
+            super::SupersedeIo {
+                message_bus: &bus,
+                inbox: &inbox,
+                encoder: &mut encoder,
+                ptt_guard: &mut guard,
+            },
         )
         .await;
 
@@ -18288,7 +19327,6 @@ mod supersede_rekey_tests {
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
 
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
 
         // Already a full 2-item bundle in flight — the configured cap.
         let in_flight = [
@@ -18334,22 +19372,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
-            &in_flight,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            Some(cur_parity),
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: Some(cur_parity),
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2, // max_concurrent_qsos — already met by the 2 in-flight items
+            super::SupersedeIo {
+                message_bus: &bus,
+                inbox: &inbox,
+                encoder: &mut encoder,
+                ptt_guard: &mut guard,
+            },
         )
         .await;
 
@@ -18427,7 +19469,6 @@ mod supersede_rekey_tests {
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
 
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
 
         // A 2-item bundle in flight, bound to client-a.
         let in_flight = [
@@ -18473,22 +19514,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
-            &in_flight,
-            crate::message_bus::TxOrigin::Remote,
-            Some("client-a".to_string()),
-            Some(cur_parity),
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
+                tx_parity: Some(cur_parity),
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
+            super::SupersedeIo {
+                message_bus: &bus,
+                inbox: &inbox,
+                encoder: &mut encoder,
+                ptt_guard: &mut guard,
+            },
         )
         .await;
 
@@ -18643,7 +19688,6 @@ mod supersede_rekey_tests {
         let (_, autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
         let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let (cur, _) = pan279_parities();
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -18652,22 +19696,26 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             new_request,
-            in_flight,
-            origin,
-            key.map(str::to_string),
-            Some(cur),
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            &super::SupersedeInFlight {
+                items: in_flight,
+                origin: origin,
+                remote_client_key_id: key.map(str::to_string),
+                tx_parity: Some(cur),
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                chrono::Utc::now(),
+            ),
             max_concurrent_qsos,
+            super::SupersedeIo {
+                message_bus: &bus,
+                inbox: &inbox,
+                encoder: &mut encoder,
+                ptt_guard: &mut guard,
+            },
         )
         .await;
         let requeued = std::iter::from_fn(|| inbox.try_recv().ok())
@@ -18915,19 +19963,26 @@ mod supersede_rekey_tests {
         let request = pan279_request(&new, Some(opposite));
         let outcome = super::supersede_and_rekey_or_bundle(
             request.clone(),
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            3_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            chrono::Utc::now(),
+            &super::SlotTimingContext::ft8_for_test(
+                3_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                chrono::Utc::now(),
+            ),
             2,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &[],
+            &super::SupersedeInFlight {
+                items: &[],
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
         let super::SupersedeOutcome::NotViable { superseder } = outcome else {
@@ -18955,7 +20010,6 @@ mod supersede_rekey_tests {
             .unwrap();
 
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
 
         // A single in-flight QSO — cap=2 leaves room for one more.
         let in_flight = [crate::message_bus::TransmitRequestItem {
@@ -18991,22 +20045,27 @@ mod supersede_rekey_tests {
         let mut guard = keyed_guard(&bus, &ptt_active, &last_ptt_on_ms, &last_ptt_off_ms).await;
         super::supersede_multi_reenqueue(
             superseding,
-            &in_flight,
-            crate::message_bus::TxOrigin::Local,
-            None,
-            Some(cur_parity), // the ESTABLISHED in-flight bundle's own parity
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: Some(cur_parity),
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2, // max_concurrent_qsos — room for the 2nd QSO, Bundle is viable
+            super::SupersedeIo {
+message_bus: &bus,
+inbox: &inbox,
+encoder: // the ESTABLISHED in-flight bundle's own parity
+            &mut encoder,
+ptt_guard: &mut guard,
+},
         )
         .await;
 
@@ -19179,19 +20238,26 @@ mod supersede_rekey_tests {
             outcomes.push(
                 super::supersede_and_rekey_or_bundle(
                     refresh(),
-                    &mut message_text,
-                    &mut frequency_offset,
-                    &mut schedule,
+                    super::WorkingFrame {
+                        message_text: &mut message_text,
+                        frequency_offset: &mut frequency_offset,
+                        schedule: &mut schedule,
+                    },
                     &mut guard,
-                    20_000,
-                    12_000,
-                    pancetta_core::slot::SLOT_NS,
-                    pancetta_config::station::TxSelfParity::Auto,
-                    now,
+                    &super::SlotTimingContext::ft8_for_test(
+                        20_000,
+                        12_000,
+                        pancetta_core::slot::SLOT_NS,
+                        pancetta_config::station::TxSelfParity::Auto,
+                        now,
+                    ),
                     max_concurrent_qsos,
-                    crate::message_bus::TxOrigin::Local,
-                    None,
-                    &in_flight,
+                    &super::SupersedeInFlight {
+                        items: &in_flight,
+                        origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
+                        tx_parity: None,
+                    },
                 )
                 .await,
             );
@@ -19275,20 +20341,27 @@ mod supersede_rekey_tests {
                 origin: crate::message_bus::TxOrigin::Local,
                 remote_client_key_id: None,
             },
-            &mut message_text,
-            &mut frequency_offset,
-            &mut schedule,
+            super::WorkingFrame {
+                message_text: &mut message_text,
+                frequency_offset: &mut frequency_offset,
+                schedule: &mut schedule,
+            },
             &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             // Fox off: normal cap 1, two Hounds still live.
             super::supersede_max_concurrent_qsos(1, 2),
-            crate::message_bus::TxOrigin::Local,
-            None,
-            &in_flight,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                tx_parity: None,
+            },
         )
         .await;
 
@@ -28433,7 +29506,6 @@ mod pan183_attempt_identity_tests {
         let (_a_tx, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
         let (_q_tx, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let mut encoder = super::Ft8Encoder::new();
-        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let remote = crate::message_bus::TxOrigin::Remote;
         let in_flight = [
             item(
@@ -28477,22 +29549,26 @@ mod pan183_attempt_identity_tests {
         .await;
         super::supersede_multi_reenqueue(
             superseding,
-            &in_flight,
-            remote,
-            Some("client-a".to_string()),
-            Some(cur_parity),
-            &mut encoder,
-            pancetta_ft8::Protocol::Ft8,
-            &tx_params,
-            &bus,
-            &inbox,
-            &mut guard,
-            20_000,
-            12_000,
-            pancetta_core::slot::SLOT_NS,
-            pancetta_config::station::TxSelfParity::Auto,
-            now,
+            &super::SupersedeInFlight {
+                items: &in_flight,
+                origin: remote,
+                remote_client_key_id: Some("client-a".to_string()),
+                tx_parity: Some(cur_parity),
+            },
+            &super::SlotTimingContext::ft8_for_test(
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+            ),
             2,
+            super::SupersedeIo {
+                message_bus: &bus,
+                inbox: &inbox,
+                encoder: &mut encoder,
+                ptt_guard: &mut guard,
+            },
         )
         .await;
         match inbox
@@ -29461,3 +30537,6 @@ mod pan279_settlement_worker_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod abort_transcripts;
