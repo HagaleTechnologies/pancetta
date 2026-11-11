@@ -1187,6 +1187,11 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// AC3 (PAN-345), table-driven through the real parser and converter:
+    /// a band-only `["20m"]` allowlist admits a 14074.0 kHz spot and
+    /// excludes a 7074.0 kHz spot; independent band and mode allowlists
+    /// combine with AND; an empty list admits unknown values while a
+    /// nonempty list excludes unknown values for that dimension.
     #[tokio::test]
     async fn cluster_filter_allowlists() {
         /// (bands, modes, freq kHz, comment, admitted?)

@@ -315,9 +315,12 @@ mod tests {
     }
 
     /// AC1/AC3: operator filters run before the bus. A loopback cluster sends
-    /// a CW spot, an FT8 spot on 40m and an allowed FT8 sentinel on 20m; the
-    /// real TUI bus receiver sees only the sentinel, which arrives last, so
-    /// no sleep is needed to infer that the others were dropped.
+    /// a CW spot on 20m (rejected by the mode allowlist), an FT8 spot on
+    /// 7074.0 kHz (AC3's rejected band case: mode-allowed, outside
+    /// bands = ["20m"]) and an FT8 sentinel on 14074.0 kHz (AC3's permitted
+    /// band case, inside ["20m"]); the real TUI bus receiver sees only the
+    /// sentinel, which arrives last, so no sleep is needed to infer that the
+    /// others were dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configured_cluster_filters_before_bus() {
         use std::io::{Read, Write};
