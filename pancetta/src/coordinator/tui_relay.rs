@@ -777,6 +777,8 @@ impl super::ApplicationCoordinator {
                         MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                             callsign,
                             frequency,
+                            mode,
+                            band,
                             spotter,
                             ..
                         }) => {
@@ -811,17 +813,19 @@ impl super::ApplicationCoordinator {
                                     );
                                 }
                             }
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                            let _ = tui_msg_tx_relay.send(cluster_spot_tui_message(
+                                ClusterSpotRelay {
                                     callsign,
                                     frequency,
+                                    mode,
+                                    band,
                                     spotter,
                                     worked_before,
                                     needed,
                                     atno,
                                     band_needed,
                                 },
-                            );
+                            ));
                         }
                         MessageType::StatusUpdate(text) => {
                             // Free-form status emitted by other components (e.g. QSO
@@ -3892,6 +3896,36 @@ enum NudgeOutcome {
     NoEligibleTarget,
 }
 
+/// A cluster spot's fields plus the relay's station lookups, for
+/// [`cluster_spot_tui_message`].
+struct ClusterSpotRelay {
+    callsign: String,
+    frequency: u64,
+    mode: Option<pancetta_core::Mode>,
+    band: Option<pancetta_core::Band>,
+    spotter: String,
+    worked_before: bool,
+    needed: bool,
+    atno: bool,
+    band_needed: bool,
+}
+
+/// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
+/// pass through unchanged (PAN-345).
+fn cluster_spot_tui_message(spot: ClusterSpotRelay) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::DxSpot {
+        callsign: spot.callsign,
+        frequency: spot.frequency,
+        mode: spot.mode,
+        band: spot.band,
+        spotter: spot.spotter,
+        worked_before: spot.worked_before,
+        needed: spot.needed,
+        atno: spot.atno,
+        band_needed: spot.band_needed,
+    }
+}
+
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
 ///
 /// PAN-67: this MUST come from the frequency the decode's own audio window
@@ -4646,6 +4680,56 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn cluster_spot_relay_preserves_metadata() {
+        // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,
+        // including CW and unknown values.
+        for (mode, band) in [
+            (
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (None, None),
+        ] {
+            let msg = super::cluster_spot_tui_message(super::ClusterSpotRelay {
+                callsign: "JA1XYZ".to_string(),
+                frequency: 14_074_000,
+                mode,
+                band,
+                spotter: "W1ABC".to_string(),
+                worked_before: true,
+                needed: true,
+                atno: false,
+                band_needed: true,
+            });
+            match msg {
+                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                    callsign,
+                    frequency,
+                    mode: got_mode,
+                    band: got_band,
+                    spotter,
+                    worked_before,
+                    needed,
+                    atno,
+                    band_needed,
+                } => {
+                    assert_eq!(callsign, "JA1XYZ");
+                    assert_eq!(frequency, 14_074_000);
+                    assert_eq!(got_mode, mode);
+                    assert_eq!(got_band, band);
+                    assert_eq!(spotter, "W1ABC");
+                    assert!(worked_before && needed && !atno && band_needed);
+                }
+                other => panic!("expected DxSpot, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn needed_atno_for_reports_unknown_as_not_needed() {
         // PAN-93: no cqdx list loaded → not shown as needed, even though the

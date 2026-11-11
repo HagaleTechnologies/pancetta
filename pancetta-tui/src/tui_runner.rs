@@ -118,7 +118,14 @@ pub enum TuiMessage {
     /// DX spot
     DxSpot {
         callsign: String,
+        /// Spot frequency in Hz.
         frequency: u64,
+        /// Mode parsed from the cluster spot comment; `None` when unknown
+        /// (PAN-345). Shown as `Unknown`, never assumed FT8.
+        mode: Option<pancetta_core::Mode>,
+        /// Band derived from `frequency` by the shared band table; `None`
+        /// outside it (PAN-345).
+        band: Option<pancetta_core::Band>,
         spotter: String,
         /// Worked-before flag computed by the coordinator relay against
         /// the same CachedStationLookup the autonomous scorer uses
@@ -868,17 +875,21 @@ impl TuiRunner {
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
+                mode,
+                band,
                 spotter: _,
                 worked_before,
                 needed,
                 atno,
                 band_needed,
             } => {
-                // For now use FT8 as default mode
+                // PAN-345: the cluster's parsed mode, `Unknown` when the
+                // comment named none; the band the coordinator derived.
                 app.add_dx_spot(
                     callsign,
                     frequency as f64,
-                    "FT8".to_string(),
+                    band,
+                    mode.map_or_else(|| "Unknown".to_string(), |m| m.to_string()),
                     0,
                     worked_before,
                     needed,
@@ -3295,6 +3306,49 @@ mod key_tests {
         assert_eq!(app.read().await.contest_score.as_ref(), Some(&recovered));
     }
 
+    #[tokio::test]
+    async fn cluster_spot_message_preserves_mode_and_band() {
+        // PAN-345: the cluster's parsed mode and the coordinator's band reach
+        // the row through the real handler; CW stays CW and an unknown mode
+        // is `Unknown`, never FT8.
+        let (mut runner, _, app) = make_runner().await;
+        for (call, mode, band, shown) in [
+            (
+                "JA1FT8",
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+                "FT8",
+            ),
+            (
+                "JA1CW",
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+                "CW",
+            ),
+            ("JA1UNK", None, None, "Unknown"),
+        ] {
+            runner
+                .handle_message(TuiMessage::DxSpot {
+                    callsign: call.to_string(),
+                    frequency: 14_074_000,
+                    mode,
+                    band,
+                    spotter: "W1ABC".to_string(),
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    band_needed: false,
+                })
+                .await
+                .unwrap();
+            let app = app.read().await;
+            let row = &app.dx_stations[call];
+            assert_eq!(row.mode, shown, "{call}");
+            assert_eq!(row.band, band, "{call}");
+            assert_eq!(row.frequency, 14_074_000.0, "{call}: Hz kept unchanged");
+        }
+    }
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
@@ -3359,6 +3413,7 @@ mod key_tests {
             app.add_dx_spot(
                 "W5ABC".into(),
                 14.074,
+                None,
                 "FT8".into(),
                 -10,
                 false,
@@ -4061,6 +4116,7 @@ mod key_tests {
             call_sign: "VK9XX".to_string(),
             grid_square: Some("QH30".to_string()),
             frequency: 14.074,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -10,
@@ -6660,6 +6716,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,
@@ -7377,6 +7434,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,

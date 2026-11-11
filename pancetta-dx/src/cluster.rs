@@ -198,6 +198,34 @@ impl Default for ClusterFilter {
     }
 }
 
+impl ClusterFilter {
+    /// Why a spot at `frequency_hz` with the derived `band` and parsed `mode`
+    /// is excluded, or `None` when every configured restriction admits it
+    /// (PAN-345). Frequency bounds are inclusive. An empty band/mode list
+    /// admits any value, unknown included; a nonempty list excludes values it
+    /// does not name, unknown included. Restrictions combine with AND.
+    fn rejection(
+        &self,
+        frequency_hz: u64,
+        band: Option<Band>,
+        mode: Option<Mode>,
+    ) -> Option<&'static str> {
+        if self.min_frequency.is_some_and(|min| frequency_hz < min) {
+            return Some("Frequency below minimum");
+        }
+        if self.max_frequency.is_some_and(|max| frequency_hz > max) {
+            return Some("Frequency above maximum");
+        }
+        if !self.bands.is_empty() && !band.is_some_and(|b| self.bands.contains(&b)) {
+            return Some("Band not in filter");
+        }
+        if !self.modes.is_empty() && !mode.is_some_and(|m| self.modes.contains(&m)) {
+            return Some("Mode not in filter");
+        }
+        None
+    }
+}
+
 /// DX Cluster connection status
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -913,18 +941,43 @@ impl DxClusterClient {
         });
     }
 
-    /// Convert cluster spot to DxSpot
+    /// Convert cluster spot to DxSpot (PAN-345).
+    ///
+    /// Applies the configured frequency, band and mode allowlists BEFORE the
+    /// duplicate check, so a rejected spot never records a dedup key that
+    /// would suppress a later accepted spot for the same callsign/frequency.
+    /// Band comes from the shared [`Band::from_frequency`] table; an empty
+    /// allowlist admits everything (unknown included), a nonempty one admits
+    /// only listed values (unknown excluded). A zero `duplicate_timeout`
+    /// disables duplicate suppression.
     async fn convert_cluster_spot(
         cluster_spot: ClusterSpot,
         filter: &ClusterFilter,
         recent_spots: &Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     ) -> Result<DxSpot> {
-        // Check for duplicates
-        let spot_key = format!(
-            "{}:{}",
-            cluster_spot.callsign, cluster_spot.frequency_khz as u64
-        );
-        {
+        // A malformed frequency must not masquerade as valid metadata.
+        if !cluster_spot.frequency_khz.is_finite() || cluster_spot.frequency_khz <= 0.0 {
+            return Err(DxError::Configuration("Invalid spot frequency".to_string()));
+        }
+
+        // Convert frequency to Hz, rounded: `2048.14 * 1000.0` is
+        // 2048139.9999999998, which truncation would carry as 2048139 Hz and
+        // judge against inclusive limits and band edges one hertz low.
+        let frequency = (cluster_spot.frequency_khz * 1000.0).round() as u64;
+        let band = Band::from_frequency(frequency);
+        // Try to extract mode from comment
+        let mode = Self::extract_mode_from_comment(&cluster_spot.comment);
+
+        if let Some(reason) = filter.rejection(frequency, band, mode) {
+            return Err(DxError::Configuration(reason.to_string()));
+        }
+
+        // Check for duplicates (accepted spots only)
+        if filter.duplicate_timeout > 0 {
+            let spot_key = format!(
+                "{}:{}",
+                cluster_spot.callsign, cluster_spot.frequency_khz as u64
+            );
             let now = Utc::now();
             let mut recent = recent_spots.lock().await;
             if let Some(last_time) = recent.get(&spot_key) {
@@ -942,29 +995,6 @@ impl DxClusterClient {
             // aged past the window so they can't linger and mis-dedup.
             Self::prune_recent_spots(&mut recent, now, filter.duplicate_timeout);
         }
-
-        // Convert frequency to Hz
-        let frequency = (cluster_spot.frequency_khz * 1000.0) as u64;
-
-        // Apply frequency filters
-        if let Some(min_freq) = filter.min_frequency {
-            if frequency < min_freq {
-                return Err(DxError::Configuration(
-                    "Frequency below minimum".to_string(),
-                ));
-            }
-        }
-
-        if let Some(max_freq) = filter.max_frequency {
-            if frequency > max_freq {
-                return Err(DxError::Configuration(
-                    "Frequency above maximum".to_string(),
-                ));
-            }
-        }
-
-        // Try to extract mode from comment
-        let mode = Self::extract_mode_from_comment(&cluster_spot.comment);
 
         Ok(DxSpot {
             callsign: cluster_spot.callsign,
@@ -1134,6 +1164,276 @@ mod tests {
             DxClusterClient::extract_mode_from_comment("Just saying hello"),
             None
         );
+    }
+
+    /// A real telnet spot line timed "now", so an accepted spot's dedup key
+    /// stays inside the window instead of being pruned as an old spot.
+    fn pan345_line(freq_khz: &str, call: &str, comment: &str) -> String {
+        let time = Utc::now().format("%H%MZ");
+        format!("DX de W1ABC:     {freq_khz}  {call}       {comment}     {time}")
+    }
+
+    /// Parse `line` with the real parser, then run the real converter.
+    async fn pan345_convert(
+        line: &str,
+        filter: &ClusterFilter,
+        recent: &Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    ) -> Result<DxSpot> {
+        let spot = DxClusterClient::parse_dx_spot(line).expect("a parseable spot line");
+        DxClusterClient::convert_cluster_spot(spot, filter, recent).await
+    }
+
+    fn pan345_recent() -> Arc<Mutex<HashMap<String, DateTime<Utc>>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn cluster_filter_allowlists() {
+        /// (bands, modes, freq kHz, comment, admitted?)
+        type Case<'a> = (&'a [Band], &'a [Mode], &'a str, &'a str, bool);
+        let cases: &[Case] = &[
+            // Empty lists admit everything, unknown included.
+            (&[], &[], "14074.0", "FT8 -10 dB", true),
+            (&[], &[], "14074.0", "CW 25 WPM", true),
+            (&[], &[], "14074.0", "no mode here", true),
+            (&[], &[], "1000.0", "FT8 out of every band", true),
+            // Mode allowlist.
+            (&[], &[Mode::FT8], "14074.0", "FT8 -10 dB", true),
+            (&[], &[Mode::FT8], "14074.0", "CW 25 WPM", false),
+            (&[], &[Mode::FT8], "14074.0", "no mode here", false),
+            (&[], &[Mode::FT8, Mode::CW], "14025.0", "CW 25 WPM", true),
+            // Band allowlist.
+            (&[Band::Band20m], &[], "14074.0", "FT8 -10 dB", true),
+            (&[Band::Band20m], &[], "7074.0", "FT8 -10 dB", false),
+            (
+                &[Band::Band20m],
+                &[],
+                "1000.0",
+                "FT8 out of every band",
+                false,
+            ),
+            (&[Band::Band20m, Band::Band40m], &[], "7074.0", "FT8", true),
+            // Both combine with AND.
+            (
+                &[Band::Band20m],
+                &[Mode::FT8],
+                "14074.0",
+                "FT8 -10 dB",
+                true,
+            ),
+            (
+                &[Band::Band20m],
+                &[Mode::FT8],
+                "14074.0",
+                "CW 25 WPM",
+                false,
+            ),
+            (
+                &[Band::Band20m],
+                &[Mode::FT8],
+                "7074.0",
+                "FT8 -10 dB",
+                false,
+            ),
+            (&[Band::Band20m], &[Mode::FT8], "7025.0", "CW 25 WPM", false),
+        ];
+        for (i, (bands, modes, freq, comment, admitted)) in cases.iter().enumerate() {
+            let filter = ClusterFilter {
+                bands: bands.to_vec(),
+                modes: modes.to_vec(),
+                ..Default::default()
+            };
+            let call = format!("JA{i}XYZ");
+            let got = pan345_convert(
+                &pan345_line(freq, &call, comment),
+                &filter,
+                &pan345_recent(),
+            )
+            .await;
+            assert_eq!(
+                got.is_ok(),
+                *admitted,
+                "case {i}: bands {bands:?} modes {modes:?} {freq} kHz {comment:?} -> {got:?}"
+            );
+        }
+
+        // An admitted CW spot stays CW and an unknown mode stays None.
+        let recent = pan345_recent();
+        let cw = pan345_convert(
+            &pan345_line("14025.0", "K1CW", "CW 25 WPM"),
+            &ClusterFilter::default(),
+            &recent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cw.mode, Some(Mode::CW));
+        let unknown = pan345_convert(
+            &pan345_line("14025.0", "K1UNK", "loud"),
+            &ClusterFilter::default(),
+            &recent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown.mode, None);
+    }
+
+    #[tokio::test]
+    async fn cluster_filter_band_edges() {
+        let only_20m = ClusterFilter {
+            bands: vec![Band::Band20m],
+            duplicate_timeout: 0,
+            ..Default::default()
+        };
+        // The shared table's 20m edges are inclusive: 14000.0 and 14350.0 kHz.
+        for (freq, admitted) in [
+            ("13999.9", false),
+            ("14000.0", true),
+            ("14074.0", true),
+            ("14350.0", true),
+            ("14350.1", false),
+        ] {
+            let got = pan345_convert(
+                &pan345_line(freq, "JA1XYZ", "FT8"),
+                &only_20m,
+                &pan345_recent(),
+            )
+            .await;
+            assert_eq!(got.is_ok(), admitted, "{freq} kHz -> {got:?}");
+            if let Ok(spot) = got {
+                assert_eq!(Band::from_frequency(spot.frequency), Some(Band::Band20m));
+            }
+        }
+        // 14074.0 kHz carries 14,074,000 Hz, which the shared table calls 20m;
+        // a frequency outside every band derives no band.
+        let spot = pan345_convert(
+            &pan345_line("14074.0", "JA1XYZ", "FT8"),
+            &ClusterFilter::default(),
+            &pan345_recent(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(spot.frequency, 14_074_000);
+        assert_eq!(Band::from_frequency(spot.frequency), Some(Band::Band20m));
+        assert_eq!(Band::from_frequency(1_000_000), None);
+
+        // Malformed frequencies are refused, never converted.
+        for freq in [0.0, -14074.0, f64::NAN, f64::INFINITY] {
+            let spot = ClusterSpot {
+                callsign: "JA1XYZ".to_string(),
+                frequency_khz: freq,
+                spotter: "W1ABC".to_string(),
+                time: Utc::now(),
+                comment: "FT8".to_string(),
+                raw_line: String::new(),
+            };
+            let got = DxClusterClient::convert_cluster_spot(
+                spot,
+                &ClusterFilter::default(),
+                &pan345_recent(),
+            )
+            .await;
+            assert!(got.is_err(), "{freq} kHz must be refused: {got:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_filter_frequency_limits() {
+        let limits = ClusterFilter {
+            min_frequency: Some(14_000_000),
+            max_frequency: Some(14_350_000),
+            duplicate_timeout: 0,
+            ..Default::default()
+        };
+        for (freq, admitted) in [
+            ("13999.0", false),
+            ("14000.0", true),
+            ("14350.0", true),
+            ("14351.0", false),
+        ] {
+            let got = pan345_convert(
+                &pan345_line(freq, "JA1XYZ", "FT8"),
+                &limits,
+                &pan345_recent(),
+            )
+            .await;
+            assert_eq!(got.is_ok(), admitted, "{freq} kHz -> {got:?}");
+        }
+
+        // A two-decimal kHz value lands on its exact hertz, so an inclusive
+        // limit at that hertz admits it.
+        let exact = ClusterFilter {
+            min_frequency: Some(2_048_140),
+            max_frequency: Some(2_048_140),
+            duplicate_timeout: 0,
+            ..Default::default()
+        };
+        let spot = pan345_convert(
+            &pan345_line("2048.14", "JA1XYZ", "FT8"),
+            &exact,
+            &pan345_recent(),
+        )
+        .await
+        .expect("2048.14 kHz is exactly 2,048,140 Hz");
+        assert_eq!(spot.frequency, 2_048_140);
+    }
+
+    #[tokio::test]
+    async fn rejected_spot_does_not_poison_dedup() {
+        let ft8_only = ClusterFilter {
+            modes: vec![Mode::FT8],
+            duplicate_timeout: 600,
+            ..Default::default()
+        };
+        let recent = pan345_recent();
+        let cw = pan345_convert(
+            &pan345_line("14074.0", "JA1XYZ", "CW 25 WPM"),
+            &ft8_only,
+            &recent,
+        )
+        .await;
+        assert!(cw.is_err(), "CW spot must be filtered: {cw:?}");
+        assert!(
+            recent.lock().await.is_empty(),
+            "a rejected spot records no dedup key"
+        );
+
+        let ft8 = pan345_convert(
+            &pan345_line("14074.0", "JA1XYZ", "FT8 -10 dB"),
+            &ft8_only,
+            &recent,
+        )
+        .await
+        .expect("the following FT8 spot is accepted");
+        assert_eq!(ft8.mode, Some(Mode::FT8));
+    }
+
+    #[tokio::test]
+    async fn accepted_spots_obey_duplicate_window() {
+        let line = pan345_line("14074.0", "JA1XYZ", "FT8 -10 dB");
+
+        let windowed = ClusterFilter {
+            duplicate_timeout: 600,
+            ..Default::default()
+        };
+        let recent = pan345_recent();
+        assert!(pan345_convert(&line, &windowed, &recent).await.is_ok());
+        assert!(
+            pan345_convert(&line, &windowed, &recent).await.is_err(),
+            "a repeat inside the window is suppressed"
+        );
+
+        let disabled = ClusterFilter {
+            duplicate_timeout: 0,
+            ..Default::default()
+        };
+        let recent = pan345_recent();
+        for _ in 0..3 {
+            assert!(
+                pan345_convert(&line, &disabled, &recent).await.is_ok(),
+                "a zero window disables suppression"
+            );
+        }
+        assert!(recent.lock().await.is_empty());
     }
 
     #[test]
