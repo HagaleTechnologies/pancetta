@@ -685,9 +685,10 @@ changing `send_message` for its other callers; an out-of-band flush channel
 (it could clear the buffer before the revoked samples reached it).
 
 Not covered: manual PTT (TUI and remote) does not pass through the TX worker
-and is not gated on the flush wait. Hamlib's command loop clears its PTT
-watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
-stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
+and is not gated on the flush wait. Since PAN-272, a failed CAT unkey keeps
+Hamlib's PTT watchdog armed with its original key-down time, and the watchdog
+retries the unkey within a second until the rig confirms it or a later
+key-down starts a fresh timer. Non-remote PTT-off sites (clock-step hold, normal
 Step 9, supersede, tune completion) keep best-effort delivery.
 
 ## PAN-136: bundle items carry their own authorization

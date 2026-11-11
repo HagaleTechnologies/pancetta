@@ -1679,7 +1679,10 @@ pub struct ApplicationCoordinator {
 
     /// PAN-89: latched `true` when a Hamlib teardown could not force PTT off
     /// and retained the PTT watchdog as an orphan (the "watchdog retained"
-    /// diagnostic in `hamlib::teardown_hamlib`). Cleared only by a
+    /// diagnostic in `hamlib::teardown_hamlib`), or (PAN-272) when the
+    /// Hamlib command loop's `SetPtt { state: false }` fails while the PTT
+    /// watchdog tracker is armed, so the watchdog keeps retrying the unkey.
+    /// Cleared only by a
     /// rig-confirmed PTT-off, via `hamlib::confirm_ptt_off`: teardown's
     /// successful PTT-off, the startup `set_ptt(Off)`, the PTT watchdog's
     /// forced off and the command loop's `SetPtt { state: false }`. Orphan
