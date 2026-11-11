@@ -7,21 +7,16 @@ use crate::adif::{AdifProcessor, AdifQso, AdifRecord};
 use crate::states::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteConnectOptions, Connection};
 use sqlx::{
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
         SqliteSynchronous,
     },
-    Row,
+    Connection, Row,
 };
 use std::collections::HashMap;
-<<<<<<< HEAD
 use std::path::{Path, PathBuf};
-=======
-use std::path::Path;
 use std::str::FromStr;
->>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;

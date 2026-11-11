@@ -102,11 +102,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
 
-<<<<<<< HEAD
 - The startup index rebuild builds `qso.db.new`, checkpoints the old index, keeps it as `qso.db.pre-rebuild[.N]` when it holds contacts ADIF lacks or cannot be read, then renames over. Staleness compares contacts, never mtimes. Legacy migration copies `qso.db` to `qso.db.pre-migration` first, refuses unreadable rows, and keeps the ADIF writer closed on refusal (PAN-282).
-=======
 - TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.
->>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
 
 ## Where Things Live
 
