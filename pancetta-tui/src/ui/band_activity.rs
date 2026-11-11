@@ -1,3 +1,5 @@
+use super::need_display::{atno_style, band_marker, need_marker, needed_style};
+use crate::dx_need::canonical_grid_square;
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
@@ -59,25 +61,26 @@ impl BandActivityColumn {
             BandActivityColumn::Snr => Constraint::Length(4),
             BandActivityColumn::Dt => Constraint::Length(5), // fits "-15.2"
             BandActivityColumn::Df => Constraint::Length(6), // fits "+2800"
-            // Widened to absorb the engaged "● " prefix.
-            BandActivityColumn::Call => Constraint::Length(10),
-            BandActivityColumn::Grid => Constraint::Length(4),
+            // Need markers plus directed/engaged prefix and a portable call.
+            BandActivityColumn::Call => Constraint::Length(12),
+            BandActivityColumn::Grid => Constraint::Length(5),
             BandActivityColumn::Dist => Constraint::Length(6),
             BandActivityColumn::Msg => Constraint::Min(20),
         }
     }
 }
 
-/// Adaptive column set for a given panel width (Task 20b). Below 70 cols,
-/// `Dist`+`Grid` are dropped (least essential for a quick scan); below 55,
+/// Adaptive column set for a given panel width (Task 20b). Below 77 cols,
+/// `Dist`+`Grid` are dropped (least essential for a quick scan); below 64,
 /// `DT`+`DF` go too (fine sync/freq offsets an operator can live without at
 /// that width) — leaving Time/SNR/Call/Msg as the irreducible core.
+// Budgets include borders, column gaps and the two-cell selection marker.
 fn visible_columns(width: u16) -> Vec<BandActivityColumn> {
     let mut cols: Vec<BandActivityColumn> = BandActivityColumn::ALL.to_vec();
-    if width < 70 {
+    if width < 77 {
         cols.retain(|c| !matches!(c, BandActivityColumn::Grid | BandActivityColumn::Dist));
     }
-    if width < 55 {
+    if width < 64 {
         cols.retain(|c| !matches!(c, BandActivityColumn::Dt | BandActivityColumn::Df));
     }
     cols
@@ -211,6 +214,12 @@ fn create_message_row<'a>(
     // for an engaged (active-QSO) station, or "» TX" for a frame WE
     // transmitted (#172) — call_sign is always None for these rows, the
     // full exchange text is in the Msg column.
+    let (needed, atno) = msg
+        .call_sign
+        .as_deref()
+        .filter(|_| !msg.is_own_tx)
+        .map(|call| app.dx_need_flags_shown(call, msg.needed, msg.atno))
+        .unwrap_or((false, false));
     let call_str = if msg.is_own_tx {
         "» TX".to_string()
     } else {
@@ -221,7 +230,39 @@ fn create_message_row<'a>(
             None => "---".to_string(),
         }
     };
-    let grid_str = msg.grid_square.as_deref().unwrap_or("---");
+    let call_str = if !msg.is_own_tx && msg.call_sign.is_some() {
+        format!(
+            "{}{}{}",
+            need_marker(atno, needed, false),
+            band_marker(msg.band_needed, atno),
+            call_str
+        )
+    } else {
+        call_str
+    };
+    let grid = msg.grid_square.as_deref().and_then(canonical_grid_square);
+    // A frame's grid verdict answers for the current DX row, not an older
+    // decode of a rover at a different locator. Use the exact normalized key.
+    let grid_needed = !msg.is_own_tx
+        && grid.as_ref().is_some_and(|square| {
+            msg.call_sign.as_deref().is_some_and(|call| {
+                let key = pancetta_core::callsign::resolve_hash_render(call).unwrap_or(call);
+                app.dx_stations
+                    .get(key)
+                    .and_then(|station| station.grid_square.as_deref())
+                    .and_then(canonical_grid_square)
+                    .as_ref()
+                    == Some(square)
+                    && app
+                        .dx_need_for(call)
+                        .is_some_and(|need| need.grid_needed == Some(true))
+            })
+        });
+    let grid_str = match grid {
+        Some(square) if grid_needed => format!("+{square}"),
+        Some(square) => square,
+        None => "---".into(),
+    };
     let dist_str = format_distance(msg.distance);
 
     // Truncate long messages. Raised from 30 to 60 chars (Task 20a) — the
@@ -274,11 +315,15 @@ fn create_message_row<'a>(
         Style::default()
             .fg(app.theme.selected_color())
             .add_modifier(Modifier::BOLD)
+    } else if atno {
+        atno_style()
     } else if msg.worked_before {
         // Already in the log on this band — dim the callsign the same
         // way the DX hunter panel does, so the operator's eye skips
         // stations the autonomous scorer would also dup-penalize.
         Style::default().fg(app.theme.muted_color())
+    } else if needed {
+        needed_style(&app.theme)
     } else if msg.call_sign.is_some() {
         Style::default()
             .fg(app.theme.success_color())
@@ -345,7 +390,11 @@ fn create_message_row<'a>(
         ),
         (
             BandActivityColumn::Grid,
-            Cell::from(grid_str).style(neutral_style),
+            Cell::from(grid_str).style(if grid_needed {
+                needed_style(&app.theme)
+            } else {
+                neutral_style
+            }),
         ),
         (
             BandActivityColumn::Dist,
@@ -432,6 +481,270 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    struct Need(crate::dx_need::DxNeedStatus);
+    impl crate::dx_need::DxNeedLookup for Need {
+        fn lookup_need(
+            &self,
+            _: &str,
+            _: Option<&'static str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: f64,
+            _: Option<&str>,
+        ) -> crate::dx_need::DxNeedStatus {
+            self.0.clone()
+        }
+    }
+
+    async fn need_app(msg: DecodedMessageView) -> App {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        app.add_decoded_message(msg).await.unwrap();
+        app.active_panel = ActivePanel::Callers;
+        app
+    }
+
+    fn render_need(app: &App, width: u16, hunter: bool) -> ratatui::buffer::Buffer {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+        term.draw(|f| {
+            if hunter {
+                crate::ui::dx_hunter::render_dx_hunter(f, f.area(), app).unwrap();
+            } else {
+                render_band_activity(f, f.area(), app).unwrap();
+            }
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn token_cell<'a>(buf: &'a ratatui::buffer::Buffer, token: &str) -> &'a ratatui::buffer::Cell {
+        let row = row_text(buf, 2);
+        let byte = row
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token:?}: {row}"));
+        &buf[(row[..byte].chars().count() as u16, 2)]
+    }
+
+    fn call_text(buf: &ratatui::buffer::Buffer) -> String {
+        let header = header_row_text(buf);
+        let byte = header.find("Call").unwrap();
+        let x = header[..byte].chars().count() as u16;
+        (x..x + 12)
+            .map(|x| buf[(x, 2)].symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn pan350_call_need_parity() {
+        use ratatui::style::Color;
+        for (needed, atno, band, worked, prefix) in [
+            (true, true, true, false, "!"),
+            (true, false, true, false, "+▲"),
+            (false, false, true, false, "▲"),
+            (false, false, false, false, ""),
+            (true, false, false, true, "+"),
+            (true, true, false, true, "!"),
+        ] {
+            let mut msg = fixture_message("ZL1ABC");
+            msg.needed = needed;
+            msg.atno = atno;
+            msg.band_needed = band;
+            msg.worked_before = worked;
+            let app = need_app(msg).await;
+            let token = format!("{prefix}ZL1ABC");
+            let band = render_need(&app, 220, false);
+            let dx = render_need(&app, 220, true);
+            assert_eq!(call_text(&band), token);
+            assert_eq!(call_text(&dx), token);
+            let a = token_cell(&band, &token);
+            let b = token_cell(&dx, &token);
+            assert_eq!((a.fg, a.modifier), (b.fg, b.modifier));
+            assert_eq!(
+                a.fg,
+                if atno {
+                    Color::Magenta
+                } else if worked {
+                    app.theme.muted_color()
+                } else if needed {
+                    app.theme.error_color()
+                } else {
+                    app.theme.success_color()
+                }
+            );
+            assert_eq!(
+                a.modifier,
+                if atno {
+                    Modifier::BOLD | Modifier::UNDERLINED
+                } else if worked {
+                    Modifier::empty()
+                } else {
+                    Modifier::BOLD
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pan350_live_need_and_grid_parity() {
+        for (stored, atno, verdict, prefix) in [
+            (true, true, Some(false), ""),
+            (false, false, Some(true), "+"),
+            (true, true, None, "!"),
+            (true, false, None, "+"),
+            (false, false, None, ""),
+        ] {
+            for call in ["ZL1ABC", "<ZL1ABC>"] {
+                let mut msg = fixture_message(call);
+                msg.needed = stored;
+                msg.atno = atno;
+                msg.grid_square = Some("rf72ab".into());
+                let mut app = need_app(msg).await;
+                for grid_need in [Some(true), Some(false), None] {
+                    app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+                        dxcc_needed: verdict,
+                        grid_needed: grid_need,
+                        ..Default::default()
+                    })));
+                    let band = render_need(&app, 220, false);
+                    let dx = render_need(&app, 220, true);
+                    assert_eq!(call_text(&band), format!("{prefix}{call}"));
+                    assert_eq!(call_text(&dx), format!("{prefix}ZL1ABC"));
+                    let a = token_cell(&band, &format!("{prefix}{call}"));
+                    let b = token_cell(&dx, &format!("{prefix}ZL1ABC"));
+                    assert_eq!((a.fg, a.modifier), (b.fg, b.modifier));
+                    let grid = if grid_need == Some(true) {
+                        "+RF72"
+                    } else {
+                        "RF72"
+                    };
+                    for buf in [&band, &dx] {
+                        let c = token_cell(buf, grid);
+                        if grid_need == Some(true) {
+                            assert_eq!(c.fg, app.theme.error_color());
+                            assert!(c.modifier.contains(Modifier::BOLD));
+                        } else {
+                            assert!(!row_text(buf, 2).contains("+RF72"));
+                        }
+                    }
+                }
+            }
+        }
+        let mut msg = fixture_message("ZL1ABC");
+        msg.grid_square = Some("rf72ab".into());
+        let mut app = need_app(msg).await;
+        app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+            grid_needed: Some(true),
+            ..Default::default()
+        })));
+        app.dx_stations.get_mut("ZL1ABC").unwrap().grid_square = Some("FN42".into());
+        assert!(!row_text(&render_need(&app, 120, false), 2).contains("+RF72"));
+        app.dx_stations.clear();
+        assert!(!row_text(&render_need(&app, 120, false), 2).contains("+RF72"));
+        for invalid in [None, Some("ZZ34"), Some("RF72☃")] {
+            app.decoded_messages.front_mut().unwrap().grid_square = invalid.map(str::to_string);
+            let buf = render_need(&app, 120, false);
+            token_cell(&buf, "---");
+            assert!(!row_text(&buf, 2).contains("+RF72"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pan350_marker_widths_and_overrides() {
+        let mut msg = fixture_message("ZL1ABC/P");
+        msg.needed = true;
+        msg.band_needed = true;
+        msg.is_directed_at_us = true;
+        msg.grid_square = Some("rf72ab".into());
+        msg.message = "CQ ZL1ABC/P RF72".into();
+        let mut app = need_app(msg).await;
+        app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+            grid_needed: Some(true),
+            ..Default::default()
+        })));
+        for width in [120, 77, 76, 70, 65, 64, 63, 55, 51] {
+            let buf = render_need(&app, width, false);
+            let cell = token_cell(&buf, "+▲→ ZL1ABC/P");
+            assert_eq!(cell.fg, app.theme.selected_color());
+            token_cell(&buf, "CQ ZL1ABC/P RF72");
+            assert_eq!(header_row_text(&buf).contains("Grid"), width >= 77);
+            assert_eq!(header_row_text(&buf).contains("DT"), width >= 64);
+            if width >= 77 {
+                token_cell(&buf, "+RF72");
+            }
+        }
+        app.active_panel = ActivePanel::BandActivity;
+        let buf = render_need(&app, 120, false);
+        let c = token_cell(&buf, "+▲→ ZL1ABC/P");
+        assert_eq!(c.fg, ratatui::style::Color::Black);
+        assert_eq!(c.bg, app.theme.accent_color());
+        app.active_panel = ActivePanel::Callers;
+        app.decoded_messages.front_mut().unwrap().is_directed_at_us = false;
+        app.active_qsos.push(fixture_banner("ZL1ABC/P"));
+        let buf = render_need(&app, 120, false);
+        let c = token_cell(&buf, "+▲● ZL1ABC/P");
+        assert_eq!(c.fg, app.theme.success_color());
+        assert!(c.modifier.contains(Modifier::UNDERLINED));
+        app.active_qsos.clear();
+        app.active_panel = ActivePanel::DxHunter;
+        let buf = render_need(&app, 120, false);
+        assert_eq!(
+            token_cell(&buf, "+▲ZL1ABC/P").fg,
+            app.theme.selected_color()
+        );
+        app.active_panel = ActivePanel::Callers;
+        let row = app.decoded_messages.front_mut().unwrap();
+        row.is_own_tx = true;
+        row.call_sign = None;
+        token_cell(&render_need(&app, 120, false), "» TX");
+        app.decoded_messages.front_mut().unwrap().is_own_tx = false;
+        token_cell(&render_need(&app, 120, false), "---");
+        app.decoded_messages.clear();
+        let buf = render_need(&app, 120, false);
+        token_cell(&buf, "No messages");
+        token_cell(&buf, "Monitoring...");
+        for width in [0, 1, 2, 3, 10] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 8)).unwrap();
+            terminal
+                .draw(|f| render_band_activity(f, Rect::new(0, 0, width, 0), &app).unwrap())
+                .unwrap();
+        }
+    }
+
+    fn fixture_banner(call: &str) -> crate::app::ActiveQsoBanner {
+        crate::app::ActiveQsoBanner {
+            their_callsign: call.into(),
+            state: "wait rpt".into(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1234.0,
+            tx_parity: None,
+            last_tx_text: None,
+            last_tx_at: None,
+            last_rx_text: None,
+            last_rx_at: None,
+            snr_rx: None,
+            report_sent: None,
+            report_received: None,
+            exchange_count: 0,
+            qso_id: format!("{call}-id"),
+            initiated_by: "Manual".into(),
+            ladder_labels: Vec::new(),
+            ladder_ours: Vec::new(),
+            ladder_index: 0,
+            now_line: String::new(),
+            next_line: String::new(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
+            dx_last_activity: None,
+            hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
+        }
+    }
+
     #[test]
     fn test_extract_callsign_from_cq() {
         let message = "CQ DX K1ABC FN42";
@@ -459,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_columns_drops_dist_grid_below_70() {
+    fn visible_columns_drops_dist_grid_below_77() {
         let cols = visible_columns(65);
         assert!(!cols.contains(&BandActivityColumn::Grid));
         assert!(!cols.contains(&BandActivityColumn::Dist));
@@ -471,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_columns_also_drops_dt_df_below_55() {
+    fn visible_columns_also_drops_dt_df_below_64() {
         let cols = visible_columns(50);
         assert!(!cols.contains(&BandActivityColumn::Grid));
         assert!(!cols.contains(&BandActivityColumn::Dist));

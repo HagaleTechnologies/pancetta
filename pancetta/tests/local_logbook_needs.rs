@@ -87,6 +87,7 @@ async fn decode(app: &mut App, lookup: &CachedStationLookup, call: &str, mhz: f6
 
 enum View {
     Hunter,
+    BandActivity,
     Card,
     Overlay,
 }
@@ -97,6 +98,9 @@ fn render(app: &mut App, view: View, width: u16, height: u16) -> String {
         .draw(|f| match view {
             View::Hunter => {
                 pancetta_tui::ui::dx_hunter::render_dx_hunter(f, f.area(), app).unwrap()
+            }
+            View::BandActivity => {
+                pancetta_tui::ui::band_activity::render_band_activity(f, f.area(), app).unwrap()
             }
             View::Card => {
                 pancetta_tui::ui::station_card::render_station_card(f, f.area(), app).unwrap()
@@ -144,6 +148,9 @@ async fn needed_dxcc_works_offline() {
     let row = row_of(&hunter, "ZL1ABC");
     assert!(row.contains("!ZL1ABC"), "{row}");
     assert!(row.contains("all-time new entity (local logbook)"), "{row}");
+
+    let band = render(&mut app, View::BandActivity, 120, 12);
+    assert!(row_of(&band, "ZL1ABC").contains("!ZL1ABC"), "{band}");
 
     let card = render(&mut app, View::Card, 130, 6);
     assert!(card.contains("ATNO\u{2605}"), "{card}");

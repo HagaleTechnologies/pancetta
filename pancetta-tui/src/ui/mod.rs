@@ -15,6 +15,7 @@ pub mod band_activity;
 pub mod bar_fit;
 pub mod callers;
 pub mod dx_hunter;
+mod need_display;
 pub mod qso_status;
 pub mod readiness_strip;
 pub mod station_card;

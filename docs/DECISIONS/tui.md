@@ -458,3 +458,23 @@ and say nothing about any one station. The strip chip and the Why text carry
 - **Key-effect golden.** `pancetta-tui/tests/fixtures/key_effects.golden` records what every key does (status line, commands sent, App fields changed) in five modifier sets across 36 scenarios: the main view on every panel, zoomed, stopped and TX-disabled, every dialog on a rich fixture, and six empty-dialog cases. The rich fixture includes audio devices, diagnostic events and recent QSOs. It was blessed from the pre-refactor handler at `7053b62` (the harness, `tui_runner/key_effects.rs`, uses only APIs that exist there, so it can be dropped onto that commit to re-check), and the new handler reproduces it byte for byte. Any change to what a key does fails `key_effects_match_golden` until it is re-blessed on purpose with `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`. The variable is separate from `PANCETTA_REGEN_DOCS`, so regenerating docs never re-blesses key behaviour.
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
+
+## Band Activity need markers (PAN-350, 2026-11-11)
+
+Band Activity consumes the same prepared entity verdict as DX Hunter, falling
+back to stored decode flags when no verdict exists. Both use shared need glyph
+and style helpers: ATNO `!` suppresses needed `+` and band-new `▲`; otherwise
+`+` precedes `▲`. Band Activity puts these before its directed or engaged
+prefix. ATNO is bold magenta and underlined, ahead of worked-before; ordinary
+needed is bold error colour, behind worked-before. Own TX, directed and global
+focus styles win first; engaged adds green underline and selection retains
+black text on accent. Own TX and missing calls have no need markers.
+
+A new-grid `+` appears only when the prepared verdict is true and the decode's
+canonical grid matches the current DX row's canonical grid. Historical decodes
+retain their grid and band-needed flag. Unknown, invalid, absent or mismatched
+grid history adds no marker and triggers no lookup during rendering.
+
+Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
+borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
+below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.

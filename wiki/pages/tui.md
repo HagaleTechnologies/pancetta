@@ -68,3 +68,8 @@ The local relay remembers the last decoded grid per exact callsign and band for
 its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
+
+Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
+only marks a grid when both rows have the same canonical square. A later rover
+locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
+and middle width tiers start at 77/64.
