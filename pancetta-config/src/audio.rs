@@ -410,6 +410,12 @@ pub struct RecordingConfig {
     /// Maximum recording length in minutes. Not read yet.
     pub max_length_minutes: u32,
 
+    /// Minutes of raw 48 kHz capture after each start (PAN-393): one WAV per
+    /// FT8 slot of the undecimated capture stream, into `raw48/` inside
+    /// `directory`. 0 (the default) is off. Read only when `auto_record` is
+    /// on, the run has live audio and `[audio] sample_rate` is 48000.
+    pub raw_capture_minutes: u32,
+
     /// Where recordings go; created if missing. A leading `~` is expanded
     /// by pancetta itself (the loader never expands values); `~user` is not.
     /// Empty means `~/.pancetta/recordings`.
@@ -640,6 +646,7 @@ impl Default for RecordingConfig {
             bit_depth: BitDepth::Int16,
             sample_rate: 44100,
             max_length_minutes: 60,
+            raw_capture_minutes: 0,
             directory: "~/Documents/Pancetta/Recordings".to_string(),
             filename_pattern: "pancetta_%Y%m%d_%H%M%S".to_string(),
             compression_level: 5,
@@ -851,5 +858,17 @@ mod tests {
         assert_eq!(compression.ratio, 3.0);
         assert_eq!(compression.threshold_db, -20.0);
         assert!(!compression.enabled);
+    }
+
+    #[test]
+    fn raw_capture_minutes_defaults_to_off() {
+        assert_eq!(RecordingConfig::default().raw_capture_minutes, 0);
+    }
+
+    #[test]
+    fn raw_capture_minutes_parses_from_toml() {
+        let cfg: RecordingConfig = toml::from_str("raw_capture_minutes = 30").unwrap();
+        assert_eq!(cfg.raw_capture_minutes, 30);
+        assert!(!cfg.auto_record, "other keys keep their defaults");
     }
 }

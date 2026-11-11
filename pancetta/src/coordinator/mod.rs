@@ -36,6 +36,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod qso_filter;
+mod raw_capture;
 mod readiness;
 pub mod receive_overload;
 mod remote_gateway;

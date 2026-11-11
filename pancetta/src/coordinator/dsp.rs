@@ -70,15 +70,15 @@ pub(crate) fn unsupported_input_rate_message(rate: u32) -> String {
 }
 
 /// Peak absolute amplitude of an f32 audio window (0.0 if empty).
-fn window_peak(samples: &[f32]) -> f32 {
+pub(super) fn window_peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
 }
 
 /// A window is "dead air" (rig off/unplugged → digital silence) when its peak
 /// is below this threshold. Empirically: silence ≈ 0.0002, real FT8 ≥ 0.05.
-const DEAD_AIR_PEAK_THRESHOLD: f32 = 0.001;
+pub(super) const DEAD_AIR_PEAK_THRESHOLD: f32 = 0.001;
 
-fn is_dead_air(samples: &[f32]) -> bool {
+pub(super) fn is_dead_air(samples: &[f32]) -> bool {
     window_peak(samples) < DEAD_AIR_PEAK_THRESHOLD
 }
 
@@ -87,7 +87,7 @@ fn is_dead_air(samples: &[f32]) -> bool {
 /// (or when the frequency is unknown, i.e. 0 — no rig / not yet polled),
 /// in which case the filename carries no band suffix and stays backward
 /// compatible with the legacy `ft8_<date>_<time>.wav` form.
-fn band_for_freq_hz(hz: u64) -> Option<&'static str> {
+pub(super) fn band_for_freq_hz(hz: u64) -> Option<&'static str> {
     let khz = hz / 1000;
     Some(match khz {
         1_800..=2_000 => "160m",
@@ -241,7 +241,7 @@ fn reanchor_decode_window(
 /// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
 /// Each file is ~303 KB.  When total usage exceeds [`WAV_RECORDING_MAX_BYTES`],
 /// the oldest files are deleted to make room.
-struct WavRecorder {
+pub(super) struct WavRecorder {
     dir: std::path::PathBuf,
     /// Running estimate of the top-level `*.wav` bytes in `dir`. Files moved
     /// out externally (the NAS offload job) are not subtracted, so it can
@@ -287,7 +287,7 @@ impl WavRecorder {
     /// partial scan is never mistaken for the real total. A file that vanished
     /// between listing and stat (the offload moved it) is simply gone and
     /// doesn't make the scan incomplete.
-    fn dir_size(dir: &std::path::Path) -> std::io::Result<(u64, bool)> {
+    pub(super) fn dir_size(dir: &std::path::Path) -> std::io::Result<(u64, bool)> {
         let mut total = 0;
         let mut complete = true;
         for entry in std::fs::read_dir(dir)? {
@@ -678,9 +678,33 @@ impl super::ApplicationCoordinator {
         // PAN-125: decide WAV recording here, under the config guard — the
         // worker closure below only ever sees the resolved directory.
         let wav_recording = self.wav_recording(&config.audio.recording);
+        let raw_capture_minutes = config.audio.recording.raw_capture_minutes;
         drop(config);
         wav_recording.log_startup();
         let wav_recording_dir = wav_recording.dir().map(std::path::Path::to_path_buf);
+        // PAN-393: timed raw 48 kHz capture obeys the same recording
+        // decision. The capture window is fixed by the first DSP start and
+        // reused by every supervisor restart (it lives on the decode handles).
+        let raw_decision = super::raw_capture::resolve_raw_capture(
+            raw_capture_minutes,
+            &wav_recording,
+            input_rate,
+        );
+        raw_decision.log_startup();
+        let raw_plan = match raw_decision {
+            super::raw_capture::RawCaptureDecision::Enabled { dir, minutes } => {
+                let window = super::raw_capture::capture_window(
+                    &self.decode_handles()?.raw_capture_start,
+                    minutes,
+                    chrono::Utc::now(),
+                );
+                Some((dir, minutes, window))
+            }
+            _ => None,
+        };
+        let last_ptt_on_ms = self.last_ptt_on_ms.clone();
+        let last_ptt_off_ms = self.last_ptt_off_ms.clone();
+        let ptt_active = self.ptt_active.clone();
         let timing =
             super::derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(protocol));
         let dsp_window_samples = timing.window_samples;
@@ -764,6 +788,20 @@ impl super::ApplicationCoordinator {
                 }
             });
 
+            // Timed raw 48 kHz capture (PAN-393): `None` unless enabled.
+            // Fed after the dial and mode guards below; never touches a file.
+            let mut raw_capture = raw_plan.and_then(|(dir, minutes, window)| {
+                super::raw_capture::RawCapture::open(
+                    dir,
+                    minutes,
+                    window,
+                    _input_channels,
+                    window_lead_secs,
+                    super::raw_capture::RAW_CAPTURE_MAX_BYTES,
+                    chrono::Utc::now(),
+                )
+            });
+
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
             const BIN_HISTORY_LEN: usize = 60;
@@ -815,6 +853,9 @@ impl super::ApplicationCoordinator {
                         ) {
                             ft8_buffer.clear();
                             last_live_wf_samples = 0;
+                            if let Some(raw) = raw_capture.as_mut() {
+                                raw.abandon(super::raw_capture::AbandonReason::GainChange);
+                            }
                             for _ in audio_rx.try_iter() {}
                             continue;
                         }
@@ -848,13 +889,17 @@ impl super::ApplicationCoordinator {
                         // Extract left channel from interleaved stereo.
                         // cpal delivers interleaved [L, R, L, R, ...] where
                         // the right channel is near-silent on the FTdx10 USB codec.
-                        let mono: Vec<f32> = if _input_channels > 1 {
-                            samples
-                                .chunks(_input_channels as usize)
-                                .map(|ch| ch[0])
-                                .collect()
+                        // Borrowed for mono so `samples` stays available to
+                        // the raw capture below (PAN-393); same values.
+                        let mono: std::borrow::Cow<'_, [f32]> = if _input_channels > 1 {
+                            std::borrow::Cow::Owned(
+                                samples
+                                    .chunks(_input_channels as usize)
+                                    .map(|ch| ch[0])
+                                    .collect(),
+                            )
                         } else {
-                            samples
+                            std::borrow::Cow::Borrowed(&samples[..])
                         };
 
                         // One-time diagnostic: log first batch stats
@@ -875,7 +920,7 @@ impl super::ApplicationCoordinator {
                         // unnecessary and the previous 65-tap FIR was attenuating
                         // signals (ft8_lib decoded 86 from naive decimation vs 1
                         // from the FIR output on the same live audio).
-                        for &sample in &mono {
+                        for &sample in mono.iter() {
                             decimate_counter += 1;
                             if decimate_counter >= decimation_factor {
                                 decimate_counter = 0;
@@ -890,6 +935,9 @@ impl super::ApplicationCoordinator {
                         // dials under one label. This one read is also the
                         // snapshot the emitted `DecodeWindow` carries.
                         let cur_dial_hz = operating_frequency_hz.load(Ordering::Relaxed);
+                        // Set when the dial or mode guard flushes on this
+                        // batch, so the raw capture abandons its slot too.
+                        let mut raw_flush = false;
                         if let Some(flush) = apply_dial_change(
                             cur_dial_hz,
                             &mut last_known_dial_hz,
@@ -897,6 +945,7 @@ impl super::ApplicationCoordinator {
                             &mut last_live_wf_samples,
                             &mut bin_history,
                         ) {
+                            raw_flush = true;
                             if let Ok(mut registry) = sweep_capture.lock() {
                                 registry.invalidate_all("dial changed during capture");
                             }
@@ -927,6 +976,7 @@ impl super::ApplicationCoordinator {
                         // immediately above.
                         let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
                         if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
+                            raw_flush = true;
                             if let Ok(mut registry) = sweep_capture.lock() {
                                 registry.invalidate_all("mode changed during capture");
                             }
@@ -961,6 +1011,38 @@ impl super::ApplicationCoordinator {
                                 dsp_slot_ns,
                             );
                             cached_mode_u8 = cur_mode_u8;
+                        }
+
+                        // Timed raw 48 kHz capture (PAN-393): after both
+                        // flush guards, so their decisions abandon the raw
+                        // slot too and the band label is the DSP's own
+                        // reference dial. The latch reads the TX worker's
+                        // shared key-down stamps on every batch.
+                        if let Some(raw) = raw_capture.as_mut() {
+                            let cached_mode =
+                                pancetta_config::OperatingMode::from_u8(cached_mode_u8);
+                            let ctx = super::raw_capture::BatchContext {
+                                end: chrono::Utc::now(),
+                                dial_hz: last_known_dial_hz,
+                                ft8_active: cached_mode == pancetta_config::OperatingMode::Ft8,
+                                mode_label: super::mode_str(cached_mode),
+                                flushed: raw_flush,
+                                ptt: super::raw_capture::PttSnapshot {
+                                    last_on_ms: last_ptt_on_ms.load(Ordering::Acquire),
+                                    last_off_ms: last_ptt_off_ms.load(Ordering::Acquire),
+                                    keyed: ptt_active.load(Ordering::Acquire),
+                                },
+                            };
+                            if raw.on_batch(&samples, &ctx)
+                                == super::raw_capture::RawCaptureState::Done
+                            {
+                                // Queued slots are written and the summary
+                                // logged off this thread, so the DSP loop
+                                // never waits on the disk.
+                                if let Some(done) = raw_capture.take() {
+                                    done.close_in_background();
+                                }
+                            }
                         }
 
                         // Live waterfall: emit one spectrum row per second using rustfft.
@@ -1176,6 +1258,9 @@ impl super::ApplicationCoordinator {
                             ) {
                                 ft8_buffer.clear();
                                 last_live_wf_samples = 0;
+                                if let Some(raw) = raw_capture.as_mut() {
+                                    raw.abandon(super::raw_capture::AbandonReason::GainChange);
+                                }
                                 for _ in audio_rx.try_iter() {}
                                 continue;
                             }
@@ -2510,6 +2595,39 @@ mod wav_recorder_tests {
         );
         assert!(names.contains(&"ft8_b.wav".to_string()));
         assert!(names.contains(&"ft8_c.wav".to_string()));
+    }
+
+    /// PAN-393: raw captures live in `raw48/`, so the 10 GB decode-window
+    /// cap neither counts nor evicts them.
+    #[test]
+    fn raw48_subdirectory_is_outside_the_cap_and_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let raw = tmp
+            .path()
+            .join(super::super::raw_capture::RAW_CAPTURE_SUBDIR);
+        std::fs::create_dir(&raw).unwrap();
+        seed(
+            &raw,
+            &[
+                "raw48_20261110_120000_20m.wav",
+                "raw48_20261110_120015_20m.wav",
+            ],
+        );
+        assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), (3 * FILE, true));
+
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        rec.write_window(&tone(), &ts(), 0);
+
+        let names = wav_names(tmp.path());
+        assert!(!names.contains(&"ft8_a.wav".to_string()), "{names:?}");
+        assert_eq!(
+            wav_names(&raw),
+            vec![
+                "raw48_20261110_120000_20m.wav",
+                "raw48_20261110_120015_20m.wav"
+            ]
+        );
     }
 
     /// Curated fixture subdirectories (noise_1000/) and non-WAV files are

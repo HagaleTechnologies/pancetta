@@ -8,9 +8,11 @@ sources:
   - pancetta/src/coordinator/dsp.rs
   - pancetta/src/coordinator/audio.rs
   - pancetta/src/coordinator/replay.rs
+  - pancetta/src/coordinator/raw_capture.rs
+  - pancetta/tests/wav_recording.rs
 verified:
-  commit: ecf27f1
-  date: 2026-08-21
+  commit: f31db03
+  date: 2026-11-10
 links:
   - modes
 ---
@@ -19,10 +21,13 @@ not mono samples. `coordinator/dsp.rs` de-interleaves unconditionally against
 `[audio] input_channels` (default **2**):
 
 ```rust
-let mono: Vec<f32> = if input_channels > 1 {
-    samples.chunks(input_channels as usize).map(|ch| ch[0]).collect()
-} else { samples };
+let mono: Cow<[f32]> = if input_channels > 1 {
+    Cow::Owned(samples.chunks(input_channels as usize).map(|ch| ch[0]).collect())
+} else { Cow::Borrowed(&samples[..]) };
 ```
+
+(A `Cow` since PAN-393, so the interleaved batch stays available to the raw
+48 kHz capture; the values are the same.)
 
 That is correct for a real `cpal` capture stream (rig CODECs are typically
 2-channel, right channel near-silent). It is silently *destructive* for any
@@ -63,3 +68,16 @@ alone, and exactly the trap to avoid copying.
 Fix framing at the producer, not in `dsp.rs`: the de-interleave there is the
 live-audio contract and special-casing it would make synthetic sources diverge
 from real hardware behavior.
+
+## Stub pacing
+
+The stub audio source (`PANCETTA_STUB_AUDIO=1`) sends `buffer_size` samples
+every `floor(buffer_size * 1000 / sample_rate)` ms. At 48 kHz,
+`buffer_size = 512` sends every 10 ms, which is 6.7% fast in mono (51,200
+frames/s) and half rate with the default `input_channels = 2` (25,600
+frames/s). `buffer_size = 4096` sends every 85 ms, 0.4 to 0.5% fast
+(measured 48,238 frames/s). Anything that checks wall-clock continuity, such
+as the PAN-393 raw capture (it abandons a slot whose sample position drifts
+250 ms from the wall clock), needs `input_channels = 1` and
+`buffer_size = 4096` in stub tests; `pancetta/tests/wav_recording.rs` uses
+exactly that.
