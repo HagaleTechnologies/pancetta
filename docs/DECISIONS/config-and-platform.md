@@ -724,6 +724,68 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   supervisor restarts, because the running config snapshot is patched only
   for security fields.
 
+## Timed raw 48 kHz capture (PAN-393, 2026-11-10)
+
+PAN-320's decimation A/B needs raw, undecimated windows from real bands.
+`[audio.recording] raw_capture_minutes` (default 0, off) cuts the capture
+stream into one WAV per FT8 slot for that many minutes after start. Code:
+`pancetta/src/coordinator/raw_capture.rs`; the DSP worker feeds it.
+
+1. **Gate.** Key 0 first (silent), then the PAN-125 recording decision
+   (`WavRecording::Enabled`; info line otherwise), then the capture rate
+   (48000 Hz only; warn line otherwise). `max_length_minutes` was not
+   reused: its default of 60 would have turned capture on for everyone.
+2. **Rate and channels.** The configured `input_channels` at 48 kHz,
+   16-bit. No resampling.
+3. **FT8 only.** Slots are fixed at 15 s. FT4/FT2 abandon the slot in
+   progress and pause capture with one line per transition; FT4 boundaries
+   fall on half seconds the name cannot carry.
+4. **Placement.** The hook runs on the DSP thread after the dial and mode
+   flush guards, so their flushes abandon the raw slot and the band label
+   is the DSP's reference dial. The mono extraction became a `Cow` so the
+   interleaved batch stays borrowable; the decoder sees the same values.
+5. **Per-slot anchoring.** Each slot's span start (boundary minus the
+   window lead) is located in the batch whose wall-clock range contains it,
+   then the slot takes exactly 720,000 frames. Slots are anchored one by
+   one, so sound-card drift never accumulates; adjacent files may overlap
+   or leave a gap of a few milliseconds.
+6. **Continuity.** A slot whose wall-clock and sample positions part by
+   more than 250 ms is abandoned (dropped batches, stalls, device reopens,
+   clock jumps). Span starts only increase, so a backward clock step never
+   overwrites a file. Residual: a gap under 250 ms is not detected.
+7. **Window and restarts.** The start time is a `OnceLock` on
+   `DecodePipelineHandles`, which every DSP supervisor restart reuses, so
+   a restart neither extends nor restarts the capture. A partial first
+   slot is skipped.
+8. **Writer thread.** `sync_channel(2)` plus `try_send`; a full queue drops
+   the slot with a warning at most once per 60 s. Files are written as
+   `.part` and renamed; stale `.part` files are removed at open. Dropping
+   the handle joins the thread, so queued slots are written first.
+9. **Dead air.** Skipped by the 12 kHz recorder's peak rule.
+10. **Name.** `raw48_<YYYYMMDD>_<HHMMSS>[_<band>][_tx].wav` at the slot
+    boundary. The 12 kHz files carry the emit time (boundary + 12.5 to 14 s),
+    so the docs give the pairing rule.
+11. **TX marker.** A per-batch latch over the shared `last_ptt_on_ms` /
+    `last_ptt_off_ms` stamps: a check made only at completion misses TX in
+    back-to-back slots when the DSP runs late. Residual: manual TUI PTT does
+    not stamp those atomics, so it is not marked; a TX-worker key-down
+    refused before RF still marks its slot (the safe direction).
+12. **Cap.** 2 GiB of top-level `*.wav` in `raw48/`, rescanned at open.
+    Before each write, if the next file would pass it, capture stops with
+    one warning and writes nothing more this run. Nothing in `raw48/` is
+    ever deleted; the 12 kHz recorder's cap and eviction only see top-level
+    files, so `raw48/` is outside them.
+13. **Logging.** Every operator-facing line is built by one function in
+    `raw_capture.rs` and pinned by a unit test.
+14. **Off is unchanged.** With the key at 0 the DSP holds no capture; the
+    hot path gains only the `Cow` and one `bool`.
+
+Measured sizes: 2,880,044 bytes per stereo slot, 1,440,044 per mono slot;
+30 minutes is 120 files, about 346 MB in stereo (the ticket's 690 MB
+estimate was double); 2 GiB holds 745 stereo files (186 minutes). Stub
+audio only paces close to real time with `input_channels = 1` and
+`buffer_size = 4096`, which the end-to-end tests use.
+
 ## `--replay` feed waits for the QSO history seed (PAN-42, 2026-10-21)
 
 - `run()` starts the replay feeder (`start_pipeline()`) before the QSO
@@ -1051,3 +1113,117 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `pancetta/tests/cli_surface.rs` checks every help screen (found from the live
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
+
+## Stable decoder API guard (PAN-380, 2026-11-10)
+
+- **What is stable.** The union of two lists: the cycle API manta calls
+  (`CycleDecoder::new`, `CycleDecoder::decode_cycle`, `decode_cycle`,
+  `ft8lib_is_available`; dispensa ADR-0017, still `Proposed`) and the window
+  API the dispensa Q-0085 answer names (`Ft8Decoder::new(Ft8Config)`,
+  `decode_window`). Pinning only one would leave either the ticket or manta's
+  real calls unguarded. `pancetta-ft8/README.md` § Stable API and
+  compatibility policy is the list consumers read.
+- **Only named fields.** Four `DecodedMessage` fields (`text`, `snr_db`,
+  `frequency_offset`, `time_offset`) and two `Ft8Config` fields
+  (`sample_rate`, `protocol`) are stable. Every other field stays free to
+  change, as Q-0085 ("Stable API, and only this") and ADR-0017 say.
+- **Hand-written compile-time guard, not `cargo public-api`.**
+  `pancetta-ft8/tests/stable_api_guard.rs` coerces each pinned function to
+  its fn-pointer type, so drift is an E0308 naming the item, and it runs in
+  the existing `ft8-tests` and `workspace-check` jobs on the pinned 1.98.0.
+  `cargo public-api` needs a nightly toolchain, a tool build and a pinned
+  tool-to-nightly pairing, which the PAN-56 single-toolchain rule argues
+  against. `readme_lists_every_pinned_item` keeps the guard and the README
+  list in step.
+- **`Ft8Config` stays exhaustive.** `#[non_exhaustive]` would forbid
+  `Ft8Config { sample_rate, protocol, ..Ft8Config::default() }` from outside
+  the crate, so the guard's struct literal fails (E0639) if it is added.
+- **`trybuild` rejected.** Proving the guard fails would need a dev-dependency
+  to show what CI already shows by failing to compile; validation repeats the
+  mutations by hand.
+
+## Windows compiled on every code PR (PAN-286, 2026-11-10)
+
+Before this change only `release.yml` compiled Windows, on a `v*` tag, though
+Windows 11 is the maintainer's station platform.
+
+- **Leg and target.** `cross-platform-check` in `.github/workflows/ci.yml` has
+  a `windows-latest` leg that checks `x86_64-pc-windows-gnu`, with the same
+  runner, toolchain pin, ft8_lib submodule guard and MinGW `gcc --version`
+  assert as `release.yml`. MSVC stays out: it cannot compile the VLAs in
+  `vendor/ft8_lib/ft8/decode.c` (C2057).
+- **Check command.** `cargo check --target x86_64-pc-windows-gnu --workspace
+  --exclude pancetta-research --all-targets --features transmit`, the crate
+  scope Linux tests. `--all-targets` also compiles `cfg(test)`, `tests/`,
+  examples and benches, where three of today's five Windows-only warnings live.
+- **Gating.** `cross-platform-check` is in the `CI` aggregator's `needs`, so a
+  red Windows leg fails the required `CI` check. `needs` cannot pick one matrix
+  leg, so the macOS leg is gating too; a flaky macOS runner now blocks a merge
+  until it is re-run. On `push` and `merge_group` the job is `skipped`, which
+  the aggregator ignores.
+- **Not done.** No tests run on Windows: a bare `cargo test` on
+  `windows-latest` uses the MSVC host, and a gnu test run is unverified. No
+  `-D warnings`, because the Windows-only warnings would fail it.
+- **Follow-ups, not done here:** the `code` path filter misses `.h` files,
+  `.gitmodules` and the ft8_lib submodule; `deny.toml` lists
+  `x86_64-pc-windows-msvc`, not `-gnu`; `actions/checkout@v7` and
+  `Swatinem/rust-cache@v2` in this job stay unpinned (PAN-106).
+
+`scripts/ci/test-ci-windows-lane.sh`, run by the `research-scan-tests` job,
+pins the Windows leg, the `ci.needs` entry, the guards and the macOS-only
+microphone test.
+
+## DX-cluster reconnect backoff (PAN-288), 2026-11-10
+
+A dropped DX-cluster connection reconnects with capped backoff instead of
+spinning the worker on a closed spot channel.
+
+- **The loop lives in `pancetta-dx`.** `DxClusterClient::run_until_shutdown`
+  connects, forwards spots, and reconnects on one reused client (`connect()`
+  replaces the channels and keeps the dedup map and dropped-spot counter). A
+  session ends when `receive_spot()` returns `None`, which covers every way the
+  reader stops; `status()` is not used because it stays `Connected` after a
+  reader panic. The loop cannot hand the retry to the supervisor: a DxCluster
+  task that returns `Ok(())` is not restarted, and an `Err` gets only 5
+  restarts per 10 minutes. The shutdown flag is checked at least once a second.
+- **Backoff.** Base `reconnect_delay_seconds.max(1)` s, doubled after each
+  retry, capped at 10 × base (30, 60, 120, 240, 300, 300 s at the default), no
+  jitter. A failed first connect uses the same schedule, so a cluster that is
+  down at startup is retried. The delay resets to the base only after a session
+  that lasted at least 60 s, so a server that accepts and closes at once is not
+  retried at the minimum delay forever.
+- **Config.** The worker reads `[network.dx_cluster.connection]`
+  `reconnect_delay_seconds` and `timeout_seconds` (clamped to at least 1 s),
+  both defaulting to the 30 s it hard-coded before, and always sets
+  `auto_reconnect`. `reconnect_attempts`, `auto_connect` and
+  `keepalive_interval_seconds` stay unread; `reconnect_attempts` is not a
+  give-up limit, because giving up would end spots for the session silently.
+- **Time tokens.** `parse_cluster_time` strips the `Z`, requires exactly four
+  ASCII digits, and only then reads the hour and minute, so a multibyte
+  character cannot land a slice mid-character (the old `&time_str[0..4]` slice
+  panicked the reader). `parse_dx_spot` rejects a last token that ends in `Z`
+  and is not ASCII, so that line falls through to `ClusterMessage::Raw`.
+  ASCII-malformed tokens (`2560Z`, `BUZZ`) keep the `Utc::now()` fallback so
+  real lines with odd trailing fields are not dropped.
+- **Not done here:** half-open TCP detection (`keepalive_interval_seconds`),
+  rotating through `servers`, surviving a non-UTF-8 line without a reconnect,
+  and a "reconnecting" state in the TUI.
+
+## Configured rig data mode (PAN-276)
+
+`rig.mode` remains the waveform protocol. Optional `rig.data_mode` is the exact
+CAT token, restricted to PKTUSB, PKTLSB, USB and LSB. Width defaults to Hamlib's
+0. These settings require restart and remain absent in shipped defaults.
+
+The rigctld client owns mode application because a bus-level mode sender could
+interleave with a QSY and miss hidden command reconnects. Managed transactions
+serialize VFO changes, frequency changes and keying. Readiness belongs to the
+prepared connection generation, and a new socket cannot reuse old confirmation.
+A key-down is never replayed after a managed connection fails. PTT-off remains
+available regardless of readiness.
+
+Split preparation must establish the transmitting VFO, apply the mode to both
+required VFOs and restore the receive VFO. Unconfirmed split state, rejected mode
+or failed restoration leaves TX inhibited. The coordinator adds an independent
+readiness cause and never changes operator TX policy to recover it. Mock and
+socket tests are container evidence; FTdx10 hardware qualification remains pending.

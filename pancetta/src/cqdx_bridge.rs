@@ -856,7 +856,7 @@ mod tests {
         )
         .await;
         let (bridge, lookup) = bridge_for(&server.uri());
-        lookup.set_excluded_dxcc_prefixes(HashSet::from(["K".to_string()]));
+        lookup.set_home_entity(Some("United States"));
         bridge.startup().await.unwrap();
         assert!(matches!(
             lookup.dxcc_need_list(),

@@ -231,8 +231,9 @@ display-only `tx::tx_mute_causes`, which lists every active cause in `tx_hard_mu
 `tx_mute_causes_first_matches_tx_hard_mute_reason_for_every_input_combination` proves the first cause
 equals the gate's reason for all 288 input combinations. `tx_hard_mute_reason` itself is unchanged.
 
-**`ptt_off_unconfirmed`.** Latched exactly where Hamlib teardown retains the PTT watchdog because
-PTT-off could not be forced; cleared only by a rig-accepted PTT-off (teardown success, the startup
+**`ptt_off_unconfirmed`.** Latched where Hamlib teardown retains the PTT watchdog because PTT-off
+could not be forced, and (PAN-272) where the command loop's `SetPtt{false}` fails while the PTT
+watchdog tracker is armed, which keeps the watchdog retrying the unkey; cleared only by a rig-accepted PTT-off (teardown success, the startup
 unkey, the PTT watchdog's forced off, a command-loop `SetPtt{false}`). Orphan release is not a
 confirmed unkey and does not clear it. The falling edge adds `PTT-off confirmed by the rig —
 stuck-PTT warning cleared` to Shift+D. It does not mute TX: that is a TX-safety policy change for its

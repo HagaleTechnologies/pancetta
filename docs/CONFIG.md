@@ -84,7 +84,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `grid_square` | string | `"AA00aa"` | Your Maidenhead grid (4 or 6 chars). Used in `CQ` and grid-report exchanges. |
 | `power_watts` | integer | `100` | Reported in spots; not used for actual rig power level. |
 | `qth` | string | `"Unknown"` | Free-text location label, surfaced in the TUI. |
-| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). |
+| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). Not used for needed or ATNO: pancetta takes your home entity from `callsign`. |
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
@@ -149,6 +149,7 @@ directory = "~/.pancetta/recordings"
 |---|---|---|---|
 | `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
 | `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+| `raw_capture_minutes` | integer | `0` | Minutes of raw 48 kHz capture after each start, one WAV per FT8 slot, into `raw48/` inside `directory`. `0` is off. Needs `auto_record = true` and `[audio] sample_rate = 48000`. |
 
 - Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
   300 KB for FT8), named `ft8_<UTC date>_<time>[_<band>].wav`. Windows of
@@ -157,11 +158,13 @@ directory = "~/.pancetta/recordings"
 - The directory is capped at 10 GB of top-level `*.wav` files. Past that,
   the oldest recording (by filename) is deleted for each new one.
 - With recording on, pancetta also saves the first 90 s of raw capture once
-  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory.
+  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory,
+  whatever `raw_capture_minutes` says.
 - `--replay` and `--no-audio` runs never record, whatever this says.
 - The other keys in this table (`format`, `bit_depth`, `sample_rate`,
   `max_length_minutes`, `filename_pattern`, `compression_level`) are not
-  read. Recordings always use the format above.
+  read. Recordings always use the format above. (`raw_capture_minutes` is
+  read; see "Raw 48 kHz capture" below.)
 - Changes take effect after a restart.
 - The startup log says which way it went: `WAV recording enabled: dir=…`
   or `WAV recording disabled -- set audio.recording.auto_record = true …`.
@@ -172,6 +175,63 @@ directory = "~/.pancetta/recordings"
 `~/.pancetta/recordings`. A station that feeds them must set both keys as
 shown above. `auto_record = true` on its own records into the default
 `~/Documents/Pancetta/Recordings`, which nothing collects.
+
+**Raw 48 kHz capture.** For decimation studies, pancetta can also keep the
+raw capture stream, before it is decimated to 12 kHz, for a set time after
+each start:
+
+```toml
+[audio.recording]
+auto_record = true
+raw_capture_minutes = 30
+```
+
+- For `raw_capture_minutes` after each start, pancetta writes one WAV per
+  FT8 slot into `raw48/` inside `directory`. Each file holds 15 s of the
+  capture stream: 48 kHz, 16-bit, `[audio] input_channels` channels. That
+  is 2,880,044 bytes in stereo (the FTdx10 default) and 1,440,044 in mono,
+  so `[audio.recording] raw_capture_minutes = 30` is 120 files, about 346 MB
+  in stereo.
+- Sample 0 of a file is 0.5 s before the slot boundary (1.0 s with
+  `[decoder] extended_capture_window_enabled`), the same lead the live
+  decode window uses, so a slot's decode window is a prefix of its raw file.
+- Files are named `raw48_<UTC date>_<UTC slot boundary>[_<band>][_tx].wav`,
+  for example `raw48_20261110_122645_20m_tx.wav`. The time is the slot
+  boundary, so its seconds are always 00, 15, 30 or 45. An unknown dial drops
+  the band, as the 12 kHz files do.
+- The 12 kHz decode-window files are named with the time the window was
+  cut, 12.5 to 14 s after the slot boundary. So slot `122630` pairs with
+  `ft8_..._122643_...`.
+- `_tx` means one of pancetta's own TX-worker key-downs (a normal, multi-stream
+  or tune transmission) overlapped the file's 15 s span. Manual PTT from the
+  TUI, front-panel TX and other programs' TX are not marked.
+- A slot is skipped when it is digital silence, when the dial, the mode or
+  the receive gain changes during it, or when audio goes missing for more than
+  250 ms (a shorter gap is not detected). The first, partial slot after start
+  is skipped too.
+- Raw capture records FT8 slots only. While FT4 or FT2 is active it pauses
+  (`Raw 48 kHz capture paused: FT4 is active …`) and resumes when FT8 returns.
+- `raw48/` has its own cap of 2 GB of top-level `*.wav` files (about 745
+  stereo files, or 186 minutes). When the next file would pass it, raw
+  capture stops for this run and logs `Raw 48 kHz capture stopped: … holds
+  … MB and the next file would pass the 2.0 GB cap. Decode-window recording
+  continues.` A later start finds the folder still full and stops again at
+  its first slot, until you delete files. Pancetta never deletes anything in
+  `raw48/`.
+- `raw48/` does not count toward the 10 GB decode-window cap, and the corpus
+  offload and decoder tools skip it, because they read only top-level files.
+- It needs `[audio] sample_rate = 48000`. Any other rate logs
+  `Raw 48 kHz capture off -- [audio] sample_rate is … Hz …` and writes no raw
+  files. With recording off (`auto_record` unset, `--replay`, `--no-audio`)
+  the key is ignored, with a log line saying so.
+- File I/O runs on its own thread. If the disk falls about 30 s behind, a
+  slot is dropped with a warning; decoding and transmitting are never delayed.
+- Changes take effect after a restart. A component restart inside the
+  same run does not extend the capture.
+- The startup log says `Raw 48 kHz capture enabled: dir=…, length=30 min
+  (until 12:56:19 UTC), …`. At the end it says `Raw 48 kHz capture finished:
+  raw_capture_minutes = 30 ended at 12:56:19 UTC` and then `Raw 48 kHz capture
+  wrote N files (… MB) to …`.
 
 ---
 
@@ -193,6 +253,44 @@ baud_rate = 38400
 | `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
 | `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
+
+### Optional rig data mode
+
+`rig.mode` selects the station's FT8/FT4/FT2 waveform protocol. The separate
+`rig.data_mode` selects an exact Hamlib CAT mode. Both new settings are off by
+default. To opt in:
+
+```toml
+[rig]
+model = "FTdx10"
+mode = "FT8"
+data_mode = "PKTUSB"
+data_passband_hz = 3000
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `data_mode` | string | absent | `PKTUSB`, `PKTLSB`, `USB`, or `LSB`, case-insensitive. Empty strings, whitespace and other CAT tokens are rejected. |
+| `data_passband_hz` | integer | absent | 0 through 2147483647. Absent or 0 asks Hamlib for the rig's default width; positive widths are sent unchanged. Requires `data_mode`. |
+
+When `rig.data_mode` is set, Pancetta applies that CAT mode on connection and
+after commanded frequency or split changes. TX stays inhibited until the mode
+is applied. Omit it to keep manual rig-mode control. Restart after changing
+these settings. CAT-disabled simulation does not require mode confirmation.
+
+For split operation, the receive and effective transmit VFO must both accept
+the mode, and the receive VFO must be restored before TX becomes ready. If the
+rig cannot establish its split state, TX remains inhibited until reconciliation
+succeeds or a commanded simplex transition establishes it. A failed mode write
+or reconnect blocks TX; successful retry restores mode readiness without
+changing the operator's TX policy. PTT-off remains available while blocked.
+Mode is applied on connection and Pancetta-commanded retunes, not continuously
+after front-panel changes. Unsupported rig modes remain blocked rather than
+falling back to a different CAT token. Hardware qualification is pending.
+
+Config layering preserves an optional value when a higher layer omits it. A
+supplied value replaces it. Remove the setting from the layer that defines it
+to disable automatic mode control.
 
 > **Network mode:** setting environment variable `RIGCTLD_HOST` to a
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
@@ -756,6 +854,7 @@ it:
 enabled                  = false
 server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds  = 300
+max_pending_reports      = 2000
 batch_size               = 50
 include_receives         = true
 include_transmits        = true
@@ -782,6 +881,14 @@ exclude_cq_zones = []
 [network.psk_reporter.filters.geographic.distance]
 great_circle = true
 ```
+
+`max_pending_reports` (PAN-285) is how many reception reports Pancetta
+keeps while it cannot send them, for example while DNS or the network is
+down. When the queue is full, the oldest report is dropped first and the
+log says how many were dropped. When the server is reachable again, the
+backlog goes out in datagrams of at most 1400 bytes. The queue is in
+memory only, so a restart empties it. It must be at least 1 when
+`enabled = true`.
 
 ### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
 
@@ -1115,11 +1222,22 @@ external keys. Preserve the whole stopped installation and data directory.
 | File | Role | Recoverable? |
 |---|---|---|
 | `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
-| `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or stale. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
+| `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or if its contacts differ from the ADIF; writes `qso.db.new` and swaps it in. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
+| `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
+| `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
 | `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
 | `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
+
+Durability: each `qsos.adi` record is one `write_all`, a flush and a
+`sync_all` before the write returns, so a logged QSO survives a pancetta
+crash immediately afterwards, and an fsync is requested for OS crash or
+power loss (a disk's own write cache is outside that promise). This costs
+about 1 ms per QSO. Every `qso.db` connection syncs its write-ahead log at
+each commit (`synchronous = FULL`); if a power cut still leaves `qso.db`
+without a QSO that `qsos.adi` holds, the next start rebuilds it from
+`qsos.adi`. There are no settings for this (PAN-281).
 
 **Migration note:** if you are upgrading from an earlier release that wrote only
 `qso.db`, the first startup will automatically export every row from the old database
@@ -1183,7 +1301,9 @@ corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
 Releases before this setting existed recorded every window into
 `~/.pancetta/recordings` unconditionally; upgrading does not touch those
 files, and deleting them reclaims the space (the directory was capped at
-10 GB).
+10 GB). The `raw48/` subdirectory holds raw 48 kHz captures
+(`raw_capture_minutes`), which the decoder corpus tools skip: they read only
+top-level files or only 12 kHz mono files.
 
 ---
 

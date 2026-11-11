@@ -146,9 +146,12 @@ the station:
   treat rankings as a strong hint, not a guarantee. Needed-grid is wired on
   the Pancetta side but has no live cqdx.io endpoint yet, so it doesn't
   affect rankings today. DX Hunter marks a station needed (`+`) only once
-  cqdx.io's needed list has loaded. While a configured cqdx.io is
-  unreachable, the readiness strip shows `⚠ CQDX NEEDS UNKNOWN` and pancetta
-  keeps retrying in the background.
+  cqdx.io's needed list has loaded. Without cqdx.io, or while it is
+  unreachable, needed and ATNO come from your local logbook (`qsos.adi`): an
+  entity you have never logged shows `!`, and the strip shows
+  `⚠ NEEDS FROM LOCAL LOGBOOK` while pancetta keeps retrying in the
+  background. Import your older log with `pancetta import` first, or every
+  entity missing from `qsos.adi` reads as all-time new.
 - **Scoring.** Rarity and live-spot data from cqdx.io feed the same scorer
   alongside signal and recent activity, so the top of the list is the contact
   worth working right now.
@@ -309,10 +312,11 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | Tier-based pouncing, decode alerts and editable watchlist | Implemented, *Unreleased* | Optional tier admission; bell, ntfy and webhook alerts; persistent pins edited with Shift+W. No live notification-service or on-air qualification | [configuration](docs/CONFIG.md#dx-tiers-alerts-and-watchlist) |
+| Needed, ATNO, band-slot, mode and confirmed status from the local logbook | Integration-tested, *Unreleased* | Answers when cqdx.io has not; confirmations come from QSL_RCVD and LOTW_QSL_RCVD already in qsos.adi; the remote client still shows cqdx-only needed | [local logbook needs](pancetta/tests/local_logbook_needs.rs) |
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
-| Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
+| Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT. Optional `rig.data_mode` applies the CAT mode before TX at connection and after commanded retunes; this new option is hardware-unverified. Omit it for manual rig-mode control. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
 | SWR protection | Integration-tested, *Unreleased* | Halts all TX on one SWR reading above `max_swr` (default 3.0) while keyed; needs CAT. Mock rig and fake `rigctld` only; no real-rig trip recorded | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
@@ -328,7 +332,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
-| Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
+| Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station; compile-checked for `x86_64-pc-windows-gnu` on every code PR). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 
 ### Platform archive evidence
 
@@ -378,8 +382,10 @@ cargo fmt --all -- --check
 ```
 
 CI runs the workspace tests and clippy with `--exclude pancetta-research`
-(the local-only harness), checks formatting, builds the examples, and adds a
-macOS `cargo check` lane; it has no separate single-threaded hamlib run.
+(the local-only harness), checks formatting, builds the examples, and adds
+macOS and Windows (`x86_64-pc-windows-gnu`, MinGW) `cargo check` lanes on code
+PRs; a failure in either fails the required `CI` check. It has no separate
+single-threaded hamlib run.
 `cargo deny check` guards advisories and license drift. The exact CI commands
 are in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The 14-crate strictly layered workspace
 is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

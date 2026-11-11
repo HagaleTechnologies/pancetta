@@ -36,6 +36,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod qso_filter;
+mod raw_capture;
 mod readiness;
 pub mod receive_overload;
 mod remote_gateway;
@@ -1635,6 +1636,8 @@ pub struct ApplicationCoordinator {
     /// PAN-273: an armed `PttGuard`'s outstanding drop-fallback PTT-off.
     /// The TX worker's next key-down waits for it (see `tx::PendingPttOff`).
     pub(crate) pending_ptt_off: tx::PendingPttOff,
+    /// PAN-277: producers have stopped; Hamlib may exit once its drain is empty.
+    pub(crate) hamlib_drain_stop: Arc<AtomicBool>,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -1688,7 +1691,10 @@ pub struct ApplicationCoordinator {
 
     /// PAN-89: latched `true` when a Hamlib teardown could not force PTT off
     /// and retained the PTT watchdog as an orphan (the "watchdog retained"
-    /// diagnostic in `hamlib::teardown_hamlib`). Cleared only by a
+    /// diagnostic in `hamlib::teardown_hamlib`), or (PAN-272) when the
+    /// Hamlib command loop's `SetPtt { state: false }` fails while the PTT
+    /// watchdog tracker is armed, so the watchdog keeps retrying the unkey.
+    /// Cleared only by a
     /// rig-confirmed PTT-off, via `hamlib::confirm_ptt_off`: teardown's
     /// successful PTT-off, the startup `set_ptt(Off)`, the PTT watchdog's
     /// forced off and the command loop's `SetPtt { state: false }`. Orphan
@@ -2166,6 +2172,12 @@ impl ApplicationCoordinator {
         // Create message bus with high-performance configuration
         let coordinator_config = CoordinatorConfig::default();
         let message_bus = MessageBus::new(coordinator_config.message_buffer_size)?;
+        let mock_requested = std::env::var("PANCETTA_MOCK_RIG")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false);
+        message_bus.data_mode.configure(
+            config.rig.interface.enabled && !mock_requested && config.rig.data_mode.is_some(),
+        );
 
         // Cache the display-feed-wanted flag before `config` is moved into the
         // Arc<RwLock> — the additive dual-destination emit sites read this
@@ -2527,6 +2539,7 @@ impl ApplicationCoordinator {
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_ptt_off: tx::PendingPttOff::default(),
+            hamlib_drain_stop: Arc::new(AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             rigctld_process: None,
@@ -2790,34 +2803,20 @@ impl ApplicationCoordinator {
             }
         }
 
-        // Phase-5 hardening #2: seed the priority engine's
-        // "excluded DXCC prefixes" set from operator config + ADIF.
-        // Used by `CachedStationLookup::is_needed_dxcc` when cqdx
-        // hasn't populated a needed-set. Without this, the empty-set
-        // fallback returns true for every callsign — inflating CQ
-        // scores so the operator would consider every station "needed"
-        // (or, under different weighting, treat none as needed). This
-        // gives the autonomous operator a defensible signal: anything
-        // outside the operator's home DXCC + already-worked DXCCs
-        // counts as needed.
+        // PAN-347: the operator's home entity, from `[station] callsign`,
+        // is never needed or ATNO. While no cqdx list has loaded, the local
+        // logbook (seeded by the QSO task) answers needed and ATNO; with
+        // neither, the scorer guesses "needed unless the home entity".
         {
-            let config = self.config.read().await;
-            let operator_callsign = config.station.callsign.clone();
-            let dxcc_entity = config.station.dxcc_entity;
-            drop(config);
-            let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
-            let excluded = crate::priority_evaluator::default_excluded_dxcc_prefixes(
-                &operator_callsign,
-                dxcc_entity,
-                adif_path.as_deref(),
-            );
-            let n = excluded.len();
-            self.cached_lookup.set_excluded_dxcc_prefixes(excluded);
+            let operator_callsign = self.config.read().await.station.callsign.clone();
+            let home = pancetta_core::dxcc::entity_for_callsign(&operator_callsign);
+            self.cached_lookup.set_home_entity(home);
             info!(
                 target: "priority",
-                "needed_dxcc default: excluded {} prefixes (home={} entity={}); \
-                 cqdx-populated needed-set will override when available",
-                n, operator_callsign, dxcc_entity
+                "needed fallback: home entity {} (from {}); the local logbook answers \
+                 needed and ATNO until cqdx.io loads",
+                home.unwrap_or("unknown"),
+                operator_callsign
             );
         }
 

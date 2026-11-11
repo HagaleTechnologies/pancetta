@@ -114,6 +114,7 @@ directory = "~/Documents/Pancetta/Recordings"
 filename_pattern = "pancetta_%Y%m%d_%H%M%S"
 format = "wav"
 max_length_minutes = 60
+raw_capture_minutes = 0
 sample_rate = 44100
 
 [audio.routing]
@@ -272,6 +273,7 @@ frequency_accuracy_hz = 1
 include_receives = true
 include_transmits = true
 max_age_hours = 24
+max_pending_reports = 2000
 min_snr_db = -20.0
 server_url = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds = 300

@@ -78,3 +78,15 @@ waiting for PTT-off. Gotcha: the TUI switches its band only when the
 coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
+
+Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
+PTT and view labels are separate from Debug and persistence strings. Rarity
+cells use words in a nine-cell column. Band Activity uses integer kilometres
+under `km`; station-card prose appends the unit. TX, budget-cut and pause
+markers are the ASCII characters `*`, `!` and `|`.
+
+For display regressions, render actual buffers and concatenate complete cell
+symbols. Check positive content in a direct panel as well as scanning full
+views, since a hidden column or clipped overlay can hide a broken label.
+`pan353_rendered_text` covers labels, action messages, distance placement and
+marker widths. Its scanner is for controlled fixtures, not arbitrary radio text.

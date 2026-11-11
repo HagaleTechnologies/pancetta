@@ -2156,7 +2156,7 @@ impl App {
         // shrink).
         self.clamp_band_activity_selection();
         self.persist_tui_state();
-        self.status_message = format!("View: {:?}", self.active_view);
+        self.status_message = crate::presentation::view_message(self.active_view).to_string();
     }
 
     /// Apply the coordinator's authoritative `DecodeEffortUpdate` echo
@@ -2886,6 +2886,8 @@ impl App {
                             row.grid_square.as_deref(),
                             self.station_state_for(&row.call_sign),
                             current_hz,
+                            // PAN-347: only a local decode carries a reliable mode.
+                            row.local_rank.is_some().then_some(row.mode.as_str()),
                         );
                         (dx_row_call(key).to_string(), status)
                     })
@@ -5936,6 +5938,7 @@ mod tests {
             grid: Option<&str>,
             state: Option<&str>,
             hz: f64,
+            _mode: Option<&str>,
         ) -> crate::dx_need::DxNeedStatus {
             let worked = self.0.load(std::sync::atomic::Ordering::Relaxed);
             crate::dx_need::DxNeedStatus {
@@ -5959,6 +5962,7 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
+                _mode: Option<&str>,
             ) -> crate::dx_need::DxNeedStatus {
                 self.0.lock().unwrap().push(call.to_string());
                 crate::dx_need::DxNeedStatus::default()
@@ -6010,6 +6014,7 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
+                _mode: Option<&str>,
             ) -> crate::dx_need::DxNeedStatus {
                 self.0.lock().unwrap().push((call.to_string(), entity));
                 Default::default()
@@ -6027,6 +6032,53 @@ mod tests {
         let seen = provider.0.lock().unwrap();
         assert_eq!(seen.len(), 150);
         assert!(seen.iter().all(|(_, e)| *e == Some("Sentinel")));
+    }
+
+    /// PAN-347: only a row with a local decode hands its mode to the
+    /// provider; cluster and cqdx spot rows carry no reliable mode.
+    #[tokio::test]
+    async fn refresh_dx_need_passes_mode_only_for_locally_decoded_rows() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<(String, Option<String>)>>);
+        impl crate::dx_need::DxNeedLookup for Recording {
+            fn lookup_need(
+                &self,
+                call: &str,
+                _: Option<&'static str>,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+                mode: Option<&str>,
+            ) -> crate::dx_need::DxNeedStatus {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((call.to_string(), mode.map(str::to_string)));
+                Default::default()
+            }
+        }
+        let mut app = fixture_app().await;
+        let mut view = fixture_view("DL1XYZ", -12);
+        view.mode = "FT4".into();
+        app.add_decoded_message(view).await.unwrap();
+        app.add_dx_spot(
+            "JA1XYZ".into(),
+            14.074,
+            "FT8".into(),
+            -10,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.merge_spot_groups(&[reason_spot("VK3ABC", false)]);
+        let provider = Recording::default();
+        app.refresh_dx_need(Some(&provider));
+        let seen: HashMap<String, Option<String>> =
+            provider.0.lock().unwrap().iter().cloned().collect();
+        assert_eq!(seen.get("DL1XYZ"), Some(&Some("FT4".to_string())));
+        assert_eq!(seen.get("JA1XYZ"), Some(&None));
+        assert_eq!(seen.get("VK3ABC"), Some(&None));
     }
 
     /// PAN-284: every row-creation path resolves the offline entity once.

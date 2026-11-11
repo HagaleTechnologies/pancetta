@@ -1818,7 +1818,8 @@ impl TuiRunner {
             Action::PrevReplyStep => {
                 app.cycle_caller_reply(false);
                 let step = app.current_caller_reply_step();
-                app.status_message = format!("Reply step: {:?}", step);
+                app.status_message =
+                    format!("Reply step: {}", crate::presentation::reply_label(step));
             }
             Action::PlacementCursorLeft => {
                 app.placement_cursor = app.placement_cursor.saturating_sub(1);
@@ -1826,7 +1827,8 @@ impl TuiRunner {
             Action::NextReplyStep => {
                 app.cycle_caller_reply(true);
                 let step = app.current_caller_reply_step();
-                app.status_message = format!("Reply step: {:?}", step);
+                app.status_message =
+                    format!("Reply step: {}", crate::presentation::reply_label(step));
             }
             Action::PlacementCursorRight => {
                 if let Some(max_index) = app
@@ -2424,7 +2426,11 @@ impl TuiRunner {
                         step,
                         snr,
                     })?;
-                    app.status_message = format!("Replying to {} ({:?})", callsign, step);
+                    app.status_message = format!(
+                        "Replying to {} ({})",
+                        callsign,
+                        crate::presentation::reply_label(step)
+                    );
                 } else {
                     app.status_message = "No caller selected".to_string();
                 }
@@ -2713,7 +2719,7 @@ impl TuiRunner {
             ),
             (
                 "PTT",
-                format!("{:?}", state.selected_ptt()),
+                crate::presentation::ptt_label(&state.selected_ptt()).to_string(),
                 state.active_field == RigField::Ptt,
             ),
         ];
@@ -2904,12 +2910,12 @@ impl TuiRunner {
                 };
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "{} — {} @ {}, {}, {:?}",
+                        "{} — {} @ {}, {}, {}",
                         bookmark.name,
                         bookmark.model,
                         bookmark.port,
                         bookmark.baud_rate,
-                        bookmark.ptt_method
+                        crate::presentation::ptt_label(&bookmark.ptt_method)
                     ),
                     style,
                 )));
@@ -3388,6 +3394,7 @@ mod key_tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 hz: f64,
+                _mode: Option<&str>,
             ) -> DxNeedStatus {
                 assert_eq!(hz, 14_074_000.0);
                 let needed = self.0.load(Ordering::Relaxed);
@@ -4296,6 +4303,164 @@ mod key_tests {
         ));
     }
 
+    fn pan353_scan_narrow(app: &App) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app).unwrap()).unwrap();
+        crate::presentation::assert_readable_buffer(term.backend().buffer());
+    }
+
+    fn pan353_buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        crate::presentation::assert_readable_buffer(buf);
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn pan353_rendered_text_actions() {
+        use crate::app::ActivePanel;
+        use pancetta_core::ResponseStep::*;
+        let (mut runner, _rx, app) = make_runner().await;
+        for event in [key('v'), key_shift('V')] {
+            app.write().await.active_view = crate::ActiveView::Operate;
+            for _ in 0..4 {
+                runner.handle_key_event(event).await.unwrap();
+                let a = app.read().await;
+                pan353_scan_narrow(&a);
+                let expected = match a.active_view {
+                    crate::ActiveView::Operate => "Operate view",
+                    crate::ActiveView::Hunt => "Hunt view",
+                    crate::ActiveView::Run => "Run view",
+                    crate::ActiveView::Monitor => "Monitor view",
+                };
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+                term.draw(|f| crate::ui::draw(f, &a).unwrap()).unwrap();
+                assert!(pan353_buffer_text(term.backend().buffer()).contains(expected));
+            }
+        }
+        {
+            let mut a = app.write().await;
+            a.active_panel = ActivePanel::Callers;
+            a.decoded_messages
+                .push_back(crate::app::DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14_074_000.0,
+                    mode: "FT8".into(),
+                    snr: -7,
+                    delta_time: 0.0,
+                    delta_freq: 1234.0,
+                    call_sign: Some("N2ABC".into()),
+                    grid_square: Some("FN42".into()),
+                    message: "N0CALL N2ABC -07".into(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    is_directed_at_us: true,
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    band_needed: false,
+                    priority_score: None,
+                    priority_factors: None,
+                    is_own_tx: false,
+                });
+        }
+        for event in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        ] {
+            for _ in 0..5 {
+                runner.handle_key_event(event).await.unwrap();
+                let a = app.read().await;
+                pan353_scan_narrow(&a);
+                let expected = match a.current_caller_reply_step() {
+                    Grid => "grid",
+                    Report => "signal report",
+                    ReportAck => "acknowledged report",
+                    Rr73 => "RR73",
+                    SeventyThree => "73",
+                };
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+                term.draw(|f| crate::ui::draw(f, &a).unwrap()).unwrap();
+                assert!(pan353_buffer_text(term.backend().buffer())
+                    .contains(&format!("Reply step: {expected}")));
+                drop(a);
+                runner
+                    .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+                let a = app.read().await;
+                pan353_scan_narrow(&a);
+                term.draw(|f| crate::ui::draw(f, &a).unwrap()).unwrap();
+                assert!(pan353_buffer_text(term.backend().buffer())
+                    .contains(&format!("Replying to N2ABC ({expected})")));
+            }
+        }
+        app.write().await.decoded_messages.clear();
+        runner
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        pan353_scan_narrow(&a);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &a).unwrap()).unwrap();
+        assert!(pan353_buffer_text(term.backend().buffer()).contains("No caller selected"));
+    }
+
+    #[test]
+    fn pan353_rendered_text_rig_and_bookmarks() {
+        use pancetta_config::rig::{PttMethod::*, RigBookmark};
+        let mut state = crate::app::RigSelectionState::new();
+        state.model = "FTdx10".into();
+        state.available_ports = vec!["/dev/ttyUSB0".into()];
+        for (method, label) in [
+            (None, "none"),
+            (Cat, "CAT"),
+            (Serial, "serial"),
+            (Parallel, "parallel"),
+            (Usb, "USB"),
+            (SoundCard, "sound card"),
+            (Vox, "VOX"),
+            (Network, "network"),
+        ] {
+            state.selected_ptt_idx = usize::MAX;
+            state.live_ptt_method = method.clone();
+            state.bookmarks = vec![RigBookmark {
+                name: "Home".into(),
+                model: "FTdx10".into(),
+                port: "/rig".into(),
+                baud_rate: 38400,
+                ptt_method: method,
+            }];
+            for (w, h) in [(120, 40), (80, 24)] {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| TuiRunner::render_rig_selection_modal(f, f.area(), &state))
+                    .unwrap();
+                assert!(
+                    pan353_buffer_text(term.backend().buffer()).contains(&format!("PTT: {label}"))
+                );
+                term.draw(|f| TuiRunner::render_bookmark_overlay(f, f.area(), &state))
+                    .unwrap();
+                assert!(pan353_buffer_text(term.backend().buffer())
+                    .contains(&format!("38400, {label}")));
+            }
+        }
+        state.bookmarks.clear();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| TuiRunner::render_bookmark_overlay(f, f.area(), &state))
+            .unwrap();
+        assert!(pan353_buffer_text(term.backend().buffer()).contains("no saved bookmarks"));
+    }
+
     #[tokio::test]
     async fn key_c_emits_start_cq() {
         let (mut r, cmd_rx, _app) = make_runner().await;
@@ -4316,6 +4481,7 @@ mod key_tests {
         app.write().await.active_view = crate::view::ActiveView::Operate;
         r.handle_key_event(key('v')).await.unwrap();
         assert_eq!(app.read().await.active_view, crate::view::ActiveView::Hunt);
+        assert_eq!(app.read().await.status_message, "Hunt view");
         assert!(
             cmd_rx.try_recv().is_err(),
             "view cycling is local-only, no coordinator command should be sent"

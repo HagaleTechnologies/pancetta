@@ -36,6 +36,7 @@ pub(crate) struct ReadinessSources {
     rig_conn_state: Arc<AtomicU8>,
     audio_output_alive: Arc<AtomicBool>,
     receive_gain: Arc<super::receive_overload::GainSafety>,
+    data_mode: pancetta_hamlib::DataModeReadiness,
     ptt_off_unconfirmed: Arc<AtomicBool>,
     clock_skew: ClockSkewShared,
     degraded_summary: Arc<Mutex<Option<String>>>,
@@ -63,6 +64,7 @@ impl ReadinessSources {
             rig_conn_state: c.rig_conn_state.clone(),
             audio_output_alive: c.audio_output_alive.clone(),
             receive_gain: c.message_bus.receive_gain.clone(),
+            data_mode: c.message_bus.data_mode.clone(),
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
             clock_skew: c.clock_skew.clone(),
             degraded_summary: c.degraded_summary.clone(),
@@ -86,6 +88,7 @@ impl ReadinessSources {
             &self.rig_conn_state,
             &self.audio_output_alive,
             &self.receive_gain,
+            &self.data_mode,
         );
         let mut last = self.last_tx_mute_causes.borrow_mut();
         if last.as_ref() != Some(&causes) {
@@ -114,7 +117,10 @@ impl ReadinessSources {
             input_silent,
             upload_issues,
             upload_queue_refused,
-            cqdx_dxcc_needs: tui_need_list_health(&self.cached_lookup.dxcc_need_list()),
+            cqdx_dxcc_needs: tui_dxcc_need_health(
+                &self.cached_lookup.dxcc_need_list(),
+                self.cached_lookup.local_log_available(),
+            ),
             cqdx_grid_needs: tui_need_list_health(&self.cached_lookup.grid_need_list()),
         }
     }
@@ -134,6 +140,17 @@ fn tui_need_list_health(a: &NeedListAvailability) -> NeedListHealth {
             error: clip(error),
             retrying: *retrying,
         },
+    }
+}
+
+/// PAN-347: the entity list's strip view. An unloaded cqdx list with the
+/// local logbook seeded says where needed and ATNO come from instead.
+fn tui_dxcc_need_health(a: &NeedListAvailability, local_log: bool) -> NeedListHealth {
+    match tui_need_list_health(a) {
+        NeedListHealth::Unavailable { error, retrying } if local_log => {
+            NeedListHealth::LocalLogbook { error, retrying }
+        }
+        other => other,
     }
 }
 
@@ -217,6 +234,7 @@ fn tui_tx_mute_cause(cause: TxMuteCause) -> TuiTxMuteCause {
         TxMuteCause::RigStatePending => TuiTxMuteCause::RigStatePending,
         TxMuteCause::RigCommandInFlight => TuiTxMuteCause::RigCommandInFlight,
         TxMuteCause::ReceiveGainUnconfirmed => TuiTxMuteCause::ReceiveGainUnconfirmed,
+        TxMuteCause::RigDataModeNotReady => TuiTxMuteCause::RigDataModeNotReady,
         TxMuteCause::PolicyDisabled => TuiTxMuteCause::PolicyDisabled,
     }
 }
@@ -278,6 +296,7 @@ mod tests {
                 gain.confirmed_off(0);
                 Arc::new(gain)
             },
+            data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             clock_skew: ClockSkewShared::new(),
             degraded_summary: Arc::new(Mutex::new(None)),
@@ -462,6 +481,50 @@ mod tests {
         assert_eq!(s.snapshot(false, false), StationReadiness::default());
     }
 
+    #[test]
+    fn need_list_health_uses_local_logbook_when_seeded() {
+        let down = NeedListAvailability::Unavailable {
+            since: chrono::Utc::now(),
+            error: "connection refused".into(),
+            retrying: true,
+        };
+        assert_eq!(
+            tui_dxcc_need_health(&down, true),
+            NeedListHealth::LocalLogbook {
+                error: "connection refused".into(),
+                retrying: true,
+            }
+        );
+        assert_eq!(
+            tui_dxcc_need_health(&down, false),
+            NeedListHealth::Unavailable {
+                error: "connection refused".into(),
+                retrying: true,
+            }
+        );
+        for quiet in [
+            NeedListAvailability::NotConfigured,
+            NeedListAvailability::Loading,
+            NeedListAvailability::NotOffered,
+            NeedListAvailability::Loaded {
+                fetched_at: chrono::Utc::now(),
+                band: None,
+            },
+        ] {
+            for seeded in [true, false] {
+                assert_eq!(
+                    tui_dxcc_need_health(&quiet, seeded),
+                    NeedListHealth::NoWarning
+                );
+            }
+        }
+        // The grid list keeps the cqdx-only mapping.
+        assert!(matches!(
+            tui_need_list_health(&down),
+            NeedListHealth::Unavailable { .. }
+        ));
+    }
+
     fn dest_health(d: UploadDestination) -> DestinationHealth {
         DestinationHealth {
             destination: d,
@@ -567,6 +630,7 @@ mod tests {
         ));
         s.hamlib_command_in_flight.store(1, Ordering::Release);
         s.receive_gain.fail_gain();
+        s.data_mode.configure(true);
 
         assert_eq!(
             s.snapshot(false, false).tx_mute_causes,
