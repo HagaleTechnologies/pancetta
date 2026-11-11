@@ -197,9 +197,16 @@ impl QsyCtx {
 
 /// Command the rig to `frequency`: store the dial, stamp the C9 anchor, send
 /// `BandChanged` and clear split on a band change, then forward
-/// `RigControlMessage::SetFrequency`. Returns the previous dial. Never locks
+/// `RigControlMessage::SetFrequency`. Returns the previous dial only if the
+/// retune was enqueued. A refused enqueue restores the dial and C9 anchor;
+/// the preceding band teardown and split clear are not undone. Never locks
 /// the autonomous operator, so it is safe under `ptt_sync_gate`.
-pub(crate) async fn qsy_send(ctx: &QsyCtx, source: ComponentId, vfo: u8, frequency: u64) -> u64 {
+pub(crate) async fn qsy_send(
+    ctx: &QsyCtx,
+    source: ComponentId,
+    vfo: u8,
+    frequency: u64,
+) -> Option<u64> {
     // C9 — band change mid-QSO: tear down active QSOs so no
     // stale keep-call keeps TXing on the new band. Capture the
     // *old* dial frequency BEFORE we overwrite the atomic, then
@@ -209,9 +216,11 @@ pub(crate) async fn qsy_send(ctx: &QsyCtx, source: ComponentId, vfo: u8, frequen
     // Stamp the C9 dedup anchor: pancetta commanded this
     // freq, so the hamlib poll loop suppresses its own
     // teardown (here and during the rig settle window).
-    if let Ok(mut anchor) = ctx.last_freq_command.lock() {
-        *anchor = Some((frequency, Instant::now()));
-    }
+    let previous_anchor = if let Ok(mut anchor) = ctx.last_freq_command.lock() {
+        anchor.replace((frequency, Instant::now()))
+    } else {
+        None
+    };
     if super::is_band_change(old_freq_hz, frequency) {
         info!(
             target: "operator.override",
@@ -247,13 +256,21 @@ pub(crate) async fn qsy_send(ctx: &QsyCtx, source: ComponentId, vfo: u8, frequen
         MessageType::RigControl(RigControlMessage::SetFrequency { vfo, frequency }),
         Instant::now(),
     );
-    if let Err(e) = ctx.bus.send_message(msg).await {
+    let delivered = ctx.bus.send_message_checked(msg).await.unwrap_or_else(|e| {
         debug!("Failed to forward SetFrequency to hamlib: {}", e);
+        false
+    });
+    if !delivered {
+        ctx.operating_freq_hz.store(old_freq_hz, Ordering::Relaxed);
+        if let Ok(mut anchor) = ctx.last_freq_command.lock() {
+            *anchor = previous_anchor;
+        }
+        return None;
     }
     // A13 (review L4-24) seam: once `[rig] data_mode` exists, send
     // RigControlMessage::SetMode here so every pancetta-commanded QSY also
     // sets the rig's data mode. PAN-287 sends no mode command.
-    old_freq_hz
+    Some(old_freq_hz)
 }
 
 /// Clear the allocator's old-dial data (spectral snapshot, decode history,
@@ -271,7 +288,10 @@ pub(crate) async fn invalidate_allocator_band_state(ctx: &QsyCtx) {
 /// autonomous `ChangeBand` block in `coordinator/autonomous.rs`, which
 /// invalidates through the hop itself and also relays split to the gateway.
 pub(crate) async fn qsy_to(ctx: &QsyCtx, source: ComponentId, vfo: u8, frequency: u64) -> u64 {
-    let old = qsy_send(ctx, source, vfo, frequency).await;
+    let Some(old) = qsy_send(ctx, source, vfo, frequency).await else {
+        ctx.status("Can't QSY — rig command was not delivered, try again".to_string());
+        return ctx.operating_freq_hz.load(Ordering::Relaxed);
+    };
     if old != frequency {
         invalidate_allocator_band_state(ctx).await;
     }
@@ -491,7 +511,19 @@ async fn execute_spot_call(
             if ctx.keyed() {
                 return ExecOutcome::Defer;
             }
-            qsy_send(&ctx.qsy, ComponentId::Tui, 0, call.dial_hz).await;
+            if qsy_send(&ctx.qsy, ComponentId::Tui, 0, call.dial_hz)
+                .await
+                .is_none()
+            {
+                if expected_gen.is_some() {
+                    ctx.take_parked();
+                }
+                ctx.qsy.status(format!(
+                    "Can't call {} — rig command was not delivered, try again",
+                    call.callsign
+                ));
+                return ExecOutcome::Done;
+            }
         }
         // The operator lock comes only after `ptt_sync_gate` is released.
         invalidate_allocator_band_state(&ctx.qsy).await;
@@ -1098,6 +1130,46 @@ mod tests {
             vec![14_074_000]
         );
         assert_eq!(start_qsos(&drain(&h.qso_rx)), vec![(1600, true)]);
+    }
+
+    #[tokio::test]
+    async fn full_rig_channel_refuses_spot_call_and_allows_retry() {
+        let h = harness(true, 7_074_000, None).await;
+        let filler = || {
+            ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Hamlib,
+                MessageType::RigControl(RigControlMessage::SetFrequency {
+                    vfo: 0,
+                    frequency: 7_074_000,
+                }),
+                Instant::now(),
+            )
+        };
+        while h.ctx.qsy.bus.send_message_checked(filler()).await.unwrap() {}
+        handle_spot_call(&h.ctx, spot(Some(1210))).await;
+        assert!(
+            start_qsos(&drain(&h.qso_rx)).is_empty(),
+            "no call without retune delivery"
+        );
+        assert_eq!(
+            h.ctx.qsy.operating_freq_hz.load(Ordering::Acquire),
+            7_074_000
+        );
+        assert!(h.ctx.qsy.last_freq_command.lock().unwrap().is_none());
+        let tui: Vec<_> = h.tui_rx.try_iter().collect();
+        assert!(!tui.iter().any(|m| matches!(m, TuiMessage::SpotQsy { .. })));
+        assert!(tui
+            .iter()
+            .any(|m| matches!(m, TuiMessage::StatusUpdate { status, .. }
+            if status.contains("rig command was not delivered"))));
+        drain(h.hamlib_rx.as_ref().unwrap());
+        handle_spot_call(&h.ctx, spot(Some(1210))).await;
+        assert_eq!(
+            set_freqs(&drain(h.hamlib_rx.as_ref().unwrap())),
+            vec![14_074_000]
+        );
+        assert_eq!(start_qsos(&drain(&h.qso_rx)), vec![(1210, false)]);
     }
 
     #[tokio::test]
