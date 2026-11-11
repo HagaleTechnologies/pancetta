@@ -802,7 +802,11 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
         " DECODE: {} {}ms{} ",
         app.decode_effort,
         decode_elapsed_ms,
-        if decode_exhausted { " ✂" } else { "" }
+        if decode_exhausted {
+            format!(" {}", crate::presentation::BUDGET_MARKER)
+        } else {
+            String::new()
+        }
     );
     segs.push(BarSegment::with_compact(
         " ",
@@ -895,10 +899,19 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
         segs.push(BarSegment::with_compact(
             " ",
             vec![Span::styled(
-                " ⏸ AUTO-CQ PAUSED — press a key (FCC §97.221) ",
+                format!(
+                    " {} AUTO-CQ PAUSED — press a key (FCC §97.221) ",
+                    crate::presentation::PAUSE_MARKER
+                ),
                 pause_style,
             )],
-            vec![Span::styled(" ⏸ CQ PAUSED: press a key ", pause_style)],
+            vec![Span::styled(
+                format!(
+                    " {} CQ PAUSED: press a key ",
+                    crate::presentation::PAUSE_MARKER
+                ),
+                pause_style,
+            )],
             title_rank::PAUSE,
             title_rank::PAUSE_FULL,
         ));
@@ -1020,9 +1033,9 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
             // transmitting WHILE we're transmitting it" — this is the fix.
             let now_count = 1 + concurrent.len();
             let label = if now_count > 1 {
-                format!(" 🔴 TX NOW ×{} ", now_count)
+                format!(" {} TX NOW ×{} ", crate::presentation::TX_MARKER, now_count)
             } else {
-                " 🔴 TX NOW ".to_string()
+                format!(" {} TX NOW ", crate::presentation::TX_MARKER)
             };
             spans.push(Span::styled(
                 label,
@@ -1971,7 +1984,10 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
     let rig_ok = !matches!(app.rig_connected, crate::app::RigConnDisplay::PollingFailed);
     lines.push(Line::from(vec![
         dot(rig_ok),
-        Span::raw(format!(" Rig: {:?}", app.rig_connected)),
+        Span::raw(format!(
+            " Rig: {}",
+            crate::presentation::rig_label(app.rig_connected)
+        )),
     ]));
     // PAN-89: was inverted (green "system default" for the misconfig).
     lines.push(Line::from(vec![
@@ -2069,10 +2085,19 @@ pub fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> Color {
 
 /// Helper function to format distance
 pub fn format_distance(distance: Option<f64>) -> String {
+    let number = format_distance_cell(distance);
+    if number == "---" {
+        number
+    } else {
+        format!("{number} km")
+    }
+}
+
+/// Whole kilometres for a table whose header carries the unit.
+pub(crate) fn format_distance_cell(distance: Option<f64>) -> String {
     match distance {
-        Some(d) if d < 1000.0 => format!("{:.0} km", d),
-        Some(d) => format!("{:.1}k km", d / 1000.0),
-        None => "---".to_string(),
+        Some(d) if d.is_finite() && d >= 0.0 => format!("{:.0}", d),
+        _ => "---".to_string(),
     }
 }
 
@@ -2142,6 +2167,77 @@ mod view_render_tests {
             .count()
     }
 
+    #[tokio::test]
+    async fn pan353_rendered_text_all_views() {
+        let mut app = default_app().await;
+        for populated in [false, true] {
+            if populated {
+                app.decoded_messages
+                    .push_back(crate::app::DecodedMessageView {
+                        timestamp: chrono::Utc::now(),
+                        frequency: 14_074_000.0,
+                        mode: "FT8".into(),
+                        snr: -7,
+                        delta_time: 0.0,
+                        delta_freq: 1234.0,
+                        call_sign: Some("N2ABC".into()),
+                        grid_square: Some("FN42".into()),
+                        message: "N0CALL N2ABC -07".into(),
+                        distance: Some(1834.0),
+                        bearing: None,
+                        slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                        is_directed_at_us: true,
+                        worked_before: false,
+                        needed: false,
+                        atno: false,
+                        band_needed: false,
+                        priority_score: None,
+                        priority_factors: None,
+                        is_own_tx: false,
+                    });
+                app.tx_now_sending = Some(crate::app::TxQueueItem {
+                    text: "CQ N2ABC FN42".into(),
+                    freq_hz: 1500.0,
+                    qso_id: None,
+                    deferred: false,
+                });
+                app.status_message = "Reply step: RR73".into();
+            }
+            for view in ALL_VIEWS {
+                app.active_view = view;
+                for (w, h) in [(120, 40), (80, 24)] {
+                    let buf = render_app(&app, w, h);
+                    crate::presentation::assert_readable_buffer(&buf);
+                    if populated {
+                        if w >= 120 {
+                            assert!(buffer_contains(&buf, "Reply step: RR73"));
+                        }
+                        assert!(buffer_contains(&buf, "CQ N2ABC FN42"));
+                    } else {
+                        assert!(buffer_contains(&buf, "N0CALL"));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn pan353_rendered_text_distance_rounding() {
+        for (value, expected) in [
+            (0.0, "0"),
+            (999.0, "999"),
+            (999.6, "1000"),
+            (1000.0, "1000"),
+            (1834.0, "1834"),
+            (20015.0, "20015"),
+        ] {
+            assert_eq!(format_distance(Some(value)), format!("{expected} km"));
+            assert_eq!(format_distance_cell(Some(value)), expected);
+        }
+        for value in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(format_distance(value), "---");
+            assert_eq!(format_distance_cell(value), "---");
+        }
+    }
     #[tokio::test]
     async fn operate_view_shows_all_six_panels() {
         // Task 11 swapped the waterfall for the TX-placement instrument
@@ -2492,6 +2588,25 @@ mod view_render_tests {
             assert!(row.contains('…'), "{w}: {row}");
             assert!(!row.contains("more · Shift+S"), "{w}: {row}");
             assert!(row.trim_end().ends_with("! ack"), "{w}: {row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pan353_rendered_text_health_labels() {
+        use crate::app::RigConnDisplay::*;
+        let mut app = crate::app::App::new(crate::Config::default(), None)
+            .await
+            .unwrap();
+        for (state, label) in [
+            (NotConnected, "not connected"),
+            (Connected, "connected"),
+            (PollingFailed, "polling failed"),
+        ] {
+            app.rig_connected = state;
+            for buf in [render_health(&app).await, render_health_80x24(&app)] {
+                crate::presentation::assert_readable_buffer(&buf);
+                assert!(buffer_contains(&buf, &format!("Rig: {label}")));
+            }
         }
     }
 
@@ -3258,6 +3373,96 @@ mod view_render_tests {
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn pan353_rendered_text_markers() {
+        let mut app = default_app().await;
+        for exhausted in [false, true] {
+            let mut health = health_with_clock(None, false);
+            health.last_decode_budget_exhausted = exhausted;
+            app.pipeline_health = Some(health);
+            let line = title_bar_left_line(&app, 300);
+            let text = line_text(&line);
+            assert_eq!(text.contains("ms !"), exhausted, "{text}");
+            assert!(!text.contains('✂'));
+            let buf = render_app(&app, 300, 40);
+            assert_eq!(buffer_contains(&buf, "ms !"), exhausted);
+            assert!(!buffer_contains(&buf, "✂"));
+        }
+        for paused in [false, true] {
+            app.autonomous_init_paused = paused;
+            let text = line_text(&title_bar_left_line(&app, 300));
+            assert_eq!(text.contains("| AUTO-CQ PAUSED"), paused);
+            if paused {
+                assert!(title_bar_left_line(&app, 300)
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains("| AUTO-CQ PAUSED")
+                        && s.style.bg == Some(Color::Yellow)));
+            }
+            assert!(!text.contains('⏸'));
+            let buf = render_app(&app, 300, 40);
+            assert_eq!(buffer_contains(&buf, "| AUTO-CQ PAUSED"), paused);
+            assert!(!buffer_contains(&buf, "⏸"));
+        }
+        app.autonomous_init_paused = true;
+        let mut saw_compact = false;
+        for width in 50..300 {
+            let line = title_bar_left_line(&app, width);
+            assert!(line.width() <= width as usize);
+            if line_text(&line).contains("| CQ PAUSED: press a key") {
+                saw_compact = true;
+                assert!(line.spans.iter().any(
+                    |s| s.content.contains("| CQ PAUSED") && s.style.bg == Some(Color::Yellow)
+                ));
+            }
+        }
+        assert!(saw_compact);
+        app.autonomous_init_paused = false;
+        let item = crate::app::TxQueueItem {
+            text: "N2ABC N0CALL RR73".into(),
+            freq_hz: 1500.0,
+            qso_id: Some("test-qso".into()),
+            deferred: false,
+        };
+        *app.qso_status_mut() = crate::app::QsoStatus {
+            active: true,
+            call_sign: Some("N2ABC".into()),
+            qso_id: Some("test-qso".into()),
+            ladder_labels: vec!["RR73".into()],
+            ..Default::default()
+        };
+        for multi in [false, true] {
+            app.tx_now_sending = Some(item.clone());
+            app.tx_queued = if multi { vec![item.clone()] } else { vec![] };
+            let buf = render_app(&app, 120, 40);
+            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.contains(if multi { "* TX NOW ×2" } else { "* TX NOW" }),
+                "{text}"
+            );
+            assert!(!text.contains('🔴'));
+            assert!(buf
+                .content
+                .iter()
+                .any(|c| c.symbol() == "*" && c.bg == Color::Red));
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| qso_status::render_qso_status(f, f.area(), &app).unwrap())
+            .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("* TX"), "{text}");
+        assert!(!text.contains('🔴'));
+        assert!(buf
+            .content
+            .iter()
+            .any(|c| c.symbol() == "*" && c.bg == Color::Red));
+        app.tx_now_sending = None;
+        app.tx_queued.clear();
+        let buf = render_app(&app, 120, 40);
+        assert!(!buffer_contains(&buf, "* TX NOW"));
     }
 
     fn line_text(line: &Line<'_>) -> String {

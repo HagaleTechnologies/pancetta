@@ -161,7 +161,8 @@ async fn tx_strip_keyed_branch_is_unchanged() {
         deferred: false,
     });
     let buf = render(&app, 120, 40);
-    assert!(contains(&buf, "TX NOW"));
+    assert!(contains(&buf, "* TX NOW"));
+    assert!(!contains(&buf, "🔴"));
     assert!(!contains(&buf, "NEXT TX"));
 }
 

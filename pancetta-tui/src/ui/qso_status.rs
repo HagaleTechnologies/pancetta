@@ -652,7 +652,7 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
         Some(item) => Line::from(vec![
             Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
             Span::styled(
-                " 🔴 TX ",
+                format!(" {} TX ", crate::presentation::TX_MARKER),
                 Style::default()
                     .fg(ratatui::style::Color::White)
                     .bg(ratatui::style::Color::Red)

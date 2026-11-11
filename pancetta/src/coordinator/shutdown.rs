@@ -1,7 +1,114 @@
+use crate::message_bus::ComponentId;
 use anyhow::{Context, Result};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// PAN-277: outer budget for shutdown's direct rigctld PTT-off. Fits
+/// `connect()`'s `f` verification plus `T 0`, each at the command timeout.
+pub(crate) const DIRECT_PTT_OFF_BUDGET: Duration = Duration::from_secs(6);
+/// PAN-277: reply wait per direct command. Must exceed one rig answer time,
+/// because `connect()` verifies the link with `f` under this timeout.
+pub(crate) const DIRECT_PTT_OFF_COMMAND_TIMEOUT_MS: u64 = 3000;
+/// PAN-277: TCP connect timeout for the direct client.
+pub(crate) const DIRECT_PTT_OFF_CONNECT_TIMEOUT_MS: u64 = 2000;
+
+pub(crate) fn direct_ptt_off_config(host: String, port: u16) -> pancetta_hamlib::RigctldConfig {
+    pancetta_hamlib::RigctldConfig {
+        host,
+        port,
+        timeout_ms: DIRECT_PTT_OFF_CONNECT_TIMEOUT_MS,
+        command_timeout_ms: DIRECT_PTT_OFF_COMMAND_TIMEOUT_MS,
+        ..Default::default()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DirectPttOff {
+    Unkeyed,
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+/// Open a fresh rigctld connection and send PTT-off, bounded by
+/// [`DIRECT_PTT_OFF_BUDGET`]. Independent of the Hamlib component.
+pub(crate) async fn direct_rigctld_ptt_off(host: String, port: u16) -> DirectPttOff {
+    use pancetta_hamlib::RigControl;
+    let client = pancetta_hamlib::RigctldClient::new(direct_ptt_off_config(host, port));
+    let attempt = async {
+        client.connect().await?;
+        client
+            .set_ptt(
+                pancetta_hamlib::Vfo::Current,
+                pancetta_hamlib::PttState::Off,
+            )
+            .await?;
+        anyhow::Ok(())
+    };
+    match tokio::time::timeout(DIRECT_PTT_OFF_BUDGET, attempt).await {
+        Ok(Ok(())) => DirectPttOff::Unkeyed,
+        Ok(Err(e)) => DirectPttOff::Failed(e),
+        Err(_) => DirectPttOff::TimedOut,
+    }
+}
+
+fn direct_rigctld_target() -> (String, u16) {
+    (
+        std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        std::env::var("RIGCTLD_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(4532),
+    )
+}
+
+/// PAN-277: join budget for the Hamlib task after `hamlib_drain_stop`.
+pub(crate) const HAMLIB_SHUTDOWN_JOIN: Duration = Duration::from_secs(10);
+/// PAN-277: join budget for the TX worker before the drain stop.
+pub(crate) const TX_WORKER_SHUTDOWN_JOIN: Duration = Duration::from_secs(1);
+/// PAN-277: wait for an armed PttGuard's fallback PTT-off to be queued.
+pub(crate) const PENDING_PTT_OFF_SETTLE: Duration = Duration::from_secs(1);
+
+fn take_component_handles(
+    handles: &mut Vec<(ComponentId, tokio::task::JoinHandle<Result<()>>)>,
+    id: ComponentId,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    let mut selected = Vec::new();
+    let mut index = 0;
+    while index < handles.len() {
+        if handles[index].0 == id {
+            selected.push(handles.remove(index).1);
+        } else {
+            index += 1;
+        }
+    }
+    selected
+}
+
+/// Join within `budget`; on timeout abort, then wait up to `budget` again so
+/// the task's `Drop`s have run. Returns whether it finished on its own.
+async fn join_or_abort(
+    name: &str,
+    mut handle: tokio::task::JoinHandle<Result<()>>,
+    budget: Duration,
+) -> bool {
+    match tokio::time::timeout(budget, &mut handle).await {
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(e))) => {
+            warn!("Shutdown: {name} task ended with error: {e}");
+            true
+        }
+        Ok(Err(e)) => {
+            warn!("Shutdown: {name} task join error: {e}");
+            true
+        }
+        Err(_) => {
+            handle.abort();
+            let _ = tokio::time::timeout(budget, handle).await;
+            false
+        }
+    }
+}
 
 impl super::ApplicationCoordinator {
     /// Whether shutdown should open its own TCP connection to `rigctld` and
@@ -52,21 +159,8 @@ impl super::ApplicationCoordinator {
         self.is_running.store(false, Ordering::Release);
         self.shutdown_signal.store(true, Ordering::Release);
 
-        // Safety: send PTT-off before tearing down components to avoid
-        // leaving the rig transmitting if a TX was in progress. We use
-        // two parallel paths because each one can fail under shutdown
-        // race conditions:
-        //
-        // (1) Message bus to the running Hamlib component. Honoured
-        //     only as long as Hamlib is still draining its queue, which
-        //     is racy under shutdown.
-        // (2) A direct rigctld TCP connection from this scope, opened
-        //     just for PTT-off. Independent of the Hamlib component's
-        //     liveness, the message bus, and the in-flight TX worker.
-        //
-        // Whichever lands first wins. If both fail, the in-TX-worker
-        // PttGuard drop (triggered by tokio cancellation in the
-        // task-handle abort below) is the third backstop.
+        // Queue an unkey first. Concurrently stop the TX producer, settle its
+        // fallback, stop and join the Hamlib drain, and try a fresh direct client.
         {
             use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
             let ptt_off = ComponentMessage::new(
@@ -83,55 +177,62 @@ impl super::ApplicationCoordinator {
             )
             .await
             {
-                Ok(Ok(())) => info!("Shutdown: PTT-off sent via message bus"),
+                Ok(Ok(())) => info!("Shutdown: PTT-off queued for the Hamlib loop"),
                 Ok(Err(e)) => warn!("Shutdown: PTT-off via message bus failed: {}", e),
                 Err(_) => warn!("Shutdown: PTT-off via message bus timed out"),
             }
         }
 
-        // Direct rigctld PTT-off. Independent of the message bus and
-        // the Hamlib component's task. Skipped if rig was disabled, and
-        // skipped under `--replay`, which never started rig control at all
-        // (see `wants_direct_rigctld_ptt_off`).
-        if self.wants_direct_rigctld_ptt_off().await {
-            let rigctld_host =
-                std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let rigctld_port: u16 = std::env::var("RIGCTLD_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(4532);
-            let direct_client =
-                pancetta_hamlib::RigctldClient::new(pancetta_hamlib::RigctldConfig {
-                    host: rigctld_host,
-                    port: rigctld_port,
-                    ..Default::default()
-                });
-            let direct_off = async {
-                use pancetta_hamlib::RigControl;
-                direct_client.connect().await?;
-                direct_client
-                    .set_ptt(
-                        pancetta_hamlib::Vfo::Current,
-                        pancetta_hamlib::PttState::Off,
-                    )
-                    .await?;
-                anyhow::Ok::<()>(())
-            };
-            match tokio::time::timeout(Duration::from_millis(500), direct_off).await {
-                Ok(Ok(())) => info!("Shutdown: direct rigctld PTT-off succeeded"),
-                Ok(Err(e)) => warn!("Shutdown: direct rigctld PTT-off failed: {}", e),
-                Err(_) => warn!("Shutdown: direct rigctld PTT-off timed out"),
+        let direct_target = if self.wants_direct_rigctld_ptt_off().await {
+            Some(direct_rigctld_target())
+        } else {
+            if self.replay_mode() {
+                info!("Replay mode: skipping direct rigctld PTT-off — this run never started rig control");
             }
-        } else if self.replay_mode() {
-            info!(
-                "Replay mode: skipping direct rigctld PTT-off — this run never started rig control"
-            );
-        }
+            None
+        };
+        let tx_handles =
+            take_component_handles(&mut self.named_task_handles, ComponentId::Ft8Transmitter);
+        let hamlib_handles =
+            take_component_handles(&mut self.named_task_handles, ComponentId::Hamlib);
+        let pending = self.pending_ptt_off.clone();
+        let stop = self.hamlib_drain_stop.clone();
+        let direct = async move {
+            if let Some((host, port)) = direct_target {
+                match direct_rigctld_ptt_off(host, port).await {
+                    DirectPttOff::Unkeyed => info!("Shutdown: direct rigctld PTT-off succeeded"),
+                    DirectPttOff::Failed(e) => {
+                        warn!("Shutdown: direct rigctld PTT-off failed: {}", e)
+                    }
+                    DirectPttOff::TimedOut => warn!("Shutdown: direct rigctld PTT-off timed out"),
+                }
+            }
+        };
+        let drain = async move {
+            for handle in tx_handles {
+                join_or_abort("Ft8Transmitter", handle, TX_WORKER_SHUTDOWN_JOIN).await;
+            }
+            if tokio::time::timeout(PENDING_PTT_OFF_SETTLE, pending.settle())
+                .await
+                .is_err()
+            {
+                warn!("Shutdown: TX worker fallback PTT-off still outstanding");
+            }
+            stop.store(true, Ordering::Release);
+            for handle in hamlib_handles {
+                if join_or_abort("Hamlib", handle, HAMLIB_SHUTDOWN_JOIN).await {
+                    info!("Shutdown: Hamlib loop drained its queue and stopped");
+                } else {
+                    warn!(
+                        "Shutdown: Hamlib loop did not finish its drain in {}s; aborted it",
+                        HAMLIB_SHUTDOWN_JOIN.as_secs()
+                    );
+                }
+            }
+        };
+        tokio::join!(direct, drain);
 
-        // Hamlib may already have stopped on the shared shutdown flag. Complete
-        // the independent PTT-off attempt above before waiting for cleanup that
-        // requires physical PTT-off. Keep the rig connection alive for both the
-        // sweep's restoration and the fallback after a failed/panicked task.
+        // Both unkey paths have finished before gain restoration or rig teardown.
         let sweep_result = if let Some(handle) = sweep_handle {
             handle
                 .await
@@ -174,13 +275,7 @@ impl super::ApplicationCoordinator {
             .into_iter()
             .enumerate()
         {
-            // Capture an abort handle BEFORE the timeout consumes the
-            // JoinHandle. Without this, dropping the JoinHandle on
-            // timeout merely detaches the task — the underlying future
-            // keeps running, and the in-flight TX worker's PttGuard
-            // never drops because it's still alive. Aborting at the
-            // next await point causes Drop to fire, which spawns the
-            // PttGuard PTT-off message.
+            // Abort timed-out tasks so their cleanup runs instead of detaching.
             let abort_handle = handle.abort_handle();
             match tokio::time::timeout(per_task_timeout, handle).await {
                 Ok(Ok(_)) => {
@@ -234,5 +329,136 @@ impl super::ApplicationCoordinator {
         info!("Graceful shutdown completed");
 
         sweep_result
+    }
+}
+
+#[cfg(test)]
+mod pan277_direct_ptt_off_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    struct SlowRigctld {
+        port: u16,
+        commands: Arc<Mutex<Vec<String>>>,
+        keyed: Arc<AtomicBool>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl SlowRigctld {
+        async fn start(delay: Duration) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let keyed = Arc::new(AtomicBool::new(true));
+            let log = commands.clone();
+            let state = keyed.clone();
+            let server = tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let log = log.clone();
+                    let state = state.clone();
+                    clients.spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(command)) = lines.next_line().await {
+                            log.lock().unwrap().push(command.clone());
+                            if command == "T 0" {
+                                state.store(false, Ordering::Release);
+                            }
+                            tokio::time::sleep(delay).await;
+                            let reply = if command == "f" {
+                                b"14074000\n".as_slice()
+                            } else {
+                                b"RPRT 0\n".as_slice()
+                            };
+                            if write.write_all(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                port,
+                commands,
+                keyed,
+                server,
+            }
+        }
+        fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+        fn keyed(&self) -> bool {
+            self.keyed.load(Ordering::Acquire)
+        }
+    }
+    impl Drop for SlowRigctld {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn pan277_direct_ptt_off_unkeys_a_rigctld_that_takes_1500ms_to_answer() {
+        let rig = SlowRigctld::start(Duration::from_millis(1500)).await;
+        let started = Instant::now();
+        let outcome = direct_rigctld_ptt_off("127.0.0.1".into(), rig.port).await;
+        assert!(matches!(outcome, DirectPttOff::Unkeyed), "{outcome:?}");
+        assert_eq!(rig.commands(), ["f", "T 0"]);
+        assert!(!rig.keyed());
+        // The client waited for both replies instead of racing past them.
+        assert!(started.elapsed() >= Duration::from_millis(3000));
+    }
+
+    #[tokio::test]
+    async fn pan277_direct_ptt_off_gives_up_within_its_budget_on_a_silent_rigctld() {
+        let rig = SlowRigctld::start(Duration::from_secs(60)).await;
+        let started = Instant::now();
+        let outcome = direct_rigctld_ptt_off("127.0.0.1".into(), rig.port).await;
+        assert!(!matches!(outcome, DirectPttOff::Unkeyed), "{outcome:?}");
+        assert!(started.elapsed() < DIRECT_PTT_OFF_BUDGET + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn pan277_direct_ptt_off_budget_fits_f_and_t0_at_the_command_timeout() {
+        assert!(
+            DIRECT_PTT_OFF_COMMAND_TIMEOUT_MS > 1500,
+            "must exceed the ticket's 1.5 s rig"
+        );
+        assert!(
+            DIRECT_PTT_OFF_BUDGET >= Duration::from_millis(2 * DIRECT_PTT_OFF_COMMAND_TIMEOUT_MS)
+        );
+        let config = direct_ptt_off_config("h".into(), 1);
+        assert_eq!(config.command_timeout_ms, DIRECT_PTT_OFF_COMMAND_TIMEOUT_MS);
+        assert_eq!(config.timeout_ms, DIRECT_PTT_OFF_CONNECT_TIMEOUT_MS);
+    }
+
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[tokio::test]
+    async fn pan277_join_or_abort_reports_a_finished_task() {
+        let handle = tokio::spawn(async { anyhow::Ok(()) });
+        assert!(join_or_abort("t", handle, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn pan277_join_or_abort_aborts_a_hung_task_and_waits_for_its_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = SetOnDrop(flag);
+            std::future::pending::<()>().await;
+            anyhow::Ok(())
+        });
+        let started = Instant::now();
+        assert!(!join_or_abort("t", handle, Duration::from_millis(200)).await);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "Drop ran before join_or_abort returned"
+        );
+        assert!(started.elapsed() < Duration::from_millis(600));
     }
 }

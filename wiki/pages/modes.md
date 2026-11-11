@@ -65,3 +65,15 @@ so a switch just before or just after that boundary receives the same recovery.
 resolves to today's exact FT8 constants (regression-guarded). Do not change a
 slot or parity default without preserving that. See [[tx-scheduling]] for how
 the active period feeds the scheduler.
+
+## Rig CAT mode is separate
+
+PAN-276 adds optional `rig.data_mode` and `rig.data_passband_hz`. These do not
+select FT8/FT4/FT2. They request an exact CAT sideband/data mode at connection
+and after commanded retunes. See `docs/CONFIG.md` for accepted values and split
+limits. Omission preserves manual mode control.
+
+A rigctld command can reconnect internally. Mode readiness must therefore be
+bound to the actual connection generation inside the client, rather than only
+set during coordinator startup. Key-down must check that generation and must
+never reconnect and replay an old request. Hardware qualification is pending.
