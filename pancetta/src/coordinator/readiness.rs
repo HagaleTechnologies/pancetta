@@ -117,7 +117,10 @@ impl ReadinessSources {
             input_silent,
             upload_issues,
             upload_queue_refused,
-            cqdx_dxcc_needs: tui_need_list_health(&self.cached_lookup.dxcc_need_list()),
+            cqdx_dxcc_needs: tui_dxcc_need_health(
+                &self.cached_lookup.dxcc_need_list(),
+                self.cached_lookup.local_log_available(),
+            ),
             cqdx_grid_needs: tui_need_list_health(&self.cached_lookup.grid_need_list()),
         }
     }
@@ -137,6 +140,17 @@ fn tui_need_list_health(a: &NeedListAvailability) -> NeedListHealth {
             error: clip(error),
             retrying: *retrying,
         },
+    }
+}
+
+/// PAN-347: the entity list's strip view. An unloaded cqdx list with the
+/// local logbook seeded says where needed and ATNO come from instead.
+fn tui_dxcc_need_health(a: &NeedListAvailability, local_log: bool) -> NeedListHealth {
+    match tui_need_list_health(a) {
+        NeedListHealth::Unavailable { error, retrying } if local_log => {
+            NeedListHealth::LocalLogbook { error, retrying }
+        }
+        other => other,
     }
 }
 
@@ -465,6 +479,50 @@ mod tests {
         s.cached_lookup.update_needed_dxcc(Default::default());
         s.cached_lookup.update_needed_grids(Default::default());
         assert_eq!(s.snapshot(false, false), StationReadiness::default());
+    }
+
+    #[test]
+    fn need_list_health_uses_local_logbook_when_seeded() {
+        let down = NeedListAvailability::Unavailable {
+            since: chrono::Utc::now(),
+            error: "connection refused".into(),
+            retrying: true,
+        };
+        assert_eq!(
+            tui_dxcc_need_health(&down, true),
+            NeedListHealth::LocalLogbook {
+                error: "connection refused".into(),
+                retrying: true,
+            }
+        );
+        assert_eq!(
+            tui_dxcc_need_health(&down, false),
+            NeedListHealth::Unavailable {
+                error: "connection refused".into(),
+                retrying: true,
+            }
+        );
+        for quiet in [
+            NeedListAvailability::NotConfigured,
+            NeedListAvailability::Loading,
+            NeedListAvailability::NotOffered,
+            NeedListAvailability::Loaded {
+                fetched_at: chrono::Utc::now(),
+                band: None,
+            },
+        ] {
+            for seeded in [true, false] {
+                assert_eq!(
+                    tui_dxcc_need_health(&quiet, seeded),
+                    NeedListHealth::NoWarning
+                );
+            }
+        }
+        // The grid list keeps the cqdx-only mapping.
+        assert!(matches!(
+            tui_need_list_health(&down),
+            NeedListHealth::Unavailable { .. }
+        ));
     }
 
     fn dest_health(d: UploadDestination) -> DestinationHealth {

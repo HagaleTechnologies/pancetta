@@ -1982,7 +1982,8 @@ impl super::ApplicationCoordinator {
         let rig_conn_state = self.rig_conn_state.clone();
         // PAN-89: cleared (via `confirm_ptt_off`) wherever this generation's
         // rig accepts a PTT-off -- startup, the PTT watchdog's forced off and
-        // the command loop's `SetPtt { state: false }`.
+        // the command loop's `SetPtt { state: false }`. PAN-272: also latched
+        // by the command loop when that unkey fails with the watchdog armed.
         let ptt_off_unconfirmed = self.ptt_off_unconfirmed.clone();
         let ptt_off_confirmations = self.ptt_off_confirmations.clone();
         // C9 dedup anchor (most recent pancetta-initiated SetFrequency) — the
@@ -2180,6 +2181,14 @@ impl super::ApplicationCoordinator {
                 let ptt_on_since: Arc<RwLock<Option<Instant>>> =
                     Arc::new(RwLock::new(initial_ptt_on));
                 let ptt_on_since_poll = ptt_on_since.clone();
+                // PAN-272: the command loop's last PTT-off failed while
+                // `ptt_on_since` was armed, so the radio may still be keyed.
+                // Set by a failed command-loop unkey, cleared by a confirmed
+                // unkey (command loop or watchdog) or a new key-down. The
+                // watchdog treats it as overdue and retries every tick. Read
+                // and written only while holding the `ptt_on_since` lock, so
+                // the flag and the tracker always change together.
+                let ptt_unkey_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let message_bus_for_connect = message_bus.clone();
                 let rig_poll = Arc::clone(&rig);
                 let rig_for_polling = Arc::clone(&rig_poll);
@@ -2588,6 +2597,7 @@ impl super::ApplicationCoordinator {
                 // Spawn the PTT watchdog as a background task
                 let rig_for_watchdog = Arc::clone(&rig_poll);
                 let ptt_watchdog_tracker = ptt_on_since.clone();
+                let ptt_unkey_failed_watchdog = ptt_unkey_failed.clone();
                 let overload_watchdog_safety = message_bus_for_connect.receive_gain.clone();
                 let shutdown_for_watchdog = shutdown.clone();
                 let ptt_active_watchdog = ptt_active.clone();
@@ -2620,17 +2630,36 @@ impl super::ApplicationCoordinator {
                             break;
                         }
 
-                        let ptt_time = {
-                            let guard = ptt_watchdog_tracker.read().await;
-                            *guard
-                        };
+                        // PAN-272: read the flag under the tracker's lock so
+                        // the pair is consistent, and hold that lock until the
+                        // PTT-off below completes. A command-loop key-down takes
+                        // the same lock before it is admitted and releases it
+                        // before its `set_ptt(On)`, so a retry of a failed unkey
+                        // either sees that key-down's fresh timer and cleared
+                        // flag and stands down, or finishes before the key-down
+                        // is sent. It cannot land after a superseding key-down
+                        // from this generation's command loop and cut the new
+                        // transmission off (PR #612 review).
+                        let mut guard = ptt_watchdog_tracker.write().await;
+                        let unkey_failed = ptt_unkey_failed_watchdog.load(Ordering::Acquire);
 
-                        if let Some(on_since) = ptt_time {
-                            if on_since.elapsed() > Duration::from_secs(PTT_SAFETY_TIMEOUT_SECS) {
-                                error!(
-                                    "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds -- forcing OFF",
-                                    PTT_SAFETY_TIMEOUT_SECS
-                                );
+                        if let Some(on_since) = *guard {
+                            // PAN-272: a PTT-off the rig rejected is overdue at
+                            // once, so the watchdog retries it every tick
+                            // instead of waiting for the 14 s ceiling.
+                            let overdue = on_since.elapsed()
+                                > Duration::from_secs(PTT_SAFETY_TIMEOUT_SECS);
+                            if overdue || unkey_failed {
+                                if overdue {
+                                    error!(
+                                        "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds -- forcing OFF",
+                                        PTT_SAFETY_TIMEOUT_SECS
+                                    );
+                                } else {
+                                    error!(
+                                        "PTT SAFETY WATCHDOG: retrying a PTT-off the rig did not acknowledge"
+                                    );
+                                }
                                 match rig_for_watchdog
                                     .set_ptt(
                                         pancetta_hamlib::Vfo::Current,
@@ -2641,15 +2670,23 @@ impl super::ApplicationCoordinator {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
                                         overload_watchdog_safety.confirmed_off(chrono::Utc::now().timestamp_millis());
-                                        ptt_active_watchdog.store(false, Ordering::Release);
+                                        // PAN-272: a failed unkey was already delivered,
+                                        // so its TX worker guard cleared `ptt_active`.
+                                        // A set flag now belongs to the next
+                                        // transmission, whose key-down waits on this lock.
+                                        if !unkey_failed {
+                                            ptt_active_watchdog.store(false, Ordering::Release);
+                                        }
                                         confirm_ptt_off(
                                             &ptt_off_unconfirmed_watchdog,
                                             &ptt_off_confirmations_watchdog,
                                             rig_enabled,
                                         );
-                                        // Only clear timer on success -- retry on next tick if it fails
-                                        let mut guard = ptt_watchdog_tracker.write().await;
+                                        // Only clear timer on success -- retry on next tick if it fails.
+                                        // PAN-272: the lock held since the check means no
+                                        // key-down was recorded while `set_ptt` was in flight.
                                         *guard = None;
+                                        ptt_unkey_failed_watchdog.store(false, Ordering::Release);
                                     }
                                     Err(e) => {
                                         error!(
@@ -3101,6 +3138,19 @@ impl super::ApplicationCoordinator {
                                         );
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
+                                        // PAN-272: a key-down holds the watchdog
+                                        // tracker's lock from before admission until
+                                        // its tracker update, so it waits for a
+                                        // watchdog PTT-off already in flight instead
+                                        // of being cut off by it (see the watchdog).
+                                        // Taken before `ptt_command_consumed`, so that
+                                        // PTT-off's `confirmed_off` still sees this key
+                                        // as pending. Every `continue` below drops it.
+                                        let keydown_tracker = if *state {
+                                            Some(ptt_on_since.write().await)
+                                        } else {
+                                            None
+                                        };
                                         if *state {
                                             message_bus_for_connect
                                                 .receive_gain
@@ -3149,21 +3199,30 @@ impl super::ApplicationCoordinator {
                                         {
                                             continue;
                                         }
-                                        // Update PTT watchdog tracker
-                                        {
-                                            let mut guard = ptt_on_since.write().await;
-                                            if *state {
-                                                // PTT going on -- record the time
-                                                if guard.is_none() {
-                                                    *guard = Some(Instant::now());
-                                                    debug!("PTT watchdog: PTT ON, timer started");
-                                                }
-                                            } else {
-                                                // PTT going off -- clear the timer
-                                                *guard = None;
-                                                debug!("PTT watchdog: PTT OFF, timer cleared");
+                                        // Update PTT watchdog tracker. A key-down arms it
+                                        // before the CAT call, so a key-down whose
+                                        // `set_ptt(On)` fails is still watched. PAN-272: an
+                                        // unkey leaves it armed here; only the rig's `Ok`
+                                        // below clears it.
+                                        if let Some(mut guard) = keydown_tracker {
+                                            // PAN-272: a key-down after a failed unkey
+                                            // supersedes it with a fresh timer, so the new
+                                            // transmission does not inherit the old,
+                                            // expired deadline. The swap runs on every
+                                            // accepted key-down, never behind a
+                                            // short-circuit. Duplicate key-downs still
+                                            // cannot extend a live timer.
+                                            let stale =
+                                                ptt_unkey_failed.swap(false, Ordering::AcqRel);
+                                            if guard.is_none() || stale {
+                                                *guard = Some(Instant::now());
+                                                debug!("PTT watchdog: PTT ON, timer started");
                                             }
                                         }
+                                        // PAN-272: a confirmation that races a failing
+                                        // unkey (the watchdog's) must win, as in teardown.
+                                        let confirms_before =
+                                            ptt_off_confirmations.load(Ordering::SeqCst);
 
                                         let ptt = if *state {
                                             pancetta_hamlib::PttState::On
@@ -3192,9 +3251,44 @@ impl super::ApplicationCoordinator {
                                                         &ptt_off_confirmations,
                                                         rig_enabled,
                                                     );
+                                                    // PAN-272: the rig acknowledged the
+                                                    // unkey, so the watchdog can stand down.
+                                                    let mut guard = ptt_on_since.write().await;
+                                                    *guard = None;
+                                                    ptt_unkey_failed
+                                                        .store(false, Ordering::Release);
+                                                    debug!("PTT watchdog: PTT OFF confirmed, timer cleared");
                                                 }
                                             }
-                                            Err(e) => error!("Failed to set PTT: {}", e),
+                                            Err(e) => {
+                                                error!("Failed to set PTT: {}", e);
+                                                if !*state {
+                                                    // PAN-272: the radio may still be keyed.
+                                                    // Keep the tracker and its original
+                                                    // key-down time, make the watchdog retry
+                                                    // on its next tick, and raise the
+                                                    // readiness strip's PTT blocker. With no
+                                                    // tracker there is no evidence the rig is
+                                                    // keyed: no key-down was recorded, or the
+                                                    // watchdog already confirmed an unkey.
+                                                    let armed = {
+                                                        let guard = ptt_on_since.write().await;
+                                                        let armed = guard.is_some();
+                                                        if armed {
+                                                            ptt_unkey_failed
+                                                                .store(true, Ordering::Release);
+                                                        }
+                                                        armed
+                                                    };
+                                                    if armed {
+                                                        latch_ptt_off_unconfirmed_unless_confirmed_since(
+                                                            &ptt_off_unconfirmed,
+                                                            &ptt_off_confirmations,
+                                                            confirms_before,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     crate::message_bus::RigControlMessage::GetReceiveGain {
@@ -4184,7 +4278,9 @@ fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool
 
 /// PAN-89: the rig accepted a PTT-off, so clear the coordinator's
 /// `ptt_off_unconfirmed` latch (set by `teardown_hamlib` when it had to
-/// retain the PTT watchdog). Returns whether the latch was set. Call it only
+/// retain the PTT watchdog, and since PAN-272 by the command loop when a
+/// live `SetPtt { state: false }` fails while the watchdog tracker is armed).
+/// Returns whether the latch was set. Call it only
 /// on a rig-confirmed unkey -- never on orphan release, which only proves a
 /// replacement watchdog exists. `real_rig` is whether the PTT-off went to a
 /// real CAT link: a MockRig (rig control off / `PANCETTA_MOCK_RIG`)
@@ -4205,9 +4301,11 @@ pub(crate) fn confirm_ptt_off(
 }
 
 /// PAN-89: set the `ptt_off_unconfirmed` latch after a teardown failed to
-/// force PTT off, unless a rig-confirmed PTT-off ([`confirm_ptt_off`]) has
-/// happened since `confirms_before` was read. The watchdog keeps running
-/// during teardown's attempts and may confirm an unkey before this store;
+/// force PTT off, or (PAN-272) after the command loop's `set_ptt(Off)` failed
+/// while the watchdog tracker was armed, unless a rig-confirmed PTT-off
+/// ([`confirm_ptt_off`]) has happened since `confirms_before` was read. The
+/// watchdog keeps running during teardown's attempts and during the command
+/// loop's CAT call, and may confirm an unkey before this store;
 /// without the check the store would re-latch over that confirmation and,
 /// since the watchdog then clears its retry timer, nothing would clear it.
 /// Latch first, then re-check, so a confirmation on either side of the
@@ -9741,6 +9839,7 @@ mod pan251_swr_protection_tests {
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 mod pan276_data_mode_tests {
     use super::*;
     use crate::message_bus::{RigControlMessage, SendIfOutcome};
@@ -10048,5 +10147,329 @@ mod pan276_data_mode_tests {
         assert!(c.message_bus.data_mode.is_ready());
         c.shutdown_signal.store(true, Ordering::Release);
         c.teardown_hamlib().await;
+=======
+mod pan272_ptt_off_watchdog_tests {
+    //! PAN-272: the Hamlib command loop keeps the PTT watchdog armed until
+    //! the rig confirms a PTT-off. End to end through the real
+    //! `start_hamlib_component` command loop and watchdog, with an injected
+    //! mock rig whose `disconnect()` makes `set_ptt` fail.
+    use super::*;
+    use crate::message_bus::SendIfOutcome;
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+    use std::sync::atomic::AtomicBool;
+
+    async fn test_coordinator(config: Config) -> super::super::ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true, // no_audio
+            true, // headless
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    struct Started {
+        coordinator: super::super::ApplicationCoordinator,
+        rig: Arc<MockRig>,
+    }
+
+    fn mock_rig() -> Arc<MockRig> {
+        Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }))
+    }
+
+    async fn start() -> Started {
+        let rig = mock_rig();
+        let coordinator = start_with(rig.clone()).await;
+        Started { coordinator, rig }
+    }
+
+    async fn start_with(
+        rig: Arc<dyn RigControl + Send + Sync>,
+    ) -> super::super::ApplicationCoordinator {
+        let mut coordinator = test_coordinator(Config::default()).await;
+        coordinator.test_mock_rig = Some(rig);
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+        for _ in 0..250 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire));
+        coordinator
+    }
+
+    fn ptt(c: &super::super::ApplicationCoordinator, on: bool) -> SendIfOutcome {
+        super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, on, || true)
+    }
+
+    /// Polls the mock until it reports `want`, for at most `within`. A
+    /// disconnected mock's `get_ptt` fails, which counts as "not yet".
+    async fn rig_reports(rig: &MockRig, want: PttState, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if rig.get_ptt(Vfo::Current).await.ok() == Some(want) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn unconfirmed(c: &super::super::ApplicationCoordinator) -> bool {
+        c.ptt_off_unconfirmed.load(Ordering::Acquire)
+    }
+
+    #[tokio::test]
+    async fn failed_ptt_off_keeps_watchdog_armed_and_retries() {
+        let s = start().await;
+        let c = &s.coordinator;
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        assert!(
+            rig_reports(&s.rig, PttState::On, Duration::from_secs(3)).await,
+            "the key-down must reach the rig"
+        );
+        let keyed_at = Instant::now();
+
+        s.rig.disconnect().await.unwrap();
+        assert_eq!(ptt(c, false), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            unconfirmed(c),
+            "a failed PTT-off with the watchdog armed must latch ptt_off_unconfirmed"
+        );
+
+        s.rig.connect().await.unwrap();
+        assert!(
+            rig_reports(&s.rig, PttState::Off, Duration::from_millis(1500)).await,
+            "the watchdog must retry the unkey within one tick of the link returning"
+        );
+        // The 14 s ceiling cannot explain that unkey.
+        assert!(keyed_at.elapsed() < Duration::from_secs(14));
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn key_down_after_failed_ptt_off_gets_a_fresh_timer() {
+        let s = start().await;
+        let c = &s.coordinator;
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        assert!(rig_reports(&s.rig, PttState::On, Duration::from_secs(3)).await);
+
+        s.rig.disconnect().await.unwrap();
+        assert_eq!(ptt(c, false), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(unconfirmed(c));
+        // A new transmission supersedes the failed unkey.
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        s.rig.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            s.rig.get_ptt(Vfo::Current).await.unwrap(),
+            PttState::On,
+            "the new key-down must get a fresh 14 s timer, not the failed unkey's retry"
+        );
+
+        let _ = ptt(c, false);
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    /// Delegates to `MockRig`. Once `hold_next_off` is set, the next
+    /// `set_ptt(Off)` signals `off_held` and waits for `release_off`, so a
+    /// test can land a key-down while that PTT-off is in flight.
+    struct GatedOffRig {
+        inner: Arc<MockRig>,
+        hold_next_off: AtomicBool,
+        off_held: tokio::sync::Notify,
+        release_off: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl RigControl for GatedOffRig {
+        async fn connect(&self) -> anyhow::Result<()> {
+            self.inner.connect().await
+        }
+        async fn disconnect(&self) -> anyhow::Result<()> {
+            self.inner.disconnect().await
+        }
+        async fn get_status(&self) -> anyhow::Result<pancetta_hamlib::RigStatus> {
+            self.inner.get_status().await
+        }
+        async fn set_frequency(&self, vfo: Vfo, freq: u64) -> anyhow::Result<()> {
+            self.inner.set_frequency(vfo, freq).await
+        }
+        async fn get_frequency(&self, vfo: Vfo) -> anyhow::Result<u64> {
+            self.inner.get_frequency(vfo).await
+        }
+        async fn set_mode(
+            &self,
+            vfo: Vfo,
+            mode: pancetta_hamlib::Mode,
+            width: Option<i32>,
+        ) -> anyhow::Result<()> {
+            self.inner.set_mode(vfo, mode, width).await
+        }
+        async fn get_mode(&self, vfo: Vfo) -> anyhow::Result<(pancetta_hamlib::Mode, i32)> {
+            self.inner.get_mode(vfo).await
+        }
+        async fn set_vfo(&self, vfo: Vfo) -> anyhow::Result<()> {
+            self.inner.set_vfo(vfo).await
+        }
+        async fn get_vfo(&self) -> anyhow::Result<Vfo> {
+            self.inner.get_vfo().await
+        }
+        async fn set_ptt(&self, vfo: Vfo, ptt: PttState) -> anyhow::Result<()> {
+            if ptt == PttState::Off && self.hold_next_off.swap(false, Ordering::SeqCst) {
+                self.off_held.notify_one();
+                self.release_off.notified().await;
+            }
+            self.inner.set_ptt(vfo, ptt).await
+        }
+        async fn get_ptt(&self, vfo: Vfo) -> anyhow::Result<PttState> {
+            self.inner.get_ptt(vfo).await
+        }
+        async fn set_power_level(&self, level: f32) -> anyhow::Result<()> {
+            self.inner.set_power_level(level).await
+        }
+        async fn get_power_level(&self) -> anyhow::Result<f32> {
+            self.inner.get_power_level().await
+        }
+        async fn get_s_meter(&self) -> anyhow::Result<i32> {
+            self.inner.get_s_meter().await
+        }
+        async fn get_swr(&self) -> anyhow::Result<f32> {
+            self.inner.get_swr().await
+        }
+        async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> anyhow::Result<()> {
+            self.inner.set_memory_channel(vfo, channel).await
+        }
+        async fn get_memory_channel(&self, vfo: Vfo) -> anyhow::Result<i32> {
+            self.inner.get_memory_channel(vfo).await
+        }
+        async fn set_scan(&self, vfo: Vfo, enable: bool) -> anyhow::Result<()> {
+            self.inner.set_scan(vfo, enable).await
+        }
+        async fn get_info(&self) -> anyhow::Result<String> {
+            self.inner.get_info().await
+        }
+    }
+
+    /// PR #612 review (Codex P1): a watchdog retry of a failed unkey that is
+    /// still in flight when a new transmission keys must not land after the
+    /// new key-down and cut it off.
+    #[tokio::test]
+    async fn watchdog_retry_in_flight_cannot_unkey_a_superseding_key_down() {
+        let inner = mock_rig();
+        let rig = Arc::new(GatedOffRig {
+            inner: inner.clone(),
+            hold_next_off: AtomicBool::new(false),
+            off_held: tokio::sync::Notify::new(),
+            release_off: tokio::sync::Notify::new(),
+        });
+        let coordinator = start_with(rig.clone()).await;
+        let c = &coordinator;
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        assert!(rig_reports(&inner, PttState::On, Duration::from_secs(3)).await);
+
+        inner.disconnect().await.unwrap();
+        assert_eq!(ptt(c, false), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(unconfirmed(c));
+
+        // Hold the watchdog's next retry in flight, then restore the link.
+        rig.hold_next_off.store(true, Ordering::SeqCst);
+        inner.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), rig.off_held.notified())
+            .await
+            .expect("the watchdog must retry the failed unkey");
+
+        // A new transmission keys while that retry is in flight. Its TX
+        // worker `PttGuard` sets `ptt_active` before it enqueues the key-down.
+        c.ptt_active.store(true, Ordering::Release);
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        rig.release_off.notify_one();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            inner.get_ptt(Vfo::Current).await.unwrap(),
+            PttState::On,
+            "a stale watchdog retry must not unkey the superseding transmission"
+        );
+        assert!(
+            c.ptt_active.load(Ordering::Acquire),
+            "a retry of a failed unkey must not clear the next transmission's ptt_active"
+        );
+
+        let _ = ptt(c, false);
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn failed_ptt_off_without_recorded_key_down_does_not_latch() {
+        let s = start().await;
+        let c = &s.coordinator;
+        s.rig.disconnect().await.unwrap();
+        assert_eq!(ptt(c, false), SendIfOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !unconfirmed(c),
+            "with no key-down recorded there is no evidence the rig is keyed"
+        );
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn confirmed_ptt_off_clears_watchdog() {
+        let s = start().await;
+        let c = &s.coordinator;
+        assert_eq!(ptt(c, true), SendIfOutcome::Enqueued);
+        assert!(rig_reports(&s.rig, PttState::On, Duration::from_secs(3)).await);
+        assert_eq!(ptt(c, false), SendIfOutcome::Enqueued);
+        assert!(rig_reports(&s.rig, PttState::Off, Duration::from_secs(3)).await);
+        assert!(!unconfirmed(c));
+
+        // Key the rig behind the command loop's back. A watchdog timer left
+        // armed by the confirmed unkey would force it off at 14 s from the
+        // first key-down. Real time: the tracker is a `std::time::Instant`.
+        s.rig.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(
+            s.rig.get_ptt(Vfo::Current).await.unwrap(),
+            PttState::On,
+            "a confirmed PTT-off must clear the watchdog timer"
+        );
+        assert!(!unconfirmed(c));
+
+        s.rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+        c.shutdown_signal.store(true, Ordering::Release);
+>>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
     }
 }

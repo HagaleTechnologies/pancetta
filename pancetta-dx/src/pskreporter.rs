@@ -11,7 +11,7 @@ use crate::{Band, DxError, DxSpot, Mode, Result};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
 
@@ -557,7 +557,7 @@ impl Default for PskReporterClient {
 // =============================================================================
 
 /// A reception report to upload to PSKReporter
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceptionReport {
     /// Transmitter callsign (the station we heard)
     pub tx_callsign: String,
@@ -572,6 +572,13 @@ pub struct ReceptionReport {
     /// Time of reception (Unix timestamp)
     pub timestamp: i64,
 }
+
+/// Default for [`PskReporterUploadConfig::max_pending_reports`] (PAN-285).
+pub const DEFAULT_MAX_PENDING_REPORTS: usize = 2000;
+
+/// Largest datagram Pancetta sends to PSKReporter, IPFIX header included
+/// (PAN-285).
+pub const MAX_DATAGRAM_BYTES: usize = 1400;
 
 /// Configuration for PSKReporter upload
 #[derive(Debug, Clone)]
@@ -590,6 +597,10 @@ pub struct PskReporterUploadConfig {
     pub port: u16,
     /// Minimum interval between uploads (seconds)
     pub upload_interval_secs: u64,
+    /// Most reception reports held while they cannot be sent. When the queue
+    /// is full, `add_report` drops the oldest report first. 0 acts as 1
+    /// (PAN-285).
+    pub max_pending_reports: usize,
 }
 
 impl Default for PskReporterUploadConfig {
@@ -602,18 +613,192 @@ impl Default for PskReporterUploadConfig {
             server: "report.pskreporter.info".to_string(),
             port: 4739,
             upload_interval_secs: 300, // 5 minutes per PSKReporter guidelines
+            max_pending_reports: DEFAULT_MAX_PENDING_REPORTS,
         }
+    }
+}
+
+// --- IPFIX wire layout (https://pskreporter.info/pskdev.html) ---
+
+/// IPFIX protocol version in the message header.
+const IPFIX_VERSION: u16 = 10;
+/// IANA Private Enterprise Number registered to PSKReporter.
+const PSKREPORTER_PEN: u32 = 30351;
+/// IPFIX field length meaning "variable length".
+const VARIABLE_LENGTH: u16 = 0xFFFF;
+/// IPFIX Set ID of a Template Set.
+const SET_ID_TEMPLATE: u16 = 2;
+/// IPFIX Set ID of an Options Template Set.
+const SET_ID_OPTIONS_TEMPLATE: u16 = 3;
+/// Template (and Data Set) ID of the receiver descriptor (our station).
+const RECEIVER_TEMPLATE_ID: u16 = 0x5002;
+/// Template (and Data Set) ID of the sender records (the stations we heard).
+const SENDER_TEMPLATE_ID: u16 = 0x5003;
+/// `informationSource` 1 means "automatically extracted", the only value
+/// pskdev.html says the server counts.
+const INFORMATION_SOURCE_AUTOMATIC: u8 = 1;
+
+/// One field specifier in a template record.
+#[derive(Clone, Copy)]
+struct Field {
+    element: u16,
+    length: u16,
+    enterprise: bool,
+}
+
+impl Field {
+    /// A PSKReporter enterprise field (PEN 30351).
+    const fn pen(element: u16, length: u16) -> Self {
+        Self {
+            element,
+            length,
+            enterprise: true,
+        }
+    }
+
+    /// A standard IANA IPFIX field (no enterprise number).
+    const fn iana(element: u16, length: u16) -> Self {
+        Self {
+            element,
+            length,
+            enterprise: false,
+        }
+    }
+}
+
+/// Receiver descriptor fields: receiverCallsign, receiverLocator,
+/// decoderSoftware, antennaInformation.
+const RECEIVER_FIELDS: [Field; 4] = [
+    Field::pen(2, VARIABLE_LENGTH),
+    Field::pen(4, VARIABLE_LENGTH),
+    Field::pen(8, VARIABLE_LENGTH),
+    Field::pen(9, VARIABLE_LENGTH),
+];
+
+/// Sender record fields: senderCallsign, frequency, sNR, mode,
+/// informationSource, flowStartSeconds (IANA 150).
+const SENDER_FIELDS: [Field; 6] = [
+    Field::pen(1, VARIABLE_LENGTH),
+    Field::pen(5, 4),
+    Field::pen(6, 1),
+    Field::pen(10, VARIABLE_LENGTH),
+    Field::pen(11, 1),
+    Field::iana(150, 4),
+];
+
+/// `len` rounded up to a multiple of four (IPFIX set padding).
+fn padded(len: usize) -> usize {
+    len.div_ceil(4) * 4
+}
+
+/// Writes `len` as a big-endian u16 at `buf[at..at + 2]`, or fails instead of
+/// wrapping (PAN-285).
+fn patch_len(buf: &mut [u8], at: usize, len: usize) -> Result<()> {
+    let len = u16::try_from(len).map_err(|_| {
+        DxError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("PSKReporter length {len} does not fit in 16 bits"),
+        ))
+    })?;
+    buf[at..at + 2].copy_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+/// Writes the 16-byte IPFIX message header. The length is patched by
+/// [`finish_datagram`].
+fn write_header(buf: &mut Vec<u8>, export_time: u32, sequence: u32, observation_domain: u32) {
+    buf.extend_from_slice(&IPFIX_VERSION.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&export_time.to_be_bytes());
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(&observation_domain.to_be_bytes());
+}
+
+/// Opens a set: writes its ID and a length placeholder, and returns where the
+/// set starts, for [`end_set`].
+fn begin_set(buf: &mut Vec<u8>, set_id: u16) -> usize {
+    let start = buf.len();
+    buf.extend_from_slice(&set_id.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    start
+}
+
+/// Pads with zero bytes to a multiple of 4 and patches the set length
+/// (padding included).
+fn end_set(buf: &mut Vec<u8>, start: usize) -> Result<()> {
+    let len = padded(buf.len() - start);
+    buf.resize(start + len, 0);
+    patch_len(buf, start + 2, len)
+}
+
+/// Template Set (ID 2, `scope_fields: None`) or Options Template Set
+/// (ID 3, `Some(n)`), padded to 4 with its length patched.
+fn write_template_set(
+    buf: &mut Vec<u8>,
+    set_id: u16,
+    template_id: u16,
+    scope_fields: Option<u16>,
+    fields: &[Field],
+) -> Result<()> {
+    let start = begin_set(buf, set_id);
+    buf.extend_from_slice(&template_id.to_be_bytes());
+    let start_of_count = buf.len();
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    patch_len(buf, start_of_count, fields.len())?;
+    if let Some(scope) = scope_fields {
+        buf.extend_from_slice(&scope.to_be_bytes());
+    }
+    for field in fields {
+        let specifier = if field.enterprise {
+            0x8000 | field.element
+        } else {
+            field.element
+        };
+        buf.extend_from_slice(&specifier.to_be_bytes());
+        buf.extend_from_slice(&field.length.to_be_bytes());
+        if field.enterprise {
+            buf.extend_from_slice(&PSKREPORTER_PEN.to_be_bytes());
+        }
+    }
+    end_set(buf, start)
+}
+
+/// Patches the IPFIX header's message length to the datagram's length.
+fn finish_datagram(buf: &mut [u8]) -> Result<()> {
+    let len = buf.len();
+    patch_len(buf, 2, len)
+}
+
+/// Where `flush_to` writes datagrams: the connected UDP socket in production,
+/// an in-memory recorder in tests (PAN-285).
+trait DatagramSink {
+    async fn send_datagram(&self, datagram: &[u8]) -> std::io::Result<()>;
+}
+
+impl DatagramSink for tokio::net::UdpSocket {
+    async fn send_datagram(&self, datagram: &[u8]) -> std::io::Result<()> {
+        let sent = self.send(datagram).await?;
+        if sent != datagram.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("UDP send wrote {sent} of {} bytes", datagram.len()),
+            ));
+        }
+        Ok(())
     }
 }
 
 /// PSKReporter uploader that batches and sends reception reports
 pub struct PskReporterUploader {
     config: PskReporterUploadConfig,
-    /// Pending reports to be uploaded
-    pending_reports: Vec<ReceptionReport>,
+    /// Pending reports to be uploaded, oldest first; never longer than
+    /// [`Self::max_pending_reports`] (PAN-285).
+    pending_reports: VecDeque<ReceptionReport>,
+    /// Reports the cap evicted since this uploader was created (PAN-285).
+    dropped_reports: u64,
     /// Random identifier for this session
     session_id: u32,
-    /// Sequence number for packets
+    /// Sequence number of the next datagram; advances once per datagram sent
     sequence_number: u32,
 }
 
@@ -628,15 +813,23 @@ impl PskReporterUploader {
 
         Self {
             config,
-            pending_reports: Vec::new(),
+            pending_reports: VecDeque::new(),
+            dropped_reports: 0,
             session_id,
             sequence_number: 0,
         }
     }
 
-    /// Add a reception report to the upload queue
+    /// Add a reception report to the upload queue. When the queue already
+    /// holds [`Self::max_pending_reports`] reports, the oldest are dropped
+    /// first and counted in [`Self::dropped_count`] (PAN-285).
     pub fn add_report(&mut self, report: ReceptionReport) {
-        self.pending_reports.push(report);
+        let cap = self.max_pending_reports();
+        while self.pending_reports.len() >= cap {
+            self.pending_reports.pop_front();
+            self.dropped_reports += 1;
+        }
+        self.pending_reports.push_back(report);
     }
 
     /// Get number of pending reports
@@ -644,137 +837,108 @@ impl PskReporterUploader {
         self.pending_reports.len()
     }
 
-    /// Build the binary UDP packet for PSKReporter
-    ///
-    /// PSKReporter uses an IPFIX-inspired binary format:
-    /// - Header (16 bytes): version, length, export time, sequence, observation domain
-    /// - Sender descriptor (template record describing sender info fields)
-    /// - Receiver descriptor (template record describing reception report fields)
-    /// - Sender data (our station info)
-    /// - Receiver data (the spots we're reporting)
-    fn build_packet(&mut self) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(1024);
+    /// Reports the cap evicted since this uploader was created.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_reports
+    }
 
-        // We'll fill in the header length later
-        let header_pos = packet.len();
-        // IPFIX header: version=10, length=TBD, export_time, seq, observation_domain_id
-        packet.extend_from_slice(&0x000Au16.to_be_bytes()); // Version 10
-        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
+    /// The effective cap (`max_pending_reports`, at least 1).
+    pub fn max_pending_reports(&self) -> usize {
+        self.config.max_pending_reports.max(1)
+    }
+
+    /// Writes the part every datagram repeats: the IPFIX header (with the
+    /// current sequence number), the receiver options template, the sender
+    /// template and the receiver record.
+    fn write_fixed_part(&self, buf: &mut Vec<u8>) -> Result<()> {
         let export_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as u32;
-        packet.extend_from_slice(&export_time.to_be_bytes());
-        packet.extend_from_slice(&self.sequence_number.to_be_bytes());
-        packet.extend_from_slice(&self.session_id.to_be_bytes());
+        write_header(buf, export_time, self.sequence_number, self.session_id);
+        write_template_set(
+            buf,
+            SET_ID_OPTIONS_TEMPLATE,
+            RECEIVER_TEMPLATE_ID,
+            Some(1),
+            &RECEIVER_FIELDS,
+        )?;
+        write_template_set(
+            buf,
+            SET_ID_TEMPLATE,
+            SENDER_TEMPLATE_ID,
+            None,
+            &SENDER_FIELDS,
+        )?;
+        let receiver = begin_set(buf, RECEIVER_TEMPLATE_ID);
+        Self::write_variable_field(buf, self.config.reporter_callsign.as_bytes());
+        Self::write_variable_field(buf, self.config.reporter_grid.as_bytes());
+        Self::write_variable_field(buf, self.config.software.as_bytes());
+        Self::write_variable_field(buf, self.config.antenna.as_bytes());
+        end_set(buf, receiver)
+    }
 
-        // --- Receiver information descriptor (Template Set, ID=2) ---
-        // Describes fields about the station doing the receiving (us), per
-        // PSKReporter's published field IDs (https://pskreporter.info/pskdev.html):
-        // receiverCallsign=2, receiverLocator=4, decoderSoftware=8, antennaInformation=9.
-        // Template Set header: Set ID=2, Length
-        let sender_desc_start = packet.len();
-        packet.extend_from_slice(&2u16.to_be_bytes()); // Set ID for template
-        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
-                                                       // Template Record: ID=0x5002, field count=4
-        packet.extend_from_slice(&0x5002u16.to_be_bytes()); // Template ID
-        packet.extend_from_slice(&4u16.to_be_bytes()); // Field count
-                                                       // Field: receiverCallsign (ID=2, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8002u16).to_be_bytes()); // Enterprise bit + ID 2
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes()); // Variable length
-        packet.extend_from_slice(&30351u32.to_be_bytes()); // IANA PEN for PSKReporter
-                                                           // Field: receiverLocator (ID=4, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8004u16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: decoderSoftware (ID=8, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8008u16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: antennaInformation (ID=9, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8009u16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Patch sender descriptor length
-        let sender_desc_len = (packet.len() - sender_desc_start) as u16;
-        packet[sender_desc_start + 2..sender_desc_start + 4]
-            .copy_from_slice(&sender_desc_len.to_be_bytes());
+    /// Encodes one sender record into `out` (cleared first), in
+    /// [`SENDER_FIELDS`] order.
+    fn encode_record(report: &ReceptionReport, out: &mut Vec<u8>) {
+        out.clear();
+        Self::write_variable_field(out, report.tx_callsign.as_bytes());
+        out.extend_from_slice(&(report.frequency as u32).to_be_bytes());
+        out.push(report.snr.unwrap_or(0) as u8);
+        Self::write_variable_field(out, report.mode.as_bytes());
+        out.push(INFORMATION_SOURCE_AUTOMATIC);
+        out.extend_from_slice(&(report.timestamp as u32).to_be_bytes());
+    }
 
-        // --- Sender information descriptor (Template Set, ID=2) ---
-        // Describes fields about the spotted station's transmission, per
-        // PSKReporter's published field IDs: senderCallsign=1, frequency=5,
-        // sNR=6, mode=10.
-        let rx_desc_start = packet.len();
-        packet.extend_from_slice(&2u16.to_be_bytes());
-        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
-                                                       // Template Record: ID=0x5003, field count=5
-        packet.extend_from_slice(&0x5003u16.to_be_bytes());
-        packet.extend_from_slice(&5u16.to_be_bytes());
-        // Field: senderCallsign (ID=1, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8001u16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: frequency (ID=5, PEN=30351, 4 bytes)
-        packet.extend_from_slice(&(0x8005u16).to_be_bytes());
-        packet.extend_from_slice(&4u16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: sNR (ID=6, PEN=30351, 1 byte)
-        packet.extend_from_slice(&(0x8006u16).to_be_bytes());
-        packet.extend_from_slice(&1u16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: mode (ID=10, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x800Au16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: flowStartSeconds (ID=150, standard IPFIX, 4 bytes)
-        packet.extend_from_slice(&150u16.to_be_bytes());
-        packet.extend_from_slice(&4u16.to_be_bytes());
-        // Patch receiver descriptor length
-        let rx_desc_len = (packet.len() - rx_desc_start) as u16;
-        packet[rx_desc_start + 2..rx_desc_start + 4].copy_from_slice(&rx_desc_len.to_be_bytes());
-
-        // --- Sender data record (Data Set, ID=0x5002) ---
-        let sender_data_start = packet.len();
-        packet.extend_from_slice(&0x5002u16.to_be_bytes());
-        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
-                                                       // Variable-length encoding: length byte + data
-        Self::write_variable_field(&mut packet, self.config.reporter_callsign.as_bytes());
-        Self::write_variable_field(&mut packet, self.config.reporter_grid.as_bytes());
-        Self::write_variable_field(&mut packet, self.config.software.as_bytes());
-        Self::write_variable_field(&mut packet, self.config.antenna.as_bytes());
-        // Patch sender data length
-        let sender_data_len = (packet.len() - sender_data_start) as u16;
-        packet[sender_data_start + 2..sender_data_start + 4]
-            .copy_from_slice(&sender_data_len.to_be_bytes());
-
-        // --- Receiver data records (Data Set, ID=0x5003) ---
-        let rx_data_start = packet.len();
-        packet.extend_from_slice(&0x5003u16.to_be_bytes());
-        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
-
-        for report in &self.pending_reports {
-            // senderCallsign (variable)
-            Self::write_variable_field(&mut packet, report.tx_callsign.as_bytes());
-            // frequency (4 bytes, u32)
-            packet.extend_from_slice(&(report.frequency as u32).to_be_bytes());
-            // SNR (1 byte, signed)
-            packet.push(report.snr.unwrap_or(0) as u8);
-            // mode (variable)
-            Self::write_variable_field(&mut packet, report.mode.as_bytes());
-            // flowStartSeconds (4 bytes, u32)
-            packet.extend_from_slice(&(report.timestamp as u32).to_be_bytes());
+    /// Builds the next datagram from the front of the queue without removing
+    /// anything, and returns it with the number of reports it carries, or
+    /// `None` when the queue is empty. The datagram is at most
+    /// [`MAX_DATAGRAM_BYTES`], padding included. A report too large to fit
+    /// even alone is removed and logged, since it never will fit (PAN-285).
+    /// Call [`Self::mark_sent`] once the datagram has been sent.
+    fn next_datagram(&mut self) -> Result<Option<(Vec<u8>, usize)>> {
+        if self.pending_reports.is_empty() {
+            return Ok(None);
         }
+        let mut datagram = Vec::with_capacity(MAX_DATAGRAM_BYTES);
+        self.write_fixed_part(&mut datagram)?;
+        let set_start = begin_set(&mut datagram, SENDER_TEMPLATE_ID);
+        let mut record = Vec::with_capacity(64);
+        let mut count = 0usize;
+        while count < self.pending_reports.len() {
+            Self::encode_record(&self.pending_reports[count], &mut record);
+            let set_len = datagram.len() - set_start + record.len();
+            if set_start + padded(set_len) <= MAX_DATAGRAM_BYTES {
+                datagram.extend_from_slice(&record);
+                count += 1;
+                continue;
+            }
+            if count > 0 {
+                break;
+            }
+            // Nothing is in this datagram yet, so this report cannot fit in
+            // any datagram (the fixed part never changes): drop it.
+            if let Some(dropped) = self.pending_reports.pop_front() {
+                warn!(
+                    "PSKReporter: dropped the report for {}; it does not fit in a {}-byte datagram",
+                    dropped.tx_callsign, MAX_DATAGRAM_BYTES
+                );
+            }
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        end_set(&mut datagram, set_start)?;
+        finish_datagram(&mut datagram)?;
+        Ok(Some((datagram, count)))
+    }
 
-        // Patch receiver data length
-        let rx_data_len = (packet.len() - rx_data_start) as u16;
-        packet[rx_data_start + 2..rx_data_start + 4].copy_from_slice(&rx_data_len.to_be_bytes());
-
-        // Patch total packet length in header
-        let total_len = packet.len() as u16;
-        packet[header_pos + 2..header_pos + 4].copy_from_slice(&total_len.to_be_bytes());
-
-        self.sequence_number += 1;
-        packet
+    /// Removes the `n` reports a sent datagram carried and advances the
+    /// sequence number (PAN-285).
+    fn mark_sent(&mut self, n: usize) {
+        let n = n.min(self.pending_reports.len());
+        self.pending_reports.drain(..n);
+        self.sequence_number = self.sequence_number.wrapping_add(1);
     }
 
     /// Write a variable-length field: 1-byte length + data (for fields < 255 bytes)
@@ -784,9 +948,13 @@ impl PskReporterUploader {
         packet.extend_from_slice(&data[..len as usize]);
     }
 
-    /// Send all pending reports to PSKReporter
+    /// Send all pending reports to PSKReporter, in datagrams of at most
+    /// [`MAX_DATAGRAM_BYTES`] from one socket.
     ///
-    /// Returns the number of reports sent, or an error.
+    /// Returns the number of reports sent. On the first failed send it
+    /// returns the error and keeps every report not yet sent; reports in
+    /// datagrams already sent are removed, so a retry never repeats them
+    /// (PAN-285).
     pub async fn flush(&mut self) -> Result<usize> {
         if self.pending_reports.is_empty() {
             return Ok(0);
@@ -797,15 +965,6 @@ impl PskReporterUploader {
                 "Reporter callsign must be set for PSKReporter upload".to_string(),
             ));
         }
-
-        let count = self.pending_reports.len();
-        let packet = self.build_packet();
-
-        info!(
-            "Sending {} reception reports to PSKReporter ({} bytes)",
-            count,
-            packet.len()
-        );
 
         let addr = format!("{}:{}", self.config.server, self.config.port);
         // Bind to 0.0.0.0:0 so the kernel can route the outbound packet to the
@@ -822,16 +981,42 @@ impl PskReporterUploader {
         // connect is purely a hardening measure with no behavioral cost.
         socket.connect(&addr).await.map_err(DxError::Io)?;
 
-        socket.send(&packet).await.map_err(DxError::Io)?;
+        self.flush_to(&socket).await
+    }
 
-        // UDP is fire-and-forget: this only confirms the local socket write
-        // succeeded, not that PSKReporter's server received or accepted it.
+    /// The datagram loop behind [`Self::flush`]: a datagram's reports leave
+    /// the queue only after its send returns `Ok`, and the first error stops
+    /// the loop (PAN-285).
+    async fn flush_to<S: DatagramSink>(&mut self, sink: &S) -> Result<usize> {
+        let mut reports = 0usize;
+        let mut datagrams = 0usize;
+        while let Some((datagram, n)) = self.next_datagram()? {
+            if let Err(e) = sink.send_datagram(&datagram).await {
+                if reports > 0 {
+                    info!(
+                        "Sent {} reception reports to PSKReporter in {} datagrams before a send failed (delivery unconfirmed)",
+                        reports, datagrams
+                    );
+                }
+                return Err(DxError::Io(e));
+            }
+            debug!(
+                "PSKReporter datagram seq={}: {} reports, {} bytes",
+                self.sequence_number,
+                n,
+                datagram.len()
+            );
+            self.mark_sent(n);
+            reports += n;
+            datagrams += 1;
+        }
+        // UDP is fire-and-forget: this only confirms the local socket writes
+        // succeeded, not that PSKReporter's server received or accepted them.
         info!(
-            "Sent {} reception reports to PSKReporter (delivery unconfirmed)",
-            count
+            "Sent {} reception reports to PSKReporter in {} datagrams (delivery unconfirmed)",
+            reports, datagrams
         );
-        self.pending_reports.clear();
-        Ok(count)
+        Ok(reports)
     }
 }
 
@@ -971,12 +1156,13 @@ mod tests {
     }
 
     /// Walks the IPFIX Sets following the 16-byte header and returns, per
-    /// Template Set encountered, the field IDs (enterprise bit masked off)
-    /// declared by its Template Record. Uses each Set's own declared length
-    /// to advance — never scans raw bytes — so it can't be fooled by
-    /// coincidental byte matches in the random export-time/session-id header
-    /// or in variable-length data payloads.
-    fn parse_template_field_ids(packet: &[u8]) -> Vec<Vec<u16>> {
+    /// Template Set or Options Template Set encountered, the set ID and the
+    /// field IDs (enterprise bit masked off) declared by its Template Record.
+    /// Uses each Set's own declared length to advance — never scans raw
+    /// bytes — so it can't be fooled by coincidental byte matches in the
+    /// random export-time/session-id header or in variable-length data
+    /// payloads.
+    fn parse_template_field_ids(packet: &[u8]) -> Vec<(u16, Vec<u16>)> {
         let mut templates = Vec::new();
         let mut pos = 16; // fixed IPFIX header size
         while pos + 4 <= packet.len() {
@@ -989,12 +1175,17 @@ mod tests {
             let set_end = pos + set_len;
             assert!(set_end <= packet.len(), "Set at {pos} overruns packet");
 
-            if set_id == 2 {
-                // Template Record: template_id(2) + field_count(2), then per field:
-                // field_specifier(2) [+ enterprise_number(4) if the enterprise bit is set].
+            if set_id == 2 || set_id == 3 {
+                // Template Record: template_id(2) + field_count(2)
+                // [+ scope_field_count(2) for an Options Template], then per
+                // field: field_specifier(2) + length(2) [+ enterprise_number(4)
+                // if the enterprise bit is set].
                 let mut p = pos + 4 + 2; // skip Set header (4) + Template ID (2)
                 let field_count = u16::from_be_bytes([packet[p], packet[p + 1]]);
                 p += 2;
+                if set_id == 3 {
+                    p += 2; // scope field count
+                }
                 let mut field_ids = Vec::new();
                 for _ in 0..field_count {
                     let specifier = u16::from_be_bytes([packet[p], packet[p + 1]]);
@@ -1004,18 +1195,162 @@ mod tests {
                     }
                     field_ids.push(specifier & 0x7FFF);
                 }
-                templates.push(field_ids);
+                templates.push((set_id, field_ids));
             }
             pos = set_end;
         }
         templates
     }
 
+    /// Every set as (set ID, set bytes), walked by declared lengths. Asserts
+    /// the sets end exactly at the datagram end.
+    fn sets(datagram: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut out = Vec::new();
+        let mut pos = 16;
+        while pos < datagram.len() {
+            let set_id = u16::from_be_bytes([datagram[pos], datagram[pos + 1]]);
+            let set_len = u16::from_be_bytes([datagram[pos + 2], datagram[pos + 3]]) as usize;
+            assert!(set_len >= 4 && pos + set_len <= datagram.len());
+            out.push((set_id, &datagram[pos..pos + set_len]));
+            pos += set_len;
+        }
+        assert_eq!(pos, datagram.len(), "sets must end at the datagram end");
+        out
+    }
+
+    /// One decoded sender record, in Pancetta's layout.
+    #[derive(Debug, PartialEq)]
+    struct WireRecord {
+        call: String,
+        freq: u32,
+        snr: i8,
+        mode: String,
+        info_source: u8,
+        time: u32,
+    }
+
+    /// Smallest possible sender record: empty callsign and mode.
+    const MIN_RECORD_BYTES: usize = 1 + 4 + 1 + 1 + 1 + 4;
+
+    /// Walks the sets after the 16-byte header by their declared lengths and
+    /// decodes every record in the 0x5003 data set. Stops when fewer bytes
+    /// remain than the smallest possible record (so padding is never read as
+    /// a record). Asserts the header length equals the datagram length.
+    fn sender_records(datagram: &[u8]) -> Vec<WireRecord> {
+        assert_eq!(
+            u16::from_be_bytes([datagram[2], datagram[3]]) as usize,
+            datagram.len(),
+            "header length must equal the datagram length"
+        );
+        let mut records = Vec::new();
+        for (set_id, set) in sets(datagram) {
+            if set_id != SENDER_TEMPLATE_ID {
+                continue;
+            }
+            let mut p = 4;
+            while set.len() - p >= MIN_RECORD_BYTES {
+                let call_len = set[p] as usize;
+                let call = String::from_utf8(set[p + 1..p + 1 + call_len].to_vec()).unwrap();
+                p += 1 + call_len;
+                let freq = u32::from_be_bytes(set[p..p + 4].try_into().unwrap());
+                p += 4;
+                let snr = set[p] as i8;
+                p += 1;
+                let mode_len = set[p] as usize;
+                let mode = String::from_utf8(set[p + 1..p + 1 + mode_len].to_vec()).unwrap();
+                p += 1 + mode_len;
+                let info_source = set[p];
+                p += 1;
+                let time = u32::from_be_bytes(set[p..p + 4].try_into().unwrap());
+                p += 4;
+                records.push(WireRecord {
+                    call,
+                    freq,
+                    snr,
+                    mode,
+                    info_source,
+                    time,
+                });
+            }
+        }
+        records
+    }
+
+    /// In-memory `DatagramSink`: records every datagram, and fails the send
+    /// whose zero-based index is `fail_at`, and every later one.
+    struct TestSink {
+        sent: std::cell::RefCell<Vec<Vec<u8>>>,
+        fail_at: Option<usize>,
+    }
+
+    impl TestSink {
+        fn ok() -> Self {
+            Self {
+                sent: std::cell::RefCell::new(Vec::new()),
+                fail_at: None,
+            }
+        }
+
+        fn failing_at(k: usize) -> Self {
+            Self {
+                sent: std::cell::RefCell::new(Vec::new()),
+                fail_at: Some(k),
+            }
+        }
+    }
+
+    impl DatagramSink for TestSink {
+        async fn send_datagram(&self, datagram: &[u8]) -> std::io::Result<()> {
+            let index = self.sent.borrow().len();
+            if self.fail_at.is_some_and(|k| index >= k) {
+                return Err(std::io::Error::other("simulated outage"));
+            }
+            self.sent.borrow_mut().push(datagram.to_vec());
+            Ok(())
+        }
+    }
+
+    fn report_n(i: usize) -> ReceptionReport {
+        ReceptionReport {
+            tx_callsign: format!("K{i:04}"),
+            frequency: 14_074_000,
+            snr: Some(-10),
+            mode: "FT8".to_string(),
+            tx_grid: None,
+            timestamp: 1_600_000_000 + i as i64,
+        }
+    }
+
+    fn uploader_with_cap(cap: usize) -> PskReporterUploader {
+        PskReporterUploader::new(PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            max_pending_reports: cap,
+            ..Default::default()
+        })
+    }
+
+    fn calls_in(datagrams: &[Vec<u8>]) -> Vec<String> {
+        datagrams
+            .iter()
+            .flat_map(|d| sender_records(d))
+            .map(|r| r.call)
+            .collect()
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        hex.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect()
+    }
+
     /// PAN-108: the receiver-info template (our station) and sender-info
     /// template (the spotted station) must declare PSKReporter's published
     /// enterprise field IDs, not the pre-fix values (which used the
     /// sender-template IDs 1/3/4/5 for what is actually the receiver-info
-    /// template, and field ID 2 instead of 5 for frequency).
+    /// template, and field ID 2 instead of 5 for frequency). PAN-285: the
+    /// receiver descriptor is an Options Template Set (ID 3) and the sender
+    /// template carries informationSource (11).
     #[test]
     fn test_field_ids_match_pskreporter_protocol() {
         let config = PskReporterUploadConfig {
@@ -1035,19 +1370,19 @@ mod tests {
             timestamp: 1_600_000_000,
         });
 
-        let packet = uploader.build_packet();
+        let packet = uploader.next_datagram().unwrap().unwrap().0;
         let templates = parse_template_field_ids(&packet);
 
         assert_eq!(templates.len(), 2, "expected exactly two Template Sets");
         assert_eq!(
             templates[0],
-            vec![0x0002, 0x0004, 0x0008, 0x0009],
-            "receiver-info template (our station) has the wrong field IDs"
+            (3, vec![0x0002, 0x0004, 0x0008, 0x0009]),
+            "receiver-info options template (our station) has the wrong set or field IDs"
         );
         assert_eq!(
             templates[1],
-            vec![0x0001, 0x0005, 0x0006, 0x000A, 0x0096],
-            "sender-info template (the spotted station) has the wrong field IDs"
+            (2, vec![0x0001, 0x0005, 0x0006, 0x000A, 0x000B, 0x0096]),
+            "sender-info template (the spotted station) has the wrong set or field IDs"
         );
     }
 
@@ -1071,7 +1406,7 @@ mod tests {
             timestamp: 1600000000,
         });
 
-        let packet = uploader.build_packet();
+        let packet = uploader.next_datagram().unwrap().unwrap().0;
 
         // Verify IPFIX header
         assert_eq!(packet[0], 0x00); // Version high byte
@@ -1087,12 +1422,14 @@ mod tests {
             "Packet should be larger than just header"
         );
         assert!(
-            packet.len() < 2000,
-            "Packet should be under 2KB for single report"
+            packet.len() <= MAX_DATAGRAM_BYTES,
+            "Packet should fit in one datagram for a single report"
         );
 
-        // Verify pending reports were cleared by sequence increment
-        assert_eq!(uploader.sequence_number, 1);
+        // Building a datagram neither removes reports nor advances the
+        // sequence number; only a successful send does (PAN-285).
+        assert_eq!(uploader.sequence_number, 0);
+        assert_eq!(uploader.pending_count(), 1);
     }
 
     #[test]
@@ -1117,9 +1454,353 @@ mod tests {
 
         assert_eq!(uploader.pending_count(), 5);
 
-        let packet = uploader.build_packet();
+        let (packet, n) = uploader.next_datagram().unwrap().unwrap();
         // Multiple reports should produce a larger packet
         assert!(packet.len() > 100);
+        assert_eq!(n, 5);
+        assert_eq!(sender_records(&packet).len(), 5);
+    }
+
+    // --- PAN-285: bounded queue ---
+
+    #[test]
+    fn queue_holds_at_most_the_cap_and_drops_the_oldest() {
+        let mut u = uploader_with_cap(2000);
+        for i in 0..2500 {
+            u.add_report(report_n(i));
+        }
+        assert_eq!(u.pending_count(), 2000);
+        assert_eq!(u.dropped_count(), 500);
+        assert_eq!(u.pending_reports.front().unwrap().tx_callsign, "K0500");
+        assert_eq!(u.pending_reports.back().unwrap().tx_callsign, "K2499");
+    }
+
+    #[test]
+    fn default_cap_is_2000() {
+        assert_eq!(PskReporterUploadConfig::default().max_pending_reports, 2000);
+        assert_eq!(DEFAULT_MAX_PENDING_REPORTS, 2000);
+    }
+
+    #[test]
+    fn cap_of_zero_keeps_the_newest_report() {
+        let mut u = uploader_with_cap(0);
+        for i in 0..3 {
+            u.add_report(report_n(i));
+        }
+        assert_eq!(u.pending_count(), 1);
+        assert_eq!(u.dropped_count(), 2);
+        assert_eq!(u.pending_reports.front().unwrap().tx_callsign, "K0002");
+    }
+
+    // --- PAN-285: chunked flush, removal after send, checked lengths ---
+
+    #[tokio::test]
+    async fn backlog_is_sent_in_datagrams_of_at_most_1400_bytes() {
+        let mut u = uploader_with_cap(2000);
+        for i in 0..2000 {
+            u.add_report(report_n(i));
+        }
+        let sink = TestSink::ok();
+        assert_eq!(u.flush_to(&sink).await.unwrap(), 2000);
+        assert_eq!(u.pending_count(), 0);
+        let sent = sink.sent.into_inner();
+        assert!(
+            sent.len() <= 2000usize.div_ceil(60),
+            "{} datagrams",
+            sent.len()
+        );
+        for d in &sent {
+            assert!(
+                d.len() <= MAX_DATAGRAM_BYTES,
+                "datagram of {} bytes",
+                d.len()
+            );
+            assert_eq!(u16::from_be_bytes([d[2], d[3]]) as usize, d.len());
+        }
+        assert_eq!(
+            calls_in(&sent),
+            (0..2000).map(|i| format!("K{i:04}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keeps_every_unsent_report_and_none_that_were_sent() {
+        let mut u = uploader_with_cap(2000);
+        for i in 0..200 {
+            u.add_report(report_n(i));
+        }
+        let failing = TestSink::failing_at(2);
+        assert!(u.flush_to(&failing).await.is_err());
+        let first = calls_in(&failing.sent.into_inner());
+        assert!(
+            !first.is_empty(),
+            "two datagrams went out before the failure"
+        );
+        assert_eq!(u.pending_count(), 200 - first.len());
+        assert_eq!(
+            u.pending_reports.front().unwrap().tx_callsign,
+            format!("K{:04}", first.len())
+        );
+        let ok = TestSink::ok();
+        assert_eq!(u.flush_to(&ok).await.unwrap(), 200 - first.len());
+        let rest = calls_in(&ok.sent.into_inner());
+        let all: Vec<String> = first.into_iter().chain(rest).collect();
+        assert_eq!(
+            all,
+            (0..200).map(|i| format!("K{i:04}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// The ticket's scenario: two hours of FT8 (480 slots, 10 decodes each)
+    /// with every 300 s flush failing, then the server comes back.
+    #[tokio::test]
+    async fn two_hour_outage_stays_within_the_cap_and_drains_when_the_server_returns() {
+        let mut u = uploader_with_cap(2000);
+        let down = TestSink::failing_at(0);
+        let mut next = 0;
+        for slot in 0..480 {
+            for _ in 0..10 {
+                u.add_report(report_n(next));
+                next += 1;
+            }
+            assert!(u.pending_count() <= 2000);
+            if slot % 20 == 19 {
+                assert!(u.flush_to(&down).await.is_err());
+            }
+        }
+        assert_eq!(u.pending_count(), 2000);
+        assert_eq!(u.dropped_count(), 2800);
+        let up = TestSink::ok();
+        assert_eq!(u.flush_to(&up).await.unwrap(), 2000);
+        assert_eq!(u.pending_count(), 0);
+        let sent = up.sent.into_inner();
+        assert!(sent.iter().all(|d| d.len() <= MAX_DATAGRAM_BYTES));
+        assert_eq!(
+            calls_in(&sent),
+            (2800..4800).map(|i| format!("K{i:04}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_too_large_for_any_datagram_is_dropped_and_the_rest_are_sent() {
+        let long = "X".repeat(254);
+        let mut u = PskReporterUploader::new(PskReporterUploadConfig {
+            reporter_callsign: long.clone(),
+            reporter_grid: long.clone(),
+            antenna: long.clone(),
+            software: long.clone(),
+            ..Default::default()
+        });
+        u.add_report(ReceptionReport {
+            tx_callsign: long.clone(),
+            mode: long.clone(),
+            ..report_n(0)
+        });
+        u.add_report(report_n(1));
+        let sink = TestSink::ok();
+        assert_eq!(u.flush_to(&sink).await.unwrap(), 1);
+        assert_eq!(u.pending_count(), 0);
+        let sent = sink.sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].len() <= MAX_DATAGRAM_BYTES);
+        assert_eq!(sender_records(&sent[0])[0].call, "K0001");
+    }
+
+    #[test]
+    fn a_length_over_16_bits_is_an_error_not_a_wrap() {
+        let mut buf = vec![0u8; 4];
+        assert!(patch_len(&mut buf, 2, 70_000).is_err());
+        assert!(patch_len(&mut buf, 2, 1400).is_ok());
+        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 1400);
+    }
+
+    #[test]
+    fn sequence_number_advances_once_per_sent_datagram() {
+        let mut u = uploader_with_cap(2000);
+        for i in 0..100 {
+            u.add_report(report_n(i));
+        }
+        let (first, n) = u.next_datagram().unwrap().unwrap();
+        assert_eq!(u32::from_be_bytes(first[8..12].try_into().unwrap()), 0);
+        assert_eq!(u.pending_count(), 100, "building removes nothing");
+        u.mark_sent(n);
+        assert_eq!(u.pending_count(), 100 - n);
+        let (second, _) = u.next_datagram().unwrap().unwrap();
+        assert_eq!(u32::from_be_bytes(second[8..12].try_into().unwrap()), 1);
+    }
+
+    /// Real loopback UDP, real clock (MAN-506: never a paused clock around a
+    /// socket read).
+    #[tokio::test]
+    async fn flush_sends_a_backlog_over_udp_in_datagrams_of_at_most_1400_bytes() {
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut u = PskReporterUploader::new(PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".into(),
+            reporter_grid: "FN42".into(),
+            server: "127.0.0.1".into(),
+            port: rx.local_addr().unwrap().port(),
+            ..Default::default()
+        });
+        for i in 0..2000 {
+            u.add_report(report_n(i));
+        }
+        assert_eq!(u.flush().await.unwrap(), 2000);
+        let mut got = 0;
+        let mut buf = vec![0u8; 65_536];
+        while got < 2000 {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .expect("datagram within 5 s")
+                .unwrap();
+            assert!(n <= MAX_DATAGRAM_BYTES);
+            got += sender_records(&buf[..n]).len();
+        }
+        assert_eq!(got, 2000);
+        assert_eq!(u.pending_count(), 0);
+    }
+
+    /// A local network failure (connect refused by the OS) leaves the queue
+    /// intact. Linux-only: CI runs tests on ubuntu-latest, where an IPv6
+    /// connect from the uploader's IPv4 socket fails with `os error 97`; the
+    /// macOS errno for this case was not verified.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn flush_with_no_usable_route_keeps_the_queue() {
+        let mut u = PskReporterUploader::new(PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".into(),
+            server: "[::1]".into(),
+            ..Default::default()
+        });
+        for i in 0..10 {
+            u.add_report(report_n(i));
+        }
+        assert!(u.flush().await.is_err());
+        assert_eq!(u.pending_count(), 10);
+    }
+
+    // --- PAN-285: wire layout from https://pskreporter.info/pskdev.html ---
+
+    /// https://pskreporter.info/pskdev.html, "An example of a complete
+    /// datagram" (read 2026-11-10): header, receiver options template (3
+    /// fields, scope 1), sender template (5 fields), receiver record, two
+    /// sender records, padded.
+    const PSKDEV_EXAMPLE: &str = "\
+00 0A 00 AC 47 95 32 72 00 00 00 01 00 00 00 00 \
+00 03 00 24 99 92 00 03 00 01 80 02 FF FF 00 00 76 8F 80 04 FF FF 00 00 76 8F 80 08 FF FF 00 00 76 8F 00 00 \
+00 02 00 2C 99 93 00 05 80 01 FF FF 00 00 76 8F 80 05 00 04 00 00 76 8F 80 0A FF FF 00 00 76 8F 80 0B 00 01 00 00 76 8F 00 96 00 04 \
+99 92 00 20 04 4E 31 44 51 06 46 4E 34 32 68 6E 0D 48 6F 6D 65 62 72 65 77 20 76 35 2E 36 00 00 \
+99 93 00 2C 04 4E 31 44 51 00 D6 B3 27 03 50 53 4B 01 47 95 32 54 06 4B 42 31 4D 42 58 00 D6 B4 CB 03 50 53 4B 01 47 95 32 68 00 00";
+
+    #[test]
+    fn rebuilds_the_pskdev_example_datagram_byte_for_byte() {
+        let mut built = Vec::new();
+        write_header(&mut built, 1_200_960_114, 1, 0);
+        write_template_set(
+            &mut built,
+            SET_ID_OPTIONS_TEMPLATE,
+            0x9992,
+            Some(1),
+            &[
+                Field::pen(2, VARIABLE_LENGTH),
+                Field::pen(4, VARIABLE_LENGTH),
+                Field::pen(8, VARIABLE_LENGTH),
+            ],
+        )
+        .unwrap();
+        write_template_set(
+            &mut built,
+            SET_ID_TEMPLATE,
+            0x9993,
+            None,
+            &[
+                Field::pen(1, VARIABLE_LENGTH),
+                Field::pen(5, 4),
+                Field::pen(10, VARIABLE_LENGTH),
+                Field::pen(11, 1),
+                Field::iana(150, 4),
+            ],
+        )
+        .unwrap();
+        let receiver = begin_set(&mut built, 0x9992);
+        PskReporterUploader::write_variable_field(&mut built, b"N1DQ");
+        PskReporterUploader::write_variable_field(&mut built, b"FN42hn");
+        PskReporterUploader::write_variable_field(&mut built, b"Homebrew v5.6");
+        end_set(&mut built, receiver).unwrap();
+        let senders = begin_set(&mut built, 0x9993);
+        for (call, freq, time) in [
+            (&b"N1DQ"[..], 14_070_567u32, 1_200_960_084u32),
+            (&b"KB1MBX"[..], 14_070_987u32, 1_200_960_104u32),
+        ] {
+            PskReporterUploader::write_variable_field(&mut built, call);
+            built.extend_from_slice(&freq.to_be_bytes());
+            PskReporterUploader::write_variable_field(&mut built, b"PSK");
+            built.push(INFORMATION_SOURCE_AUTOMATIC);
+            built.extend_from_slice(&time.to_be_bytes());
+        }
+        end_set(&mut built, senders).unwrap();
+        finish_datagram(&mut built).unwrap();
+
+        let expected = hex_bytes(PSKDEV_EXAMPLE);
+        assert_eq!(expected.len(), 172);
+        assert_eq!(built, expected);
+    }
+
+    #[test]
+    fn pancetta_datagram_follows_the_pskdev_layout_rules() {
+        let mut u = PskReporterUploader::new(PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            antenna: "Dipole".to_string(),
+            software: "Pancetta/0.1".to_string(),
+            ..Default::default()
+        });
+        u.add_report(ReceptionReport {
+            tx_callsign: "K1DEF".to_string(),
+            frequency: 14_074_000,
+            snr: Some(-5),
+            mode: "FT4".to_string(),
+            tx_grid: None,
+            timestamp: 1_600_000_000,
+        });
+        let datagram = u.next_datagram().unwrap().unwrap().0;
+
+        let all_sets = sets(&datagram);
+        assert_eq!(all_sets.len(), 4);
+        for (set_id, set) in &all_sets {
+            assert_eq!(set.len() % 4, 0, "set {set_id:#06x} is not padded to 4");
+        }
+
+        // Receiver descriptor: Options Template Set, scope count 1, equal to
+        // the page's four-field descriptor with our template ID.
+        let (set_id, receiver_template) = all_sets[0];
+        assert_eq!(set_id, SET_ID_OPTIONS_TEMPLATE);
+        let mut expected_receiver = hex_bytes(
+            "00 03 00 2C 99 92 00 04 00 01 80 02 FF FF 00 00 76 8F 80 04 FF FF 00 00 76 8F \
+             80 08 FF FF 00 00 76 8F 80 09 FF FF 00 00 76 8F 00 00",
+        );
+        expected_receiver[4..6].copy_from_slice(&[0x50, 0x02]);
+        assert_eq!(receiver_template, &expected_receiver[..]);
+        assert_eq!(
+            u16::from_be_bytes([receiver_template[8], receiver_template[9]]),
+            1
+        );
+
+        let templates = parse_template_field_ids(&datagram);
+        assert_eq!(templates[0], (3, vec![2, 4, 8, 9]));
+        assert_eq!(templates[1], (2, vec![1, 5, 6, 10, 11, 150]));
+
+        assert_eq!(
+            sender_records(&datagram),
+            vec![WireRecord {
+                call: "K1DEF".to_string(),
+                freq: 14_074_000,
+                snr: -5,
+                mode: "FT4".to_string(),
+                info_source: 1,
+                time: 1_600_000_000,
+            }]
+        );
+        assert_eq!(datagram.len(), 172);
     }
 
     #[test]

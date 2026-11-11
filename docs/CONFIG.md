@@ -84,7 +84,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `grid_square` | string | `"AA00aa"` | Your Maidenhead grid (4 or 6 chars). Used in `CQ` and grid-report exchanges. |
 | `power_watts` | integer | `100` | Reported in spots; not used for actual rig power level. |
 | `qth` | string | `"Unknown"` | Free-text location label, surfaced in the TUI. |
-| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). |
+| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). Not used for needed or ATNO: pancetta takes your home entity from `callsign`. |
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
@@ -794,6 +794,7 @@ it:
 enabled                  = false
 server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds  = 300
+max_pending_reports      = 2000
 batch_size               = 50
 include_receives         = true
 include_transmits        = true
@@ -820,6 +821,14 @@ exclude_cq_zones = []
 [network.psk_reporter.filters.geographic.distance]
 great_circle = true
 ```
+
+`max_pending_reports` (PAN-285) is how many reception reports Pancetta
+keeps while it cannot send them, for example while DNS or the network is
+down. When the queue is full, the oldest report is dropped first and the
+log says how many were dropped. When the server is reachable again, the
+backlog goes out in datagrams of at most 1400 bytes. The queue is in
+memory only, so a restart empties it. It must be at least 1 when
+`enabled = true`.
 
 ### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
 
@@ -1158,6 +1167,15 @@ external keys. Preserve the whole stopped installation and data directory.
 | `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
 | `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
+
+Durability: each `qsos.adi` record is one `write_all`, a flush and a
+`sync_all` before the write returns, so a logged QSO survives a pancetta
+crash immediately afterwards, and an fsync is requested for OS crash or
+power loss (a disk's own write cache is outside that promise). This costs
+about 1 ms per QSO. Every `qso.db` connection syncs its write-ahead log at
+each commit (`synchronous = FULL`); if a power cut still leaves `qso.db`
+without a QSO that `qsos.adi` holds, the next start rebuilds it from
+`qsos.adi`. There are no settings for this (PAN-281).
 
 **Migration note:** if you are upgrading from an earlier release that wrote only
 `qso.db`, the first startup will automatically export every row from the old database
