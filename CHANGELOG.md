@@ -7,13 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
-- PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
-=======
 ### Added
 
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
->>>>>>> 88af8930a9594ad8179ed41c213be781fcc1da85
+- PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
 
 ### Changed
 
