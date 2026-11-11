@@ -36,6 +36,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod qso_filter;
+mod qso_upload_status;
 mod raw_capture;
 mod readiness;
 pub mod receive_overload;
@@ -1716,6 +1717,11 @@ pub struct ApplicationCoordinator {
     /// PAN-57: the upload worker's task, awaited by `shutdown` so runtime
     /// teardown never cancels it while it drains and saves the queue.
     pub(crate) upload_outbox_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// PAN-344: process-wide registry of explicit per-QSO upload results,
+    /// registered at completion and updated by the upload worker's result
+    /// paths. Snapshotted by the TUI relay on its health tick.
+    pub(crate) qso_upload_statuses: qso_upload_status::SharedUploadStatusRegistry,
     /// PAN-274: every ADIF subscriber this process started, and the signal that
     /// asks them to finish. Shared with each Qso start, so a supervisor restart
     /// registers with the same holder. `shutdown` stops and waits for them.
@@ -2553,6 +2559,7 @@ impl ApplicationCoordinator {
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
             upload_outbox: None,
             upload_outbox_task: None,
+            qso_upload_statuses: qso_upload_status::UploadStatusRegistry::shared(),
             adif_subscribers: qso::AdifSubscribers::new(),
             upload_health: Arc::new(std::sync::Mutex::new(Default::default())),
             audio_reopen_tx: None,

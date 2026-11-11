@@ -1234,10 +1234,21 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(app.theme.warning_color())
                     .add_modifier(Modifier::BOLD),
             ),
-            None => Span::styled(
-                app.status_message.clone(),
-                Style::default().fg(app.theme.accent_color()),
-            ),
+            // PAN-344: the typed completion toast outranks ordinary status
+            // text (which stays stored and reappears on expiry) but never
+            // compose input. Rendered in place — no layout change.
+            None => match app.active_toast_text(chrono::Utc::now()) {
+                Some(toast) => Span::styled(
+                    toast,
+                    Style::default()
+                        .fg(app.theme.accent_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled(
+                    app.status_message.clone(),
+                    Style::default().fg(app.theme.accent_color()),
+                ),
+            },
         },
     ];
 
@@ -1729,7 +1740,9 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let modal_width = area.width.saturating_sub(4);
-    let modal_height = area.height.saturating_sub(4);
+    let modal_height = area
+        .height
+        .saturating_sub(if area.height < 12 { 0 } else { 4 });
     let modal_area = Rect {
         x: (area.width.saturating_sub(modal_width)) / 2,
         y: (area.height.saturating_sub(modal_height)) / 2,
@@ -1760,10 +1773,52 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Same windowing approach as the Diagnostics overlay: a page of rows
     // ending at (or centered near) the scroll cursor, oldest-first within
     // the window.
-    let visible_rows = inner.height as usize;
     let cursor = app
         .recent_qsos_scroll
         .min(app.recent_qsos.len().saturating_sub(1));
+
+    // PAN-344: the selected-contact Station card is reserved BEFORE the
+    // visible-row window is calculated, so the card never overlaps rows.
+    let selected = app.recent_qsos.get(cursor);
+    let detail = selected
+        .map(|qso| {
+            station_card::upload_detail_lines(
+                qso,
+                app.upload_status_for(&qso.qso_uuid),
+                inner.width.saturating_sub(2),
+            )
+        })
+        .unwrap_or_default();
+    let card_lines = detail.len().max(1) as u16;
+    let card_h = (card_lines + 2).min(inner.height.saturating_sub(1)); // + borders
+    let rows_h = inner.height - card_h;
+
+    // Legend: one compact line at narrow widths, two lines when the modal
+    // is wide enough (a full 80-col terminal gives the modal 74 inner
+    // columns; the two-line legend fits from ~70).
+    let legend_lines = if inner.width >= 70 { 2 } else { 1 };
+    let legend_h = if rows_h > legend_lines {
+        legend_lines
+    } else {
+        0
+    };
+
+    let rows_area = Rect {
+        height: rows_h - legend_h,
+        ..inner
+    };
+    let legend_area = Rect {
+        y: inner.y + rows_h - legend_h,
+        height: legend_h,
+        ..inner
+    };
+    let card_area = Rect {
+        y: inner.y + rows_h,
+        height: card_h,
+        ..inner
+    };
+
+    let visible_rows = rows_area.height as usize;
     let end = cursor + 1;
     let start = end.saturating_sub(visible_rows);
 
@@ -1791,13 +1846,50 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .last()
                 .map(String::as_str)
                 .unwrap_or(&qso.last_state);
-            let line = format!(
-                "{} {:<10} {}  ({} Hz)",
-                qso.ts.format("%H:%M:%S"),
-                qso.callsign,
-                summary,
-                qso.freq_hz
-            );
+            // PAN-344: per-target glyph cells between the outcome summary
+            // and the frequency. Only enabled targets occupy cells; a
+            // completed QSO with no snapshot yet shows `?`; failed QSOs
+            // made no upload attempt.
+            let upload_cells = match (&qso.outcome, app.upload_status_for(&qso.qso_uuid)) {
+                (crate::app::QsoOutcome::Completed, Some(status)) => {
+                    if status.targets.is_empty() {
+                        "uploads off".to_string()
+                    } else {
+                        crate::upload_status::glyph_cells(status)
+                    }
+                }
+                (crate::app::QsoOutcome::Completed, None) => "?".to_string(),
+                (crate::app::QsoOutcome::Failed(_), _) => String::new(),
+            };
+            let line = if upload_cells.is_empty() {
+                format!(
+                    "{} {:<10} {}  ({} Hz)",
+                    qso.ts.format("%H:%M:%S"),
+                    qso.callsign,
+                    summary,
+                    qso.freq_hz
+                )
+            } else if inner.width >= 60 {
+                format!(
+                    "{} {:<10} {}  {}  ({} Hz)",
+                    qso.ts.format("%H:%M:%S"),
+                    qso.callsign,
+                    summary,
+                    upload_cells,
+                    qso.freq_hz
+                )
+            } else {
+                // Narrow widths prioritize time, callsign and every enabled
+                // glyph ahead of the RF and outcome summary (PAN-344).
+                format!(
+                    "{} {:<10} {} {} ({} Hz)",
+                    qso.ts.format("%H:%M"),
+                    qso.callsign,
+                    upload_cells,
+                    summary,
+                    qso.freq_hz
+                )
+            };
             let style = if i == cursor {
                 Style::default()
                     .fg(color)
@@ -1805,11 +1897,90 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 Style::default().fg(color)
             };
-            Line::from(Span::styled(line, style))
+            if let Some((before, after)) = (!upload_cells.is_empty())
+                .then(|| line.split_once(&upload_cells))
+                .flatten()
+            {
+                let mut spans = vec![Span::styled(before.to_string(), style)];
+                if let Some(status) = app
+                    .upload_status_for(&qso.qso_uuid)
+                    .filter(|s| !s.targets.is_empty())
+                {
+                    for (index, (target, slot)) in status.targets.iter().enumerate() {
+                        if index > 0 {
+                            spans.push(Span::raw(" "));
+                        }
+                        let color = match slot.state {
+                            crate::upload_status::UploadState::Accepted => Color::Green,
+                            crate::upload_status::UploadState::Pending => Color::Yellow,
+                            crate::upload_status::UploadState::Rejected
+                            | crate::upload_status::UploadState::Failed => Color::Red,
+                            crate::upload_status::UploadState::Unknown => Color::Gray,
+                        };
+                        spans.push(Span::styled(
+                            format!("{}{}", target.letter(), slot.state.glyph()),
+                            style.fg(color),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled(upload_cells, style));
+                }
+                spans.push(Span::styled(after.to_string(), style));
+                Line::from(spans)
+            } else {
+                Line::from(Span::styled(line, style))
+            }
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    if legend_h > 0 {
+        let legend = if inner.width >= 70 {
+            vec![
+                Line::from(Span::styled(
+                    "Uploads: Q QRZ \u{b7} C ClubLog \u{b7} E eQSL \u{b7} D cqdx.io \u{b7} L LoTW",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "\u{2713} accepted \u{b7} ~ pending \u{b7} \u{d7} rejected \u{b7} ! failed \u{b7} ? unknown",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        } else {
+            vec![Line::from(Span::styled(
+                "Q QRZ C ClubLog E eQSL D cqdx L LoTW",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        f.render_widget(Paragraph::new(legend), legend_area);
+    }
+    f.render_widget(Paragraph::new(lines), rows_area);
+
+    // PAN-344: the selected-contact Station card. This card uses the
+    // SELECTED QSO (UUID), never the live focused station, so the upload
+    // results of an older contact are never attributed to a live station
+    // with the same callsign.
+    if let Some(qso) = selected {
+        let title = format!(
+            " Station: {} \u{b7} {} UTC \u{b7} {} Hz ",
+            qso.callsign,
+            qso.ts.format("%H:%M:%S"),
+            qso.freq_hz
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Cyan));
+        f.render_widget(block, card_area);
+        f.render_widget(
+            Paragraph::new(detail),
+            Rect {
+                x: card_area.x + 1,
+                y: card_area.y + 1,
+                width: card_area.width.saturating_sub(2),
+                height: card_area.height.saturating_sub(2),
+            },
+        );
+    }
 }
 
 /// Render the Shift+S station-health panel: a consolidated "is the station
@@ -3226,6 +3397,7 @@ mod view_render_tests {
         // UserCancelled=gray).
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
+            qso_uuid: "u-k1abc".to_string(),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -3237,6 +3409,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "KJ5NJF".to_string(),
+            qso_uuid: "u-kj5njf".to_string(),
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
             last_state: "Failed".to_string(),
             freq_hz: 1832,
@@ -3248,6 +3421,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "W2XYZ".to_string(),
+            qso_uuid: "u-w2xyz".to_string(),
             outcome: crate::app::QsoOutcome::Failed(
                 pancetta_qso::QsoFailureReason::InvalidCallsign,
             ),
@@ -3258,6 +3432,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "N3TEST".to_string(),
+            qso_uuid: "u-n3test".to_string(),
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::UserCancelled),
             last_state: "Failed".to_string(),
             freq_hz: 800,
@@ -3312,6 +3487,232 @@ mod view_render_tests {
             buffer_contains(&buf, "k aborts"),
             "title should say what k does here"
         );
+    }
+
+    /// PAN-344 AC1: one completed QSO with QRZ accepted, ClubLog retrying
+    /// and eQSL rejected renders `Q✓ C~ E×` in its row, plus the legend and
+    /// the selected-contact Station card with each target's state+reason.
+    #[tokio::test]
+    async fn pan344_recent_qsos_mixed_upload_states() {
+        use crate::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState::*, UploadTarget::*,
+        };
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+        app.recent_qsos_scroll = 0;
+        app.apply_qso_upload_statuses(
+            vec![QsoUploadStatus {
+                uuid: "u-1".to_string(),
+                callsign: "K1ABC".to_string(),
+                revision: 3,
+                targets: vec![
+                    (Qrz, TargetUploadStatus::new(Accepted, "")),
+                    (
+                        ClubLog,
+                        TargetUploadStatus::pending("retrying \u{b7} temporary service failure"),
+                    ),
+                    (
+                        Eqsl,
+                        TargetUploadStatus::new(Rejected, "record rejected \u{b7} invalid record"),
+                    ),
+                ],
+            }],
+            chrono::Utc::now(),
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            buffer_contains(&buf, "Q\u{2713} C~ E\u{d7}"),
+            "row glyph cells"
+        );
+        assert!(buffer_contains(&buf, "Uploads: Q QRZ"), "legend letters");
+        assert!(buffer_contains(&buf, "Station: K1ABC"), "selected card");
+        assert!(buffer_contains(&buf, "QRZ Logbook: accepted"));
+        assert!(buffer_contains(
+            &buf,
+            "ClubLog: pending \u{b7} retrying \u{b7} temporary service failure"
+        ));
+        assert!(buffer_contains(
+            &buf,
+            "eQSL: rejected \u{b7} record rejected \u{b7} invalid record"
+        ));
+        let mut second = app.recent_qsos[0].clone();
+        second.qso_uuid = "u-2".into();
+        second.ts += chrono::Duration::seconds(15);
+        app.push_recent_qso_outcome(second);
+        app.apply_qso_upload_statuses(
+            vec![crate::upload_status::QsoUploadStatus {
+                uuid: "u-2".into(),
+                callsign: "K1ABC".into(),
+                revision: 1,
+                targets: vec![(
+                    crate::upload_status::UploadTarget::Qrz,
+                    crate::upload_status::TargetUploadStatus::new(
+                        crate::upload_status::UploadState::Rejected,
+                        "login rejected",
+                    ),
+                )],
+            }],
+            chrono::Utc::now(),
+        );
+        app.recent_qsos_scroll = 1;
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        assert!(buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: rejected"
+        ));
+        app.recent_qsos_scroll = 0;
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        assert!(buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: accepted"
+        ));
+        assert!(!buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: rejected"
+        ));
+    }
+
+    /// PAN-344 AC2: the completion toast renders through the status-text
+    /// slot — visible while active, never over compose input, and ordinary
+    /// status text returns on expiry.
+    #[tokio::test]
+    async fn pan344_completion_toast_rendering() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.status_message = "Pancetta TUI Ready".to_string();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+
+        let draw = |app: &crate::app::App| {
+            let backend = TestBackend::new(100, 5);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_status_bar(f, f.area(), app)).unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "K1ABC logged \u{b7} uploads queued"));
+        assert!(!buffer_contains(&buf, "Pancetta TUI Ready"));
+
+        // Compose input retains precedence over the toast.
+        app.compose_mode = true;
+        app.tx_input_buffer = "hello".to_string();
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "TX> hello_"));
+        assert!(!buffer_contains(&buf, "uploads queued"));
+        app.compose_mode = false;
+
+        // After expiry the stored status text reappears.
+        if let Some(toast) = app.completion_toast.as_mut() {
+            toast.since = chrono::Utc::now() - chrono::Duration::seconds(60);
+        }
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "Pancetta TUI Ready"));
+    }
+
+    /// PAN-344 AC7: 80×24 and 40×16 both show all five target identities
+    /// (glyph cells + legend + card detail); smaller areas render safely.
+    #[tokio::test]
+    async fn pan344_recent_qsos_terminal_sizes() {
+        use crate::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState::*, UploadTarget::*,
+        };
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+        app.recent_qsos_scroll = 0;
+        app.apply_qso_upload_statuses(
+            vec![QsoUploadStatus {
+                uuid: "u-1".to_string(),
+                callsign: "K1ABC".to_string(),
+                revision: 1,
+                targets: vec![
+                    (Qrz, TargetUploadStatus::new(Accepted, "")),
+                    (ClubLog, TargetUploadStatus::pending("retrying")),
+                    (Eqsl, TargetUploadStatus::new(Rejected, "record rejected")),
+                    (Cqdx, TargetUploadStatus::new(Failed, "upload queue full")),
+                    (Lotw, TargetUploadStatus::pending("queued")),
+                ],
+            }],
+            chrono::Utc::now(),
+        );
+
+        for (w, h, legend) in [
+            (80u16, 24u16, "Uploads: Q QRZ"),
+            // 40 cols give the modal 34 inner columns: the compact legend
+            // clips after "cqdx"; LoTW's identity still shows via its glyph
+            // and the card's "LoTW: pending" detail line.
+            (40, 16, "Q QRZ C ClubLog E eQSL D cqdx"),
+        ] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+            let buf = term.backend().buffer().clone();
+            assert!(buffer_contains(&buf, "Q\u{2713}"), "{w}x{h} qrz glyph");
+            assert!(buffer_contains(&buf, "C~"), "{w}x{h} clublog glyph");
+            assert!(buffer_contains(&buf, "E\u{d7}"), "{w}x{h} eqsl glyph");
+            assert!(buffer_contains(&buf, "D!"), "{w}x{h} cqdx glyph");
+            assert!(buffer_contains(&buf, "L~"), "{w}x{h} lotw glyph");
+            assert!(buffer_contains(&buf, legend), "{w}x{h} legend");
+            assert!(buffer_contains(&buf, "Station: K1ABC"), "{w}x{h} card");
+            assert!(
+                buffer_contains(&buf, "LoTW: pending"),
+                "{w}x{h} card detail"
+            );
+        }
+
+        for (w, h) in [(40, 12), (20, 8), (20, 6)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+            assert!(
+                buffer_contains(term.backend().buffer(), "K1ABC"),
+                "selected row survives {w}x{h}"
+            );
+        }
+
+        // Below the render threshold (20×6 / smaller): no panic, no overlap.
+        for (w, h) in [(20u16, 6u16), (19, 5), (1, 1)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+        }
     }
 
     #[tokio::test]

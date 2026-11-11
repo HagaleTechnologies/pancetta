@@ -328,6 +328,10 @@ impl super::ApplicationCoordinator {
         // PAN-114: clock-skew warning published by the clock-skew monitor
         // (`clock_monitor.rs`), read on the same 2s health tick.
         let clock_skew_relay = self.clock_skew.clone();
+        // PAN-344: per-QSO upload-status registry, snapshotted (cloned) on
+        // the same 2s tick and relayed as full bounded snapshots so a lost
+        // best-effort transition heals on the next tick.
+        let qso_upload_statuses_relay = self.qso_upload_statuses.clone();
         // PAN-89: readiness-strip inputs, snapshotted on the same 2s tick.
         let readiness_sources = super::readiness::ReadinessSources::from_coordinator(self);
         // Clone our callsign before the tui-relay thread consumes the original
@@ -997,6 +1001,16 @@ impl super::ApplicationCoordinator {
 
                 // Send pipeline health to TUI every 2 seconds
                 if last_health_send.elapsed() >= std::time::Duration::from_secs(2) {
+                    // PAN-344: relay the full bounded per-QSO upload-status
+                    // snapshot on the same tick. Sent repeatedly; the App
+                    // merges by UUID and revision.
+                    let uploads = qso_upload_statuses_relay
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot();
+                    let _ = tui_msg_tx_relay.send(
+                        pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(uploads),
+                    );
                     let health = pancetta_tui::app::PipelineHealth {
                         audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
                         dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
@@ -3589,6 +3603,7 @@ fn map_recent_qso_outcome(
 ) -> pancetta_tui::app::RecentQsoOutcome {
     pancetta_tui::app::RecentQsoOutcome {
         callsign: outcome.callsign.clone(),
+        qso_uuid: outcome.qso_uuid.clone(),
         outcome: match &outcome.outcome {
             crate::message_bus::QsoOutcome::Completed => pancetta_tui::app::QsoOutcome::Completed,
             crate::message_bus::QsoOutcome::Failed(reason) => {
@@ -6808,6 +6823,7 @@ mod tui_relay_tests {
         let ts = chrono::Utc::now();
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "JA1ABC".to_string(),
+            qso_uuid: "u-ja1abc".to_string(),
             outcome: crate::message_bus::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -6834,6 +6850,7 @@ mod tui_relay_tests {
     fn map_recent_qso_outcome_carries_failure_reason() {
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "W2XYZ".to_string(),
+            qso_uuid: "u-w2xyz".to_string(),
             outcome: crate::message_bus::QsoOutcome::Failed(
                 pancetta_qso::QsoFailureReason::Timeout,
             ),
@@ -6847,6 +6864,70 @@ mod tui_relay_tests {
             mapped.outcome,
             pancetta_tui::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)
         ));
+    }
+
+    /// PAN-344 AC3: UUID correlation survives the relay — repeated
+    /// callsigns map to distinct UUIDs, and the registry snapshot the relay
+    /// forwards keeps each contact's identity and per-target states intact.
+    #[test]
+    fn pan344_upload_snapshot_mapping_preserves_identity() {
+        let mk = |uuid: &str| crate::message_bus::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: uuid.to_string(),
+            outcome: crate::message_bus::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        };
+        let a = map_recent_qso_outcome(&mk("u-1"));
+        let b = map_recent_qso_outcome(&mk("u-2"));
+        assert_eq!(a.callsign, b.callsign);
+        assert_ne!(a.qso_uuid, b.qso_uuid, "same callsign, distinct QSOs");
+        assert_eq!(a.qso_uuid, "u-1");
+        assert_eq!(b.qso_uuid, "u-2");
+
+        // The registry snapshot flows through the typed message unchanged:
+        // two same-callsign contacts keep independent per-target states.
+        let registry = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(
+                "u-1",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::new(
+                        pancetta_tui::upload_status::UploadState::Accepted,
+                        "",
+                    ),
+                )],
+            );
+            reg.register(
+                "u-2",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            );
+        }
+        let snapshot = registry.lock().unwrap().snapshot();
+        let msg = pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(snapshot);
+        let pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(statuses) = msg else {
+            panic!("typed snapshot message");
+        };
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].uuid, "u-1");
+        assert_eq!(statuses[0].callsign, "K1ABC");
+        assert_eq!(
+            statuses[0].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            statuses[1].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Pending)
+        );
     }
 
     fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {
