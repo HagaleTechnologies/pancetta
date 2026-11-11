@@ -68,3 +68,8 @@ The local relay remembers the last decoded grid per exact callsign and band for
 its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
+
+Replay sessions show `TX: REPLAY` in neutral gray from the first title-bar draw,
+regardless of TX policy. The session flag is supplied by the coordinator and is
+not saved in TUI config. See
+[the TX-policy banner decision](../../docs/DECISIONS/tui.md#tri-state-global-tx-policy).
