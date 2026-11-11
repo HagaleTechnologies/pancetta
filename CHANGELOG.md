@@ -13,8 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - PAN-277: Shutdown now drains queued PTT-off through Hamlib before stopping it, including the TX worker's cancellation fallback. The independent direct rigctld unkey now allows 3 s per reply within a 6 s budget, so a rig taking 1.5 s to answer can unkey. Previously Hamlib exited before reading the unkey and the direct attempt had only 500 ms. Unresponsive rigs can add about 13 s to shutdown.
 
+=======
+- PAN-281: A QSO written to `qsos.adi` now survives a power cut or OS crash right after it is logged. Each record is synced to disk before the write returns, about 1 ms per QSO. Every connection to `qso.db` now syncs its commits too; before, one of its five connections did not.
+>>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
 - PAN-285: PSKReporter uploads keep at most `[network.psk_reporter].max_pending_reports` reports (default 2000) while they cannot be sent. When the queue is full, the oldest report is dropped and the log says how many. A backlog now goes out in datagrams of at most 1400 bytes, and reports leave the queue only after their datagram is sent, so a long outage no longer makes every later upload fail with "Message too long". FT4 decodes are reported as FT4, not FT8, and FT2 decodes are not reported. Each report now carries `informationSource` 1, the receiver descriptor is an options template, and every set is padded to four bytes, as https://pskreporter.info/pskdev.html describes. Whether pskreporter.info accepts these reports is still unchecked.
 - PAN-347: Hawaii, Alaska, Puerto Rico and other entities that share letters with your callsign or with calls in your log are no longer treated as already worked, and a German call on a new band is marked new whatever its prefix. `[station] dxcc_entity` no longer affects needed status; pancetta takes your home entity from `callsign`.
 - PAN-272: When the radio does not acknowledge a PTT-off, Pancetta now keeps its PTT watchdog running and retries the unkey every second until the rig confirms it or a new transmission takes over with its own unkey and a fresh timer, and the readiness strip shows "⚠ PTT MAY STILL BE KEYED — check radio". Before, the watchdog stopped as soon as the PTT-off was sent, so a rejected unkey left the radio transmitting with every indicator saying it was not.
