@@ -33,12 +33,13 @@ pub enum TxMuteCause {
     RigStatePending,
     RigCommandInFlight,
     ReceiveGainUnconfirmed,
+    RigDataModeNotReady,
     PolicyDisabled,
 }
 
 impl TxMuteCause {
     /// Every cause, in the gate's priority order.
-    pub const ALL: [TxMuteCause; 8] = [
+    pub const ALL: [TxMuteCause; 9] = [
         TxMuteCause::RigRestarting,
         TxMuteCause::RigNotReady,
         TxMuteCause::RigDisconnected,
@@ -46,6 +47,7 @@ impl TxMuteCause {
         TxMuteCause::RigStatePending,
         TxMuteCause::RigCommandInFlight,
         TxMuteCause::ReceiveGainUnconfirmed,
+        TxMuteCause::RigDataModeNotReady,
         TxMuteCause::PolicyDisabled,
     ];
 
@@ -57,6 +59,7 @@ impl TxMuteCause {
                 | TxMuteCause::RigDisconnected
                 | TxMuteCause::AudioOutputDead
                 | TxMuteCause::ReceiveGainUnconfirmed
+                | TxMuteCause::RigDataModeNotReady
         )
     }
 }
@@ -169,6 +172,7 @@ pub enum ReadinessKey {
     RigCmdQueued,
     RigCmdApplying,
     ReceiveGainUnconfirmed,
+    RigDataModeNotReady,
     /// A logbook-upload warning, keyed by service and kind (not count), so
     /// an ack survives a count change (PAN-57).
     Upload(String, UploadIssueKind),
@@ -457,6 +461,12 @@ fn cause_items(
                 "receive gain change is in progress or unconfirmed",
                 "receive gain change is in progress or unconfirmed",
             )),
+            TxMuteCause::RigDataModeNotReady => blockers.push(item(
+                ReadinessKey::RigDataModeNotReady,
+                Severity::Blocker,
+                "rig data mode is not ready",
+                "rig data mode is not ready",
+            )),
             // The verdict chip (`■ RX ONLY`) already says it; no item.
             TxMuteCause::PolicyDisabled => {}
         }
@@ -743,6 +753,18 @@ mod tests {
         app.station_readiness = Some(StationReadiness::default());
         assert_eq!(verdict(&app), Verdict::Ready);
         assert!(readiness_items(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rig_data_mode_is_a_typed_tx_blocker() {
+        let mut app = app().await;
+        app.station_readiness = Some(snapshot(&[TxMuteCause::RigDataModeNotReady]));
+        assert_eq!(verdict(&app), Verdict::Held);
+        let items = readiness_items(&app);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, ReadinessKey::RigDataModeNotReady);
+        assert_eq!(items[0].severity, Severity::Blocker);
+        assert_eq!(items[0].label, "rig data mode is not ready");
     }
 
     #[tokio::test]

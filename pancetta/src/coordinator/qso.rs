@@ -3911,6 +3911,7 @@ impl super::ApplicationCoordinator {
             let rig_conn_state_for_hard_mute = self.rig_conn_state.clone();
             let audio_output_alive_for_hard_mute = self.audio_output_alive.clone();
             let receive_gain_for_hard_mute = self.message_bus.receive_gain.clone();
+            let data_mode_for_hard_mute = self.message_bus.data_mode.clone();
             qso_manager.set_hamlib_hard_muted_source(std::sync::Arc::new(move || {
                 crate::coordinator::tx::tx_hard_mute_reason(
                     &tx_policy_for_hard_mute,
@@ -3922,6 +3923,7 @@ impl super::ApplicationCoordinator {
                     &rig_conn_state_for_hard_mute,
                     &audio_output_alive_for_hard_mute,
                     &receive_gain_for_hard_mute,
+                    &data_mode_for_hard_mute,
                 )
                 .is_some()
             }));

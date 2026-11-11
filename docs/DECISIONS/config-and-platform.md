@@ -1118,3 +1118,22 @@ spinning the worker on a closed spot channel.
 - **Not done here:** half-open TCP detection (`keepalive_interval_seconds`),
   rotating through `servers`, surviving a non-UTF-8 line without a reconnect,
   and a "reconnecting" state in the TUI.
+
+## Configured rig data mode (PAN-276)
+
+`rig.mode` remains the waveform protocol. Optional `rig.data_mode` is the exact
+CAT token, restricted to PKTUSB, PKTLSB, USB and LSB. Width defaults to Hamlib's
+0. These settings require restart and remain absent in shipped defaults.
+
+The rigctld client owns mode application because a bus-level mode sender could
+interleave with a QSY and miss hidden command reconnects. Managed transactions
+serialize VFO changes, frequency changes and keying. Readiness belongs to the
+prepared connection generation, and a new socket cannot reuse old confirmation.
+A key-down is never replayed after a managed connection fails. PTT-off remains
+available regardless of readiness.
+
+Split preparation must establish the transmitting VFO, apply the mode to both
+required VFOs and restore the receive VFO. Unconfirmed split state, rejected mode
+or failed restoration leaves TX inhibited. The coordinator adds an independent
+readiness cause and never changes operator TX policy to recover it. Mock and
+socket tests are container evidence; FTdx10 hardware qualification remains pending.
