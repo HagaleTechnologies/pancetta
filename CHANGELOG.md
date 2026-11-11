@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Show slot progress, current parity and station TX parity in the title bar, including the narrow-terminal resize screen (PAN-352).
+
 - PAN-393: `[audio.recording] raw_capture_minutes` records one raw 48 kHz WAV per FT8 slot for that many minutes after start, into `raw48/` inside the recording directory, so decimation changes can be tested on real captures. It is off by default (0) and needs `auto_record = true` and a 48 kHz capture device. Files are named with the UTC slot time and band, `_tx` marks a slot our transmission overlapped, and `raw48/` stops at its own 2 GB cap while decode-window recording continues.
 - PAN-380: `pancetta-ft8/README.md` lists the crate's stable API (the cycle API manta calls and the window API from dispensa Q-0085) and its compatibility policy. `pancetta-ft8/tests/stable_api_guard.rs` fails to compile, naming the item, when a change breaks one of those signatures, fields or trait bounds. The README's configuration example and parameter table no longer use the nonexistent `time_range` field.
 - PAN-347: Without cqdx.io, or while it is unreachable, pancetta derives needed and all-time-new entities from `qsos.adi` and says so (`local logbook`). DX Hunter shows `new mode FT4` when an entity was never logged in the current mode, and the station card shows `worked-unconfirmed` or `confirmed` from the QSL and LoTW fields in your log.

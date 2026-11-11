@@ -1679,9 +1679,8 @@ pub struct App {
     /// pick the right budget. Loaded from `~/.pancetta/tui_state.json` at
     /// startup and persisted alongside `active_view` on every change; the
     /// coordinator's startup echo corrects a stale persisted guess within
-    /// the first health tick regardless. Drives the "DECODE: <PRESET>
-    /// <ms>ms" title-bar chip (the elapsed-ms/exhausted half comes from
-    /// `pipeline_health` separately).
+    /// the first health tick regardless. Drives the "DECODE: <PRESET>"
+    /// title-bar chip. Decode timing and budget exhaustion appear in Shift+S health.
     pub decode_effort: String,
     /// The message currently being transmitted (NOW-SENDING), if any.
     /// Updated from the coordinator's `TxQueueUpdate`.

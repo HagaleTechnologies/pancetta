@@ -17,6 +17,7 @@ pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
 pub mod readiness_strip;
+pub mod slot_clock;
 pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
@@ -93,10 +94,19 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         crate::contest_score::render(
             f,
             Rect {
-                height: 2.min(size.height),
+                y: size.y + 1.min(size.height),
+                height: 2.min(size.height.saturating_sub(1)),
                 ..size
             },
             app.contest_score.as_ref(),
+        );
+        render_title_bar(
+            f,
+            Rect {
+                height: 1.min(size.height),
+                ..size
+            },
+            app,
         );
         return Ok(());
     }
@@ -653,11 +663,11 @@ pub fn hit_test(
 /// more important; 0 is pinned. Admit steps bring a chip in at its compact
 /// form (full form when it has none); `*_FULL` steps upgrade compact → full.
 /// When the row is too narrow the chips drop out lowest-value first; when it
-/// fits, every step succeeds and the row is byte-identical to the
-/// pre-PAN-88 row. Reorder by moving a constant — this table IS the policy.
+/// fits, every step succeeds. Reorder by moving a constant — this table IS the policy.
 mod title_rank {
     pub const CALLSIGN: u8 = 0;
     pub const TX_POLICY: u8 = 0;
+    pub const SLOT_CLOCK: u8 = 1;
     pub const LIVE_TX: u8 = 2;
     pub const PAUSE: u8 = 3;
     pub const MODE: u8 = 5;
@@ -679,15 +689,25 @@ mod title_rank {
 }
 
 /// Every title-bar chip as a [`BarSegment`], in display order. Chip text and
-/// styles are unchanged from the pre-PAN-88 row; only the composition moved
-/// into [`title_bar_left_line`]. Returns the segments plus the index of the
+/// styles are composed by [`title_bar_left_line`]. Returns the segments plus the index of the
 /// grid segment (where #171's own-entity span attaches).
-fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
+fn title_bar_segments(
+    app: &App,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<BarSegment<'_>>, usize) {
     let accent_bold = Style::default()
         .fg(app.theme.accent_color())
         .add_modifier(Modifier::BOLD);
 
     let mut segs = vec![
+        BarSegment::new(
+            " ",
+            vec![Span::styled(
+                slot_clock::slot_clock_text(now, &app.station_info.mode, app.resolve_tx_parity()),
+                accent_bold,
+            )],
+            title_rank::SLOT_CLOCK,
+        ),
         BarSegment::new(
             " | ",
             vec![Span::styled("Pancetta TUI", accent_bold)],
@@ -784,26 +804,8 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
         title_rank::FREQ_MODE,
     ));
 
-    // Decode-effort chip (decoder-speed-overhaul Task 15): the live preset
-    // + the most recently completed decode window's wall-time, with a
-    // trailing scissors mark when that window ran out of its budget before
-    // finishing optional work. `app.decode_effort` is authoritative-from-
-    // frame-1 (the coordinator seeds it at startup, not just on the
-    // operator's first `e` press); `pipeline_health` is `None` only for the
-    // first ~2s before the first health tick, in which case the elapsed
-    // reads as 0ms (never exhausted) rather than hiding the chip. The
-    // compact form keeps only the preset.
-    let (decode_elapsed_ms, decode_exhausted) = app
-        .pipeline_health
-        .as_ref()
-        .map(|h| (h.last_decode_elapsed_ms, h.last_decode_budget_exhausted))
-        .unwrap_or((0, false));
-    let decode_text = format!(
-        " DECODE: {} {}ms{} ",
-        app.decode_effort,
-        decode_elapsed_ms,
-        if decode_exhausted { " ✂" } else { "" }
-    );
+    // Decode preset only; elapsed time and budget exhaustion live in Shift+S health.
+    let decode_text = format!(" DECODE: {} ", app.decode_effort);
     segs.push(BarSegment::with_compact(
         " ",
         vec![Span::styled(decode_text, accent_bold)],
@@ -938,10 +940,19 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
 
 /// The title bar's left side (everything but the clock), priority-fitted to
 /// `width` columns. Pinned chips (callsign, TX policy) are always present.
-fn title_bar_left_line(app: &App, width: u16) -> Line<'_> {
+fn title_bar_left_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) -> Line<'_> {
     let width = width as usize;
-    let (mut segs, grid_idx) = title_bar_segments(app);
-    let forms = bar_fit::fit_bar(&segs, width);
+    let (mut segs, grid_idx) = title_bar_segments(app, now);
+    let mut forms = bar_fit::fit_bar(&segs, width);
+    // PAN-352: the slot clock is the last item dropped. The fitter may
+    // admit smaller, lower-priority chips after skipping it, so hide those.
+    if forms[0] == bar_fit::SegmentForm::Hidden {
+        for (seg, form) in segs.iter().zip(forms.iter_mut()) {
+            if seg.admit != 0 {
+                *form = bar_fit::SegmentForm::Hidden;
+            }
+        }
+    }
 
     // #171: our own DXCC entity attaches after the grid only if it fits
     // alongside every chip `fit_bar` already committed — applied last, so
@@ -967,7 +978,8 @@ fn title_bar_left_line(app: &App, width: u16) -> Line<'_> {
 /// it off screen; the chips priority-fit into whatever is left (see
 /// `title_rank` for the drop order).
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let utc_clock = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
+    let now = chrono::Utc::now();
+    let utc_clock = now.format("%H:%M:%S UTC").to_string();
     let clock_width = Span::raw(utc_clock.as_str()).width() as u16;
     let [left_area, clock_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).areas(area);
@@ -977,7 +989,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         .fg(app.theme.foreground_color());
 
     f.render_widget(
-        Paragraph::new(title_bar_left_line(app, left_area.width)).style(row_style),
+        Paragraph::new(title_bar_left_line(app, left_area.width, now)).style(row_style),
         left_area,
     );
     f.render_widget(
@@ -3205,14 +3217,8 @@ mod view_render_tests {
         config.station.call_sign = "K5ARH".to_string();
         let mut app = crate::app::App::new(config, None).await.unwrap();
         app.active_view = crate::view::ActiveView::Operate;
-        // 140, not the file's usual 120: at 120 columns this exact scenario's
-        // baseline chips (title/call/grid/freq/band/mode/TX-policy/FREQ/
-        // DECODE + clock) sum to 121 — one character over the width the
-        // entity-omit-if-overflowing logic (see render_title_bar) allows,
-        // which would suppress the very thing this test verifies. This test
-        // proves the entity CAN render; the omit-when-tight behavior itself
-        // is covered by a separate test at the standard 120-column width.
-        let backend = TestBackend::new(140, 40);
+        // 150 columns leave room for the slot clock and own-station entity.
+        let backend = TestBackend::new(150, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app).unwrap()).unwrap();
         let buf = term.backend().buffer().clone();
@@ -3288,6 +3294,125 @@ mod view_render_tests {
             && tail[8..].iter().collect::<String>() == " UTC"
     }
 
+    fn slot_test_now() -> chrono::DateTime<chrono::Utc> {
+        "2026-01-01T00:00:06Z".parse().unwrap()
+    }
+
+    fn has_slot_clock(row: &str) -> bool {
+        let chars: Vec<_> = row.chars().collect();
+        chars.windows(21).any(|c| {
+            c[0] == '['
+                && matches!(c[1], 'E' | 'O')
+                && c[2] == ' '
+                && c[3..9].iter().all(|c| matches!(c, '▮' | '▯'))
+                && c[9] == ' '
+                && c[10..12].iter().all(char::is_ascii_digit)
+                && c[12..19].iter().collect::<String>() == "s │ TX:"
+                && matches!(c[19], 'E' | 'O' | '-')
+                && c[20] == ']'
+        })
+    }
+
+    #[tokio::test]
+    async fn title_bar_shows_slot_clock_in_every_view_at_supported_sizes() {
+        let mut app = default_app().await;
+        for (w, h) in [(80, 20), (80, 24), (100, 30), (132, 40)] {
+            for view in ALL_VIEWS {
+                for zoomed in [false, true] {
+                    app.active_view = view;
+                    app.zoomed = zoomed;
+                    let row = row_text(&render_app(&app, w, h), 0);
+                    assert!(
+                        has_slot_clock(&row),
+                        "{w}x{h} {view:?} zoom={zoomed}: {row}"
+                    );
+                    assert!(ends_with_utc_clock(&row));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_slot_clock_is_last_droppable_chip() {
+        let mut app = default_app().await;
+        for worst_case in [false, true] {
+            if worst_case {
+                app.station_info.call_sign = "VP2V/W1ABC".into();
+                app.tx_policy = pancetta_core::TxPolicy::Disabled;
+                app.autonomous_init_paused = true;
+                app.fox_mode = true;
+                app.split_tx_hz = 14_075_000;
+                app.tx_offset_hold_hz = Some(1520);
+                app.is_transmitting = true;
+                app.session_completed = 12;
+                app.active_view = crate::view::ActiveView::Hunt;
+            }
+            let pinned = if worst_case {
+                "VP2V/W1ABC  TX: DISABLED — RX ONLY "
+            } else {
+                "N0CALL  TX: FULL "
+            };
+            for width in 0..=200 {
+                let line = line_text(&title_bar_left_line(&app, width, slot_test_now()));
+                assert!(
+                    has_slot_clock(&line) || line == pinned,
+                    "width {width}: {line}"
+                );
+                assert!(!line.contains("Pancetta TUI") || has_slot_clock(&line));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_omits_decode_timing_telemetry() {
+        let mut app = default_app().await;
+        let mut health = health_with_clock(None, false);
+        health.last_decode_elapsed_ms = 2243;
+        health.last_decode_budget_exhausted = true;
+        app.pipeline_health = Some(health);
+        let row = row_text(&render_app(&app, 180, 40), 0);
+        assert!(row.contains("DECODE: AUTO "));
+        assert!(!row.contains("2243ms"));
+        assert!(!row.contains('✂'));
+    }
+
+    #[tokio::test]
+    async fn too_small_screen_keeps_title_row_with_slot_clock() {
+        let mut app = default_app().await;
+        let buf = render_app(&app, 60, 24);
+        let row = row_text(&buf, 0);
+        assert!(has_slot_clock(&row), "{row}");
+        assert!(row.contains("N0CALL") && row.contains("TX: FULL"));
+        assert!(ends_with_utc_clock(&row));
+        assert!(!row.contains("Pancetta TUI"));
+        assert!(buffer_contains(&buf, "Terminal too small"));
+        use pancetta_qso::contest::ledger::{ContestScoreState, ContestScoreUpdate};
+        use pancetta_qso::contest::scoring::{
+            reduce_contest_score, ContestScoringContext, KSQP_FT_2026,
+        };
+        let snapshot = reduce_contest_score(
+            &ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
+                .unwrap(),
+            &[],
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        app.contest_score = Some(ContestScoreUpdate {
+            generation: 1,
+            instance_id: "ks".into(),
+            rules_id: KSQP_FT_2026.into(),
+            display_name: "KSQP 2026".into(),
+            outside_period: false,
+            state: ContestScoreState::Ready(snapshot),
+        });
+        let buf = render_app(&app, 60, 24);
+        assert!(has_slot_clock(&row_text(&buf, 0)));
+        assert!(row_text(&buf, 1).starts_with("Contest"));
+        for (w, h) in [(60, 1), (79, 24), (80, 19)] {
+            render_app(&app, w, h);
+        }
+    }
+
     const ALL_VIEWS: [crate::view::ActiveView; 4] = [
         crate::view::ActiveView::Operate,
         crate::view::ActiveView::Hunt,
@@ -3334,13 +3459,17 @@ mod view_render_tests {
             assert!(row.contains("VP2V/W1ABC"), "{w}: [{row}]");
             assert!(row.contains("TX: DISABLED — RX ONLY"), "{w}: [{row}]");
             assert!(ends_with_utc_clock(&row), "{w}: [{row}]");
-            let left = line_text(&title_bar_left_line(&app, w - 12));
+            assert!(has_slot_clock(&row), "{w}: [{row}]");
+            let left = line_text(&title_bar_left_line(&app, w - 12, slot_test_now()));
             assert!(
                 left.chars().count() <= (w - 12) as usize,
                 "{w}: fitted chips overflow their rect: [{left}]"
             );
             assert!(
-                row.starts_with(&left),
+                row.chars()
+                    .skip(21)
+                    .collect::<String>()
+                    .starts_with(&left.chars().skip(21).collect::<String>()),
                 "{w}: a chip was clipped\n row: [{row}]\nleft: [{left}]"
             );
         }
@@ -3350,17 +3479,17 @@ mod view_render_tests {
     async fn title_bar_drops_low_value_chips_in_documented_order_at_80_and_100() {
         let mut app = default_app().await;
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 68)),
-            "N0CALL | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO "
+            line_text(&title_bar_left_line(&app, 68, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 MHz 20M | FT8  TX: FULL "
         );
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 88)),
-            "N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms "
+            line_text(&title_bar_left_line(&app, 88, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO "
         );
         app.active_view = crate::view::ActiveView::Hunt;
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 68)),
-            "N0CALL | 14.074 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO   HUNT "
+            line_text(&title_bar_left_line(&app, 68, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 20M | FT8  TX: FULL   HUNT "
         );
     }
 
@@ -3368,8 +3497,11 @@ mod view_render_tests {
     async fn title_bar_is_unchanged_when_everything_fits() {
         let mut app = default_app().await;
         let legacy =
-            "Pancetta TUI | N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms ";
+            " | Pancetta TUI | N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO ";
         let check = |row: &str, prefix: &str| {
+            assert!(has_slot_clock(row));
+            let after_slot: String = row.chars().skip(21).collect();
+            let row = after_slot.as_str();
             assert!(row.starts_with(prefix), "[{row}] !starts_with [{prefix}]");
             let rest: String = row.chars().skip(prefix.chars().count()).collect();
             let rest = rest.trim_start();
@@ -3377,18 +3509,19 @@ mod view_render_tests {
             assert!(ends_with_utc_clock(rest), "[{row}]");
         };
 
-        let buf = render_app(&app, 120, 40);
+        let buf = render_app(&app, 130, 40);
         check(&row_text(&buf, 0), legacy);
 
+        // Hunt adds its own chip, so the full row needs six more columns.
         app.active_view = crate::view::ActiveView::Hunt;
-        let buf = render_app(&app, 120, 40);
+        let buf = render_app(&app, 136, 40);
         check(&row_text(&buf, 0), &format!("{legacy}  HUNT "));
 
         app.active_view = crate::view::ActiveView::Operate;
         let buf = render_app(&app, 160, 40);
         check(
             &row_text(&buf, 0),
-            "Pancetta TUI | N0CALL | FN20 (United States) | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms",
+            " | Pancetta TUI | N0CALL | FN20 (United States) | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO",
         );
     }
 
