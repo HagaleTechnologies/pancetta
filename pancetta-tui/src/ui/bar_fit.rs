@@ -292,7 +292,7 @@ mod tests {
     fn width_counts_display_columns_not_bytes() {
         let segs = vec![
             seg("", "⚠", 1),
-            seg(" ", "⏸", 1),
+            seg(" ", crate::presentation::PAUSE_MARKER, 1),
             seg(" ", "—", 1),
             seg(" ", "★", 1),
         ];
