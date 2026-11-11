@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-277: Shutdown now drains queued PTT-off through Hamlib before stopping it, including the TX worker's cancellation fallback. The independent direct rigctld unkey now allows 3 s per reply within a 6 s budget, so a rig taking 1.5 s to answer can unkey. Previously Hamlib exited before reading the unkey and the direct attempt had only 500 ms. Unresponsive rigs can add about 13 s to shutdown.
+
 - PAN-356: In FT4, the autonomous operator now acts on every other 7.5 s slot, matching its configured parity. Before, it acted on two slots in a row and then skipped two.
 - PAN-334: `--audio-device`, `--no-audio`, `--wav`, `--replay` and `--test-tx` given to a subcommand other than `run` now exit 2 with "applies only to the receiving service" instead of being ignored, and `--test-tx-offset` now requires `--test-tx`. `benchmark-decode --format` accepts only `text` and `json`, so a typo exits 2 instead of printing text. `test-rig --ptt` with CAT PTT now says the serial test does not key CAT PTT.
 - PAN-279: A frame that arrives too late to replace the one on air now goes out in its own next slot instead of being lost. Replacing an autonomous CQ with a newer frame for the same QSO no longer undoes the CQ. A multi-TX stream left out of a bundle now gives back its call count.

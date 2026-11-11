@@ -885,6 +885,52 @@ mod hamlib_command_in_flight_guard_tests {
     }
 }
 
+/// PAN-277: ceiling on the command loop's shutdown drain when the
+/// coordinator never sets `hamlib_drain_stop`.
+pub(crate) const HAMLIB_SHUTDOWN_DRAIN_CEILING: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainAdmit {
+    /// A PTT-off: run it through the normal `SetPtt` arm.
+    Execute,
+    /// A PTT-off after one was confirmed during this drain.
+    DiscardRedundantUnkey,
+    /// A key-down: never executed once shutdown has begun.
+    DiscardKeyDown,
+    /// Any other command: dropped without CAT I/O.
+    Discard,
+}
+
+/// PAN-277: the command loop's state after it sees the shutdown flag.
+#[derive(Debug)]
+pub(crate) struct ShutdownDrain {
+    started: Instant,
+    pub(crate) unkey_confirmed: bool,
+}
+
+impl ShutdownDrain {
+    pub(crate) fn new(started: Instant) -> Self {
+        Self {
+            started,
+            unkey_confirmed: false,
+        }
+    }
+    pub(crate) fn ceiling_passed(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= HAMLIB_SHUTDOWN_DRAIN_CEILING
+    }
+    pub(crate) fn admit(&self, message: &MessageType) -> DrainAdmit {
+        use crate::message_bus::RigControlMessage::SetPtt;
+        match message {
+            MessageType::RigControl(SetPtt { state: false }) if self.unkey_confirmed => {
+                DrainAdmit::DiscardRedundantUnkey
+            }
+            MessageType::RigControl(SetPtt { state: false }) => DrainAdmit::Execute,
+            MessageType::RigControl(SetPtt { state: true }) => DrainAdmit::DiscardKeyDown,
+            _ => DrainAdmit::Discard,
+        }
+    }
+}
+
 /// Whether a spawned Hamlib child task (poll loop or PTT watchdog)
 /// terminated unexpectedly and the outer message-loop task should treat
 /// that as a crash.
@@ -2097,6 +2143,7 @@ impl super::ApplicationCoordinator {
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
+            let hamlib_drain_stop = self.hamlib_drain_stop.clone();
             // PAN-19 round-8 review (Codex P1): the spawned task itself is
             // the true source of truth for this flag -- see the comment at
             // the readiness-reporting call site below for why.
@@ -2880,7 +2927,25 @@ impl super::ApplicationCoordinator {
                 let mut overload = ReceiveOverloadRuntime::default();
                 overload.sweep_configured = overload_sweep_configured;
                 // Process messages
-                while !shutdown.load(Ordering::Acquire) {
+                // PAN-277: the shutdown flag switches the loop into a drain instead of ending it.
+                let mut drain: Option<ShutdownDrain> = None;
+                loop {
+                    if drain.is_none() && shutdown.load(Ordering::Acquire) {
+                        info!("Hamlib: shutdown seen; draining queued PTT-off before stopping");
+                        drain = Some(ShutdownDrain::new(Instant::now()));
+                    }
+                    // Read the stop before the queue, so a PTT-off queued before the stop is
+                    // always seen by `try_recv` below.
+                    let drain_stop_requested =
+                        drain.is_some() && hamlib_drain_stop.load(Ordering::Acquire);
+                    if drain
+                        .as_ref()
+                        .is_some_and(|d| d.ceiling_passed(Instant::now()))
+                    {
+                        warn!("Hamlib: shutdown drain ceiling reached; stopping");
+                        break;
+                    }
+
                     if child_task_crashed(
                         || spawned_handles.iter().any(|handle| handle.is_finished()),
                         || shutdown.load(Ordering::Acquire),
@@ -2889,6 +2954,22 @@ impl super::ApplicationCoordinator {
                     }
                     match hamlib_rx.try_recv() {
                         Ok(message) => {
+                            if let Some(d) = drain.as_ref() {
+                                match d.admit(&message.message_type) {
+                                    DrainAdmit::Execute => {}
+                                    DrainAdmit::DiscardKeyDown => {
+                                        message_bus_for_connect.receive_gain.ptt_command_consumed();
+                                        warn!("Hamlib: discarding PTT-on queued during shutdown");
+                                        continue;
+                                    }
+                                    DrainAdmit::DiscardRedundantUnkey => {
+                                        debug!("Hamlib: PTT-off already confirmed during shutdown drain");
+                                        continue;
+                                    }
+                                    DrainAdmit::Discard => continue,
+                                }
+                            }
+
                             if let MessageType::RigControl(ref rig_msg) = message.message_type {
                                 match rig_msg {
                                     crate::message_bus::RigControlMessage::SetFrequency {
@@ -3161,6 +3242,9 @@ impl super::ApplicationCoordinator {
                                                     if *state { "ON" } else { "OFF" }
                                                 );
                                                 if !*state {
+                                                    if let Some(d) = drain.as_mut() {
+                                                        d.unkey_confirmed = true;
+                                                    }
                                                     message_bus_for_connect
                                                         .receive_gain
                                                         .confirmed_off(
@@ -3315,6 +3399,13 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+                        Err(crossbeam_channel::TryRecvError::Empty) if drain.is_some() => {
+                            if drain_stop_requested {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+
                         Err(crossbeam_channel::TryRecvError::Empty) => {
                             if overload_enabled && rig_enabled {
                                 overload
@@ -9714,5 +9805,212 @@ mod pan251_swr_protection_tests {
         );
         c.ptt_active.store(false, Ordering::Release);
         c.shutdown_signal.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod pan277_shutdown_drain_tests {
+    use super::*;
+    use crate::message_bus::{RigControlMessage, TxOrigin};
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+    use std::sync::atomic::AtomicBool;
+    fn set_ptt(state: bool) -> MessageType {
+        MessageType::RigControl(RigControlMessage::SetPtt { state })
+    }
+    fn set_ptt_message(state: bool) -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Hamlib,
+            set_ptt(state),
+            Instant::now(),
+        )
+    }
+    #[test]
+    fn pan277_drain_executes_only_unkeys_until_one_is_confirmed() {
+        let mut drain = ShutdownDrain::new(Instant::now());
+        assert_eq!(drain.admit(&set_ptt(false)), DrainAdmit::Execute);
+        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
+        for command in [
+            RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14074000,
+            },
+            RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14075000,
+            },
+            RigControlMessage::GetReceiveGain {
+                frequency: 14074000,
+                request_id: 1,
+            },
+        ] {
+            assert_eq!(
+                drain.admit(&MessageType::RigControl(command)),
+                DrainAdmit::Discard
+            );
+        }
+        drain.unkey_confirmed = true;
+        assert_eq!(
+            drain.admit(&set_ptt(false)),
+            DrainAdmit::DiscardRedundantUnkey
+        );
+        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
+    }
+    #[test]
+    fn pan277_drain_ceiling_is_thirty_seconds_from_entry() {
+        let start = Instant::now();
+        let drain = ShutdownDrain::new(start);
+        assert!(!drain.ceiling_passed(start + Duration::from_millis(29_999)));
+        assert!(drain.ceiling_passed(start + HAMLIB_SHUTDOWN_DRAIN_CEILING));
+    }
+    async fn coordinator() -> (
+        super::super::ApplicationCoordinator,
+        Arc<MockRig>,
+        tempfile::TempDir,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut c = super::super::ApplicationCoordinator::new(
+            Config::default(),
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            scratch.path().join("config.toml"),
+            true,
+            Some(scratch.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let rig = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }));
+        c.test_mock_rig = Some(rig.clone());
+        c.start_hamlib_component().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !c.hamlib_command_loop_ready.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "loop ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (c, rig, scratch)
+    }
+    async fn wait_ptt(rig: &MockRig, state: PttState, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            if rig.get_ptt(Vfo::Current).await.unwrap() == state {
+                return;
+            }
+            assert!(Instant::now() < deadline, "PTT must become {state:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    async fn keyed_coordinator() -> (
+        super::super::ApplicationCoordinator,
+        Arc<MockRig>,
+        tempfile::TempDir,
+    ) {
+        let (c, rig, scratch) = coordinator().await;
+        c.message_bus
+            .send_message(set_ptt_message(true))
+            .await
+            .unwrap();
+        wait_ptt(&rig, PttState::On, Duration::from_secs(5)).await;
+        (c, rig, scratch)
+    }
+    #[tokio::test]
+    async fn pan277_loop_keeps_running_after_the_flag_until_the_drain_stop() {
+        let (mut c, _rig, _scratch) = keyed_coordinator().await;
+        let index = c
+            .named_task_handles
+            .iter()
+            .position(|(id, _)| *id == ComponentId::Hamlib)
+            .unwrap();
+        let (_, handle) = c.named_task_handles.remove(index);
+        c.shutdown_signal.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "must drain after flag");
+        c.hamlib_drain_stop.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn pan277_shutdown_after_the_signal_flag_unkeys_through_the_hamlib_loop() {
+        let (c, rig, _scratch) = keyed_coordinator().await;
+        c.shutdown_signal.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.shutdown().await.unwrap();
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+    }
+    #[tokio::test]
+    async fn pan277_shutdown_as_first_flag_writer_unkeys_through_the_hamlib_loop() {
+        for _ in 0..5 {
+            let (c, rig, _scratch) = keyed_coordinator().await;
+            c.shutdown().await.unwrap();
+            assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+        }
+    }
+    #[tokio::test]
+    async fn pan277_keydown_queued_after_the_flag_is_never_executed() {
+        let (c, rig, _scratch) = coordinator().await;
+        c.shutdown_signal.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.message_bus
+            .send_message(set_ptt_message(true))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+        c.shutdown().await.unwrap();
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
+    }
+    #[tokio::test]
+    async fn pan277_sigterm_while_the_tx_worker_airs_a_frame_unkeys_before_shutdown_runs() {
+        let (mut c, rig, _scratch) = coordinator().await;
+        for component in [
+            ComponentId::Autonomous,
+            ComponentId::Qso,
+            ComponentId::Tui,
+            ComponentId::Audio,
+        ] {
+            c.message_bus
+                .get_or_create_channel(component)
+                .await
+                .unwrap();
+        }
+        c.start_transmitter_component().await.unwrap();
+        c.message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    attempt_id: None,
+                    message_text: "CQ N0CALL FN20".into(),
+                    frequency_offset: 1500.0,
+                    qso_id: None,
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        wait_ptt(&rig, PttState::On, Duration::from_secs(40)).await;
+        assert!(c.ptt_active.load(Ordering::Acquire));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        c.shutdown_signal.store(true, Ordering::Release);
+        wait_ptt(&rig, PttState::Off, Duration::from_millis(500)).await;
+        c.shutdown().await.unwrap();
+        assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
     }
 }
