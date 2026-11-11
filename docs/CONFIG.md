@@ -816,6 +816,7 @@ it:
 enabled                  = false
 server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds  = 300
+max_pending_reports      = 2000
 batch_size               = 50
 include_receives         = true
 include_transmits        = true
@@ -842,6 +843,14 @@ exclude_cq_zones = []
 [network.psk_reporter.filters.geographic.distance]
 great_circle = true
 ```
+
+`max_pending_reports` (PAN-285) is how many reception reports Pancetta
+keeps while it cannot send them, for example while DNS or the network is
+down. When the queue is full, the oldest report is dropped first and the
+log says how many were dropped. When the server is reachable again, the
+backlog goes out in datagrams of at most 1400 bytes. The queue is in
+memory only, so a restart empties it. It must be at least 1 when
+`enabled = true`.
 
 ### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
 

@@ -1114,6 +1114,34 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
 
+## Stable decoder API guard (PAN-380, 2026-11-10)
+
+- **What is stable.** The union of two lists: the cycle API manta calls
+  (`CycleDecoder::new`, `CycleDecoder::decode_cycle`, `decode_cycle`,
+  `ft8lib_is_available`; dispensa ADR-0017, still `Proposed`) and the window
+  API the dispensa Q-0085 answer names (`Ft8Decoder::new(Ft8Config)`,
+  `decode_window`). Pinning only one would leave either the ticket or manta's
+  real calls unguarded. `pancetta-ft8/README.md` § Stable API and
+  compatibility policy is the list consumers read.
+- **Only named fields.** Four `DecodedMessage` fields (`text`, `snr_db`,
+  `frequency_offset`, `time_offset`) and two `Ft8Config` fields
+  (`sample_rate`, `protocol`) are stable. Every other field stays free to
+  change, as Q-0085 ("Stable API, and only this") and ADR-0017 say.
+- **Hand-written compile-time guard, not `cargo public-api`.**
+  `pancetta-ft8/tests/stable_api_guard.rs` coerces each pinned function to
+  its fn-pointer type, so drift is an E0308 naming the item, and it runs in
+  the existing `ft8-tests` and `workspace-check` jobs on the pinned 1.98.0.
+  `cargo public-api` needs a nightly toolchain, a tool build and a pinned
+  tool-to-nightly pairing, which the PAN-56 single-toolchain rule argues
+  against. `readme_lists_every_pinned_item` keeps the guard and the README
+  list in step.
+- **`Ft8Config` stays exhaustive.** `#[non_exhaustive]` would forbid
+  `Ft8Config { sample_rate, protocol, ..Ft8Config::default() }` from outside
+  the crate, so the guard's struct literal fails (E0639) if it is added.
+- **`trybuild` rejected.** Proving the guard fails would need a dev-dependency
+  to show what CI already shows by failing to compile; validation repeats the
+  mutations by hand.
+
 ## Windows compiled on every code PR (PAN-286, 2026-11-10)
 
 Before this change only `release.yml` compiled Windows, on a `v*` tag, though
