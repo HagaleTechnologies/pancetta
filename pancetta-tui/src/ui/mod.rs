@@ -3485,6 +3485,7 @@ mod view_render_tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: f64,
+                _mode: Option<&str>,
             ) -> crate::dx_need::DxNeedStatus {
                 crate::dx_need::DxNeedStatus {
                     grid_needed: Some(true),

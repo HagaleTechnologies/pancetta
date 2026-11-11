@@ -1113,3 +1113,70 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `pancetta/tests/cli_surface.rs` checks every help screen (found from the live
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
+
+## Windows compiled on every code PR (PAN-286, 2026-11-10)
+
+Before this change only `release.yml` compiled Windows, on a `v*` tag, though
+Windows 11 is the maintainer's station platform.
+
+- **Leg and target.** `cross-platform-check` in `.github/workflows/ci.yml` has
+  a `windows-latest` leg that checks `x86_64-pc-windows-gnu`, with the same
+  runner, toolchain pin, ft8_lib submodule guard and MinGW `gcc --version`
+  assert as `release.yml`. MSVC stays out: it cannot compile the VLAs in
+  `vendor/ft8_lib/ft8/decode.c` (C2057).
+- **Check command.** `cargo check --target x86_64-pc-windows-gnu --workspace
+  --exclude pancetta-research --all-targets --features transmit`, the crate
+  scope Linux tests. `--all-targets` also compiles `cfg(test)`, `tests/`,
+  examples and benches, where three of today's five Windows-only warnings live.
+- **Gating.** `cross-platform-check` is in the `CI` aggregator's `needs`, so a
+  red Windows leg fails the required `CI` check. `needs` cannot pick one matrix
+  leg, so the macOS leg is gating too; a flaky macOS runner now blocks a merge
+  until it is re-run. On `push` and `merge_group` the job is `skipped`, which
+  the aggregator ignores.
+- **Not done.** No tests run on Windows: a bare `cargo test` on
+  `windows-latest` uses the MSVC host, and a gnu test run is unverified. No
+  `-D warnings`, because the Windows-only warnings would fail it.
+- **Follow-ups, not done here:** the `code` path filter misses `.h` files,
+  `.gitmodules` and the ft8_lib submodule; `deny.toml` lists
+  `x86_64-pc-windows-msvc`, not `-gnu`; `actions/checkout@v7` and
+  `Swatinem/rust-cache@v2` in this job stay unpinned (PAN-106).
+
+`scripts/ci/test-ci-windows-lane.sh`, run by the `research-scan-tests` job,
+pins the Windows leg, the `ci.needs` entry, the guards and the macOS-only
+microphone test.
+
+## DX-cluster reconnect backoff (PAN-288), 2026-11-10
+
+A dropped DX-cluster connection reconnects with capped backoff instead of
+spinning the worker on a closed spot channel.
+
+- **The loop lives in `pancetta-dx`.** `DxClusterClient::run_until_shutdown`
+  connects, forwards spots, and reconnects on one reused client (`connect()`
+  replaces the channels and keeps the dedup map and dropped-spot counter). A
+  session ends when `receive_spot()` returns `None`, which covers every way the
+  reader stops; `status()` is not used because it stays `Connected` after a
+  reader panic. The loop cannot hand the retry to the supervisor: a DxCluster
+  task that returns `Ok(())` is not restarted, and an `Err` gets only 5
+  restarts per 10 minutes. The shutdown flag is checked at least once a second.
+- **Backoff.** Base `reconnect_delay_seconds.max(1)` s, doubled after each
+  retry, capped at 10 × base (30, 60, 120, 240, 300, 300 s at the default), no
+  jitter. A failed first connect uses the same schedule, so a cluster that is
+  down at startup is retried. The delay resets to the base only after a session
+  that lasted at least 60 s, so a server that accepts and closes at once is not
+  retried at the minimum delay forever.
+- **Config.** The worker reads `[network.dx_cluster.connection]`
+  `reconnect_delay_seconds` and `timeout_seconds` (clamped to at least 1 s),
+  both defaulting to the 30 s it hard-coded before, and always sets
+  `auto_reconnect`. `reconnect_attempts`, `auto_connect` and
+  `keepalive_interval_seconds` stay unread; `reconnect_attempts` is not a
+  give-up limit, because giving up would end spots for the session silently.
+- **Time tokens.** `parse_cluster_time` strips the `Z`, requires exactly four
+  ASCII digits, and only then reads the hour and minute, so a multibyte
+  character cannot land a slice mid-character (the old `&time_str[0..4]` slice
+  panicked the reader). `parse_dx_spot` rejects a last token that ends in `Z`
+  and is not ASCII, so that line falls through to `ClusterMessage::Raw`.
+  ASCII-malformed tokens (`2560Z`, `BUZZ`) keep the `Utc::now()` fallback so
+  real lines with odd trailing fields are not dropped.
+- **Not done here:** half-open TCP detection (`keepalive_interval_seconds`),
+  rotating through `servers`, surviving a non-UTF-8 line without a reconnect,
+  and a "reconnecting" state in the TUI.

@@ -647,6 +647,7 @@ mod tests {
             _: Option<&str>,
             _: Option<&str>,
             _: f64,
+            _mode: Option<&str>,
         ) -> crate::dx_need::DxNeedStatus {
             self.0.clone()
         }

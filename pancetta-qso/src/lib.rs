@@ -117,8 +117,8 @@
 pub use crate::adif::*;
 pub use crate::adif_log_writer::{AdifLogError, AdifLogResult, AdifLogWriter};
 pub use crate::async_database::{
-    DatabaseStats, DateRange, FrequencyRange, QslStatus, QsoDatabase, QsoDatabaseRecord, QsoFilter,
-    QueryOptions, SortField, SortOrder,
+    is_confirmed_qsl_value, DatabaseStats, DateRange, FrequencyRange, QslStatus, QsoDatabase,
+    QsoDatabaseRecord, QsoFilter, QueryOptions, SortField, SortOrder, WorkedContact,
 };
 pub use crate::async_logger::{
     AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig, ExportResult,

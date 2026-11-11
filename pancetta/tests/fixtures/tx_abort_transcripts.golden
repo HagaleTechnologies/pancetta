@@ -1,0 +1,329 @@
+# TX-worker abort transcripts (PAN-322). One block per cell:
+# [Shape/Phase/Reason], then `pre|post <channel> <event>` for every
+# message the worker sent, relative to the abort action. Channels go
+# in the order hamlib, autonomous, qso, tui, audio; each keeps its
+# arrival order. Re-bless with:
+#   PANCETTA_BLESS_TX_ABORT=1 cargo test -p pancetta --lib coordinator::tx::abort_transcripts
+
+[Single/PrePtt/Shutdown]
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+
+[Single/PrePtt/Operator]
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(7)), 'K1ABC W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Single/PreSlot/Shutdown]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Single/PreSlot/Operator]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(7)), 'K1ABC W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Single/PreSlot/Disarm]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(7)), 'K1ABC W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+post tui Diagnostic(Warn, 'Remote TX interrupted (disarmed mid-transmission: 'K1ABC W9XYZ FN20' at 1500 Hz)')
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Single/PreSlot/Supersede]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=true, Some("qso-a"), Some(TxAttemptId(8)), 'K1ABC W9XYZ -10')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+post qso TxFrameScheduled(qso-a, TxAttemptId(8))
+post qso TxFrameSent(qso-a, 'K1ABC W9XYZ -10')
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ -10", 1600.0, false)])
+post tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ -10", 1600.0, true)])
+post tui TxStatus
+post tui TxQueueStatus(sending=Some(("K1ABC W9XYZ -10", 1600.0, false)), queued=[])
+post tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post audio AudioOutput(flush_first=false, nonempty=true)
+
+[Single/Playback/Shutdown]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+pre tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=false, nonempty=true)
+
+[Single/Playback/Operator]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(7)), 'K1ABC W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+pre tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=false, nonempty=true)
+
+[Single/Playback/Disarm]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(7)), 'K1ABC W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+pre tui TxFrameLogged
+post tui Diagnostic(Warn, 'Remote TX interrupted (disarmed mid-transmission: 'K1ABC W9XYZ FN20' at 1500 Hz)')
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=false, nonempty=true)
+post audio AudioFlush
+
+[Single/Playback/Supersede]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=true, Some("qso-a"), Some(TxAttemptId(8)), 'K1ABC W9XYZ -10')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(7))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(7)), replaced=false)
+post qso TxFrameScheduled(qso-a, TxAttemptId(8))
+post qso TxFrameSent(qso-a, 'K1ABC W9XYZ -10')
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1500.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1500.0, false)), queued=[])
+pre tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=Some(("K1ABC W9XYZ -10", 1600.0, false)), queued=[])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=false, nonempty=true)
+post audio AudioOutput(flush_first=true, nonempty=true)
+
+[Bundle/PrePtt/Shutdown]
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+
+[Bundle/PrePtt/Operator]
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(11)), 'K1ABC W9XYZ FN20')
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=false)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+
+[Bundle/PreSlot/Shutdown]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Bundle/PreSlot/Operator]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(11)), 'K1ABC W9XYZ FN20')
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=false)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Bundle/PreSlot/Disarm]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(11)), 'K1ABC W9XYZ FN20')
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=false)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+post tui Diagnostic(Warn, 'Remote TX interrupted (disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz)')
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+
+[Bundle/PreSlot/Supersede]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+post autonomous TransmitComplete(success=true, Some("qso-a"), Some(TxAttemptId(8)), 'K1ABC W9XYZ -10')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=true)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=true)
+post qso TxFrameScheduled(qso-a, TxAttemptId(8))
+post qso TxFrameSent(qso-a, 'K1ABC W9XYZ -10')
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ -10", 1600.0, false)])
+post tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ -10", 1600.0, true)])
+post tui TxStatus
+post tui TxQueueStatus(sending=Some(("K1ABC W9XYZ -10", 1600.0, false)), queued=[])
+post tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post audio AudioOutput(flush_first=false, nonempty=true)
+
+[Bundle/Playback/Shutdown]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxFrameLogged
+pre tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=true, nonempty=true)
+
+[Bundle/Playback/Operator]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(11)), 'K1ABC W9XYZ FN20')
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=false)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxFrameLogged
+pre tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=true, nonempty=true)
+
+[Bundle/Playback/Disarm]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=false, Some("qso-a"), Some(TxAttemptId(11)), 'K1ABC W9XYZ FN20')
+post autonomous TransmitComplete(success=false, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=false)
+post qso TxFrameNotSent(qso-b, 'K2DEF W9XYZ FN20', Some(TxAttemptId(12)), replaced=false)
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxFrameLogged
+pre tui TxFrameLogged
+post tui Diagnostic(Warn, 'Remote TX interrupted (disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz)')
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=true, nonempty=true)
+post audio AudioFlush
+
+[Bundle/Playback/Supersede]
+pre hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post hamlib SetPtt(true)
+post hamlib SetPtt(false)
+post autonomous TransmitComplete(success=true, Some("qso-b"), Some(TxAttemptId(12)), 'K2DEF W9XYZ FN20')
+post autonomous TransmitComplete(success=true, Some("qso-a"), Some(TxAttemptId(8)), 'K1ABC W9XYZ -10')
+pre qso TxFrameScheduled(qso-a, TxAttemptId(11))
+pre qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameNotSent(qso-a, 'K1ABC W9XYZ FN20', Some(TxAttemptId(11)), replaced=true)
+post qso TxFrameScheduled(qso-b, TxAttemptId(12))
+post qso TxFrameScheduled(qso-a, TxAttemptId(8))
+post qso TxFrameSent(qso-b, 'K2DEF W9XYZ FN20')
+post qso TxFrameSent(qso-a, 'K1ABC W9XYZ -10')
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, false), ("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxQueueStatus(sending=None, queued=[("K1ABC W9XYZ FN20", 1000.0, true), ("K2DEF W9XYZ FN20", 1800.0, true)])
+pre tui TxStatus
+pre tui TxQueueStatus(sending=Some(("K1ABC W9XYZ FN20", 1000.0, false)), queued=[("K2DEF W9XYZ FN20", 1800.0, false)])
+pre tui TxFrameLogged
+pre tui TxFrameLogged
+post tui TxQueueStatus(sending=None, queued=[("K2DEF W9XYZ FN20", 1800.0, false), ("K1ABC W9XYZ -10", 1600.0, false)])
+post tui TxQueueStatus(sending=None, queued=[("K2DEF W9XYZ FN20", 1800.0, true), ("K1ABC W9XYZ -10", 1600.0, true)])
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+post tui TxStatus
+post tui TxQueueStatus(sending=Some(("K2DEF W9XYZ FN20", 1800.0, false)), queued=[("K1ABC W9XYZ -10", 1600.0, false)])
+post tui TxFrameLogged
+post tui TxFrameLogged
+post tui TxStatus
+post tui TxQueueStatus(sending=None, queued=[])
+pre audio AudioOutput(flush_first=true, nonempty=true)
+post audio AudioOutput(flush_first=true, nonempty=true)

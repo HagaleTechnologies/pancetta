@@ -9,10 +9,38 @@ pub struct DxNeedStatus {
     pub grid_needed: Option<bool>,
     pub state: Option<String>,
     pub state_needed: Option<bool>,
-    /// PAN-93: cqdx.io needed-entity verdict; None while the list is not loaded.
+    /// PAN-93 / PAN-347: needed-entity verdict, cqdx or local logbook
+    /// (`dxcc_source`); None while neither has answered.
     pub dxcc_needed: Option<bool>,
-    /// PAN-93: the loaded list's scope and time, when `dxcc_needed` is known.
+    /// PAN-93: the loaded cqdx list's scope and time, when cqdx answered.
     pub dxcc_list: Option<NeedListSource>,
+    /// PAN-347: who answered `dxcc_needed`; None exactly when `dxcc_needed` is None.
+    pub dxcc_source: Option<pancetta_qso::priority::NeedSource>,
+    /// PAN-347: the row's entity in the local logbook; None before the log
+    /// loads or without an entity.
+    pub entity_standing: Option<EntityStanding>,
+    /// PAN-347: no contact with the entity in the row's mode on any band.
+    /// None without a locally decoded mode, the log, or an entity, and for
+    /// the home entity.
+    pub new_mode: Option<bool>,
+}
+
+/// PAN-347: an entity's standing in the local logbook, all bands and modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityStanding {
+    NotWorked,
+    WorkedUnconfirmed,
+    Confirmed,
+}
+
+impl EntityStanding {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotWorked => "not worked",
+            Self::WorkedUnconfirmed => "worked-unconfirmed",
+            Self::Confirmed => "confirmed",
+        }
+    }
 }
 
 /// PAN-93: where a needed-entity verdict came from, so reason surfaces can
@@ -27,7 +55,8 @@ pub struct NeedListSource {
 pub trait DxNeedLookup: Send + Sync {
     /// `entity` is the row's `DxStation::offline_entity`, resolved once when
     /// the row was created. Frames call this per row: use `entity`, never
-    /// resolve `callsign` again.
+    /// resolve `callsign` again. `mode` is the row's locally decoded mode
+    /// (PAN-347), None for rows with no local decode.
     fn lookup_need(
         &self,
         callsign: &str,
@@ -35,6 +64,7 @@ pub trait DxNeedLookup: Send + Sync {
         grid: Option<&str>,
         known_state: Option<&str>,
         current_frequency_hz: f64,
+        mode: Option<&str>,
     ) -> DxNeedStatus;
 }
 

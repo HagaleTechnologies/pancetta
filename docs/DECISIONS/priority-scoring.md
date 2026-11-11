@@ -165,7 +165,8 @@ precedent of adding inherent siblings beside the trait.
 the call matches an excluded (home or logged) prefix, and needed for every call
 when there are no exclusions. `is_needed_grid` is true only for `Needed`, so an
 unknown grid list still adds nothing. `PriorityWeights`, `score_cq_detailed`
-and `score_tiered_explained` are unchanged.
+and `score_tiered_explained` are unchanged. PAN-347 replaced this guess: see
+"The local logbook answers needed when cqdx has not" below.
 
 `Unknown` keeps the guess because this ticket fixes what pancetta claims, not
 what the unattended station calls during a cqdx outage. Giving `Unknown` zero
@@ -295,3 +296,75 @@ CI enforces the 2 µs budget from the ticket. The Workspace Check lane runs
 `cargo bench -p pancetta-core --bench dxcc_lookup` and
 `scripts/ci/check-criterion-budget.sh`, which fails when any benchmark mean is
 2,000 ns or more.
+
+## The local logbook answers needed when cqdx has not (PAN-347, 2026-11)
+
+Before PAN-347, an operator without cqdx.io, or with cqdx.io unreachable, had
+no needed or ATNO verdict: the strip said `⚠ CQDX NEEDS UNKNOWN`, no station
+got `!` or `+`, and the scorer guessed "needed" from callsign letter prefixes
+(the PAN-93 D3 guess above). That guess treated KH6, KL7 and KP4 as home for a
+US operator, hid a new band-slot for any entity whose letters appeared in
+`qsos.adi` (a DL contact hid DA on every band), and, because `[station]
+dxcc_entity` defaults to 291, gave every operator on the default config the
+whole US prefix family as "home".
+
+Decisions:
+
+- **D1. Local needed means never logged.** An entity with no contact in the
+  indexed `qsos.adi` (any band, any mode) is needed, and that verdict is the
+  local ATNO. Worked-unconfirmed is a separate standing that adds no score:
+  almost no log carries confirmations until H6 imports them.
+- **D2. Precedence.** A loaded cqdx list answers needed and ATNO. Otherwise
+  the local logbook answers once its first full read succeeded, for any call
+  that resolves to an entity, whether cqdx is not configured, loading or
+  unavailable. Otherwise the scorer guesses "needed unless the home entity"
+  and displays show nothing.
+- **D3. Home entity, not home prefixes.** `CachedStationLookup` holds the
+  home entity from `entity_for_callsign([station] callsign)`. The prefix
+  exclusion set, `default_excluded_dxcc_prefixes` and
+  `derive_prefix_from_callsign` are gone, and `dxcc_entity` no longer has any
+  runtime effect (it still parses and merges). The home entity is never
+  needed, ATNO, new on band or new in mode. Band-slot (`is_dxcc_needed_on_band`)
+  is entity-scoped: DL and DA calls give one answer, KH6 is not the US.
+- **D4. Mode** is the logged mode string, trimmed and uppercased (imports use
+  SUBMODE, else MODE), so FT8 and FT4 differ. "New mode" means no contact with
+  the entity in that mode on any band. It is display only and never shown
+  with an all-time-new headline or for a row with no local decode.
+- **D5. Band read fallback.** `worked_history` returns the record's logged
+  `BAND` tag when the index band is a `…MHZ` fallback bucket (a record
+  imported without `FREQ`). No schema change or rebuild.
+- **D6. Confirmed** means `QSL_RCVD` or `LOTW_QSL_RCVD` is `Y` or `V` on any
+  contact with the entity. eQSL does not count (DXCC does not accept it).
+  `get_statistics().confirmed_qsos` now counts the same rows in SQL; the dead
+  `$.confirmed` reader is gone.
+- **D7. One read, one flag.** `worked_history` returns one `WorkedContact`
+  per contact; `seed_worked_history` feeds the band maps and the local log,
+  then marks the log available. A failed read changes nothing. The flag is
+  never reset: seeds are additive and live completions keep it current.
+- **D8. Two display helpers.** `display_needed_atno` stays cqdx-only for the
+  remote `DecodedView` and cqdx spot info (the wire contract in
+  `pancetta-protocol/src/dto.rs` says cqdx). The TUI relay uses
+  `needed_atno_shown` (cqdx, else local).
+- **D9.** `PriorityFactors.need_source` (`Cqdx`, `LocalLogbook`, `Guess`)
+  records who answered at score time; it defaults to `Cqdx`, the meaning of
+  every factor stored before PAN-347. The Why view names the local logbook.
+- **D10.** `DxNeedLookup::lookup_need` takes the row's mode only when the row
+  has a local decode; `DxNeedStatus` carries `dxcc_source`,
+  `entity_standing` and `new_mode`.
+- **D11. Strip.** `NeedListHealth::LocalLogbook` replaces `Unavailable` for
+  the entity list once the local log is seeded: `⚠ NEEDS FROM LOCAL LOGBOOK`,
+  same `CqdxNeeds` key and Warning severity.
+- **D12. Alerts** treat a local logbook verdict as evidence; the payload is
+  unchanged and its `tier` can now be `atno` offline.
+- **D13.** An empty log still answers: every non-home entity is ATNO. The
+  README tells operators to run `pancetta import` first.
+- **D14.** Offline ranking changes on purpose: a worked entity on a worked
+  band no longer scores as needed just because its letter prefix was not in
+  the log, and the `Atno` tier is reachable without cqdx.io.
+
+Follow-ups: a dispensa contract proposal for a `needSource` on the remote
+`DecodedView` so panino can show local-logbook ATNO (no dispensa access from
+the implementing session); H6 confirmation import, with a
+`record_confirmation` hook if it runs live; whether a new mode or a
+worked-unconfirmed entity should raise rank; reloading the local log after
+`pancetta import` without a restart.
