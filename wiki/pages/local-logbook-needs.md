@@ -47,3 +47,20 @@ nothing. Do not reset it in `reset_display_history`.
 The home entity comes from `[station] callsign`, not `dxcc_entity`. KH6, KL7
 and KP4 are separate entities from the US. The old letter-prefix exclusion
 set is gone; do not reintroduce prefix matching for home.
+
+
+## Confirmation-based need (PAN-348)
+
+`[autonomous] needed_means` defaults to `unworked`, preserving cqdx-first
+precedence. With `unconfirmed`, a successfully seeded local log takes precedence
+for local entity and band need. Global need checks confirmations on all bands;
+band need checks the evaluated band, across modes. ATNO always checks worked
+history. Home entities and unknown bands retain their existing exclusions.
+The cqdx-only remote display helper keeps its existing meaning.
+
+Seeds remain additive and availability never resets after a successful read.
+Live completion adds worked history without inventing a confirmation. The LoTW
+file command changes only the durable ADIF file under its shared lock and leaves
+a rebuild request. Restart rebuilds the index before seeding the cache. A running
+station does not pick up imported confirmations. No new remote fields or cqdx
+API changes are involved.

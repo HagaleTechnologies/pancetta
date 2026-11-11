@@ -11392,7 +11392,8 @@ async fn start_local_qso_log_writers(
 /// NOT EXISTS`, a write-mode connection even on an already-current DB) — not
 /// anything derived from `--replay`'s capture-dir argument, so it only runs
 /// from the live branch of [`start_local_qso_log_writers`] (PAN-41).
-async fn prepare_local_qso_index(
+#[doc(hidden)]
+pub async fn prepare_local_qso_index(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
 ) -> Option<pancetta_qso::async_database::QsoDatabase> {

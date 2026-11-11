@@ -10,6 +10,7 @@ pub(crate) struct LocalLog {
     pub(crate) available: bool,
     worked: HashSet<&'static str>,
     confirmed: HashSet<&'static str>,
+    confirmed_on_band: HashMap<String, HashSet<&'static str>>,
     worked_in_mode: HashMap<String, HashSet<&'static str>>,
 }
 
@@ -28,6 +29,23 @@ impl LocalLog {
         if let Some(m) = normalize_mode(mode) {
             self.worked_in_mode.entry(m).or_default().insert(entity);
         }
+    }
+
+    pub(crate) fn record_confirmation_on_band(&mut self, entity: &'static str, band: &str) {
+        self.confirmed_on_band
+            .entry(band.trim().to_uppercase())
+            .or_default()
+            .insert(entity);
+    }
+
+    pub(crate) fn is_confirmed(&self, entity: &str) -> bool {
+        self.confirmed.contains(entity)
+    }
+
+    pub(crate) fn is_confirmed_on_band(&self, entity: &str, band: &str) -> bool {
+        self.confirmed_on_band
+            .get(band)
+            .is_some_and(|set| set.contains(entity))
     }
 
     pub(crate) fn mark_worked(&mut self, entity: &'static str) {
