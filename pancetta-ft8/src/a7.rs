@@ -44,9 +44,9 @@
 //!
 //! ## Feature gating
 //!
-//! Template synthesis requires the FT8 encoder, which is feature-gated
-//! behind `transmit`. The cross-correlation primitive itself is pure
-//! arithmetic on LLR slices and does not require `transmit`.
+//! None. Template synthesis uses the FT8 encoder, which is in every build
+//! (PAN-331). The cross-correlation primitive itself is pure arithmetic on
+//! LLR slices.
 
 #![allow(dead_code)]
 // rationale: template cross-correlation loops index LLR/symbol slices by
@@ -226,7 +226,6 @@ const A7_REPORT_DBS: &[i8] = &[-20, -15, -10, -5, 0, 5, 10, 15];
 /// Status messages emitted from C (or to C).
 const A7_STATUS_MSGS: &[&str] = &["RRR", "RR73", "73"];
 
-#[cfg(feature = "transmit")]
 fn ldpc_codeword_for_message(text: &str) -> Option<[bool; A7_CODEWORD_BITS]> {
     use crate::encoder::Ft8Encoder;
     let mut enc = Ft8Encoder::new();
@@ -299,7 +298,6 @@ fn build_standard_pinned_mask(pin_payload: bool) -> [bool; A7_CODEWORD_BITS] {
 
 /// Build a template from text + categorization. Returns `None` if the
 /// FT8 encoder can't encode the message (invalid callsign, etc.).
-#[cfg(feature = "transmit")]
 fn make_template(text: &str, kind: A7TemplateKind, pin_payload: bool) -> Option<A7Template> {
     let codeword = ldpc_codeword_for_message(text)?;
     Some(A7Template {
@@ -324,11 +322,6 @@ fn make_template(text: &str, kind: A7TemplateKind, pin_payload: bool) -> Option<
 /// 4. Grid-bearing messages.
 /// 5. CQ-from-C.
 /// 6. Fallback templates (no `my_call` / `heard_with` context).
-///
-/// On feature-disabled builds (no `transmit`), returns an empty vec —
-/// callers in non-transmit builds must use a separately-supplied codeword
-/// (testing-only path).
-#[cfg(feature = "transmit")]
 pub fn generate_templates(call: &A7ExpectedCall) -> Vec<A7Template> {
     let mut templates: Vec<A7Template> = Vec::new();
     let c = &call.call;
@@ -424,11 +417,6 @@ pub fn generate_templates(call: &A7ExpectedCall) -> Vec<A7Template> {
     }
 
     templates
-}
-
-#[cfg(not(feature = "transmit"))]
-pub fn generate_templates(_call: &A7ExpectedCall) -> Vec<A7Template> {
-    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -623,9 +611,8 @@ mod tests {
         }
     }
 
-    // ----- Template generation tests (require `transmit` feature) ----------
+    // ----- Template generation tests ------------------------------------------
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_template_generation_known_call_produces_templates() {
         let expected = A7ExpectedCall::new("K1ABC", 1200.0, A7SlotParity::Even)
@@ -655,7 +642,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_template_pinned_mask_covers_callsigns_and_i3() {
         let expected = A7ExpectedCall::new("K1ABC", 1200.0, A7SlotParity::Even);
@@ -681,7 +667,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_template_count_bounded_no_runaway() {
         // Even with rich context, we must stay under the cap.
@@ -703,7 +688,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_template_text_contains_expected_kinds() {
         let expected =
@@ -924,7 +908,6 @@ mod tests {
 
     // ----- Codeword reconstruction round-trip ------------------------------
 
-    #[cfg(feature = "transmit")]
     #[test]
     fn test_codeword_reconstruction_round_trip() {
         // Encoding then Gray-decoding the data symbols should give back a

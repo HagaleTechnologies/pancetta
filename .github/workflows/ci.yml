@@ -456,14 +456,20 @@ jobs:
         with:
           key: ft8-tests
 
-      - name: Check (no features)
+      - name: Check (default features)
         run: cargo check -p pancetta-ft8
+
+      - name: Check (no default features)
+        run: cargo check -p pancetta-ft8 --no-default-features
 
       - name: Check (transmit feature)
         run: cargo check --features transmit -p pancetta-ft8
 
-      - name: Run FT8 tests (all features)
-        run: cargo test --features transmit -p pancetta-ft8
+      - name: Run FT8 tests (default features, the standalone build)
+        # The configuration manta and other programs build (PAN-176,
+        # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
+        # run in workspace-check's `--features transmit` test step.
+        run: cargo test -p pancetta-ft8
 
   workspace-check:
     name: Workspace Check
@@ -527,6 +533,15 @@ jobs:
         # examples are never built in CI.
         run: cargo check --workspace --exclude pancetta-research
 
+      - name: Check pancetta without default features (PAN-331)
+        # The station crate must compile without its default features.
+        # `pancetta-hamlib` is a plain dependency (PAN-331) and the crate has
+        # no default features today (PAN-334 removed `metrics`), so this step
+        # differs from the default build only once a default feature gains
+        # cfg sites. GitHub #270 broke the old hamlib-off build silently
+        # because no lane built it. The opt-in `ft2` build is not checked here.
+        run: cargo check -p pancetta --no-default-features
+
       - name: Build examples
         run: cargo build --workspace --exclude pancetta-research --examples
 
@@ -549,6 +564,8 @@ jobs:
   # CI lane silently lets platform regressions land. Check-only plus scoped microphone identity tests
   # to keep wall-clock manageable. PR + weekly cron + manual dispatch
   # (skipped on direct human push to main; macos minutes are 10x cost).
+  # Both legs are in the `ci` aggregator's needs, so either one failing
+  # fails the required CI check (PAN-286).
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
     needs: [changes, codex-clean]
@@ -557,21 +574,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest dropped 2026-05-23: MSVC can't compile the
-        # variable-length arrays in vendor/ft8_lib/ft8/decode.c
-        # (error C2057). The pancetta-ft8 build script invokes cc on
-        # the C sources, and MSVC is stricter than gcc/clang about
-        # VLA support (only allowed with /experimental:c11atomics, and
-        # even then not reliably). Patching upstream ft8_lib is out of
-        # scope; on-rig builds use the MinGW toolchain on the Windows
-        # MiniPC, not MSVC. Re-add windows-latest if the upstream
-        # ft8_lib drops VLAs.
-        os: [macos-latest]
+        # Windows builds the GNU (MinGW) target, never MSVC: MSVC cannot
+        # compile the VLAs in vendor/ft8_lib/ft8/decode.c (error C2057;
+        # windows-latest/MSVC was dropped 2026-05-23 for that reason). Same
+        # runner, toolchain pin and target as release.yml (PAN-286).
+        include:
+          - os: macos-latest
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
     runs-on: ${{ matrix.os }}
     steps:
       # See ft8-tests's own comment above for why this explicit step exists
       # instead of a richer `if:`.
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        shell: bash
         run: |
           result="${{ needs.codex-clean.result }}"
           if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
@@ -583,26 +599,50 @@ jobs:
         with:
           submodules: recursive
 
+      # Without the ft8_lib submodule, pancetta-ft8/build.rs silently falls
+      # back to the ft8lib_stub decoder; fail loudly instead (release.yml guard).
+      - name: Guard -- ft8_lib submodule sources present (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          test -f pancetta-ft8/vendor/ft8_lib/ft8/constants.c \
+            || { echo "::error::ft8_lib submodule not checked out"; exit 1; }
+
+      # windows-latest images ship MinGW gcc on PATH; the cc crate uses it to
+      # compile ft8_lib for the gnu target (release.yml makes the same assert).
+      - name: Assert MinGW gcc available (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: gcc --version
+
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
       # it mid-job (a second, wasted download per run). See
-      # docs/DECISIONS/config-and-platform.md.
+      # docs/DECISIONS/config-and-platform.md. `targets` is empty on the
+      # macOS leg (host target only) and x86_64-pc-windows-gnu on Windows.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: 1.98.0
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: cross-${{ matrix.os }}
 
-      # default-members excludes pancetta-hamlib; the rigctld TCP path is
-      # exercised on Linux and the bundled FFI bindings are dead code. The
-      # other crates must compile on all three platforms.
       - name: Check workspace (default members)
+        if: runner.os != 'Windows'
         run: cargo check
+
+      # PAN-286: the maintainer's station platform. --all-targets also compiles
+      # cfg(test), tests/, examples and benches; pancetta-research never builds
+      # in CI. No -D warnings: Windows-only warnings exist today.
+      - name: Check workspace for x86_64-pc-windows-gnu (PAN-286)
+        if: runner.os == 'Windows'
+        run: cargo check --target ${{ matrix.target }} --workspace --exclude pancetta-research --all-targets --features transmit
 
       # Never requests microphone access. Exercises macOS FFI and thin-parent signals.
       - name: Test macOS microphone identity (PAN-264)
+        if: runner.os == 'macOS'
         run: "cargo test -p pancetta --bin pancetta -- responsibility:: mic_access::"
 
   # PAN-172: advisories still run on code PRs, pushes and the weekly schedule.
@@ -643,7 +683,7 @@ jobs:
     # failure|cancelled grep below wouldn't otherwise catch on its own --
     # codex-clean's own result flows into the SAME toJSON(needs.*.result)
     # string via this needs: entry, so a real gate failure still fails CI.
-    needs: [clippy, fmt, ft8-tests, workspace-check, deny, codex-clean, scan-trailers, research-scan-tests]
+    needs: [clippy, fmt, ft8-tests, workspace-check, cross-platform-check, deny, codex-clean, scan-trailers, research-scan-tests]
     runs-on: ubuntu-latest
     if: always()
     steps:

@@ -32,7 +32,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), and persistent operator watchlist pins are implemented, unreleased; live notification-service and on-air qualification are pending.
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback are implemented, unreleased; live notification-service and on-air qualification are pending.
 
 ## Building and Testing
 
@@ -43,9 +43,10 @@ cargo build
 # Run all workspace tests
 cargo test --workspace --features transmit
 
-# FT8 tests (encoder is feature-gated behind `transmit`)
+# FT8 tests: default features are the standalone (manta) build and include the
+# encoder; the `transmit` feature adds the audio/PTT transmitter (and turns on `serde`)
+cargo test -p pancetta-ft8                         # standalone build; skips test files still gated on `transmit`
 cargo test --features transmit -p pancetta-ft8    # all FT8 tests
-cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
 cargo test -p pancetta --test loopback_qso
@@ -77,6 +78,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Key-down never waits on the bus channel table: every PTT-on (single TX, bundle, tune, manual PTT) goes through `tx::send_ptt_command` → `MessageBus::send_rig_command_if`, which is synchronous and lock-free on the route `create_channel(Hamlib)` publishes, so nothing can suspend between the last pre-PTT gate and the enqueue (PAN-202).
 - A TX-worker frame, bundle or tune whose PTT-on `send_ptt_command` returns `Dropped` while Hamlib's route is registered is never played or reported as aired. It unwinds like a pre-PTT refusal; a frame or bundle item reports through `report_unaired_frame`, and a tune is abandoned (PAN-278).
 - Every TX-worker unkey after a key-down (Step 9, multi-TX, tune, clock-step hold guard, supersede) goes through `PttGuard::release`; the guard stands down only on `PttRelease::Delivered` (or `NoRig`, no Hamlib channel), never after a best-effort `send_message`, and `disarm()` is only for frames whose PTT-on was never enqueued; the next `PttGuard::new` waits for an armed guard's outstanding `Drop` fallback PTT-off before keying (PAN-273).
+- The Hamlib command loop clears the PTT watchdog tracker only after the rig acknowledges a PTT-off. A failed unkey keeps the original key-down time, latches `ptt_off_unconfirmed`, and makes the watchdog retry every tick; a later key-down starts a fresh timer (PAN-272).
 - The TX worker revalidates its snapshotted relocation epoch after acquiring `ptt_sync_gate` and refuses, never keys, a frame whose QSO `apply_tx_offset_switch` moved between that snapshot and the gate (PAN-145).
 - The TX worker never sends into its own `Ft8Transmitter` bus channel: messages it took off the channel and has not handled go back on the front of its coordinator-owned `TxRequeue`, which it reads before the channel, so no concurrent producer can overtake them and a full channel cannot drop them (PAN-73).
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
@@ -99,6 +101,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - TUI keys (PAN-327): every bound key in every dialog and the main view resolves through `keymap::resolve` into exactly one `Action`; a new key is a chord on its documented `KEYBINDINGS` row (or `MODAL_BINDINGS` for dialog-internal keys) plus an `Action` variant and a `match action` arm in `handle_key_event`, Main-scope chords for `Action::starts_tx()` refuse Ctrl/Alt, Shift+Q resolves in Global scope before any dialog chord or text-entry rule, and any change to what a key does must re-bless `pancetta-tui/tests/fixtures/key_effects.golden` (`PANCETTA_BLESS_KEY_EFFECTS=1`).
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
+
+- TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.
 
 ## Where Things Live
 
