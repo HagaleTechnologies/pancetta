@@ -4,11 +4,13 @@
 //! duplicate checking and DXCC need lookups.
 
 use chrono::{DateTime, Utc};
-use pancetta_qso::priority::WorkedStationLookup;
+use pancetta_qso::priority::{NeedSource, WorkedStationLookup};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
+
+mod local_log;
+use local_log::LocalLog;
 
 /// PAN-58: resolve a possibly hash-rendered callsign (`"<N7RLK>"`, FT8's
 /// i3=4 nonstandard-callsign hash-render — see
@@ -24,82 +26,6 @@ use std::sync::Arc;
 fn resolved_identity(callsign: &str) -> Option<String> {
     let upper = callsign.trim().to_uppercase();
     pancetta_core::callsign::resolve_hash_render(&upper).map(|s| s.to_string())
-}
-
-/// Derive the operator's home DXCC prefix from a callsign by stripping
-/// at the first digit. Examples:
-///   K5ARH  -> "K"
-///   JA1ABC -> "JA"
-///   WB9KMW -> "WB"
-///   DL5XYZ -> "DL"
-/// Returns the uppercase prefix, or `None` if the callsign has no
-/// digit (unparseable). Note: this is a heuristic — for the operator's
-/// own callsign it's accurate enough. The result is intended for the
-/// "all-except-home" exclusion set, not for general DXCC lookup.
-pub fn derive_prefix_from_callsign(callsign: &str) -> Option<String> {
-    let upper = callsign.to_uppercase();
-    let mut prefix = String::new();
-    let mut found_digit = false;
-    for c in upper.chars() {
-        if c.is_ascii_digit() {
-            found_digit = true;
-            break;
-        }
-        if c.is_ascii_alphabetic() {
-            prefix.push(c);
-        } else {
-            // Non-alpha, non-digit (e.g. '/') — stop, callsign
-            // structure is unusual and we should bail.
-            break;
-        }
-    }
-    if !found_digit || prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
-/// Phase-5 hardening #2: compute the default "excluded DXCC prefixes"
-/// set used when cqdx hasn't supplied a needed-set. The set covers:
-///
-///   - the operator's home DXCC, derived from their configured callsign
-///     (e.g. K5ARH → K). When `dxcc_entity` is 291 (United States), the
-///     full US prefix family is added: K, W, N, AA-AK.
-///   - prefixes derived from each CALL field in the operator's ADIF
-///     (already-worked stations' home DXCCs). Same callsign-prefix
-///     heuristic.
-///
-/// If `adif_path` doesn't exist or isn't readable, ADIF prefixes are
-/// silently skipped. Returns an upper-case `HashSet<String>`.
-pub fn default_excluded_dxcc_prefixes(
-    operator_callsign: &str,
-    dxcc_entity: u16,
-    adif_path: Option<&Path>,
-) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
-    if let Some(p) = derive_prefix_from_callsign(operator_callsign) {
-        out.insert(p);
-    }
-    if dxcc_entity == 291 {
-        // United States: ITU has allocated K, W, N, AA-AK to the US.
-        for p in [
-            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
-        ] {
-            out.insert(p.to_string());
-        }
-    }
-    if let Some(path) = adif_path {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            let calls = pancetta_qso::callsign_continuity::parse_adif_calls(&text);
-            for call in calls {
-                if let Some(p) = derive_prefix_from_callsign(&call) {
-                    out.insert(p);
-                }
-            }
-        }
-    }
-    out
 }
 
 /// PAN-93: one needed verdict. `Unknown` when its cqdx list has not loaded.
@@ -217,22 +143,14 @@ pub struct CachedStationLookup {
     network_snr: Arc<RwLock<HashMap<String, (u32, i32)>>>,
     /// Network last-seen timestamps: callsign -> unix timestamp.
     network_last_seen: Arc<RwLock<HashMap<String, i64>>>,
-    /// Phase-5 hardening #2: callsign-prefix exclusions the scorer's
-    /// `is_needed_dxcc` uses only while the cqdx needed-entity list is
-    /// unknown (not loaded). Display surfaces never use them (PAN-93).
-    /// Populated from:
-    ///
-    /// - operator's own callsign (home DXCC)
-    /// - ADIF CALL field of prior QSOs (already-worked DXCCs)
-    ///
-    /// When empty, behavior matches the pre-hardening "all needed"
-    /// default; when populated, `is_needed_dxcc` returns true for
-    /// every callsign whose uppercase prefix does NOT match any entry
-    /// (i.e. "all entities except home + already-worked"). This avoids
-    /// shipping a full DXCC entity list while still giving the
-    /// autonomous operator a defensible signal: non-home calls are
-    /// candidates, home calls aren't.
-    excluded_dxcc_prefixes: Arc<RwLock<HashSet<String>>>,
+    /// PAN-347: per-entity worked, confirmed and per-mode sets from the
+    /// local logbook, with whether its first full read has succeeded. While
+    /// no cqdx list has loaded, it answers needed and ATNO.
+    local_log: Arc<RwLock<LocalLog>>,
+    /// PAN-347: the operator's own DXCC entity, from `[station] callsign`.
+    /// Never needed, ATNO, new on band or new in mode. Replaces the
+    /// letter-prefix exclusions that treated KH6/KL7/KP4 as home.
+    home_entity: Arc<RwLock<Option<&'static str>>>,
     /// Contacted stations' US state/territory, keyed by UPPERCASE callsign.
     /// Seeded at startup from the QSO log's ADIF `STATE` and updated on QSO
     /// completion / QRZ enrichment. Display-only (PAN-85) — deliberately NOT
@@ -267,7 +185,8 @@ impl CachedStationLookup {
             notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
-            excluded_dxcc_prefixes: Arc::new(RwLock::new(HashSet::new())),
+            local_log: Arc::new(RwLock::new(LocalLog::default())),
+            home_entity: Arc::new(RwLock::new(None)),
             station_states: Arc::new(RwLock::new(HashMap::new())),
             worked_states: Arc::new(RwLock::new(HashSet::new())),
             grid_history_available: Arc::new(RwLock::new(false)),
@@ -275,23 +194,21 @@ impl CachedStationLookup {
         }
     }
 
-    /// Phase-5 hardening #2: install the set of callsign-prefix
-    /// exclusions the scorer uses while the cqdx needed-entity list is
-    /// unknown (cqdx unavailable or not yet loaded). Operator typically
-    /// seeds this with:
-    ///
-    ///   - their own home DXCC prefixes (e.g. K, W, N, AA-AK for US)
-    ///   - prefixes derived from worked QSOs in their ADIF
-    ///
-    /// Subsequent calls fully replace the set. Uppercase enforced.
-    pub fn set_excluded_dxcc_prefixes(&self, prefixes: HashSet<String>) {
-        let upper: HashSet<String> = prefixes.into_iter().map(|p| p.to_uppercase()).collect();
-        *self.excluded_dxcc_prefixes.write() = upper;
+    /// PAN-347: the operator's own DXCC entity, never needed, ATNO, new on
+    /// band or new in mode.
+    pub fn set_home_entity(&self, entity: Option<&'static str>) {
+        *self.home_entity.write() = entity;
     }
 
-    /// Returns the current count of excluded prefixes (for logging).
-    pub fn excluded_dxcc_prefix_count(&self) -> usize {
-        self.excluded_dxcc_prefixes.read().len()
+    /// PAN-347: true once the local logbook's first full read succeeded
+    /// this session. Never reset: seeds are additive and live completions
+    /// keep it current.
+    pub fn local_log_available(&self) -> bool {
+        self.local_log.read().available
+    }
+
+    fn is_home_entity(&self, entity: Option<&str>) -> bool {
+        matches!((entity, *self.home_entity.read()), (Some(e), Some(h)) if e == h)
     }
 
     /// Seed `worked_on_band` for `band` from a list of callsigns loaded out-of-band
@@ -309,7 +226,7 @@ impl CachedStationLookup {
     /// Merge dated history for all bands. Dates never expire the worked-before display.
     pub fn seed_dated_worked(&self, rows: Vec<(String, String, DateTime<Utc>)>) {
         for (band, call, date) in rows {
-            self.record_worked_at(&call, &band, date);
+            let _ = self.record_worked_at(&call, &band, date);
         }
     }
 
@@ -319,7 +236,17 @@ impl CachedStationLookup {
         db: &pancetta_qso::async_database::QsoDatabase,
     ) -> Result<(), pancetta_qso::async_database::AsyncDatabaseError> {
         let rows = db.worked_history().await?;
-        self.seed_dated_worked(rows);
+        for row in rows {
+            self.record_logged_contact(
+                &row.callsign,
+                &row.band,
+                &row.mode,
+                row.confirmed,
+                row.start_time,
+            );
+        }
+        // PAN-347: publish only after a full successful read.
+        self.local_log.write().available = true;
         Ok(())
     }
 
@@ -333,6 +260,7 @@ impl CachedStationLookup {
     pub fn seed_worked_dxcc_from_list(&self, pairs: Vec<(String, String)>) {
         let mut map = self.worked_dxcc_on_band.write();
         let mut resolved = 0usize;
+        let mut entities = Vec::new();
         let mut skipped = 0usize;
         for (band, callsign) in pairs {
             match pancetta_core::dxcc::entity_for_callsign(&callsign) {
@@ -340,16 +268,26 @@ impl CachedStationLookup {
                     map.entry(band.trim().to_uppercase())
                         .or_default()
                         .insert(entity.to_string());
+                    entities.push(entity);
                     resolved += 1;
                 }
                 None => skipped += 1,
+            }
+        }
+        // PAN-347: ATNO and the band maps never disagree.
+        let band_count = map.len();
+        drop(map);
+        {
+            let mut log = self.local_log.write();
+            for entity in entities {
+                log.mark_worked(entity);
             }
         }
         tracing::info!(
             "CachedStationLookup: seeded per-band worked-DXCC from {} resolved QSO(s) \
              across {} band(s) ({} callsign(s) had no resolvable entity)",
             resolved,
-            map.len(),
+            band_count,
             skipped
         );
     }
@@ -467,7 +405,8 @@ impl CachedStationLookup {
             return;
         };
         let band = pancetta_qso::utils::frequency_to_band(metadata.frequency);
-        self.record_worked_at(call, &band, metadata.start_time);
+        // PAN-347: a live contact is worked, in its mode, and not yet confirmed.
+        self.record_logged_contact(call, &band, &metadata.mode, false, metadata.start_time);
         if let Some(grid) = metadata.grids.theirs.as_deref() {
             self.record_worked_grid(grid, &band);
         }
@@ -628,9 +567,72 @@ impl CachedStationLookup {
     /// station card, `CqdxSpotInfo`, the remote `DecodedView`). Never true
     /// while the list is unknown: the scorer's home/logged-prefix guess in
     /// `is_needed_dxcc` is not shown as a cqdx claim.
+    ///
+    /// PAN-347: this is the cqdx-only answer, kept for the remote
+    /// `DecodedView` and cqdx spot info (the wire contract says cqdx). The
+    /// local TUI uses `needed_atno_shown`, which adds the local logbook.
     pub fn display_needed_atno(&self, callsign: &str) -> (bool, bool) {
         let needed = self.needed_dxcc_status(callsign) == NeedStatus::Needed;
-        (needed, needed && self.is_atno(callsign))
+        (needed, needed && self.cqdx_is_atno(callsign))
+    }
+
+    /// PAN-347: needed-entity verdict and who answered. cqdx once its list
+    /// loaded; else the local logbook once seeded, for a call that resolves
+    /// to an entity; else `(Unknown, Guess)`.
+    pub fn dxcc_need_verdict(&self, callsign: &str) -> (NeedStatus, NeedSource) {
+        let Some(upper) = resolved_identity(callsign) else {
+            return (NeedStatus::Unknown, NeedSource::Guess);
+        };
+        let entity = pancetta_core::dxcc::entity_for_callsign(&upper);
+        self.verdict_for(&upper, entity)
+    }
+
+    /// PAN-347: `(needed, atno)` for the local TUI: cqdx's answer, else the
+    /// local logbook's, never the scorer's guess.
+    pub fn needed_atno_shown(&self, callsign: &str) -> (bool, bool) {
+        match self.dxcc_need_verdict(callsign) {
+            (NeedStatus::Needed, NeedSource::Cqdx) => (true, self.cqdx_is_atno(callsign)),
+            (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, true),
+            _ => (false, false),
+        }
+    }
+
+    /// `upper` is already resolved; `entity` is its offline entity, passed in
+    /// so a per-frame caller resolves nothing (PAN-284).
+    fn verdict_for(&self, upper: &str, entity: Option<&'static str>) -> (NeedStatus, NeedSource) {
+        let cqdx = self.needed_dxcc_status(upper);
+        if cqdx != NeedStatus::Unknown {
+            return (cqdx, NeedSource::Cqdx);
+        }
+        let Some(entity) = entity else {
+            return (NeedStatus::Unknown, NeedSource::Guess);
+        };
+        let worked = {
+            let log = self.local_log.read();
+            if !log.available {
+                return (NeedStatus::Unknown, NeedSource::Guess);
+            }
+            log.is_worked(entity)
+        };
+        if worked || self.is_home_entity(Some(entity)) {
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        } else {
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        }
+    }
+
+    /// cqdx's ATNO prefix set; empty (false) until a cqdx list loads.
+    fn cqdx_is_atno(&self, callsign: &str) -> bool {
+        let atno = self.needed_atno.read();
+        if atno.is_empty() {
+            return false;
+        }
+        // PAN-58: resolve a hash-render before prefix-matching — see
+        // `resolved_identity`'s doc comment.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
+        atno.iter().any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
     pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
@@ -693,19 +695,38 @@ impl CachedStationLookup {
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
-        self.record_worked_at(callsign, band, Utc::now());
+        let _ = self.record_worked_at(callsign, band, Utc::now());
     }
 
-    fn record_worked_at(&self, callsign: &str, band: &str, date: DateTime<Utc>) {
+    /// PAN-347: one logged contact: the band maps plus the local log's
+    /// worked, confirmed and per-mode sets.
+    fn record_logged_contact(
+        &self,
+        callsign: &str,
+        band: &str,
+        mode: &str,
+        confirmed: bool,
+        date: DateTime<Utc>,
+    ) {
+        if let Some(entity) = self.record_worked_at(callsign, band, date) {
+            self.local_log.write().record(entity, mode, confirmed);
+        }
+    }
+
+    /// Returns the resolved entity, if any (PAN-347), so callers resolve once.
+    fn record_worked_at(
+        &self,
+        callsign: &str,
+        band: &str,
+        date: DateTime<Utc>,
+    ) -> Option<&'static str> {
         // PAN-58 round 1 (Codex P1): canonicalize on write, matching
         // `is_duplicate`'s resolved-form read — otherwise a QSO completed
         // with a hash-rendered identity is stored under a key later lookups
         // (already resolved to plain form) never match, silently losing the
         // duplicate penalty. Never record the unresolved hash-miss
         // placeholder; it isn't a real station identity.
-        let Some(upper) = resolved_identity(callsign) else {
-            return;
-        };
+        let upper = resolved_identity(callsign)?;
         self.worked_on_band
             .write()
             .entry(band.trim().to_uppercase())
@@ -716,13 +737,15 @@ impl CachedStationLookup {
         // Keep worked_dxcc_on_band live-updated as QSOs complete during the
         // session, not just at startup seeding — same resolver, same
         // skip-if-unresolvable behavior as seed_worked_dxcc_from_list.
-        if let Some(entity) = pancetta_core::dxcc::entity_for_callsign(&upper) {
-            self.worked_dxcc_on_band
-                .write()
-                .entry(band.trim().to_uppercase())
-                .or_default()
-                .insert(entity.to_string());
-        }
+        let entity = pancetta_core::dxcc::entity_for_callsign(&upper)?;
+        self.worked_dxcc_on_band
+            .write()
+            .entry(band.trim().to_uppercase())
+            .or_default()
+            .insert(entity.to_string());
+        // PAN-347: ATNO and the band maps never disagree.
+        self.local_log.write().mark_worked(entity);
+        Some(entity)
     }
 
     /// Record a worked grid square for #164 tier 4, called alongside
@@ -749,6 +772,7 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
         grid: Option<&str>,
         known_state: Option<&str>,
         current_frequency_hz: f64,
+        mode: Option<&str>,
     ) -> pancetta_tui::dx_need::DxNeedStatus {
         use pancetta_core::dxcc;
         use pancetta_tui::dx_need::{canonical_grid_square, DxNeedStatus};
@@ -776,16 +800,32 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
             .as_deref()
             .filter(|_| state_available && eligible)
             .map(|code| self.is_state_needed(code));
-        let dxcc_needed = match self.needed_dxcc_status(&call) {
+        // PAN-347: cqdx, else the local logbook, from the row's entity.
+        let (status, source) = self.verdict_for(&call, entity);
+        let dxcc_needed = match status {
             NeedStatus::Needed => Some(true),
             NeedStatus::NotNeeded => Some(false),
             NeedStatus::Unknown => None,
         };
+        let dxcc_source = dxcc_needed.map(|_| source);
         let dxcc_list = match self.dxcc_need_list() {
-            NeedListAvailability::Loaded { fetched_at, band } if dxcc_needed.is_some() => {
+            NeedListAvailability::Loaded { fetched_at, band }
+                if dxcc_source == Some(NeedSource::Cqdx) =>
+            {
                 Some(pancetta_tui::dx_need::NeedListSource { band, fetched_at })
             }
             _ => None,
+        };
+        let home = self.is_home_entity(entity);
+        let (entity_standing, new_mode) = {
+            let log = self.local_log.read();
+            match entity.filter(|_| log.available) {
+                Some(e) => (
+                    Some(log.standing(e)),
+                    mode.filter(|_| !home).and_then(|m| log.new_in_mode(e, m)),
+                ),
+                None => (None, None),
+            }
         };
         DxNeedStatus {
             grid_needed,
@@ -793,6 +833,9 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
             state_needed,
             dxcc_needed,
             dxcc_list,
+            dxcc_source,
+            entity_standing,
+            new_mode,
         }
     }
 }
@@ -850,39 +893,31 @@ impl WorkedStationLookup for CachedStationLookup {
         let Some(upper) = resolved_identity(callsign) else {
             return false;
         };
-        match self.needed_dxcc_status(&upper) {
-            // cqdx-loaded list (empty means "nothing needed"): prefix match.
+        match self.dxcc_need_verdict(&upper).0 {
+            // A loaded cqdx list (empty means "nothing needed"), else the
+            // local logbook (PAN-347): never logged means needed.
             NeedStatus::Needed => true,
             NeedStatus::NotNeeded => false,
-            // Phase-5 hardening #2 guess, scoring only (PAN-93): display
-            // surfaces use `display_needed_atno` and never show this. While
-            // the cqdx list is unknown, fall back to "all-except-excluded".
-            // Excluded = operator's home DXCC + already-worked DXCCs (set by
-            // the coordinator at startup). This stops the autonomous
-            // operator from scoring every CQ at ~needed while still letting
-            // non-home / new-DXCC calls through. With no exclusions either,
-            // keep the historical "everything is needed" scoring default.
+            // PAN-347 guess, scoring only: neither a cqdx list nor the local
+            // logbook has answered. Every entity except the operator's home
+            // entity scores as needed; displays never show this guess.
             NeedStatus::Unknown => {
-                let excluded = self.excluded_dxcc_prefixes.read();
-                excluded.is_empty()
-                    || !excluded
-                        .iter()
-                        .any(|prefix| upper.starts_with(prefix.as_str()))
+                !self.is_home_entity(pancetta_core::dxcc::entity_for_callsign(&upper))
             }
         }
     }
 
     fn is_atno(&self, callsign: &str) -> bool {
-        let atno = self.needed_atno.read();
-        if atno.is_empty() {
-            return false;
+        // PAN-347: the local logbook's ATNO is its needed verdict (never
+        // logged on any band or mode); otherwise cqdx's ATNO list.
+        match self.dxcc_need_verdict(callsign) {
+            (status, NeedSource::LocalLogbook) => status == NeedStatus::Needed,
+            _ => self.cqdx_is_atno(callsign),
         }
-        // PAN-58: resolve a hash-render before prefix-matching — see
-        // `resolved_identity`'s doc comment.
-        let Some(upper) = resolved_identity(callsign) else {
-            return false;
-        };
-        atno.iter().any(|prefix| upper.starts_with(prefix.as_str()))
+    }
+
+    fn need_source(&self, callsign: &str) -> NeedSource {
+        self.dxcc_need_verdict(callsign).1
     }
 
     fn is_dxcc_needed_on_band(&self, callsign: &str, freq_hz: f64) -> bool {
@@ -919,20 +954,16 @@ impl WorkedStationLookup for CachedStationLookup {
         let Some(upper) = resolved_identity(callsign) else {
             return false;
         };
-        let excluded = self.excluded_dxcc_prefixes.read();
-        if excluded
-            .iter()
-            .any(|prefix| upper.starts_with(prefix.as_str()))
-        {
-            return false;
-        }
-        drop(excluded);
-
         // Unresolvable callsign (no matching prefix in the offline table):
         // never claim "needed" for an entity we can't even identify.
         let Some(entity) = pancetta_core::dxcc::entity_for_callsign(&upper) else {
             return false;
         };
+        // PAN-347: the home entity, not letter prefixes. A DL and a DA call
+        // are one entity; KH6 is not the US.
+        if self.is_home_entity(Some(entity)) {
+            return false;
+        }
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
         let worked = self.worked_dxcc_on_band.read();
         !worked.get(&band).is_some_and(|set| set.contains(entity))
@@ -1006,7 +1037,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
                 None,
                 None,
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .dxcc_needed,
             None
@@ -1017,7 +1049,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
                 None,
                 None,
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .dxcc_list,
             None
@@ -1030,6 +1063,7 @@ mod tests {
             None,
             None,
             14_074_000.0,
+            None,
         );
         assert_eq!(s.dxcc_needed, Some(true));
         assert_eq!(
@@ -1045,7 +1079,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("DL1ABC"),
                 None,
                 None,
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .dxcc_needed,
             Some(false)
@@ -1058,7 +1093,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("W5ABC"),
                 Some("EM34"),
                 Some("AR"),
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .grid_needed,
             None
@@ -1076,7 +1112,8 @@ mod tests {
                         pancetta_core::dxcc::entity_for_callsign("W5ABC"),
                         Some(grid),
                         None,
-                        hz
+                        hz,
+                        None
                     )
                     .grid_needed,
                     Some(l.is_grid_needed_on_band(grid, hz))
@@ -1099,7 +1136,8 @@ mod tests {
                     pancetta_core::dxcc::entity_for_callsign("W5ABC"),
                     Some(grid),
                     None,
-                    14_074_000.0
+                    14_074_000.0,
+                    None
                 )
                 .grid_needed,
                 None,
@@ -1113,7 +1151,8 @@ mod tests {
                     pancetta_core::dxcc::entity_for_callsign("W5ABC"),
                     Some("EM34"),
                     None,
-                    hz
+                    hz,
+                    None
                 )
                 .grid_needed,
                 None
@@ -1125,7 +1164,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("<...>"),
                 Some("EM34"),
                 Some("AR"),
-                14_074_000.0
+                14_074_000.0,
+                None
             ),
             Default::default()
         );
@@ -1135,7 +1175,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("JA1ABC"),
                 None,
                 Some("CA"),
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .state_needed,
             None
@@ -1147,6 +1188,7 @@ mod tests {
             None,
             Some("CA"),
             14_074_000.0,
+            None,
         );
         assert_eq!(need.state.as_deref(), Some("AR"));
         assert_eq!(need.state_needed, Some(true));
@@ -1157,7 +1199,8 @@ mod tests {
                 pancetta_core::dxcc::entity_for_callsign("W5ABC"),
                 None,
                 None,
-                7_074_000.0
+                7_074_000.0,
+                None
             )
             .state_needed,
             Some(false)
@@ -1182,14 +1225,15 @@ mod tests {
                 Some("United States"),
                 None,
                 Some("AR"),
-                14_074_000.0
+                14_074_000.0,
+                None
             )
             .state_needed,
             Some(true)
         );
         // W5ABC resolves to United States, but the row says Japan: not eligible.
         assert_eq!(
-            l.lookup_need("W5ABC", Some("Japan"), None, Some("AR"), 14_074_000.0)
+            l.lookup_need("W5ABC", Some("Japan"), None, Some("AR"), 14_074_000.0, None)
                 .state_needed,
             None
         );
@@ -1401,8 +1445,8 @@ mod tests {
         // cqdx-populated branch (prefix-match, no exclusion fallback
         // involved), so `is_needed_dxcc("JA1ABC")` is false purely because
         // JA isn't in cqdx's needed set, genuinely not needed. Critically,
-        // `excluded_dxcc_prefixes` is left EMPTY here, so
-        // `is_dxcc_needed_on_band`'s own exclusion short-circuit can't mask
+        // no home entity is set here, so
+        // `is_dxcc_needed_on_band`'s own home short-circuit can't mask
         // the freq_hz=0.0 corruption under test — before the fix, it would
         // still (wrongly) report "needed" for the synthetic "0MHZ" band.
         let mut needed = HashSet::new();
@@ -1443,16 +1487,14 @@ mod tests {
     }
 
     #[test]
-    fn dxcc_needed_on_band_excludes_home_prefix_even_when_nothing_worked_yet() {
+    fn dxcc_needed_on_band_excludes_home_entity_even_when_nothing_worked_yet() {
         // BUG #163 follow-up: a fresh session (no QSOs on ANY band yet) must
         // NOT report the operator's own excluded (home) callsign as "needed
         // on this band" just because nothing has been worked there — that
         // would incorrectly boost the home station's own score once this
         // signal feeds into PriorityScorer.
         let lookup = CachedStationLookup::new();
-        let mut excluded = HashSet::new();
-        excluded.insert("K".to_string());
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        lookup.set_home_entity(Some("United States"));
 
         assert!(!lookup.is_dxcc_needed_on_band("K5ARH", 14_074_000.0));
         // Non-excluded (foreign) entity is unaffected.
@@ -1597,7 +1639,7 @@ mod tests {
         for call in ["K1ABC", "JA1XYZ", "3Y/B1234"] {
             assert_eq!(lookup.needed_dxcc_status(call), NeedStatus::Unknown);
         }
-        lookup.set_excluded_dxcc_prefixes(HashSet::from(["K".to_string()]));
+        lookup.set_home_entity(Some("United States"));
         assert_eq!(lookup.needed_dxcc_status("JA1XYZ"), NeedStatus::Unknown);
         assert_eq!(lookup.display_needed_atno("JA1XYZ"), (false, false));
     }
@@ -1616,7 +1658,7 @@ mod tests {
     fn empty_loaded_dxcc_list_means_nothing_needed() {
         // PAN-93 / P04: a successful empty answer is not "everything needed".
         let lookup = CachedStationLookup::new();
-        lookup.set_excluded_dxcc_prefixes(HashSet::from(["K".to_string()]));
+        lookup.set_home_entity(Some("United States"));
         lookup.update_needed_dxcc(HashSet::new());
         assert_eq!(lookup.needed_dxcc_status("JA1XYZ"), NeedStatus::NotNeeded);
         assert!(!lookup.is_needed_dxcc("JA1XYZ"));
@@ -1745,20 +1787,12 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_needed_with_exclusions_all_except_home() {
-        // Phase-5 hardening #2: scoring guess while the cqdx list is
-        // unknown. With US prefixes excluded and no cqdx-loaded needed
-        // list, the scorer's "needed" becomes "anything outside US"; the
-        // reported verdict stays "unknown" (PAN-93). Mirrors the
-        // operator's typical configuration.
+    fn test_unknown_needed_guess_is_all_except_home_entity() {
+        // PAN-347: scoring guess while neither the cqdx list nor the local
+        // logbook has answered: every entity except the home entity is
+        // needed; the reported verdict stays "unknown" (PAN-93).
         let lookup = CachedStationLookup::new();
-        let mut excluded = HashSet::new();
-        for p in [
-            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
-        ] {
-            excluded.insert(p.to_string());
-        }
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        lookup.set_home_entity(Some("United States"));
 
         // US calls — NOT needed
         assert!(!lookup.is_needed_dxcc("K5ARH"));
@@ -1781,10 +1815,8 @@ mod tests {
         // When cqdx populates needed_dxcc, the exclusion fallback is
         // bypassed entirely — needed-set semantics rule.
         let lookup = CachedStationLookup::new();
-        // Configure exclusions (would normally apply)
-        let mut excluded = HashSet::new();
-        excluded.insert("K".to_string());
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        // A home entity (would normally apply to the guess)
+        lookup.set_home_entity(Some("United States"));
         // But cqdx says only Bouvet is needed
         let mut needed = HashSet::new();
         needed.insert("3Y/B".to_string());
@@ -1809,10 +1841,8 @@ mod tests {
         let lookup = CachedStationLookup::new();
         assert!(!lookup.is_needed_dxcc("<...>"));
 
-        // Branch 2: no needed set, exclusions populated.
-        let mut excluded = HashSet::new();
-        excluded.insert("K".to_string());
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        // Branch 2: no needed set, home entity set.
+        lookup.set_home_entity(Some("United States"));
         assert!(!lookup.is_needed_dxcc("<...>"));
 
         // Branch 3: cqdx-populated needed set (prefix-match branch).
@@ -1950,13 +1980,7 @@ mod tests {
         use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
         use pancetta_qso::DxEvaluator;
         let lookup = CachedStationLookup::new();
-        let mut excluded = HashSet::new();
-        for p in [
-            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
-        ] {
-            excluded.insert(p.to_string());
-        }
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        lookup.set_home_entity(Some("United States"));
 
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
         let ja_score = scorer.evaluate_cq("JA1ABC", Some("PM95"), -10, 14_074_000.0);
@@ -1974,40 +1998,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_derive_prefix_from_callsign() {
-        assert_eq!(derive_prefix_from_callsign("K5ARH"), Some("K".into()));
-        assert_eq!(derive_prefix_from_callsign("JA1ABC"), Some("JA".into()));
-        assert_eq!(derive_prefix_from_callsign("WB9KMW"), Some("WB".into()));
-        assert_eq!(derive_prefix_from_callsign("DL5XYZ"), Some("DL".into()));
-        assert_eq!(derive_prefix_from_callsign("k5arh"), Some("K".into())); // case-insensitive
-        assert_eq!(derive_prefix_from_callsign("NODIGITS"), None);
-    }
-
-    #[test]
-    fn test_default_exclusions_us() {
-        // Operator K5ARH, US (291), no ADIF
-        let excluded = default_excluded_dxcc_prefixes("K5ARH", 291, None);
-        for p in [
-            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
-        ] {
-            assert!(excluded.contains(p), "US prefix '{}' missing", p);
-        }
-        // Non-US prefix shouldn't be present
-        assert!(!excluded.contains("JA"));
-        assert!(!excluded.contains("DL"));
-    }
-
-    #[test]
-    fn test_default_exclusions_non_us_operator() {
-        // German operator: DL5XYZ, DXCC 230, no ADIF — only "DL"
-        // gets added (no special-case prefix family).
-        let excluded = default_excluded_dxcc_prefixes("DL5XYZ", 230, None);
-        assert!(excluded.contains("DL"));
-        assert!(!excluded.contains("K"));
-        assert!(!excluded.contains("JA"));
-    }
-
     // --- PAN-58: a resolved i3=4 hash-render ("<N7RLK>") must score
     // identically to the plain callsign it represents, everywhere a
     // decode's identity drives DXCC/needed/atno/worked/notable lookups.
@@ -2021,9 +2011,7 @@ mod tests {
     #[test]
     fn is_needed_dxcc_resolves_hash_render_before_prefix_match() {
         let lookup = CachedStationLookup::new();
-        let mut excluded = HashSet::new();
-        excluded.insert("N".to_string());
-        lookup.set_excluded_dxcc_prefixes(excluded);
+        lookup.set_home_entity(Some("United States"));
 
         // N7RLK is a home (excluded) US call — must read as "not needed"
         // whether decoded plain or via a resolved hash-render.
@@ -2224,5 +2212,353 @@ mod pan260 {
         db.close().await;
         assert!(l.seed_worked_history(&db).await.is_err());
         assert!(l.is_duplicate("JA1XYZ", 7_074_000.0));
+    }
+
+    // ----- PAN-347: needed, ATNO, band-slot, mode and standing from the
+    // local logbook. ---------------------------------------------------------
+
+    use super::test_support::{adif, seeded_lookup};
+    use pancetta_qso::priority::{PriorityScorer, PriorityTier, PriorityWeights};
+    use pancetta_tui::dx_need::{DxNeedLookup, EntityStanding};
+
+    const DE: &str = "Fed. Rep. of Germany";
+
+    /// The probe's 400-record log: 20 entities x 20 QSOs on 20 m FT8, one
+    /// JA record LoTW-confirmed.
+    fn four_hundred_qso_log() -> String {
+        let prefixes = [
+            "JA1", "DL1", "G4", "F5", "I1", "EA1", "VE3", "VK2", "PY2", "LU1", "ZS1", "UA3", "SM5",
+            "OH2", "OZ1", "LA1", "ON4", "PA3", "HB9", "SP5",
+        ];
+        let mut recs = Vec::new();
+        for p in prefixes {
+            for j in 0..20u8 {
+                let call = format!("{p}A{}", (b'A' + j) as char);
+                let extra = if p == "JA1" && j == 0 {
+                    "<LOTW_QSL_RCVD:1>Y"
+                } else {
+                    ""
+                };
+                recs.push((call, "FT8".to_string(), 14.074, extra.to_string()));
+            }
+        }
+        let refs: Vec<(&str, &str, f64, &str)> = recs
+            .iter()
+            .map(|(c, m, f, e)| (c.as_str(), m.as_str(), *f, e.as_str()))
+            .collect();
+        adif(&refs)
+    }
+
+    fn scorer(l: &CachedStationLookup) -> PriorityScorer {
+        PriorityScorer::new(PriorityWeights::default(), Box::new(l.clone()))
+    }
+
+    #[tokio::test]
+    async fn local_log_answers_needed_and_atno_when_cqdx_has_not() {
+        let (_tmp, l) = seeded_lookup(&four_hundred_qso_log(), "K5ARH").await;
+        l.set_need_lists_loading();
+        l.mark_need_lists_unavailable("connection refused", true);
+        assert!(l.local_log_available());
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+        assert!(l.is_atno("ZL1ABC"));
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (true, true));
+        // The wire stays cqdx-only.
+        assert_eq!(l.display_needed_atno("ZL1ABC"), (false, false));
+        let zl = scorer(&l).score_tiered_explained("ZL1ABC", None, -10, 14_074_000.0);
+        assert_eq!(zl.score.tier, PriorityTier::Atno);
+        assert_eq!(zl.factors.need_source, NeedSource::LocalLogbook);
+        assert_eq!(
+            l.dxcc_need_verdict("JA1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        );
+        let ja = scorer(&l).score_tiered_explained("JA1XYZ", None, -10, 14_074_000.0);
+        assert_eq!(ja.score.tier, PriorityTier::Standard);
+        assert!(!ja.factors.needed_dxcc && !ja.factors.atno);
+    }
+
+    #[tokio::test]
+    async fn local_log_answers_while_cqdx_is_not_configured_and_while_loading() {
+        let (_tmp, l) = seeded_lookup(&four_hundred_qso_log(), "K5ARH").await;
+        assert_eq!(l.dxcc_need_list(), NeedListAvailability::NotConfigured);
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+        l.set_need_lists_loading();
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (true, true));
+    }
+
+    #[tokio::test]
+    async fn loaded_cqdx_list_wins_over_the_local_log() {
+        let (_tmp, l) = seeded_lookup(&four_hundred_qso_log(), "K5ARH").await;
+        l.update_needed_dxcc(HashSet::new());
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::NotNeeded, NeedSource::Cqdx)
+        );
+        assert!(!l.is_atno("ZL1ABC"));
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (false, false));
+    }
+
+    #[tokio::test]
+    async fn band_slot_is_entity_scoped_and_ignores_letter_prefixes() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("DL1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        for call in ["DL1XYZ", "DA1XYZ"] {
+            assert!(l.is_dxcc_needed_on_band(call, 7_047_500.0), "{call}");
+            assert!(!l.is_dxcc_needed_on_band(call, 14_080_000.0), "{call}");
+        }
+        let at40 = scorer(&l).score_tiered_explained("DL1XYZ", None, -12, 7_047_500.0);
+        assert_eq!(at40.score.tier, PriorityTier::PerBandDxccNew);
+        assert!(at40.factors.dxcc_new_on_band && !at40.factors.atno);
+    }
+
+    #[tokio::test]
+    async fn new_mode_is_per_entity_across_bands() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("DL1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        let need = |mode| l.lookup_need("DL1XYZ", Some(DE), None, None, 7_047_500.0, mode);
+        assert_eq!(need(Some("FT4")).new_mode, Some(true));
+        assert_eq!(need(Some("FT8")).new_mode, Some(false));
+        assert_eq!(need(None).new_mode, None);
+    }
+
+    #[tokio::test]
+    async fn standing_distinguishes_worked_from_confirmed() {
+        let (_tmp, l) = seeded_lookup(
+            &adif(&[
+                ("DL1ABC", "FT8", 14.074, ""),
+                ("JA1ABC", "FT8", 14.074, "<LOTW_QSL_RCVD:1>Y"),
+            ]),
+            "K5ARH",
+        )
+        .await;
+        let standing = |call, entity| {
+            l.lookup_need(call, Some(entity), None, None, 14_074_000.0, None)
+                .entity_standing
+        };
+        assert_eq!(
+            standing("DL1XYZ", DE),
+            Some(EntityStanding::WorkedUnconfirmed)
+        );
+        assert_eq!(standing("JA1XYZ", "Japan"), Some(EntityStanding::Confirmed));
+        assert_eq!(
+            standing("ZL1ABC", "New Zealand"),
+            Some(EntityStanding::NotWorked)
+        );
+    }
+
+    #[tokio::test]
+    async fn home_entity_is_never_needed_and_dependencies_are_not_home() {
+        let (_tmp, l) = seeded_lookup(&adif(&[]), "W5AU").await;
+        assert_eq!(
+            l.dxcc_need_verdict("K1ABC"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        );
+        assert!(!l.is_dxcc_needed_on_band("K1ABC", 14_074_000.0));
+        let home = pancetta_core::dxcc::entity_for_callsign("K1ABC");
+        assert_eq!(
+            l.lookup_need("K1ABC", home, None, None, 14_074_000.0, Some("FT8"))
+                .new_mode,
+            None
+        );
+        for call in ["KH6ABC", "KL7ABC", "KP4ABC", "AL7ABC"] {
+            assert_eq!(
+                l.dxcc_need_verdict(call),
+                (NeedStatus::Needed, NeedSource::LocalLogbook),
+                "{call}"
+            );
+            assert!(l.is_dxcc_needed_on_band(call, 14_074_000.0), "{call}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logged_prefixes_no_longer_hide_other_entities() {
+        let (_tmp, l) = seeded_lookup(
+            &adif(&[("EA1ABC", "FT8", 14.074, ""), ("VK2ABC", "FT8", 14.074, "")]),
+            "K5ARH",
+        )
+        .await;
+        for call in ["EA8ABC", "VK9ABC"] {
+            assert!(l.is_needed_dxcc(call), "{call}");
+        }
+        for call in ["EA4XYZ", "VK4XYZ"] {
+            assert!(!l.is_needed_dxcc(call), "{call}");
+        }
+    }
+
+    #[test]
+    fn unseeded_lookup_keeps_the_guess_and_shows_nothing() {
+        let l = CachedStationLookup::new();
+        l.set_home_entity(Some("United States"));
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::Unknown, NeedSource::Guess)
+        );
+        assert!(l.is_needed_dxcc("ZL1ABC"));
+        assert!(!l.is_needed_dxcc("K1ABC"));
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (false, false));
+        let need = l.lookup_need(
+            "ZL1ABC",
+            Some("New Zealand"),
+            None,
+            None,
+            14_074_000.0,
+            Some("FT8"),
+        );
+        assert_eq!(need.entity_standing, None);
+        assert_eq!(need.dxcc_needed, None);
+        assert_eq!(need.dxcc_source, None);
+        assert_eq!(need.new_mode, None);
+    }
+
+    #[tokio::test]
+    async fn failed_seed_leaves_the_local_log_unavailable() {
+        let l = CachedStationLookup::new();
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        db.close().await;
+        assert!(l.seed_worked_history(&db).await.is_err());
+        assert!(!l.local_log_available());
+    }
+
+    #[tokio::test]
+    async fn live_completion_updates_mode_and_standing() {
+        let (_tmp, l) = seeded_lookup(&four_hundred_qso_log(), "K5ARH").await;
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq_manual("ZL1ABC".into(), 14_074_000.0, None)
+            .await
+            .unwrap();
+        let mut metadata = manager.get_qso(id).await.unwrap().metadata;
+        metadata.mode = "FT4".into();
+        l.record_completed_contact(&metadata);
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        );
+        let need = l.lookup_need(
+            "ZL2XYZ",
+            Some("New Zealand"),
+            None,
+            None,
+            14_074_000.0,
+            Some("FT4"),
+        );
+        assert_eq!(
+            need.entity_standing,
+            Some(EntityStanding::WorkedUnconfirmed)
+        );
+        assert_eq!(need.new_mode, Some(false));
+    }
+
+    #[tokio::test]
+    async fn reseeding_after_restart_keeps_availability_and_is_additive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        std::fs::write(&path, adif(&[("DL1ABC", "FT8", 14.074, "")])).unwrap();
+        let db = pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", &path)
+            .await
+            .unwrap();
+        let l = CachedStationLookup::new();
+        l.set_home_entity(Some("United States"));
+        l.seed_worked_history(&db).await.unwrap();
+        l.seed_worked_history(&db).await.unwrap();
+        assert!(l.local_log_available());
+        assert_eq!(
+            l.dxcc_need_verdict("DL1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        );
+        assert_eq!(l.worked_on_band.read()["20M"].len(), 1);
+        assert_eq!(
+            l.dxcc_need_verdict("ZL1ABC"),
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_band_pairs_also_mark_the_local_log() {
+        let (_tmp, l) = seeded_lookup(&adif(&[]), "K5ARH").await;
+        l.seed_worked_dxcc_from_list(vec![("20m".into(), "JA1ABC".into())]);
+        assert_eq!(
+            l.dxcc_need_verdict("JA1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_placeholder_is_unknown_and_never_needed() {
+        let (_tmp, l) = seeded_lookup(&adif(&[]), "K5ARH").await;
+        assert_eq!(
+            l.dxcc_need_verdict("<...>"),
+            (NeedStatus::Unknown, NeedSource::Guess)
+        );
+        assert!(!l.is_needed_dxcc("<...>"));
+        assert_eq!(
+            l.dxcc_need_verdict("<ZL1ABC>"),
+            l.dxcc_need_verdict("ZL1ABC")
+        );
+        assert_eq!(l.needed_atno_shown("<ZL1ABC>"), (true, true));
+    }
+}
+
+/// PAN-347: shared test helpers that build a seeded lookup from ADIF text.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::CachedStationLookup;
+
+    /// ADIF text for `(call, mode, freq_mhz, extra_fields)` records, one
+    /// minute apart so no two records collide.
+    pub(crate) fn adif(records: &[(&str, &str, f64, &str)]) -> String {
+        let mut out = String::from("PAN-347 test log\n<ADIF_VER:5>3.1.4 <EOH>\n");
+        for (i, (call, mode, freq, extra)) in records.iter().enumerate() {
+            let freq = format!("{freq:.6}");
+            let time = format!("{:02}{:02}00", (i / 60) % 24, i % 60);
+            let date = format!(
+                "2025{:02}{:02}",
+                1 + (i / 1440) % 12,
+                1 + (i / 60 / 24) % 28
+            );
+            out.push_str(&format!(
+                "<CALL:{}>{} <QSO_DATE:8>{} <TIME_ON:6>{} <MODE:{}>{} <FREQ:{}>{} {} <EOR>\n",
+                call.len(),
+                call,
+                date,
+                time,
+                mode.len(),
+                mode,
+                freq.len(),
+                freq,
+                extra
+            ));
+        }
+        out
+    }
+
+    /// Replay `adif` into `:memory:`, seed the lookup from it, and set the
+    /// operator's home entity. The temp dir must outlive the test.
+    pub(crate) async fn seeded_lookup(
+        adif: &str,
+        operator: &str,
+    ) -> (tempfile::TempDir, CachedStationLookup) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        std::fs::write(&path, adif).unwrap();
+        let db = pancetta_qso::async_database::QsoDatabase::replay_from_adif(":memory:", &path)
+            .await
+            .unwrap();
+        let l = CachedStationLookup::new();
+        l.set_home_entity(pancetta_core::dxcc::entity_for_callsign(operator));
+        l.seed_worked_history(&db).await.unwrap();
+        (tmp, l)
     }
 }

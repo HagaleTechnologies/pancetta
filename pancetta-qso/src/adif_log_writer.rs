@@ -6,10 +6,16 @@
 //!
 //! ## Durability contract
 //!
-//! Each record is followed by `f.flush().await` (OS buffer → kernel), which is
-//! sufficient for the FT8 hot path: at most one QSO completes per 15-second
-//! window. `sync_data` (fsync) would be roughly 10 000× more expensive and is
-//! deliberately omitted here.
+//! The header and each record are one `write_all`, then `flush` (the bytes
+//! reach the kernel), then `sync_all` (the kernel is asked to put them on
+//! disk), all under the logbook lock, before the write returns (PAN-281).
+//! Creating the file also syncs its directory on Unix, so the new entry
+//! survives too. The sync costs about 1 ms per QSO (measured on Linux) and
+//! runs in the ADIF subscriber task, off the TX path. A logged QSO survives a
+//! process crash, and fsync has been requested for an OS crash or power loss;
+//! a disk's own write cache is outside this promise. `sync_all` rather than
+//! `sync_data` because only `sync_all` is guaranteed to persist the file's
+//! mtime, which the startup index rebuild compares, and it costs the same.
 //!
 //! The header and each record are written while holding the
 //! [`LogbookLock`] that `pancetta import` also takes (PAN-214), so a QSO
@@ -140,7 +146,10 @@ impl AdifLogWriter {
 
             if !already_exists {
                 let header = processor.generate_header();
-                write_and_flush(&mut file, header.as_bytes(), &path).await?;
+                write_and_sync(&mut file, header.as_bytes(), &path).await?;
+                // The file is synced; its directory entry must be too, or a
+                // power cut can leave the directory without the new logbook.
+                sync_parent_dir(&path);
             }
             file
         };
@@ -154,15 +163,16 @@ impl AdifLogWriter {
         })
     }
 
-    /// One `write_all` on the `O_APPEND` handle, then flush to the OS buffer,
-    /// during one turn at the logbook lock.
-    async fn write_flushed(&self, bytes: &[u8], what: &str) -> AdifLogResult<()> {
+    /// One `write_all` on the `O_APPEND` handle, then flush and sync to disk,
+    /// during one turn at the logbook lock (PAN-281).
+    async fn write_synced(&self, bytes: &[u8], what: &str) -> AdifLogResult<()> {
         let mut f = self.file.lock().await;
         let _turn = turn(self.lock.as_ref(), self.lock_wait, &self.path, what).await;
-        write_and_flush(&mut f, bytes, &self.path).await
+        write_and_sync(&mut f, bytes, &self.path).await
     }
 
-    /// Append one ADIF record for `qso` and flush to the OS buffer.
+    /// Append one ADIF record for `qso` and sync it to disk before returning
+    /// (PAN-281).
     ///
     /// Thread-safe: the underlying file handle is guarded by a `Mutex`. Waits
     /// up to [`LIVE_LOCK_WAIT`] while `pancetta import` holds the logbook,
@@ -177,7 +187,7 @@ impl AdifLogWriter {
             Some(call) => format!("the QSO with {call}"),
             None => "the QSO".to_string(),
         };
-        self.write_flushed(record.as_bytes(), &what).await
+        self.write_synced(record.as_bytes(), &what).await
     }
 
     /// Return the path this writer is managing.
@@ -229,13 +239,50 @@ async fn turn<'a>(
     }
 }
 
-async fn write_and_flush(f: &mut File, bytes: &[u8], path: &Path) -> AdifLogResult<()> {
+/// One `write_all`, then `flush` (the bytes reach the kernel), then
+/// `sync_all` (the kernel puts them on disk) (PAN-281). A failed sync is an
+/// error, but the bytes are already in the file, so the caller must not write
+/// them again.
+async fn write_and_sync(f: &mut File, bytes: &[u8], path: &Path) -> AdifLogResult<()> {
     let io = |source| AdifLogError::Io {
         path: path.to_path_buf(),
         source,
     };
     f.write_all(bytes).await.map_err(io)?;
-    f.flush().await.map_err(io)
+    f.flush().await.map_err(io)?;
+    f.sync_all().await.map_err(io)?;
+    #[cfg(test)]
+    FILE_SYNCS.with(|n| n.set(n.get() + 1));
+    Ok(())
+}
+
+/// Best effort: make a newly created logbook's directory entry durable (Unix
+/// only; Windows has no directory handle to fsync). A copy of the TX log's
+/// helper in the `pancetta` crate, which `pancetta-qso` cannot depend on.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if dir.sync_all().is_ok() {
+                #[cfg(test)]
+                DIR_SYNCS.with(|n| n.set(n.get() + 1));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+// Successful file and directory syncs on this thread, so a test can count
+// them (PAN-281). `#[tokio::test]` runs a current-thread runtime, so the code
+// after each `.await` runs on the test's own thread and the counts are per test.
+#[cfg(test)]
+thread_local! {
+    static FILE_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(all(test, unix))]
+thread_local! {
+    static DIR_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// An import's records, rendered and placed (PAN-214). The caller holds the
@@ -794,5 +841,59 @@ mod tests {
         assert!(contents.starts_with(&[pre, tail].concat()));
         let contents = String::from_utf8(contents).unwrap();
         assert_eq!(calls_in(&contents), ["W1AW", "N0XYZ"]);
+    }
+
+    fn file_syncs() -> usize {
+        FILE_SYNCS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(unix)]
+    fn dir_syncs() -> usize {
+        DIR_SYNCS.with(std::cell::Cell::get)
+    }
+
+    /// PAN-281: creating the logbook syncs its header and, on Unix, the
+    /// directory that now holds it; reopening an existing logbook writes
+    /// nothing, so it syncs nothing.
+    #[tokio::test]
+    async fn open_syncs_a_new_logbook_and_its_directory() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let files_before = file_syncs();
+        #[cfg(unix)]
+        let dirs_before = dir_syncs();
+
+        drop(AdifLogWriter::open(&path).await.unwrap());
+
+        assert_eq!(file_syncs() - files_before, 1, "header write is synced");
+        #[cfg(unix)]
+        assert_eq!(
+            dir_syncs() - dirs_before,
+            1,
+            "new entry's directory is synced"
+        );
+
+        let _reopened = AdifLogWriter::open(&path).await.unwrap();
+
+        assert_eq!(file_syncs() - files_before, 1, "reopen syncs no file");
+        #[cfg(unix)]
+        assert_eq!(dir_syncs() - dirs_before, 1, "reopen syncs no directory");
+    }
+
+    /// PAN-281: every appended record is synced to disk before `append`
+    /// returns, so a power cut right after a completion keeps it.
+    #[tokio::test]
+    async fn append_syncs_every_record() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let writer = AdifLogWriter::open(&path).await.unwrap();
+        let before = file_syncs();
+
+        writer.append(&fixture_metadata()).await.unwrap();
+        writer.append(&metadata_with("N0XYZ")).await.unwrap();
+
+        assert_eq!(file_syncs() - before, 2, "one sync per record");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("<EOR>").count(), 2);
     }
 }

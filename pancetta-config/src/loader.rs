@@ -1326,6 +1326,7 @@ token   = "pat_xxx"
 enabled                  = false
 server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
 upload_interval_seconds  = 300
+max_pending_reports      = 2000
 batch_size               = 50
 include_receives         = true
 include_transmits        = true
@@ -1363,6 +1364,16 @@ great_circle = true
             toml::to_string(&expected).unwrap(),
             "CONFIG.md's psk_reporter block has drifted from PskReporterConfig::default()"
         );
+    }
+
+    #[test]
+    fn psk_reporter_max_pending_reports_parses_from_a_partial_table() {
+        let loader = ConfigLoader::new().unwrap();
+        let parsed = loader
+            .parse_toml("[network.psk_reporter]\nenabled = true\nmax_pending_reports = 500\n")
+            .unwrap();
+        assert_eq!(parsed.network.psk_reporter.max_pending_reports, 500);
+        assert_eq!(parsed.network.psk_reporter.upload_interval_seconds, 300);
     }
 
     #[test]

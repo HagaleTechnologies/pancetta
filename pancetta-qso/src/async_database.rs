@@ -9,11 +9,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteConnectOptions, Connection};
 use sqlx::{
-    sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+        SqliteSynchronous,
+    },
     Row,
 };
 use std::collections::HashMap;
+<<<<<<< HEAD
 use std::path::{Path, PathBuf};
+=======
+use std::path::Path;
+use std::str::FromStr;
+>>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -132,6 +140,44 @@ pub enum SortField {
 pub enum SortOrder {
     Ascending,
     Descending,
+}
+
+/// PAN-347: one indexed contact, as the local needs lookup reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkedContact {
+    /// Uppercase band ("20M"). The record's logged BAND when the index band
+    /// is a `…MHZ` fallback bucket (a record imported without FREQ).
+    pub band: String,
+    /// Uppercase, trimmed callsign as logged.
+    pub callsign: String,
+    /// Uppercase logged mode (SUBMODE preferred on import); empty when the
+    /// row has none.
+    pub mode: String,
+    /// QSL_RCVD or LOTW_QSL_RCVD is Y or V. eQSL does not count.
+    pub confirmed: bool,
+    pub start_time: DateTime<Utc>,
+}
+
+/// PAN-347: an ADIF QSL_RCVD / LOTW_QSL_RCVD value that confirms the contact.
+pub fn is_confirmed_qsl_value(v: &str) -> bool {
+    matches!(v.trim().to_ascii_uppercase().as_str(), "Y" | "V")
+}
+
+/// PAN-347: SQL twin of `is_confirmed_qsl_value`, over the two fields it reads.
+const CONFIRMED_QSO_SQL: &str =
+    "upper(trim(coalesce(json_extract(metadata, '$.tags.QSL_RCVD'), ''))) IN ('Y','V') \
+     OR upper(trim(coalesce(json_extract(metadata, '$.tags.LOTW_QSL_RCVD'), ''))) IN ('Y','V')";
+
+/// PAN-347: the index band, or the logged BAND tag when the index band is a
+/// `…MHZ` fallback bucket.
+fn logged_band(adif_band: &str, band_tag: Option<&str>) -> String {
+    let b = adif_band.trim().to_uppercase();
+    if b.ends_with("MHZ") {
+        if let Some(tag) = band_tag.map(str::trim).filter(|t| !t.is_empty()) {
+            return tag.to_uppercase();
+        }
+    }
+    b
 }
 
 /// QSO database record
@@ -453,9 +499,16 @@ impl QsoDatabase {
             format!("sqlite:{}?mode=rwc", path.as_ref().display())
         };
 
+        // `synchronous` is a per-connection setting, so it goes in the connect
+        // options, which every pooled connection runs (PAN-281). `from_str`
+        // parses the URL exactly as `connect(&database_url)` did.
+        let options = SqliteConnectOptions::from_str(&database_url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&database_url)
+            .connect_with(options)
             .await?;
 
         let mut db = Self {
@@ -475,14 +528,11 @@ impl QsoDatabase {
 
     /// Initialize database schema
     async fn initialize_schema(&mut self) -> Result<(), AsyncDatabaseError> {
-        // Enable WAL mode and relaxed synchronous for better concurrent performance.
-        // WAL mode allows readers and writers to operate concurrently without blocking.
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&self.pool)
-            .await?;
+        // WAL and `synchronous = FULL` are connect options (see `open`), not
+        // PRAGMAs here: `synchronous` is per connection, and a PRAGMA through
+        // the pool reaches only one of its connections. WAL lets readers and
+        // writers run concurrently; FULL syncs the WAL at every commit, so a
+        // completed QSO's row survives a power cut (PAN-281).
 
         let schema = r#"
             CREATE TABLE IF NOT EXISTS qsos (
@@ -826,9 +876,10 @@ impl QsoDatabase {
             .fetch_one(&self.pool)
             .await? as u64;
 
-        let confirmed_qsos: u64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM qsos WHERE json_extract(metadata, '$.confirmed') = 1",
-        )
+        // PAN-347: count real confirmations (QSL_RCVD / LOTW_QSL_RCVD of Y or V).
+        let confirmed_qsos: u64 = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM qsos WHERE {CONFIRMED_QSO_SQL}"
+        ))
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0) as u64;
@@ -919,30 +970,47 @@ impl QsoDatabase {
         .transpose()
     }
 
-    /// All-time worked contacts, reduced to the latest start date per band/callsign.
-    /// Validate every date before returning anything, so a failed refresh cannot erase history.
-    pub async fn worked_history(
-        &self,
-    ) -> Result<Vec<(String, String, DateTime<Utc>)>, AsyncDatabaseError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT json_extract(adif_data, '$.band'), json_extract(metadata, '$.their_callsign'),
-                    json_extract(metadata, '$.start_time') FROM qsos",
+    /// PAN-347: every indexed contact with its band, callsign, mode and
+    /// confirmation, for the local needs lookup. Not reduced per band or
+    /// callsign; the cache keeps the latest date. Validate every date before
+    /// returning anything, so a failed refresh cannot erase history.
+    pub async fn worked_history(&self) -> Result<Vec<WorkedContact>, AsyncDatabaseError> {
+        type Row = (
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT json_extract(adif_data, '$.band'), json_extract(metadata, '$.tags.BAND'),
+                    json_extract(metadata, '$.their_callsign'),
+                    json_extract(metadata, '$.start_time'), json_extract(metadata, '$.mode'),
+                    json_extract(metadata, '$.tags.QSL_RCVD'),
+                    json_extract(metadata, '$.tags.LOTW_QSL_RCVD') FROM qsos",
         )
         .fetch_all(&self.pool)
         .await?;
-        let mut latest = HashMap::new();
-        for (band, call, date) in rows {
-            let date = DateTime::parse_from_rfc3339(&date)
+        let mut out = Vec::with_capacity(rows.len());
+        for (band, band_tag, call, date, mode, qsl, lotw) in rows {
+            let start_time = DateTime::parse_from_rfc3339(&date)
                 .map_err(|e| AsyncDatabaseError::InvalidQuery {
                     message: format!("Invalid QSO start date {date}: {e}"),
                 })?
                 .with_timezone(&Utc);
-            let entry = latest
-                .entry((band.trim().to_uppercase(), call.trim().to_uppercase()))
-                .or_insert(date);
-            *entry = (*entry).max(date);
+            let confirmed = qsl.as_deref().is_some_and(is_confirmed_qsl_value)
+                || lotw.as_deref().is_some_and(is_confirmed_qsl_value);
+            out.push(WorkedContact {
+                band: logged_band(&band, band_tag.as_deref()),
+                callsign: call.trim().to_uppercase(),
+                mode: mode.unwrap_or_default().trim().to_uppercase(),
+                confirmed,
+                start_time,
+            });
         }
-        Ok(latest.into_iter().map(|((b, c), d)| (b, c, d)).collect())
+        Ok(out)
     }
 
     /// Complete, unpaginated contest ledger. Malformed rows fail closed.
@@ -1911,6 +1979,38 @@ impl QsoDatabase {
 mod tests {
     use super::*;
 
+    /// PAN-281: every connection the pool can hand out commits durably. Five
+    /// connections held at once (the pool's max) are five distinct ones; when
+    /// one PRAGMA through the pool set `synchronous` to NORMAL, one of them
+    /// reported 1 instead of 2.
+    #[tokio::test]
+    async fn every_pooled_connection_is_wal_and_synchronous_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.pool.acquire().await.unwrap());
+        }
+        let mut seen = Vec::new();
+        for conn in &mut held {
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            seen.push((synchronous, journal_mode));
+        }
+
+        let expected = vec![(2, "wal".to_string()); 5];
+        assert_eq!(seen, expected, "(synchronous, journal_mode) per connection");
+        drop(held);
+        db.close().await;
+    }
+
     // --- Security: I-8 (VACUUM INTO path escaping) -------------------------
 
     #[test]
@@ -2263,6 +2363,67 @@ mod tests {
         }
     }
 
+    /// PAN-347: the four-record probe log. DL1ABC 20m FT8 no QSL; JA1ABC
+    /// QSL_RCVD=N + LOTW_QSL_RCVD=Y; G4ABC MFSK/FT4 QSL_RCVD=Y; F5ABC BAND=40m
+    /// with no FREQ and eQSL only.
+    async fn four_record_fixture() -> (tempfile::TempDir, QsoDatabase) {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let adif = "PAN-347 fixture\n<ADIF_VER:5>3.1.4 <EOH>\n\
+            <CALL:6>DL1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m <EOR>\n\
+            <CALL:6>JA1ABC <QSO_DATE:8>20250101 <TIME_ON:6>121500 <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m <QSL_RCVD:1>N <LOTW_QSL_RCVD:1>Y <EOR>\n\
+            <CALL:5>G4ABC <QSO_DATE:8>20250101 <TIME_ON:6>123000 <MODE:4>MFSK <SUBMODE:3>FT4 <FREQ:8>7.047500 <BAND:3>40m <QSL_RCVD:1>Y <EOR>\n\
+            <CALL:5>F5ABC <QSO_DATE:8>20250101 <TIME_ON:6>124500 <MODE:3>FT4 <BAND:3>40m <EQSL_QSL_RCVD:1>Y <EOR>\n";
+        tokio::fs::write(&adif_path, adif).await.unwrap();
+        let db = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+            .await
+            .unwrap();
+        (tmp, db)
+    }
+
+    #[tokio::test]
+    async fn worked_history_reads_mode_confirmation_and_logged_band() {
+        let (_tmp, db) = four_record_fixture().await;
+        let mut rows = db.worked_history().await.unwrap();
+        rows.sort_by(|a, b| a.callsign.cmp(&b.callsign));
+        let view: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.callsign.as_str(),
+                    r.band.as_str(),
+                    r.mode.as_str(),
+                    r.confirmed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                ("DL1ABC", "20M", "FT8", false), // no QSL fields
+                ("F5ABC", "40M", "FT4", false),  // no FREQ: logged BAND; eQSL does not confirm
+                ("G4ABC", "40M", "FT4", true),   // MFSK/FT4 indexes as FT4; QSL_RCVD=Y
+                ("JA1ABC", "20M", "FT8", true),  // QSL_RCVD=N but LOTW_QSL_RCVD=Y
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn statistics_count_confirmed_contacts_from_qsl_fields() {
+        let (_tmp, db) = four_record_fixture().await;
+        assert_eq!(db.get_statistics().await.unwrap().confirmed_qsos, 2);
+    }
+
+    #[test]
+    fn confirmation_values_are_y_or_v_only() {
+        for v in ["Y", "y", " V "] {
+            assert!(is_confirmed_qsl_value(v), "{v:?}");
+        }
+        for v in ["N", "R", "I", "", "YES"] {
+            assert!(!is_confirmed_qsl_value(v), "{v:?}");
+        }
+    }
+
     #[tokio::test]
     async fn pan260_band_window_and_history() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
@@ -2340,13 +2501,18 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        // PAN-347: one row per contact; the cache keeps the latest date.
         let history = db.worked_history().await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(history.contains(&(
-            "20M".into(),
-            "K1ABC".into(),
-            now - chrono::Duration::minutes(30)
-        )));
+        assert_eq!(history.len(), 3);
+        let latest_20m = history
+            .iter()
+            .filter(|r| r.band == "20M" && r.callsign == "K1ABC")
+            .map(|r| r.start_time)
+            .max();
+        assert_eq!(latest_20m, Some(now - chrono::Duration::minutes(30)));
+        assert!(history
+            .iter()
+            .any(|r| r.band == "40M" && r.callsign == "K1ABC"));
         sqlx::query("UPDATE qsos SET metadata = json_set(metadata, '$.start_time', 'invalid')")
             .execute(&db.pool)
             .await

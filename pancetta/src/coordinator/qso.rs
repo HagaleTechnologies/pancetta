@@ -13048,6 +13048,78 @@ mod replay_local_log_tests {
         adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
+    /// PAN-281 scenario 2: a power cut right after a completion keeps the
+    /// synced ADIF record but can lose the index's row (its WAL was not yet
+    /// synced, and a WAL commit never moves `qso.db`'s mtime). The restart
+    /// must index the QSO the ADIF holds. The post-cut state is built in a
+    /// second directory: session 1's real `qsos.adi`, and an older, empty
+    /// `qso.db`. It holds under the mtime rule and a content rule alike.
+    #[tokio::test]
+    async fn live_start_indexes_a_logged_qso_the_index_lost() {
+        // Session 1: a live run logs one QSO with K1DEF.
+        let before_cut = tempfile::tempdir().expect("tempdir");
+        let logged_adif = before_cut.path().join("qsos.adi");
+        let first_session = manager();
+        let adif_subscribers = AdifSubscribers::new();
+        let _session_one = start_local_qso_log_writers(
+            false,
+            &logged_adif,
+            &before_cut.path().join("qso.db"),
+            100,
+            false,
+            &first_session,
+            &adif_subscribers,
+        )
+        .await;
+        complete_one_qso(&first_session).await;
+        assert_eq!(
+            wait_for_adif_record(&logged_adif).await,
+            1,
+            "precondition: the completed QSO is in qsos.adi"
+        );
+        adif_subscribers.stop(Duration::from_secs(2)).await;
+
+        // The state after the cut: the ADIF kept the record, the index did
+        // not, and the index file is older than the ADIF.
+        let after_cut = tempfile::tempdir().expect("tempdir");
+        let adif_path = after_cut.path().join("qsos.adi");
+        let db_path = after_cut.path().join("qso.db");
+        std::fs::copy(&logged_adif, &adif_path).expect("copy qsos.adi");
+        pancetta_qso::async_database::QsoDatabase::open(&db_path)
+            .await
+            .expect("create the empty index")
+            .close()
+            .await;
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qso.db");
+
+        // Restart on the post-cut state.
+        let restarted = manager();
+        let adif_subscribers = AdifSubscribers::new();
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &restarted,
+            &adif_subscribers,
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.get_worked_callsigns("20M").await,
+            vec!["K1DEF".to_string()],
+            "the restart must index the QSO the ADIF kept"
+        );
+        adif_subscribers.stop(Duration::from_secs(2)).await;
+    }
+
     /// PAN-127: an import stopped part-way leaves a partial index that is
     /// newer than the ADIF log, plus the rebuild marker. The marker, not the
     /// mtimes, decides: the index is rebuilt and the marker cleared.
