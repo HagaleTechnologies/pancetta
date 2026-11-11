@@ -125,8 +125,8 @@ pub enum NeedListHealth {
 pub struct StationReadiness {
     /// Every active TX hard-mute cause, in the gate's priority order. Empty ⇔ gate open.
     pub tx_mute_causes: Vec<TxMuteCause>,
-    /// Hamlib teardown could not confirm PTT off; cleared only when the rig
-    /// accepts a later PTT-off.
+    /// The rig did not confirm a PTT-off (teardown or a live unkey); cleared
+    /// only when the rig accepts a later PTT-off.
     pub ptt_off_unconfirmed: bool,
     pub clock: ClockState,
     /// Supervisor degraded-components summary, `None` when nothing failed.
@@ -431,7 +431,7 @@ fn cause_items(
             ReadinessKey::PttOffUnconfirmed,
             Severity::Blocker,
             "⚠ PTT MAY STILL BE KEYED — check radio",
-            "PTT may still be keyed — Hamlib teardown could not confirm PTT off. Check the radio; clears when the rig confirms PTT off.",
+            "PTT may still be keyed — the rig did not confirm PTT off. Check the radio; clears when the rig confirms PTT off.",
         ));
     }
     for cause in &r.tx_mute_causes {
