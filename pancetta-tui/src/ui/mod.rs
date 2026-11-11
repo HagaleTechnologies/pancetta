@@ -804,35 +804,8 @@ fn title_bar_segments(
         title_rank::FREQ_MODE,
     ));
 
-<<<<<<< HEAD
     // Decode preset only; elapsed time and budget exhaustion live in Shift+S health.
     let decode_text = format!(" DECODE: {} ", app.decode_effort);
-=======
-    // Decode-effort chip (decoder-speed-overhaul Task 15): the live preset
-    // + the most recently completed decode window's wall-time, with a
-    // trailing scissors mark when that window ran out of its budget before
-    // finishing optional work. `app.decode_effort` is authoritative-from-
-    // frame-1 (the coordinator seeds it at startup, not just on the
-    // operator's first `e` press); `pipeline_health` is `None` only for the
-    // first ~2s before the first health tick, in which case the elapsed
-    // reads as 0ms (never exhausted) rather than hiding the chip. The
-    // compact form keeps only the preset.
-    let (decode_elapsed_ms, decode_exhausted) = app
-        .pipeline_health
-        .as_ref()
-        .map(|h| (h.last_decode_elapsed_ms, h.last_decode_budget_exhausted))
-        .unwrap_or((0, false));
-    let decode_text = format!(
-        " DECODE: {} {}ms{} ",
-        app.decode_effort,
-        decode_elapsed_ms,
-        if decode_exhausted {
-            format!(" {}", crate::presentation::BUDGET_MARKER)
-        } else {
-            String::new()
-        }
-    );
->>>>>>> 2108c5b582f6ac4bb7f753cf607c54a74640e53e
     segs.push(BarSegment::with_compact(
         " ",
         vec![Span::styled(decode_text, accent_bold)],
@@ -3409,20 +3382,23 @@ mod view_render_tests {
             let mut health = health_with_clock(None, false);
             health.last_decode_budget_exhausted = exhausted;
             app.pipeline_health = Some(health);
-            let line = title_bar_left_line(&app, 300);
+            let line = title_bar_left_line(&app, 300, slot_test_now());
             let text = line_text(&line);
-            assert_eq!(text.contains("ms !"), exhausted, "{text}");
+            assert!(!text.contains("ms"), "{text}");
             assert!(!text.contains('✂'));
             let buf = render_app(&app, 300, 40);
-            assert_eq!(buffer_contains(&buf, "ms !"), exhausted);
+            assert!(!row_text(&buf, 0).contains("ms"));
+            let health = render_health(&app).await;
+            assert_eq!(buffer_contains(&health, "(budget exhausted)"), exhausted);
+            assert!(!buffer_contains(&health, "✂"));
             assert!(!buffer_contains(&buf, "✂"));
         }
         for paused in [false, true] {
             app.autonomous_init_paused = paused;
-            let text = line_text(&title_bar_left_line(&app, 300));
+            let text = line_text(&title_bar_left_line(&app, 300, slot_test_now()));
             assert_eq!(text.contains("| AUTO-CQ PAUSED"), paused);
             if paused {
-                assert!(title_bar_left_line(&app, 300)
+                assert!(title_bar_left_line(&app, 300, slot_test_now())
                     .spans
                     .iter()
                     .any(|s| s.content.contains("| AUTO-CQ PAUSED")
@@ -3436,7 +3412,7 @@ mod view_render_tests {
         app.autonomous_init_paused = true;
         let mut saw_compact = false;
         for width in 50..300 {
-            let line = title_bar_left_line(&app, width);
+            let line = title_bar_left_line(&app, width, slot_test_now());
             assert!(line.width() <= width as usize);
             if line_text(&line).contains("| CQ PAUSED: press a key") {
                 saw_compact = true;
