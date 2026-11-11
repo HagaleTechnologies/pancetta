@@ -48,11 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<<<<<<< HEAD
 - PAN-393: `[audio.recording] raw_capture_minutes` records one raw 48 kHz WAV per FT8 slot for that many minutes after start, into `raw48/` inside the recording directory, so decimation changes can be tested on real captures. It is off by default (0) and needs `auto_record = true` and a 48 kHz capture device. Files are named with the UTC slot time and band, `_tx` marks a slot our transmission overlapped, and `raw48/` stops at its own 2 GB cap while decode-window recording continues.
-=======
 - PAN-380: `pancetta-ft8/README.md` lists the crate's stable API (the cycle API manta calls and the window API from dispensa Q-0085) and its compatibility policy. `pancetta-ft8/tests/stable_api_guard.rs` fails to compile, naming the item, when a change breaks one of those signatures, fields or trait bounds. The README's configuration example and parameter table no longer use the nonexistent `time_range` field.
->>>>>>> 0e12650fb830b85271f2f9b0ab42a5f6a9575868
 - PAN-347: Without cqdx.io, or while it is unreachable, pancetta derives needed and all-time-new entities from `qsos.adi` and says so (`local logbook`). DX Hunter shows `new mode FT4` when an entity was never logged in the current mode, and the station card shows `worked-unconfirmed` or `confirmed` from the QSL and LoTW fields in your log.
 - PAN-334: `--log-format json` now works. Each log line in `~/.pancetta/logs/pancetta.log.*` and, with `--headless`, on stderr is one JSON object: `timestamp`, `level`, `target`, `threadId`, `fields` (the message and the event's other fields) and, inside a span, `span` and `spans`. Headless text logs stay on stdout and are unchanged. The daily file keeps its name, so the day you switch formats holds both.
 - PAN-271: `docs/SUPPORTED_RIGS.md` lists every rig Pancetta starts `rigctld` for, with its `rig.model` names, Hamlib model and CAT, audio and TX test status. It is generated from the rig table in `pancetta-hamlib/src/models.rs` and drift-tested. The Yaesu FTdx10 is the only rig with a recorded hardware test. `pancetta doctor` points an unknown `rig.model` at the page.
