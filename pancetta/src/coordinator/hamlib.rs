@@ -9930,7 +9930,6 @@ mod pan251_swr_protection_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pan276_data_mode_tests {
     use super::*;
     use crate::message_bus::{RigControlMessage, SendIfOutcome};
@@ -9971,71 +9970,6 @@ mod pan276_data_mode_tests {
     async fn coordinator(config: Config) -> super::super::ApplicationCoordinator {
         super::super::ApplicationCoordinator::new(
             config,
-=======
-mod pan277_shutdown_drain_tests {
-    use super::*;
-    use crate::message_bus::{RigControlMessage, TxOrigin};
-    use pancetta_config::Config;
-    use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
-    use std::sync::atomic::AtomicBool;
-    fn set_ptt(state: bool) -> MessageType {
-        MessageType::RigControl(RigControlMessage::SetPtt { state })
-    }
-    fn set_ptt_message(state: bool) -> ComponentMessage {
-        ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Hamlib,
-            set_ptt(state),
-            Instant::now(),
-        )
-    }
-    #[test]
-    fn pan277_drain_executes_only_unkeys_until_one_is_confirmed() {
-        let mut drain = ShutdownDrain::new(Instant::now());
-        assert_eq!(drain.admit(&set_ptt(false)), DrainAdmit::Execute);
-        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
-        for command in [
-            RigControlMessage::SetFrequency {
-                vfo: 0,
-                frequency: 14074000,
-            },
-            RigControlMessage::SetSplit {
-                enabled: true,
-                tx_frequency: 14075000,
-            },
-            RigControlMessage::GetReceiveGain {
-                frequency: 14074000,
-                request_id: 1,
-            },
-        ] {
-            assert_eq!(
-                drain.admit(&MessageType::RigControl(command)),
-                DrainAdmit::Discard
-            );
-        }
-        drain.unkey_confirmed = true;
-        assert_eq!(
-            drain.admit(&set_ptt(false)),
-            DrainAdmit::DiscardRedundantUnkey
-        );
-        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
-    }
-    #[test]
-    fn pan277_drain_ceiling_is_thirty_seconds_from_entry() {
-        let start = Instant::now();
-        let drain = ShutdownDrain::new(start);
-        assert!(!drain.ceiling_passed(start + Duration::from_millis(29_999)));
-        assert!(drain.ceiling_passed(start + HAMLIB_SHUTDOWN_DRAIN_CEILING));
-    }
-    async fn coordinator() -> (
-        super::super::ApplicationCoordinator,
-        Arc<MockRig>,
-        tempfile::TempDir,
-    ) {
-        let scratch = tempfile::tempdir().unwrap();
-        let mut c = super::super::ApplicationCoordinator::new(
-            Config::default(),
->>>>>>> f078104113d5fc1b059594041628336ad309d3ae
             None,
             true,
             true,
@@ -10045,7 +9979,6 @@ mod pan277_shutdown_drain_tests {
             1500.0,
             Arc::new(AtomicBool::new(false)),
             Vec::new(),
-<<<<<<< HEAD
             std::env::temp_dir().join(format!("pan276-{}.toml", uuid::Uuid::new_v4())),
             true,
             None,
@@ -10304,7 +10237,82 @@ mod pan277_shutdown_drain_tests {
         assert!(c.message_bus.data_mode.is_ready());
         c.shutdown_signal.store(true, Ordering::Release);
         c.teardown_hamlib().await;
-=======
+    }
+}
+
+#[cfg(test)]
+mod pan277_shutdown_drain_tests {
+    use super::*;
+    use crate::message_bus::{RigControlMessage, TxOrigin};
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, MockRigConfig, PttState, RigControl, Vfo};
+    use std::sync::atomic::AtomicBool;
+    fn set_ptt(state: bool) -> MessageType {
+        MessageType::RigControl(RigControlMessage::SetPtt { state })
+    }
+    fn set_ptt_message(state: bool) -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Hamlib,
+            set_ptt(state),
+            Instant::now(),
+        )
+    }
+    #[test]
+    fn pan277_drain_executes_only_unkeys_until_one_is_confirmed() {
+        let mut drain = ShutdownDrain::new(Instant::now());
+        assert_eq!(drain.admit(&set_ptt(false)), DrainAdmit::Execute);
+        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
+        for command in [
+            RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14074000,
+            },
+            RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14075000,
+            },
+            RigControlMessage::GetReceiveGain {
+                frequency: 14074000,
+                request_id: 1,
+            },
+        ] {
+            assert_eq!(
+                drain.admit(&MessageType::RigControl(command)),
+                DrainAdmit::Discard
+            );
+        }
+        drain.unkey_confirmed = true;
+        assert_eq!(
+            drain.admit(&set_ptt(false)),
+            DrainAdmit::DiscardRedundantUnkey
+        );
+        assert_eq!(drain.admit(&set_ptt(true)), DrainAdmit::DiscardKeyDown);
+    }
+    #[test]
+    fn pan277_drain_ceiling_is_thirty_seconds_from_entry() {
+        let start = Instant::now();
+        let drain = ShutdownDrain::new(start);
+        assert!(!drain.ceiling_passed(start + Duration::from_millis(29_999)));
+        assert!(drain.ceiling_passed(start + HAMLIB_SHUTDOWN_DRAIN_CEILING));
+    }
+    async fn coordinator() -> (
+        super::super::ApplicationCoordinator,
+        Arc<MockRig>,
+        tempfile::TempDir,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut c = super::super::ApplicationCoordinator::new(
+            Config::default(),
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
             scratch.path().join("config.toml"),
             true,
             Some(scratch.path().to_path_buf()),
@@ -10436,7 +10444,6 @@ mod pan277_shutdown_drain_tests {
         wait_ptt(&rig, PttState::Off, Duration::from_millis(500)).await;
         c.shutdown().await.unwrap();
         assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
->>>>>>> f078104113d5fc1b059594041628336ad309d3ae
     }
 }
 
