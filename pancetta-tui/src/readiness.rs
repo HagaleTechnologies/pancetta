@@ -115,6 +115,9 @@ pub enum NeedListHealth {
     /// No list has loaded this session. `retrying` is false when only a
     /// config fix and restart can help. `error` is ≤ 160 chars, never a credential.
     Unavailable { error: String, retrying: bool },
+    /// PAN-347: the cqdx.io list has not loaded, and the local logbook
+    /// answers needed and ATNO instead. Entity list only.
+    LocalLogbook { error: String, retrying: bool },
 }
 
 /// Coordinator → TUI readiness snapshot (relay, 2 s tick, pushed on change).
@@ -122,8 +125,8 @@ pub enum NeedListHealth {
 pub struct StationReadiness {
     /// Every active TX hard-mute cause, in the gate's priority order. Empty ⇔ gate open.
     pub tx_mute_causes: Vec<TxMuteCause>,
-    /// Hamlib teardown could not confirm PTT off; cleared only when the rig
-    /// accepts a later PTT-off.
+    /// The rig did not confirm a PTT-off (teardown or a live unkey); cleared
+    /// only when the rig accepts a later PTT-off.
     pub ptt_off_unconfirmed: bool,
     pub clock: ClockState,
     /// Supervisor degraded-components summary, `None` when nothing failed.
@@ -355,12 +358,28 @@ fn cqdx_need_detail(list: &str, error: &str, retrying: bool, effect: &str) -> St
 fn cqdx_need_item(r: &StationReadiness) -> Option<ReadinessItem> {
     let grids_down = matches!(r.cqdx_grid_needs, NeedListHealth::Unavailable { .. });
     let (key, label, detail) = match (&r.cqdx_dxcc_needs, &r.cqdx_grid_needs) {
+        (NeedListHealth::LocalLogbook { error, retrying }, _) => {
+            let mut detail = cqdx_need_detail(
+                "entity",
+                error,
+                *retrying,
+                "needed and ATNO come from your local logbook (qsos.adi).",
+            );
+            if grids_down {
+                detail.push_str(" Needed grids are unavailable too.");
+            }
+            (
+                ReadinessKey::CqdxNeeds,
+                "⚠ NEEDS FROM LOCAL LOGBOOK",
+                detail,
+            )
+        }
         (NeedListHealth::Unavailable { error, retrying }, _) => {
             let mut detail = cqdx_need_detail(
                 "entity",
                 error,
                 *retrying,
-                "no station shows the + needed marker and ranking guesses from your home and logged prefixes.",
+                "no station shows the + needed marker and ranking guesses that every entity except your home entity is needed.",
             );
             if grids_down {
                 detail.push_str(" Needed grids are unavailable too.");
@@ -378,6 +397,8 @@ fn cqdx_need_item(r: &StationReadiness) -> Option<ReadinessItem> {
             ),
         ),
         (NeedListHealth::NoWarning, NeedListHealth::NoWarning) => return None,
+        // The grid list never maps to `LocalLogbook`; treat it as quiet.
+        (NeedListHealth::NoWarning, NeedListHealth::LocalLogbook { .. }) => return None,
     };
     Some(ReadinessItem {
         key,
@@ -410,7 +431,7 @@ fn cause_items(
             ReadinessKey::PttOffUnconfirmed,
             Severity::Blocker,
             "⚠ PTT MAY STILL BE KEYED — check radio",
-            "PTT may still be keyed — Hamlib teardown could not confirm PTT off. Check the radio; clears when the rig confirms PTT off.",
+            "PTT may still be keyed — the rig did not confirm PTT off. Check the radio; clears when the rig confirms PTT off.",
         ));
     }
     for cause in &r.tx_mute_causes {
@@ -1136,7 +1157,7 @@ mod tests {
         assert!(i.is_acknowledgeable());
         assert_eq!(
             i.detail,
-            "cqdx.io needed-entity list not loaded: HTTP request failed. pancetta keeps retrying. Until it loads, no station shows the + needed marker and ranking guesses from your home and logged prefixes."
+            "cqdx.io needed-entity list not loaded: HTTP request failed. pancetta keeps retrying. Until it loads, no station shows the + needed marker and ranking guesses that every entity except your home entity is needed."
         );
         assert!(app
             .station_readiness
@@ -1159,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             detail,
-            "cqdx.io needed-entity list not loaded: Authentication failed: invalid or expired PAT. Fix [network.cqdx] token and restart pancetta. Until then, no station shows the + needed marker and ranking guesses from your home and logged prefixes."
+            "cqdx.io needed-entity list not loaded: Authentication failed: invalid or expired PAT. Fix [network.cqdx] token and restart pancetta. Until then, no station shows the + needed marker and ranking guesses that every entity except your home entity is needed."
         );
         assert!(!detail.contains("keeps retrying"), "{detail}");
     }
@@ -1195,6 +1216,43 @@ mod tests {
             detail.ends_with("Needed grids are unavailable too."),
             "{detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_logbook_chip_replaces_cqdx_needs_unknown() {
+        let mut app = app().await;
+        let local = |error: &str, retrying: bool| NeedListHealth::LocalLogbook {
+            error: error.to_string(),
+            retrying,
+        };
+        app.station_readiness = Some(with_needs(
+            local("connection refused", true),
+            NeedListHealth::NoWarning,
+        ));
+        assert_eq!(labels(&app), vec!["⚠ NEEDS FROM LOCAL LOGBOOK"]);
+        let items = readiness_items(&app);
+        assert_eq!(items[0].key, ReadinessKey::CqdxNeeds);
+        assert_eq!(items[0].severity, Severity::Warning);
+        assert_eq!(
+            items[0].detail,
+            "cqdx.io needed-entity list not loaded: connection refused. pancetta keeps retrying. Until it loads, needed and ATNO come from your local logbook (qsos.adi)."
+        );
+        app.station_readiness = Some(with_needs(
+            local("Authentication failed", false),
+            NeedListHealth::NoWarning,
+        ));
+        assert_eq!(
+            readiness_items(&app)[0].detail,
+            "cqdx.io needed-entity list not loaded: Authentication failed. Fix [network.cqdx] token and restart pancetta. Until then, needed and ATNO come from your local logbook (qsos.adi)."
+        );
+        app.station_readiness = Some(with_needs(
+            local("connection refused", true),
+            unavailable("connection refused", true),
+        ));
+        assert_eq!(labels(&app), vec!["⚠ NEEDS FROM LOCAL LOGBOOK"]);
+        assert!(readiness_items(&app)[0]
+            .detail
+            .ends_with(" Needed grids are unavailable too."));
     }
 
     #[tokio::test]

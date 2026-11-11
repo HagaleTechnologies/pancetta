@@ -84,7 +84,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `grid_square` | string | `"AA00aa"` | Your Maidenhead grid (4 or 6 chars). Used in `CQ` and grid-report exchanges. |
 | `power_watts` | integer | `100` | Reported in spots; not used for actual rig power level. |
 | `qth` | string | `"Unknown"` | Free-text location label, surfaced in the TUI. |
-| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). |
+| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). Not used for needed or ATNO: pancetta takes your home entity from `callsign`. |
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |

@@ -63,7 +63,8 @@ pub(super) struct AlertDispatcher {
     scorer: PriorityScorer,
     lookup: CachedStationLookup,
     tui: bool,
-    available: Option<bool>,
+    /// (cqdx list loaded, local logbook available) at the last log line.
+    available: Option<(bool, bool)>,
     dedupe: HashMap<(usize, String, String), Instant>,
     delivery: [Arc<Mutex<DeliveryState>>; 2],
 }
@@ -122,18 +123,22 @@ impl AlertDispatcher {
             self.lookup.dxcc_need_list(),
             NeedListAvailability::Loaded { .. }
         );
-        if self.available != Some(loaded) {
-            self.available = Some(loaded);
-            if !loaded {
+        let local = self.lookup.local_log_available();
+        if self.available != Some((loaded, local)) {
+            self.available = Some((loaded, local));
+            if !loaded && local {
+                info!(target: "pancetta::alerts", "cqdx need list unavailable; tier alerts use the local logbook");
+            } else if !loaded {
                 info!(target: "pancetta::alerts", "cqdx need list unavailable; tier alerts limited to local per-band evidence");
             } else {
                 info!(target: "pancetta::alerts", "cqdx need list available for tier alerts");
             }
         }
         // Unknown needed-list fallback is a scoring heuristic, never evidence for an alert.
+        // PAN-347: a local logbook verdict is evidence, like a loaded cqdx list.
         let mut tier = scored.score.tier;
         if tier == PriorityTier::PerBandDxccNew
-            && self.lookup.needed_dxcc_status(&call) == NeedStatus::Unknown
+            && self.lookup.dxcc_need_verdict(&call).0 == NeedStatus::Unknown
             && !scored.factors.dxcc_new_on_band
         {
             tier = if scored.factors.notable || scored.factors.special_event_callsign {
@@ -539,6 +544,35 @@ mod evidence_tests {
         // Without a known dial neither local-band nor remote needed-list evidence exists.
         assert!(!d.on_decode(&cq("VP8PJ", 0), 0, &[]).0);
         assert!(d.on_decode(&cq("VP8PJ", 14_074_000), 14_074_000, &[]).0);
+    }
+    #[tokio::test]
+    async fn local_logbook_atno_alerts_without_cqdx() {
+        // PAN-347: an entity absent from qsos.adi is ATNO evidence offline.
+        use crate::priority_evaluator::test_support::{adif, seeded_lookup};
+        let (_tmp, lookup) = seeded_lookup(&adif(&[("JA1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        lookup.set_need_lists_loading();
+        lookup.mark_need_lists_unavailable("connection refused", true);
+        let mut config = AlertsConfig::default();
+        config.bell.enabled = true;
+        config.bell.min_tier = DxTier::Atno;
+        let mut d =
+            AlertDispatcher::new(config.clone(), lookup.clone(), Default::default(), true).unwrap();
+        let tier = d
+            .scorer
+            .score_tiered_explained("ZL1ABC", None, -8, 14_074_000.0)
+            .score
+            .tier;
+        assert_eq!(tier, PriorityTier::Atno);
+        assert!(d.on_decode(&cq("ZL1ABC", 14_074_000), 14_074_000, &[]).0);
+        // Without the local log, the same CQ never reaches the ATNO threshold.
+        let mut unseeded =
+            AlertDispatcher::new(config, CachedStationLookup::new(), Default::default(), true)
+                .unwrap();
+        assert!(
+            !unseeded
+                .on_decode(&cq("ZL1ABC", 14_074_000), 14_074_000, &[])
+                .0
+        );
     }
     #[test]
     fn alerts_special_tier_only_reaches_special_threshold() {
