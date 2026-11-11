@@ -328,6 +328,7 @@ fn cq_dx_station() -> crate::app::DxStation {
         call_sign: "VK9XX".to_string(),
         grid_square: Some("QH30".to_string()),
         frequency: 14.074,
+        band: None,
         mode: "FT8".to_string(),
         last_seen: chrono::Utc::now(),
         snr: -10,

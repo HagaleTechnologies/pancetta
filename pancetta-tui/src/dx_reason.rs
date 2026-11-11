@@ -604,6 +604,7 @@ mod tests {
             call_sign: call.into(),
             grid_square: Some("EM34".into()),
             frequency: 14.074,
+            band: None,
             mode: "FT8".into(),
             last_seen: now(),
             snr: -7,
