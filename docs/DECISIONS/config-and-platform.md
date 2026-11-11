@@ -1052,7 +1052,6 @@ Every flag and subcommand `pancetta --help` lists either works or is gone.
 `--help` output, so a new subcommand is covered), the removed flags' exit 2,
 the guard, and both JSON sinks.
 
-<<<<<<< HEAD
 ## Stable decoder API guard (PAN-380, 2026-11-10)
 
 - **What is stable.** The union of two lists: the cycle API manta calls
@@ -1080,7 +1079,7 @@ the guard, and both JSON sinks.
 - **`trybuild` rejected.** Proving the guard fails would need a dev-dependency
   to show what CI already shows by failing to compile; validation repeats the
   mutations by hand.
-=======
+
 ## Windows compiled on every code PR (PAN-286, 2026-11-10)
 
 Before this change only `release.yml` compiled Windows, on a `v*` tag, though
@@ -1147,4 +1146,3 @@ spinning the worker on a closed spot channel.
 - **Not done here:** half-open TCP detection (`keepalive_interval_seconds`),
   rotating through `servers`, surviving a non-UTF-8 line without a reconnect,
   and a "reconnecting" state in the TUI.
->>>>>>> 01bd53305b037ba981cb4dade7541c1c35c103fd
