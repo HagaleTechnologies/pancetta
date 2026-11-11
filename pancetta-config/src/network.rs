@@ -547,6 +547,10 @@ pub struct PskReporterConfig {
     /// Upload interval in seconds
     pub upload_interval_seconds: u64,
 
+    /// Most reception reports held for upload while PSKReporter cannot be
+    /// reached; the oldest is dropped first (PAN-285). At least 1.
+    pub max_pending_reports: u32,
+
     /// Batch size for uploads
     pub batch_size: u32,
 
@@ -1288,6 +1292,7 @@ impl Default for PskReporterConfig {
             enabled: false,
             server_url: "https://pskreporter.info/cgi-bin/pskdata.pl".to_string(),
             upload_interval_seconds: 300,
+            max_pending_reports: 2000,
             batch_size: 50,
             include_receives: true,
             include_transmits: true,
@@ -1655,6 +1660,12 @@ impl ConfigSection for NetworkConfig {
                 return Err(ConfigError::InvalidValue {
                     field: "psk_reporter.batch_size".to_string(),
                     value: self.psk_reporter.batch_size.to_string(),
+                });
+            }
+            if self.psk_reporter.max_pending_reports == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "psk_reporter.max_pending_reports".to_string(),
+                    value: self.psk_reporter.max_pending_reports.to_string(),
                 });
             }
         }
@@ -2301,6 +2312,25 @@ mod tests {
         config.psk_reporter.upload_interval_seconds = 300; // Reset to valid
         config.psk_reporter.batch_size = 0;
         assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn psk_reporter_max_pending_reports_defaults_to_2000_and_rejects_zero_when_enabled() {
+        let mut config = NetworkConfig::default();
+        assert_eq!(config.psk_reporter.max_pending_reports, 2000);
+        config.psk_reporter.max_pending_reports = 0;
+        assert!(
+            config.validate_section().is_ok(),
+            "a disabled section is not validated"
+        );
+        config.psk_reporter.enabled = true;
+        match config.validate_section() {
+            Err(ConfigError::InvalidValue { field, value }) => {
+                assert_eq!(field, "psk_reporter.max_pending_reports");
+                assert_eq!(value, "0");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

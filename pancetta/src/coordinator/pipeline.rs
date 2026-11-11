@@ -231,6 +231,10 @@ pub(crate) struct DecodePipelineHandles {
     pub(crate) health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) health_last_rms: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
+    /// PAN-393: when the timed raw 48 kHz capture started. Set by the first
+    /// DSP start with capture enabled and reused by every DSP supervisor
+    /// restart, so a restart neither extends nor restarts the capture.
+    pub(crate) raw_capture_start: Arc<std::sync::OnceLock<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl DecodePipelineHandles {
@@ -254,6 +258,7 @@ impl DecodePipelineHandles {
             health_dsp_windows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             health_last_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             health_total_decodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            raw_capture_start: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
