@@ -9907,7 +9907,6 @@ mod pan251_swr_protection_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pan277_shutdown_drain_tests {
     use super::*;
     use crate::message_bus::{RigControlMessage, TxOrigin};
@@ -10111,7 +10110,10 @@ mod pan277_shutdown_drain_tests {
         wait_ptt(&rig, PttState::Off, Duration::from_millis(500)).await;
         c.shutdown().await.unwrap();
         assert_eq!(rig.get_ptt(Vfo::Current).await.unwrap(), PttState::Off);
-=======
+    }
+}
+
+#[cfg(test)]
 mod pan272_ptt_off_watchdog_tests {
     //! PAN-272: the Hamlib command loop keeps the PTT watchdog armed until
     //! the rig confirms a PTT-off. End to end through the real
@@ -10434,6 +10436,5 @@ mod pan272_ptt_off_watchdog_tests {
 
         s.rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
         c.shutdown_signal.store(true, Ordering::Release);
->>>>>>> 0e12650fb830b85271f2f9b0ab42a5f6a9575868
     }
 }

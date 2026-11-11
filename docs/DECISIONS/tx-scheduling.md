@@ -1255,7 +1255,6 @@ Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
 
-<<<<<<< HEAD
 ## Shutdown unkeys through the Hamlib loop (PAN-277, 2026-11-10)
 
 The signal handler sets the shutdown flag before coordinator cleanup runs. The
@@ -1285,7 +1284,7 @@ races with the producer. Restart teardown can take about 13 s and replays to the
 same abandoned queue. The explicit producer-stop handshake avoids those paths.
 Planning measured unkey 33 to 44 ms after the flag with the real TX worker and
 a mock rig. Hardware and systemd qualification remain pending.
-=======
+
 ## One handler per TX-worker abort outcome (PAN-322, 2026-11-10)
 
 The TX worker matched every abort outcome inline: 20 `SleepOutcome` arms across the four Step 6
@@ -1338,4 +1337,3 @@ PAN-322 moves each outcome into one handler. Behaviour and log lines do not chan
   `on_sleep_outcome` cover pivot unwinding on a pre-slot disarm, for both shapes. The real worker
   cannot reach the single-frame Step 6 `Replace` and `Bundle` handling, and only
   `supersede_rekey_tests` exercises those outcomes, on `supersede_and_rekey_or_bundle` itself.
->>>>>>> 0e12650fb830b85271f2f9b0ab42a5f6a9575868
