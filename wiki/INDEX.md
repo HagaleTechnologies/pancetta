@@ -24,3 +24,5 @@
 - [What will bite you about receive overload attenuation?](pages/receive-overload-guard.md) - raw capture provenance, confirmed PTT-off and gain reservations.
 - [What can invalidate a receive-gain experiment?](pages/receive-gain-sweep.md) — source-slot gain epochs, coordinator-owned restoration and conservative TX-parity skips.
 - [What will bite you about macOS microphone approval?](pages/macos-microphone-approval.md)
+
+- [What will bite you about shutdown PTT-off?](pages/shutdown-ptt-off.md) — PAN-277: enqueue versus unkey, drain ordering, and direct-client timeouts.

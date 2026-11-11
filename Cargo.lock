@@ -3096,6 +3096,7 @@ dependencies = [
  "signal-hook 0.4.5",
  "snow",
  "socket2",
+ "sqlx",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",

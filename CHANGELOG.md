@@ -7,12 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
+
 ### Changed
 
 - `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`) and turns on the `serde` feature, so a `transmit` build also gets the crate's serde derives. `decode_cycle` output is unchanged (PAN-331).
 
 ### Fixed
 
+- PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
+- Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.
+- Legacy QSO migration keeps a backup and refuses unreadable rows instead of writing a partial logbook.
+- PAN-277: Shutdown now drains queued PTT-off through Hamlib before stopping it, including the TX worker's cancellation fallback. The independent direct rigctld unkey now allows 3 s per reply within a 6 s budget, so a rig taking 1.5 s to answer can unkey. Previously Hamlib exited before reading the unkey and the direct attempt had only 500 ms. Unresponsive rigs can add about 13 s to shutdown.
 - PAN-281: A QSO written to `qsos.adi` now survives a power cut or OS crash right after it is logged. Each record is synced to disk before the write returns, about 1 ms per QSO. Every connection to `qso.db` now syncs its commits too; before, one of its five connections did not.
 - PAN-285: PSKReporter uploads keep at most `[network.psk_reporter].max_pending_reports` reports (default 2000) while they cannot be sent. When the queue is full, the oldest report is dropped and the log says how many. A backlog now goes out in datagrams of at most 1400 bytes, and reports leave the queue only after their datagram is sent, so a long outage no longer makes every later upload fail with "Message too long". FT4 decodes are reported as FT4, not FT8, and FT2 decodes are not reported. Each report now carries `informationSource` 1, the receiver descriptor is an options template, and every set is padded to four bytes, as https://pskreporter.info/pskdev.html describes. Whether pskreporter.info accepts these reports is still unchecked.
 - PAN-347: Hawaii, Alaska, Puerto Rico and other entities that share letters with your callsign or with calls in your log are no longer treated as already worked, and a German call on a new band is marked new whatever its prefix. `[station] dxcc_entity` no longer affects needed status; pancetta takes your home entity from `callsign`.

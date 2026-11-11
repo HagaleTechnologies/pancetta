@@ -7,6 +7,7 @@ use crate::models::{Mode, Vfo};
 use crate::rig::{
     ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigControl, RigStatus,
 };
+use crate::{DataModePolicy, DataModeReadiness};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 /// Rigctld connection configuration
 #[derive(Debug, Clone)]
@@ -74,10 +75,27 @@ pub struct RigctldClient {
     /// Configuration
     config: RigctldConfig,
     generation: AtomicU64,
+    prepared_generation: AtomicU64,
+    mode_epoch: u64,
+    transaction: Mutex<()>,
+    data_mode: Option<(DataModePolicy, DataModeReadiness)>,
     /// Persistent connection (reader + writer)
     conn: Arc<Mutex<Option<RigctldConnection>>>,
     /// Internal state
     state: Arc<RwLock<RigctldState>>,
+}
+
+// Cancellation of an in-flight exchange loses the socket and mode confirmation.
+struct ModeIoGuard<'a> {
+    client: &'a RigctldClient,
+    completed: bool,
+}
+impl Drop for ModeIoGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.client.invalidate_mode();
+        }
+    }
 }
 
 impl RigctldClient {
@@ -86,6 +104,10 @@ impl RigctldClient {
         Self {
             config,
             generation: AtomicU64::new(0),
+            prepared_generation: AtomicU64::new(0),
+            mode_epoch: 0,
+            transaction: Mutex::new(()),
+            data_mode: None,
             conn: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(RigctldState {
                 connected: false,
@@ -94,6 +116,235 @@ impl RigctldClient {
                 last_ptt: PttState::Off,
                 last_signal_strength: -120,
             })),
+        }
+    }
+
+    /// Opt into exact CAT mode application with shared TX readiness.
+    pub fn with_data_mode(mut self, policy: DataModePolicy, readiness: DataModeReadiness) -> Self {
+        readiness.configure(true);
+        self.mode_epoch = readiness.epoch();
+        self.data_mode = Some((policy, readiness));
+        self
+    }
+
+    async fn managed_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if self.data_mode.is_some() {
+            Some(self.transaction.lock().await)
+        } else {
+            None
+        }
+    }
+
+    fn invalidate_mode(&self) {
+        if let Some((_, readiness)) = &self.data_mode {
+            readiness.invalidate_epoch(self.mode_epoch);
+        }
+        self.prepared_generation.store(0, Ordering::Release);
+    }
+
+    fn mode_ready(&self) -> bool {
+        self.data_mode.as_ref().is_none_or(|(_, readiness)| {
+            readiness.is_ready_for(self.mode_epoch)
+                && self.prepared_generation.load(Ordering::Acquire)
+                    == self.generation.load(Ordering::Acquire)
+                && self.generation.load(Ordering::Acquire) != 0
+        })
+    }
+
+    async fn begin_mutation(&self) -> Result<()> {
+        self.invalidate_mode();
+        if self.state.read().await.last_ptt != PttState::Off {
+            return Err(anyhow!("Cannot change rig data mode while keyed"));
+        }
+        Ok(())
+    }
+
+    fn reserve_receive_restore(&self, rx: &str) {
+        if let Some((_, readiness)) = &self.data_mode {
+            readiness.reserve_restore(self.mode_epoch, if rx == "VFOA" { 1 } else { 2 });
+        }
+    }
+
+    // A failed/cancelled temporary selection survives socket replacement and
+    // component restart through the shared handle. Never infer RX from the
+    // VFO we may have left selected while working on the split transmitter.
+    async fn restore_receive_vfo(&self) -> Result<()> {
+        if let Some((_, readiness)) = &self.data_mode {
+            let target = readiness.restore_target();
+            if target != 0 {
+                let token = if target == 1 { "VFOA" } else { "VFOB" };
+                self.send_command_inner(&format!("V {token}"), true).await?;
+                readiness.restored(self.mode_epoch, target);
+            }
+        }
+        Ok(())
+    }
+
+    async fn receive_vfo(&self) -> Result<&'static str> {
+        match self.send_command("\\get_vfo").await?.as_str() {
+            "VFOA" => Ok("VFOA"),
+            "VFOB" => Ok("VFOB"),
+            _ => Err(anyhow!("Cannot establish receive VFO for rig data mode")),
+        }
+    }
+
+    // Caller owns transaction. No retries here: a reconnect loses VFO selection.
+    async fn managed_frequency(&self, vfo: Vfo, frequency: u64) -> Result<()> {
+        self.restore_receive_vfo().await?;
+        let rx = self.receive_vfo().await?;
+        let target = if vfo == Vfo::Current {
+            rx
+        } else {
+            Self::vfo_to_string(vfo)
+        };
+        if target != rx {
+            self.reserve_receive_restore(rx);
+        }
+        let result = async {
+            if target != rx {
+                self.send_command_inner(&format!("V {target}"), true)
+                    .await?;
+            }
+            self.send_command_inner(&format!("F {frequency}"), true)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let restore = if target != rx {
+            self.restore_receive_vfo().await
+        } else {
+            Ok(())
+        };
+        result?;
+        restore?;
+        self.prepare_mode(false, None).await?;
+        self.state.write().await.last_frequency = frequency;
+        Ok(())
+    }
+
+    // All preparation and ready publication is serialized with keying and VFO access.
+    async fn prepare_mode(&self, unkey: bool, known_split: Option<(bool, Vfo)>) -> Result<()> {
+        self.invalidate_mode();
+        let Some((policy, readiness)) = &self.data_mode else {
+            return Ok(());
+        };
+        let generation = self.generation.load(Ordering::Acquire);
+        if unkey {
+            self.send_command_inner("T 0", true).await?;
+            self.state.write().await.last_ptt = PttState::Off;
+        } else if self.state.read().await.last_ptt != PttState::Off {
+            return Err(anyhow!("Cannot prepare rig data mode while keyed"));
+        }
+        self.restore_receive_vfo().await?;
+        let rx = self.receive_vfo().await?;
+        let (split, tx) = if let Some(split) = known_split {
+            split
+        } else {
+            let response = self.send_command("s").await?;
+            let mut lines = response.lines();
+            Self::parse_split_vfo_response(lines.next().unwrap_or(""), lines.next().unwrap_or(""))?
+        };
+        let tx = if split {
+            match tx {
+                Vfo::A => "VFOA",
+                Vfo::B => "VFOB",
+                _ => return Err(anyhow!("Cannot establish split TX VFO for rig data mode")),
+            }
+        } else {
+            rx
+        };
+        if tx != rx {
+            self.reserve_receive_restore(rx);
+        }
+        let result = async {
+            self.send_command_inner(&policy.command(), true).await?;
+            if tx != rx {
+                self.send_command_inner(&format!("V {tx}"), true).await?;
+                self.send_command_inner(&policy.command(), true).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // Restore even after a failed selection or mode write. Failure stays blocked.
+        let restore = if tx != rx {
+            self.restore_receive_vfo().await
+        } else {
+            Ok(())
+        };
+        result?;
+        restore?;
+        if generation == 0 || generation != self.generation.load(Ordering::Acquire) {
+            return Err(anyhow!("Rig connection changed during mode preparation"));
+        }
+        self.prepared_generation
+            .store(generation, Ordering::Release);
+        readiness.confirm(self.mode_epoch);
+        Ok(())
+    }
+
+    async fn connect_unlocked(&self) -> Result<()> {
+        self.invalidate_mode();
+        info!(
+            "Connecting to rigctld at {}:{}",
+            self.config.host, self.config.port
+        );
+
+        // Try to connect with timeout
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let connect_result = timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            TcpStream::connect(&addr),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+
+                // Split into reader/writer and wrap reader in BufReader
+                let (read_half, write_half) = tokio::io::split(stream);
+                *self.conn.lock().await = Some(RigctldConnection {
+                    reader: BufReader::new(read_half),
+                    writer: write_half,
+                });
+
+                // Update state
+                let mut state = self.state.write().await;
+                state.connected = true;
+                self.generation.fetch_add(1, Ordering::SeqCst);
+
+                info!("Successfully connected to rigctld");
+
+                // Verify with a simple frequency query
+                drop(state); // release write lock before send_command
+                match self.send_command("f").await {
+                    Ok(resp) => {
+                        info!("Rigctld connection verified (freq={})", resp);
+                        if self.data_mode.is_some() {
+                            if let Err(error) = self.prepare_mode(true, None).await {
+                                self.state.write().await.connected = false;
+                                return Err(error);
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to verify connection: {}", e);
+                        let mut state = self.state.write().await;
+                        state.connected = false;
+                        *self.conn.lock().await = None;
+                        Err(anyhow!("Connection verification failed: {}", e))
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                error!("Failed to connect to rigctld: {}", e);
+                Err(anyhow!("Connection failed: {}", e))
+            }
+            Err(_) => {
+                error!("Connection timeout");
+                Err(anyhow!("Connection timeout"))
+            }
         }
     }
 
@@ -112,105 +363,79 @@ impl RigctldClient {
 
     async fn send_command_inner(&self, command: &str, require_ack: bool) -> Result<String> {
         let mut conn_guard = self.conn.lock().await;
-
-        if let Some(conn) = conn_guard.as_mut() {
-            let cmd_with_newline = format!("{}\n", command);
-            debug!("Sending rigctld command: {}", command);
-
-            conn.writer.write_all(cmd_with_newline.as_bytes()).await?;
-            conn.writer.flush().await?;
-
-            // Read response line (using persistent BufReader so buffered data isn't lost)
-            let mut response = String::new();
-            match timeout(
-                Duration::from_millis(self.config.command_timeout_ms),
-                conn.reader.read_line(&mut response),
-            )
-            .await
-            {
-                Ok(Ok(0)) => {
-                    *conn_guard = None;
-                    let mut state = self.state.write().await;
-                    state.connected = false;
-                    Err(anyhow!("rigctld closed connection"))
+        let Some(mut conn) = conn_guard.take() else {
+            self.invalidate_mode();
+            self.state.write().await.connected = false;
+            return Err(anyhow!("Not connected to rigctld"));
+        };
+        let mut cancellation = ModeIoGuard {
+            client: self,
+            completed: false,
+        };
+        let mut complete_error = false;
+        let mut complete_response = false;
+        let result = timeout(
+            Duration::from_millis(self.config.command_timeout_ms),
+            async {
+                conn.writer
+                    .write_all(format!("{command}\n").as_bytes())
+                    .await?;
+                conn.writer.flush().await?;
+                let mut response = String::new();
+                let n = conn.reader.read_line(&mut response).await?;
+                if n == 0 || !response.ends_with('\n') {
+                    return Err(anyhow!("rigctld closed or truncated response"));
                 }
-                Ok(Ok(_)) => {
-                    response = response.trim().to_string();
-
-                    if require_ack && response != "RPRT 0" {
-                        return Err(anyhow!(
-                            "Missing successful rigctld acknowledgement: {response}"
-                        ));
+                complete_response = true;
+                let response = response.trim().to_owned();
+                complete_error = response.starts_with("RPRT ")
+                    && response
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|s| s.parse::<i32>().is_ok());
+                if require_ack && response != "RPRT 0" {
+                    return Err(anyhow!(
+                        "Missing successful rigctld acknowledgement: {response}"
+                    ));
+                }
+                if response.starts_with("RPRT") {
+                    if response != "RPRT 0" {
+                        return Err(anyhow!("Rigctld error: {response}"));
                     }
-
-                    // Check for RPRT error/success codes
-                    if response.starts_with("RPRT") {
-                        let code = response
-                            .split_whitespace()
-                            .nth(1)
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or_else(|| {
-                                tracing::warn!(
-                                    "rigctld: malformed RPRT response '{}', \
-                                     treating as error",
-                                    response
-                                );
-                                -1
-                            });
-
-                        if code != 0 {
-                            return Err(anyhow!("Rigctld error code: {}", code));
-                        }
-
-                        // RPRT 0 means success for set commands — no data follows
-                        debug!("Rigctld response: RPRT 0 (OK)");
-                        return Ok(String::new());
+                    return Ok(String::new());
+                }
+                if command.trim() == "s"
+                    || (self.data_mode.is_some()
+                        && matches!(command.split_whitespace().next(), Some("m" | "\\get_mode")))
+                {
+                    complete_response = false;
+                    let mut vfo = String::new();
+                    let n = conn.reader.read_line(&mut vfo).await?;
+                    if n == 0 || !vfo.ends_with('\n') {
+                        return Err(anyhow!("Incomplete rigctld split response"));
                     }
-
-                    // PAN-206: `s` has two response lines. Keep the socket
-                    // locked until both are consumed, including raw `s` calls,
-                    // so a concurrent CAT command cannot steal the VFO line.
-                    if command.trim() == "s" {
-                        let mut vfo = String::new();
-                        let result = timeout(
-                            Duration::from_millis(self.config.command_timeout_ms),
-                            conn.reader.read_line(&mut vfo),
-                        )
-                        .await;
-                        match result {
-                            Ok(Ok(n)) if n > 0 => {
-                                response.push('\n');
-                                response.push_str(vfo.trim());
-                            }
-                            _ => {
-                                // A late/partial line must not become the next
-                                // command's response. The poll loop redials.
-                                *conn_guard = None;
-                                self.state.write().await.connected = false;
-                                return Err(anyhow!("Incomplete rigctld split response"));
-                            }
-                        }
-                    }
-
-                    debug!("Rigctld response: {}", response);
-                    Ok(response)
+                    complete_response = true;
+                    return Ok(format!("{response}\n{}", vfo.trim()));
                 }
-                Ok(Err(e)) => {
-                    *conn_guard = None;
-                    let mut state = self.state.write().await;
-                    state.connected = false;
-                    Err(anyhow!("Failed to read response: {}", e))
-                }
-                Err(_) => {
-                    *conn_guard = None;
-                    let mut state = self.state.write().await;
-                    state.connected = false;
-                    Err(anyhow!("Command timeout"))
-                }
+                Ok(response)
+            },
+        )
+        .await
+        .map_err(|_| anyhow!("Command timeout"))
+        .and_then(|r| r);
+        // Negative RPRT is a complete response, but dropping on errors also prevents
+        // a malformed/late response from leaking into the next operation.
+        if result.is_ok() || complete_error || (complete_response && self.data_mode.is_none()) {
+            *conn_guard = Some(conn);
+            cancellation.completed =
+                result.is_ok() || self.data_mode.is_none() || (complete_error && !require_ack);
+            if result.is_err() && self.data_mode.is_some() && require_ack {
+                self.state.write().await.connected = false;
             }
         } else {
-            Err(anyhow!("Not connected to rigctld"))
+            self.state.write().await.connected = false;
         }
+        result
     }
 
     // Keep the socket out of the shared slot while awaiting I/O. Cancellation
@@ -221,6 +446,10 @@ impl RigctldClient {
         deadline: tokio::time::Instant,
         extended: bool,
     ) -> Result<Vec<String>> {
+        let mut cancellation = ModeIoGuard {
+            client: self,
+            completed: false,
+        };
         let mut guard = tokio::time::timeout_at(deadline, self.conn.lock())
             .await
             .map_err(|_| anyhow!("Gain transaction deadline expired waiting for transport"))?;
@@ -283,6 +512,7 @@ impl RigctldClient {
         .and_then(|value| value);
         if result.is_ok() {
             *guard = Some(conn);
+            cancellation.completed = true;
         } else {
             self.state.write().await.connected = false;
         }
@@ -342,7 +572,10 @@ impl RigctldClient {
                     let state = self.state.read().await;
                     if !state.connected {
                         drop(state);
-                        let _ = self.connect().await;
+                        let reconnect = self.connect_unlocked().await;
+                        if self.data_mode.is_some() {
+                            reconnect?;
+                        }
                     }
                 }
             }
@@ -498,6 +731,30 @@ impl RigctldClient {
                 "raw command verb '{}' is not in the rigctld allow-list",
                 verb
             ));
+        }
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            // Raw commands must not bypass the generation or keyed-state gates.
+            let verb = cmd.split_whitespace().next().unwrap_or("");
+            if matches!(verb, "T" | "\\set_ptt") {
+                return Err(anyhow!("Use set_ptt for a mode-managed rig"));
+            }
+            if matches!(
+                verb,
+                "F" | "I"
+                    | "S"
+                    | "V"
+                    | "M"
+                    | "\\set_mode"
+                    | "\\set_vfo"
+                    | "\\set_mem"
+                    | "\\set_func"
+            ) {
+                self.begin_mutation().await?;
+                let response = self.send_command_inner(cmd, true).await?;
+                self.prepare_mode(false, None).await?;
+                return Ok(response);
+            }
         }
         self.send_command_with_retry(cmd).await
     }
@@ -669,14 +926,17 @@ fn parse_attenuator_steps(body: &str) -> Result<Vec<i32>> {
 #[async_trait]
 impl RigControl for RigctldClient {
     async fn receive_gain_capabilities(&self) -> Result<ReceiveGainCapabilities> {
+        let _transaction = self.managed_lock().await;
         parse_gain_capabilities(&self.dump_caps().await?)
     }
 
     async fn reports_swr(&self) -> Result<bool> {
+        let _transaction = self.managed_lock().await;
         parse_reports_swr(&self.dump_caps().await?)
     }
 
     async fn get_receive_gain(&self) -> Result<ReceiveGain> {
+        let _transaction = self.managed_lock().await;
         let replies = self
             .gain_request(
                 &["l PREAMP".to_owned(), "l ATT".to_owned()],
@@ -695,6 +955,7 @@ impl RigControl for RigctldClient {
         gain: ReceiveGain,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        let _transaction = self.managed_lock().await;
         if !(0..=120).contains(&gain.preamp_db) || !(0..=120).contains(&gain.attenuator_db) {
             return Err(anyhow!("Receive gain outside integer dB range"));
         }
@@ -733,65 +994,13 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
-        info!(
-            "Connecting to rigctld at {}:{}",
-            self.config.host, self.config.port
-        );
-
-        // Try to connect with timeout
-        let addr = format!("{}:{}", self.config.host, self.config.port);
-        let connect_result = timeout(
-            Duration::from_millis(self.config.timeout_ms),
-            TcpStream::connect(&addr),
-        )
-        .await;
-
-        match connect_result {
-            Ok(Ok(stream)) => {
-                stream.set_nodelay(true)?;
-
-                // Split into reader/writer and wrap reader in BufReader
-                let (read_half, write_half) = tokio::io::split(stream);
-                *self.conn.lock().await = Some(RigctldConnection {
-                    reader: BufReader::new(read_half),
-                    writer: write_half,
-                });
-
-                // Update state
-                let mut state = self.state.write().await;
-                state.connected = true;
-                self.generation.fetch_add(1, Ordering::SeqCst);
-
-                info!("Successfully connected to rigctld");
-
-                // Verify with a simple frequency query
-                drop(state); // release write lock before send_command
-                match self.send_command("f").await {
-                    Ok(resp) => {
-                        info!("Rigctld connection verified (freq={})", resp);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to verify connection: {}", e);
-                        let mut state = self.state.write().await;
-                        state.connected = false;
-                        *self.conn.lock().await = None;
-                        Err(anyhow!("Connection verification failed: {}", e))
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                error!("Failed to connect to rigctld: {}", e);
-                Err(anyhow!("Connection failed: {}", e))
-            }
-            Err(_) => {
-                error!("Connection timeout");
-                Err(anyhow!("Connection timeout"))
-            }
-        }
+        let _transaction = self.managed_lock().await;
+        self.connect_unlocked().await
     }
 
     async fn disconnect(&self) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        self.invalidate_mode();
         info!("Disconnecting from rigctld");
 
         // Close connection
@@ -829,6 +1038,12 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_frequency(&self, vfo: Vfo, frequency: u64) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            self.begin_mutation().await?;
+            return self.managed_frequency(vfo, frequency).await;
+        }
+
         // Use short-form rigctld command: "F <freq>" sets current VFO frequency
         // For non-current VFO, switch VFO first
         if !matches!(vfo, Vfo::Current | Vfo::A) {
@@ -851,6 +1066,36 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_frequency(&self, vfo: Vfo) -> Result<u64> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() && vfo != Vfo::Current {
+            let mut cancellation = ModeIoGuard {
+                client: self,
+                completed: false,
+            };
+            self.restore_receive_vfo().await?;
+            let rx = self.receive_vfo().await?;
+            let target = Self::vfo_to_string(vfo);
+            if target != rx {
+                self.reserve_receive_restore(rx);
+            }
+            let result = async {
+                if target != rx {
+                    self.send_command_inner(&format!("V {target}"), true)
+                        .await?;
+                }
+                Self::parse_frequency(&self.send_command("f").await?)
+            }
+            .await;
+            let restore = if target != rx {
+                self.restore_receive_vfo().await
+            } else {
+                Ok(())
+            };
+            let frequency = result?;
+            restore?;
+            cancellation.completed = true;
+            return Ok(frequency);
+        }
         // Use short-form: "f" gets current VFO frequency
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
@@ -873,6 +1118,11 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_mode(&self, vfo: Vfo, mode: Mode, passband: Option<i32>) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            return Err(anyhow!("The configured data mode owns mode control"));
+        }
+
         // Switch VFO first if needed (same pattern as set_frequency)
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
@@ -898,6 +1148,14 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_mode(&self, _vfo: Vfo) -> Result<(Mode, i32)> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            let response = self.send_command_with_retry("m").await?;
+            let (token, width) = response
+                .split_once('\n')
+                .ok_or_else(|| anyhow!("Incomplete mode response"))?;
+            return Ok((Self::string_to_mode(token), width.parse()?));
+        }
         // Use short-form "m" which returns two lines: mode\npassband\n
         // We must consume both lines to keep the BufReader in sync.
         let mode_str = self.send_command_with_retry("m").await?;
@@ -920,6 +1178,17 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_ptt(&self, _vfo: Vfo, state: PttState) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() && state != PttState::Off {
+            if !self.mode_ready() {
+                return Err(anyhow!("rig data mode is not ready"));
+            }
+            // Never reconnect or replay a key-down from an old slot.
+            self.send_command_inner("T 1", true).await?;
+            self.state.write().await.last_ptt = state;
+            return Ok(());
+        }
+
         let ptt_value = match state {
             PttState::On | PttState::OnMic | PttState::OnData => "1",
             PttState::Off => "0",
@@ -940,6 +1209,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_ptt(&self, vfo: Vfo) -> Result<PttState> {
+        let _transaction = self.managed_lock().await;
         let cmd = format!("\\get_ptt {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
 
@@ -959,6 +1229,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_s_meter(&self) -> Result<i32> {
+        let _transaction = self.managed_lock().await;
         // Get signal strength
         let response = self.send_command_with_retry("\\get_level STRENGTH").await?;
 
@@ -984,12 +1255,21 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_vfo(&self, vfo: Vfo) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            self.begin_mutation().await?;
+            self.send_command_inner(&format!("V {}", Self::vfo_to_string(vfo)), true)
+                .await?;
+            return self.prepare_mode(false, None).await;
+        }
+
         let cmd = format!("\\set_vfo {}", Self::vfo_to_string(vfo));
         self.send_command_with_retry(&cmd).await?;
         Ok(())
     }
 
     async fn get_vfo(&self) -> Result<Vfo> {
+        let _transaction = self.managed_lock().await;
         let response = self.send_command_with_retry("\\get_vfo").await?;
 
         let vfo = match response.trim() {
@@ -1006,6 +1286,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_attenuator(&self) -> Result<i32> {
+        let _transaction = self.managed_lock().await;
         let response = self.send_command("\\get_level ATT").await?;
         let db = response
             .parse::<i32>()
@@ -1017,6 +1298,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_attenuator(&self, db: i32) -> Result<()> {
+        let _transaction = self.managed_lock().await;
         if db < 0 {
             return Err(anyhow!("Attenuation must be nonnegative"));
         }
@@ -1058,6 +1340,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_power_level(&self, watts: f32) -> Result<()> {
+        let _transaction = self.managed_lock().await;
         // Convert watts to percentage (0.0 - 1.0)
         // Assuming 100W max for now (should be configurable)
         let level = (watts / 100.0).clamp(0.0, 1.0);
@@ -1067,6 +1350,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_power_level(&self) -> Result<f32> {
+        let _transaction = self.managed_lock().await;
         let response = self.send_command_with_retry("\\get_level RFPOWER").await?;
 
         // Parse as fraction (0.0 - 1.0) and convert to watts
@@ -1082,12 +1366,14 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_preamp(&self, preamp_db: i32) -> Result<()> {
+        let _transaction = self.managed_lock().await;
         self.send_command_with_retry(&format!("\\set_level PREAMP {}", preamp_db))
             .await?;
         Ok(())
     }
 
     async fn get_preamp(&self) -> Result<i32> {
+        let _transaction = self.managed_lock().await;
         let response = self.send_command_with_retry("\\get_level PREAMP").await?;
         response.trim().parse::<i32>().map_err(|error| {
             anyhow!(
@@ -1099,6 +1385,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_swr(&self) -> Result<f32> {
+        let _transaction = self.managed_lock().await;
         // PAN-251: read once, without retry warnings. The coordinator samples
         // every 500 ms while keyed and redials a dropped link itself. Never
         // invent a reading: an unparseable reply is an error, not 1.0:1.
@@ -1113,12 +1400,23 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            self.begin_mutation().await?;
+            self.send_command_inner(
+                &format!("\\set_mem {} {}", Self::vfo_to_string(vfo), channel),
+                true,
+            )
+            .await?;
+            return self.prepare_mode(false, None).await;
+        }
         let cmd = format!("\\set_mem {} {}", Self::vfo_to_string(vfo), channel);
         self.send_command_with_retry(&cmd).await?;
         Ok(())
     }
 
     async fn get_memory_channel(&self, vfo: Vfo) -> Result<i32> {
+        let _transaction = self.managed_lock().await;
         let cmd = format!("\\get_mem {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
 
@@ -1131,6 +1429,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn set_scan(&self, vfo: Vfo, enable: bool) -> Result<()> {
+        let _transaction = self.managed_lock().await;
         let scan_value = if enable { "1" } else { "0" };
         let cmd = format!(
             "\\set_func {} SCAN {}",
@@ -1142,6 +1441,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_info(&self) -> Result<String> {
+        let _transaction = self.managed_lock().await;
         // NOTE: \dump_state returns dozens of lines and corrupts the BufReader
         // stream. Use the single-line \get_info command instead which returns
         // just the rig model/info string.
@@ -1151,6 +1451,14 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_split(&self, enabled: bool, tx_vfo: Vfo) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            self.begin_mutation().await?;
+            self.send_command_inner(&Self::split_command(enabled, tx_vfo), true)
+                .await?;
+            return self.prepare_mode(false, Some((enabled, tx_vfo))).await;
+        }
+
         // OPERATOR-CONFIRM(split): exact short-form verified on-air (FTdx10).
         self.send_command_with_retry(&Self::split_command(enabled, tx_vfo))
             .await?;
@@ -1158,6 +1466,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_split(&self) -> Result<(bool, Vfo)> {
+        let _transaction = self.managed_lock().await;
         // NOTE: `s` is Hamlib's standard get_split_vfo short form, returning
         // flag then TX VFO. Awaiting FTdx10 OPERATOR-CONFIRM(split-read).
         // Read once, without retry warnings: the coordinator logs unavailable
@@ -1170,6 +1479,7 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_split_freq(&self) -> Result<u64> {
+        let _transaction = self.managed_lock().await;
         // NOTE: `i` is Hamlib's standard get_split_freq short form.
         // Awaiting FTdx10 OPERATOR-CONFIRM(split-read), as above.
         let response = self.send_command("i").await?;
@@ -1178,6 +1488,14 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_split_freq(&self, tx_freq: u64) -> Result<()> {
+        let _transaction = self.managed_lock().await;
+        if self.data_mode.is_some() {
+            self.begin_mutation().await?;
+            self.send_command_inner(&Self::split_freq_command(tx_freq), true)
+                .await?;
+            return self.prepare_mode(false, None).await;
+        }
+
         // OPERATOR-CONFIRM(split): exact short-form verified on-air (FTdx10).
         self.send_command_with_retry(&Self::split_freq_command(tx_freq))
             .await?;
@@ -2013,5 +2331,477 @@ mod receive_gain_tests {
         ] {
             assert!(parse_gain_capabilities(text).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_mode_tests {
+    use super::*;
+
+    async fn peer(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (
+        RigctldClient,
+        DataModeReadiness,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let readiness = DataModeReadiness::new(true);
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            command_timeout_ms: 100,
+            retry_count: 2,
+            ..Default::default()
+        })
+        .with_data_mode(
+            DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+            readiness.clone(),
+        );
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            for (expected, response) in script {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim(), expected);
+                write.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (client, readiness, task)
+    }
+
+    fn startup() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("f", "14074000\n"),
+            ("T 0", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("s", "0\nVFOA\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+        ]
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_and_band_hop_prepare_exact_mode_before_keying() {
+        let mut script = startup();
+        script.extend([
+            ("\\get_vfo", "VFOA\n"),
+            ("F 7074000", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("s", "0\nVFOA\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("T 1", "RPRT 0\n"),
+            ("T 0", "RPRT 0\n"),
+        ]);
+        let (client, ready, server) = peer(script).await;
+        assert!(!ready.is_ready());
+        assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+        client.connect().await.unwrap();
+        assert!(ready.is_ready());
+        client.set_frequency(Vfo::A, 7_074_000).await.unwrap();
+        assert!(ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        assert!(client.set_frequency(Vfo::A, 14_074_000).await.is_err());
+        assert!(!ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_applies_both_vfos_and_confirms_restoration() {
+        let mut script = startup();
+        script.extend([
+            ("S 1 VFOB", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("V VFOB", "RPRT 0\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("V VFOA", "RPRT 0\n"),
+            ("T 1", "RPRT 0\n"),
+        ]);
+        let (client, ready, server) = peer(script).await;
+        client.connect().await.unwrap();
+        client.set_split(true, Vfo::B).await.unwrap();
+        assert!(ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_or_malformed_mode_and_failed_restore_never_allow_keying() {
+        for reply in ["RPRT -1\n", "OK\n", ""] {
+            let mut script = startup();
+            script.last_mut().unwrap().1 = reply;
+            let (client, ready, server) = peer(script).await;
+            assert!(client.connect().await.is_err());
+            assert!(!ready.is_ready());
+            assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+            server.await.unwrap();
+        }
+        let mut script = startup();
+        script.extend([
+            ("S 1 VFOB", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("V VFOB", "RPRT 0\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("V VFOA", "RPRT -1\n"),
+        ]);
+        let (client, ready, server) = peer(script).await;
+        client.connect().await.unwrap();
+        assert!(client.set_split(true, Vfo::B).await.is_err());
+        assert!(!ready.is_ready());
+        assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mode_rejection_restores_receive_vfo_and_never_blocks_unkey() {
+        let mut script = startup();
+        script.extend([
+            ("S 1 VFOB", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+            ("V VFOB", "RPRT 0\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT -1\n"),
+            ("V VFOA", "RPRT 0\n"),
+            ("T 0", "RPRT 0\n"),
+        ]);
+        let (client, ready, server) = peer(script).await;
+        client.connect().await.unwrap();
+        assert!(client.set_split(true, Vfo::B).await.is_err());
+        assert!(!ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+        assert!(!ready.is_ready());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_key_down_is_not_retried_on_a_new_connection() {
+        let mut script = startup();
+        script.push(("T 1", ""));
+        let (client, ready, server) = peer(script).await;
+        client.connect().await.unwrap();
+        assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+        assert!(!ready.is_ready());
+        assert_eq!(client.connection_generation(), 1);
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod managed_recovery_tests {
+    use super::*;
+
+    async fn respond(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        expected: &str,
+        response: &str,
+    ) {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim(), expected);
+        writer.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn prepare(
+        stream: TcpStream,
+    ) -> (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        for (command, response) in [
+            ("f", "14074000\n"),
+            ("T 0", "RPRT 0\n"),
+            ("\\get_vfo", "VFOA\n"),
+            ("s", "0\nVFOB\n"),
+            ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+        ] {
+            respond(&mut read, &mut write, command, response).await;
+        }
+        (read, write)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn implicit_poll_reconnect_prepares_a_new_generation_before_fresh_key_down() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = DataModeReadiness::new(true);
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            command_timeout_ms: 100,
+            retry_count: 2,
+            ..Default::default()
+        })
+        .with_data_mode(
+            DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+            ready.clone(),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, write) = prepare(stream).await;
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), "f");
+            drop(read);
+            drop(write);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = prepare(stream).await;
+            respond(&mut read, &mut write, "f", "7074000\n").await;
+            respond(&mut read, &mut write, "T 1", "RPRT 0\n").await;
+        });
+        client.connect().await.unwrap();
+        assert_eq!(client.get_frequency(Vfo::Current).await.unwrap(), 7_074_000);
+        assert_eq!(client.connection_generation(), 2);
+        assert!(ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_split_mode_serializes_polling_and_cancel_invalidates_readiness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = DataModeReadiness::new(true);
+        let client = Arc::new(
+            RigctldClient::new(RigctldConfig {
+                port: listener.local_addr().unwrap().port(),
+                command_timeout_ms: 500,
+                ..Default::default()
+            })
+            .with_data_mode(
+                DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+                ready.clone(),
+            ),
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = prepare(stream).await;
+            for (command, response) in [
+                ("S 1 VFOB", "RPRT 0\n"),
+                ("\\get_vfo", "VFOA\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOB", "RPRT 0\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), "\\set_mode PKTUSB 3000");
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            // Abort must close the socket, rather than reuse a late mode reply.
+            line.clear();
+            assert_eq!(read.read_line(&mut line).await.unwrap(), 0);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            // The rig is still on B after cancellation. Restore A before
+            // asking which VFO is the receive VFO on the new connection.
+            for (command, response) in [
+                ("f", "7075000\n"),
+                ("T 0", "RPRT 0\n"),
+                ("V VFOA", "RPRT 0\n"),
+                ("\\get_vfo", "VFOA\n"),
+                ("s", "1\nVFOB\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOB", "RPRT 0\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOA", "RPRT 0\n"),
+                ("T 1", "RPRT 0\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+        });
+        client.connect().await.unwrap();
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.set_split(true, Vfo::B).await }
+        });
+        entered_rx.await.unwrap();
+        assert!(!ready.is_ready());
+        // Poll cannot send while the temporary B is selected.
+        let mut poll = Box::pin(client.get_frequency(Vfo::Current));
+        assert!(matches!(
+            futures::poll!(&mut poll),
+            std::task::Poll::Pending
+        ));
+        drop(poll);
+        task.abort();
+        let _ = task.await;
+        assert!(!ready.is_ready());
+        assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+        release_tx.send(()).unwrap();
+        client.connect().await.unwrap();
+        assert!(ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mode_timeout_keeps_readiness_blocked_and_drops_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = DataModeReadiness::new(true);
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            command_timeout_ms: 20,
+            ..Default::default()
+        })
+        .with_data_mode(
+            DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+            ready.clone(),
+        );
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            for (command, response) in [
+                ("f", "14074000\n"),
+                ("T 0", "RPRT 0\n"),
+                ("\\get_vfo", "VFOA\n"),
+                ("s", "0\nVFOA\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), "\\set_mode PKTUSB 3000");
+            done_rx.await.unwrap();
+            line.clear();
+            assert_eq!(read.read_line(&mut line).await.unwrap(), 0);
+        });
+        let error = client.connect().await.unwrap_err();
+        assert!(error.to_string().contains("timeout"));
+        assert!(!ready.is_ready());
+        assert!(client.conn.lock().await.is_none());
+        assert!(client.set_ptt(Vfo::Current, PttState::On).await.is_err());
+        done_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_policy_connect_qsy_split_and_key_never_write_mode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            for (command, response) in [
+                ("f", "14074000\n"),
+                ("F 7074000", "RPRT 0\n"),
+                ("S 1 VFOB", "RPRT 0\n"),
+                ("I 7075000", "RPRT 0\n"),
+                ("T 1", "RPRT 0\n"),
+                ("T 0", "RPRT 0\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+        });
+        client.connect().await.unwrap();
+        client.set_frequency(Vfo::A, 7_074_000).await.unwrap();
+        client.set_split(true, Vfo::B).await.unwrap();
+        client.set_split_freq(7_075_000).await.unwrap();
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        client.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+        server.await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_optional_read_while_keyed_keeps_connection_and_mode_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = DataModeReadiness::new(true);
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            retry_count: 1,
+            ..Default::default()
+        })
+        .with_data_mode(
+            DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+            ready.clone(),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = prepare(stream).await;
+            for (command, response) in [
+                ("T 1", "RPRT 0\n"),
+                ("\\get_level STRENGTH", "RPRT -11\n"),
+                ("\\get_level SWR", "RPRT -11\n"),
+                ("f", "14074000\n"),
+                ("T 0", "RPRT 0\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+        });
+        client.connect().await.unwrap();
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        assert!(client.get_s_meter().await.is_err());
+        assert!(client.get_swr().await.is_err());
+        assert!(ready.is_ready());
+        assert_eq!(
+            client.get_frequency(Vfo::Current).await.unwrap(),
+            14_074_000
+        );
+        assert_eq!(client.connection_generation(), 1);
+        client.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_receive_restore_is_retried_before_preparing_a_replacement_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = DataModeReadiness::new(true);
+        let client = RigctldClient::new(RigctldConfig {
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        })
+        .with_data_mode(
+            DataModePolicy::new("PKTUSB", Some(3000)).unwrap(),
+            ready.clone(),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = prepare(stream).await;
+            for (command, response) in [
+                ("S 1 VFOB", "RPRT 0\n"),
+                ("\\get_vfo", "VFOA\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOB", "RPRT 0\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOA", "RPRT -1\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            for (command, response) in [
+                ("f", "7075000\n"),
+                ("T 0", "RPRT 0\n"),
+                ("V VFOA", "RPRT 0\n"),
+                ("\\get_vfo", "VFOA\n"),
+                ("s", "1\nVFOB\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOB", "RPRT 0\n"),
+                ("\\set_mode PKTUSB 3000", "RPRT 0\n"),
+                ("V VFOA", "RPRT 0\n"),
+                ("T 1", "RPRT 0\n"),
+            ] {
+                respond(&mut read, &mut write, command, response).await;
+            }
+        });
+        client.connect().await.unwrap();
+        assert!(client.set_split(true, Vfo::B).await.is_err());
+        assert!(!ready.is_ready());
+        client.connect().await.unwrap();
+        assert!(ready.is_ready());
+        client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
+        server.await.unwrap();
     }
 }

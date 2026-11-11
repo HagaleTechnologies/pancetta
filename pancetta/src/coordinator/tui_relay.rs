@@ -2729,6 +2729,7 @@ impl super::ApplicationCoordinator {
                                     &cmd_rig_conn_state,
                                     &cmd_audio_output_alive,
                                     &cmd_message_bus.receive_gain,
+                                    &cmd_message_bus.data_mode,
                                 ) {
                                     warn!(
                                         target: "tx.policy",
@@ -4044,6 +4045,8 @@ fn ptt_on_refusal(
     rig_conn_state: &Arc<std::sync::atomic::AtomicU8>,
     audio_output_alive: &Arc<std::sync::atomic::AtomicBool>,
     receive_gain: &Arc<super::receive_overload::GainSafety>,
+
+    data_mode: &pancetta_hamlib::DataModeReadiness,
 ) -> Option<String> {
     super::tx::tx_hard_mute_reason(
         tx_policy,
@@ -4055,6 +4058,7 @@ fn ptt_on_refusal(
         rig_conn_state,
         audio_output_alive,
         receive_gain,
+        data_mode,
     )
     .map(|reason| format!("Can't key PTT — {reason}"))
 }
@@ -6347,6 +6351,7 @@ mod tui_relay_tests {
                 gain.confirmed_off(0);
                 std::sync::Arc::new(gain)
             },
+            &pancetta_hamlib::DataModeReadiness::new(false),
         );
         assert!(
             refusal.is_some(),
@@ -6394,6 +6399,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             )
             .is_some(),
             "a direct PTT-on toggle must be refused while a pending SetSplit is still \
@@ -6419,6 +6425,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
@@ -6455,6 +6462,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             )
             .is_some(),
             "a direct PTT-on toggle must be refused while a rig frequency/split command is in \
@@ -6477,6 +6485,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             ),
             None,
             "PTT-on must be permitted again once the in-flight CAT call has resolved"
@@ -6506,6 +6515,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             ),
             None,
             "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \
@@ -6554,6 +6564,7 @@ mod tui_relay_tests {
                         gain.confirmed_off(0);
                         std::sync::Arc::new(gain)
                     },
+                    &pancetta_hamlib::DataModeReadiness::new(false),
                 )
                 .is_some(),
                 "a pending command for {vfo:?} alone must still refuse a manual PTT key-up"
@@ -6584,6 +6595,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             ),
             Some("Can't key PTT — rig is disconnected".to_string())
         );
@@ -6609,6 +6621,7 @@ mod tui_relay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             ),
             Some("Can't key PTT — audio output device is dead".to_string())
         );

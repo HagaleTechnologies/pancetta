@@ -1255,6 +1255,36 @@ Removing the unused variants, or wiring Serial/Vox/hardware PTT into the runtime
 work that needs hardware validation. Existing config values, picker choices and runtime behavior
 stay as they are. Nothing here was checked against a physical rig or on the air.
 
+## Shutdown unkeys through the Hamlib loop (PAN-277, 2026-11-10)
+
+The signal handler sets the shutdown flag before coordinator cleanup runs. The
+Hamlib command loop therefore drains after that flag instead of exiting. It
+executes only PTT-off through the normal SetPtt arm, discards all key-downs and
+other commands without CAT I/O, and skips redundant unkeys after confirmation.
+This preserves the existing confirmation and receive-gain bookkeeping.
+
+The coordinator queues its own unkey, joins or aborts the TX worker, waits for
+its pending PttGuard fallback to be queued, then sets hamlib_drain_stop. The loop
+reads that stop before reading its queue, and exits only when empty. A 30 s
+ceiling prevents an abandoned drain from running forever. The TX join and
+fallback settle each get 1 s; Hamlib gets 10 s because a failing unkey on its
+normal client took about 4 s in planning tests. Handles are selected by component,
+since supervisor restarts can change their order.
+
+A fresh direct rigctld client runs concurrently as an independent backstop. Its
+6 s budget covers connection verification with f and T 0, with a 3000 ms command
+timeout and 2000 ms TCP connect timeout. A rig taking 1.5 s per reply needs about
+3 s. Raising only the outer budget fails because the default 1000 ms command
+timeout rejects f. Replay and disabled-rig gates remain in force. Concurrent
+attempts avoid adding the two budgets serially. Enqueue logs say queued, since
+a bus send cannot prove the rig acted.
+
+Reordering cleanup alone cannot help a loop that already exited. A fixed sleep
+races with the producer. Restart teardown can take about 13 s and replays to the
+same abandoned queue. The explicit producer-stop handshake avoids those paths.
+Planning measured unkey 33 to 44 ms after the flag with the real TX worker and
+a mock rig. Hardware and systemd qualification remain pending.
+
 ## One handler per TX-worker abort outcome (PAN-322, 2026-11-10)
 
 The TX worker matched every abort outcome inline: 20 `SleepOutcome` arms across the four Step 6
