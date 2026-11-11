@@ -1052,11 +1052,13 @@ impl<T: OutboxTransport> Worker<T> {
     /// stay held and the write is retried with capped backoff.
     async fn persist(&mut self, store: &OutboxStore) {
         if self.persist_blocked {
-            for entry in store
-                .entries()
-                .iter()
-                .filter(|e| self.unsaved.contains(&e.id))
-            {
+            for entry in store.entries().iter().filter(|e| {
+                self.unsaved.contains(&e.id)
+                    && !self
+                        .lanes
+                        .get(&e.destination)
+                        .is_some_and(|lane| lane.login_rejection().is_some())
+            }) {
                 Self::record_status(
                     &self.statuses,
                     Some(&entry.qso_id.to_string()),
@@ -1113,12 +1115,18 @@ impl<T: OutboxTransport> Worker<T> {
             format_wait(wait),
             err
         );
-        // PAN-344: retained entries waiting on a queue write stay Pending
-        // with a saving detail — never Accepted.
+        // PAN-344: queue-save delays leave retained entries Pending, but must
+        // not overwrite a login rejection that holds their lane for the session.
         let unsaved: Vec<(String, UploadDestination)> = store
             .entries()
             .iter()
-            .filter(|e| self.unsaved.contains(&e.id))
+            .filter(|e| {
+                self.unsaved.contains(&e.id)
+                    && !self
+                        .lanes
+                        .get(&e.destination)
+                        .is_some_and(|lane| lane.login_rejection().is_some())
+            })
             .map(|e| (e.qso_id.to_string(), e.destination))
             .collect();
         for (uuid, destination) in unsaved {
@@ -1569,6 +1577,68 @@ mod tests {
             ) == Some(UploadState::Rejected)
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn pan344_login_rejection_survives_queue_save_failure_and_recovery() {
+        use pancetta_tui::upload_status::{TargetUploadStatus, UploadState, UploadTarget};
+        let notify = Arc::new(Notify::new());
+        let (rig, q) = start_blockable(
+            FakeTransport {
+                block: Some(notify.clone()),
+                ..FakeTransport::new(&[QrzLogbook]).always(QrzLogbook, login())
+            },
+            None,
+        );
+        let saved = upload(QrzLogbook, "K1AAA");
+        let unsaved = upload(QrzLogbook, "K1BBB");
+        let ids = [saved.qso_id, unsaved.qso_id];
+        for item in [&saved, &unsaved] {
+            rig.statuses.lock().unwrap().register(
+                &item.qso_id.to_string(),
+                &item.call,
+                vec![(UploadTarget::Qrz, TargetUploadStatus::pending("queued"))],
+            );
+        }
+        rig.handle.enqueue(vec![saved]).await;
+        wait_until(|| rig.transport.calls_to(QrzLogbook) == 1).await;
+        std::fs::remove_file(&rig.path).unwrap();
+        block_writes(&q).await;
+        rig.handle.enqueue(vec![unsaved]).await;
+        wait_until(|| {
+            rig.statuses.lock().unwrap().snapshot()[1].targets[0]
+                .1
+                .reason
+                == "waiting for queue save"
+        })
+        .await;
+        notify.notify_one();
+        // Health is published after on_result's persistence attempt.
+        wait_until(|| {
+            rig.health()
+                .destinations
+                .iter()
+                .any(|h| h.login_rejected.is_some())
+        })
+        .await;
+        let assert_rejected = || {
+            let snap = rig.statuses.lock().unwrap().snapshot();
+            for uuid in &ids {
+                assert_eq!(
+                    status_of(&snap, uuid, UploadTarget::Qrz),
+                    Some(UploadState::Rejected),
+                    "login rejection must survive queue-save status updates"
+                );
+                let entry = snap.iter().find(|s| s.uuid == uuid.to_string()).unwrap();
+                assert!(entry.targets[0].1.reason.contains("login rejected"));
+            }
+        };
+        assert_rejected();
+        std::fs::remove_file(&q).unwrap();
+        std::fs::create_dir(&q).unwrap();
+        wait_until(|| rig.path.exists()).await;
+        assert_rejected();
+        assert_eq!(rig.transport.calls_to(QrzLogbook), 1);
     }
 
     /// PAN-344 AC5: a queue-capacity refusal marks every refused target
