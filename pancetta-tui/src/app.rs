@@ -2133,7 +2133,7 @@ impl App {
         // shrink).
         self.clamp_band_activity_selection();
         self.persist_tui_state();
-        self.status_message = format!("View: {:?}", self.active_view);
+        self.status_message = crate::presentation::view_message(self.active_view).to_string();
     }
 
     /// Apply the coordinator's authoritative `DecodeEffortUpdate` echo

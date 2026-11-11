@@ -149,6 +149,7 @@ directory = "~/.pancetta/recordings"
 |---|---|---|---|
 | `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
 | `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+| `raw_capture_minutes` | integer | `0` | Minutes of raw 48 kHz capture after each start, one WAV per FT8 slot, into `raw48/` inside `directory`. `0` is off. Needs `auto_record = true` and `[audio] sample_rate = 48000`. |
 
 - Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
   300 KB for FT8), named `ft8_<UTC date>_<time>[_<band>].wav`. Windows of
@@ -157,11 +158,13 @@ directory = "~/.pancetta/recordings"
 - The directory is capped at 10 GB of top-level `*.wav` files. Past that,
   the oldest recording (by filename) is deleted for each new one.
 - With recording on, pancetta also saves the first 90 s of raw capture once
-  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory.
+  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory,
+  whatever `raw_capture_minutes` says.
 - `--replay` and `--no-audio` runs never record, whatever this says.
 - The other keys in this table (`format`, `bit_depth`, `sample_rate`,
   `max_length_minutes`, `filename_pattern`, `compression_level`) are not
-  read. Recordings always use the format above.
+  read. Recordings always use the format above. (`raw_capture_minutes` is
+  read; see "Raw 48 kHz capture" below.)
 - Changes take effect after a restart.
 - The startup log says which way it went: `WAV recording enabled: dir=…`
   or `WAV recording disabled -- set audio.recording.auto_record = true …`.
@@ -172,6 +175,63 @@ directory = "~/.pancetta/recordings"
 `~/.pancetta/recordings`. A station that feeds them must set both keys as
 shown above. `auto_record = true` on its own records into the default
 `~/Documents/Pancetta/Recordings`, which nothing collects.
+
+**Raw 48 kHz capture.** For decimation studies, pancetta can also keep the
+raw capture stream, before it is decimated to 12 kHz, for a set time after
+each start:
+
+```toml
+[audio.recording]
+auto_record = true
+raw_capture_minutes = 30
+```
+
+- For `raw_capture_minutes` after each start, pancetta writes one WAV per
+  FT8 slot into `raw48/` inside `directory`. Each file holds 15 s of the
+  capture stream: 48 kHz, 16-bit, `[audio] input_channels` channels. That
+  is 2,880,044 bytes in stereo (the FTdx10 default) and 1,440,044 in mono,
+  so `[audio.recording] raw_capture_minutes = 30` is 120 files, about 346 MB
+  in stereo.
+- Sample 0 of a file is 0.5 s before the slot boundary (1.0 s with
+  `[decoder] extended_capture_window_enabled`), the same lead the live
+  decode window uses, so a slot's decode window is a prefix of its raw file.
+- Files are named `raw48_<UTC date>_<UTC slot boundary>[_<band>][_tx].wav`,
+  for example `raw48_20261110_122645_20m_tx.wav`. The time is the slot
+  boundary, so its seconds are always 00, 15, 30 or 45. An unknown dial drops
+  the band, as the 12 kHz files do.
+- The 12 kHz decode-window files are named with the time the window was
+  cut, 12.5 to 14 s after the slot boundary. So slot `122630` pairs with
+  `ft8_..._122643_...`.
+- `_tx` means one of pancetta's own TX-worker key-downs (a normal, multi-stream
+  or tune transmission) overlapped the file's 15 s span. Manual PTT from the
+  TUI, front-panel TX and other programs' TX are not marked.
+- A slot is skipped when it is digital silence, when the dial, the mode or
+  the receive gain changes during it, or when audio goes missing for more than
+  250 ms (a shorter gap is not detected). The first, partial slot after start
+  is skipped too.
+- Raw capture records FT8 slots only. While FT4 or FT2 is active it pauses
+  (`Raw 48 kHz capture paused: FT4 is active …`) and resumes when FT8 returns.
+- `raw48/` has its own cap of 2 GB of top-level `*.wav` files (about 745
+  stereo files, or 186 minutes). When the next file would pass it, raw
+  capture stops for this run and logs `Raw 48 kHz capture stopped: … holds
+  … MB and the next file would pass the 2.0 GB cap. Decode-window recording
+  continues.` A later start finds the folder still full and stops again at
+  its first slot, until you delete files. Pancetta never deletes anything in
+  `raw48/`.
+- `raw48/` does not count toward the 10 GB decode-window cap, and the corpus
+  offload and decoder tools skip it, because they read only top-level files.
+- It needs `[audio] sample_rate = 48000`. Any other rate logs
+  `Raw 48 kHz capture off -- [audio] sample_rate is … Hz …` and writes no raw
+  files. With recording off (`auto_record` unset, `--replay`, `--no-audio`)
+  the key is ignored, with a log line saying so.
+- File I/O runs on its own thread. If the disk falls about 30 s behind, a
+  slot is dropped with a warning; decoding and transmitting are never delayed.
+- Changes take effect after a restart. A component restart inside the
+  same run does not extend the capture.
+- The startup log says `Raw 48 kHz capture enabled: dir=…, length=30 min
+  (until 12:56:19 UTC), …`. At the end it says `Raw 48 kHz capture finished:
+  raw_capture_minutes = 30 ended at 12:56:19 UTC` and then `Raw 48 kHz capture
+  wrote N files (… MB) to …`.
 
 ---
 
@@ -1239,7 +1299,9 @@ corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
 Releases before this setting existed recorded every window into
 `~/.pancetta/recordings` unconditionally; upgrading does not touch those
 files, and deleting them reclaims the space (the directory was capped at
-10 GB).
+10 GB). The `raw48/` subdirectory holds raw 48 kHz captures
+(`raw_capture_minutes`), which the decoder corpus tools skip: they read only
+top-level files or only 12 kHz mono files.
 
 ---
 
