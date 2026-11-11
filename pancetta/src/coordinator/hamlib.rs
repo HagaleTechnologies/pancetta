@@ -9839,7 +9839,6 @@ mod pan251_swr_protection_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod pan276_data_mode_tests {
     use super::*;
     use crate::message_bus::{RigControlMessage, SendIfOutcome};
@@ -10147,7 +10146,10 @@ mod pan276_data_mode_tests {
         assert!(c.message_bus.data_mode.is_ready());
         c.shutdown_signal.store(true, Ordering::Release);
         c.teardown_hamlib().await;
-=======
+    }
+}
+
+#[cfg(test)]
 mod pan272_ptt_off_watchdog_tests {
     //! PAN-272: the Hamlib command loop keeps the PTT watchdog armed until
     //! the rig confirms a PTT-off. End to end through the real
@@ -10470,6 +10472,5 @@ mod pan272_ptt_off_watchdog_tests {
 
         s.rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
         c.shutdown_signal.store(true, Ordering::Release);
->>>>>>> e5a553cfab7c125c74bd606b208826e27e18aa63
     }
 }
