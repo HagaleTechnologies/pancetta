@@ -36,7 +36,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 #[doc(hidden)]
-pub use qso::prepare_local_qso_index;
+pub use qso::{prepare_local_qso_index, LocalIndex};
 mod qso_filter;
 mod raw_capture;
 mod readiness;

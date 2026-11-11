@@ -289,9 +289,11 @@ async fn unconfirmed_policy_renders_needed_then_confirmed() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rebuilt = pancetta_lib::coordinator::prepare_local_qso_index(&local_adif, &dbpath)
-        .await
-        .unwrap();
+    let rebuilt =
+        match pancetta_lib::coordinator::prepare_local_qso_index(&local_adif, &dbpath).await {
+            pancetta_lib::coordinator::LocalIndex::Ready(db) => db,
+            _ => panic!("confirmation import must rebuild a ready index"),
+        };
     let lookup = CachedStationLookup::new();
     lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
     lookup.seed_worked_history(&rebuilt).await.unwrap();

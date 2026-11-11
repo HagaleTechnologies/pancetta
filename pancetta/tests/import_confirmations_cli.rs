@@ -291,7 +291,10 @@ async fn restart_rebuilds_confirmation_index() {
         } else {
             assert!(!s.db().exists());
         }
-        let db = prepare_local_qso_index(&s.adif(), &s.db()).await.unwrap();
+        let db = match prepare_local_qso_index(&s.adif(), &s.db()).await {
+            pancetta_lib::coordinator::LocalIndex::Ready(db) => db,
+            _ => panic!("confirmation import must rebuild a ready index"),
+        };
         let history = db.worked_history().await.unwrap();
         assert_eq!(history.len(), 1);
         assert!(history[0].confirmed);

@@ -11388,34 +11388,9 @@ async fn start_local_qso_log_writers(
     (adif_writer, async_logger, seed_db)
 }
 
-<<<<<<< HEAD
-/// Bring the rebuildable SQLite index in line with the ADIF source of truth
-/// BEFORE either local log writer opens a file (PAN-127), and return it for
-/// the worked-station seed (`None` when it cannot be opened).
-///
-/// Three-case startup decision (non-replay only):
-///   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
-///      so contacts are not lost; future runs use ADIF as source of truth.
-///   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
-///      index so duplicate detection sees every prior contact.
-///   3. Open as-is: normal startup; index is current.
-///
-/// The order matters: `AdifLogWriter::open` creates an empty `qsos.adi` and
-/// `QsoLogger::new` an empty `qso.db`. When the writers opened first, the new
-/// empty ADIF made a legacy-only `qso.db` look stale, so the rebuild wiped
-/// every legacy contact, and a freshly created `qso.db` made a missing index
-/// look current, so it was never rebuilt.
-///
-/// Every path here is a write against the *real* `~/.pancetta/qsos.adi` /
-/// `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
-/// NOT EXISTS`, a write-mode connection even on an already-current DB) — not
-/// anything derived from `--replay`'s capture-dir argument, so it only runs
-/// from the live branch of [`start_local_qso_log_writers`] (PAN-41).
-#[doc(hidden)]
-pub async fn prepare_local_qso_index(
-=======
 /// The history seed and whether a refused migration must hold back ADIF creation.
-pub(crate) enum LocalIndex {
+#[doc(hidden)]
+pub enum LocalIndex {
     Ready(pancetta_qso::async_database::QsoDatabase),
     Unavailable { reason: String },
     MigrationRefused { reason: String },
@@ -11437,8 +11412,8 @@ impl LocalIndex {
 /// Reconcile contacts before either writer opens a file. An unchanged ADIF
 /// needs no rebuild regardless of timestamps. A migration refusal must never
 /// create a header-only ADIF that would erase legacy contacts on the next start.
-async fn prepare_local_qso_index(
->>>>>>> 2108c5b582f6ac4bb7f753cf607c54a74640e53e
+#[doc(hidden)]
+pub async fn prepare_local_qso_index(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
 ) -> LocalIndex {

@@ -9,11 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<<<<<<< HEAD
 - PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.
-=======
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
->>>>>>> 2108c5b582f6ac4bb7f753cf607c54a74640e53e
 
 ### Changed
 
