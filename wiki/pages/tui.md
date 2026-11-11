@@ -69,12 +69,11 @@ its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
 
-<<<<<<< HEAD
 Replay sessions show `TX: REPLAY` in neutral gray from the first title-bar draw,
 regardless of TX policy. The session flag is supplied by the coordinator and is
 not saved in TUI config. See
 [the TX-policy banner decision](../../docs/DECISIONS/tui.md#tri-state-global-tx-policy).
-=======
+
 Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
 PTT and view labels are separate from Debug and persistence strings. Rarity
 cells use words in a nine-cell column. Band Activity uses integer kilometres
@@ -86,4 +85,3 @@ symbols. Check positive content in a direct panel as well as scanning full
 views, since a hidden column or clipped overlay can hide a broken label.
 `pan353_rendered_text` covers labels, action messages, distance placement and
 marker widths. Its scanner is for controlled fixtures, not arbitrary radio text.
->>>>>>> f078104113d5fc1b059594041628336ad309d3ae
