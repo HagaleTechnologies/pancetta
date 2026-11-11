@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{create_panel_block, format_distance, get_snr_color};
+use super::{create_panel_block, format_distance_cell, get_snr_color};
 use crate::app::{ActivePanel, App, DecodedMessageView};
 
 /// Single source of truth for Band Activity's column set (Task 20b). Header
@@ -230,7 +230,6 @@ fn create_message_row<'a>(
             None => "---".to_string(),
         }
     };
-<<<<<<< HEAD
     let call_str = if !msg.is_own_tx && msg.call_sign.is_some() {
         format!(
             "{}{}{}",
@@ -264,11 +263,7 @@ fn create_message_row<'a>(
         Some(square) => square,
         None => "---".into(),
     };
-    let dist_str = format_distance(msg.distance);
-=======
-    let grid_str = msg.grid_square.as_deref().unwrap_or("---");
-    let dist_str = super::format_distance_cell(msg.distance);
->>>>>>> 88af8930a9594ad8179ed41c213be781fcc1da85
+    let dist_str = format_distance_cell(msg.distance);
 
     // Truncate long messages. Raised from 30 to 60 chars (Task 20a) — the
     // Msg column absorbed the space freed by dropping the per-row-constant
