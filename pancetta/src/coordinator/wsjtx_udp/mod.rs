@@ -7,7 +7,7 @@
 //! (`pancetta/src/coordinator/psk_reporter.rs`): `enabled = false` (default)
 //! ⇒ no socket is ever bound and a bus-drain task keeps the channel open so
 //! the decoder fan-out never backs up; `enabled = true` ⇒ open the socket,
-//! emit Heartbeat every 15s and change-driven Status, fan in FT8 decodes
+//! emit Heartbeat every 15s and change-driven Status, fan in FT8/FT4 decodes
 //! (additive tap in `ft8.rs`) as Decode(2) into a 500-entry retention ring,
 //! emit Clear(3) on band change, answer Replay(7) by re-emitting the ring
 //! with `New=false`, and emit Close(6) on shutdown. `--replay` forces the
@@ -166,6 +166,8 @@ impl super::ApplicationCoordinator {
             last_decode_timestamp: self.last_decode_timestamp.clone(),
         };
 
+        let qso_manager = self.qso_manager_watch.subscribe();
+        let latest_tx_intent = self.latest_tx_intent.clone();
         let instance_id = cfg.instance_id.clone();
         let shutdown = self.shutdown_signal.clone();
         // Task 6 (inbound dispatch): the audit trail (`emit_diagnostic`) and
@@ -195,7 +197,7 @@ impl super::ApplicationCoordinator {
             // send it synchronously here, before the loop (and therefore
             // before any future Decode fan-in drained from `wsjtx_rx`) ever
             // gets a chance to run.
-            let initial_snapshot = state.sample();
+            let initial_snapshot = sample_status(&state, &qso_manager, &latest_tx_intent).await;
             let initial_status = build_status(&initial_snapshot, &station_ids);
             let mut last_status = initial_status.encode(&instance_id);
             if let Err(e) = socket.send_to(&last_status, dest).await {
@@ -296,7 +298,7 @@ impl super::ApplicationCoordinator {
                         if let Err(e) = socket.send_to(&hb.encode(&instance_id), dest).await {
                             warn!("WSJT-X UDP: heartbeat send failed: {e}");
                         }
-                        let snapshot = state.sample();
+                        let snapshot = sample_status(&state, &qso_manager, &latest_tx_intent).await;
                         if let Some(band) = band_changed(snapshot.dial_frequency_hz, last_band) {
                             last_band = Some(band);
                             decode_ring.clear();
@@ -315,7 +317,7 @@ impl super::ApplicationCoordinator {
                     // Also the band-change sampler: a dial-frequency move
                     // into a new MHz bucket invalidates the retained ring.
                     _ = status_timer.tick() => {
-                        let snapshot = state.sample();
+                        let snapshot = sample_status(&state, &qso_manager, &latest_tx_intent).await;
                         if let Some(band) = band_changed(snapshot.dial_frequency_hz, last_band) {
                             last_band = Some(band);
                             decode_ring.clear();
@@ -426,7 +428,7 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                     }
-                                    let encoded = build_status(&state.sample(), &station_ids).encode(&instance_id);
+                                    let encoded = build_status(&sample_status(&state, &qso_manager, &latest_tx_intent).await, &station_ids).encode(&instance_id);
                                     if let Err(e) = socket.send_to(&encoded, dest).await {
                                         warn!("WSJT-X UDP: post-replay status send failed: {e}");
                                     }
@@ -736,6 +738,7 @@ impl WsjtxState {
             tx_enabled: policy.allows_any_tx(),
             transmitting: self.ptt_active.load(Ordering::Relaxed),
             decoding,
+            contact: ContactStatus::default(),
         }
     }
 }
@@ -744,7 +747,7 @@ impl WsjtxState {
 /// separate from the atomics themselves so [`build_status`] — the mapping
 /// from sampled values to wire fields — is a pure, easily-tested function
 /// with no `Arc`/`Ordering` involved.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatusSnapshot {
     /// `operating_frequency_hz` (mod.rs) — the rig dial frequency in Hz.
     pub(crate) dial_frequency_hz: u64,
@@ -758,6 +761,86 @@ pub(crate) struct StatusSnapshot {
     pub(crate) transmitting: bool,
     /// `true` when `last_decode_timestamp` is within the last 2s.
     pub(crate) decoding: bool,
+    contact: ContactStatus,
+}
+
+/// All contact fields are selected together; an empty selection clears them.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ContactStatus {
+    dx_call: String,
+    report: String,
+    dx_grid: String,
+    rx_df: u32,
+    tx_message: String,
+}
+
+fn select_status_qso<'a>(
+    qsos: &'a [(pancetta_qso::QsoId, pancetta_qso::QsoProgress)],
+    mode: &str,
+) -> Option<&'a (pancetta_qso::QsoId, pancetta_qso::QsoProgress)> {
+    qsos.iter()
+        .filter(|(_, q)| {
+            q.state.is_active()
+                && q.metadata.mode == mode
+                && q.metadata
+                    .their_callsign
+                    .as_ref()
+                    .is_some_and(|call| !call.is_empty())
+        })
+        .min_by_key(|(id, q)| (q.metadata.start_time, id.to_string()))
+}
+
+fn contact_status(
+    selected: Option<&(pancetta_qso::QsoId, pancetta_qso::QsoProgress)>,
+    intents: &std::sync::RwLock<std::collections::HashMap<String, super::LatestTxIntent>>,
+) -> ContactStatus {
+    let Some((id, qso)) = selected else {
+        return ContactStatus::default();
+    };
+    let metadata = &qso.metadata;
+    let rx = metadata.partner_freq.unwrap_or(metadata.frequency);
+    ContactStatus {
+        dx_call: metadata.their_callsign.clone().unwrap_or_default(),
+        report: match &qso.state {
+            pancetta_qso::QsoState::WaitingForReport { our_report, .. }
+            | pancetta_qso::QsoState::SendingReport { our_report, .. }
+            | pancetta_qso::QsoState::WaitingForConfirmation { our_report, .. }
+            | pancetta_qso::QsoState::SendingConfirmation { our_report, .. } => Some(*our_report),
+            _ => metadata.reports.sent,
+        }
+        .map(|report| format!("{report:+03}"))
+        .unwrap_or_default(),
+        dx_grid: metadata.grids.theirs.clone().unwrap_or_default(),
+        rx_df: if rx.is_finite() && rx >= 0.0 && rx <= u32::MAX as f64 {
+            rx.round() as u32
+        } else {
+            0
+        },
+        tx_message: intents
+            .read()
+            .ok()
+            .and_then(|map| {
+                map.get(&super::active_tx_qso_key(&id.to_string()))
+                    .filter(|i| i.request_queued)
+                    .map(|i| i.message_text.clone())
+            })
+            .unwrap_or_default(),
+    }
+}
+
+async fn sample_status(
+    state: &WsjtxState,
+    manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+    intents: &std::sync::RwLock<std::collections::HashMap<String, super::LatestTxIntent>>,
+) -> StatusSnapshot {
+    let mut snapshot = state.sample();
+    // Release the watch borrow before awaiting the manager's snapshot lock.
+    let manager = manager_watch.borrow().clone();
+    if let Some(manager) = manager {
+        let qsos = manager.get_active_qsos().await;
+        snapshot.contact = contact_status(select_status_qso(&qsos, snapshot.mode), intents);
+    }
+    snapshot
 }
 
 /// Station identity fields sampled once from config at component start,
@@ -777,34 +860,33 @@ pub(crate) struct StationIds {
 /// mapping is exhaustively unit-tested without a socket or running
 /// coordinator.
 ///
-/// Fields this task has no live source for yet (DXCall/Report/DXGrid —
-/// tracked from an active QSO/decode in later tasks; TxMessage — the text
-/// currently being transmitted) are emitted as unset (empty string; the
-/// codec always writes the explicit `0x00000000` empty form, never the
-/// `0xFFFFFFFF` null sentinel — both decode to `""` per protocol notes §3).
 pub(crate) fn build_status(snapshot: &StatusSnapshot, ids: &StationIds) -> OutMsg {
     OutMsg::Status {
         dial_frequency: snapshot.dial_frequency_hz,
         mode: snapshot.mode.to_string(),
-        dx_call: String::new(),
-        report: String::new(),
+        dx_call: snapshot.contact.dx_call.clone(),
+        report: snapshot.contact.report.clone(),
         tx_mode: snapshot.mode.to_string(),
         tx_enabled: snapshot.tx_enabled,
         transmitting: snapshot.transmitting,
         decoding: snapshot.decoding,
-        rx_df: 0,
+        rx_df: snapshot.contact.rx_df,
         tx_df: snapshot.tx_df_hz,
         de_call: ids.de_call.clone(),
         de_grid: ids.de_grid.clone(),
-        dx_grid: String::new(),
+        dx_grid: snapshot.contact.dx_grid.clone(),
         tx_watchdog: false,
         sub_mode: String::new(),
         fast_mode: false,
         special_operation_mode: 0,
         frequency_tolerance: u32::MAX,
-        tr_period: u32::MAX,
+        tr_period: match snapshot.mode {
+            "FT8" => 15,
+            "FT4" => 7,
+            _ => u32::MAX,
+        },
         configuration_name: "Default".to_string(),
-        tx_message: String::new(),
+        tx_message: snapshot.contact.tx_message.clone(),
     }
 }
 
@@ -839,27 +921,23 @@ pub(crate) struct StoredKey {
 /// OUT table). Pure — no atomics, no I/O, `mode` passed in explicitly — so
 /// field mapping is exhaustively unit-tested without a running component.
 ///
-/// v1 emits `Decode` only when the station's active mode is FT8: `"~"` is
-/// the only byte-verified mode glyph (protocol notes §8 flag 7 — FT4's
-/// glyph is unconfirmed from non-GPL sources). Returns `None` for any other
-/// active mode rather than guessing an unverified glyph; this must not
-/// perturb decode behavior outside this fan-out (`mode=FT8` paths stay
-/// byte-identical — the gate only decides whether a *wsjtx* message is
-/// produced).
+/// FT4 uses the published "+" glyph; FT2 has no supported UDP glyph.
 pub(crate) fn decode_to_msg(
     d: &pancetta_ft8::DecodedMessage,
     mode: pancetta_config::OperatingMode,
 ) -> Option<OutMsg> {
-    if mode != pancetta_config::OperatingMode::Ft8 {
-        return None;
-    }
+    let glyph = match mode {
+        pancetta_config::OperatingMode::Ft8 => "~",
+        pancetta_config::OperatingMode::Ft4 => "+",
+        pancetta_config::OperatingMode::Ft2 => return None,
+    };
     Some(OutMsg::Decode {
         new: true,
         time_ms: time_ms_since_midnight_utc(d.timestamp),
         snr: d.snr_db.round() as i32,
         delta_time: d.time_offset,
         delta_freq: d.frequency_offset as u32,
-        mode: "~".to_string(),
+        mode: glyph.to_string(),
         message: d.text.clone(),
         low_confidence: false,
         off_air: false,
@@ -1487,6 +1565,7 @@ mod status_tests {
             tx_enabled,
             transmitting: false,
             decoding: true,
+            contact: ContactStatus::default(),
         }
     }
 
@@ -1566,7 +1645,7 @@ mod status_tests {
     }
 
     #[test]
-    fn frequency_tolerance_and_tr_period_are_sentinel_unset() {
+    fn status_period_and_ordinary_operation_values() {
         let status = build_status(&snapshot(true), &ids());
         let OutMsg::Status {
             frequency_tolerance,
@@ -1577,7 +1656,21 @@ mod status_tests {
             panic!("expected OutMsg::Status");
         };
         assert_eq!(frequency_tolerance, u32::MAX);
-        assert_eq!(tr_period, u32::MAX);
+        assert_eq!(tr_period, 15);
+        for (mode, expected) in [("FT8", 15), ("FT4", 7), ("FT2", u32::MAX)] {
+            let mut s = snapshot(false);
+            s.mode = mode;
+            let OutMsg::Status {
+                tr_period,
+                special_operation_mode,
+                ..
+            } = build_status(&s, &ids())
+            else {
+                panic!()
+            };
+            assert_eq!(tr_period, expected);
+            assert_eq!(special_operation_mode, 0);
+        }
     }
 
     #[test]
@@ -1663,11 +1756,26 @@ mod decode_tests {
     }
 
     #[test]
-    fn non_ft8_active_mode_emits_nothing() {
+    fn ft4_mode_emits_decode_with_plus_glyph_and_text() {
         let d = decoded(-5.0, 1302.0, 0.2, "CQ K1ABC FN42", known_timestamp());
-        // v1 only has a byte-verified glyph for FT8 (protocol notes §8 flag
-        // 7) — FT4/FT2 must not guess one.
-        assert!(decode_to_msg(&d, OperatingMode::Ft4).is_none());
+        // FT4 follows the published glyph; FT2 remains unsupported.
+        let OutMsg::Decode {
+            mode,
+            message,
+            time_ms,
+            snr,
+            delta_time,
+            delta_freq,
+            new,
+            ..
+        } = decode_to_msg(&d, OperatingMode::Ft4).expect("FT4 Decode")
+        else {
+            panic!()
+        };
+        assert_eq!((mode.as_str(), message.as_str()), ("+", "CQ K1ABC FN42"));
+        assert_eq!((time_ms, snr, delta_freq), (45_296_789, -5, 1302));
+        assert_eq!(delta_time, 0.2);
+        assert!(new);
         assert!(decode_to_msg(&d, OperatingMode::Ft2).is_none());
     }
 
@@ -2699,5 +2807,573 @@ mod replay_gate_tests {
             .await
             .expect("consent re-enabled live: Reply initiates a remote QSO");
         assert_eq!((callsign.as_str(), remote_origin), ("W1AW", true));
+    }
+}
+
+#[cfg(test)]
+mod active_status_tests {
+    use super::*;
+    use pancetta_qso::{QsoId, QsoManager, QsoManagerConfig, QsoProgress, QsoState};
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    pub(super) fn manager(mode: &str) -> QsoManager {
+        QsoManager::new(QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            our_grid: Some("EM12".into()),
+            active_mode: mode.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn contact(manager: &QsoManager, call: &str) -> (QsoId, QsoProgress) {
+        let id = manager
+            .respond_to_cq(call.into(), 1500.0, None)
+            .await
+            .unwrap();
+        (id, manager.get_qso(id).await.unwrap())
+    }
+
+    pub(super) fn intent() -> super::super::LatestTxIntent {
+        super::super::LatestTxIntent {
+            message_text: "DL1ABC K5ARH R-10".into(),
+            frequency_offset: 1500.0,
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+            attempt_id: None,
+            request_queued: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_qso_populates_status_fields() {
+        let manager = manager("FT8");
+        let mut q = contact(&manager, "DL1ABC").await;
+        q.1.metadata.reports.sent = Some(-10);
+        q.1.metadata.reports.received = Some(-17);
+        q.1.metadata.partner_freq = Some(1302.0);
+        q.1.metadata.grids.theirs = Some("JO62".into());
+        let intents = RwLock::new(HashMap::from([(
+            super::super::active_tx_qso_key(&q.0.to_string()),
+            intent(),
+        )]));
+        super::super::settle_tx_intent(
+            &intents,
+            &super::super::active_tx_qso_key(&q.0.to_string()),
+            &intent(),
+            true,
+        );
+        let c = contact_status(Some(&q), &intents);
+        assert_eq!(
+            c,
+            ContactStatus {
+                dx_call: "DL1ABC".into(),
+                report: "-10".into(),
+                dx_grid: "JO62".into(),
+                rx_df: 1302,
+                tx_message: "DL1ABC K5ARH R-10".into(),
+            }
+        );
+        let snapshot = StatusSnapshot {
+            dial_frequency_hz: 14_074_000,
+            mode: "FT8",
+            tx_df_hz: 1500,
+            tx_enabled: true,
+            transmitting: false,
+            decoding: false,
+            contact: c,
+        };
+        let OutMsg::Status {
+            dx_call,
+            report,
+            rx_df,
+            tx_df,
+            tx_message,
+            tr_period,
+            special_operation_mode,
+            ..
+        } = build_status(
+            &snapshot,
+            &StationIds {
+                de_call: "K5ARH".into(),
+                de_grid: "EM12".into(),
+            },
+        )
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (dx_call.as_str(), report.as_str(), tx_message.as_str()),
+            ("DL1ABC", "-10", "DL1ABC K5ARH R-10")
+        );
+        assert_eq!(
+            (rx_df, tx_df, tr_period, special_operation_mode),
+            (1302, 1500, 15, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_selection_is_stable_across_input_order() {
+        let manager = manager("FT8");
+        let first = contact(&manager, "DL1ABC").await;
+        let mut second = contact(&manager, "W1AW").await;
+        second.1.metadata.start_time = first.1.metadata.start_time;
+        let mut qsos = vec![first.clone(), second.clone()];
+        let expected = first.0.to_string().min(second.0.to_string());
+        assert_eq!(
+            select_status_qso(&qsos, "FT8").unwrap().0.to_string(),
+            expected
+        );
+        qsos.reverse();
+        assert_eq!(
+            select_status_qso(&qsos, "FT8").unwrap().0.to_string(),
+            expected
+        );
+        qsos[0].1.metadata.start_time -= chrono::Duration::seconds(1);
+        assert_eq!(select_status_qso(&qsos, "FT8").unwrap().0, qsos[0].0);
+        qsos[0].1.metadata.their_callsign = None;
+        assert_eq!(select_status_qso(&qsos, "FT8").unwrap().0, qsos[1].0);
+        qsos[1].1.metadata.mode = "FT4".into();
+        assert!(select_status_qso(&qsos, "FT8").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_qso_clears_or_reselects_status() {
+        let manager = manager("FT8");
+        let first = contact(&manager, "DL1ABC").await;
+        let second = contact(&manager, "W1AW").await;
+        let mut qsos = vec![first, second];
+        qsos[0].1.state = QsoState::Completed {
+            their_callsign: "DL1ABC".into(),
+            frequency: 1500.0,
+            completed_at: Utc::now(),
+            our_report: -10,
+            their_report: -17,
+            grid_square: None,
+            duration_seconds: 60,
+        };
+        assert_eq!(select_status_qso(&qsos, "FT8").unwrap().0, qsos[1].0);
+        manager.cancel_qso(qsos[1].0).await.unwrap();
+        assert!(manager.get_qso(qsos[1].0).await.is_err());
+        qsos[1].1.state = pancetta_qso::QsoState::Failed {
+            reason: pancetta_qso::QsoFailureReason::UserCancelled,
+            failed_at: Utc::now(),
+            last_state: Box::new(qsos[1].1.state.clone()),
+        };
+        assert!(select_status_qso(&qsos, "FT8").is_none());
+        assert_eq!(
+            contact_status(None, &RwLock::new(HashMap::new())),
+            ContactStatus::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn unqueued_intent_is_not_status_tx_message() {
+        let manager = manager("FT8");
+        let mut q = contact(&manager, "DL1ABC").await;
+        let intents = RwLock::new(HashMap::from([(
+            super::super::active_tx_qso_key(&q.0.to_string()),
+            intent(),
+        )]));
+        assert_eq!(contact_status(Some(&q), &intents).tx_message, "");
+        assert_eq!(contact_status(Some(&q), &intents).report, "");
+        for bad in [f64::NAN, f64::INFINITY, -2.0, u32::MAX as f64 + 1.0] {
+            q.1.metadata.partner_freq = Some(bad);
+            assert_eq!(contact_status(Some(&q), &intents).rx_df, 0);
+        }
+        q.1.metadata.partner_freq = None;
+        assert_eq!(contact_status(Some(&q), &intents).rx_df, 1500);
+        let _ = std::panic::catch_unwind(|| {
+            let _lock = intents.write().unwrap();
+            panic!("poison test");
+        });
+        assert_eq!(contact_status(Some(&q), &intents).tx_message, "");
+    }
+}
+
+#[cfg(test)]
+mod ft4_component_tests {
+    use super::active_status_tests::{intent, manager};
+    use super::*;
+    use crate::coordinator::ApplicationCoordinator;
+    use pancetta_config::{Config, OperatingMode};
+
+    async fn setup() -> (
+        ApplicationCoordinator,
+        tokio::net::UdpSocket,
+        tempfile::TempDir,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.wsjtx_udp.enabled = true;
+        config.network.wsjtx_udp.accept_udp_requests = true;
+        config.network.wsjtx_udp.destination = listener.local_addr().unwrap().to_string();
+        let coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            scratch.path().join("config.toml"),
+            true,
+            Some(scratch.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        (coordinator, listener, scratch)
+    }
+
+    async fn receive(listener: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut bytes = [0u8; 4096];
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(4), listener.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        (bytes[..n].to_vec(), source)
+    }
+
+    fn packet_type(bytes: &[u8]) -> u32 {
+        u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+    }
+
+    async fn packet(listener: &tokio::net::UdpSocket, kind: u32) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let (bytes, _) = receive(listener).await;
+                if packet_type(&bytes) == kind {
+                    return bytes;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn payload(bytes: &[u8]) -> codec::Reader<'_> {
+        let mut r = codec::Reader::new(bytes);
+        assert_eq!(r.read_u32(), Some(0xadbc_cbda));
+        assert_eq!(r.read_u32(), Some(2));
+        r.read_u32().unwrap();
+        r.read_utf8().unwrap();
+        r
+    }
+
+    async fn send_decode(c: &ApplicationCoordinator, text: &str, dial: u64) -> OutMsg {
+        let mut decoded =
+            pancetta_ft8::DecodedMessage::new(Ft8Message::default(), -10.0, 1.0, 1302.0, 0.2);
+        decoded.text = text.into();
+        decoded.captured_dial_hz = Some(dial);
+        let expected = decode_to_msg(&decoded, OperatingMode::Ft4).unwrap();
+        c.message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::WsjtxUdp,
+                MessageType::DecodedMessage(decoded),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        expected
+    }
+
+    async fn stop(mut c: ApplicationCoordinator) {
+        c.shutdown_signal.store(true, Ordering::Release);
+        for (_, task) in c.named_task_handles.drain(..) {
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ft4_live_decode_and_replay_reach_udp_listener() {
+        let (mut c, listener, _scratch) = setup().await;
+        c.active_protocol_mode
+            .store(OperatingMode::Ft4.as_u8(), Ordering::Relaxed);
+        c.start_wsjtx_udp_component().await.unwrap();
+        let (first, source) = receive(&listener).await;
+        assert_eq!(packet_type(&first), 1, "startup Status precedes any Decode");
+        assert_eq!(status_contact(&first), ContactStatus::default());
+        let id = c.config.read().await.network.wsjtx_udp.instance_id.clone();
+        let one = send_decode(&c, "CQ DL1ABC JO62", 0).await;
+        let two = send_decode(&c, "CQ W1AW FN31", 0).await;
+        assert_eq!(packet(&listener, 2).await, one.encode(&id));
+        assert_eq!(packet(&listener, 2).await, two.encode(&id));
+        let mut replay = codec::Writer::new();
+        replay.u32(0xadbc_cbda);
+        replay.u32(2);
+        replay.u32(7);
+        replay.utf8(&id);
+        listener.send_to(&replay.into_vec(), source).await.unwrap();
+        for mut expected in [one, two] {
+            if let OutMsg::Decode { new, .. } = &mut expected {
+                *new = false;
+            }
+            assert_eq!(packet(&listener, 2).await, expected.encode(&id));
+        }
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn ft4_startup_status_precedes_decode() {
+        // Queue before the first receive to exercise startup ordering.
+        let (mut c, listener, _scratch) = setup().await;
+        c.active_protocol_mode
+            .store(OperatingMode::Ft4.as_u8(), Ordering::Relaxed);
+        c.start_wsjtx_udp_component().await.unwrap();
+        let expected = send_decode(&c, "CQ DL1ABC JO62", 0).await;
+        let first = receive(&listener).await.0;
+        assert_eq!(packet_type(&first), 1);
+        status_contact(&first);
+        let id = c.config.read().await.network.wsjtx_udp.instance_id.clone();
+        assert_eq!(packet(&listener, 2).await, expected.encode(&id));
+        c.active_protocol_mode
+            .store(OperatingMode::Ft8.as_u8(), Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let bytes = packet(&listener, 1).await;
+                status_contact(&bytes);
+                let mut r = payload(&bytes);
+                r.read_u64().unwrap();
+                if r.read_utf8().as_deref() == Some("FT8") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn ft4_stale_band_decode_is_not_broadcast() {
+        let (mut c, listener, _scratch) = setup().await;
+        c.active_protocol_mode
+            .store(OperatingMode::Ft4.as_u8(), Ordering::Relaxed);
+        c.operating_frequency_hz
+            .store(14_080_000, Ordering::Relaxed);
+        c.start_wsjtx_udp_component().await.unwrap();
+        send_decode(&c, "CQ STALE JO62", 7_047_500).await;
+        let valid = send_decode(&c, "CQ DL1ABC JO62", 14_080_000).await;
+        let unknown = send_decode(&c, "CQ W1AW FN31", 0).await;
+        let id = c.config.read().await.network.wsjtx_udp.instance_id.clone();
+        assert_eq!(packet(&listener, 2).await, valid.encode(&id));
+        assert_eq!(packet(&listener, 2).await, unknown.encode(&id));
+        // No third Decode may be hiding behind Status or heartbeat traffic.
+        assert!(tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if packet_type(&receive(&listener).await.0) == 2 {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err());
+        stop(c).await;
+    }
+
+    // Read all Status fields, retaining the contact fields this suite changes.
+    fn status_contact(bytes: &[u8]) -> ContactStatus {
+        let mut r = payload(bytes);
+        r.read_u64().unwrap();
+        let mode = r.read_utf8().unwrap();
+        let dx_call = r.read_utf8().unwrap();
+        let report = r.read_utf8().unwrap();
+        r.read_utf8().unwrap();
+        for _ in 0..3 {
+            r.read_bool().unwrap();
+        }
+        let rx_df = r.read_u32().unwrap();
+        r.read_u32().unwrap();
+        r.read_utf8().unwrap();
+        r.read_utf8().unwrap();
+        let dx_grid = r.read_utf8().unwrap();
+        r.read_bool().unwrap();
+        r.read_utf8().unwrap();
+        r.read_bool().unwrap();
+        assert_eq!(r.read_u8(), Some(0));
+        r.read_u32().unwrap();
+        assert_eq!(r.read_u32(), Some(if mode == "FT4" { 7 } else { 15 }));
+        r.read_utf8().unwrap();
+        let tx_message = r.read_utf8().unwrap();
+        assert_eq!(r.remaining(), 0);
+        ContactStatus {
+            dx_call,
+            report,
+            dx_grid,
+            rx_df,
+            tx_message,
+        }
+    }
+
+    async fn until_contact(
+        listener: &tokio::net::UdpSocket,
+        expected: impl Fn(&ContactStatus) -> bool,
+    ) -> ContactStatus {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let c = status_contact(&packet(listener, 1).await);
+                if expected(&c) {
+                    return c;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn qso_only_changes_emit_status_before_heartbeat() {
+        let (mut c, listener, _scratch) = setup().await;
+        let manager = manager("FT8");
+        let id = manager
+            .respond_to_cq_with(
+                "DL1ABC".into(),
+                1500.0,
+                None,
+                pancetta_qso::CallInitiation::Manual,
+                Some(1302.0),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        c.qso_manager_watch.send_replace(Some(manager.clone()));
+        c.start_wsjtx_udp_component().await.unwrap();
+        until_contact(&listener, |s| s.dx_call == "DL1ABC" && s.rx_df == 1302).await;
+        // Drain immediate timer ticks, so the change has to reach a later sample.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0; 4096];
+        while listener.try_recv_from(&mut buf).is_ok() {}
+        let start = Instant::now();
+        let published = intent();
+        c.latest_tx_intent.write().unwrap().insert(
+            super::super::active_tx_qso_key(&id.to_string()),
+            published.clone(),
+        );
+        super::super::settle_tx_intent(
+            &c.latest_tx_intent,
+            &super::super::active_tx_qso_key(&id.to_string()),
+            &published,
+            true,
+        );
+        until_contact(&listener, |s| s.tx_message == "DL1ABC K5ARH R-10").await;
+        let report = pancetta_qso::MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "DL1ABC".into(),
+            report: -17,
+        };
+        manager
+            .process_message(
+                report.clone(),
+                "K5ARH DL1ABC -17".into(),
+                1302.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        until_contact(&listener, |s| s.report == "-10" && s.rx_df == 1302).await;
+        // Two separate sightings confirm an RX-only partner drift, with held
+        // station TX offset, dial and PTT unchanged.
+        manager
+            .process_message(
+                report.clone(),
+                "K5ARH DL1ABC -17".into(),
+                1600.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        manager
+            .process_message(report, "K5ARH DL1ABC -17".into(), 1600.0, Some(-10.0))
+            .await
+            .unwrap();
+        until_contact(&listener, |s| s.rx_df == 1600 && s.report == "-10").await;
+        manager.cancel_qso(id).await.unwrap();
+        until_contact(&listener, |s| *s == ContactStatus::default()).await;
+        assert!(start.elapsed() < HEARTBEAT_INTERVAL);
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn unqueued_intent_is_not_status_tx_message() {
+        let (mut c, listener, _scratch) = setup().await;
+        let manager = manager("FT8");
+        let id = manager
+            .respond_to_cq("DL1ABC".into(), 1302.0, None)
+            .await
+            .unwrap();
+        c.qso_manager_watch.send_replace(Some(manager));
+        let published = intent();
+        c.latest_tx_intent.write().unwrap().insert(
+            super::super::active_tx_qso_key(&id.to_string()),
+            published.clone(),
+        );
+        c.start_wsjtx_udp_component().await.unwrap();
+        until_contact(&listener, |s| {
+            s.dx_call == "DL1ABC" && s.tx_message.is_empty()
+        })
+        .await;
+        super::super::settle_tx_intent(
+            &c.latest_tx_intent,
+            &super::super::active_tx_qso_key(&id.to_string()),
+            &published,
+            true,
+        );
+        until_contact(&listener, |s| s.tx_message == published.message_text).await;
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_component_emits_no_datagrams() {
+        let (mut c, listener, _scratch) = setup().await;
+        c.config.write().await.network.wsjtx_udp.enabled = false;
+        c.start_wsjtx_udp_component().await.unwrap();
+        send_decode(&c, "CQ DL1ABC JO62", 0).await;
+        let mut bytes = [0; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), listener.recv_from(&mut bytes))
+                .await
+                .is_err()
+        );
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn status_uses_replacement_qso_manager() {
+        let (mut c, listener, _scratch) = setup().await;
+        let old = manager("FT8");
+        let first = old
+            .respond_to_cq("DL1ABC".into(), 1302.0, None)
+            .await
+            .unwrap();
+        old.respond_to_cq("W1AW".into(), 1800.0, None)
+            .await
+            .unwrap();
+        c.qso_manager_watch.send_replace(Some(old.clone()));
+        c.start_wsjtx_udp_component().await.unwrap();
+        until_contact(&listener, |s| s.dx_call == "DL1ABC").await;
+        old.cancel_qso(first).await.unwrap();
+        until_contact(&listener, |s| s.dx_call == "W1AW" && s.rx_df == 1800).await;
+        let new = manager("FT8");
+        new.respond_to_cq("N4BP".into(), 1900.0, None)
+            .await
+            .unwrap();
+        c.qso_manager_watch.send_replace(Some(new.clone()));
+        until_contact(&listener, |s| {
+            s.dx_call == "N4BP" && s.rx_df == 1900 && s.tx_message.is_empty()
+        })
+        .await;
+        c.qso_manager_watch.send_replace(Some(manager("FT8")));
+        until_contact(&listener, |s| *s == ContactStatus::default()).await;
+        c.qso_manager_watch.send_replace(None);
+        stop(c).await;
     }
 }
