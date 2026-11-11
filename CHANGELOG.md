@@ -13,10 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
 - Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.
 - Legacy QSO migration keeps a backup and refuses unreadable rows instead of writing a partial logbook.
 
+=======
+- PAN-277: Shutdown now drains queued PTT-off through Hamlib before stopping it, including the TX worker's cancellation fallback. The independent direct rigctld unkey now allows 3 s per reply within a 6 s budget, so a rig taking 1.5 s to answer can unkey. Previously Hamlib exited before reading the unkey and the direct attempt had only 500 ms. Unresponsive rigs can add about 13 s to shutdown.
+>>>>>>> f078104113d5fc1b059594041628336ad309d3ae
 - PAN-281: A QSO written to `qsos.adi` now survives a power cut or OS crash right after it is logged. Each record is synced to disk before the write returns, about 1 ms per QSO. Every connection to `qso.db` now syncs its commits too; before, one of its five connections did not.
 - PAN-285: PSKReporter uploads keep at most `[network.psk_reporter].max_pending_reports` reports (default 2000) while they cannot be sent. When the queue is full, the oldest report is dropped and the log says how many. A backlog now goes out in datagrams of at most 1400 bytes, and reports leave the queue only after their datagram is sent, so a long outage no longer makes every later upload fail with "Message too long". FT4 decodes are reported as FT4, not FT8, and FT2 decodes are not reported. Each report now carries `informationSource` 1, the receiver descriptor is an options template, and every set is padded to four bytes, as https://pskreporter.info/pskdev.html describes. Whether pskreporter.info accepts these reports is still unchecked.
 - PAN-347: Hawaii, Alaska, Puerto Rico and other entities that share letters with your callsign or with calls in your log are no longer treated as already worked, and a German call on a new band is marked new whatever its prefix. `[station] dxcc_entity` no longer affects needed status; pancetta takes your home entity from `callsign`.
@@ -53,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-393: `[audio.recording] raw_capture_minutes` records one raw 48 kHz WAV per FT8 slot for that many minutes after start, into `raw48/` inside the recording directory, so decimation changes can be tested on real captures. It is off by default (0) and needs `auto_record = true` and a 48 kHz capture device. Files are named with the UTC slot time and band, `_tx` marks a slot our transmission overlapped, and `raw48/` stops at its own 2 GB cap while decode-window recording continues.
 - PAN-380: `pancetta-ft8/README.md` lists the crate's stable API (the cycle API manta calls and the window API from dispensa Q-0085) and its compatibility policy. `pancetta-ft8/tests/stable_api_guard.rs` fails to compile, naming the item, when a change breaks one of those signatures, fields or trait bounds. The README's configuration example and parameter table no longer use the nonexistent `time_range` field.
 - PAN-347: Without cqdx.io, or while it is unreachable, pancetta derives needed and all-time-new entities from `qsos.adi` and says so (`local logbook`). DX Hunter shows `new mode FT4` when an entity was never logged in the current mode, and the station card shows `worked-unconfirmed` or `confirmed` from the QSL and LoTW fields in your log.
 - PAN-334: `--log-format json` now works. Each log line in `~/.pancetta/logs/pancetta.log.*` and, with `--headless`, on stderr is one JSON object: `timestamp`, `level`, `target`, `threadId`, `fields` (the message and the event's other fields) and, inside a span, `span` and `spans`. Headless text logs stay on stdout and are unchanged. The daily file keeps its name, so the day you switch formats holds both.

@@ -40,6 +40,7 @@ pub mod config;
 pub mod dx_need;
 pub mod dx_reason;
 pub mod keymap;
+mod presentation;
 pub mod readiness;
 pub mod tui_runner;
 pub mod ui;

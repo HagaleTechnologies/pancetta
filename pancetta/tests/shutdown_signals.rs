@@ -29,7 +29,7 @@ struct FakeRig {
 }
 
 impl FakeRig {
-    fn start() -> Self {
+    fn start(reply_delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -51,7 +51,7 @@ impl FakeRig {
                     Err(e) => return Err(e),
                 }
             };
-            serve(stream, &server_keyed)
+            serve(stream, &server_keyed, reply_delay)
         });
         Self {
             port,
@@ -62,7 +62,11 @@ impl FakeRig {
     }
 }
 
-fn serve(mut stream: TcpStream, keyed: &AtomicBool) -> io::Result<Vec<String>> {
+fn serve(
+    mut stream: TcpStream,
+    keyed: &AtomicBool,
+    reply_delay: Duration,
+) -> io::Result<Vec<String>> {
     // On macOS the accepted stream inherits the listener's O_NONBLOCK.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -76,9 +80,13 @@ fn serve(mut stream: TcpStream, keyed: &AtomicBool) -> io::Result<Vec<String>> {
             return Ok(commands);
         }
         match line.trim() {
-            "f" => stream.write_all(b"14074000\n")?,
+            "f" => {
+                thread::sleep(reply_delay);
+                stream.write_all(b"14074000\n")?;
+            }
             "T 0" => {
                 keyed.store(false, Ordering::Release);
+                thread::sleep(reply_delay);
                 stream.write_all(b"RPRT 0\n")?;
             }
             command => {
@@ -114,7 +122,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     }
 }
 
-fn assert_signal_shutdown(signal: libc::c_int) {
+fn assert_signal_shutdown(signal: libc::c_int, reply_delay: Duration) {
     let scratch = tempfile::tempdir().unwrap();
     let config = scratch.path().join("pancetta.toml");
     fs::write(
@@ -123,7 +131,7 @@ fn assert_signal_shutdown(signal: libc::c_int) {
          [rig.interface]\nenabled = true\n",
     )
     .unwrap();
-    let mut rig = FakeRig::start();
+    let mut rig = FakeRig::start(reply_delay);
     // Regular files cannot fill a pipe and stall the child during startup.
     let output_path = scratch.path().join("output.log");
     let output = File::create(&output_path).unwrap();
@@ -203,6 +211,16 @@ fn assert_signal_shutdown(signal: libc::c_int) {
             .unwrap_or_else(|| panic!("missing or out-of-order {marker}:\n{logs}"));
         remaining = &remaining[index + marker.len()..];
     }
+    for marker in [
+        "Shutdown: PTT-off queued for the Hamlib loop",
+        "Shutdown: Hamlib loop drained its queue and stopped",
+    ] {
+        let at = logs
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing {marker}: {logs}"));
+        assert!(at > logs.find("Starting graceful shutdown").unwrap());
+        assert!(at < logs.find("Graceful shutdown completed").unwrap());
+    }
     assert_eq!(logs.contains("Received Ctrl+C"), signal == libc::SIGINT);
 }
 
@@ -232,12 +250,12 @@ fn packaged_service_only_sends_initial_stop_signal_to_pancetta() {
 
 #[test]
 fn sigterm_unkeys_rig_and_completes_shutdown() {
-    assert_signal_shutdown(libc::SIGTERM);
+    assert_signal_shutdown(libc::SIGTERM, Duration::ZERO);
 }
 
 #[test]
 fn sigint_unkeys_rig_and_completes_shutdown() {
-    assert_signal_shutdown(libc::SIGINT);
+    assert_signal_shutdown(libc::SIGINT, Duration::ZERO);
 }
 
 #[test]
@@ -249,7 +267,7 @@ fn fake_rig_serves_stream_that_inherited_nonblocking() {
     stream.set_nonblocking(true).unwrap();
     let keyed = Arc::new(AtomicBool::new(true));
     let server_keyed = keyed.clone();
-    let server = thread::spawn(move || serve(stream, &server_keyed));
+    let server = thread::spawn(move || serve(stream, &server_keyed, Duration::ZERO));
 
     let mut replies = BufReader::new(client.try_clone().unwrap());
     let mut reply = String::new();
@@ -268,4 +286,9 @@ fn fake_rig_serves_stream_that_inherited_nonblocking() {
     let commands = server.join().unwrap().unwrap();
     assert_eq!(commands, ["f", "T 0"]);
     assert!(!keyed.load(Ordering::Acquire));
+}
+
+#[test]
+fn sigterm_unkeys_a_rigctld_that_takes_1500ms_to_answer() {
+    assert_signal_shutdown(libc::SIGTERM, Duration::from_millis(1500));
 }

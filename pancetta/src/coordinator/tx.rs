@@ -3943,7 +3943,8 @@ impl PendingPttOff {
     /// (delivered or given up after its bounded retries). If this wait is
     /// cancelled (worker abort or restart), the unfinished handle goes back
     /// in the slot, so the next key-down still waits for it.
-    async fn settle(&self) {
+    /// Shutdown also awaits this before stopping the Hamlib drain (PAN-277).
+    pub(crate) async fn settle(&self) {
         struct Waiting<'a> {
             slot: &'a PendingPttOff,
             unkey: Option<tokio::task::JoinHandle<()>>,
@@ -8383,11 +8384,11 @@ impl Drop for PttGuard {
                     .await
                 {
                     Ok(true) => {
-                        tracing::warn!("PTT GUARD: forced PTT off due to task cancellation")
+                        tracing::warn!("PTT GUARD: queued a forced PTT-off for Hamlib after task cancellation")
                     }
                     Ok(false) => tracing::error!(
                         target: "pancetta::tx.ptt",
-                        "PTT GUARD: PTT OFF not delivered to Hamlib after {} attempts on drop; Hamlib's PTT watchdog is the remaining backstop",
+                        "PTT GUARD: PTT OFF not delivered to Hamlib after {} attempts on drop; Hamlib's PTT watchdog, or at shutdown the direct rigctld PTT-off, is the remaining backstop",
                         SAFETY_SEND_RETRY_DELAYS.len() + 1
                     ),
                     Err(e) => tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e),
