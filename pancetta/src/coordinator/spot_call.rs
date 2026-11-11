@@ -23,8 +23,9 @@
 //!   `qsos` lock before `ptt_sync_gate`.
 //! - A call that needs a QSY while keyed is parked (latest wins) and runs
 //!   after PTT-off. It is dropped after [`SPOT_QSY_WAIT_CAP`], on any
-//!   operator frequency change, by a newer spot call, or when the TX policy,
-//!   exchange state or rig route no longer allow it.
+//!   operator frequency change or operating-mode switch, by a newer spot
+//!   call, or when the TX policy, exchange state or rig route no longer allow
+//!   it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -314,10 +315,13 @@ pub(crate) struct SpotCallCtx {
     pub active_tx_offsets: Arc<std::sync::RwLock<HashMap<String, f64>>>,
     pub ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
     /// Held by the relay's `SetFrequency` arm and by spot-call execution, so
-    /// a band key cannot interleave between a QSY and its `StartQso`.
+    /// a band key cannot interleave between a QSY and its `StartQso`, and
+    /// across the relay's operating-mode switch, so a parked call cannot run
+    /// between that switch and its cancel.
     pub spot_qsy_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Bumped by every new spot call and every operator frequency change; a
-    /// parked call whose generation is stale exits quietly.
+    /// Bumped by every new spot call, every operator frequency change and
+    /// every successful operating-mode switch; a parked call whose
+    /// generation is stale exits quietly.
     pub generation: Arc<AtomicU64>,
     /// Callsign of the parked call, if any, so a cancel line can name it.
     pub parked_call: Arc<std::sync::Mutex<Option<String>>>,
@@ -588,6 +592,37 @@ pub(crate) fn note_operator_frequency_change(ctx: &SpotCallCtx) {
             "Queued call to {call} cancelled — frequency changed"
         ));
     }
+}
+
+/// Run the operating-mode switch `switch` (Shift+M) under `spot_qsy_lock`,
+/// so a parked spot call cannot execute between the switch and its cancel.
+/// When the switch succeeds, a parked call is cancelled: the TUI resolved its
+/// dial for the old mode, so running it would retune to that dial and call
+/// there in the new mode. A refused switch leaves the parked call alone.
+/// Returns the cancelled call's callsign; report it with
+/// [`report_mode_change_cancel`] after the switch's own status lines.
+pub(crate) async fn switch_mode_cancelling_parked<E>(
+    ctx: &SpotCallCtx,
+    switch: impl FnOnce() -> Result<(), E>,
+) -> Result<Option<String>, E> {
+    let _lock = ctx.spot_qsy_lock.lock().await;
+    switch()?;
+    ctx.generation.fetch_add(1, Ordering::SeqCst);
+    let cancelled = ctx.take_parked();
+    if let Some(call) = &cancelled {
+        info!(
+            target: "operator.override",
+            "Parked spot call to {} cancelled: operating mode changed", call
+        );
+    }
+    Ok(cancelled)
+}
+
+/// Status line for a parked spot call a mode switch cancelled.
+pub(crate) fn report_mode_change_cancel(ctx: &SpotCallCtx, call: &str) {
+    ctx.qsy.status(format!(
+        "Queued call to {call} cancelled — operating mode changed"
+    ));
 }
 
 #[cfg(test)]
@@ -1171,6 +1206,53 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(drain(&h.qso_rx).is_empty());
         assert!(drain(h.hamlib_rx.as_ref().unwrap()).is_empty());
+    }
+
+    /// Shift+M while a call is parked: the call's dial was resolved for the
+    /// old mode, so it must not run after the switch.
+    #[tokio::test]
+    async fn operating_mode_switch_cancels_the_parked_call() {
+        let h = harness(true, 7_074_000, None).await;
+        h.ctx.ptt_active.store(true, Ordering::Release);
+        handle_spot_call(&h.ctx, spot(Some(1210))).await;
+        let _ = statuses(&h);
+        let switched = switch_mode_cancelling_parked(&h.ctx, || {
+            assert!(
+                h.ctx.spot_qsy_lock.try_lock().is_err(),
+                "the switch runs under spot_qsy_lock"
+            );
+            Ok::<(), ()>(())
+        })
+        .await;
+        assert_eq!(switched, Ok(Some(CALL.to_string())));
+        assert!(statuses(&h).is_empty(), "the caller reports the cancel");
+        report_mode_change_cancel(&h.ctx, CALL);
+        assert_eq!(
+            statuses(&h),
+            vec!["Queued call to ZL1ABC cancelled — operating mode changed"]
+        );
+        h.ctx.ptt_active.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(drain(&h.qso_rx).is_empty());
+        assert!(drain(h.hamlib_rx.as_ref().unwrap()).is_empty());
+    }
+
+    /// A refused mode switch (a QSO is active, a lock is busy) leaves the
+    /// parked call to run at PTT-off.
+    #[tokio::test]
+    async fn refused_mode_switch_keeps_the_parked_call() {
+        let h = harness(true, 7_074_000, None).await;
+        h.ctx.ptt_active.store(true, Ordering::Release);
+        handle_spot_call(&h.ctx, spot(Some(1210))).await;
+        let switched = switch_mode_cancelling_parked(&h.ctx, || Err::<(), _>("refused")).await;
+        assert_eq!(switched, Err("refused"));
+        h.ctx.ptt_active.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            set_freqs(&drain(h.hamlib_rx.as_ref().unwrap())),
+            vec![14_074_000]
+        );
+        assert_eq!(start_qsos(&drain(&h.qso_rx)), vec![(1210, false)]);
     }
 
     /// A dial move nobody routed through the relay (an autonomous hop, a

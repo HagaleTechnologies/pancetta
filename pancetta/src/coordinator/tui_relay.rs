@@ -2083,17 +2083,24 @@ impl super::ApplicationCoordinator {
                                 cmd_active_protocol_mode.load(Ordering::Relaxed),
                             );
                             let next = current.cycle();
-                            match super::try_switch_operating_mode(
-                                next,
-                                &cmd_active_tx_qsos,
-                                &cmd_decode_window,
-                                &cmd_active_protocol_mode,
-                                &cmd_active_slot_ns,
-                                &cmd_active_decode_phase_ns,
-                                &cmd_current_decode_effort,
-                                &cmd_resolved_hardware_tier,
-                            ) {
-                                Ok(()) => {
+                            // PAN-287: a parked spot call's dial was resolved
+                            // for the old mode; a successful switch cancels it.
+                            let switched =
+                                super::spot_call::switch_mode_cancelling_parked(&spot_ctx, || {
+                                    super::try_switch_operating_mode(
+                                        next,
+                                        &cmd_active_tx_qsos,
+                                        &cmd_decode_window,
+                                        &cmd_active_protocol_mode,
+                                        &cmd_active_slot_ns,
+                                        &cmd_active_decode_phase_ns,
+                                        &cmd_current_decode_effort,
+                                        &cmd_resolved_hardware_tier,
+                                    )
+                                })
+                                .await;
+                            match switched {
+                                Ok(cancelled_spot_call) => {
                                     let mode_str = super::mode_str(next).to_string();
                                     warn!(
                                         target: "operator.override",
@@ -2153,6 +2160,12 @@ impl super::ApplicationCoordinator {
                                                     the FT2 label"
                                                     .to_string(),
                                             },
+                                        );
+                                    }
+                                    // Last, so no status line above overwrites it.
+                                    if let Some(call) = cancelled_spot_call {
+                                        super::spot_call::report_mode_change_cancel(
+                                            &spot_ctx, &call,
                                         );
                                     }
                                 }
