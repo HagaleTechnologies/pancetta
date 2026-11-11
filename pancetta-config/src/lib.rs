@@ -1971,6 +1971,8 @@ mod merge_guard {
         assert_carries_all::<rig::RigConfig>(
             "RigConfig",
             &[
+                ("data_mode", json!("PKTUSB")),
+                ("data_passband_hz", json!(3000)),
                 (
                     "bookmarks",
                     json!([{

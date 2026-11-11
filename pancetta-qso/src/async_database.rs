@@ -12,10 +12,10 @@ use sqlx::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
         SqliteSynchronous,
     },
-    Row,
+    Connection, Row,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -267,9 +267,154 @@ pub struct QsoTimelineRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// An ADIF log converted exactly as the index replay converts it.
+pub struct AdifSnapshot {
+    path: PathBuf,
+    records: Vec<QsoMetadata>,
+}
+impl AdifSnapshot {
+    pub async fn load(path: impl AsRef<Path>) -> Result<Self, AsyncDatabaseError> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path).map_err(|e| io_error(path, e))?;
+        let processor = AdifProcessor::new();
+        let file = processor
+            .parse_string(&raw)
+            .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
+        Ok(Self {
+            path: path.to_owned(),
+            records: QsoDatabase::convert_adif_records(&processor, &file.records)?,
+        })
+    }
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousIndex {
+    Replace,
+    KeepCopy,
+}
+pub struct Rebuilt {
+    pub db: QsoDatabase,
+    pub inserted: u64,
+    pub skipped: u64,
+    pub kept: Option<PathBuf>,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexDrift {
+    pub missing_from_index: usize,
+    pub missing_from_adif: usize,
+}
+impl IndexDrift {
+    pub fn is_current(&self) -> bool {
+        self.missing_from_index == 0 && self.missing_from_adif == 0
+    }
+}
+pub struct LegacyMigration {
+    pub backup: PathBuf,
+    pub backup_existed: bool,
+    pub exported: usize,
+}
+#[derive(Debug)]
+pub struct LegacyMigrationError {
+    pub db: PathBuf,
+    pub adif: PathBuf,
+    pub backup: Option<PathBuf>,
+    pub source: AsyncDatabaseError,
+}
+impl std::fmt::Display for LegacyMigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "legacy index {} was not migrated to {}: {}; ",
+            self.db.display(),
+            self.adif.display(),
+            self.source
+        )?;
+        match &self.backup {
+            Some(p) => write!(f, "a copy of it is at {}", p.display()),
+            None => write!(f, "no copy of it could be made, so it was not opened"),
+        }
+    }
+}
+impl std::error::Error for LegacyMigrationError {}
+#[derive(Debug, Clone, Copy)]
+enum RebuildStep {
+    TempReady,
+    RowsCommitted,
+    TempClosed,
+    OldCheckpointed,
+    OldKept,
+    Swapped,
+    Done,
+}
+fn io_error(path: &Path, source: std::io::Error) -> AsyncDatabaseError {
+    AsyncDatabaseError::Io {
+        path: path.to_owned(),
+        source,
+    }
+}
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    p.into()
+}
+fn remove_if_exists(path: &Path) -> Result<(), AsyncDatabaseError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error(path, e)),
+    }
+}
+fn sync_file(path: &Path) -> Result<(), AsyncDatabaseError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| io_error(path, e))
+}
+fn sync_parent(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+}
+fn checkpoint_allows_swap(busy: i64, log: i64, checkpointed: i64) -> bool {
+    busy == 0 && log == checkpointed
+}
+fn copy_private(from: &Path, to: &Path) -> Result<(), AsyncDatabaseError> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(to).map_err(|e| io_error(to, e))?;
+    let bytes = std::fs::read(from).map_err(|e| io_error(from, e))?;
+    out.write_all(&bytes)
+        .and_then(|_| out.sync_all())
+        .map_err(|e| io_error(to, e))
+}
+
 /// Async database operation errors
 #[derive(Debug, Error)]
 pub enum AsyncDatabaseError {
+    #[error("index {path} is in use by another connection; the rebuild left it in place")]
+    IndexBusy { path: PathBuf },
+    #[error("{reason}")]
+    IndexUnavailable { reason: String },
+    #[error("{unreadable} of {total} rows cannot be read; the first is row {id} (qso_id {qso_id}): {reason}")]
+    UnreadableRows {
+        unreadable: usize,
+        total: usize,
+        id: i64,
+        qso_id: String,
+        reason: String,
+    },
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
@@ -1125,7 +1270,7 @@ impl QsoDatabase {
 
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
-    /// If `db_path` exists, it is deleted once the ADIF has been read and
+    /// If `db_path` exists, it is replaced atomically once the ADIF has been read and
     /// converted (an unreadable/malformed ADIF leaves it untouched) — caller
     /// should only invoke this when the DB is known to be stale or missing. `db_path` may also be the
     /// literal `":memory:"` sentinel (see [`Self::open`]) for a throwaway,
@@ -1135,62 +1280,352 @@ impl QsoDatabase {
         db_path: impl AsRef<std::path::Path>,
         adif_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, AsyncDatabaseError> {
-        let db_path = db_path.as_ref();
-        let adif_path = adif_path.as_ref();
+        let snapshot = AdifSnapshot::load(adif_path).await?;
+        Ok(
+            Self::rebuild_from(db_path, snapshot, PreviousIndex::Replace)
+                .await?
+                .db,
+        )
+    }
 
-        // `:memory:` is `Self::open`'s special in-memory sentinel, not a real
-        // path -- never `try_exists`/`remove_file` it. On Unix that pair would
-        // otherwise happily delete an unrelated regular file that literally
-        // happens to be named `:memory:` in the process's current directory
-        // (`open` below only recognizes the sentinel AFTER this check).
-        let is_in_memory = db_path == std::path::Path::new(":memory:");
-
-        // Read and convert the whole ADIF BEFORE touching the existing index:
-        // an unreadable or malformed ADIF must leave the old `qso.db` (and
-        // the history it carries) in place for the caller's fallback.
-        let raw = tokio::fs::read_to_string(adif_path)
-            .await
-            .map_err(|source| AsyncDatabaseError::Io {
-                path: adif_path.to_path_buf(),
-                source,
-            })?;
-
-        let processor = crate::adif::AdifProcessor::new();
-        let adif_file = processor
-            .parse_string(&raw)
-            .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
-
-        // Convert every record before touching the existing index: a record
-        // `record_to_qso` rejects must leave the old `qso.db` in place.
-        let converted = Self::convert_adif_records(&processor, &adif_file.records)?;
-
-        // Drop any existing index so the rebuild is from scratch.
-        if !is_in_memory && tokio::fs::try_exists(db_path).await.unwrap_or(false) {
-            tokio::fs::remove_file(db_path)
-                .await
-                .map_err(|source| AsyncDatabaseError::Io {
-                    path: db_path.to_path_buf(),
-                    source,
-                })?;
+    /// Probe startup history without losing an unreadable index's WAL during
+    /// SQLite's failed open. Busy/locked failures never restore over live data.
+    pub async fn open_for_reconciliation(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, AsyncDatabaseError> {
+        let path = path.as_ref();
+        let wal = suffixed(path, "-wal");
+        let original = match std::fs::read(&wal) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io_error(&wal, e)),
+        };
+        let probe = async {
+            let mut conn = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(false),
+            )
+            .await?;
+            let result = sqlx::query("SELECT name FROM sqlite_schema LIMIT 1")
+                .fetch_optional(&mut conn)
+                .await;
+            conn.close().await?;
+            result.map(|_| ())
         }
+        .await;
+        if let Err(error) = probe {
+            let code = error
+                .as_database_error()
+                .and_then(|d| d.code())
+                .and_then(|c| c.parse::<i32>().ok())
+                .map(|c| c & 255);
+            if matches!(code, Some(11 | 26)) && !original.is_empty() {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&wal)
+                    .map_err(|e| io_error(&wal, e))?;
+                file.write_all(&original)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|e| io_error(&wal, e))?;
+            }
+            return Err(error.into());
+        }
+        Self::open(path).await
+    }
 
-        let db = Self::open(db_path).await?;
-        let (inserted, skipped) = db.insert_converted(converted).await?;
+    pub fn rebuild_temp_path(db_path: &Path) -> PathBuf {
+        suffixed(db_path, ".new")
+    }
+    pub async fn rebuild_from(
+        db_path: impl AsRef<Path>,
+        snapshot: AdifSnapshot,
+        previous: PreviousIndex,
+    ) -> Result<Rebuilt, AsyncDatabaseError> {
+        let path = db_path.as_ref();
+        let result = Self::rebuild_with(path, snapshot, previous, &mut |_| {}).await;
+        if result.is_err() && path != Path::new(":memory:") {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let _ = remove_if_exists(&suffixed(&Self::rebuild_temp_path(path), suffix));
+            }
+        }
+        result
+    }
 
-        if skipped > 0 {
-            warn!(
-                "Skipped {} ADIF records with no CALL field during replay",
+    // Before Swapped the old index remains at its original name. After Swapped
+    // the new index is complete, checkpointed and synced. Never unlink the target.
+    async fn rebuild_with(
+        db_path: &Path,
+        snapshot: AdifSnapshot,
+        previous: PreviousIndex,
+        at: &mut (dyn FnMut(RebuildStep) + Send),
+    ) -> Result<Rebuilt, AsyncDatabaseError> {
+        debug!(
+            records = snapshot.len(),
+            empty = snapshot.is_empty(),
+            "Preparing index rebuild"
+        );
+        if db_path == Path::new(":memory:") {
+            let db = Self::open(db_path).await?;
+            let (inserted, skipped) = db.insert_converted(snapshot.records).await?;
+            info!(
+                "Replayed {} records from {} into {} ({} skipped)",
+                inserted,
+                snapshot.path.display(),
+                db_path.display(),
                 skipped
             );
+            return Ok(Rebuilt {
+                db,
+                inserted,
+                skipped,
+                kept: None,
+            });
         }
+        let temp = Self::rebuild_temp_path(db_path);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            remove_if_exists(&suffixed(&temp, suffix))?;
+        }
+        at(RebuildStep::TempReady);
+        let db = Self::open(&temp).await?;
+        let result = db.insert_converted(snapshot.records).await;
+        at(RebuildStep::RowsCommitted);
+        db.close().await;
+        let (inserted, skipped) = result?;
+        if std::fs::metadata(suffixed(&temp, "-wal")).is_ok_and(|m| m.len() > 0) {
+            return Err(AsyncDatabaseError::Replay(
+                "temporary index WAL was not checkpointed".into(),
+            ));
+        }
+        sync_file(&temp)?;
+        for suffix in ["-wal", "-shm"] {
+            remove_if_exists(&suffixed(&temp, suffix))?;
+        }
+        at(RebuildStep::TempClosed);
+        let mut kept = None;
+        if db_path.try_exists().map_err(|e| io_error(db_path, e))? {
+            // SQLite can discard an invalid WAL even when opening fails. Retain
+            // its original bytes before probing so an unreadable copy is complete.
+            let old_wal_path = suffixed(db_path, "-wal");
+            let old_wal = match std::fs::read(&old_wal_path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(io_error(&old_wal_path, e)),
+            };
+            let checkpoint = async {
+                let mut conn = sqlx::SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new()
+                        .filename(db_path)
+                        .create_if_missing(false),
+                )
+                .await?;
+                let result =
+                    sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .fetch_one(&mut conn)
+                        .await;
+                conn.close().await?;
+                result
+            }
+            .await;
+            let unreadable = match checkpoint {
+                Ok((busy, log, done)) if checkpoint_allows_swap(busy, log, done) => false,
+                Ok(_) => {
+                    return Err(AsyncDatabaseError::IndexBusy {
+                        path: db_path.to_owned(),
+                    })
+                }
+                Err(e) => {
+                    let code = e
+                        .as_database_error()
+                        .and_then(|d| d.code())
+                        .and_then(|c| c.parse::<i32>().ok())
+                        .map(|c| c & 255);
+                    match code {
+                        Some(11 | 26) => true,
+                        Some(5 | 6) => {
+                            return Err(AsyncDatabaseError::IndexBusy {
+                                path: db_path.to_owned(),
+                            })
+                        }
+                        _ => return Err(e.into()),
+                    }
+                }
+            };
+            at(RebuildStep::OldCheckpointed);
+            if unreadable || previous == PreviousIndex::KeepCopy {
+                for n in 0..=999 {
+                    let candidate = suffixed(
+                        db_path,
+                        &if n == 0 {
+                            ".pre-rebuild".into()
+                        } else {
+                            format!(".pre-rebuild.{n}")
+                        },
+                    );
+                    match std::fs::hard_link(db_path, &candidate) {
+                        Ok(()) => {
+                            kept = Some(candidate);
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(io_error(&candidate, e)),
+                    }
+                }
+                let Some(copy) = &kept else {
+                    return Err(AsyncDatabaseError::Replay(
+                        "all pre-rebuild copy names are taken".into(),
+                    ));
+                };
+                if unreadable && !old_wal.is_empty() {
+                    use std::io::Write;
+                    let wal_copy = suffixed(copy, "-wal");
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&wal_copy)
+                        .map_err(|e| io_error(&wal_copy, e))?;
+                    file.write_all(&old_wal)
+                        .and_then(|_| file.sync_all())
+                        .map_err(|e| io_error(&wal_copy, e))?;
+                    remove_if_exists(&old_wal_path)?;
+                }
+            }
+            at(RebuildStep::OldKept);
+        }
+        for attempt in 0..=10 {
+            match std::fs::rename(&temp, db_path) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 10 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                }
+                Err(e) => return Err(io_error(db_path, e)),
+            }
+        }
+        at(RebuildStep::Swapped);
+        for suffix in ["-wal", "-shm"] {
+            remove_if_exists(&suffixed(db_path, suffix))?;
+        }
+        sync_parent(db_path);
+        let db = Self::open(db_path).await?;
         info!(
             "Replayed {} records from {} into {} ({} skipped)",
             inserted,
-            adif_path.display(),
+            snapshot.path.display(),
             db_path.display(),
-            skipped,
+            skipped
         );
-        Ok(db)
+        at(RebuildStep::Done);
+        Ok(Rebuilt {
+            db,
+            inserted,
+            skipped,
+            kept,
+        })
+    }
+
+    pub async fn drift_from(
+        &self,
+        snapshot: &AdifSnapshot,
+    ) -> Result<IndexDrift, AsyncDatabaseError> {
+        #[derive(Deserialize)]
+        struct ContactFields {
+            their_callsign: Option<String>,
+            start_time: DateTime<Utc>,
+        }
+        fn key(call: Option<&str>, time: DateTime<Utc>) -> Option<(String, i64)> {
+            call.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|c| (c.to_uppercase(), time.timestamp()))
+        }
+        let mut counts = HashMap::<_, i64>::new();
+        for record in &snapshot.records {
+            if let Some(k) = key(record.their_callsign.as_deref(), record.start_time) {
+                *counts.entry(k).or_default() += 1;
+            }
+        }
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT metadata FROM qsos")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut invalid = 0;
+        for (raw,) in rows {
+            match serde_json::from_str::<ContactFields>(&raw) {
+                Ok(row) => {
+                    if let Some(k) = key(row.their_callsign.as_deref(), row.start_time) {
+                        *counts.entry(k).or_default() -= 1;
+                    }
+                }
+                Err(_) => invalid += 1,
+            }
+        }
+        Ok(IndexDrift {
+            missing_from_index: counts
+                .values()
+                .filter(|n| **n > 0)
+                .map(|n| *n as usize)
+                .sum(),
+            missing_from_adif: invalid
+                + counts
+                    .values()
+                    .filter(|n| **n < 0)
+                    .map(|n| (-*n) as usize)
+                    .sum::<usize>(),
+        })
+    }
+
+    pub async fn migrate_legacy_to_adif(
+        db_path: impl AsRef<Path>,
+        adif_path: impl AsRef<Path>,
+    ) -> Result<(Self, LegacyMigration), LegacyMigrationError> {
+        let db_path = db_path.as_ref();
+        let adif_path = adif_path.as_ref();
+        let backup = suffixed(db_path, ".pre-migration");
+        let mut copied = false;
+        let result = async {
+            let backup_existed = backup.try_exists().map_err(|e| io_error(&backup, e))?;
+            if !backup_existed {
+                let partial = suffixed(&backup, ".partial");
+                let partial_wal = suffixed(&backup, ".partial-wal");
+                for p in [&partial, &partial_wal, &suffixed(&backup, "-wal")] {
+                    remove_if_exists(p)?;
+                }
+                let wal = suffixed(db_path, "-wal");
+                if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+                    copy_private(&wal, &partial_wal)?;
+                    std::fs::rename(&partial_wal, suffixed(&backup, "-wal"))
+                        .map_err(|e| io_error(&backup, e))?;
+                }
+                copy_private(db_path, &partial)?;
+                std::fs::hard_link(&partial, &backup).map_err(|e| io_error(&backup, e))?;
+                remove_if_exists(&partial)?;
+                sync_parent(&backup);
+            }
+            copied = true;
+            let db = Self::open(db_path).await?;
+            match db.export_to_adif(adif_path).await {
+                Ok(exported) => Ok((
+                    db,
+                    LegacyMigration {
+                        backup: backup.clone(),
+                        backup_existed,
+                        exported,
+                    },
+                )),
+                Err(e) => {
+                    db.close().await;
+                    Err(e)
+                }
+            }
+        }
+        .await;
+        result.map_err(|source| LegacyMigrationError {
+            db: db_path.to_owned(),
+            adif: adif_path.to_owned(),
+            backup: copied.then_some(backup),
+            source,
+        })
     }
 
     /// Index `records` exactly as [`Self::replay_from_adif`] does: the same
@@ -1298,8 +1733,8 @@ impl QsoDatabase {
     /// removes it once the new rows are indexed; startup rebuilds an index it
     /// finds marked. The new rows commit together, but an import stopped
     /// between appending to the ADIF log and committing them (Ctrl-C, power
-    /// loss) leaves an index missing rows the log holds, which the mtime
-    /// check alone may trust (PAN-127).
+    /// loss) may leave the index incomplete. The marker also catches changed
+    /// fields outside the contact key used by startup comparison (PAN-127).
     pub fn rebuild_marker(db_path: &Path) -> std::path::PathBuf {
         let mut name = db_path.as_os_str().to_owned();
         name.push(".rebuild");
@@ -1340,27 +1775,38 @@ impl QsoDatabase {
     pub async fn export_to_adif(
         &self,
         path: impl AsRef<std::path::Path>,
-    ) -> Result<(), AsyncDatabaseError> {
+    ) -> Result<usize, AsyncDatabaseError> {
         use crate::adif::{AdifFile, AdifHeader};
 
         let path = path.as_ref();
 
-        // Fetch all rows from the database as QsoProgress.
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT progress_data FROM qsos ORDER BY created_at ASC")
-                .fetch_all(&self.pool)
-                .await?;
-
-        let processor = crate::adif::AdifProcessor::new();
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, qso_id, progress_data FROM qsos ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let processor = AdifProcessor::new();
         let mut records = Vec::with_capacity(rows.len());
-        for (progress_json,) in &rows {
-            if let Ok(progress) = serde_json::from_str::<QsoProgress>(progress_json) {
-                let adif_qso = processor
-                    .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
-                records.push(processor.qso_to_record(&adif_qso));
+        let mut failures = Vec::new();
+        for (id, qso_id, raw) in &rows {
+            match serde_json::from_str::<QsoProgress>(raw) {
+                Ok(progress) => {
+                    let qso = processor
+                        .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
+                    records.push(processor.qso_to_record(&qso));
+                }
+                Err(e) => failures.push((*id, qso_id.clone(), e.to_string())),
             }
         }
-
+        if let Some((id, qso_id, reason)) = failures.first() {
+            return Err(AsyncDatabaseError::UnreadableRows {
+                unreadable: failures.len(),
+                total: rows.len(),
+                id: *id,
+                qso_id: qso_id.clone(),
+                reason: reason.clone(),
+            });
+        }
         let adif_file = AdifFile {
             header: AdifHeader::default(),
             records,
@@ -1370,15 +1816,32 @@ impl QsoDatabase {
             .generate_string(&adif_file)
             .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF generate failed: {e}")))?;
 
-        tokio::fs::write(path, content)
-            .await
-            .map_err(|source| AsyncDatabaseError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-        info!("Exported {} QSOs to {}", rows.len(), path.display());
-        Ok(())
+        let temp = suffixed(path, ".migrating");
+        remove_if_exists(&temp)?;
+        let result = async {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .map_err(|e| io_error(&temp, e))?;
+            file.write_all(content.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|e| io_error(&temp, e))?;
+            drop(file);
+            let drift = self.drift_from(&AdifSnapshot::load(&temp).await?).await?;
+            if !drift.is_current() {
+                return Err(AsyncDatabaseError::Replay(format!(
+                    "the exported logbook does not read back the same: {drift:?}"
+                )));
+            }
+            std::fs::hard_link(&temp, path).map_err(|e| io_error(path, e))?;
+            sync_parent(path);
+            Ok(rows.len())
+        }
+        .await;
+        remove_if_exists(&temp)?;
+        result
     }
 
     /// Total number of QSOs in the index.
@@ -3017,5 +3480,323 @@ mod tests {
         let reloaded = db.get_qso_timeline(qso_id).await.unwrap().unwrap();
         assert_eq!(reloaded.outcome, "completed");
         assert_eq!(reloaded.state_history, second_history);
+    }
+}
+
+#[cfg(test)]
+mod pan282_tests {
+    use super::*;
+    fn log(calls: &[&str]) -> String {
+        let mut text = String::from("<EOH>\n");
+        for call in calls {
+            text += &format!("<CALL:{}>{call} <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20M <EOR>\n",call.len());
+        }
+        text
+    }
+    async fn snapshot(dir: &Path, calls: &[&str]) -> AdifSnapshot {
+        let path = dir.join("source.adi");
+        std::fs::write(&path, log(calls)).unwrap();
+        AdifSnapshot::load(path).await.unwrap()
+    }
+    async fn seed(path: &Path, calls: &[&str]) -> QsoDatabase {
+        let dir = tempfile::tempdir().unwrap();
+        QsoDatabase::rebuild_from(
+            path,
+            snapshot(dir.path(), calls).await,
+            PreviousIndex::Replace,
+        )
+        .await
+        .unwrap()
+        .db
+    }
+    fn copy_files(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    async fn assert_index(path: &Path, count: u64) {
+        let db = QsoDatabase::open(path).await.unwrap();
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(db.count_qsos().await.unwrap(), count);
+        db.close().await;
+    }
+    #[tokio::test]
+    async fn rebuild_leaves_the_old_or_the_complete_new_index_at_every_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let snaps = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        seed(&path, &["OLD1", "OLD2", "OLD3"]).await.close().await;
+        let calls: Vec<_> = (0..50).map(|i| format!("NEW{i}")).collect();
+        let refs: Vec<_> = calls.iter().map(String::as_str).collect();
+        let mut steps = Vec::new();
+        let rebuilt = QsoDatabase::rebuild_with(
+            &path,
+            snapshot(dir.path(), &refs).await,
+            PreviousIndex::Replace,
+            &mut |step| {
+                let target = snaps.path().join(format!("{step:?}"));
+                copy_files(dir.path(), &target);
+                steps.push((step, target));
+            },
+        )
+        .await
+        .unwrap();
+        rebuilt.db.close().await;
+        for (step, snap) in steps {
+            let count = if matches!(step, RebuildStep::Swapped | RebuildStep::Done) {
+                50
+            } else {
+                3
+            };
+            assert_index(&snap.join("qso.db"), count).await;
+        }
+        assert!(!QsoDatabase::rebuild_temp_path(&path).exists());
+    }
+    #[tokio::test]
+    async fn rebuild_over_an_index_with_a_stale_wal_keeps_the_new_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let killed = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        let db = seed(&path, &["OLD1"]).await;
+        db.insert_converted(snapshot(dir.path(), &["OLD2"]).await.records)
+            .await
+            .unwrap();
+        copy_files(dir.path(), killed.path());
+        db.close().await;
+        let calls: Vec<_> = (0..500).map(|i| format!("NEW{i}")).collect();
+        let refs: Vec<_> = calls.iter().map(String::as_str).collect();
+        let path = killed.path().join("qso.db");
+        let new = QsoDatabase::rebuild_from(
+            &path,
+            snapshot(dir.path(), &refs).await,
+            PreviousIndex::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(new.db.count_qsos().await.unwrap(), 500);
+        assert!(!new
+            .db
+            .get_worked_callsigns("20M")
+            .await
+            .iter()
+            .any(|c| c.starts_with("OLD")));
+        new.db.close().await;
+        assert_index(&path, 500).await;
+    }
+    #[tokio::test]
+    async fn rebuild_keeps_a_copy_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        seed(&path, &["OLD1"]).await.close().await;
+        for n in 0..2 {
+            let result = QsoDatabase::rebuild_from(
+                &path,
+                snapshot(dir.path(), &["NEW1", "NEW2"]).await,
+                PreviousIndex::KeepCopy,
+            )
+            .await
+            .unwrap();
+            let expected = suffixed(
+                &path,
+                if n == 0 {
+                    ".pre-rebuild"
+                } else {
+                    ".pre-rebuild.1"
+                },
+            );
+            assert_eq!(result.kept, Some(expected.clone()));
+            result.db.close().await;
+            assert_index(&expected, if n == 0 { 1 } else { 2 }).await;
+        }
+    }
+    #[tokio::test]
+    async fn rebuild_keeps_an_unreadable_index_and_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        std::fs::write(&path, b"this is not a database").unwrap();
+        std::fs::write(suffixed(&path, "-wal"), [42; 64]).unwrap();
+        let result = QsoDatabase::rebuild_from(
+            &path,
+            snapshot(dir.path(), &["NEW1"]).await,
+            PreviousIndex::Replace,
+        )
+        .await
+        .unwrap();
+        result.db.close().await;
+        assert_eq!(
+            std::fs::read(suffixed(&path, ".pre-rebuild")).unwrap(),
+            b"this is not a database"
+        );
+        assert_eq!(
+            std::fs::read(suffixed(&path, ".pre-rebuild-wal")).unwrap(),
+            [42; 64]
+        );
+        assert_index(&path, 1).await;
+    }
+    #[tokio::test]
+    async fn rebuild_clears_leftovers_of_a_crashed_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        for suffix in [".new", ".new-wal", ".new-shm", ".new-journal"] {
+            std::fs::write(suffixed(&path, suffix), b"junk").unwrap();
+        }
+        let db = seed(&path, &["NEW1"]).await;
+        db.close().await;
+        assert_index(&path, 1).await;
+        for suffix in [".new", ".new-wal", ".new-shm", ".new-journal"] {
+            assert!(!suffixed(&path, suffix).exists());
+        }
+    }
+    #[test]
+    fn checkpoint_allows_swap_only_when_complete() {
+        for (busy, log, done, expected) in [
+            (0, 0, 0, true),
+            (0, -1, -1, true),
+            (1, 5, 3, false),
+            (0, 5, 3, false),
+        ] {
+            assert_eq!(checkpoint_allows_swap(busy, log, done), expected);
+        }
+    }
+    #[tokio::test]
+    async fn drift_counts_both_directions_as_a_multiset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed(Path::new(":memory:"), &["A", "C"]).await;
+        assert_eq!(
+            db.drift_from(&snapshot(dir.path(), &["A", "A", "B"]).await)
+                .await
+                .unwrap(),
+            IndexDrift {
+                missing_from_index: 2,
+                missing_from_adif: 1
+            }
+        );
+    }
+    #[tokio::test]
+    async fn drift_ignores_sub_second_start_times_and_callsign_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed(Path::new(":memory:"), &[]).await;
+        let mut records = snapshot(dir.path(), &["w1aw"]).await.records;
+        records[0].start_time += chrono::Duration::milliseconds(611);
+        db.insert_converted(records).await.unwrap();
+        assert!(db
+            .drift_from(&snapshot(dir.path(), &["W1AW"]).await)
+            .await
+            .unwrap()
+            .is_current());
+    }
+    #[tokio::test]
+    async fn drift_skips_records_and_rows_without_a_callsign() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed(Path::new(":memory:"), &["A"]).await;
+        sqlx::query("UPDATE qsos SET metadata = json_set(metadata, '$.their_callsign', '')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .drift_from(&snapshot(dir.path(), &[""]).await)
+            .await
+            .unwrap()
+            .is_current());
+    }
+    #[tokio::test]
+    async fn drift_counts_an_unreadable_row_as_missing_from_the_adif() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed(Path::new(":memory:"), &["A"]).await;
+        sqlx::query("UPDATE qsos SET metadata = '{not json'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.drift_from(&snapshot(dir.path(), &[]).await)
+                .await
+                .unwrap()
+                .missing_from_adif,
+            1
+        );
+    }
+    #[tokio::test]
+    async fn migration_refuses_an_unreadable_row_and_keeps_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        let adif = dir.path().join("qsos.adi");
+        let db = seed(&path, &["A", "B"]).await;
+        let id: String = sqlx::query_scalar("SELECT qso_id FROM qsos WHERE id=1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE qsos SET progress_data = '{not json' WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        let bytes = std::fs::read(&path).unwrap();
+        let err = match QsoDatabase::migrate_legacy_to_adif(&path, &adif).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("migration accepted unreadable row"),
+        };
+        assert!(
+            err.contains("row 1") && err.contains(&id) && err.contains("qso.db.pre-migration"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(suffixed(&path, ".pre-migration")).unwrap(),
+            bytes
+        );
+        assert!(!adif.exists());
+        assert!(!suffixed(&adif, ".migrating").exists());
+    }
+    #[tokio::test]
+    async fn migration_copies_a_non_empty_wal_with_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let killed = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        let db = seed(&path, &["A"]).await;
+        db.insert_converted(snapshot(dir.path(), &["B"]).await.records)
+            .await
+            .unwrap();
+        copy_files(dir.path(), killed.path());
+        db.close().await;
+        let path = killed.path().join("qso.db");
+        let (db, _) = QsoDatabase::migrate_legacy_to_adif(&path, killed.path().join("qsos.adi"))
+            .await
+            .unwrap();
+        db.close().await;
+        assert!(suffixed(&path, ".pre-migration-wal").exists());
+        assert_index(&suffixed(&path, ".pre-migration"), 2).await;
+    }
+    #[tokio::test]
+    async fn migration_keeps_an_existing_pre_migration_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qso.db");
+        seed(&path, &["A"]).await.close().await;
+        std::fs::write(suffixed(&path, ".pre-migration"), b"older copy").unwrap();
+        let (db, result) = QsoDatabase::migrate_legacy_to_adif(&path, dir.path().join("qsos.adi"))
+            .await
+            .unwrap();
+        assert!(result.backup_existed);
+        db.close().await;
+        assert_eq!(std::fs::read(result.backup).unwrap(), b"older copy");
+    }
+    #[tokio::test]
+    async fn export_writes_the_whole_logbook_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        let db = seed(Path::new(":memory:"), &["A", "B"]).await;
+        assert_eq!(db.export_to_adif(&path).await.unwrap(), 2);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            matches!(db.export_to_adif(&path).await,Err(AsyncDatabaseError::Io{source,..}) if source.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!suffixed(&path, ".migrating").exists());
     }
 }

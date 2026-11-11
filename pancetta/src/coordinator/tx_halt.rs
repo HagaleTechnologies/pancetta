@@ -106,6 +106,7 @@ mod tests {
                 &rig_conn_state,
                 &audio_alive,
                 &Arc::default(),
+                &pancetta_hamlib::DataModeReadiness::new(false),
             )
         };
         assert_eq!(reason(), None);

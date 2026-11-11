@@ -7,6 +7,10 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+// Serialize tests that replace the process-wide external-rigctld address.
+#[cfg(test)]
+static RIGCTLD_TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // The command owner alone executes gain transactions. In particular, polling
 // and the watchdog may unkey, but never issue an attenuator setter.
 #[derive(Default)]
@@ -1336,6 +1340,7 @@ mod rig_poll_health_tests {
 
 impl super::ApplicationCoordinator {
     pub(crate) async fn teardown_hamlib(&mut self) {
+        self.message_bus.data_mode.invalidate();
         for orphan in self.hamlib_orphans.drain(..) {
             orphan.abort();
         }
@@ -1775,6 +1780,7 @@ impl super::ApplicationCoordinator {
         // doc comment in `coordinator/mod.rs` for the full reasoning.
         self.hamlib_command_loop_ready
             .store(false, Ordering::Release);
+        self.message_bus.data_mode.invalidate();
 
         // PAN-19 round-17 review (Codex P1): "keep readiness cleanup
         // scoped to its Hamlib generation". Bump the generation epoch
@@ -1843,6 +1849,13 @@ impl super::ApplicationCoordinator {
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
         let rig_enabled = rig_config.interface.enabled && !use_mock;
+        self.message_bus
+            .data_mode
+            .configure(rig_enabled && rig_config.data_mode.is_some());
+        let data_mode_policy = rig_config
+            .normalized_data_mode()?
+            .map(|mode| pancetta_hamlib::DataModePolicy::new(mode, rig_config.data_passband_hz))
+            .transpose()?;
 
         // Spawn rigctld as a managed child process if rig is enabled
         // and no external rigctld is already running
@@ -1990,13 +2003,16 @@ impl super::ApplicationCoordinator {
             self.rig_control_disabled_rig()
         } else {
             info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
-            Arc::new(pancetta_hamlib::RigctldClient::new(
-                pancetta_hamlib::RigctldConfig {
-                    host: rigctld_host.clone(),
-                    port: rigctld_port,
-                    ..Default::default()
-                },
-            ))
+            let client = pancetta_hamlib::RigctldClient::new(pancetta_hamlib::RigctldConfig {
+                host: rigctld_host.clone(),
+                port: rigctld_port,
+                ..Default::default()
+            });
+            let client = match data_mode_policy {
+                Some(policy) => client.with_data_mode(policy, self.message_bus.data_mode.clone()),
+                None => client,
+            };
+            Arc::new(client)
         };
         self.rig_handle = Some(rig.clone());
         self.rig_handle_is_real = rig_enabled;
@@ -3220,6 +3236,10 @@ impl super::ApplicationCoordinator {
                                             message_bus_for_connect
                                                 .receive_gain
                                                 .ptt_command_consumed();
+                                        }
+                                        if *state && !message_bus_for_connect.data_mode.is_ready() {
+                                            warn!("Discarding PTT-on: rig data mode is not ready");
+                                            continue;
                                         }
                                         // Revalidate queued key-downs at the rig owner too.
                                         // An acknowledged earlier unkey may have retired the
@@ -7499,6 +7519,7 @@ mod teardown_replay_tests {
                     gain.confirmed_off(0);
                     std::sync::Arc::new(gain)
                 },
+                &pancetta_hamlib::DataModeReadiness::new(false),
             )
             .is_some(),
             "PTT must stay refused while the pending slot a failed CAT command repopulated is \
@@ -8222,6 +8243,7 @@ mod pan_59_reconnect_tests {
     /// bound) or a slow connect() against an unrelated live service.
     #[tokio::test]
     async fn refuses_reconnect_when_rig_model_is_unrecognized() {
+        let _environment_lock = super::RIGCTLD_TEST_ENV.lock().await;
         // SAFETY: this test mutates process-wide env vars (RIGCTLD_PORT/
         // RIGCTLD_HOST). No other test in this module reads them (the mock
         // -rig path used elsewhere never reaches the code that does), and
@@ -9809,6 +9831,7 @@ mod pan251_swr_protection_tests {
             &c.rig_conn_state,
             &c.audio_output_alive,
             &c.message_bus.receive_gain,
+            &c.message_bus.data_mode,
         )
     }
 
@@ -9903,6 +9926,317 @@ mod pan251_swr_protection_tests {
         );
         c.ptt_active.store(false, Ordering::Release);
         c.shutdown_signal.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod pan276_data_mode_tests {
+    use super::*;
+    use crate::message_bus::{RigControlMessage, SendIfOutcome};
+    use pancetta_config::Config;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // This test shares PAN-59's serialized external-rigctld environment seam.
+    struct RigEnvironment(Option<String>, Option<String>, Option<String>);
+    impl RigEnvironment {
+        fn set(port: u16) -> Self {
+            let previous = Self(
+                std::env::var("RIGCTLD_PORT").ok(),
+                std::env::var("PANCETTA_MOCK_RIG").ok(),
+                std::env::var("RIGCTLD_HOST").ok(),
+            );
+            std::env::set_var("RIGCTLD_PORT", port.to_string());
+            std::env::set_var("RIGCTLD_HOST", "127.0.0.1");
+            std::env::remove_var("PANCETTA_MOCK_RIG");
+            previous
+        }
+    }
+    impl Drop for RigEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in [
+                ("RIGCTLD_PORT", &self.0),
+                ("PANCETTA_MOCK_RIG", &self.1),
+                ("RIGCTLD_HOST", &self.2),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    async fn coordinator(config: Config) -> super::super::ApplicationCoordinator {
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            std::env::temp_dir().join(format!("pan276-{}.toml", uuid::Uuid::new_v4())),
+            true,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn eventually(done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition did not become true");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_startup_and_bus_qsy_gate_ptt_and_retry_mode_failures() {
+        let _environment_lock = RIGCTLD_TEST_ENV.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _environment = RigEnvironment::set(listener.local_addr().unwrap().port());
+        let transcript = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reject_mode = Arc::new(AtomicBool::new(false));
+        let hold_startup = Arc::new(AtomicBool::new(true));
+        let mode_entered = Arc::new(tokio::sync::Notify::new());
+        let release_mode = Arc::new(tokio::sync::Notify::new());
+        let peer = tokio::spawn({
+            let transcript = transcript.clone();
+            let reject_mode = reject_mode.clone();
+            let hold_startup = hold_startup.clone();
+            let mode_entered = mode_entered.clone();
+            let release_mode = release_mode.clone();
+            async move {
+                // First connection is the coordinator's daemon-presence probe.
+                let (probe, _) = listener.accept().await.unwrap();
+                drop(probe);
+                let mut dial = 14_074_000u64;
+                let mut ptt = false;
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(command)) = lines.next_line().await {
+                        transcript.lock().unwrap().push(command.clone());
+                        let response = match command.as_str() {
+                            "f" => format!("{dial}\n"),
+                            "t" => format!("{}\n", u8::from(ptt)),
+                            "s" => "0\nVFOB\n".to_string(),
+                            "i" => format!("{dial}\n"),
+                            "m" | "\\get_mode" => "PKTUSB\n3000\n".to_string(),
+                            "v" | "\\get_vfo" => "VFOA\n".to_string(),
+                            "\\get_level STRENGTH" | "l STRENGTH" => "-20\n".to_string(),
+                            "+\\dump_caps" => {
+                                "dump_caps:\nGet level: STRENGTH(-54..50/1)\nRPRT 0\n".to_string()
+                            }
+                            "\\set_mode PKTUSB 3000" => {
+                                if hold_startup.swap(false, Ordering::AcqRel) {
+                                    mode_entered.notify_one();
+                                    release_mode.notified().await;
+                                }
+                                if reject_mode.load(Ordering::Acquire) {
+                                    "RPRT -1\n".to_string()
+                                } else {
+                                    "RPRT 0\n".to_string()
+                                }
+                            }
+                            "T 0" => {
+                                ptt = false;
+                                "RPRT 0\n".to_string()
+                            }
+                            "T 1" => {
+                                ptt = true;
+                                "RPRT 0\n".to_string()
+                            }
+                            _ if command.starts_with("F ") => {
+                                dial = command[2..].parse().unwrap();
+                                "RPRT 0\n".to_string()
+                            }
+                            _ if command.starts_with("V ") || command.starts_with("S ") => {
+                                "RPRT 0\n".to_string()
+                            }
+                            _ => "RPRT -11\n".to_string(),
+                        };
+                        if writer.write_all(response.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut config = Config::default();
+        config.rig.interface.enabled = true;
+        config.rig.interface.port.clear();
+        config.rig.data_mode = Some("PKTUSB".to_string());
+        config.rig.data_passband_hz = Some(3000);
+        let mut c = coordinator(config).await;
+        let bus = c.message_bus.clone();
+        assert!(
+            !bus.data_mode.is_ready(),
+            "configured station starts blocked"
+        );
+        let start = tokio::spawn(async move {
+            c.start_hamlib_component().await.unwrap();
+            c
+        });
+        tokio::time::timeout(Duration::from_secs(10), mode_entered.notified())
+            .await
+            .unwrap();
+        for source in [
+            ComponentId::Ft8Transmitter,
+            ComponentId::Tui,
+            ComponentId::StationAgent,
+        ] {
+            // Frames, bundles and tune share the transmitter's final enqueue gate.
+            assert_eq!(
+                super::super::tx::send_ptt_command(&bus, source, true, || true),
+                SendIfOutcome::Denied
+            );
+        }
+        assert!(!transcript
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == "T 1"));
+        release_mode.notify_one();
+        let mut c = start.await.unwrap();
+        eventually(|| bus.data_mode.is_ready()).await;
+        let policy_before = c.tx_policy.load(Ordering::Acquire);
+        // Every frequency producer reaches the same owner and managed client.
+        for (source, hz) in [
+            (ComponentId::Tui, 7_074_000),
+            (ComponentId::Autonomous, 14_074_000),
+            (ComponentId::StationAgent, 7_074_000),
+        ] {
+            let start_index = transcript.lock().unwrap().len();
+            reject_mode.store(true, Ordering::Release);
+            bus.send_message(ComponentMessage::new(
+                source,
+                ComponentId::Hamlib,
+                MessageType::RigControl(RigControlMessage::SetFrequency {
+                    frequency: hz,
+                    vfo: 0,
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+            eventually(|| {
+                !bus.data_mode.is_ready() && !c.hamlib_pending_frequency.lock().unwrap().is_empty()
+            })
+            .await;
+            // Bypass producer admission to simulate a key-down already queued.
+            bus.send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Hamlib,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: true }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+            // A following unkey is a FIFO barrier for the refused key-down.
+            let old_unkeys = transcript
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| *s == "T 0")
+                .count();
+            bus.send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Hamlib,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: false }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+            eventually(|| {
+                transcript
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| *s == "T 0")
+                    .count()
+                    > old_unkeys
+            })
+            .await;
+            assert!(!transcript.lock().unwrap()[start_index..]
+                .iter()
+                .any(|s| s == "T 1"));
+            c.tx_policy
+                .store(pancetta_core::TxPolicy::Disabled.as_u8(), Ordering::Release);
+            reject_mode.store(false, Ordering::Release);
+            eventually(|| {
+                bus.data_mode.is_ready() && c.hamlib_pending_frequency.lock().unwrap().is_empty()
+            })
+            .await;
+            let causes = super::super::readiness::ReadinessSources::from_coordinator(&c)
+                .snapshot(false, false)
+                .tx_mute_causes;
+            assert!(causes.contains(&pancetta_tui::readiness::TxMuteCause::PolicyDisabled));
+            assert!(!causes.contains(&pancetta_tui::readiness::TxMuteCause::RigDataModeNotReady));
+            c.tx_policy.store(policy_before, Ordering::Release);
+            let commands = transcript.lock().unwrap();
+            let commands = &commands[start_index..];
+            let frequency = commands
+                .iter()
+                .position(|s| s == &format!("F {hz}"))
+                .unwrap();
+            let mode = commands
+                .iter()
+                .position(|s| s == "\\set_mode PKTUSB 3000")
+                .unwrap();
+            assert!(frequency < mode);
+        }
+        assert_eq!(c.tx_policy.load(Ordering::Acquire), policy_before);
+        c.teardown_hamlib().await;
+        assert!(
+            !bus.data_mode.is_ready(),
+            "teardown revokes the old client confirmation"
+        );
+        hold_startup.store(true, Ordering::Release);
+        let restart = tokio::spawn(async move {
+            c.start_hamlib_component().await.unwrap();
+            c
+        });
+        tokio::time::timeout(Duration::from_secs(10), mode_entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            !bus.data_mode.is_ready(),
+            "restart waits for the new client's mode acknowledgement"
+        );
+        assert_eq!(
+            super::super::tx::send_ptt_command(&bus, ComponentId::Tui, true, || true),
+            SendIfOutcome::Denied
+        );
+        release_mode.notify_one();
+        let mut c = restart.await.unwrap();
+        assert!(bus.data_mode.is_ready());
+        assert_eq!(c.tx_policy.load(Ordering::Acquire), policy_before);
+        c.shutdown_signal.store(true, Ordering::Release);
+        c.teardown_hamlib().await;
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_data_mode_does_not_block_cat_disabled_simulation() {
+        let mut config = Config::default();
+        config.rig.interface.enabled = false;
+        config.rig.data_mode = Some("PKTUSB".to_string());
+        let mut c = coordinator(config).await;
+        assert!(c.message_bus.data_mode.is_ready());
+        c.start_hamlib_component().await.unwrap();
+        assert!(c.message_bus.data_mode.is_ready());
+        c.shutdown_signal.store(true, Ordering::Release);
+        c.teardown_hamlib().await;
     }
 }
 

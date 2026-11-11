@@ -254,6 +254,44 @@ baud_rate = 38400
 | `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
 
+### Optional rig data mode
+
+`rig.mode` selects the station's FT8/FT4/FT2 waveform protocol. The separate
+`rig.data_mode` selects an exact Hamlib CAT mode. Both new settings are off by
+default. To opt in:
+
+```toml
+[rig]
+model = "FTdx10"
+mode = "FT8"
+data_mode = "PKTUSB"
+data_passband_hz = 3000
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `data_mode` | string | absent | `PKTUSB`, `PKTLSB`, `USB`, or `LSB`, case-insensitive. Empty strings, whitespace and other CAT tokens are rejected. |
+| `data_passband_hz` | integer | absent | 0 through 2147483647. Absent or 0 asks Hamlib for the rig's default width; positive widths are sent unchanged. Requires `data_mode`. |
+
+When `rig.data_mode` is set, Pancetta applies that CAT mode on connection and
+after commanded frequency or split changes. TX stays inhibited until the mode
+is applied. Omit it to keep manual rig-mode control. Restart after changing
+these settings. CAT-disabled simulation does not require mode confirmation.
+
+For split operation, the receive and effective transmit VFO must both accept
+the mode, and the receive VFO must be restored before TX becomes ready. If the
+rig cannot establish its split state, TX remains inhibited until reconciliation
+succeeds or a commanded simplex transition establishes it. A failed mode write
+or reconnect blocks TX; successful retry restores mode readiness without
+changing the operator's TX policy. PTT-off remains available while blocked.
+Mode is applied on connection and Pancetta-commanded retunes, not continuously
+after front-panel changes. Unsupported rig modes remain blocked rather than
+falling back to a different CAT token. Hardware qualification is pending.
+
+Config layering preserves an optional value when a higher layer omits it. A
+supplied value replaces it. Remove the setting from the layer that defines it
+to disable automatic mode control.
+
 > **Network mode:** setting environment variable `RIGCTLD_HOST` to a
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
@@ -1207,7 +1245,9 @@ external keys. Preserve the whole stopped installation and data directory.
 | File | Role | Recoverable? |
 |---|---|---|
 | `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
-| `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or stale. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
+| `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or if its contacts differ from the ADIF; writes `qso.db.new` and swaps it in. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
+| `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
+| `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
 | `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |

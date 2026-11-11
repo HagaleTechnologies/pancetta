@@ -2152,6 +2152,12 @@ impl ApplicationCoordinator {
         // Create message bus with high-performance configuration
         let coordinator_config = CoordinatorConfig::default();
         let message_bus = MessageBus::new(coordinator_config.message_buffer_size)?;
+        let mock_requested = std::env::var("PANCETTA_MOCK_RIG")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false);
+        message_bus.data_mode.configure(
+            config.rig.interface.enabled && !mock_requested && config.rig.data_mode.is_some(),
+        );
 
         // Cache the display-feed-wanted flag before `config` is moved into the
         // Arc<RwLock> — the additive dual-destination emit sites read this
