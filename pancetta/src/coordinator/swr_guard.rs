@@ -838,6 +838,7 @@ mod tests {
             )),
             &Arc::new(AtomicBool::new(true)),
             &Arc::default(),
+            &pancetta_hamlib::DataModeReadiness::new(false),
         )
     }
 
