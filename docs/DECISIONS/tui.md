@@ -458,3 +458,20 @@ and say nothing about any one station. The strip chip and the Why text carry
 - **Key-effect golden.** `pancetta-tui/tests/fixtures/key_effects.golden` records what every key does (status line, commands sent, App fields changed) in five modifier sets across 36 scenarios: the main view on every panel, zoomed, stopped and TX-disabled, every dialog on a rich fixture, and six empty-dialog cases. The rich fixture includes audio devices, diagnostic events and recent QSOs. It was blessed from the pre-refactor handler at `7053b62` (the harness, `tui_runner/key_effects.rs`, uses only APIs that exist there, so it can be dropped onto that commit to re-check), and the new handler reproduces it byte for byte. Any change to what a key does fails `key_effects_match_golden` until it is re-blessed on purpose with `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`. The variable is separate from `PANCETTA_REGEN_DOCS`, so regenerating docs never re-blesses key behaviour.
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
+
+## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
+
+Each Recent-QSOs row shows one glyph cell per enabled upload target in
+fixed order Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW
+(✓ accepted, ~ pending, × rejected, ! failed, ? unknown), with per-target
+state and reason on the selected-contact Station card. The card follows the
+overlay cursor's QSO UUID, never the live focused station, so an older
+contact's results are never attributed to a same-callsign live station.
+The completion toast is typed App state ("{call} logged · uploads queued"
+until every explicitly accepted target yields "{call} uploaded"); compose
+input outranks it and ordinary status text returns on expiry. Acceptance is
+only ever an explicit service result — an empty captured target set renders
+"uploads off", a missing result renders "?", and colour supplements glyphs.
+History is session-only: the coordinator retains the last 100 completion
+registrations and the TUI mirrors them; a restart invents no accepted
+history.

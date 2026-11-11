@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use pancetta_dx::upload_outbox::{
-    Lane, NewUpload, OutboxStore, RetryDelay, RetrySchedule, UploadDestination, OUTBOX_MAX_ENTRIES,
+    EntryState, Lane, NewUpload, OutboxStore, RetryDelay, RetrySchedule, UploadDestination,
+    OUTBOX_MAX_ENTRIES,
 };
 use pancetta_dx::UploadFailureClass;
 use tokio::sync::{mpsc, watch};
@@ -422,10 +423,12 @@ impl UploadOutboxHandle {
     /// shutdown it keeps taking batches until every handle is gone (or its
     /// backstop after the stop request), then closes the channel and saves
     /// what is in it; a batch sent after the close (or after the worker is
-    /// gone) is not queued and is logged at warn.
-    pub(crate) async fn enqueue(&self, batch: Vec<NewUpload>) {
+    /// gone) is not queued and is logged at warn. PAN-344: the outcome is
+    /// returned so the caller can mark the refused targets Failed instead
+    /// of only reading a log line.
+    pub(crate) async fn enqueue(&self, batch: Vec<NewUpload>) -> bool {
         if batch.is_empty() {
-            return;
+            return true;
         }
         if let Err(mpsc::error::SendError(batch)) = self.tx.send(batch).await {
             let call = batch.first().map_or("?", |u| u.call.as_str());
@@ -435,7 +438,9 @@ impl UploadOutboxHandle {
                 batch.len(),
                 call
             );
+            return false;
         }
+        true
     }
 
     /// Resolves once coordinator shutdown asks the upload subscribers to
@@ -469,6 +474,7 @@ pub(crate) fn start_upload_outbox<T: OutboxTransport>(
     health: Arc<std::sync::Mutex<UploadHealth>>,
     bus: Option<MessageBus>,
     shutdown: Arc<AtomicBool>,
+    statuses: Option<crate::coordinator::qso_upload_status::SharedUploadStatusRegistry>,
 ) -> (UploadOutboxHandle, tokio::task::JoinHandle<()>) {
     spawn_upload_outbox(
         path,
@@ -479,6 +485,7 @@ pub(crate) fn start_upload_outbox<T: OutboxTransport>(
         health,
         bus,
         shutdown,
+        statuses,
     )
 }
 
@@ -532,6 +539,7 @@ fn spawn_upload_outbox<T: OutboxTransport>(
     health: Arc<std::sync::Mutex<UploadHealth>>,
     bus: Option<MessageBus>,
     shutdown: Arc<AtomicBool>,
+    statuses: Option<crate::coordinator::qso_upload_status::SharedUploadStatusRegistry>,
 ) -> (UploadOutboxHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(256);
     let destinations: Arc<[UploadDestination]> = transport.destinations().into();
@@ -547,6 +555,7 @@ fn spawn_upload_outbox<T: OutboxTransport>(
         health,
         bus,
         shutdown,
+        statuses,
         stop: stop_rx,
         lanes: HashMap::new(),
         refused_full: 0,
@@ -580,6 +589,11 @@ struct Worker<T: OutboxTransport> {
     health: Arc<std::sync::Mutex<UploadHealth>>,
     bus: Option<MessageBus>,
     shutdown: Arc<AtomicBool>,
+    /// PAN-344: optional per-QSO upload-status registry. Present only in
+    /// the production coordinator wiring; tests may pass `None`. Updated
+    /// on the result paths BEFORE an accepted entry is deleted, under no
+    /// other lock, never across I/O.
+    statuses: Option<crate::coordinator::qso_upload_status::SharedUploadStatusRegistry>,
     /// The stop request [`stop_upload_outbox`] sends; starts the shutdown
     /// backstop.
     stop: watch::Receiver<bool>,
@@ -773,7 +787,33 @@ impl<T: OutboxTransport> Worker<T> {
         }
     }
 
+    /// PAN-344: record one target transition in the per-QSO upload-status
+    /// registry (no-op without a registry or a known UUID). An associated
+    /// function taking only the registry field so the borrow stays disjoint
+    /// from the lane/store borrows on the result paths. Never takes another
+    /// lock and never awaits.
+    fn record_status(
+        statuses: &Option<crate::coordinator::qso_upload_status::SharedUploadStatusRegistry>,
+        qso_id: Option<&str>,
+        d: UploadDestination,
+        state: pancetta_tui::upload_status::UploadState,
+        reason: &str,
+    ) {
+        use super::qso_upload_status::upload_target_for_destination;
+        if let (Some(registry), Some(uuid)) = (statuses.as_ref(), qso_id) {
+            registry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record(uuid, upload_target_for_destination(d), state, reason);
+        }
+    }
+
     async fn on_batch(&mut self, store: &mut OutboxStore, batch: Vec<NewUpload>) {
+        // PAN-344: remember the batch's (uuid, destination) pairs so a
+        // queue-capacity refusal can mark each refused target Failed —
+        // absence from the queue is never acceptance.
+        let batch_ids: Vec<(Uuid, UploadDestination)> =
+            batch.iter().map(|n| (n.qso_id, n.destination)).collect();
         let before = store.len();
         let r = store.add(batch, Utc::now());
         if r.added > 0 {
@@ -791,6 +831,20 @@ impl<T: OutboxTransport> Worker<T> {
                 store.len(),
                 r.refused_full
             );
+            // PAN-344: when the whole batch was refused, every one of its
+            // targets is locally Failed. (A partial refusal cannot be
+            // attributed per-entry, so only the whole-batch case marks.)
+            if !batch_ids.is_empty() && r.refused_full >= batch_ids.len() {
+                for (uuid, destination) in batch_ids {
+                    Self::record_status(
+                        &self.statuses,
+                        Some(&uuid.to_string()),
+                        destination,
+                        pancetta_tui::upload_status::UploadState::Failed,
+                        "upload queue full",
+                    );
+                }
+            }
         }
         self.publish(store);
     }
@@ -807,8 +861,23 @@ impl<T: OutboxTransport> Worker<T> {
         let label = d.label();
         let lane = self.lanes.entry(d).or_default();
         let mut row: Option<(DiagnosticLevel, String)> = None;
+        use pancetta_tui::upload_status::UploadState;
         match delivery {
             Delivery::Accepted { duplicate } => {
+                // PAN-344: explicit acceptance (duplicates included) is
+                // recorded BEFORE the queue entry is deleted, from the
+                // identity copied above.
+                Self::record_status(
+                    &self.statuses,
+                    qso_id.as_deref(),
+                    d,
+                    UploadState::Accepted,
+                    if duplicate {
+                        "duplicate \u{2014} already logged"
+                    } else {
+                        ""
+                    },
+                );
                 store.delivered(id);
                 let recovered = lane.delivered(now, self.timing.drain_spacing);
                 if duplicate {
@@ -834,6 +903,14 @@ impl<T: OutboxTransport> Worker<T> {
                 text,
             } => {
                 store.record_failure(id, Utc::now(), &text);
+                // PAN-344: a transient failure stays Pending with its reason.
+                Self::record_status(
+                    &self.statuses,
+                    qso_id.as_deref(),
+                    d,
+                    UploadState::Pending,
+                    &format!("retrying \u{b7} {}", clip(&text)),
+                );
                 let was_slow = lane.is_retrying_slowly();
                 match lane.failed(now, &self.schedule, jitter_unit()) {
                     RetryDelay::Burst(wait) => warn!(
@@ -884,6 +961,33 @@ impl<T: OutboxTransport> Worker<T> {
                     label,
                     text
                 );
+                // PAN-344: an authentication rejection affects EVERY
+                // nonaccepted contact waiting in this destination lane,
+                // including ones enqueued later in this batch; previously
+                // accepted contacts stay accepted (registry no-regression).
+                let reason = format!("login rejected \u{b7} restart after fixing credentials");
+                let lane_pending: Vec<String> = store
+                    .entries()
+                    .iter()
+                    .filter(|e| e.destination == d && e.state == EntryState::Pending)
+                    .map(|e| e.qso_id.to_string())
+                    .collect();
+                for uuid in lane_pending {
+                    Self::record_status(
+                        &self.statuses,
+                        Some(&uuid),
+                        d,
+                        UploadState::Rejected,
+                        &reason,
+                    );
+                }
+                Self::record_status(
+                    &self.statuses,
+                    qso_id.as_deref(),
+                    d,
+                    UploadState::Rejected,
+                    &reason,
+                );
                 row = Some((
                     DiagnosticLevel::Warn,
                     format!(
@@ -904,6 +1008,14 @@ impl<T: OutboxTransport> Worker<T> {
                     label,
                     call,
                     text
+                );
+                // PAN-344: the service refused THIS record.
+                Self::record_status(
+                    &self.statuses,
+                    qso_id.as_deref(),
+                    d,
+                    UploadState::Rejected,
+                    &format!("record rejected \u{b7} {}", clip(&text)),
                 );
                 row = Some((
                     DiagnosticLevel::Warn,
@@ -975,6 +1087,23 @@ impl<T: OutboxTransport> Worker<T> {
             format_wait(wait),
             err
         );
+        // PAN-344: retained entries waiting on a queue write stay Pending
+        // with a saving detail — never Accepted.
+        let unsaved: Vec<(String, UploadDestination)> = store
+            .entries()
+            .iter()
+            .filter(|e| self.unsaved.contains(&e.id))
+            .map(|e| (e.qso_id.to_string(), e.destination))
+            .collect();
+        for (uuid, destination) in unsaved {
+            Self::record_status(
+                &self.statuses,
+                Some(&uuid),
+                destination,
+                pancetta_tui::upload_status::UploadState::Pending,
+                "waiting for queue save",
+            );
+        }
         if !self.persist_error_reported {
             self.persist_error_reported = true;
             self.diag(
@@ -1170,6 +1299,8 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
         health: Arc<std::sync::Mutex<UploadHealth>>,
         shutdown: Arc<AtomicBool>,
+        /// PAN-344: the registry this rig's worker reports into.
+        statuses: crate::coordinator::qso_upload_status::SharedUploadStatusRegistry,
     }
 
     impl Rig {
@@ -1195,6 +1326,7 @@ mod tests {
         let transport = Arc::new(transport);
         let health = Arc::new(std::sync::Mutex::new(UploadHealth::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let statuses = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
         let (handle, task) = spawn_upload_outbox(
             path.clone(),
             capacity,
@@ -1204,6 +1336,7 @@ mod tests {
             health.clone(),
             bus,
             shutdown.clone(),
+            Some(statuses.clone()),
         );
         Rig {
             _dir: dir,
@@ -1213,6 +1346,7 @@ mod tests {
             task,
             health,
             shutdown,
+            statuses,
         }
     }
 
@@ -1227,6 +1361,226 @@ mod tests {
             call: call.to_string(),
             payload: format!("<CALL:{}>{}<EOR>", call.len(), call),
         }
+    }
+
+    /// PAN-344 AC4: the worker reports per-QSO delivery states — one UUID
+    /// with QRZ accepted (a duplicate counts as acceptance), ClubLog
+    /// retrying (transient failure stays Pending with its reason) and eQSL
+    /// record-rejected. Explicit acceptance survives the queue deletion.
+    #[tokio::test]
+    async fn pan344_worker_reports_per_qso_delivery_states() {
+        use pancetta_tui::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new(&[ClubLog, QrzLogbook, Eqsl])
+            .always(QrzLogbook, Delivery::Accepted { duplicate: true })
+            .always(ClubLog, transient())
+            .always(Eqsl, record_rejected());
+        let rig = start_in(dir, transport, None);
+        let uuid = Uuid::new_v4();
+        {
+            let mut reg = rig.statuses.lock().unwrap();
+            reg.register(
+                &uuid.to_string(),
+                "K1ABC",
+                vec![
+                    (UploadTarget::Qrz, TargetUploadStatus::pending("queued")),
+                    (UploadTarget::ClubLog, TargetUploadStatus::pending("queued")),
+                    (UploadTarget::Eqsl, TargetUploadStatus::pending("queued")),
+                ],
+            );
+        }
+        let one = |d| NewUpload {
+            qso_id: uuid,
+            destination: d,
+            call: "K1ABC".to_string(),
+            payload: format!("p-{d:?}"),
+        };
+        rig.handle
+            .enqueue(vec![one(QrzLogbook), one(ClubLog), one(Eqsl)])
+            .await;
+        wait_until(|| {
+            let snap = rig.statuses.lock().unwrap().snapshot();
+            matches!(
+                status_of(&snap, &uuid, UploadTarget::Eqsl),
+                Some(UploadState::Rejected)
+            ) && matches!(
+                status_of(&snap, &uuid, UploadTarget::Qrz),
+                Some(UploadState::Accepted)
+            )
+        })
+        .await;
+        let snap = rig.statuses.lock().unwrap().snapshot();
+        assert_eq!(
+            status_of(&snap, &uuid, UploadTarget::Qrz),
+            Some(UploadState::Accepted),
+            "duplicate reply counts as acceptance"
+        );
+        assert_eq!(
+            status_of(&snap, &uuid, UploadTarget::ClubLog),
+            Some(UploadState::Pending),
+            "transient failure stays pending"
+        );
+        let entry = snap.iter().find(|s| s.uuid == uuid.to_string()).unwrap();
+        let clublog = entry
+            .targets
+            .iter()
+            .find(|(t, _)| *t == UploadTarget::ClubLog)
+            .unwrap();
+        assert!(
+            clublog.1.reason.contains("retrying"),
+            "{}",
+            clublog.1.reason
+        );
+        let eqsl = entry
+            .targets
+            .iter()
+            .find(|(t, _)| *t == UploadTarget::Eqsl)
+            .unwrap();
+        assert_eq!(eqsl.1.state, UploadState::Rejected);
+        assert!(
+            eqsl.1.reason.contains("record rejected"),
+            "{}",
+            eqsl.1.reason
+        );
+        // The accepted entry left the queue; the registry keeps the result.
+        assert!(!rig.entries().iter().any(|e| e.destination == QrzLogbook));
+    }
+
+    fn status_of(
+        snap: &[pancetta_tui::upload_status::QsoUploadStatus],
+        uuid: &Uuid,
+        target: pancetta_tui::upload_status::UploadTarget,
+    ) -> Option<pancetta_tui::upload_status::UploadState> {
+        snap.iter()
+            .find(|s| s.uuid == uuid.to_string())
+            .and_then(|s| s.state(target))
+    }
+
+    /// PAN-344 AC4: an authentication rejection marks every nonaccepted
+    /// contact waiting in that destination lane, including ones still
+    /// queued; a previously accepted contact stays accepted.
+    #[tokio::test]
+    async fn pan344_login_rejection_marks_pending_lane() {
+        use pancetta_tui::upload_status::{TargetUploadStatus, UploadState, UploadTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new(&[QrzLogbook]).script(QrzLogbook, vec![ok(), login()]);
+        let rig = start_in(dir, transport, None);
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let u3 = Uuid::new_v4();
+        {
+            let mut reg = rig.statuses.lock().unwrap();
+            for u in [&u1, &u2, &u3] {
+                reg.register(
+                    &u.to_string(),
+                    "K1ABC",
+                    vec![(UploadTarget::Qrz, TargetUploadStatus::pending("queued"))],
+                );
+            }
+        }
+        let one = |u: Uuid| NewUpload {
+            qso_id: u,
+            destination: QrzLogbook,
+            call: "K1ABC".to_string(),
+            payload: format!("p-{u}"),
+        };
+        rig.handle.enqueue(vec![one(u1), one(u2), one(u3)]).await;
+        wait_until(|| {
+            let snap = rig.statuses.lock().unwrap().snapshot();
+            matches!(
+                status_of(&snap, &u1, UploadTarget::Qrz),
+                Some(UploadState::Accepted)
+            ) && matches!(
+                status_of(&snap, &u2, UploadTarget::Qrz),
+                Some(UploadState::Rejected)
+            ) && matches!(
+                status_of(&snap, &u3, UploadTarget::Qrz),
+                Some(UploadState::Rejected)
+            )
+        })
+        .await;
+        let snap = rig.statuses.lock().unwrap().snapshot();
+        // u1 was accepted before the rejection: explicit acceptance is not
+        // regressed by the lane-wide rejection.
+        assert_eq!(
+            status_of(&snap, &u1, UploadTarget::Qrz),
+            Some(UploadState::Accepted)
+        );
+        for u in [&u2, &u3] {
+            let entry = snap.iter().find(|s| s.uuid == u.to_string()).unwrap();
+            let qrz = entry
+                .targets
+                .iter()
+                .find(|(t, _)| *t == UploadTarget::Qrz)
+                .unwrap();
+            assert_eq!(qrz.1.state, UploadState::Rejected);
+            assert!(qrz.1.reason.contains("login rejected"), "{}", qrz.1.reason);
+        }
+        // u3 is still queued for after a credential fix; its state is Rejected.
+        assert!(rig.entries().iter().any(|e| e.qso_id == u3));
+    }
+
+    /// PAN-344 AC5: a queue-capacity refusal marks every refused target
+    /// Failed — a queue refusal can never imply acceptance, and the enabled
+    /// target stays in the all-accepted calculation as Failed.
+    #[tokio::test]
+    async fn pan344_queue_failures_never_imply_acceptance() {
+        use pancetta_tui::upload_status::{
+            verdict, TargetUploadStatus, UploadState, UploadTarget, UploadVerdict,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 0: every new upload is refused at the door.
+        let rig = start_with_capacity(dir, 0, FakeTransport::new(&[ClubLog]), None);
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        {
+            let mut reg = rig.statuses.lock().unwrap();
+            for u in [&u1, &u2] {
+                reg.register(
+                    &u.to_string(),
+                    "K1ABC",
+                    vec![(UploadTarget::ClubLog, TargetUploadStatus::pending("queued"))],
+                );
+            }
+        }
+        let one = |u: Uuid| NewUpload {
+            qso_id: u,
+            destination: ClubLog,
+            call: "K1ABC".to_string(),
+            payload: format!("p-{u}"),
+        };
+        rig.handle.enqueue(vec![one(u1), one(u2)]).await;
+        wait_until(|| {
+            let snap = rig.statuses.lock().unwrap().snapshot();
+            matches!(
+                status_of(&snap, &u1, UploadTarget::ClubLog),
+                Some(UploadState::Failed)
+            ) && matches!(
+                status_of(&snap, &u2, UploadTarget::ClubLog),
+                Some(UploadState::Failed)
+            )
+        })
+        .await;
+        let snap = rig.statuses.lock().unwrap().snapshot();
+        for u in [&u1, &u2] {
+            let entry = snap.iter().find(|s| s.uuid == u.to_string()).unwrap();
+            let clublog = entry
+                .targets
+                .iter()
+                .find(|(t, _)| *t == UploadTarget::ClubLog)
+                .unwrap();
+            assert_eq!(clublog.1.state, UploadState::Failed);
+            assert!(
+                clublog.1.reason.contains("queue full"),
+                "{}",
+                clublog.1.reason
+            );
+            assert_eq!(verdict(entry), UploadVerdict::NeedsAttention);
+        }
+        // Nothing was queued and nothing was sent.
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -1718,6 +2072,7 @@ mod tests {
         let transport = Arc::new(transport);
         let health = Arc::new(std::sync::Mutex::new(UploadHealth::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let statuses = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
         let (handle, task) = spawn_upload_outbox(
             path.clone(),
             OUTBOX_MAX_ENTRIES,
@@ -1727,6 +2082,7 @@ mod tests {
             health.clone(),
             bus,
             shutdown.clone(),
+            Some(statuses.clone()),
         );
         let rig = Rig {
             _dir: dir,
@@ -1736,6 +2092,7 @@ mod tests {
             task,
             health,
             shutdown,
+            statuses,
         };
         (rig, q)
     }
@@ -2033,6 +2390,7 @@ mod tests {
             health,
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .0;
         handle
@@ -2080,6 +2438,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(UploadHealth::default())),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .0;
         handle

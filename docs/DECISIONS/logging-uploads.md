@@ -118,3 +118,16 @@ External step: Tony enables `[network.psk_reporter]` on the station and confirms
 **Index rebuild, staleness and migration (PAN-282, 2026-11).** Startup compares a multiset of trimmed, uppercase callsigns and start times truncated to seconds. ADIF cannot represent subsecond times. File times play no part. A rebuild writes `qso.db.new` in one transaction, checkpoints and closes it, then syncs it. Before rename-over, a bare connection checkpoints the old index with `TRUNCATE`; a busy or incomplete checkpoint refuses the swap. This prevents old WAL frames overwriting the new index. The old index is hard-linked as `qso.db.pre-rebuild[.N]` when it holds contacts absent from ADIF or cannot be read. An unreadable index's WAL goes with that copy. Copies have no automatic cleanup policy.
 
 Legacy migration copies `qso.db` and any nonempty WAL to `qso.db.pre-migration` and `qso.db.pre-migration-wal` before opening the source. Existing copies are retained. Every row must deserialize; a refusal names the first bad row and its QSO id. Export writes and syncs `qsos.adi.migrating`, reads it back through the startup parser, and publishes with a no-clobber hard link. A refused migration keeps the ADIF writer closed for that session, so a header-only log cannot wipe the legacy index at the next start. The independent database logger still records new QSOs. Keep migration copies until migration is confirmed.
+
+## Per-QSO upload status registry (PAN-344, 2026-11-11)
+
+Explicit upload results are retained per QSO UUID and target in a
+coordinator-side registry (last 100 completions, session-only), fed by the
+completion subscriber (which captures the enabled target set — outbox
+destinations plus an enabled LoTW — before preparation) and the outbox
+worker's result paths. Duplicates count as acceptance; transient failures
+stay pending; a login rejection marks every nonaccepted contact in that
+lane; record rejection marks its entry; queue refusal, missing cqdx
+payload, ADIF render failure and a closed queue mark targets failed. A
+pending queue write never implies acceptance. The registry never changes
+queue policy; the TUI relay snapshots it on the 2 s health tick.

@@ -44,6 +44,7 @@ mod presentation;
 pub mod readiness;
 pub mod tui_runner;
 pub mod ui;
+pub mod upload_status;
 pub mod view;
 pub mod widgets;
 
