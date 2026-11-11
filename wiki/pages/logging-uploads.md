@@ -48,6 +48,12 @@ up to 5 s for it. A new task that writes `qsos.adi` on `QsoCompleted` must
 register with `AdifSubscribers` the same way, or runtime teardown cancels it
 during shutdown.
 
+Gotcha (PAN-281): `qsos.adi` appends and `qso.db` commits are fsynced.
+`AdifLogWriter` runs `sync_all` after every header and record write (about
+1 ms per QSO), and `qso.db` gets WAL and `synchronous = FULL` as connect
+options, because `synchronous` is per connection and a `PRAGMA` through the
+pool reaches only one of its five connections.
+
 Gotcha (PAN-122): the local TX log `~/.pancetta/tx-log.jsonl` is written by
 the TX worker directly through `TxFrameLog` (`coordinator/tx_log.rs`), never
 via the message bus, and only once a frame's audio is `Enqueued`. The worker
