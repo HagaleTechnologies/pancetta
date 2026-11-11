@@ -1627,6 +1627,8 @@ pub struct ApplicationCoordinator {
     /// PAN-273: an armed `PttGuard`'s outstanding drop-fallback PTT-off.
     /// The TX worker's next key-down waits for it (see `tx::PendingPttOff`).
     pub(crate) pending_ptt_off: tx::PendingPttOff,
+    /// PAN-277: producers have stopped; Hamlib may exit once its drain is empty.
+    pub(crate) hamlib_drain_stop: Arc<AtomicBool>,
 
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
@@ -2148,6 +2150,12 @@ impl ApplicationCoordinator {
         // Create message bus with high-performance configuration
         let coordinator_config = CoordinatorConfig::default();
         let message_bus = MessageBus::new(coordinator_config.message_buffer_size)?;
+        let mock_requested = std::env::var("PANCETTA_MOCK_RIG")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false);
+        message_bus.data_mode.configure(
+            config.rig.interface.enabled && !mock_requested && config.rig.data_mode.is_some(),
+        );
 
         // Cache the display-feed-wanted flag before `config` is moved into the
         // Arc<RwLock> — the additive dual-destination emit sites read this
@@ -2509,6 +2517,7 @@ impl ApplicationCoordinator {
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_ptt_off_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_ptt_off: tx::PendingPttOff::default(),
+            hamlib_drain_stop: Arc::new(AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             rigctld_process: None,

@@ -238,13 +238,27 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Rig connection badge — clear "connected / not connected" state so the
     // operator isn't left inferring it from a "---" S-meter alone.
     let (rig_badge, rig_badge_color) = match app.rig_connected {
-        crate::app::RigConnDisplay::Connected => ("RIG: ✓ connected", app.theme.success_color()),
-        crate::app::RigConnDisplay::PollingFailed => {
-            ("RIG: ⚠ polling failed", app.theme.warning_color())
-        }
-        crate::app::RigConnDisplay::NotConnected => {
-            ("RIG: ✗ not connected", app.theme.error_color())
-        }
+        crate::app::RigConnDisplay::Connected => (
+            format!(
+                "RIG: ✓ {}",
+                crate::presentation::rig_label(app.rig_connected)
+            ),
+            app.theme.success_color(),
+        ),
+        crate::app::RigConnDisplay::PollingFailed => (
+            format!(
+                "RIG: ⚠ {}",
+                crate::presentation::rig_label(app.rig_connected)
+            ),
+            app.theme.warning_color(),
+        ),
+        crate::app::RigConnDisplay::NotConnected => (
+            format!(
+                "RIG: ✗ {}",
+                crate::presentation::rig_label(app.rig_connected)
+            ),
+            app.theme.error_color(),
+        ),
     };
 
     let mut device_first_line = vec![

@@ -45,6 +45,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod data_mode;
 pub mod error;
 pub mod models;
 pub mod rig;
@@ -54,6 +55,7 @@ pub mod rigctld;
 pub mod mock;
 
 // Public surface — what the rest of the workspace depends on.
+pub use data_mode::{DataModePolicy, DataModeReadiness};
 pub use error::{ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError};
 pub use models::{
     find_supported_rig, normalize_rig_model, render_supported_rigs_markdown, Band, HardwareTest,
