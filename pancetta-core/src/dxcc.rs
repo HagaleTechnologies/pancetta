@@ -38,11 +38,10 @@ static INDEX: LazyLock<PrefixIndex> = LazyLock::new(|| PrefixIndex {
 /// Resolve a callsign to a DXCC entity name, best-effort. Returns `None` for an
 /// unrecognized prefix (caller renders "---" rather than a guess).
 ///
-/// The lookup is a longest-leading-prefix match against the authoritative
-/// `PREFIX_TABLE` (generated from AD1C BigCTY cty.dat), done by probing a
-/// `HashMap` index from the longest table prefix down to one character: a
-/// handful of hash probes instead of a scan of every row. Its answers are
-/// identical to the pre-PAN-284 linear scan (pinned by an equivalence test).
+/// Full normalized exact calls win, followed by the KG4 length rule and a
+/// longest-leading-prefix match against `PREFIX_TABLE`. Both tables use
+/// indexed lookups. The prefix-only layer remains equivalent to the
+/// pre-PAN-284 linear scan (pinned by the full equivalence corpus).
 /// The "K"/"W"/"N" and "AA"–"AL" US prefixes are covered by the table; the
 /// US safety net below answers the US patterns cty.dat does not list.
 pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
@@ -59,6 +58,105 @@ pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
     // and correctly still resolves to `None`.
     let c = crate::callsign::resolve_hash_render(&trimmed)?;
 
+    layered_lookup(c, |c| EXACT_INDEX.get(c).copied())
+}
+
+static EXACT_INDEX: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| crate::dxcc_exact::EXACT_TABLE.iter().copied().collect());
+
+struct EntityIndex {
+    by_name: HashMap<&'static str, (u16, &'static str)>,
+    by_primary: HashMap<&'static str, u16>,
+}
+
+static ENTITIES: LazyLock<EntityIndex> = LazyLock::new(|| {
+    let mut by_name = HashMap::new();
+    let mut by_primary = HashMap::new();
+    for &(primary, name, id, canonical) in crate::dxcc_registry::REGISTRY {
+        by_name.insert(name, (id, canonical));
+        by_primary.insert(primary, id);
+    }
+    for &(alias, name) in crate::dxcc_registry::NAME_ALIASES {
+        let identity = by_name[name];
+        by_name.insert(alias, identity);
+    }
+    EntityIndex {
+        by_name,
+        by_primary,
+    }
+});
+
+/// ADIF DXCC identity resolved with the same precedence as the displayed entity.
+pub fn entity_id_for_callsign(call: &str) -> Option<u16> {
+    entity_for_callsign(call).and_then(entity_id_of_name)
+}
+
+/// ADIF identity of a known cty entity name, including contest subdivisions.
+pub fn entity_id_of_name(name: &str) -> Option<u16> {
+    ENTITIES.by_name.get(name).map(|&(id, _)| id)
+}
+
+/// Look up a cty primary prefix as a registry key, never as a callsign.
+pub fn entity_by_primary_prefix(primary: &str) -> Option<u16> {
+    ENTITIES
+        .by_primary
+        .get(primary.trim().to_uppercase().as_str())
+        .copied()
+}
+
+/// Whether this identity is represented in the offline entity registry.
+pub fn is_known_entity_id(id: u16) -> bool {
+    ENTITIES.by_primary.values().any(|&known| known == id)
+}
+
+/// Canonical parent entity name for history keys; preserve unknown names.
+pub fn canonical_entity(name: &str) -> &str {
+    ENTITIES
+        .by_name
+        .get(name)
+        .map_or(name, |&(_, canonical)| canonical)
+}
+
+struct SubEntityRule {
+    prefix: &'static str,
+    short_entity: &'static str,
+    other_entity: &'static str,
+}
+
+const SUB_ENTITY_RULES: &[SubEntityRule] = &[SubEntityRule {
+    prefix: "KG4",
+    short_entity: "Guantanamo Bay",
+    other_entity: "United States",
+}];
+
+fn sub_entity_rule(c: &str) -> Option<&'static str> {
+    let head = c.split('/').next()?;
+    for rule in SUB_ENTITY_RULES {
+        if let Some(suffix) = head.strip_prefix(rule.prefix) {
+            return Some(
+                if suffix.is_empty()
+                    || (suffix.len() == 2 && suffix.bytes().all(|b| b.is_ascii_alphabetic()))
+                {
+                    rule.short_entity
+                } else {
+                    rule.other_entity
+                },
+            );
+        }
+    }
+    None
+}
+
+fn layered_lookup(
+    c: &str,
+    exact: impl FnOnce(&str) -> Option<&'static str>,
+) -> Option<&'static str> {
+    exact(c)
+        .or_else(|| sub_entity_rule(c))
+        .or_else(|| prefix_lookup(c))
+}
+
+fn prefix_lookup(c: &str) -> Option<&'static str> {
     // Longest leading-prefix match: probe from the longest table prefix down.
     // The leading prefix also correctly handles portable-PREFIX compounds
     // (e.g. "EA8/G8BCG" → "EA8" → Canary Islands) and ignores trailing "/P",
@@ -73,7 +171,6 @@ pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
 
     us_safety_net(c)
 }
-
 /// US safety-net fallback: K/W/N anything, or A followed by A–L (the AA–AL US
 /// block). Reachable: the table has no bare `AH` key (cty.dat lists AH0–AH9),
 /// so `AH` plus a non-digit (e.g. "AHA") lands here and answers
@@ -163,6 +260,110 @@ pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn entity_registry_is_complete_and_ids_are_valid() {
+        let valid: serde_json::Value =
+            serde_json::from_str(include_str!("../data/adif_dxcc_ids.json")).unwrap();
+        for &(_, name) in PREFIX_TABLE.iter().chain(crate::dxcc_exact::EXACT_TABLE) {
+            let id = entity_id_of_name(name).unwrap_or_else(|| panic!("unmapped {name}"));
+            assert!(
+                valid["entities"].get(id.to_string()).is_some(),
+                "{name}: {id}"
+            );
+        }
+        for (call, id) in [
+            ("JA1ABC", 339),
+            ("W1AW", 291),
+            ("DL1ABC", 230),
+            ("VK2ABC", 150),
+            ("3Y0J", 24),
+            ("KG4AC", 105),
+        ] {
+            assert_eq!(entity_id_for_callsign(call), Some(id), "{call}");
+        }
+    }
+
+    #[test]
+    fn primary_prefix_lookup_handles_slash_entities() {
+        assert_eq!(entity_by_primary_prefix("3Y/B"), Some(24));
+        assert_eq!(entity_by_primary_prefix("3y/b"), Some(24));
+        assert_eq!(entity_by_primary_prefix("QQ"), None);
+    }
+
+    #[test]
+    fn cty_subdivisions_share_parent_ids() {
+        for (child, parent) in [
+            ("European Turkey", "Asiatic Turkey"),
+            ("African Italy", "Italy"),
+            ("Sicily", "Italy"),
+            ("Shetland Islands", "Scotland"),
+            ("Bear Island", "Svalbard"),
+            ("Vienna Intl Ctr", "Austria"),
+        ] {
+            assert_eq!(entity_id_of_name(child), entity_id_of_name(parent));
+            assert_eq!(canonical_entity(child), parent);
+        }
+        assert_eq!(canonical_entity("Unknown name"), "Unknown name");
+        assert_eq!(entity_id_of_name("Cabo Verde"), Some(409));
+    }
+
+    fn fixture_resolve(call: &str, exact: &[(&str, &'static str)]) -> Option<&'static str> {
+        let normalized = call.trim().to_uppercase();
+        let c = crate::callsign::resolve_hash_render(&normalized)?;
+        layered_lookup(c, |c| {
+            exact
+                .iter()
+                .find_map(|(key, name)| (*key == c).then_some(*name))
+        })
+    }
+
+    #[test]
+    fn exact_call_override_beats_subentity_and_prefix() {
+        assert_eq!(
+            fixture_resolve("KG4AB", &[("KG4AB", "United States")]),
+            Some("United States")
+        );
+        assert_eq!(fixture_resolve("KG4AB", &[]), Some("Guantanamo Bay"));
+        assert_eq!(entity_for_callsign("KG4BKW"), Some("Guam"));
+        assert_eq!(entity_for_callsign("W1AW/KG4"), Some("Guantanamo Bay"));
+        assert_eq!(entity_for_callsign("3Y0J"), Some("Bouvet"));
+    }
+
+    #[test]
+    fn exact_call_normalization_and_full_match() {
+        let fixture = [("KG4AB", "United States"), ("EA8/KG4AB", "Japan")];
+        for call in [" kg4ab ", "<KG4AB>"] {
+            assert_eq!(fixture_resolve(call, &fixture), Some("United States"));
+        }
+        assert_eq!(fixture_resolve("KG4ABC", &fixture), Some("United States"));
+        assert_eq!(fixture_resolve("EA8/KG4AB", &fixture), Some("Japan"));
+        assert_eq!(
+            fixture_resolve("EA8/KG4ABC", &fixture),
+            Some("Canary Islands")
+        );
+        assert_eq!(fixture_resolve("KG4AB/P", &fixture), Some("Guantanamo Bay"));
+        assert_eq!(fixture_resolve("<...>", &fixture), None);
+    }
+
+    #[test]
+    fn every_generated_exact_call_resolves() {
+        for &(call, name) in crate::dxcc_exact::EXACT_TABLE {
+            assert_eq!(entity_for_callsign(call), Some(name), "{call}");
+        }
+    }
+
+    #[test]
+    fn kg4_length_rule_and_portable_suffix() {
+        for call in ["KG4", "KG4AB", "KG4AC", "KG4AB/P"] {
+            assert_eq!(entity_for_callsign(call), Some("Guantanamo Bay"), "{call}");
+        }
+        for call in [
+            "KG4OJT", "KG4ABC", "KG4DFX", "KG4OJT/P", "KG4A", "KG4ÉÉ", "KG412",
+        ] {
+            assert_eq!(entity_for_callsign(call), Some("United States"), "{call}");
+        }
+    }
+
     /// The pre-PAN-284 resolver, kept verbatim as the oracle for the index.
     fn linear_entity_for_callsign(call: &str) -> Option<&'static str> {
         let trimmed = call.trim().to_uppercase();
@@ -233,10 +434,42 @@ mod tests {
         assert_eq!(corpus.len(), 105_385);
         let mismatches: Vec<_> = corpus
             .iter()
-            .filter(|c| entity_for_callsign(c) != linear_entity_for_callsign(c))
+            .filter(|c| {
+                let upper = c.trim().to_uppercase();
+                let indexed = crate::callsign::resolve_hash_render(&upper).and_then(prefix_lookup);
+                indexed != linear_entity_for_callsign(c)
+            })
             .take(20)
             .collect();
         assert!(mismatches.is_empty(), "first mismatches: {mismatches:?}");
+    }
+
+    #[test]
+    fn full_layered_precedence_over_the_corpus() {
+        let exact: HashMap<_, _> = crate::dxcc_exact::EXACT_TABLE.iter().copied().collect();
+        for call in equivalence_corpus() {
+            let upper = call.trim().to_uppercase();
+            let expected = crate::callsign::resolve_hash_render(&upper).and_then(|c| {
+                exact
+                    .get(c)
+                    .copied()
+                    .or_else(|| {
+                        let head = c.split('/').next().unwrap();
+                        head.strip_prefix("KG4").map(|suffix| {
+                            if suffix.is_empty()
+                                || (suffix.len() == 2
+                                    && suffix.bytes().all(|b| b.is_ascii_alphabetic()))
+                            {
+                                "Guantanamo Bay"
+                            } else {
+                                "United States"
+                            }
+                        })
+                    })
+                    .or_else(|| linear_entity_for_callsign(&call))
+            });
+            assert_eq!(entity_for_callsign(&call), expected, "{call}");
+        }
     }
 
     #[test]
@@ -279,7 +512,7 @@ mod tests {
         // US sub-entities beat the bare K/W/N fallback.
         assert_eq!(entity_for_callsign("KH6XYZ"), Some("Hawaii"));
         assert_eq!(entity_for_callsign("KL7ABC"), Some("Alaska"));
-        assert_eq!(entity_for_callsign("KP4XX"), Some("Puerto Rico"));
+        assert_eq!(entity_for_callsign("KP4ABC"), Some("Puerto Rico"));
         // Spain sub-entities beat bare EA.
         assert_eq!(entity_for_callsign("EA8ABC"), Some("Canary Islands"));
         assert_eq!(entity_for_callsign("EA6XYZ"), Some("Balearic Islands"));
