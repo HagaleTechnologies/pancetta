@@ -68,3 +68,9 @@ The local relay remembers the last decoded grid per exact callsign and band for
 its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
+
+PAN-354: operator offset controls follow the allocator default range, but Auto
+creation and active relocation retain distinct bounds. A held endpoint must
+survive manual creation before collision avoidance. Placement Assigned means
+current ownership, not quiet duration. Short single-QSO layouts admit complete
+lines before rendering. See [the PAN-354 decision](../../docs/DECISIONS/tui.md#honest-qso-values-and-operator-offsets-pan-354).

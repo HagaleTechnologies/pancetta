@@ -529,7 +529,8 @@ const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
 ///
 /// Then **de-conflict**: if the candidate is within `MIN_TX_SEPARATION_HZ` of
 /// any already-active QSO, nudge to the nearest clear slot in
-/// `[TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ]`.
+/// the allocator-default operator range for a nonzero Hold, or
+/// `[TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ]` for Auto.
 ///
 /// Returns `(tx_off, partner_freq)` where:
 /// - `tx_off` is our chosen TX audio offset.
@@ -557,12 +558,20 @@ pub fn compute_manual_tx_offset(
     } else {
         dx_freq
     };
+    let (lo, hi) = if hold_mode && held_hz != 0 {
+        pancetta_qso::frequency::FrequencyAllocatorConfig::default().range
+    } else {
+        (
+            pancetta_qso::TX_OFFSET_MIN_HZ,
+            pancetta_qso::TX_OFFSET_MAX_HZ,
+        )
+    };
     let tx_off = pancetta_qso::deconflict_offset(
         candidate,
         active_offsets,
         pancetta_qso::MIN_TX_SEPARATION_HZ,
-        pancetta_qso::TX_OFFSET_MIN_HZ,
-        pancetta_qso::TX_OFFSET_MAX_HZ,
+        lo,
+        hi,
     );
     // Set partner_freq only when we actually diverge from the DX's RX freq.
     // The 1.0 Hz tolerance guards against float-rounding noise on the exact
@@ -7403,6 +7412,43 @@ mod pending_manual_tests {
         assert_eq!(partner, Some(180.0));
     }
 
+    #[test]
+    fn held_operator_endpoints_survive_manual_placement() {
+        for held in [200, 2800] {
+            assert_eq!(
+                compute_manual_tx_offset(1500.0, true, held, &[]),
+                (held as f64, Some(1500.0)),
+            );
+            assert_eq!(
+                compute_manual_tx_offset(held as f64, true, held, &[]),
+                (held as f64, None),
+            );
+        }
+    }
+
+    #[test]
+    fn held_operator_endpoints_deconflict_inside_operator_range() {
+        for held in [200, 2800] {
+            let occupied = [held as f64, if held == 200 { 250.0 } else { 2750.0 }];
+            let (offset, partner) = compute_manual_tx_offset(1500.0, true, held, &occupied);
+            assert!((200.0..=2800.0).contains(&offset));
+            assert!(occupied
+                .iter()
+                .all(|busy| (offset - busy).abs() >= pancetta_qso::MIN_TX_SEPARATION_HZ));
+            assert_eq!(partner, Some(1500.0));
+        }
+    }
+
+    #[test]
+    fn held_zero_retains_auto_clamps() {
+        for (dx, expected) in [(180.0, 300.0), (2931.0, 2700.0)] {
+            assert_eq!(
+                compute_manual_tx_offset(dx, true, 0, &[]),
+                (expected, Some(dx))
+            );
+        }
+    }
+
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
     // on `dx`, so its desired TX parity is the opposite. Used to verify a
     // `RespondToCaller` entry queued by the admission gate participates in
@@ -7777,10 +7823,10 @@ mod pending_manual_tests {
             compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         // Should NOT be 1500 (too close to the occupied slot).
         assert_ne!(tx_off, 1500.0, "must not stack on the occupied offset");
-        // tx_off should be within [300, 2700].
+        // A held offset deconflicts within the operator range.
         assert!(
-            (300.0..=2700.0).contains(&tx_off),
-            "tx_off={tx_off} is outside [300, 2700]"
+            (200.0..=2800.0).contains(&tx_off),
+            "tx_off={tx_off} is outside [200, 2800]"
         );
         // partner_freq must be Some so the DX's replies at 1200 Hz are routed.
         assert_eq!(

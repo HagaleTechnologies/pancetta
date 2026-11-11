@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
+
 ### Changed
 
 - `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`) and turns on the `serde` feature, so a `transmit` build also gets the crate's serde derives. `decode_cycle` output is unchanged (PAN-331).

@@ -458,3 +458,32 @@ and say nothing about any one station. The strip chip and the Why text carry
 - **Key-effect golden.** `pancetta-tui/tests/fixtures/key_effects.golden` records what every key does (status line, commands sent, App fields changed) in five modifier sets across 36 scenarios: the main view on every panel, zoomed, stopped and TX-disabled, every dialog on a rich fixture, and six empty-dialog cases. The rich fixture includes audio devices, diagnostic events and recent QSOs. It was blessed from the pre-refactor handler at `7053b62` (the harness, `tui_runner/key_effects.rs`, uses only APIs that exist there, so it can be dropped onto that commit to re-check), and the new handler reproduces it byte for byte. Any change to what a key does fails `key_effects_match_golden` until it is re-blessed on purpose with `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`. The variable is separate from `PANCETTA_REGEN_DOCS`, so regenerating docs never re-blesses key behaviour.
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
+
+
+## Honest QSO values and operator offsets (PAN-354)
+
+Missing QSO reports render as a muted "—" with zero gauge fill. A measured
+-50 dB remains a report. QSO Status, DX Hunter, Band Activity and Callers
+use `ui::get_snr_color`: below -10 dB is error, -10 through -1 is warning,
+and 0 or higher is success. Audio-level colours remain a separate scale.
+
+Operator arrows and offset entry use the allocator default range, 200–2800 Hz.
+The modal, validation and opening hint derive their limits from that range.
+Nonzero Hold also uses it when creating a manual QSO, including collision
+avoidance. Auto and held-zero retain fresh-autonomous bounds of 300–2700 Hz;
+active relocation retains its separate 200–2900 Hz policy.
+
+Placement zoom labels real live ownership as Assigned, preserving the full
+callsign and keyed star. Quiet was removed because the snapshot has no
+per-frequency quiet history. The renderer continues to use allocator snapshots.
+Callers draws one outer border and reserves its final inner row for the hint.
+
+Single-QSO detail uses its full layout only when every mandatory section fits,
+including the optional queue and combined DX/drift row. Short panels admit
+complete lines in this priority: status/callsign, TX, RX, queued parity, control
+hint, SNR, NOW, NEXT. Admitted lines retain their normal display order.
+The multi-QSO table is unchanged.
+
+The unused public SignalMeter, Modal and SpectrumDisplay widgets remain for a
+separate compatibility review. They are not an alternate production SNR scale.
+Physical tmux and Windows Terminal glyph checks still need operator qualification.
