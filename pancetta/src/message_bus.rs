@@ -1594,6 +1594,8 @@ impl DurableInbox {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    /// PAN-276: shared atomic CAT-mode confirmation, also checked at final enqueue.
+    pub(crate) data_mode: pancetta_hamlib::DataModeReadiness,
     pub(crate) receive_gain: Arc<crate::coordinator::receive_overload::GainSafety>,
     /// Atomic receive-gain transition and pending key-down reservation (PAN-244).
     pub(crate) gain_tx_intents: Arc<std::sync::atomic::AtomicU32>,
@@ -1634,6 +1636,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gain_tx_epoch: Arc::new(AtomicU64::new(0)),
@@ -1654,6 +1657,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gain_tx_epoch: Arc::new(AtomicU64::new(0)),
