@@ -639,22 +639,28 @@ fn import_backs_up_the_logbook_first() {
     }
 }
 
-/// An index that was already behind the logbook before the import (startup
-/// rebuilds it when `qsos.adi` is newer) must still look behind afterwards,
-/// or the rows it was missing would never be rebuilt.
+/// Import indexes only its new contacts. Startup content comparison must
+/// still see any earlier gap after a successful import clears its marker.
 #[test]
-fn import_keeps_a_stale_index_looking_stale() {
+fn an_import_into_a_stale_index_clears_its_marker_and_leaves_the_gap_visible() {
     let s = Scratch::new();
     s.seed_logbook(
         &pancetta_logbook(&[pancetta_record("KA1AA", "20231201", "090000")]),
         true,
     );
-    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(s.db())
-        .and_then(|f| f.set_modified(an_hour_ago))
-        .unwrap();
+    // Remove the indexed contact while leaving the ADIF intact.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = QsoDatabase::open(s.db()).await.unwrap();
+        let rows = db
+            .search_qsos(&Default::default(), &Default::default())
+            .await
+            .unwrap();
+        for row in rows {
+            db.delete_qso(row.metadata.qso_id).await.unwrap();
+        }
+        db.close().await;
+    });
     let file = s.write_file(
         "wsjtx_log.adi",
         wsjtx_file(&[wsjtx_record("W1AW", "FN31", "120000", "14.075123")]),
@@ -662,26 +668,24 @@ fn import_keeps_a_stale_index_looking_stale() {
 
     s.import_ok(&file);
 
-    let modified = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
-    assert!(
-        modified(s.adif()) > modified(s.db()),
-        "qso.db must stay older than qsos.adi so the next start rebuilds it"
-    );
-    // A later live write can make qso.db newer again, so the mtime alone
-    // cannot carry the stale index to the next start (PR #451 review).
-    assert!(
-        QsoDatabase::rebuild_marker(&s.db()).exists(),
-        "an index that was already behind stays marked for rebuild"
-    );
+    assert!(!QsoDatabase::rebuild_marker(&s.db()).exists());
+    rt.block_on(async {
+        let db = QsoDatabase::open(s.db()).await.unwrap();
+        let snapshot = pancetta_qso::async_database::AdifSnapshot::load(s.adif())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.drift_from(&snapshot).await.unwrap().missing_from_index,
+            1
+        );
+        db.close().await;
+    });
 }
 
-/// When indexing fails, the logbook must be left looking newer than any
-/// `qso.db` the attempt left behind: otherwise the next start treats it as
-/// current and never repairs it. Here the logbook's second record cannot be
-/// converted, so the index build fails — before creating `qso.db` at all,
-/// since the replay converts every record before it touches the index.
+/// A failed index update leaves either a missing index or a rebuild marker,
+/// so startup retries it. Here an unconvertible record fails before creation.
 #[test]
-fn a_failed_index_update_leaves_the_logbook_newer() {
+fn a_failed_index_update_is_rebuilt_at_the_next_start() {
     let s = Scratch::new();
     let logbook = format!(
         "{}{}",
@@ -702,11 +706,7 @@ fn a_failed_index_update_leaves_the_logbook_newer() {
         stderr(&out)
     );
 
-    let modified = |p: PathBuf| std::fs::metadata(p).ok().map(|m| m.modified().unwrap());
-    assert!(
-        modified(s.adif()) > modified(s.db()),
-        "qso.db must be missing or older than qsos.adi so the next start rebuilds it"
-    );
+    assert!(!s.db().exists() || QsoDatabase::rebuild_marker(&s.db()).exists());
 }
 
 /// An import marks the index for a rebuild before it writes, and clears the

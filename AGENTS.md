@@ -100,6 +100,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
 
+- The startup index rebuild builds `qso.db.new`, checkpoints the old index, keeps it as `qso.db.pre-rebuild[.N]` when it holds contacts ADIF lacks or cannot be read, then renames over. Staleness compares contacts, never mtimes. Legacy migration copies `qso.db` to `qso.db.pre-migration` first, refuses unreadable rows, and keeps the ADIF writer closed on refusal (PAN-282).
+
 ## Where Things Live
 
 - `docs/superpowers/specs/` — design specs (authoritative for current behavior)

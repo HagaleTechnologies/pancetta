@@ -461,7 +461,7 @@ the launching app's approval, as before PAN-264.
   goes to the SQLite index only. Check the log for `ADIF writer init
   failed`.
 - The SQLite index at `~/.pancetta/qso.db` is rebuildable from ADIF on
-  startup. If ADIF is the truth and the DB is stale, delete the DB and
+  startup whenever its contacts differ from the ADIF, regardless of file times. If ADIF is the truth and the DB is stale, delete the DB and
   restart — the index gets replayed from ADIF.
 
 ### Pancetta is decoding fewer signals than WSJT-X on the same band
