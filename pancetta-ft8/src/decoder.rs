@@ -3136,6 +3136,48 @@ impl Ft8Decoder {
         .collect()
     }
 
+    /// PAN-318 AC4: the reference pass, plus the monitor's owned 0–3000 Hz
+    /// display grid so the coordinator derives the waterfall from the SAME
+    /// C FFT work that decoded this window (no second spectrogram). The
+    /// decode result is identical to [`Self::decode_window_ft8lib_with_context`];
+    /// the grid is `None` in the FFI stub build (callers fall back to the
+    /// legacy waterfall generator).
+    ///
+    /// Internal application plumbing, NOT part of the stable API
+    /// (`tests/stable_api_guard.rs` pins none of it).
+    #[doc(hidden)]
+    pub fn decode_window_ft8lib_with_context_and_capture(
+        &self,
+        samples: &[f32],
+        protocol: Protocol,
+    ) -> (
+        Vec<DecodedMessage>,
+        Option<crate::ft8_lib_ffi::Ft8LibDisplayGrid>,
+    ) {
+        let ftx_protocol = match protocol {
+            Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
+            _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+        };
+        let (tuples, grid) =
+            crate::ft8_lib_ffi::ft8lib_decode_audio_protocol_with_parser_and_capture(
+                samples,
+                ftx_protocol,
+                Some(&self.message_parser),
+            );
+        let messages = tuples
+            .into_iter()
+            .map(|(text, freq, dt, errors, snr, message)| {
+                let mut decoded = DecodedMessage::from_ft8lib(&text, freq, snr, errors);
+                decoded.time_offset = dt as f64;
+                if let Some(message) = message {
+                    decoded.message = message;
+                }
+                decoded
+            })
+            .collect();
+        (messages, grid)
+    }
+
     /// Decode a 12.64-second window of audio samples with A Priori (AP) context.
     ///
     /// When `ap_context` contains known callsigns or an active QSO, candidates
