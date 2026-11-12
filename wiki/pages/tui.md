@@ -105,3 +105,9 @@ symbols. Check positive content in a direct panel as well as scanning full
 views, since a hidden column or clipped overlay can hide a broken label.
 `pan353_rendered_text` covers labels, action messages, distance placement and
 marker widths. Its scanner is for controlled fixtures, not arbitrary radio text.
+
+PAN-354: operator offset controls follow the allocator default range, but Auto
+creation and active relocation retain distinct bounds. A held endpoint must
+survive manual creation before collision avoidance. Placement Assigned means
+current ownership, not quiet duration. Short single-QSO layouts admit complete
+lines before rendering. See [the PAN-354 decision](../../docs/DECISIONS/tui.md#honest-qso-values-and-operator-offsets-pan-354).
