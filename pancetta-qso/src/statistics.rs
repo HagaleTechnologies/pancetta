@@ -2177,29 +2177,11 @@ impl StatisticsCalculator {
         has_letter && has_number && valid_chars
     }
 
-    /// Basic grid square validation
+    /// Basic grid square validation: core Maidenhead semantics with the
+    /// statistics context's 4/6/8-character precision (PAN-330). Case is
+    /// normalized by the core validator.
     fn is_valid_grid_square(&self, grid: &str) -> bool {
-        if grid.len() < 4 || grid.len() > 8 {
-            return false;
-        }
-
-        let chars: Vec<char> = grid.chars().collect();
-
-        // First two characters should be letters A-R
-        if !chars[0].is_ascii_alphabetic() || !chars[1].is_ascii_alphabetic() {
-            return false;
-        }
-
-        if chars[0] < 'A' || chars[0] > 'R' || chars[1] < 'A' || chars[1] > 'R' {
-            return false;
-        }
-
-        // Next two characters should be digits 0-9
-        if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
-            return false;
-        }
-
-        true
+        matches!(grid.len(), 4 | 6 | 8) && pancetta_core::gridsquare::validate_grid(grid).is_ok()
     }
 
     /// Check if frequency is valid for the specified band
@@ -2433,6 +2415,35 @@ mod tests {
         assert!(!technical.signal_reports.received_distribution.is_empty());
         assert!(technical.frequencies.average_frequency > 0.0);
         assert_eq!(technical.completion_rates.overall_rate, 100.0);
+    }
+
+    /// PAN-330 AC6: statistics grid validity uses core Maidenhead semantics
+    /// with this caller's 4/6/8-character precision (case normalized).
+    #[tokio::test]
+    async fn statistics_grid_policy_table() {
+        let dummy_db = QsoDatabase::new_in_memory().await.unwrap();
+        let calculator = StatisticsCalculator::new(dummy_db);
+        for ok in ["FN42", "fn42", "FN42ab", "FN42AB12", "RR73"] {
+            assert!(
+                calculator.is_valid_grid_square(ok),
+                "expected valid: {ok:?}"
+            );
+        }
+        for bad in [
+            "ZZ99",
+            "FN42YY",
+            "FN42X",
+            "FN4212",
+            "FN42AB12CD", // 10 chars: beyond statistics' 4/6/8 precision
+            "",
+            "   ",
+            "FN42€",
+        ] {
+            assert!(
+                !calculator.is_valid_grid_square(bad),
+                "expected invalid: {bad:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2741,25 +2752,9 @@ mod tests {
     }
 
     fn is_valid_grid_square_test(grid: &str) -> bool {
-        if grid.len() < 4 || grid.len() > 8 {
-            return false;
-        }
-
-        let chars: Vec<char> = grid.chars().collect();
-
-        if !chars[0].is_ascii_alphabetic() || !chars[1].is_ascii_alphabetic() {
-            return false;
-        }
-
-        if chars[0] < 'A' || chars[0] > 'R' || chars[1] < 'A' || chars[1] > 'R' {
-            return false;
-        }
-
-        if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
-            return false;
-        }
-
-        true
+        // Mirrors the production predicate (PAN-330): core Maidenhead
+        // semantics with the statistics 4/6/8-character precision.
+        matches!(grid.len(), 4 | 6 | 8) && pancetta_core::gridsquare::validate_grid(grid).is_ok()
     }
 
     fn is_frequency_valid_for_band_test(frequency: f64, band: &str) -> bool {

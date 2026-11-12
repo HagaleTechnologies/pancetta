@@ -4731,11 +4731,10 @@ impl App {
     /// `true` if `callsign` appears to be mid-exchange with a THIRD party
     /// (BUSY flag): seen within the last ~90s in a 3-token `<to> <from>
     /// <payload>` exchange where neither party is us and the payload is a
-    /// committed report/RR73/RRR/73. Mirrors
-    /// `pancetta_qso::autonomous::third_party_exchange_callsigns` /
-    /// `is_exchange_payload` (re-implemented here because `pancetta-tui` does
-    /// not depend on `pancetta-qso`); the canonical versions are `pub` + unit
-    /// tested in that crate to guard both copies against drift.
+    /// committed report/RR73/RRR/73. PAN-330: the payload classification is
+    /// `pancetta_core::ft8_tokens::is_exchange_payload` — the same single
+    /// definition `pancetta_qso::autonomous` uses (the TUI already depends
+    /// on pancetta-qso and pancetta-core; the old private copy is gone).
     pub fn is_caller_busy(&self, callsign: &str) -> bool {
         const BUSY_WINDOW_SECS: i64 = 90;
         let now = chrono::Utc::now();
@@ -5449,7 +5448,12 @@ fn third_party_exchange_participants(text: &str, our_call: &str) -> Vec<String> 
     if !is_committed_exchange_payload(payload) {
         return Vec::new();
     }
-    if to.eq_ignore_ascii_case(our_call) || from.eq_ignore_ascii_case(our_call) {
+    // PAN-330: party identity is the core compound-aware matcher, so our own
+    // portable-form traffic ("EA8/K5ARH DL1ABC -10" while we are K5ARH) is
+    // our exchange, not a third party's.
+    if pancetta_core::callsign::callsigns_match(to, our_call)
+        || pancetta_core::callsign::callsigns_match(from, our_call)
+    {
         return Vec::new();
     }
     let looks_like_call =
@@ -5465,17 +5469,11 @@ fn third_party_exchange_participants(text: &str, our_call: &str) -> Vec<String> 
 }
 
 /// `true` if `tok` is the payload of a committed exchange (report / RR73 /
-/// RRR / 73 / RR). Mirrors `pancetta_qso::autonomous::is_exchange_payload`.
+/// RRR / 73 / RR). PAN-330: one shared definition —
+/// `pancetta_core::ft8_tokens::is_exchange_payload`, the same function
+/// `pancetta_qso::autonomous` re-exports.
 fn is_committed_exchange_payload(tok: &str) -> bool {
-    let u = tok.to_uppercase();
-    if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
-        return true;
-    }
-    let body = u.strip_prefix('R').unwrap_or(&u);
-    if let Some(rest) = body.strip_prefix(['-', '+']) {
-        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
-    }
-    false
+    pancetta_core::ft8_tokens::is_exchange_payload(tok)
 }
 
 /// Shared staleness window for rig S-meter readings, used by both
@@ -9901,6 +9899,68 @@ mod tests {
         assert!(app.is_caller_busy("JA1ABC"));
         assert!(app.is_caller_busy("W1XYZ"));
         assert!(!app.is_caller_busy("K9ZZ"));
+    }
+
+    /// PAN-330 AC2: a prefix-portable decode the relay marked directed at
+    /// us surfaces the caller (DL1ABC) in the eligible Callers list.
+    #[tokio::test]
+    async fn prefix_portable_caller_visible() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+        // The relay-produced directed flag for `EA8/K5ARH DL1ABC -10`.
+        let mut v = fixture_view("DL1ABC", -10);
+        v.is_directed_at_us = true;
+        v.message = "EA8/K5ARH DL1ABC -10".to_string();
+        app.add_decoded_message(v).await.unwrap();
+
+        let callers = app.displayed_callers();
+        assert_eq!(
+            callers
+                .iter()
+                .map(|m| m.call_sign.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("DL1ABC")],
+            "prefix-portable directed decode must surface its caller"
+        );
+        // And it is not flagged busy (nobody is mid-third-party-exchange).
+        assert!(!app.is_caller_busy("DL1ABC"));
+        // A non-directed decode never becomes a caller row.
+        let mut plain = fixture_view("W2XYZ", -10);
+        plain.message = "CQ W2XYZ FN42".to_string();
+        app.add_decoded_message(plain).await.unwrap();
+        assert!(app
+            .displayed_callers()
+            .iter()
+            .all(|m| m.call_sign.as_deref() != Some("W2XYZ")));
+    }
+
+    /// PAN-330 AC5: the TUI busy detector classifies committed payloads
+    /// through the same core function as pancetta-qso (parity with
+    /// `pancetta_qso::autonomous`'s table).
+    #[tokio::test]
+    async fn committed_exchange_payload_table() {
+        for payload in ["-12", "+05", "R-12", "R+05", "RR73", "RRR", "73", "rr73"] {
+            let mut app = fixture_app().await;
+            app.station_info.call_sign = "K5ARH".to_string();
+            let mut v = fixture_view("JA1ABC", -10);
+            v.message = format!("W1XYZ JA1ABC {payload}");
+            app.add_decoded_message(v).await.unwrap();
+            assert!(
+                app.is_caller_busy("JA1ABC"),
+                "expected busy for {payload:?}"
+            );
+        }
+        for payload in ["FN42", "ZZ99", "12", "-", "+", "R", "RR7", "-12x"] {
+            let mut app = fixture_app().await;
+            app.station_info.call_sign = "K5ARH".to_string();
+            let mut v = fixture_view("JA1ABC", -10);
+            v.message = format!("W1XYZ JA1ABC {payload}");
+            app.add_decoded_message(v).await.unwrap();
+            assert!(
+                !app.is_caller_busy("JA1ABC"),
+                "expected not busy for {payload:?}"
+            );
+        }
     }
 
     // === UX audit Batch 1: callsign-pinned cursors ====================

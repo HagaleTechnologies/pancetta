@@ -35,18 +35,38 @@ pub fn match_grid_with_r_ack(text: &str) -> Option<ContestMatch> {
     })
 }
 
+/// Contest R-grid check: core Maidenhead semantics with this caller's
+/// uppercase 4-character precision (PAN-330). `RR73` is reserved by the
+/// caller above as the acknowledgement token, never a grid.
 fn is_valid_grid(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 4
-        && (b'A'..=b'R').contains(&b[0])
-        && (b'A'..=b'R').contains(&b[1])
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit()
+    s.len() == 4
+        && s.chars()
+            .all(|c| !c.is_ascii_alphabetic() || c.is_ascii_uppercase())
+        && pancetta_core::gridsquare::validate_grid(s).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC6: contest grid matching uses core Maidenhead semantics
+    /// with an uppercase 4-character adapter, and keeps reserving `RR73`
+    /// for the acknowledgement.
+    #[test]
+    fn contest_grid_policy_table() {
+        assert!(is_valid_grid("FN42"));
+        assert!(is_valid_grid("EM40"));
+        assert!(is_valid_grid("RR73")); // shape-valid; caller reserves it
+        assert!(!is_valid_grid("fn42")); // contest context is uppercase-only
+        assert!(!is_valid_grid("FN42ab")); // 6 chars: beyond 4-char precision
+        assert!(!is_valid_grid("ZZ99"));
+        assert!(!is_valid_grid("FN42YY"));
+        assert!(!is_valid_grid("FN42X"));
+        assert!(!is_valid_grid("FN4212"));
+        assert!(!is_valid_grid(""));
+        // The reservation is exercised through the matcher entry point.
+        assert!(match_grid_with_r_ack("K5ARH K5TD R RR73").is_none());
+    }
 
     #[test]
     fn matches_the_pan_49_repro_text() {
