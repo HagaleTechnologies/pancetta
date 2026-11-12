@@ -126,10 +126,10 @@ pub fn panic_count() -> u64 {
 ///
 /// A config reload must **never** clobber an in-progress QSO's latched partner
 /// callsign / `tx_parity`, and must never rebuild the QSO manager (or the
-/// autonomous operator) in a way that drops active QSOs. Some config sections
-/// are safe to apply on the fly (UI theme, most network toggles); others are
-/// snapshotted into the QSO/autonomous machinery at startup and, if re-applied
-/// mid-QSO, would invalidate the latched identity/parity.
+/// autonomous operator) in a way that drops active QSOs. Only the
+/// remote-access security fields are applied on the fly; everything else
+/// is snapshotted into the QSO/autonomous machinery at startup and, if
+/// re-applied mid-QSO, would invalidate the latched identity/parity.
 ///
 /// This enum is the single decision point a hot-reload apply-handler must
 /// consult before touching anything. The wired handler
@@ -143,7 +143,8 @@ pub fn panic_count() -> u64 {
 pub enum ConfigReloadApplicability {
     /// Nothing changed that matters; ignore.
     NoChange,
-    /// Only live-safe sections changed (UI, network) — safe to apply now.
+    /// Only live-safe sections changed (remote-access consent/revocations) —
+    /// safe to apply now.
     SafeLive,
     /// A QSO-latched field changed (`station.callsign`, `station.grid_square`,
     /// or `autonomous.slot_parity`) and a QSO is currently active. The change
