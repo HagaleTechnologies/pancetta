@@ -624,6 +624,7 @@ fn panel_row_offset(panel: ActivePanel) -> u16 {
 /// Pure geometry — computed from the SAME `view_rects` the renderer's
 /// `layout_*` functions draw from, so a click always lands on the panel
 /// boundary the operator actually sees on screen.
+#[allow(clippy::too_many_arguments)] // Mirror `view_rects`' geometry inputs plus the focused-station card flag (PAN-343); hit-test and layout must stay in lockstep.
 pub fn hit_test(
     view: crate::view::ActiveView,
     zoomed: bool,

@@ -42,3 +42,6 @@ harness = false
 [[example]]
 name = "ft8_pipeline_demo"
 required-features = []
+
+[lints]
+workspace = true

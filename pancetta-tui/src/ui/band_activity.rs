@@ -827,6 +827,31 @@ mod tests {
         }
     }
 
+    /// PAN-330 AC2: a prefix-portable decode the relay marked directed at
+    /// us gets the existing arrow and directed styling in Band Activity.
+    #[tokio::test]
+    async fn prefix_portable_directed_row() {
+        use ratatui::style::Modifier;
+
+        let mut msg = fixture_message("DL1ABC");
+        msg.is_directed_at_us = true; // the relay-produced directed flag
+        msg.message = "EA8/K5ARH DL1ABC -10".to_string();
+        let app = need_app(msg).await;
+        let buf = render_need(&app, 220, false);
+
+        // The Call column shows the existing directed arrow form.
+        assert_eq!(call_text(&buf), "→ DL1ABC");
+        // And the call cell carries the existing directed styling (bold).
+        let cell = token_cell(&buf, "DL1ABC");
+        assert!(
+            cell.style().add_modifier.contains(Modifier::BOLD),
+            "directed row must keep the existing bold styling"
+        );
+        // The full exchange text stays in the Msg column.
+        let row = row_text(&buf, 2);
+        assert!(row.contains("EA8/K5ARH DL1ABC -10"), "row: {row}");
+    }
+
     async fn render_panel_at_width(width: u16) -> ratatui::buffer::Buffer {
         use ratatui::{backend::TestBackend, Terminal};
 
