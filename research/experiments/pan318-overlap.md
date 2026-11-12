@@ -26,8 +26,14 @@ the native AP pass concurrently through the shared helper
   single-parser pipeline did;
 - the waterfall moved from the pre-native prefix to after the joined
   pair: the native entry no longer pays the waterfall FFT or the ft8_lib
-  pass. The generator and fan-out are unchanged (byte-identical rows);
-  deriving the waterfall from the reference monitor's FFT is deferred.
+  pass. A successful FT8 reference pass now captures the monitor's owned
+  0–3000 Hz magnitude grid (`ft8lib_decode_audio_protocol_with_parser_and_capture`,
+  one C monitor for both jobs) and the coordinator derives the waterfall
+  from it onto the legacy display geometry — no `generate_waterfall_data`
+  call on that path. The legacy generator remains as the fallback
+  (non-FT8 protocols, a caught reference panic, the FFI stub build) and
+  the fan-out (TUI rows, allocator feed, remote `SpectrumRow`) is
+  unchanged for both sources.
 
 `pancetta/src/coordinator/ft8/timing.rs` adds bounded histograms over
 `ft8lib_ms` / `waterfall_ms` / `pre_native_ms` (microsecond samples,
@@ -86,8 +92,42 @@ below the sequential figure on every fixture.
 ## Pending
 
 - Windows MiniPC / on-air qualification.
-- Deriving the waterfall from the reference monitor FFT (plan Phase 2);
-  today the legacy generator still runs, relocated after the joined pair.
+
+## Reference-spectrum waterfall (plan Phase 2, remediation round)
+
+The validate phase failed AC4 (the reference-spectrogram waterfall was
+never built); this round built it:
+
+- `pancetta-ft8/src/ft8_lib_ffi.rs`: capture entry
+  `ft8lib_decode_audio_protocol_with_parser_and_capture` — one monitor
+  spans 0–3000 Hz, an owned copy of the original 100–3000 Hz bins in the
+  original layout drives candidate search/decode/SNR (byte-identical
+  messages, asserted), and the full grid is copied out as
+  `Ft8LibDisplayGrid` before the monitor is freed.
+- `Ft8LibDisplayGrid::to_waterfall_data`: quantized dB → linear power,
+  time-averaged over monitor sub-frames assigned to the legacy row
+  partition (startup zero-padding excluded), linearly interpolated in
+  power on the `(min_bin + bin + freq_sub/freq_osr) / symbol_period` axis,
+  rescaled by `nfft²/2` (C `2/nfft` window gain vs legacy one-sided PSD).
+  Reproduces the legacy row count, time labels and 0–3000 Hz bin axis
+  (asserted against the real legacy generator on a fixture) without a
+  second FFT; tone placement asserted at 50/1500/2990 Hz, silence renders
+  finite uniform rows. The image is approximate by design — no pixel or
+  calibrated-power claim.
+- `pancetta/src/coordinator/ft8.rs`: FT8 windows use the captured grid
+  (`waterfall_from_reference_capture`); legacy generator only as fallback,
+  still after the joined pair. Named proofs added:
+  `display_capture_reuses_monitor`, `display_capture_preserves_decode_band`
+  (FFI), `reference_waterfall_preserves_geometry_and_tones`
+  (pan318_overlap_tests), and the previously mooted AC6 tests
+  `parallel_waterfall_fallback`, `parallel_non_ft8_uses_legacy_path`,
+  `parallel_worker_joins_on_shutdown` (coordinator).
+
+Commands run in this round (debug, this container, 2026-11-12):
+`cargo test -p pancetta-ft8 --lib ft8_lib_ffi` (13 passed),
+`cargo test -p pancetta-ft8 --test pan318_overlap_tests` (5 passed,
+2 release-only ignored), `cargo test -p pancetta --lib coordinator::ft8`
+(53 passed).
 
 ## Commands
 

@@ -257,6 +257,29 @@ fn pre_native_us(received: Instant, native_entry: Instant) -> u64 {
     native_entry.duration_since(received).as_micros() as u64
 }
 
+/// PAN-318 AC4/AC6: decide a completed window's waterfall source.
+///
+/// A captured FT8 reference grid converts directly onto the legacy display
+/// grid (same row partition, time labels and 0–3000 Hz bin axis — see
+/// `Ft8LibDisplayGrid::to_waterfall_data`) with no second FFT: on that
+/// path the coordinator never calls `generate_waterfall_data`. Everything
+/// else returns `None` and the caller falls back to the legacy generator,
+/// which it may only run AFTER the native pass has started and joined:
+/// non-FT8 protocols (FT4/FT2 keep the legacy display path), a missing
+/// capture (the FFI stub build), or a caught reference panic (no capture
+/// survives the unwind).
+fn waterfall_from_reference_capture(
+    capture: Option<pancetta_ft8::ft8_lib_ffi::Ft8LibDisplayGrid>,
+    protocol: pancetta_ft8::Protocol,
+    window_len: usize,
+) -> Option<pancetta_ft8::WaterfallData> {
+    let grid = capture?;
+    if !matches!(protocol, pancetta_ft8::Protocol::Ft8) {
+        return None;
+    }
+    Some(grid.to_waterfall_data(window_len))
+}
+
 /// Compute the active protocol's slot parity for a decoded window.
 ///
 /// `received_utc` is the window's receipt timestamp (captured immediately on
@@ -1263,11 +1286,32 @@ impl super::ApplicationCoordinator {
                         let reference_worker = reference_decoder;
                         let outcome = run_overlapped_passes(
                             move || {
-                                let messages = reference_worker.decode_window_ft8lib_with_context(
-                                    window_for_reference,
-                                    last_protocol,
-                                );
-                                (messages, reference_worker)
+                                // PAN-318 AC4: on FT8 the reference pass
+                                // also captures the monitor's owned
+                                // 0–3000 Hz magnitude grid — the waterfall
+                                // is derived from the same C FFT work
+                                // after the join, and the legacy
+                                // generator is NOT called on this path.
+                                // FT4/FT2 keep the no-capture entry: their
+                                // waterfall stays on the legacy path.
+                                let (messages, display_grid) =
+                                    if matches!(last_protocol, pancetta_ft8::Protocol::Ft8) {
+                                        let (messages, grid) = reference_worker
+                                            .decode_window_ft8lib_with_context_and_capture(
+                                                window_for_reference,
+                                                last_protocol,
+                                            );
+                                        (messages, grid)
+                                    } else {
+                                        (
+                                            reference_worker.decode_window_ft8lib_with_context(
+                                                window_for_reference,
+                                                last_protocol,
+                                            ),
+                                            None,
+                                        )
+                                    };
+                                (messages, display_grid, reference_worker)
                             },
                             || {
                                 decoder.decode_window_with_ap_scoped_partner_budgeted(
@@ -1309,10 +1353,10 @@ impl super::ApplicationCoordinator {
                         // one from the live config snapshot and reseed it —
                         // the per-window `sync_reference_parser_seeds` above
                         // already restores full parser parity.
-                        let ft8lib_messages = match outcome.reference {
-                            Some((messages, worker)) => {
+                        let (ft8lib_messages, reference_display_grid) = match outcome.reference {
+                            Some((messages, display_grid, worker)) => {
                                 reference_decoder = worker;
-                                messages
+                                (messages, display_grid)
                             }
                             None => {
                                 let n = DECODE_PANIC_COUNT
@@ -1336,7 +1380,11 @@ impl super::ApplicationCoordinator {
                                         });
                                 fresh.seed_hash_callsign(&station_callsign);
                                 reference_decoder = fresh;
-                                Vec::new()
+                                // No capture survived the panic: the
+                                // waterfall falls back to the legacy
+                                // generator below, still only after the
+                                // native pass has run.
+                                (Vec::new(), None)
                             }
                         };
 
@@ -1374,14 +1422,32 @@ impl super::ApplicationCoordinator {
                         // pre-native prefix (see the comment above the
                         // scoped fast path). Runs after both main passes
                         // have been launched and joined — on the native
-                        // entry path it costs nothing — with the unchanged
-                        // legacy generator and fan-out, so the TUI rows,
-                        // the autonomous allocator feed and the remote
-                        // gateway `SpectrumRow` payloads stay byte-identical.
+                        // entry path it costs nothing. AC4: a successful
+                        // FT8 reference pass supplies the waterfall from
+                        // its OWN monitor FFT via
+                        // `waterfall_from_reference_capture` (no
+                        // `generate_waterfall_data` call on that path);
+                        // the legacy generator runs only as the fallback —
+                        // non-FT8 protocols, a caught reference panic, or
+                        // the FFI stub build — never before the native
+                        // pass. The fan-out below (TUI rows, autonomous
+                        // allocator feed, remote gateway `SpectrumRow`
+                        // payloads) is unchanged for both sources: the
+                        // capture route produces the same legacy display
+                        // geometry (0–3000 Hz bins, row count, row time
+                        // offsets) the TUI and gateway already consume.
                         let waterfall_start = Instant::now();
-                        // Generate waterfall data
-                        let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
-                        match decoder.generate_waterfall_data(&audio_f64) {
+                        let waterfall_result = waterfall_from_reference_capture(
+                            reference_display_grid,
+                            last_protocol,
+                            window.len(),
+                        )
+                        .map(Ok)
+                        .unwrap_or_else(|| {
+                            let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
+                            decoder.generate_waterfall_data(&audio_f64)
+                        });
+                        match waterfall_result {
                             Ok(wf) => {
                                 let range = wf.max_power - wf.min_power;
                                 info!(
@@ -2694,6 +2760,117 @@ mod pan318_overlap_lifecycle_tests {
             reference_set.is_superset(&native_set),
             "reference parser must mirror the native learned set"
         );
+    }
+
+    /// A real captured grid from a silence window, for the waterfall
+    /// source tests (79 blocks of 1920 samples: silence still runs the
+    /// monitor; nothing decodes, but the display grid is captured).
+    fn captured_grid() -> pancetta_ft8::ft8_lib_ffi::Ft8LibDisplayGrid {
+        let reference = Ft8Decoder::new(Ft8Config::default()).expect("reference ctor");
+        let window = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
+        let (_, grid) = reference
+            .decode_window_ft8lib_with_context_and_capture(&window, pancetta_ft8::Protocol::Ft8);
+        grid.expect("real build captures a display grid")
+    }
+
+    /// AC6 (`parallel_waterfall_fallback`): reference absence or failure
+    /// (a caught panic, the stub build) yields NO captured grid, and the
+    /// fallback still works — the legacy generator produces rows — while
+    /// a captured grid converts without the legacy generator at all (the
+    /// helper takes no decoder; on the Some path there is nothing to
+    /// call `generate_waterfall_data` on).
+    #[test]
+    fn parallel_waterfall_fallback() {
+        use super::waterfall_from_reference_capture;
+        use pancetta_ft8::Protocol;
+
+        // No capture survived (reference panicked / stub build): None, so
+        // the hot loop falls back to the legacy generator — which still
+        // works on the recovered native decoder.
+        assert!(super::waterfall_from_reference_capture(
+            None,
+            Protocol::Ft8,
+            pancetta_ft8::WINDOW_SAMPLES
+        )
+        .is_none());
+        let mut native = Ft8Decoder::new(Ft8Config::default()).expect("native ctor");
+        let silence = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
+        let audio_f64: Vec<f64> = silence.iter().map(|&s| s as f64).collect();
+        let legacy = native
+            .generate_waterfall_data(&audio_f64)
+            .expect("legacy fallback generator still produces rows");
+        assert!(!legacy.power_matrix.is_empty());
+
+        // With a capture the waterfall converts on the display grid
+        // WITHOUT any decoder — structurally, no legacy FFT can run.
+        let wf = waterfall_from_reference_capture(
+            Some(captured_grid()),
+            Protocol::Ft8,
+            pancetta_ft8::WINDOW_SAMPLES,
+        )
+        .expect("captured FT8 grid converts");
+        assert_eq!(wf.power_matrix.len(), legacy.power_matrix.len());
+        assert_eq!(wf.frequency_bins.len(), legacy.frequency_bins.len());
+    }
+
+    /// AC6 (`parallel_non_ft8_uses_legacy_path`): FT4 (and FT2) never use
+    /// the reference capture — even a present grid is ignored, so their
+    /// waterfall stays on the unchanged legacy path.
+    #[test]
+    fn parallel_non_ft8_uses_legacy_path() {
+        use pancetta_ft8::Protocol;
+
+        let grid = Some(captured_grid());
+        assert!(
+            super::waterfall_from_reference_capture(
+                grid,
+                Protocol::Ft4,
+                pancetta_ft8::WINDOW_SAMPLES
+            )
+            .is_none(),
+            "FT4 must keep the legacy waterfall path"
+        );
+        assert!(
+            super::waterfall_from_reference_capture(
+                Some(captured_grid()),
+                Protocol::Ft8,
+                pancetta_ft8::WINDOW_SAMPLES
+            )
+            .is_some(),
+            "FT8 with a capture must use it"
+        );
+    }
+
+    /// AC6 (`parallel_worker_joins_on_shutdown`): no orphaned job outlives
+    /// a window — the scoped-thread join inside `run_overlapped_passes`
+    /// covers a reference branch still running when the native branch (and
+    /// the window loop's interest in it) has finished, so by the time the
+    /// helper returns — the earliest moment shutdown could begin — the
+    /// slow branch's work is complete.
+    #[test]
+    fn parallel_worker_joins_on_shutdown() {
+        use pancetta_ft8::window_execution::run_overlapped_passes;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reference_finished = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&reference_finished);
+        let outcome = run_overlapped_passes(
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                flag.store(true, Ordering::Release);
+                "slow-reference"
+            },
+            || "native-done",
+        );
+        // The helper returned: the join must already have covered the
+        // still-running reference branch (an orphan would leave this
+        // false for a while after return).
+        assert!(
+            reference_finished.load(Ordering::Acquire),
+            "reference branch outlived the window — orphaned work"
+        );
+        assert_eq!(outcome.reference.as_deref(), Some("slow-reference"));
+        assert_eq!(outcome.native.as_deref(), Some("native-done"));
     }
 }
 
