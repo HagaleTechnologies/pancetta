@@ -37,6 +37,55 @@ pub(crate) fn decode_panic_count() -> u64 {
     DECODE_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// PAN-316 (review H-28): per-window and per-decode diagnostics live at
+// DEBUG. A busy band writes ~40 decode records per slot plus a handful of
+// window records, ≈30 MB/day of SD writes on a Pi at the default
+// `pancetta=info,warn` filter. Each is a small emitter called from the
+// production site, so the filter behaviour is drivable from tests through
+// the exact production formatting (see `decode_diagnostics_respect_log_filter`).
+fn log_window_received(window_samples: usize) {
+    debug!("FT8 decoder: received window ({window_samples} samples)");
+}
+
+fn log_waterfall_dimensions(rows: usize, cols: usize, min_db: f64, max_db: f64) {
+    debug!("Waterfall: {rows}x{cols} matrix, power range {min_db:.1}..{max_db:.1} dB");
+}
+
+fn log_scoped_fast_path(text: &str, snr_db: f32, frequency_offset: f64) {
+    debug!("FT8 scoped fast-path: {text} (SNR: {snr_db:.0}, freq: {frequency_offset:.1})");
+}
+
+fn log_narrow_filter_range(start_bin: usize, end_bin: usize, partner_hz: f64) {
+    debug!("hb-229: narrowing main decode to freq_bins {start_bin}..={end_bin} (partner {partner_hz:.1} Hz)");
+}
+
+fn log_window_decode_totals(total: usize, ft8lib: usize, native: usize, cross_seq: usize) {
+    debug!("FT8 decoder: {total} messages decoded ({ft8lib} ft8lib + {native} native + {cross_seq} cross-seq)");
+}
+
+fn log_ap_eval_suppressed(msg: &pancetta_ft8::DecodedMessage) {
+    debug!(
+        "AP eval-mode: decode suppressed (ap_level={}, text='{}', SNR: {:.0}, freq: {:.1})",
+        msg.ap_level, msg.text, msg.snr_db, msg.frequency_offset
+    );
+}
+
+fn log_decoded(msg: &pancetta_ft8::DecodedMessage) {
+    debug!(
+        "FT8 decoded: {} (SNR: {:.0}, freq: {:.1}, ap={})",
+        msg.text, msg.snr_db, msg.frequency_offset, msg.ap_level
+    );
+}
+
+/// Aggregate false-positive-filter suppression summary — deliberately
+/// INFO (bumped from debug during the 2026-07-17 decode-shortfall
+/// diagnosis): the operator needs the suppression rate visible at the
+/// default filter. Per-decode diagnostics above are DEBUG; this one
+/// record per window is not.
+fn log_fp_filter_dropped(dropped: usize, total: usize) {
+    info!("FP filter dropped {dropped} of {total} decodes");
+}
+
 /// Maximum length (in chars) for any human-facing decoded string field.
 /// FT8 message payloads are short (callsigns ≤ ~11 chars, grids 4-6, the
 /// full text well under 64); anything longer is malformed/hostile.
@@ -868,7 +917,7 @@ impl super::ApplicationCoordinator {
                             Vec::new()
                         };
 
-                        info!("FT8 decoder: received window ({} samples)", window.len());
+                        log_window_received(window.len());
 
                         // PAN-165: covers generation, normalisation and the
                         // channel sends below, all time the native call loses.
@@ -878,8 +927,7 @@ impl super::ApplicationCoordinator {
                         match decoder.generate_waterfall_data(&audio_f64) {
                             Ok(wf) => {
                                 let range = wf.max_power - wf.min_power;
-                                info!(
-                                    "Waterfall: {}x{} matrix, power range {:.1}..{:.1} dB",
+                                log_waterfall_dimensions(
                                     wf.power_matrix.len(),
                                     wf.power_matrix.first().map(|r| r.len()).unwrap_or(0),
                                     wf.min_power,
@@ -1082,11 +1130,10 @@ impl super::ApplicationCoordinator {
                                 // by exactly the lead. Subtract it so the reported DT
                                 // is ≈0 for a station on the slot boundary.
                                 decoded_msg.time_offset -= window_lead_secs;
-                                info!(
-                                    "FT8 scoped fast-path: {} (SNR: {:.0}, freq: {:.1})",
-                                    decoded_msg.text,
+                                log_scoped_fast_path(
+                                    &decoded_msg.text,
                                     decoded_msg.snr_db,
-                                    decoded_msg.frequency_offset
+                                    decoded_msg.frequency_offset,
                                 );
                                 let qso_msg = ComponentMessage::new(
                                     ComponentId::Ft8Decoder,
@@ -1228,10 +1275,9 @@ impl super::ApplicationCoordinator {
                                 qso_filter_override_off || fox_response.is_some(),
                             );
                         if let Some(ref range) = narrow_filter_bins {
-                            info!(
-                                "hb-229: narrowing main decode to freq_bins {}..={} (partner {:.1} Hz)",
-                                range.start(),
-                                range.end(),
+                            log_narrow_filter_range(
+                                *range.start(),
+                                *range.end(),
                                 partner_freq_for_main.unwrap_or(0.0),
                             );
                         }
@@ -1374,8 +1420,7 @@ impl super::ApplicationCoordinator {
                         health_total_decodes
                             .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
 
-                        info!(
-                            "FT8 decoder: {} messages decoded ({} ft8lib + {} native + {} cross-seq)",
+                        log_window_decode_totals(
                             decoded_messages.len(),
                             ft8lib_count,
                             native_added_count,
@@ -1492,7 +1537,7 @@ impl super::ApplicationCoordinator {
                                 // number that was invisible while diagnosing
                                 // the 2026-07-17 "far fewer decodes than
                                 // expected" report.
-                                info!("FP filter dropped {} of {} decodes", dropped, pre);
+                                log_fp_filter_dropped(dropped, pre);
                             }
                             filter.note_window_raw_calls(&raw_texts);
                         }
@@ -1509,10 +1554,7 @@ impl super::ApplicationCoordinator {
                         let (decoded_messages, suppressed_ap_decodes) =
                             partition_ap_eval_decodes(decoded_messages, ap_eval_mode);
                         for msg in &suppressed_ap_decodes {
-                            info!(
-                                "AP eval-mode: decode suppressed (ap_level={}, text='{}', SNR: {:.0}, freq: {:.1})",
-                                msg.ap_level, msg.text, msg.snr_db, msg.frequency_offset
-                            );
+                            log_ap_eval_suppressed(msg);
                         }
 
                         // `[decoder].ap_eval_mode`: pull AP-derived decodes
@@ -1527,10 +1569,7 @@ impl super::ApplicationCoordinator {
                         let (decoded_messages, suppressed_ap_decodes) =
                             partition_ap_eval_decodes(decoded_messages, ap_eval_mode);
                         for msg in &suppressed_ap_decodes {
-                            info!(
-                                "AP eval-mode: decode suppressed (ap_level={}, text='{}', SNR: {:.0}, freq: {:.1})",
-                                msg.ap_level, msg.text, msg.snr_db, msg.frequency_offset
-                            );
+                            log_ap_eval_suppressed(msg);
                         }
 
                         // PAN-40: the ft8lib+native merge above dedupes only
@@ -1667,13 +1706,7 @@ impl super::ApplicationCoordinator {
                         }
 
                         for decoded_msg in &decoded_messages {
-                            info!(
-                                "FT8 decoded: {} (SNR: {:.0}, freq: {:.1}, ap={})",
-                                decoded_msg.text,
-                                decoded_msg.snr_db,
-                                decoded_msg.frequency_offset,
-                                decoded_msg.ap_level
-                            );
+                            log_decoded(decoded_msg);
 
                             // Send to TUI via point-to-point channel, tagged with the
                             // dial frequency THIS window's audio was captured on (PAN-67:
@@ -2870,5 +2903,93 @@ mod dxpedition_context_tests {
         assert!(refresh_hound_receive_context(&mut rebuilt, &rx).await);
         manager.cancel_qso(id).await.unwrap();
         assert!(!refresh_hound_receive_context(&mut rebuilt, &rx).await);
+    }
+}
+
+#[cfg(test)]
+mod decode_log_level_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn decoded_fixture(text: &str) -> pancetta_ft8::DecodedMessage {
+        let ft8 = pancetta_ft8::Ft8Message {
+            from_callsign: Some("K1ABC".into()),
+            to_callsign: Some("K5ARH".into()),
+            ..Default::default()
+        };
+        let mut message = pancetta_ft8::DecodedMessage::new(ft8, -10.0, 0.0, 747.0, 0.2);
+        message.text = text.to_string();
+        message
+    }
+
+    /// Drive every production decode/window diagnostic emitter the same
+    /// way the decoder hot loop does, under the given env filter.
+    fn run_diagnostics(logs: LogBuffer, filter: &str, decodes: usize) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_window_received(184_320);
+            log_waterfall_dimensions(184, 512, -120.5, -10.25);
+            log_narrow_filter_range(31, 96, 742.0);
+            log_window_decode_totals(decodes, decodes / 2, decodes / 2, 0);
+            log_fp_filter_dropped(3, decodes + 3);
+            for i in 0..decodes {
+                let msg = decoded_fixture(&format!("K5ARH K1ABC FN42 -1{i}0"));
+                log_decoded(&msg);
+                log_ap_eval_suppressed(&msg);
+                log_scoped_fast_path(&msg.text, msg.snr_db, msg.frequency_offset);
+            }
+        });
+    }
+
+    #[test]
+    fn decode_diagnostics_respect_log_filter() {
+        // The production default filter: a busy band's forty decodes
+        // produce ZERO individual-decode or routine-window records.
+        let quiet = LogBuffer::default();
+        run_diagnostics(quiet.clone(), "pancetta=info,warn", 40);
+        let text = String::from_utf8(quiet.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("FT8 decoded:"), "{text}");
+        assert!(!text.contains("AP eval-mode:"), "{text}");
+        assert!(!text.contains("scoped fast-path"), "{text}");
+        assert!(!text.contains("received window"), "{text}");
+        assert!(!text.contains("Waterfall:"), "{text}");
+        assert!(!text.contains("narrowing main decode"), "{text}");
+        assert!(!text.contains("messages decoded"), "{text}");
+        // The aggregate false-positive-filter summary keeps its
+        // deliberately operator-visible INFO level.
+        assert!(
+            text.contains("FP filter dropped 3 of 43 decodes"),
+            "the FP-filter summary must stay INFO: {text}"
+        );
+
+        // At DEBUG the same forty decodes produce exactly forty of each
+        // per-decode record.
+        let verbose = LogBuffer::default();
+        run_diagnostics(verbose.clone(), "pancetta=debug,warn", 40);
+        let text = String::from_utf8(verbose.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("FT8 decoded:").count(), 40);
+        assert_eq!(text.matches("AP eval-mode:").count(), 40);
+        assert_eq!(text.matches("scoped fast-path").count(), 40);
+        assert!(text.contains("received window (184320 samples)"));
+        assert!(text.contains("messages decoded"));
+        assert!(text.contains("Waterfall: 184x512 matrix"));
+        assert!(text.contains("narrowing main decode"));
+        assert!(text.contains("FP filter dropped 3 of 43 decodes"));
     }
 }

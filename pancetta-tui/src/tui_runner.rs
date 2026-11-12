@@ -885,7 +885,11 @@ impl TuiRunner {
             match self.message_rx.try_recv() {
                 Ok(message) => {
                     if matches!(message, TuiMessage::DecodedMessage(_)) {
-                        info!("TUI process_messages: received DecodedMessage");
+                        // PAN-316 (review H-28): per-decode chatter is
+                        // DEBUG — a busy band wrote ~40 INFO lines per
+                        // slot at the default filter, ≈30 MB/day of SD
+                        // writes on a Pi.
+                        debug!("TUI process_messages: received DecodedMessage");
                     }
                     self.handle_message(message).await?;
                     message_count += 1;
@@ -9368,3 +9372,188 @@ mod pan_59_command_tests {
 
 #[cfg(test)]
 mod key_effects;
+
+#[cfg(test)]
+mod decode_log_level_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory capture for a thread-local tracing subscriber: records
+    /// (level, message) for every event the filter lets through. This
+    /// crate has no tracing-subscriber dependency, so the subscriber is
+    /// hand-rolled — which is all the assertion needs: a level filter
+    /// (like the default `pancetta=info,warn`) plus the formatted
+    /// message field.
+    #[derive(Default, Clone)]
+    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct CaptureSubscriber {
+        /// Most verbose level allowed through, mirroring an env-filter
+        /// level directive. tracing orders levels by verbosity
+        /// (ERROR < WARN < INFO < DEBUG < TRACE), so an `info` directive
+        /// keeps events whose level is at or below INFO.
+        filter: tracing::Level,
+        events: CapturedEvents,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            *meta.level() <= self.filter
+        }
+
+        // Spans are never inspected here; only events are captured.
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(0)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor {
+                message: String,
+            }
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor {
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            self.events
+                .0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.message));
+        }
+    }
+
+    fn decoded_view(i: usize) -> crate::app::DecodedMessageView {
+        crate::app::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some(format!("K{i}ABC")),
+            grid_square: None,
+            message: format!("CQ K{i}ABC FN42"),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            priority_factors: None,
+            is_own_tx: false,
+        }
+    }
+
+    async fn make_runner() -> TuiRunner {
+        // Same test seam as key_tests::make_runner: a throwaway state
+        // path so no parallel test touches the operator's real
+        // tui_state.json.
+        static STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_path = std::env::temp_dir().join(format!("pancetta_tui_test_state_{n}.json"));
+        App::set_test_tui_state_path(state_path);
+
+        let app = Arc::new(RwLock::new(
+            App::new(Config::default(), None).await.unwrap(),
+        ));
+        let (_msg_tx, msg_rx) = crossbeam_channel::unbounded::<TuiMessage>();
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<TuiCommand>();
+        TuiRunner::new_for_test(
+            app,
+            Config::default(),
+            msg_rx,
+            cmd_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forty_decodes_are_quiet_at_info_and_visible_at_debug() {
+        // Feed forty ordinary decodes through the real TUI message
+        // processor (the exact production `process_messages` path that
+        // carries the per-decode record) under an INFO-level filter, the
+        // default `pancetta=info,warn` shape: zero per-decode records.
+        let mut runner = make_runner().await;
+        let (msg_tx, msg_rx) = crossbeam_channel::unbounded::<TuiMessage>();
+        runner.message_rx = msg_rx;
+        for i in 0..40 {
+            msg_tx
+                .send(TuiMessage::DecodedMessage(decoded_view(i)))
+                .unwrap();
+        }
+        let at_info = CapturedEvents::default();
+        {
+            let _guard = tracing::subscriber::set_default(CaptureSubscriber {
+                filter: tracing::Level::INFO,
+                events: at_info.clone(),
+            });
+            for _ in 0..4 {
+                runner.process_messages().await.unwrap();
+            }
+        }
+        assert_eq!(
+            runner.metrics.messages_processed, 40,
+            "all forty decodes went through the production processor"
+        );
+        let records = at_info.0.lock().unwrap().clone();
+        assert!(
+            records
+                .iter()
+                .all(|(_, message)| !message.contains("received DecodedMessage")),
+            "no per-decode record may survive the default INFO filter: {records:?}"
+        );
+
+        // Same forty decodes at DEBUG: exactly one DEBUG record each.
+        for i in 0..40 {
+            msg_tx
+                .send(TuiMessage::DecodedMessage(decoded_view(i)))
+                .unwrap();
+        }
+        let at_debug = CapturedEvents::default();
+        {
+            let _guard = tracing::subscriber::set_default(CaptureSubscriber {
+                filter: tracing::Level::DEBUG,
+                events: at_debug.clone(),
+            });
+            for _ in 0..4 {
+                runner.process_messages().await.unwrap();
+            }
+        }
+        let records = at_debug.0.lock().unwrap().clone();
+        let decode_records: Vec<_> = records
+            .iter()
+            .filter(|(_, message)| message.contains("received DecodedMessage"))
+            .collect();
+        assert_eq!(decode_records.len(), 40, "{records:?}");
+        assert!(
+            decode_records
+                .iter()
+                .all(|(level, _)| *level == tracing::Level::DEBUG),
+            "the per-decode record is a DEBUG record: {decode_records:?}"
+        );
+    }
+}
