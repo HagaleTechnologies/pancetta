@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{create_panel_block, format_bearing, format_distance, format_time_ago};
+use super::{create_panel_block, format_bearing, format_distance, format_time_ago, get_snr_color};
 use crate::app::{ActivePanel, App, DxStation, SpotSource};
 
 /// Format the DX Hunter SNR cell. A pure NETWORK spot that carried no SNR
@@ -544,14 +544,6 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
         if is_engaged { "● " } else { "" },
         station.call_sign
     )
-}
-
-fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
-    match snr {
-        snr if snr >= 0 => theme.success_color(),
-        snr if snr >= -10 => theme.warning_color(),
-        _ => theme.error_color(),
-    }
 }
 
 /// Check if a station is rare DX using cqdx.io rarity tier (preferred)
