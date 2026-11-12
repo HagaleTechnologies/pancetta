@@ -17,6 +17,7 @@ pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
 pub mod readiness_strip;
+pub mod slot_clock;
 pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
@@ -93,10 +94,19 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         crate::contest_score::render(
             f,
             Rect {
-                height: 2.min(size.height),
+                y: size.y + 1.min(size.height),
+                height: 2.min(size.height.saturating_sub(1)),
                 ..size
             },
             app.contest_score.as_ref(),
+        );
+        render_title_bar(
+            f,
+            Rect {
+                height: 1.min(size.height),
+                ..size
+            },
+            app,
         );
         return Ok(());
     }
@@ -653,11 +663,11 @@ pub fn hit_test(
 /// more important; 0 is pinned. Admit steps bring a chip in at its compact
 /// form (full form when it has none); `*_FULL` steps upgrade compact → full.
 /// When the row is too narrow the chips drop out lowest-value first; when it
-/// fits, every step succeeds and the row is byte-identical to the
-/// pre-PAN-88 row. Reorder by moving a constant — this table IS the policy.
+/// fits, every step succeeds. Reorder by moving a constant — this table IS the policy.
 mod title_rank {
     pub const CALLSIGN: u8 = 0;
     pub const TX_POLICY: u8 = 0;
+    pub const SLOT_CLOCK: u8 = 1;
     pub const LIVE_TX: u8 = 2;
     pub const PAUSE: u8 = 3;
     pub const MODE: u8 = 5;
@@ -679,15 +689,25 @@ mod title_rank {
 }
 
 /// Every title-bar chip as a [`BarSegment`], in display order. Chip text and
-/// styles are unchanged from the pre-PAN-88 row; only the composition moved
-/// into [`title_bar_left_line`]. Returns the segments plus the index of the
+/// styles are composed by [`title_bar_left_line`]. Returns the segments plus the index of the
 /// grid segment (where #171's own-entity span attaches).
-fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
+fn title_bar_segments(
+    app: &App,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<BarSegment<'_>>, usize) {
     let accent_bold = Style::default()
         .fg(app.theme.accent_color())
         .add_modifier(Modifier::BOLD);
 
     let mut segs = vec![
+        BarSegment::new(
+            " ",
+            vec![Span::styled(
+                slot_clock::slot_clock_text(now, &app.station_info.mode, app.resolve_tx_parity()),
+                accent_bold,
+            )],
+            title_rank::SLOT_CLOCK,
+        ),
         BarSegment::new(
             " | ",
             vec![Span::styled("Pancetta TUI", accent_bold)],
@@ -784,30 +804,8 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
         title_rank::FREQ_MODE,
     ));
 
-    // Decode-effort chip (decoder-speed-overhaul Task 15): the live preset
-    // + the most recently completed decode window's wall-time, with a
-    // trailing scissors mark when that window ran out of its budget before
-    // finishing optional work. `app.decode_effort` is authoritative-from-
-    // frame-1 (the coordinator seeds it at startup, not just on the
-    // operator's first `e` press); `pipeline_health` is `None` only for the
-    // first ~2s before the first health tick, in which case the elapsed
-    // reads as 0ms (never exhausted) rather than hiding the chip. The
-    // compact form keeps only the preset.
-    let (decode_elapsed_ms, decode_exhausted) = app
-        .pipeline_health
-        .as_ref()
-        .map(|h| (h.last_decode_elapsed_ms, h.last_decode_budget_exhausted))
-        .unwrap_or((0, false));
-    let decode_text = format!(
-        " DECODE: {} {}ms{} ",
-        app.decode_effort,
-        decode_elapsed_ms,
-        if decode_exhausted {
-            format!(" {}", crate::presentation::BUDGET_MARKER)
-        } else {
-            String::new()
-        }
-    );
+    // Decode preset only; elapsed time and budget exhaustion live in Shift+S health.
+    let decode_text = format!(" DECODE: {} ", app.decode_effort);
     segs.push(BarSegment::with_compact(
         " ",
         vec![Span::styled(decode_text, accent_bold)],
@@ -951,10 +949,19 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
 
 /// The title bar's left side (everything but the clock), priority-fitted to
 /// `width` columns. Pinned chips (callsign, TX policy) are always present.
-fn title_bar_left_line(app: &App, width: u16) -> Line<'_> {
+fn title_bar_left_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) -> Line<'_> {
     let width = width as usize;
-    let (mut segs, grid_idx) = title_bar_segments(app);
-    let forms = bar_fit::fit_bar(&segs, width);
+    let (mut segs, grid_idx) = title_bar_segments(app, now);
+    let mut forms = bar_fit::fit_bar(&segs, width);
+    // PAN-352: the slot clock is the last item dropped. The fitter may
+    // admit smaller, lower-priority chips after skipping it, so hide those.
+    if forms[0] == bar_fit::SegmentForm::Hidden {
+        for (seg, form) in segs.iter().zip(forms.iter_mut()) {
+            if seg.admit != 0 {
+                *form = bar_fit::SegmentForm::Hidden;
+            }
+        }
+    }
 
     // #171: our own DXCC entity attaches after the grid only if it fits
     // alongside every chip `fit_bar` already committed — applied last, so
@@ -980,7 +987,8 @@ fn title_bar_left_line(app: &App, width: u16) -> Line<'_> {
 /// it off screen; the chips priority-fit into whatever is left (see
 /// `title_rank` for the drop order).
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let utc_clock = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
+    let now = chrono::Utc::now();
+    let utc_clock = now.format("%H:%M:%S UTC").to_string();
     let clock_width = Span::raw(utc_clock.as_str()).width() as u16;
     let [left_area, clock_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).areas(area);
@@ -990,7 +998,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         .fg(app.theme.foreground_color());
 
     f.render_widget(
-        Paragraph::new(title_bar_left_line(app, left_area.width)).style(row_style),
+        Paragraph::new(title_bar_left_line(app, left_area.width, now)).style(row_style),
         left_area,
     );
     f.render_widget(
@@ -1234,10 +1242,21 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(app.theme.warning_color())
                     .add_modifier(Modifier::BOLD),
             ),
-            None => Span::styled(
-                app.status_message.clone(),
-                Style::default().fg(app.theme.accent_color()),
-            ),
+            // PAN-344: the typed completion toast outranks ordinary status
+            // text (which stays stored and reappears on expiry) but never
+            // compose input. Rendered in place — no layout change.
+            None => match app.active_toast_text(chrono::Utc::now()) {
+                Some(toast) => Span::styled(
+                    toast,
+                    Style::default()
+                        .fg(app.theme.accent_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled(
+                    app.status_message.clone(),
+                    Style::default().fg(app.theme.accent_color()),
+                ),
+            },
         },
     ];
 
@@ -1729,7 +1748,9 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let modal_width = area.width.saturating_sub(4);
-    let modal_height = area.height.saturating_sub(4);
+    let modal_height = area
+        .height
+        .saturating_sub(if area.height < 12 { 0 } else { 4 });
     let modal_area = Rect {
         x: (area.width.saturating_sub(modal_width)) / 2,
         y: (area.height.saturating_sub(modal_height)) / 2,
@@ -1760,10 +1781,52 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Same windowing approach as the Diagnostics overlay: a page of rows
     // ending at (or centered near) the scroll cursor, oldest-first within
     // the window.
-    let visible_rows = inner.height as usize;
     let cursor = app
         .recent_qsos_scroll
         .min(app.recent_qsos.len().saturating_sub(1));
+
+    // PAN-344: the selected-contact Station card is reserved BEFORE the
+    // visible-row window is calculated, so the card never overlaps rows.
+    let selected = app.recent_qsos.get(cursor);
+    let detail = selected
+        .map(|qso| {
+            station_card::upload_detail_lines(
+                qso,
+                app.upload_status_for(&qso.qso_uuid),
+                inner.width.saturating_sub(2),
+            )
+        })
+        .unwrap_or_default();
+    let card_lines = detail.len().max(1) as u16;
+    let card_h = (card_lines + 2).min(inner.height.saturating_sub(1)); // + borders
+    let rows_h = inner.height - card_h;
+
+    // Legend: one compact line at narrow widths, two lines when the modal
+    // is wide enough (a full 80-col terminal gives the modal 74 inner
+    // columns; the two-line legend fits from ~70).
+    let legend_lines = if inner.width >= 70 { 2 } else { 1 };
+    let legend_h = if rows_h > legend_lines {
+        legend_lines
+    } else {
+        0
+    };
+
+    let rows_area = Rect {
+        height: rows_h - legend_h,
+        ..inner
+    };
+    let legend_area = Rect {
+        y: inner.y + rows_h - legend_h,
+        height: legend_h,
+        ..inner
+    };
+    let card_area = Rect {
+        y: inner.y + rows_h,
+        height: card_h,
+        ..inner
+    };
+
+    let visible_rows = rows_area.height as usize;
     let end = cursor + 1;
     let start = end.saturating_sub(visible_rows);
 
@@ -1791,13 +1854,50 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .last()
                 .map(String::as_str)
                 .unwrap_or(&qso.last_state);
-            let line = format!(
-                "{} {:<10} {}  ({} Hz)",
-                qso.ts.format("%H:%M:%S"),
-                qso.callsign,
-                summary,
-                qso.freq_hz
-            );
+            // PAN-344: per-target glyph cells between the outcome summary
+            // and the frequency. Only enabled targets occupy cells; a
+            // completed QSO with no snapshot yet shows `?`; failed QSOs
+            // made no upload attempt.
+            let upload_cells = match (&qso.outcome, app.upload_status_for(&qso.qso_uuid)) {
+                (crate::app::QsoOutcome::Completed, Some(status)) => {
+                    if status.targets.is_empty() {
+                        "uploads off".to_string()
+                    } else {
+                        crate::upload_status::glyph_cells(status)
+                    }
+                }
+                (crate::app::QsoOutcome::Completed, None) => "?".to_string(),
+                (crate::app::QsoOutcome::Failed(_), _) => String::new(),
+            };
+            let line = if upload_cells.is_empty() {
+                format!(
+                    "{} {:<10} {}  ({} Hz)",
+                    qso.ts.format("%H:%M:%S"),
+                    qso.callsign,
+                    summary,
+                    qso.freq_hz
+                )
+            } else if inner.width >= 60 {
+                format!(
+                    "{} {:<10} {}  {}  ({} Hz)",
+                    qso.ts.format("%H:%M:%S"),
+                    qso.callsign,
+                    summary,
+                    upload_cells,
+                    qso.freq_hz
+                )
+            } else {
+                // Narrow widths prioritize time, callsign and every enabled
+                // glyph ahead of the RF and outcome summary (PAN-344).
+                format!(
+                    "{} {:<10} {} {} ({} Hz)",
+                    qso.ts.format("%H:%M"),
+                    qso.callsign,
+                    upload_cells,
+                    summary,
+                    qso.freq_hz
+                )
+            };
             let style = if i == cursor {
                 Style::default()
                     .fg(color)
@@ -1805,11 +1905,90 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 Style::default().fg(color)
             };
-            Line::from(Span::styled(line, style))
+            if let Some((before, after)) = (!upload_cells.is_empty())
+                .then(|| line.split_once(&upload_cells))
+                .flatten()
+            {
+                let mut spans = vec![Span::styled(before.to_string(), style)];
+                if let Some(status) = app
+                    .upload_status_for(&qso.qso_uuid)
+                    .filter(|s| !s.targets.is_empty())
+                {
+                    for (index, (target, slot)) in status.targets.iter().enumerate() {
+                        if index > 0 {
+                            spans.push(Span::raw(" "));
+                        }
+                        let color = match slot.state {
+                            crate::upload_status::UploadState::Accepted => Color::Green,
+                            crate::upload_status::UploadState::Pending => Color::Yellow,
+                            crate::upload_status::UploadState::Rejected
+                            | crate::upload_status::UploadState::Failed => Color::Red,
+                            crate::upload_status::UploadState::Unknown => Color::Gray,
+                        };
+                        spans.push(Span::styled(
+                            format!("{}{}", target.letter(), slot.state.glyph()),
+                            style.fg(color),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled(upload_cells, style));
+                }
+                spans.push(Span::styled(after.to_string(), style));
+                Line::from(spans)
+            } else {
+                Line::from(Span::styled(line, style))
+            }
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    if legend_h > 0 {
+        let legend = if inner.width >= 70 {
+            vec![
+                Line::from(Span::styled(
+                    "Uploads: Q QRZ \u{b7} C ClubLog \u{b7} E eQSL \u{b7} D cqdx.io \u{b7} L LoTW",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "\u{2713} accepted \u{b7} ~ pending \u{b7} \u{d7} rejected \u{b7} ! failed \u{b7} ? unknown",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        } else {
+            vec![Line::from(Span::styled(
+                "Q QRZ C ClubLog E eQSL D cqdx L LoTW",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        f.render_widget(Paragraph::new(legend), legend_area);
+    }
+    f.render_widget(Paragraph::new(lines), rows_area);
+
+    // PAN-344: the selected-contact Station card. This card uses the
+    // SELECTED QSO (UUID), never the live focused station, so the upload
+    // results of an older contact are never attributed to a live station
+    // with the same callsign.
+    if let Some(qso) = selected {
+        let title = format!(
+            " Station: {} \u{b7} {} UTC \u{b7} {} Hz ",
+            qso.callsign,
+            qso.ts.format("%H:%M:%S"),
+            qso.freq_hz
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Cyan));
+        f.render_widget(block, card_area);
+        f.render_widget(
+            Paragraph::new(detail),
+            Rect {
+                x: card_area.x + 1,
+                y: card_area.y + 1,
+                width: card_area.width.saturating_sub(2),
+                height: card_area.height.saturating_sub(2),
+            },
+        );
+    }
 }
 
 /// Render the Shift+S station-health panel: a consolidated "is the station
@@ -3226,6 +3405,7 @@ mod view_render_tests {
         // UserCancelled=gray).
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
+            qso_uuid: "u-k1abc".to_string(),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -3237,6 +3417,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "KJ5NJF".to_string(),
+            qso_uuid: "u-kj5njf".to_string(),
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
             last_state: "Failed".to_string(),
             freq_hz: 1832,
@@ -3248,6 +3429,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "W2XYZ".to_string(),
+            qso_uuid: "u-w2xyz".to_string(),
             outcome: crate::app::QsoOutcome::Failed(
                 pancetta_qso::QsoFailureReason::InvalidCallsign,
             ),
@@ -3258,6 +3440,7 @@ mod view_render_tests {
         });
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "N3TEST".to_string(),
+            qso_uuid: "u-n3test".to_string(),
             outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::UserCancelled),
             last_state: "Failed".to_string(),
             freq_hz: 800,
@@ -3314,20 +3497,240 @@ mod view_render_tests {
         );
     }
 
+    /// PAN-344 AC1: one completed QSO with QRZ accepted, ClubLog retrying
+    /// and eQSL rejected renders `Q✓ C~ E×` in its row, plus the legend and
+    /// the selected-contact Station card with each target's state+reason.
+    #[tokio::test]
+    async fn pan344_recent_qsos_mixed_upload_states() {
+        use crate::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState::*, UploadTarget::*,
+        };
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+        app.recent_qsos_scroll = 0;
+        app.apply_qso_upload_statuses(
+            vec![QsoUploadStatus {
+                uuid: "u-1".to_string(),
+                callsign: "K1ABC".to_string(),
+                revision: 3,
+                targets: vec![
+                    (Qrz, TargetUploadStatus::new(Accepted, "")),
+                    (
+                        ClubLog,
+                        TargetUploadStatus::pending("retrying \u{b7} temporary service failure"),
+                    ),
+                    (
+                        Eqsl,
+                        TargetUploadStatus::new(Rejected, "record rejected \u{b7} invalid record"),
+                    ),
+                ],
+            }],
+            chrono::Utc::now(),
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            buffer_contains(&buf, "Q\u{2713} C~ E\u{d7}"),
+            "row glyph cells"
+        );
+        assert!(buffer_contains(&buf, "Uploads: Q QRZ"), "legend letters");
+        assert!(buffer_contains(&buf, "Station: K1ABC"), "selected card");
+        assert!(buffer_contains(&buf, "QRZ Logbook: accepted"));
+        assert!(buffer_contains(
+            &buf,
+            "ClubLog: pending \u{b7} retrying \u{b7} temporary service failure"
+        ));
+        assert!(buffer_contains(
+            &buf,
+            "eQSL: rejected \u{b7} record rejected \u{b7} invalid record"
+        ));
+        let mut second = app.recent_qsos[0].clone();
+        second.qso_uuid = "u-2".into();
+        second.ts += chrono::Duration::seconds(15);
+        app.push_recent_qso_outcome(second);
+        app.apply_qso_upload_statuses(
+            vec![crate::upload_status::QsoUploadStatus {
+                uuid: "u-2".into(),
+                callsign: "K1ABC".into(),
+                revision: 1,
+                targets: vec![(
+                    crate::upload_status::UploadTarget::Qrz,
+                    crate::upload_status::TargetUploadStatus::new(
+                        crate::upload_status::UploadState::Rejected,
+                        "login rejected",
+                    ),
+                )],
+            }],
+            chrono::Utc::now(),
+        );
+        app.recent_qsos_scroll = 1;
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        assert!(buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: rejected"
+        ));
+        app.recent_qsos_scroll = 0;
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        assert!(buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: accepted"
+        ));
+        assert!(!buffer_contains(
+            term.backend().buffer(),
+            "QRZ Logbook: rejected"
+        ));
+    }
+
+    /// PAN-344 AC2: the completion toast renders through the status-text
+    /// slot — visible while active, never over compose input, and ordinary
+    /// status text returns on expiry.
+    #[tokio::test]
+    async fn pan344_completion_toast_rendering() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.status_message = "Pancetta TUI Ready".to_string();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+
+        let draw = |app: &crate::app::App| {
+            let backend = TestBackend::new(100, 5);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_status_bar(f, f.area(), app)).unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "K1ABC logged \u{b7} uploads queued"));
+        assert!(!buffer_contains(&buf, "Pancetta TUI Ready"));
+
+        // Compose input retains precedence over the toast.
+        app.compose_mode = true;
+        app.tx_input_buffer = "hello".to_string();
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "TX> hello_"));
+        assert!(!buffer_contains(&buf, "uploads queued"));
+        app.compose_mode = false;
+
+        // After expiry the stored status text reappears.
+        if let Some(toast) = app.completion_toast.as_mut() {
+            toast.since = chrono::Utc::now() - chrono::Duration::seconds(60);
+        }
+        let buf = draw(&app);
+        assert!(buffer_contains(&buf, "Pancetta TUI Ready"));
+    }
+
+    /// PAN-344 AC7: 80×24 and 40×16 both show all five target identities
+    /// (glyph cells + legend + card detail); smaller areas render safely.
+    #[tokio::test]
+    async fn pan344_recent_qsos_terminal_sizes() {
+        use crate::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState::*, UploadTarget::*,
+        };
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        });
+        app.recent_qsos_scroll = 0;
+        app.apply_qso_upload_statuses(
+            vec![QsoUploadStatus {
+                uuid: "u-1".to_string(),
+                callsign: "K1ABC".to_string(),
+                revision: 1,
+                targets: vec![
+                    (Qrz, TargetUploadStatus::new(Accepted, "")),
+                    (ClubLog, TargetUploadStatus::pending("retrying")),
+                    (Eqsl, TargetUploadStatus::new(Rejected, "record rejected")),
+                    (Cqdx, TargetUploadStatus::new(Failed, "upload queue full")),
+                    (Lotw, TargetUploadStatus::pending("queued")),
+                ],
+            }],
+            chrono::Utc::now(),
+        );
+
+        for (w, h, legend) in [
+            (80u16, 24u16, "Uploads: Q QRZ"),
+            // 40 cols give the modal 34 inner columns: the compact legend
+            // clips after "cqdx"; LoTW's identity still shows via its glyph
+            // and the card's "LoTW: pending" detail line.
+            (40, 16, "Q QRZ C ClubLog E eQSL D cqdx"),
+        ] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+            let buf = term.backend().buffer().clone();
+            assert!(buffer_contains(&buf, "Q\u{2713}"), "{w}x{h} qrz glyph");
+            assert!(buffer_contains(&buf, "C~"), "{w}x{h} clublog glyph");
+            assert!(buffer_contains(&buf, "E\u{d7}"), "{w}x{h} eqsl glyph");
+            assert!(buffer_contains(&buf, "D!"), "{w}x{h} cqdx glyph");
+            assert!(buffer_contains(&buf, "L~"), "{w}x{h} lotw glyph");
+            assert!(buffer_contains(&buf, legend), "{w}x{h} legend");
+            assert!(buffer_contains(&buf, "Station: K1ABC"), "{w}x{h} card");
+            assert!(
+                buffer_contains(&buf, "LoTW: pending"),
+                "{w}x{h} card detail"
+            );
+        }
+
+        for (w, h) in [(40, 12), (20, 8), (20, 6)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+            assert!(
+                buffer_contains(term.backend().buffer(), "K1ABC"),
+                "selected row survives {w}x{h}"
+            );
+        }
+
+        // Below the render threshold (20×6 / smaller): no panic, no overlap.
+        for (w, h) in [(20u16, 6u16), (19, 5), (1, 1)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn title_bar_shows_own_station_entity_when_resolvable() {
         let mut config = crate::config::Config::default();
         config.station.call_sign = "K5ARH".to_string();
         let mut app = crate::app::App::new(config, None).await.unwrap();
         app.active_view = crate::view::ActiveView::Operate;
-        // 140, not the file's usual 120: at 120 columns this exact scenario's
-        // baseline chips (title/call/grid/freq/band/mode/TX-policy/FREQ/
-        // DECODE + clock) sum to 121 — one character over the width the
-        // entity-omit-if-overflowing logic (see render_title_bar) allows,
-        // which would suppress the very thing this test verifies. This test
-        // proves the entity CAN render; the omit-when-tight behavior itself
-        // is covered by a separate test at the standard 120-column width.
-        let backend = TestBackend::new(140, 40);
+        // 150 columns leave room for the slot clock and own-station entity.
+        let backend = TestBackend::new(150, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app).unwrap()).unwrap();
         let buf = term.backend().buffer().clone();
@@ -3380,20 +3783,23 @@ mod view_render_tests {
             let mut health = health_with_clock(None, false);
             health.last_decode_budget_exhausted = exhausted;
             app.pipeline_health = Some(health);
-            let line = title_bar_left_line(&app, 300);
+            let line = title_bar_left_line(&app, 300, slot_test_now());
             let text = line_text(&line);
-            assert_eq!(text.contains("ms !"), exhausted, "{text}");
+            assert!(!text.contains("ms"), "{text}");
             assert!(!text.contains('✂'));
             let buf = render_app(&app, 300, 40);
-            assert_eq!(buffer_contains(&buf, "ms !"), exhausted);
+            assert!(!row_text(&buf, 0).contains("ms"));
+            let health = render_health(&app).await;
+            assert_eq!(buffer_contains(&health, "(budget exhausted)"), exhausted);
+            assert!(!buffer_contains(&health, "✂"));
             assert!(!buffer_contains(&buf, "✂"));
         }
         for paused in [false, true] {
             app.autonomous_init_paused = paused;
-            let text = line_text(&title_bar_left_line(&app, 300));
+            let text = line_text(&title_bar_left_line(&app, 300, slot_test_now()));
             assert_eq!(text.contains("| AUTO-CQ PAUSED"), paused);
             if paused {
-                assert!(title_bar_left_line(&app, 300)
+                assert!(title_bar_left_line(&app, 300, slot_test_now())
                     .spans
                     .iter()
                     .any(|s| s.content.contains("| AUTO-CQ PAUSED")
@@ -3407,7 +3813,7 @@ mod view_render_tests {
         app.autonomous_init_paused = true;
         let mut saw_compact = false;
         for width in 50..300 {
-            let line = title_bar_left_line(&app, width);
+            let line = title_bar_left_line(&app, width, slot_test_now());
             assert!(line.width() <= width as usize);
             if line_text(&line).contains("| CQ PAUSED: press a key") {
                 saw_compact = true;
@@ -3493,6 +3899,125 @@ mod view_render_tests {
             && tail[8..].iter().collect::<String>() == " UTC"
     }
 
+    fn slot_test_now() -> chrono::DateTime<chrono::Utc> {
+        "2026-01-01T00:00:06Z".parse().unwrap()
+    }
+
+    fn has_slot_clock(row: &str) -> bool {
+        let chars: Vec<_> = row.chars().collect();
+        chars.windows(21).any(|c| {
+            c[0] == '['
+                && matches!(c[1], 'E' | 'O')
+                && c[2] == ' '
+                && c[3..9].iter().all(|c| matches!(c, '▮' | '▯'))
+                && c[9] == ' '
+                && c[10..12].iter().all(char::is_ascii_digit)
+                && c[12..19].iter().collect::<String>() == "s │ TX:"
+                && matches!(c[19], 'E' | 'O' | '-')
+                && c[20] == ']'
+        })
+    }
+
+    #[tokio::test]
+    async fn title_bar_shows_slot_clock_in_every_view_at_supported_sizes() {
+        let mut app = default_app().await;
+        for (w, h) in [(80, 20), (80, 24), (100, 30), (132, 40)] {
+            for view in ALL_VIEWS {
+                for zoomed in [false, true] {
+                    app.active_view = view;
+                    app.zoomed = zoomed;
+                    let row = row_text(&render_app(&app, w, h), 0);
+                    assert!(
+                        has_slot_clock(&row),
+                        "{w}x{h} {view:?} zoom={zoomed}: {row}"
+                    );
+                    assert!(ends_with_utc_clock(&row));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_slot_clock_is_last_droppable_chip() {
+        let mut app = default_app().await;
+        for worst_case in [false, true] {
+            if worst_case {
+                app.station_info.call_sign = "VP2V/W1ABC".into();
+                app.tx_policy = pancetta_core::TxPolicy::Disabled;
+                app.autonomous_init_paused = true;
+                app.fox_mode = true;
+                app.split_tx_hz = 14_075_000;
+                app.tx_offset_hold_hz = Some(1520);
+                app.is_transmitting = true;
+                app.session_completed = 12;
+                app.active_view = crate::view::ActiveView::Hunt;
+            }
+            let pinned = if worst_case {
+                "VP2V/W1ABC  TX: DISABLED — RX ONLY "
+            } else {
+                "N0CALL  TX: FULL "
+            };
+            for width in 0..=200 {
+                let line = line_text(&title_bar_left_line(&app, width, slot_test_now()));
+                assert!(
+                    has_slot_clock(&line) || line == pinned,
+                    "width {width}: {line}"
+                );
+                assert!(!line.contains("Pancetta TUI") || has_slot_clock(&line));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_omits_decode_timing_telemetry() {
+        let mut app = default_app().await;
+        let mut health = health_with_clock(None, false);
+        health.last_decode_elapsed_ms = 2243;
+        health.last_decode_budget_exhausted = true;
+        app.pipeline_health = Some(health);
+        let row = row_text(&render_app(&app, 180, 40), 0);
+        assert!(row.contains("DECODE: AUTO "));
+        assert!(!row.contains("2243ms"));
+        assert!(!row.contains('✂'));
+    }
+
+    #[tokio::test]
+    async fn too_small_screen_keeps_title_row_with_slot_clock() {
+        let mut app = default_app().await;
+        let buf = render_app(&app, 60, 24);
+        let row = row_text(&buf, 0);
+        assert!(has_slot_clock(&row), "{row}");
+        assert!(row.contains("N0CALL") && row.contains("TX: FULL"));
+        assert!(ends_with_utc_clock(&row));
+        assert!(!row.contains("Pancetta TUI"));
+        assert!(buffer_contains(&buf, "Terminal too small"));
+        use pancetta_qso::contest::ledger::{ContestScoreState, ContestScoreUpdate};
+        use pancetta_qso::contest::scoring::{
+            reduce_contest_score, ContestScoringContext, KSQP_FT_2026,
+        };
+        let snapshot = reduce_contest_score(
+            &ContestScoringContext::new("ks", "us-state-qso-party", KSQP_FT_2026, "TX", vec![])
+                .unwrap(),
+            &[],
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        app.contest_score = Some(ContestScoreUpdate {
+            generation: 1,
+            instance_id: "ks".into(),
+            rules_id: KSQP_FT_2026.into(),
+            display_name: "KSQP 2026".into(),
+            outside_period: false,
+            state: ContestScoreState::Ready(snapshot),
+        });
+        let buf = render_app(&app, 60, 24);
+        assert!(has_slot_clock(&row_text(&buf, 0)));
+        assert!(row_text(&buf, 1).starts_with("Contest"));
+        for (w, h) in [(60, 1), (79, 24), (80, 19)] {
+            render_app(&app, w, h);
+        }
+    }
+
     const ALL_VIEWS: [crate::view::ActiveView; 4] = [
         crate::view::ActiveView::Operate,
         crate::view::ActiveView::Hunt,
@@ -3539,13 +4064,17 @@ mod view_render_tests {
             assert!(row.contains("VP2V/W1ABC"), "{w}: [{row}]");
             assert!(row.contains("TX: DISABLED — RX ONLY"), "{w}: [{row}]");
             assert!(ends_with_utc_clock(&row), "{w}: [{row}]");
-            let left = line_text(&title_bar_left_line(&app, w - 12));
+            assert!(has_slot_clock(&row), "{w}: [{row}]");
+            let left = line_text(&title_bar_left_line(&app, w - 12, slot_test_now()));
             assert!(
                 left.chars().count() <= (w - 12) as usize,
                 "{w}: fitted chips overflow their rect: [{left}]"
             );
             assert!(
-                row.starts_with(&left),
+                row.chars()
+                    .skip(21)
+                    .collect::<String>()
+                    .starts_with(&left.chars().skip(21).collect::<String>()),
                 "{w}: a chip was clipped\n row: [{row}]\nleft: [{left}]"
             );
         }
@@ -3555,17 +4084,17 @@ mod view_render_tests {
     async fn title_bar_drops_low_value_chips_in_documented_order_at_80_and_100() {
         let mut app = default_app().await;
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 68)),
-            "N0CALL | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO "
+            line_text(&title_bar_left_line(&app, 68, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 MHz 20M | FT8  TX: FULL "
         );
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 88)),
-            "N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms "
+            line_text(&title_bar_left_line(&app, 88, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO "
         );
         app.active_view = crate::view::ActiveView::Hunt;
         assert_eq!(
-            line_text(&title_bar_left_line(&app, 68)),
-            "N0CALL | 14.074 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO   HUNT "
+            line_text(&title_bar_left_line(&app, 68, slot_test_now())),
+            "[E ▮▮▯▯▯▯ 06s │ TX:-] | N0CALL | 14.074 20M | FT8  TX: FULL   HUNT "
         );
     }
 
@@ -3573,8 +4102,11 @@ mod view_render_tests {
     async fn title_bar_is_unchanged_when_everything_fits() {
         let mut app = default_app().await;
         let legacy =
-            "Pancetta TUI | N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms ";
+            " | Pancetta TUI | N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO ";
         let check = |row: &str, prefix: &str| {
+            assert!(has_slot_clock(row));
+            let after_slot: String = row.chars().skip(21).collect();
+            let row = after_slot.as_str();
             assert!(row.starts_with(prefix), "[{row}] !starts_with [{prefix}]");
             let rest: String = row.chars().skip(prefix.chars().count()).collect();
             let rest = rest.trim_start();
@@ -3582,18 +4114,19 @@ mod view_render_tests {
             assert!(ends_with_utc_clock(rest), "[{row}]");
         };
 
-        let buf = render_app(&app, 120, 40);
+        let buf = render_app(&app, 130, 40);
         check(&row_text(&buf, 0), legacy);
 
+        // Hunt adds its own chip, so the full row needs six more columns.
         app.active_view = crate::view::ActiveView::Hunt;
-        let buf = render_app(&app, 120, 40);
+        let buf = render_app(&app, 136, 40);
         check(&row_text(&buf, 0), &format!("{legacy}  HUNT "));
 
         app.active_view = crate::view::ActiveView::Operate;
         let buf = render_app(&app, 160, 40);
         check(
             &row_text(&buf, 0),
-            "Pancetta TUI | N0CALL | FN20 (United States) | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms",
+            " | Pancetta TUI | N0CALL | FN20 (United States) | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO",
         );
     }
 

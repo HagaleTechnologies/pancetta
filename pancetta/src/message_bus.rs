@@ -596,6 +596,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the correlation key for per-QSO upload state
+    /// (PAN-344). Internal only; never added to any external message.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed"). NOT the full
