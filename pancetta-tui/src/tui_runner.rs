@@ -588,7 +588,8 @@ pub enum TuiCommand {
     /// answering callers; Disabled is a hard RX-only mute.
     CycleTxPolicy,
     /// Operator pressed Shift+M: cycle the station-wide operating mode
-    /// FT8 → FT4 → FT2 → FT8. Unlike `CycleTxPolicy` this can be REFUSED
+    /// FT8 → FT4 → FT8 (FT8 → FT4 → FT2 → FT8 with the `ft2` feature).
+    /// Unlike `CycleTxPolicy` this can be REFUSED
     /// (a QSO is active) — the coordinator relay does not optimistically
     /// flip anything locally; it waits for either a `ModeUpdate` (success)
     /// or a `StatusUpdate` (refusal) echo.
