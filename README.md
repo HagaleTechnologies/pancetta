@@ -140,10 +140,9 @@ the station:
 
 - **Hunting.** The needed-DXCC feed from cqdx.io flows straight into the
   priority scorer, so DX Hunter weighs decoded CQs by what you actually
-  still need — not just what's loudest. Matching is prefix-based, so a
-  needed entity represented by a short/overlapping prefix can occasionally
-  mismatch (e.g. a needed `K` entry can false-match `KH6`/`KL7`/`KP4`);
-  treat rankings as a strong hint, not a guarantee. Needed-grid is wired on
+  still need. Matching uses ADIF DXCC entity IDs, so alternate prefixes share the
+  right needed status and US dependencies remain separate. Unknown API IDs
+  retain a prefix fallback for compatibility. Needed-grid is wired on
   the Pancetta side but has no live cqdx.io endpoint yet, so it doesn't
   affect rankings today. DX Hunter marks a station needed (`+`) only once
   cqdx.io's needed list has loaded. Without cqdx.io, or while it is

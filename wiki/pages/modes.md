@@ -33,7 +33,10 @@ periods, band dial tables, and offset regions are normative in the code and
   `_with_period` variants; `derive_dsp_timing` maps a `ProtocolParams` to
   window/decode-phase/overlap/slot values threaded into `dsp.rs` and the parity
   stamping in `ft8.rs`.
-- **Runtime switch** — `try_switch_operating_mode` is the single gate; it
+- **Runtime switch** — Shift+M cycles FT8 → FT4 → FT8 by default. Builds
+  with the experimental `ft2` feature cycle FT8 → FT4 → FT2 → FT8.
+  `next_operating_mode` selects only compiled-in modes;
+  `try_switch_operating_mode` is the single gate; it
   refuses while any QSO is active (synchronous lock, zero `.await` in the
   critical section) and only then mutates the shared protocol + timing atomics.
 - **Hound** — a manual `Tx≠Rx` procedure flagged by `QsoMetadata.hound`; mode

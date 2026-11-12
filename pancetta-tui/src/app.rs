@@ -788,7 +788,7 @@ pub struct FreqModalState {
 
 /// State for the `o`-key TX-audio-offset modal: a single integer Hz field.
 ///
-/// Valid range: 300–2700 Hz (matching `pancetta_qso::TX_OFFSET_{MIN,MAX}_HZ`).
+/// Valid range: 200–2800 Hz (the allocator default range).
 /// Blank entry on Enter clears the held offset (→ Auto). Out-of-range input is
 /// rejected with a status message.
 #[derive(Debug, Clone, Default)]
@@ -809,18 +809,17 @@ pub fn parse_hz(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
 }
 
-/// Valid TX audio offset range (inclusive), in Hz.
-///
-/// Must match `pancetta_qso::TX_OFFSET_MIN_HZ` / `TX_OFFSET_MAX_HZ`
-/// (300.0 / 2700.0) — the coordinator clamps to those bounds via
-/// `deconflict_offset`, so accepting values outside them would cause the
-/// status chip to display an offset that is silently clamped on use.
-pub const TX_OFFSET_MIN_HZ: u64 = 300;
-/// Valid TX audio offset range (inclusive), in Hz.
-///
-/// Must match `pancetta_qso::TX_OFFSET_MAX_HZ` (2700.0). See
-/// [`TX_OFFSET_MIN_HZ`] for the rationale.
-pub const TX_OFFSET_MAX_HZ: u64 = 2700;
+/// Operator TX audio offset floor, in Hz. Kept public for compatibility.
+/// Parity-tested against the allocator default range used by the UI.
+pub const TX_OFFSET_MIN_HZ: u64 = 200;
+/// Operator TX audio offset ceiling, in Hz.
+pub const TX_OFFSET_MAX_HZ: u64 = 2800;
+
+/// Effective operator bounds share the allocator's default candidate range.
+pub(crate) fn operator_tx_offset_range() -> (u64, u64) {
+    let (lo, hi) = pancetta_qso::frequency::FrequencyAllocatorConfig::default().range;
+    (lo as u64, hi as u64)
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {

@@ -26,7 +26,7 @@ async fn test_startup_flow_entities_and_needed() {
                     "rarityRank": 300, "rarityTier": "common", "isDeleted": false
                 },
                 {
-                    "adifNumber": 327, "entityName": "Bouvet Island", "prefix": "3Y/B",
+                    "adifNumber": 24, "entityName": "Bouvet Island", "prefix": "3Y/B",
                     "continent": "AF", "cqZone": 38, "ituZone": 67,
                     "rarityRank": 1, "rarityTier": "legendary", "isDeleted": false
                 }
@@ -39,7 +39,7 @@ async fn test_startup_flow_entities_and_needed() {
         .and(path("/api/v1/entities/needed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "needed": [
-                { "entityId": 327, "name": "Bouvet Island", "prefix": "3Y/B" }
+                { "entityId": 24, "name": "Bouvet Island", "prefix": "3Y/B" }
             ]
         })))
         .mount(&server)
@@ -58,7 +58,7 @@ async fn test_startup_flow_entities_and_needed() {
     assert_eq!(needed.len(), 1);
     cache.load_needed(needed);
 
-    assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(true));
+    assert_eq!(cache.is_needed_dxcc("3Y0J"), Some(true));
     assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false));
     assert_eq!(cache.is_needed_dxcc("JA1XYZ"), Some(false));
 }
@@ -77,7 +77,7 @@ async fn test_live_spot_poll_updates_rarity() {
                     "dxCall": "3Y0J",
                     "band": "20m",
                     "mode": "FT8",
-                    "dxDxcc": 327,
+                    "dxDxcc": 24,
                     "dxEntityName": "Bouvet Island",
                     "dxContinent": "AF",
                     "dxCqZone": 38,
@@ -175,12 +175,11 @@ async fn test_spot_and_qso_reporting() {
     client.report_qso(qso).await.unwrap();
 }
 
-/// Degraded mode: CqdxCache with no data returns conservative defaults
-/// (PAN-93: needed status is unknown, not "needed").
+/// Without API data, offline identity still works and needed stays unknown.
 #[test]
 fn test_degraded_mode_defaults() {
     let cache = CqdxCache::new();
-    assert_eq!(cache.resolve_entity("K1ABC"), None);
+    assert_eq!(cache.resolve_entity("K1ABC"), Some(291));
     assert_eq!(cache.is_needed_dxcc("K1ABC"), None);
     assert!((cache.rarity("K1ABC") - 0.5).abs() < f64::EPSILON);
     assert!(cache.spot_groups().is_empty());

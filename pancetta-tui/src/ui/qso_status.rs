@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{create_panel_block, format_time_ago};
+use super::{create_panel_block, format_time_ago, get_snr_color};
 use crate::app::{ActivePanel, App};
 
 /// Resolve a DX station's DXCC entity name for display: when the partner has
@@ -58,14 +58,31 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         // both via `Paragraph`'s top-down truncation. Mirrors `queued_height`
         // just below.
         let tx_rx_height = tx_rx_status_height(app.qso_status());
+        let inner = block.inner(area);
+        // Keep every fixed section intact. Short panels use complete lines.
+        let qso = app.qso_status();
+        let info_height = 3 + u16::from(qso.max_calls > 0);
+        let ladder_height = if qso.active && !qso.ladder_labels.is_empty() {
+            2
+        } else {
+            1
+        };
+        let timing_height = if qso.active { 1 } else { 2 };
+        let full_height =
+            info_height + ladder_height + tx_rx_height + 2 + timing_height + 1 + queued_height + 1;
+        if inner.height < full_height || inner.width == 0 {
+            f.render_widget(block, area);
+            render_compact_qso(f, inner, app);
+            return Ok(());
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),             // QSO info
-                Constraint::Length(3),             // Sequence ladder + Now/Next
+                Constraint::Length(info_height),   // QSO info + optional watchdog
+                Constraint::Length(ladder_height), // Sequence ladder + Now/Next
                 Constraint::Length(tx_rx_height), // TX/RX status (+ DX activity and/or drift candidate)
                 Constraint::Length(2),            // SNR meters
-                Constraint::Min(1),               // Progress/timing
+                Constraint::Min(timing_height),   // Progress/timing
                 Constraint::Length(1),            // Last-10-QSOs history (#165)
                 Constraint::Length(queued_height), // Queued calls (0 when empty)
                 Constraint::Length(1),            // Control hint
@@ -87,6 +104,104 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Admit complete rows by importance, then draw them in reading order.
+fn compact_rows(height: u16, queued: bool) -> Vec<usize> {
+    let mut rows: Vec<_> = [0, 1, 2, 6, 7, 3, 4, 5]
+        .into_iter()
+        .filter(|row| *row != 6 || queued)
+        .take(height as usize)
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+fn snr_label(snr: Option<i32>) -> String {
+    snr.map_or_else(|| "—".to_string(), |value| format!("{value:+} dB"))
+}
+
+fn snr_style(snr: Option<i32>, app: &App) -> Style {
+    Style::default().fg(snr.map_or_else(
+        || app.theme.muted_color(),
+        |value| get_snr_color(value, &app.theme),
+    ))
+}
+
+fn render_compact_qso(f: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let qso = app.qso_status();
+    for (index, row) in compact_rows(area.height, !app.pending_calls.is_empty())
+        .into_iter()
+        .enumerate()
+    {
+        let target = Rect::new(area.x, area.y + index as u16, area.width, 1);
+        let line = match row {
+            0 => Line::from(format!(
+                "Status: {}  Call: {}",
+                if qso.active { "ACTIVE QSO" } else { "STANDBY" },
+                qso.call_sign.as_deref().unwrap_or("---")
+            )),
+            1 => Line::from(format_direction_line(
+                "TX",
+                qso.last_tx_text.as_deref(),
+                qso.last_tx,
+            )),
+            2 => Line::from(format_direction_line(
+                "RX",
+                qso.last_rx_text.as_deref(),
+                qso.last_rx,
+            )),
+            3 => Line::from(vec![
+                Span::raw("TX SNR: "),
+                Span::styled(snr_label(qso.snr_tx), snr_style(qso.snr_tx, app)),
+                Span::raw("  RX SNR: "),
+                Span::styled(snr_label(qso.snr_rx), snr_style(qso.snr_rx, app)),
+            ]),
+            4 => {
+                if let Some(item) =
+                    live_tx_for_qso(app.tx_now_sending.as_ref(), qso.qso_id.as_deref())
+                {
+                    Line::from(Span::styled(
+                        format!("NOW: TX {} @{:.0}Hz", item.text, item.freq_hz),
+                        Style::default().fg(app.theme.error_color()),
+                    ))
+                } else {
+                    Line::from(format!(
+                        "NOW: {}",
+                        if qso.now_line.is_empty() {
+                            "---"
+                        } else {
+                            &qso.now_line
+                        }
+                    ))
+                }
+            }
+            5 => Line::from(format!(
+                "NEXT: {}",
+                if qso.next_line.is_empty() {
+                    "---"
+                } else {
+                    &qso.next_line
+                }
+            )),
+            6 => {
+                render_queued_calls(f, target, app);
+                continue;
+            }
+            7 => {
+                render_control_hint(f, target, app);
+                continue;
+            }
+            _ => unreachable!(),
+        };
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().fg(app.theme.foreground_color())),
+            target,
+        );
+    }
 }
 
 fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -771,29 +886,25 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // TX SNR Gauge
-    let tx_snr = qso.snr_tx.unwrap_or(-50);
-    let tx_ratio = ((tx_snr + 50) as f64 / 80.0).clamp(0.0, 1.0); // Map -50 to +30 dB to 0-1
-
-    let tx_gauge = Gauge::default()
-        .block(ratatui::widgets::Block::default().title("TX SNR"))
-        .gauge_style(Style::default().fg(get_snr_gauge_color(tx_snr, &app.theme)))
-        .ratio(tx_ratio)
-        .label(format!("{:+} dB", tx_snr));
-
-    f.render_widget(tx_gauge, chunks[0]);
-
-    // RX SNR Gauge
-    let rx_snr = qso.snr_rx.unwrap_or(-50);
-    let rx_ratio = ((rx_snr + 50) as f64 / 80.0).clamp(0.0, 1.0);
-
-    let rx_gauge = Gauge::default()
-        .block(ratatui::widgets::Block::default().title("RX SNR"))
-        .gauge_style(Style::default().fg(get_snr_gauge_color(rx_snr, &app.theme)))
-        .ratio(rx_ratio)
-        .label(format!("{:+} dB", rx_snr));
-
-    f.render_widget(rx_gauge, chunks[1]);
+    for (snr, title, target) in [
+        (qso.snr_tx, "TX SNR", chunks[0]),
+        (qso.snr_rx, "RX SNR", chunks[1]),
+    ] {
+        // Convert before arithmetic so even extreme i32 reports cannot overflow.
+        let ratio = snr.map_or(0.0, |value| {
+            ((f64::from(value) + 50.0) / 80.0).clamp(0.0, 1.0)
+        });
+        let style = snr_style(snr, app);
+        let gauge = Gauge::default()
+            .block(ratatui::widgets::Block::default().title(title))
+            .gauge_style(style)
+            .ratio(ratio)
+            .label(Span::styled(
+                snr_label(snr),
+                style.bg(app.theme.background_color()),
+            ));
+        f.render_widget(gauge, target);
+    }
 }
 
 fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -873,15 +984,6 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn get_snr_gauge_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
-    match snr {
-        snr if snr >= 10 => theme.success_color(),
-        snr if snr >= 0 => theme.warning_color(),
-        snr if snr >= -10 => theme.warning_color(),
-        _ => theme.error_color(),
-    }
-}
-
 fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::style::Color {
     match level {
         level if level > 0.8 => theme.error_color(), // Too loud
@@ -900,9 +1002,230 @@ mod tests {
         use crate::config::Theme;
         let theme = Theme::Dark;
 
-        assert_eq!(get_snr_gauge_color(15, &theme), theme.success_color());
-        assert_eq!(get_snr_gauge_color(5, &theme), theme.warning_color());
-        assert_eq!(get_snr_gauge_color(-15, &theme), theme.error_color());
+        assert_eq!(get_snr_color(15, &theme), theme.success_color());
+        assert_eq!(get_snr_color(5, &theme), theme.success_color());
+        assert_eq!(get_snr_color(-15, &theme), theme.error_color());
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn snr_reports_remain_optional_and_accept_extreme_measurements() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+            let mut app = App::new(crate::config::Config::default(), None)
+                .await
+                .unwrap();
+            app.theme = theme;
+            for active in [false, true] {
+                for (tx, rx) in [
+                    (None, None),
+                    (Some(-12), None),
+                    (None, Some(-7)),
+                    (Some(-50), Some(-50)),
+                    (Some(i32::MAX), Some(i32::MIN)),
+                ] {
+                    let qso = app.qso_status_mut();
+                    qso.active = active;
+                    qso.snr_tx = tx;
+                    qso.snr_rx = rx;
+                    let mut term = Terminal::new(TestBackend::new(80, 2)).unwrap();
+                    term.draw(|f| render_snr_meters(f, f.area(), &app)).unwrap();
+                    let buf = term.backend().buffer();
+                    let text = buffer_text(buf);
+                    for (value, x) in [(tx, 0), (rx, 40)] {
+                        let label = value.map_or_else(|| "—".to_string(), |v| format!("{v:+} dB"));
+                        let row: String = (x..x + 40).map(|col| buf[(col, 1)].symbol()).collect();
+                        assert!(row.contains(&label), "{text}");
+                        let label_start = row.find(&label).unwrap();
+                        let label_x = x + row[..label_start].chars().count() as u16;
+                        assert_eq!(buf[(label_x, 1)].fg, snr_style(value, &app).fg.unwrap());
+                        if value == Some(-50) {
+                            assert_eq!(buf[(label_x, 1)].fg, app.theme.error_color());
+                        }
+                        if value.is_none() {
+                            assert!(!row.contains('█'), "missing reports have zero fill");
+                            assert!(!row.contains("-50"));
+                            for col in x..x + 40 {
+                                assert_ne!(buf[(col, 1)].fg, app.theme.error_color());
+                                if buf[(col, 1)].symbol() == "—" {
+                                    assert_eq!(buf[(col, 1)].fg, app.theme.muted_color());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_qso_admits_complete_priority_lines_and_preserves_boundaries() {
+        use crate::app::PendingCallBanner;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let qso = app.qso_status_mut();
+        qso.active = true;
+        qso.call_sign = Some("JA1ABC".into());
+        qso.last_tx_text = Some("sent".into());
+        qso.last_rx_text = Some("heard".into());
+        qso.now_line = "waiting".into();
+        qso.next_line = "their report".into();
+        app.pending_calls.push(PendingCallBanner {
+            callsign: "D2UY".into(),
+            dx_parity: Some(pancetta_core::slot::SlotParity::Even),
+            waited_secs: 45,
+        });
+        for width in [32, 48, 80, 120] {
+            for height in 0..=20 {
+                let area = Rect::new(2, 2, width, height);
+                let mut term = Terminal::new(TestBackend::new(width + 4, 24)).unwrap();
+                term.draw(|f| {
+                    f.render_widget(
+                        Paragraph::new(vec![Line::from("!".repeat((width + 4) as usize)); 24]),
+                        f.area(),
+                    );
+                    render_qso_status(f, area, &app).unwrap();
+                })
+                .unwrap();
+                let buf = term.backend().buffer();
+                for y in 0..24 {
+                    for x in 0..width + 4 {
+                        if !area.contains((x, y).into()) {
+                            assert_eq!(buf[(x, y)].symbol(), "!");
+                        }
+                    }
+                }
+                if height >= 2 {
+                    for x in 3..width + 1 {
+                        assert_eq!(buf[(x, height + 1)].symbol(), "─");
+                    }
+                }
+                if width == 120 && (3..=10).contains(&height) {
+                    let text = buffer_text(buf);
+                    for (priority, expected) in [
+                        "Status: ACTIVE QSO  Call: JA1ABC",
+                        "TX: sent",
+                        "RX: heard",
+                        "Queued: D2UY",
+                        "[k] abort",
+                        "TX SNR: —  RX SNR: —",
+                        "NOW: waiting",
+                        "NEXT: their report",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        assert_eq!(
+                            text.contains(expected),
+                            priority < (height - 2) as usize,
+                            "{expected}: {text}"
+                        );
+                    }
+                }
+                if width >= 80 && height == 10 {
+                    let text = buffer_text(buf);
+                    for expected in [
+                        "Status: ACTIVE QSO  Call: JA1ABC",
+                        "TX: sent",
+                        "RX: heard",
+                        "TX SNR: —  RX SNR: —",
+                        "NOW: waiting",
+                        "NEXT: their report",
+                        "Queued: D2UY",
+                        "[k] abort",
+                    ] {
+                        assert!(text.contains(expected), "missing {expected}: {text}");
+                    }
+                }
+                if width >= 80 && height == 7 {
+                    let text = buffer_text(buf);
+                    assert!(text.contains("TX: sent"));
+                    assert!(text.contains("RX: heard"));
+                    assert!(text.contains("Queued: D2UY"));
+                    assert!(text.contains("[k] abort"));
+                    assert!(!text.contains("TX SNR:"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qso_height_matrix_covers_idle_optional_details_and_multi_qso() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        for state in 0..4 {
+            app.qso_statuses.clear();
+            if state > 0 {
+                let qso = app.qso_status_mut();
+                qso.active = true;
+                qso.call_sign = Some("JA1ABC".into());
+                qso.snr_tx = Some(-12);
+                qso.dx_last_activity = Some("CQ".into());
+                qso.pending_freq_drift_hz = Some(940.0);
+                qso.max_calls = 10;
+                qso.call_count = 4;
+            }
+            if state == 3 {
+                let mut second = app.qso_status().clone();
+                second.call_sign = Some("D2UY".into());
+                app.qso_statuses.push(second);
+            }
+            for width in [0, 32, 48, 80, 120] {
+                for height in 0..=20 {
+                    let area = Rect::new(2, 2, width, height);
+                    let mut term = Terminal::new(TestBackend::new(width + 4, 24)).unwrap();
+                    term.draw(|f| {
+                        f.render_widget(
+                            Paragraph::new(vec![Line::from("!".repeat((width + 4) as usize)); 24]),
+                            f.area(),
+                        );
+                        render_qso_status(f, area, &app).unwrap();
+                    })
+                    .unwrap();
+                    let buf = term.backend().buffer();
+                    for y in 0..24 {
+                        for x in 0..width + 4 {
+                            if !area.contains((x, y).into()) {
+                                assert_eq!(buf[(x, y)].symbol(), "!");
+                            }
+                        }
+                    }
+                    if width >= 80 && height == 20 {
+                        let text = buffer_text(buf);
+                        match state {
+                            0 => {
+                                assert!(text.contains("STANDBY"));
+                                assert!(!text.contains("-50 dB"));
+                            }
+                            1 | 2 => {
+                                assert!(text.contains("DX: CQ"));
+                                assert!(text.contains("940"));
+                                assert!(text.contains("Call 4/10"));
+                            }
+                            3 => {
+                                assert!(text.contains("JA1ABC"));
+                                assert!(text.contains("D2UY"));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Batch 2 #1: the watchdog line reads "Call N/M · stops M:SS" while

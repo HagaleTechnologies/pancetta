@@ -17,8 +17,8 @@ links:
   - tui
 ---
 The offline callsign to DXCC entity resolver is `pancetta_core::dxcc`
-(PAN-284). It probes a prefix index, not a scan, and its answers must stay
-identical to the old linear scan; a test keeps that scan as an oracle.
+(PAN-284). Its prefix index answers match the old linear scan. Exact-call
+and KG4 layers take precedence (PAN-346).
 
 ## Never resolve inside a frame
 
@@ -50,3 +50,21 @@ need no code change.
 The lookup uppercases with `to_uppercase`, not `to_ascii_uppercase` (`ß`
 becomes `SS`), resolves FT8 hash-renders (`<N7RLK>`) first, and slices with
 `str::get` so a non-ASCII first character cannot panic.
+
+## Identity and exact rules (PAN-346)
+
+The registry maps primary prefixes and names to explicit ADIF IDs. European
+and Asiatic Turkey share 390; African Italy, Sicily and Italy share 248;
+Shetland and Scotland share 279; Bear Island and Svalbard share 259;
+Vienna Intl Ctr and Austria share 206. Display names remain separate.
+
+Full normalized exact calls win over the KG4 rule and prefix layer, including
+slash exact calls. Bare KG4 and KG4 plus two ASCII letters are Guantanamo;
+other nonempty KG4 suffixes are USA. The rule examines the leading component
+before /P. No hypothetical KG4AB override is added to production data.
+
+The pinned cty input, explicit primary-prefix ID map and ADIF enumeration
+live under pancetta-core/data. Regenerate registry and exact output with
+`python3 pancetta-core/scripts/gen_dxcc_table.py --supplemental`. This leaves
+the base prefix table unchanged.
+Generated headers record the input version and SHA-256.
