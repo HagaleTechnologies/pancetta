@@ -18,11 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
-=======
 - PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.
->>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
 - Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.
 - Legacy QSO migration keeps a backup and refuses unreadable rows instead of writing a partial logbook.
