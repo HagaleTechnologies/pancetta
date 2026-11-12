@@ -118,7 +118,14 @@ pub enum TuiMessage {
     /// DX spot
     DxSpot {
         callsign: String,
+        /// Spot frequency in Hz.
         frequency: u64,
+        /// Mode parsed from the cluster spot comment; `None` when unknown
+        /// (PAN-345). Shown as `Unknown`, never assumed FT8.
+        mode: Option<pancetta_core::Mode>,
+        /// Band derived from `frequency` by the shared band table; `None`
+        /// outside it (PAN-345).
+        band: Option<pancetta_core::Band>,
         spotter: String,
         /// Worked-before flag computed by the coordinator relay against
         /// the same CachedStationLookup the autonomous scorer uses
@@ -180,6 +187,11 @@ pub enum TuiMessage {
     /// appended to `App`'s own bounded ring (`App::recent_qsos`), separate
     /// from `diagnostic_events`.
     RecentQsoOutcome(crate::app::RecentQsoOutcome),
+    /// PAN-344: full bounded snapshot of per-QSO upload statuses, relayed on
+    /// the coordinator's existing 2 s health tick. Sent repeatedly so
+    /// correctness never relies on an individual best-effort transition;
+    /// merged by UUID and revision in `App::apply_qso_upload_statuses`.
+    QsoUploadStatuses(Vec<crate::upload_status::QsoUploadStatus>),
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate {
         rows: Vec<Vec<f32>>,
@@ -264,9 +276,8 @@ pub enum TuiMessage {
     /// Authoritative decode-effort echo (decoder-speed-overhaul Task 15).
     /// Sent by the coordinator relay both once at startup (so the chip is
     /// correct from frame 1) and after every `CycleDecodeEffort` (operator
-    /// `e`). Drives the "DECODE: <PRESET> <ms>ms" title-bar chip; the
-    /// elapsed/exhausted half of that chip comes from `PipelineHealth`
-    /// separately.
+    /// `e`). Drives the "DECODE: <PRESET>" title-bar chip; the
+    /// elapsed time and budget exhaustion appear in Shift+S station health.
     DecodeEffortUpdate {
         /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
         /// "AUTO").
@@ -889,17 +900,21 @@ impl TuiRunner {
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
+                mode,
+                band,
                 spotter: _,
                 worked_before,
                 needed,
                 atno,
                 band_needed,
             } => {
-                // For now use FT8 as default mode
+                // PAN-345: the cluster's parsed mode, `Unknown` when the
+                // comment named none; the band the coordinator derived.
                 app.add_dx_spot(
                     callsign,
                     frequency as f64,
-                    "FT8".to_string(),
+                    band,
+                    mode.map_or_else(|| "Unknown".to_string(), |m| m.to_string()),
                     0,
                     worked_before,
                     needed,
@@ -1121,6 +1136,9 @@ impl TuiRunner {
             }
             TuiMessage::RecentQsoOutcome(outcome) => {
                 app.push_recent_qso_outcome(outcome);
+            }
+            TuiMessage::QsoUploadStatuses(statuses) => {
+                app.apply_qso_upload_statuses(statuses, chrono::Utc::now());
             }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
@@ -3351,6 +3369,49 @@ mod key_tests {
         assert_eq!(app.read().await.contest_score.as_ref(), Some(&recovered));
     }
 
+    #[tokio::test]
+    async fn cluster_spot_message_preserves_mode_and_band() {
+        // PAN-345: the cluster's parsed mode and the coordinator's band reach
+        // the row through the real handler; CW stays CW and an unknown mode
+        // is `Unknown`, never FT8.
+        let (mut runner, _, app) = make_runner().await;
+        for (call, mode, band, shown) in [
+            (
+                "JA1FT8",
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+                "FT8",
+            ),
+            (
+                "JA1CW",
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+                "CW",
+            ),
+            ("JA1UNK", None, None, "Unknown"),
+        ] {
+            runner
+                .handle_message(TuiMessage::DxSpot {
+                    callsign: call.to_string(),
+                    frequency: 14_074_000,
+                    mode,
+                    band,
+                    spotter: "W1ABC".to_string(),
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    band_needed: false,
+                })
+                .await
+                .unwrap();
+            let app = app.read().await;
+            let row = &app.dx_stations[call];
+            assert_eq!(row.mode, shown, "{call}");
+            assert_eq!(row.band, band, "{call}");
+            assert_eq!(row.frequency, 14_074_000.0, "{call}: Hz kept unchanged");
+        }
+    }
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
@@ -3415,6 +3476,7 @@ mod key_tests {
             app.add_dx_spot(
                 "W5ABC".into(),
                 14.074,
+                None,
                 "FT8".into(),
                 -10,
                 false,
@@ -4117,6 +4179,7 @@ mod key_tests {
             call_sign: "VK9XX".to_string(),
             grid_square: Some("QH30".to_string()),
             frequency: 14.074,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -10,
@@ -5581,6 +5644,7 @@ mod key_tests {
 
         r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -5595,6 +5659,7 @@ mod key_tests {
         for i in 0..60 {
             r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
                 callsign: format!("N{i}TEST"),
+                qso_uuid: format!("u-{i}"),
                 outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
                 last_state: "Failed".to_string(),
                 freq_hz: 1500,
@@ -5612,6 +5677,166 @@ mod key_tests {
             recent.recent_qsos.len()
         );
         assert!(!recent.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
+    }
+
+    /// PAN-344 AC8: upload snapshots feed the toast without touching the
+    /// session counters or the readiness strip, and ordinary status updates
+    /// cannot erase the toast (only compose input outranks it).
+    #[tokio::test]
+    async fn pan344_upload_updates_preserve_counters_and_readiness() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
+            qso_id: Some("u-1".into()),
+            callsign: Some("K1ABC".to_string()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.read().await.session_completed, 1);
+
+        r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["QSO with K1ABC logged".to_string()],
+        }))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(
+                a.active_toast_text(chrono::Utc::now()).as_deref(),
+                Some("K1ABC logged \u{b7} uploads queued")
+            );
+        }
+
+        // An ordinary status update must not erase the typed toast.
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "dsp".into(),
+            status: "decoding".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read()
+                .await
+                .active_toast_text(chrono::Utc::now())
+                .as_deref(),
+            Some("K1ABC logged \u{b7} uploads queued")
+        );
+
+        // A readiness snapshot stays untouched by upload updates.
+        let readiness_before = app.read().await.station_readiness.clone();
+
+        let accepted = crate::upload_status::QsoUploadStatus {
+            uuid: "u-1".to_string(),
+            callsign: "K1ABC".to_string(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::new(
+                    crate::upload_status::UploadState::Accepted,
+                    "accepted",
+                ),
+            )],
+        };
+        r.handle_message(TuiMessage::QsoUploadStatuses(vec![accepted]))
+            .await
+            .unwrap();
+
+        let a = app.read().await;
+        assert_eq!(
+            a.active_toast_text(chrono::Utc::now()).as_deref(),
+            Some("K1ABC uploaded"),
+            "all-accepted transitions the toast in place"
+        );
+        assert_eq!(
+            a.session_completed, 1,
+            "upload updates never count as completions"
+        );
+        assert_eq!(
+            a.station_readiness, readiness_before,
+            "upload updates never remove readiness warnings"
+        );
+    }
+
+    /// PAN-344 AC7: scrolling the Recent-QSOs selection moves only the
+    /// overlay cursor — the live station focus is untouched, and closing
+    /// the overlay leaves it alone too.
+    #[tokio::test]
+    async fn pan344_recent_selection_leaves_live_focus_unchanged() {
+        use crate::app::DecodedMessageView;
+        use pancetta_core::slot::SlotParity;
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.decoded_messages.push_back(DecodedMessageView {
+                timestamp: chrono::Utc::now(),
+                frequency: 14.074,
+                mode: "FT8".to_string(),
+                snr: -3,
+                delta_time: 0.0,
+                delta_freq: 1500.0,
+                call_sign: Some("JA1ABC".to_string()),
+                grid_square: Some("FN42".to_string()),
+                message: "CQ JA1ABC FN42".to_string(),
+                distance: Some(1234.0),
+                bearing: None,
+                slot_parity: Some(SlotParity::Even),
+                is_directed_at_us: false,
+                worked_before: false,
+                needed: false,
+                atno: false,
+                band_needed: false,
+                priority_score: None,
+                priority_factors: None,
+                is_own_tx: false,
+            });
+            for i in 0..2 {
+                a.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+                    callsign: format!("N{i}TEST"),
+                    qso_uuid: format!("u-{i}"),
+                    outcome: crate::app::QsoOutcome::Completed,
+                    last_state: "Completed".to_string(),
+                    freq_hz: 14075000,
+                    ts: chrono::Utc::now(),
+                    brief_timeline: vec!["Completed".to_string()],
+                });
+            }
+            a.show_recent_qsos = true;
+            a.recent_qsos_scroll = 1;
+        }
+        let focus_before = app.read().await.focused_callsign().clone();
+
+        r.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(a.recent_qsos_scroll, 0, "selection cursor moved up");
+            assert_eq!(a.focused_callsign(), focus_before, "live focus unchanged");
+        }
+
+        r.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(a.recent_qsos_scroll, 1);
+            assert_eq!(a.focused_callsign(), focus_before, "live focus unchanged");
+        }
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the
@@ -6717,6 +6942,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,
@@ -7435,6 +7661,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,
@@ -7492,6 +7719,7 @@ mod key_tests {
         a.add_dx_spot(
             call.to_string(),
             rf_hz,
+            pancetta_core::Band::from_frequency(rf_hz.round() as u64),
             "FT8".to_string(),
             0,
             false,

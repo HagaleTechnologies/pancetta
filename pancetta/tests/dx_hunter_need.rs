@@ -61,7 +61,9 @@ async fn add_rows(app: &mut App) {
 
 fn render(app: &mut App, cache: &CachedStationLookup) -> Buffer {
     app.refresh_dx_need(Some(cache));
-    let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    // 106 wide: PAN-345's six-cell Band column (five plus spacing) keeps the
+    // Entity column's slack what it was at 100 before Band existed.
+    let mut terminal = Terminal::new(TestBackend::new(106, 8)).unwrap();
     terminal
         .draw(|f| pancetta_tui::ui::dx_hunter::render_dx_hunter(f, f.area(), app).unwrap())
         .unwrap();
