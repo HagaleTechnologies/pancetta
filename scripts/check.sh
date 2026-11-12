@@ -146,6 +146,8 @@ run "pancetta-ft8 default build, all targets (check)" cargo check -p pancetta-ft
 
 if [[ "$FAST" -eq 0 ]]; then
     run "workspace tests"   cargo test --workspace --features transmit
+    run "real TX worker tests" cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
+    run "real TX worker clippy" cargo clippy -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
 fi
 
 # --- Supply-chain lane (~5 min on cold cache) ------------------------------

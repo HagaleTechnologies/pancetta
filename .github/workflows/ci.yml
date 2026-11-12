@@ -548,6 +548,12 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --exclude pancetta-research --features transmit
 
+      - name: Real TX worker integration tests
+        run: cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
+
+      - name: Real TX worker integration clippy
+        run: cargo clippy -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
+
       # PAN-284: one DXCC entity lookup must stay under 2 µs on the CI host.
       # CI builds no other bench; this one is an acceptance criterion. The rm
       # drops estimates restored from the rust-cache so only this run counts.

@@ -2,7 +2,7 @@ use crate::message_bus::ComponentId;
 use anyhow::{Context, Result};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// PAN-277: outer budget for shutdown's direct rigctld PTT-off. Fits
 /// `connect()`'s `f` verification plus `T 0`, each at the command timeout.
@@ -92,22 +92,32 @@ async fn join_or_abort(
     mut handle: tokio::task::JoinHandle<Result<()>>,
     budget: Duration,
 ) -> bool {
-    match tokio::time::timeout(budget, &mut handle).await {
-        Ok(Ok(Ok(()))) => true,
-        Ok(Ok(Err(e))) => {
-            warn!("Shutdown: {name} task ended with error: {e}");
-            true
-        }
-        Ok(Err(e)) => {
-            warn!("Shutdown: {name} task join error: {e}");
-            true
-        }
+    let result = tokio::time::timeout(budget, &mut handle).await;
+    let finished = log_component_result(name, &result);
+    if !finished {
+        handle.abort();
+        let _ = tokio::time::timeout(budget, handle).await;
+    }
+    finished
+}
+
+fn log_component_result(
+    name: &str,
+    result: &std::result::Result<
+        std::result::Result<Result<()>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> bool {
+    match result {
+        Ok(Ok(Ok(()))) => debug!("Shutdown: {name} task completed successfully"),
+        Ok(Ok(Err(e))) => error!("Shutdown: {name} task ended with error: {e:#}"),
+        Ok(Err(e)) => warn!("Shutdown: {name} task join error: {e}"),
         Err(_) => {
-            handle.abort();
-            let _ = tokio::time::timeout(budget, handle).await;
-            false
+            debug!("Shutdown: {name} task timed out; aborting");
+            return false;
         }
     }
+    true
 }
 
 impl super::ApplicationCoordinator {
@@ -271,29 +281,12 @@ impl super::ApplicationCoordinator {
 
         let per_task_timeout = Duration::from_secs(1);
 
-        for (index, (component_id, handle)) in std::mem::take(&mut self.named_task_handles)
-            .into_iter()
-            .enumerate()
-        {
+        for (component_id, handle) in std::mem::take(&mut self.named_task_handles) {
             // Abort timed-out tasks so their cleanup runs instead of detaching.
             let abort_handle = handle.abort_handle();
-            match tokio::time::timeout(per_task_timeout, handle).await {
-                Ok(Ok(_)) => {
-                    debug!("Task {} ({}) completed successfully", index, component_id);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Task {} ({}) completed with error: {}",
-                        index, component_id, e
-                    );
-                }
-                Err(_) => {
-                    debug!(
-                        "Task {} ({}) timed out — aborting so PttGuard / Drop can fire",
-                        index, component_id
-                    );
-                    abort_handle.abort();
-                }
+            let result = tokio::time::timeout(per_task_timeout, handle).await;
+            if !log_component_result(&component_id.to_string(), &result) {
+                abort_handle.abort();
             }
         }
 
@@ -328,8 +321,24 @@ impl super::ApplicationCoordinator {
 
         info!("Graceful shutdown completed");
 
-        sweep_result
+        shutdown_result(
+            self.tui_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            sweep_result,
+        )
     }
+}
+
+fn shutdown_result(tui_failure: Option<String>, sweep_result: Result<()>) -> Result<()> {
+    if let Some(cause) = tui_failure {
+        if let Err(e) = sweep_result {
+            error!("Receive-gain sweep also failed during shutdown: {e:#}");
+        }
+        anyhow::bail!("TUI failed: {cause}");
+    }
+    sweep_result
 }
 
 #[cfg(test)]
@@ -460,5 +469,150 @@ mod pan277_direct_ptt_off_tests {
             "Drop ran before join_or_abort returned"
         );
         assert!(started.elapsed() < Duration::from_millis(600));
+    }
+}
+
+#[cfg(test)]
+mod pan333_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan333_component_result_logging() {
+        for helper in [false, true] {
+            for case in 0..4 {
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                let capture = Capture(bytes.clone());
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || capture.clone())
+                    .finish();
+                let _subscriber = tracing::subscriber::set_default(subscriber);
+                let handle = tokio::spawn(async move {
+                    match case {
+                        0 => Ok(()),
+                        1 => Err(anyhow::anyhow!("simulated terminal failure")),
+                        2 => panic!("join failure"),
+                        _ => std::future::pending().await,
+                    }
+                });
+                let budget = Duration::from_millis(10);
+                let finished = if helper {
+                    join_or_abort("TUI", handle, budget).await
+                } else {
+                    let abort = handle.abort_handle();
+                    let result = tokio::time::timeout(budget, handle).await;
+                    let finished = log_component_result("TUI", &result);
+                    if !finished {
+                        abort.abort();
+                    }
+                    finished
+                };
+                assert_eq!(finished, case != 3);
+                let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+                match case {
+                    0 => assert!(output.contains("completed successfully"), "{output}"),
+                    1 => {
+                        assert!(output.contains("ERROR") && output.contains(
+                            "Shutdown: TUI task ended with error: simulated terminal failure"), "{output}");
+                        assert!(!output.contains("completed successfully"));
+                    }
+                    2 => assert!(output.contains("join error"), "{output}"),
+                    _ => assert!(output.contains("timed out"), "{output}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pan333_shutdown_error_precedence() {
+        assert!(shutdown_result(None, Ok(())).is_ok());
+        assert_eq!(
+            shutdown_result(None, Err(anyhow::anyhow!("sweep")))
+                .unwrap_err()
+                .to_string(),
+            "sweep"
+        );
+        for sweep in [Ok(()), Err(anyhow::anyhow!("sweep"))] {
+            assert_eq!(
+                shutdown_result(Some("terminal".into()), sweep)
+                    .unwrap_err()
+                    .to_string(),
+                "TUI failed: terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pan333_tui_failure_survives_handle_collection() {
+        for fail in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut config = pancetta_config::Config::default();
+            config.rig.interface.enabled = false;
+            let mut coordinator = super::super::ApplicationCoordinator::new(
+                config,
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+                1500.0,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Vec::new(),
+                home.path().join("pancetta.toml"),
+                true,
+                Some(home.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+            let failure = coordinator.tui_failure.clone();
+            let handle = tokio::spawn(async move {
+                let result = if fail {
+                    Err(anyhow::anyhow!("underlying").context("cause"))
+                } else {
+                    Ok(())
+                };
+                super::super::tui_relay::record_tui_failure(&failure, &result);
+                result
+            });
+            // Simulate the health monitor collecting the completed TUI handle.
+            assert_eq!(handle.await.unwrap().is_err(), fail);
+            let cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cleaned = cleanup.clone();
+            coordinator.named_task_handles.push((
+                ComponentId::Tui,
+                tokio::spawn(async move {
+                    cleaned.store(true, Ordering::Release);
+                    Ok(())
+                }),
+            ));
+            let result = coordinator.shutdown().await;
+            assert!(
+                cleanup.load(Ordering::Acquire),
+                "teardown must precede returned error"
+            );
+            if fail {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "TUI failed: cause: underlying"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
     }
 }
