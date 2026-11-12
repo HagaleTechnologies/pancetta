@@ -1770,7 +1770,9 @@ impl super::ApplicationCoordinator {
     /// `pancetta_hamlib::resolve_model`) and is passed as its own argv
     /// element — never concatenated into a shell string, and never the raw
     /// `rig.model` input. Host, TCP port, serial port and baud behavior are
-    /// unchanged from the inline construction this replaced.
+    /// unchanged from the inline construction this replaced. Stdout is
+    /// discarded; stderr is piped (PAN-332) so the managed spawn's
+    /// `drain_child_stderr_to_warn` reader can log it at WARN.
     pub(crate) fn rigctld_command(
         model_id: u32,
         serial_port: &str,
@@ -1793,7 +1795,7 @@ impl super::ApplicationCoordinator {
         ]);
         command
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         command
     }
 
@@ -2026,24 +2028,6 @@ impl super::ApplicationCoordinator {
                     rig_config.interface.baud_rate
                 );
 
-<<<<<<< HEAD
-                match std::process::Command::new("rigctld")
-                    .args([
-                        "-m",
-                        &model_id.to_string(),
-                        "-r",
-                        &rig_config.interface.port,
-                        "-s",
-                        &rig_config.interface.baud_rate.to_string(),
-                        "-t",
-                        &rigctld_port.to_string(),
-                        "-T",
-                        &rigctld_host,
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-=======
                 match Self::rigctld_command(
                     model_id,
                     &rig_config.interface.port,
@@ -2052,7 +2036,6 @@ impl super::ApplicationCoordinator {
                     rigctld_port,
                 )
                 .spawn()
->>>>>>> 36b53eaf1c2110292caa762ffa851c76784958f2
                 {
                     Ok(mut child) => {
                         info!("rigctld spawned (PID {})", child.id());
