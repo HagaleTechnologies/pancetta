@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-hamlib
 //!
 //! Hamlib CAT control over `rigctld` — frequency, mode, and PTT for the

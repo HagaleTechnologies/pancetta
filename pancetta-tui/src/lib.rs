@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-tui
 //!
 //! Terminal UI (ratatui) — 4 activity views (Operate/Hunt/Run/Monitor), the

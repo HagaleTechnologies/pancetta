@@ -1,3 +1,6 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Crate-level warn overrides command-line -D, so Clippy must also deny here.
+#![cfg_attr(clippy, deny(clippy::undocumented_unsafe_blocks))]
 //! # Pancetta - an FT8 station in one binary
 //!
 //! The main entry point: decoder, priority scoring, the QSO state machine,
