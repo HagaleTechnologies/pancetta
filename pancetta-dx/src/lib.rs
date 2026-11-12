@@ -39,7 +39,7 @@
 //!
 //! | Removed module           | Replacement                                      |
 //! |--------------------------|--------------------------------------------------|
-//! | `dxcc.rs`                | `pancetta_cqdx::CqdxCache::resolve_entity`       |
+//! | `dxcc.rs`                | `pancetta_core::dxcc::entity_for_callsign`       |
 //! | `priorities.rs`          | `pancetta_qso::priority::PriorityScorer`         |
 //! | `propagation.rs` / `_enhanced` | (deferred — future cqdx.io feature)        |
 //! | `statistics.rs`          | `pancetta_cqdx::CqdxCache` + per-band rolling    |

@@ -118,7 +118,14 @@ pub enum TuiMessage {
     /// DX spot
     DxSpot {
         callsign: String,
+        /// Spot frequency in Hz.
         frequency: u64,
+        /// Mode parsed from the cluster spot comment; `None` when unknown
+        /// (PAN-345). Shown as `Unknown`, never assumed FT8.
+        mode: Option<pancetta_core::Mode>,
+        /// Band derived from `frequency` by the shared band table; `None`
+        /// outside it (PAN-345).
+        band: Option<pancetta_core::Band>,
         spotter: String,
         /// Worked-before flag computed by the coordinator relay against
         /// the same CachedStationLookup the autonomous scorer uses
@@ -581,7 +588,8 @@ pub enum TuiCommand {
     /// answering callers; Disabled is a hard RX-only mute.
     CycleTxPolicy,
     /// Operator pressed Shift+M: cycle the station-wide operating mode
-    /// FT8 → FT4 → FT2 → FT8. Unlike `CycleTxPolicy` this can be REFUSED
+    /// FT8 → FT4 → FT8 (FT8 → FT4 → FT2 → FT8 with the `ft2` feature).
+    /// Unlike `CycleTxPolicy` this can be REFUSED
     /// (a QSO is active) — the coordinator relay does not optimistically
     /// flip anything locally; it waits for either a `ModeUpdate` (success)
     /// or a `StatusUpdate` (refusal) echo.
@@ -893,17 +901,21 @@ impl TuiRunner {
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
+                mode,
+                band,
                 spotter: _,
                 worked_before,
                 needed,
                 atno,
                 band_needed,
             } => {
-                // For now use FT8 as default mode
+                // PAN-345: the cluster's parsed mode, `Unknown` when the
+                // comment named none; the band the coordinator derived.
                 app.add_dx_spot(
                     callsign,
                     frequency as f64,
-                    "FT8".to_string(),
+                    band,
+                    mode.map_or_else(|| "Unknown".to_string(), |m| m.to_string()),
                     0,
                     worked_before,
                     needed,
@@ -1618,7 +1630,8 @@ impl TuiRunner {
                 } else {
                     match crate::app::parse_hz(&trimmed) {
                         Some(hz)
-                            if (crate::app::TX_OFFSET_MIN_HZ..=crate::app::TX_OFFSET_MAX_HZ)
+                            if (crate::app::operator_tx_offset_range().0
+                                ..=crate::app::operator_tx_offset_range().1)
                                 .contains(&hz) =>
                         {
                             app.offset_modal.visible = false;
@@ -1633,8 +1646,8 @@ impl TuiRunner {
                         _ => {
                             app.status_message = format!(
                                 "Invalid offset — enter {} to {} Hz (blank = Auto)",
-                                crate::app::TX_OFFSET_MIN_HZ,
-                                crate::app::TX_OFFSET_MAX_HZ
+                                crate::app::operator_tx_offset_range().0,
+                                crate::app::operator_tx_offset_range().1
                             );
                         }
                     }
@@ -1847,18 +1860,19 @@ impl TuiRunner {
                 }
             }
 
-            // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz. Clamped to
-            // 200–2900 Hz to match the modulator/passband and find_clear_offset
-            // — below 200 Hz multi-TX offsets go negative and single-TX
-            // silently encode-rejects (2900 Hz matches the TX-offset-hold
-            // modal, qso_manager::TX_OFFSET_MAX_HZ headroom, and the
-            // modulator's MAX_FREQUENCY_DEVIATION as of the 2026-07-05 fix).
+            // Operator offset steps use the same bounds as offset entry.
             Action::TxOffsetDown => {
-                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
+                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).clamp(
+                    crate::app::operator_tx_offset_range().0 as f64,
+                    crate::app::operator_tx_offset_range().1 as f64,
+                );
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
             Action::TxOffsetUp => {
-                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
+                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).clamp(
+                    crate::app::operator_tx_offset_range().0 as f64,
+                    crate::app::operator_tx_offset_range().1 as f64,
+                );
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
@@ -2274,7 +2288,7 @@ impl TuiRunner {
                 app.status_message = "Freq entry: dial MHz, Tab→split, Enter, Esc".to_string();
             }
             // `o` — open the TX-audio-offset modal. Prompts for an integer Hz
-            // value in [200, 2900]; blank Enter = clear (→ Auto). Mirrors the
+            // value in the operator range; blank Enter = clear (→ Auto). Mirrors the
             // Shift+F pattern but for audio offsets within the passband.
             Action::OpenWatchlistModal => {
                 app.watchlist_modal.buffer =
@@ -2291,8 +2305,11 @@ impl TuiRunner {
             Action::OpenOffsetModal => {
                 app.offset_modal.visible = true;
                 app.offset_modal.buffer.clear();
-                app.status_message =
-                    "TX offset: enter Hz (200–2900), blank=Auto, Enter, Esc".to_string();
+                app.status_message = format!(
+                    "TX offset: enter Hz ({}–{}), blank=Auto, Enter, Esc",
+                    crate::app::operator_tx_offset_range().0,
+                    crate::app::operator_tx_offset_range().1
+                );
             }
             Action::ToggleMonitoring => {
                 app.toggle_monitoring().await?;
@@ -3358,6 +3375,49 @@ mod key_tests {
         assert_eq!(app.read().await.contest_score.as_ref(), Some(&recovered));
     }
 
+    #[tokio::test]
+    async fn cluster_spot_message_preserves_mode_and_band() {
+        // PAN-345: the cluster's parsed mode and the coordinator's band reach
+        // the row through the real handler; CW stays CW and an unknown mode
+        // is `Unknown`, never FT8.
+        let (mut runner, _, app) = make_runner().await;
+        for (call, mode, band, shown) in [
+            (
+                "JA1FT8",
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+                "FT8",
+            ),
+            (
+                "JA1CW",
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+                "CW",
+            ),
+            ("JA1UNK", None, None, "Unknown"),
+        ] {
+            runner
+                .handle_message(TuiMessage::DxSpot {
+                    callsign: call.to_string(),
+                    frequency: 14_074_000,
+                    mode,
+                    band,
+                    spotter: "W1ABC".to_string(),
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    band_needed: false,
+                })
+                .await
+                .unwrap();
+            let app = app.read().await;
+            let row = &app.dx_stations[call];
+            assert_eq!(row.mode, shown, "{call}");
+            assert_eq!(row.band, band, "{call}");
+            assert_eq!(row.frequency, 14_074_000.0, "{call}: Hz kept unchanged");
+        }
+    }
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
@@ -3422,6 +3482,7 @@ mod key_tests {
             app.add_dx_spot(
                 "W5ABC".into(),
                 14.074,
+                None,
                 "FT8".into(),
                 -10,
                 false,
@@ -4124,6 +4185,7 @@ mod key_tests {
             call_sign: "VK9XX".to_string(),
             grid_square: Some("QH30".to_string()),
             frequency: 14.074,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -10,
@@ -5938,8 +6000,8 @@ mod key_tests {
 
     // === UX audit Batch 3 ===========================================
 
-    /// The TX offset clamp matches the modulator/passband (200–2900 Hz):
-    /// hammering `[` never goes below 200, hammering `]` never exceeds 2900.
+    /// The TX offset clamp matches the allocator default range (200–2800 Hz):
+    /// hammering `[` never goes below 200, hammering `]` never exceeds 2800.
     #[tokio::test]
     async fn tx_offset_clamps_to_modulator_passband() {
         let (mut r, _cmd_rx, app) = make_runner().await;
@@ -5958,8 +6020,8 @@ mod key_tests {
         }
         assert_eq!(
             app.read().await.tx_frequency_offset,
-            2900.0,
-            "TX offset must clamp at the 2900 Hz ceiling"
+            2800.0,
+            "TX offset must clamp at the 2800 Hz ceiling"
         );
     }
 
@@ -6886,6 +6948,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,
@@ -7086,7 +7149,7 @@ mod key_tests {
     async fn offset_modal_out_of_range_rejected() {
         let (mut r, cmd_rx, app) = make_runner().await;
         r.handle_key_event(key('o')).await.unwrap();
-        // Type "100" (below minimum 300).
+        // Type "100" (below minimum 200).
         for c in "100".chars() {
             r.handle_key_event(key(c)).await.unwrap();
         }
@@ -7106,27 +7169,52 @@ mod key_tests {
         );
     }
 
-    /// Values in the old range [200, 299] and [2701, 2900] are now rejected
-    /// because they fall outside the coordinator's clamp range [300, 2700].
     #[tokio::test]
-    async fn offset_modal_old_range_boundary_rejected() {
-        // 200 was valid under the old 200-2900 bounds but must now be rejected.
-        let (mut r, cmd_rx, app) = make_runner().await;
-        r.handle_key_event(key('o')).await.unwrap();
-        for c in "200".chars() {
-            r.handle_key_event(key(c)).await.unwrap();
+    async fn offset_modal_operator_boundaries() {
+        for input in ["200", "2800", "199", "2801", "abc", "18446744073709551616"] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            r.handle_key_event(key('o')).await.unwrap();
+            assert!(app.read().await.status_message.contains("200–2800"));
+            app.write().await.offset_modal.buffer = input.to_string();
+            r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            let a = app.read().await;
+            if let Ok(hz @ (200 | 2800)) = input.parse::<u64>() {
+                assert!(!a.offset_modal.visible);
+                assert_eq!(a.status_message, format!("TX offset held @ {hz} Hz"));
+                assert!(
+                    matches!(cmd_rx.try_recv(), Ok(TuiCommand::SetTxOffset { offset_hz: Some(v) }) if v == hz)
+                );
+            } else {
+                assert!(a.offset_modal.visible);
+                assert_eq!(
+                    a.status_message,
+                    "Invalid offset — enter 200 to 2800 Hz (blank = Auto)"
+                );
+                assert!(cmd_rx.try_recv().is_err());
+            }
         }
-        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        let a = app.read().await;
-        assert!(
-            a.offset_modal.visible,
-            "200 Hz is below new minimum 300 — modal stays open"
-        );
-        assert!(a.status_message.contains("Invalid"), "status says invalid");
-        drop(a);
-        assert!(cmd_rx.try_recv().is_err(), "no command emitted");
+    }
+
+    #[tokio::test]
+    async fn offset_arrows_clamp_both_ends_and_keep_commands_local() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        for (start, key_char, expected) in [
+            (200.0, '[', 200.0),
+            (200.0, ']', 250.0),
+            (2800.0, ']', 2800.0),
+            (2800.0, '[', 2750.0),
+            (0.0, ']', 200.0),
+            (0.0, '[', 200.0),
+            (3000.0, ']', 2800.0),
+            (3000.0, '[', 2800.0),
+        ] {
+            app.write().await.tx_frequency_offset = start;
+            r.handle_key_event(key(key_char)).await.unwrap();
+            assert_eq!(app.read().await.tx_frequency_offset, expected);
+            assert!(cmd_rx.try_recv().is_err());
+        }
     }
 
     /// Blank entry on Enter emits `SetTxOffset{None}` (→ Auto) and closes.
@@ -7296,7 +7384,7 @@ mod key_tests {
         );
         assert_eq!(
             a.tx_frequency_offset,
-            (before + 50.0).min(2900.0),
+            (before + 50.0).min(2800.0),
             "Right still nudges TX offset on Band Activity"
         );
         drop(a);
@@ -7604,6 +7692,7 @@ mod key_tests {
                     call_sign: "VK9XX".to_string(),
                     grid_square: Some("QH30".to_string()),
                     frequency: 14.074,
+                    band: None,
                     mode: "FT8".to_string(),
                     last_seen: Utc::now(),
                     snr: -10,
@@ -7661,6 +7750,7 @@ mod key_tests {
         a.add_dx_spot(
             call.to_string(),
             rf_hz,
+            pancetta_core::Band::from_frequency(rf_hz.round() as u64),
             "FT8".to_string(),
             0,
             false,

@@ -140,10 +140,9 @@ the station:
 
 - **Hunting.** The needed-DXCC feed from cqdx.io flows straight into the
   priority scorer, so DX Hunter weighs decoded CQs by what you actually
-  still need — not just what's loudest. Matching is prefix-based, so a
-  needed entity represented by a short/overlapping prefix can occasionally
-  mismatch (e.g. a needed `K` entry can false-match `KH6`/`KL7`/`KP4`);
-  treat rankings as a strong hint, not a guarantee. Needed-grid is wired on
+  still need. Matching uses ADIF DXCC entity IDs, so alternate prefixes share the
+  right needed status and US dependencies remain separate. Unknown API IDs
+  retain a prefix fallback for compatibility. Needed-grid is wired on
   the Pancetta side but has no live cqdx.io endpoint yet, so it doesn't
   affect rankings today. DX Hunter marks a station needed (`+`) only once
   cqdx.io's needed list has loaded. Without cqdx.io, or while it is
@@ -327,7 +326,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
 | PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
-| DX cluster | Integration-tested | Local mock server only | [cluster client](pancetta-dx/src/cluster.rs) |
+| DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |

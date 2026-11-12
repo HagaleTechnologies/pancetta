@@ -480,7 +480,16 @@ pub enum RankOrigin {
 pub struct DxStation {
     pub call_sign: String,
     pub grid_square: Option<String>,
+    /// Source-dependent unit: MHz for local decodes and cqdx spots, Hz for
+    /// DX-cluster spots. Read [`DxStation::band`] for the band instead of
+    /// guessing it from this value's magnitude (PAN-345).
     pub frequency: f64,
+    /// Band of `frequency`, derived at each source boundary from that
+    /// source's own unit through `pancetta_core::Band::from_frequency`:
+    /// cluster Hz, cqdx `frequency_hz`, local decode MHz × 1,000,000. `None`
+    /// when the frequency is outside every band. Refreshed whenever
+    /// `frequency` changes (PAN-345).
+    pub band: Option<pancetta_core::Band>,
     pub mode: String,
     pub last_seen: DateTime<Utc>,
     pub snr: i32,
@@ -598,6 +607,17 @@ impl DxStation {
             at,
         )
     }
+}
+
+/// Band of a local decode's dial frequency, which the decoded view carries
+/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
+/// out-of-band value has no band.
+fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+    let hz = (mhz * 1_000_000.0).round();
+    if !hz.is_finite() || hz <= 0.0 {
+        return None;
+    }
+    pancetta_core::Band::from_frequency(hz as u64)
 }
 
 /// Exact station identity for worked status: a resolved hash render matches
@@ -768,7 +788,7 @@ pub struct FreqModalState {
 
 /// State for the `o`-key TX-audio-offset modal: a single integer Hz field.
 ///
-/// Valid range: 300–2700 Hz (matching `pancetta_qso::TX_OFFSET_{MIN,MAX}_HZ`).
+/// Valid range: 200–2800 Hz (the allocator default range).
 /// Blank entry on Enter clears the held offset (→ Auto). Out-of-range input is
 /// rejected with a status message.
 #[derive(Debug, Clone, Default)]
@@ -789,18 +809,17 @@ pub fn parse_hz(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
 }
 
-/// Valid TX audio offset range (inclusive), in Hz.
-///
-/// Must match `pancetta_qso::TX_OFFSET_MIN_HZ` / `TX_OFFSET_MAX_HZ`
-/// (300.0 / 2700.0) — the coordinator clamps to those bounds via
-/// `deconflict_offset`, so accepting values outside them would cause the
-/// status chip to display an offset that is silently clamped on use.
-pub const TX_OFFSET_MIN_HZ: u64 = 300;
-/// Valid TX audio offset range (inclusive), in Hz.
-///
-/// Must match `pancetta_qso::TX_OFFSET_MAX_HZ` (2700.0). See
-/// [`TX_OFFSET_MIN_HZ`] for the rationale.
-pub const TX_OFFSET_MAX_HZ: u64 = 2700;
+/// Operator TX audio offset floor, in Hz. Kept public for compatibility.
+/// Parity-tested against the allocator default range used by the UI.
+pub const TX_OFFSET_MIN_HZ: u64 = 200;
+/// Operator TX audio offset ceiling, in Hz.
+pub const TX_OFFSET_MAX_HZ: u64 = 2800;
+
+/// Effective operator bounds share the allocator's default candidate range.
+pub(crate) fn operator_tx_offset_range() -> (u64, u64) {
+    let (lo, hi) = pancetta_qso::frequency::FrequencyAllocatorConfig::default().range;
+    (lo as u64, hi as u64)
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {
@@ -2484,6 +2503,7 @@ impl App {
                 Some(entry) => {
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
+                    entry.band = band_from_mhz(message.frequency);
                     entry.mode = message.mode.clone();
                     entry.last_seen = message.timestamp;
                     entry.snr = message.snr;
@@ -2513,6 +2533,7 @@ impl App {
                             call_sign: call_sign.clone(),
                             grid_square,
                             frequency: message.frequency,
+                            band: band_from_mhz(message.frequency),
                             mode: message.mode.clone(),
                             last_seen: message.timestamp,
                             snr: message.snr,
@@ -3395,11 +3416,14 @@ impl App {
         pancetta_core::callsign::callsigns_match(call, ours)
     }
 
+    /// Insert a DX-cluster spot row. `freq` is the cluster's Hz value and
+    /// `band` the band the coordinator derived from it (PAN-345).
     #[allow(clippy::too_many_arguments)]
     pub fn add_dx_spot(
         &mut self,
         callsign: String,
         freq: f64,
+        band: Option<pancetta_core::Band>,
         mode: String,
         snr: i32,
         worked_before: bool,
@@ -3416,6 +3440,7 @@ impl App {
             call_sign: callsign.clone(),
             grid_square: None,
             frequency: freq,
+            band,
             mode,
             last_seen: Utc::now(),
             snr,
@@ -4731,6 +4756,7 @@ impl App {
                     call_sign: spot.dx_call.clone(),
                     grid_square: spot.grid.clone(),
                     frequency: spot.frequency_hz as f64 / 1_000_000.0,
+                    band: pancetta_core::Band::from_frequency(spot.frequency_hz),
                     mode: spot.mode.clone(),
                     last_seen: chrono::Utc::now(),
                     snr: spot.best_snr.unwrap_or(0),
@@ -5280,6 +5306,60 @@ fn band_plan_candidate_ranges(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dx_row_band_is_source_unit_correct() {
+        use pancetta_core::Band;
+        // PAN-345: each source derives band from its own unit — cluster Hz,
+        // cqdx `frequency_hz`, local decode MHz — never from the magnitude.
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_dx_spot(
+            "JA1CL".into(),
+            14_074_000.0,
+            Some(Band::Band20m),
+            "CW".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.merge_spot_groups(&[reason_spot("VK3NET", false)]);
+        let mut local = fixture_view("K1LOC", -7);
+        local.frequency = 14.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        for call in ["JA1CL", "VK3NET", "K1LOC"] {
+            assert_eq!(app.dx_stations[call].band, Some(Band::Band20m), "{call}");
+        }
+        assert_eq!(app.dx_stations["JA1CL"].frequency, 14_074_000.0);
+        assert_eq!(app.dx_stations["VK3NET"].frequency, 14.074);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 14.074);
+
+        // An existing row's band follows its frequency when the frequency
+        // changes ...
+        local.frequency = 7.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+        // ... and a metadata-only cqdx merge keeps the retained frequency's
+        // band.
+        app.merge_spot_groups(&[reason_spot("K1LOC", false)]);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 7.074);
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+
+        // Outside every band (or unknown), no band.
+        local.frequency = 1.0;
+        app.add_decoded_message(local).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, None);
+        let mut off_band = reason_spot("ZL1OFF", false);
+        off_band.frequency_hz = 1_000_000;
+        app.merge_spot_groups(&[off_band]);
+        assert_eq!(app.dx_stations["ZL1OFF"].band, None);
+        assert_eq!(super::band_from_mhz(f64::NAN), None);
+        assert_eq!(super::band_from_mhz(-14.074), None);
+        // The shared table's inclusive edges, through the MHz conversion.
+        assert_eq!(super::band_from_mhz(14.0), Some(Band::Band20m));
+        assert_eq!(super::band_from_mhz(14.35), Some(Band::Band20m));
+    }
+
     fn reason_spot(call: &str, needed: bool) -> crate::tui_runner::CqdxSpotInfo {
         crate::tui_runner::CqdxSpotInfo {
             dx_call: call.into(),
@@ -5661,6 +5741,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6146,6 +6227,7 @@ mod tests {
         app.add_dx_spot(
             "JA1XYZ".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6189,6 +6271,7 @@ mod tests {
         app.add_dx_spot(
             "<W5ABC>".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6257,6 +6340,7 @@ mod tests {
         app.add_dx_spot(
             "W5ABC".into(),
             7.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -7688,6 +7772,7 @@ mod tests {
         app.add_dx_spot(
             "K5ARH".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7698,6 +7783,7 @@ mod tests {
         app.add_dx_spot(
             "k5arh".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7714,6 +7800,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -5,
             false,
@@ -7813,6 +7900,7 @@ mod tests {
                 call_sign: "K5ARH".to_string(),
                 grid_square: None,
                 frequency: 14.074,
+                band: None,
                 mode: "FT8".to_string(),
                 last_seen: chrono::Utc::now(),
                 snr: -10,
@@ -7980,6 +8068,7 @@ mod tests {
             call_sign: call.to_string(),
             grid_square: None,
             frequency: freq,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: Utc::now(),
             snr,
@@ -8240,6 +8329,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8268,6 +8358,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_074_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8296,6 +8387,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_025_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8398,6 +8490,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,

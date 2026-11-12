@@ -296,6 +296,48 @@ mod tests {
             task.await.unwrap();
         }
     }
+    #[test]
+    fn alternate_prefix_alert_uses_entity_needed_verdict() {
+        let lookup = CachedStationLookup::new();
+        lookup.update_needed_dxcc(["JA".into(), "K".into()].into());
+        lookup.update_needed_atno(["JA".into(), "K".into()].into());
+        let mut config = AlertsConfig::default();
+        config.bell.enabled = true;
+        config.bell.min_tier = DxTier::Atno;
+        let mut dispatcher =
+            AlertDispatcher::new(config.clone(), lookup.clone(), Default::default(), true).unwrap();
+        for call in ["7K1ABC", "JR1ABC", "JH1ABC", "KG4OJT"] {
+            assert_eq!(lookup.needed_atno_shown(call), (true, true), "{call}");
+            assert!(
+                dispatcher.on_decode(&decode(call, true), 14_074_000, &[]).0,
+                "{call}"
+            );
+        }
+        assert!(
+            !dispatcher
+                .on_decode(&decode("KH6ABC", true), 14_074_000, &[])
+                .0
+        );
+
+        lookup.update_needed_atno(Default::default());
+        let mut needed_only =
+            AlertDispatcher::new(config.clone(), lookup.clone(), Default::default(), true).unwrap();
+        assert_eq!(lookup.needed_atno_shown("7K1ABC"), (true, false));
+        assert!(
+            !needed_only
+                .on_decode(&decode("7K1ABC", true), 14_074_000, &[])
+                .0
+        );
+        config.bell.min_tier = DxTier::PerBandDxccNew;
+        let mut needed_threshold =
+            AlertDispatcher::new(config, lookup, Default::default(), true).unwrap();
+        assert!(
+            needed_threshold
+                .on_decode(&decode("7K1ABC", true), 14_074_000, &[])
+                .0
+        );
+    }
+
     #[tokio::test]
     async fn alerts_watchlist_webhook_json_and_dedupe_and_stale_band() {
         let server = MockServer::start().await;
@@ -303,7 +345,7 @@ mod tests {
             .and(path("/hook"))
             .and(body_partial_json(json!({
                 "type":"decode_alert", "source":"pancetta", "version":1,
-                "callsign":"VP8PJ", "band":"20m", "audio_offset_hz":1500.0,
+                "callsign":"VP8ABC", "band":"20m", "audio_offset_hz":1500.0,
                 "snr_db":-8.0, "trigger":"watchlist", "watchlisted":true,
             })))
             .respond_with(ResponseTemplate::new(204))
@@ -314,8 +356,8 @@ mod tests {
         config.webhook.enabled = true;
         config.webhook.url = format!("{}/hook", server.uri());
         let mut d = dispatcher(config, false);
-        let msg = decode("VP8PJ", false);
-        let pins = vec!["VP8PJ".into()];
+        let msg = decode("VP8ABC", false);
+        let pins = vec!["VP8ABC".into()];
         assert!(d.on_decode(&msg, 7_074_000, &pins).1.is_empty());
         complete(d.on_decode(&msg, 14_074_000, &pins).1).await;
         assert!(d.on_decode(&msg, 14_074_000, &pins).1.is_empty());
@@ -514,14 +556,14 @@ mod evidence_tests {
         let mut config = AlertsConfig::default();
         config.bell.enabled = true;
         let mut d = AlertDispatcher::new(config, lookup.clone(), Default::default(), true).unwrap();
-        let msg = cq("VP8PJ", 14_074_000);
+        let msg = cq("VP8ABC", 14_074_000);
         assert!(d.on_decode(&msg, 14_074_000, &[]).0);
         assert!(!d.on_decode(&msg, 14_074_000, &[]).0);
         for seen in d.dedupe.values_mut() {
             *seen -= Duration::from_secs(301);
         }
         assert!(d.on_decode(&msg, 14_074_000, &[]).0);
-        let other_band = cq("VP8PJ", 7_074_000);
+        let other_band = cq("VP8ABC", 7_074_000);
         assert!(d.on_decode(&other_band, 7_074_000, &[]).0);
         lookup.update_needed_dxcc(["VP8".into()].into());
         d.on_decode(&msg, 14_074_000, &[]);
@@ -530,7 +572,7 @@ mod evidence_tests {
         assert_eq!(text.matches("cqdx need list available for").count(), 1);
         assert_eq!(text.matches("decode alert").count(), 3);
         assert!(text.contains("INFO"));
-        assert!(text.contains("VP8PJ"));
+        assert!(text.contains("VP8ABC"));
         assert!(text.contains("atno"));
     }
     #[test]
