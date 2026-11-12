@@ -48,6 +48,7 @@ The home entity comes from `[station] callsign`, not `dxcc_entity`. KH6, KL7
 and KP4 are separate entities from the US. The old letter-prefix exclusion
 set is gone; do not reintroduce prefix matching for home.
 
+<<<<<<< HEAD
 
 ## Confirmation-based need (PAN-348)
 
@@ -64,3 +65,11 @@ file command changes only the durable ADIF file under its shared lock and leaves
 a rebuild request. Restart rebuilds the index before seeding the cache. A running
 station does not pick up imported confirmations. No new remote fields or cqdx
 API changes are involved.
+=======
+## Subdivisions share DXCC identity (PAN-346)
+
+All local entity keys use core's canonical parent name, including worked,
+confirmed, band, mode, rarity and home comparisons. A TA1 QSO therefore
+prevents a false TA2 ATNO. Unknown entity names stay intact. Loaded cqdx
+answers still take precedence over these local sets.
+>>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1

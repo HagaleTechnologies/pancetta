@@ -1,6 +1,7 @@
 //! PAN-347: per-entity worked, confirmed and per-mode sets from the local
 //! logbook (`qsos.adi`, through the index). Entities are the offline
 //! resolver's `&'static str` names (`pancetta_core::dxcc`).
+use pancetta_core::dxcc::canonical_entity;
 use pancetta_tui::dx_need::EntityStanding;
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +23,7 @@ fn normalize_mode(mode: &str) -> Option<String> {
 impl LocalLog {
     /// One logged contact with `entity`. An empty mode records no mode.
     pub(crate) fn record(&mut self, entity: &'static str, mode: &str, confirmed: bool) {
+        let entity = canonical_entity(entity);
         self.worked.insert(entity);
         if confirmed {
             self.confirmed.insert(entity);
@@ -49,15 +51,17 @@ impl LocalLog {
     }
 
     pub(crate) fn mark_worked(&mut self, entity: &'static str) {
+        let entity = canonical_entity(entity);
         self.worked.insert(entity);
     }
 
     pub(crate) fn is_worked(&self, entity: &str) -> bool {
-        self.worked.contains(entity)
+        self.worked.contains(canonical_entity(entity))
     }
 
     /// Confirmed beats worked-unconfirmed beats not worked.
     pub(crate) fn standing(&self, entity: &str) -> EntityStanding {
+        let entity = canonical_entity(entity);
         if self.confirmed.contains(entity) {
             EntityStanding::Confirmed
         } else if self.worked.contains(entity) {
@@ -69,6 +73,7 @@ impl LocalLog {
 
     /// No contact with `entity` in `mode` on any band. None for an empty mode.
     pub(crate) fn new_in_mode(&self, entity: &str, mode: &str) -> Option<bool> {
+        let entity = canonical_entity(entity);
         let m = normalize_mode(mode)?;
         Some(
             !self
@@ -84,6 +89,18 @@ mod tests {
     use super::*;
 
     const DL: &str = "Fed. Rep. of Germany";
+
+    #[test]
+    fn subdivisions_share_worked_confirmed_and_mode_history() {
+        let mut log = LocalLog::default();
+        log.record("European Turkey", "FT8", true);
+        assert!(log.is_worked("Asiatic Turkey"));
+        assert_eq!(log.standing("Asiatic Turkey"), EntityStanding::Confirmed);
+        assert_eq!(log.new_in_mode("Asiatic Turkey", "FT8"), Some(false));
+        assert_eq!(log.new_in_mode("Asiatic Turkey", "FT4"), Some(true));
+        log.record("unmapped entity", "FT8", false);
+        assert!(log.is_worked("unmapped entity"));
+    }
 
     #[test]
     fn standing_moves_from_not_worked_to_confirmed_and_never_back() {

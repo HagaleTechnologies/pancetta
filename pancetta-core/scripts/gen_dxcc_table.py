@@ -22,7 +22,7 @@ Each token may carry modifiers that must be stripped before use:
   {CC}  – continent override
   ~tz~  – time-zone offset
 Leading `=` means an EXACT-CALLSIGN entry (e.g. =9M2/PG5M) — skip these.
-Leading `*` on the PRIMARY prefix means "deleted DXCC" — keep the prefix but
+Leading `*` on the PRIMARY prefix means "non-DXCC contest subdivision" — keep the prefix but
   strip the `*`.
 
 Collision policy: if two entities claim the same bare prefix, the entity for
@@ -52,7 +52,7 @@ def parse_cty_dat(path: str):
     """
     Yield (entity_name, primary_prefix, [alias_prefixes]) for every record.
 
-    The primary_prefix may start with '*' (deleted DXCC) or contain a '/'
+    The primary_prefix may start with '*' (non-DXCC contest subdivision) or contain a '/'
     (sub-entity like '3D2/c'); callers decide what to do with those.
     """
     with open(path, encoding='latin-1') as fh:
@@ -108,7 +108,7 @@ def build_table(path: str) -> list[tuple[str, str]]:
     alias_map:   dict[str, str] = {}   # prefix → entity from alias list
 
     for entity_name, primary_raw, aliases in parse_cty_dat(path):
-        # Strip leading '*' (deleted DXCC marker).
+        # Strip leading '*' (non-DXCC contest subdivision marker).
         primary_bare = primary_raw.lstrip('*').strip()
 
         # Skip sub-entity records whose "prefix" contains '/'.
@@ -154,10 +154,125 @@ def escape_rust_str(s: str) -> str:
     return s.replace('\\', '\\\\').replace('"', '\\"')
 
 
+def parse_records(path):
+    """Read every entity, including exact-only and non-DXCC subdivisions."""
+    from pathlib import Path
+    for record in Path(path).read_text(encoding='latin1').split(';'):
+        lines = record.strip().splitlines()
+        if not lines:
+            continue
+        fields = lines[0].split(':')
+        if len(fields) < 8:
+            raise ValueError('Malformed cty.dat header')
+        aliases, exact = [], []
+        for token in ' '.join(lines[1:]).split(','):
+            token = strip_modifiers(token).upper()
+            if token:
+                (exact if token.startswith('=') else aliases).append(token.lstrip('='))
+        yield fields[0].strip(), fields[7].strip().upper(), aliases, exact
+
+
+def rule_entity(call):
+    head = call.split('/')[0]
+    if head.startswith('KG4'):
+        suffix = head[3:]
+        return ('Guantanamo Bay' if not suffix or
+                (len(suffix) == 2 and suffix.isascii() and suffix.isalpha()) else 'United States')
+    return None
+
+
+def supplemental_tables(records, mapping, valid_ids, base):
+    registry, exact = {}, {}
+    names = {}
+    for raw_name, raw_primary, _, calls in records:
+        primary = raw_primary.lstrip('*')
+        if primary not in mapping:
+            raise ValueError(f'Missing ADIF mapping: {primary}')
+        row = mapping[primary]
+        if str(row['id']) not in valid_ids or row['id'] <= 0:
+            raise ValueError(f'Invalid ADIF identity: {primary}')
+        if raw_name != row['name'] and raw_name not in row.get('aliases', []):
+            raise ValueError(f'Unmapped entity spelling: {raw_name}')
+        name = row['name']
+        canonical = row.get('canonical', name)
+        value = (name, row['id'], canonical)
+        if primary in registry and registry[primary] != value:
+            raise ValueError(f'Conflicting primary: {primary}')
+        registry[primary] = value
+        for n in [name, *row.get('aliases', [])]:
+            if n in names and names[n] != row['id']:
+                raise ValueError(f'Conflicting name: {n}')
+            names[n] = row['id']
+        for call in calls:
+            if call in exact:
+                previous = exact[call]
+                if names[previous] != row['id']:
+                    raise ValueError(f'Conflicting exact call: {call}')
+                exact[call] = min(previous, name)
+            else:
+                exact[call] = name
+    for name, ident, canonical in registry.values():
+        if names.get(canonical) != ident:
+            raise ValueError(f'Invalid parent: {name} -> {canonical}')
+    for _, name in base:
+        if name not in names:
+            raise ValueError(f'Unmapped shipped entity: {name}')
+    prefix = dict(base)
+    max_len = max(map(len, prefix), default=0)
+    def baseline(call):
+        rule = rule_entity(call)
+        if rule:
+            return rule
+        for length in range(min(len(call), max_len), 0, -1):
+            if call[:length] in prefix:
+                return prefix[call[:length]]
+        if call.startswith(('K', 'W', 'N')) or (len(call) > 1 and call[0] == 'A' and 'A' <= call[1] <= 'L'):
+            return 'United States'
+        return None
+    retained = sorted((call, name) for call, name in exact.items() if baseline(call) != name)
+    return sorted((primary, *value) for primary, value in registry.items()), retained
+
+
+def generate_supplemental(core):
+    import hashlib
+    import json
+    from pathlib import Path
+    core = Path(core)
+    source = core / 'data/cty.dat'
+    raw = source.read_bytes()
+    mapping = json.loads((core / 'data/dxcc_adif_map.json').read_text())['entities']
+    ids = json.loads((core / 'data/adif_dxcc_ids.json').read_text())['entities']
+    base = re.findall(r'\("([^"]+)", "([^"]+)"\)', (core / 'src/dxcc_table.rs').read_text())
+    registry, exact = supplemental_tables(list(parse_records(source)), mapping, ids, base)
+    version = re.search(rb'=VER[0-9]+', raw).group().decode().lstrip('=')
+    header = ('//! Generated by `python3 pancetta-core/scripts/gen_dxcc_table.py --supplemental`.\n'
+              '//! Source: https://www.country-files.com/bigcty/cty.dat\n'
+              f'//! Input: {version}; SHA-256 {hashlib.sha256(raw).hexdigest()}\n'
+              '//! ADIF identities: https://adif.org/315/ADIF_315_annotated.htm#DXCC_Entity_Code_Enumeration\n\n')
+    def lit(s):
+        return '"' + escape_rust_str(s) + '"'
+    reg = header + '#[rustfmt::skip]\npub(crate) static REGISTRY: &[(&str, &str, u16, &str)] = &[\n'
+    for primary, name, ident, canonical in registry:
+        reg += f'    ({lit(primary)}, {lit(name)}, {ident}, {lit(canonical)}),\n'
+    reg += '];\n\n#[rustfmt::skip]\npub(crate) static NAME_ALIASES: &[(&str, &str)] = &[\n'
+    aliases = sorted((alias, row['name']) for row in mapping.values() for alias in row.get('aliases', []))
+    reg += ''.join(f'    ({lit(alias)}, {lit(name)}),\n' for alias, name in aliases) + '];\n'
+    ex = header + '#[rustfmt::skip]\npub(crate) static EXACT_TABLE: &[(&str, &str)] = &[\n'
+    ex += ''.join(f'    ({lit(call)}, {lit(name)}),\n' for call, name in exact) + '];\n'
+    return {'dxcc_registry.rs': reg, 'dxcc_exact.rs': ex}
+
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} /path/to/cty.dat", file=sys.stderr)
         sys.exit(1)
+
+    if sys.argv[1] == '--supplemental':
+        from pathlib import Path
+        core = Path(__file__).resolve().parents[1]
+        for name, text in generate_supplemental(core).items():
+            (core / 'src' / name).write_text(text)
+        return
 
     path = sys.argv[1]
     entries = build_table(path)

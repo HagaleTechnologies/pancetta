@@ -31,7 +31,7 @@ fn normalize_grid_field(grid: &str) -> String {
 }
 
 /// Push a `needed` entity list into the [`CachedStationLookup`], splitting
-/// out the ATNO subset. `needed_dxcc` gets every prefix; `needed_atno` gets
+/// out the ATNO subset. `needed_dxcc` gets every identity; `needed_atno` gets
 /// only those flagged `atno` by cqdx.io. `band` is the per-band scope cqdx
 /// answered for (`None` = all bands); the list is marked `Loaded` with it,
 /// so an empty answer reads "nothing needed", not "unknown" (PAN-93).
@@ -41,21 +41,7 @@ fn apply_needed(
     needed: &[NeededEntity],
     band: Option<&str>,
 ) -> (usize, usize) {
-    let prefixes: std::collections::HashSet<String> =
-        needed.iter().map(|n| n.prefix.to_uppercase()).collect();
-    let atno: std::collections::HashSet<String> = needed
-        .iter()
-        .filter(|n| n.atno)
-        .map(|n| n.prefix.to_uppercase())
-        .collect();
-    let (total, atno_count) = (prefixes.len(), atno.len());
-    cached_lookup.update_needed_dxcc_for_band(
-        prefixes,
-        band.map(str::to_owned),
-        chrono::Utc::now(),
-    );
-    cached_lookup.update_needed_atno(atno);
-    (total, atno_count)
+    cached_lookup.update_needed_entities(needed, band.map(str::to_owned), chrono::Utc::now())
 }
 
 /// PAN-93: how long a needed list that has not loaded waits between retries.
@@ -225,12 +211,23 @@ impl CqdxBridge {
     /// scope), and the recovery log line when earlier attempts failed.
     async fn install_needed(&self, needed: Vec<NeededEntity>, band: Option<&str>) {
         let (total, atno) = apply_needed(&self.cached_lookup, &needed, band);
+        let mapped_rows = needed
+            .iter()
+            .filter(|row| {
+                u16::try_from(row.entity_id)
+                    .ok()
+                    .is_some_and(pancetta_core::dxcc::is_known_entity_id)
+            })
+            .count();
+        let fallback_rows = needed.len() - mapped_rows;
         self.cache.write().await.load_needed(needed);
         info!(
-            "cqdx.io needed ({}): {} DXCC prefix(es), {} flagged ATNO",
+            "cqdx.io needed ({}): {} DXCC identities, {} flagged ATNO ({} ID-mapped rows, {} fallback rows)",
             band.unwrap_or("all bands"),
             total,
-            atno
+            atno,
+            mapped_rows,
+            fallback_rows
         );
         let failures = {
             let mut pending = self.pending();
@@ -704,11 +701,57 @@ mod tests {
 
     fn ne(prefix: &str, atno: bool) -> NeededEntity {
         NeededEntity {
-            entity_id: 1,
+            entity_id: pancetta_core::dxcc::entity_by_primary_prefix(prefix)
+                .map(u32::from)
+                .unwrap_or(0),
             name: prefix.to_string(),
             prefix: prefix.to_string(),
             atno,
         }
+    }
+
+    #[test]
+    fn apply_needed_matches_alternate_prefixes_by_entity_id() {
+        let lookup = CachedStationLookup::new();
+        for atno in [true, false] {
+            apply_needed(&lookup, &[ne("JA", atno)], None);
+            for call in ["JA1ABC", "7K1ABC", "JR1ABC", "JH1ABC", "8N1ABC", "JE1ABC"] {
+                assert_eq!(lookup.display_needed_atno(call), (true, atno), "{call}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_needed_uses_id_even_when_prefix_disagrees() {
+        let lookup = CachedStationLookup::new();
+        let mut row = ne("K", true);
+        row.entity_id = 339;
+        apply_needed(&lookup, &[row], None);
+        assert_eq!(lookup.display_needed_atno("7K1ABC"), (true, true));
+        assert_eq!(lookup.display_needed_atno("W1AW"), (false, false));
+    }
+
+    #[test]
+    fn unknown_ids_use_fallback_without_truncation() {
+        let lookup = CachedStationLookup::new();
+        let mut row = ne(" qq ", true);
+        row.entity_id = 65536 + 339;
+        apply_needed(&lookup, &[row], None);
+        assert_eq!(lookup.display_needed_atno("QQ9XYZ"), (true, true));
+        assert_eq!(lookup.display_needed_atno("JA1ABC"), (false, false));
+        lookup.mark_need_lists_unavailable("failed refresh", true);
+        assert_eq!(lookup.display_needed_atno("QQ9XYZ"), (true, true));
+        apply_needed(&lookup, &[], None);
+        assert_eq!(lookup.display_needed_atno("QQ9XYZ"), (false, false));
+    }
+
+    #[test]
+    fn needed_ids_work_when_entity_load_fails() {
+        let lookup = CachedStationLookup::new();
+        lookup.set_need_lists_loading();
+        lookup.mark_need_lists_unavailable("entity endpoint failed", true);
+        apply_needed(&lookup, &[ne("JA", true)], None);
+        assert_eq!(lookup.display_needed_atno("7K1ABC"), (true, true));
     }
 
     #[test]
@@ -724,12 +767,12 @@ mod tests {
         ));
 
         // All three are "needed".
-        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+        assert!(lookup.is_needed_dxcc("3Y0J"));
         assert!(lookup.is_needed_dxcc("JA1ABC"));
         assert!(lookup.is_needed_dxcc("VK0XYZ"));
 
         // Only the ATNO-flagged two report is_atno.
-        assert!(lookup.is_atno("3Y/B1234"));
+        assert!(lookup.is_atno("3Y0J"));
         assert!(lookup.is_atno("VK0XYZ"));
         assert!(!lookup.is_atno("JA1ABC")); // band-fill, not ATNO
     }
@@ -787,7 +830,7 @@ mod tests {
         serde_json::json!({
             "needed": prefixes
                 .iter()
-                .map(|p| serde_json::json!({"entityId": 1, "name": p, "prefix": p, "atno": false}))
+                .map(|p| serde_json::json!({"entityId": pancetta_core::dxcc::entity_by_primary_prefix(p).map(u32::from).unwrap_or(0), "name": p, "prefix": p, "atno": false}))
                 .collect::<Vec<_>>()
         })
     }

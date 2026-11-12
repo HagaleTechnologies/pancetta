@@ -280,10 +280,10 @@ waits for it to finish.
 - `=` / `-` step the band up/down (CAT moves the dial; active QSOs are
   torn down safely — turning the rig's physical dial does the same).
 - `Shift+F` for any arbitrary dial frequency, including split.
-- `Shift+M` cycles the station operating mode: **FT8 → FT4 → FT2** (FT2
-  needs the `ft2` cargo feature, off by default — without it the label
-  switches but timing stays FT8). It can be refused while a QSO is in
-  flight — finish or `k` the QSO first.
+- `Shift+M` cycles the station operating mode: **FT8 → FT4 → FT8**.
+  Builds with the experimental `ft2` cargo feature also include FT2:
+  **FT8 → FT4 → FT2 → FT8**. Switching can be refused while a QSO is
+  in flight. Finish or press `k` to cancel the QSO first.
 - `e` cycles decode effort (Eco → Standard → Deep → Max → Auto) if you're
   CPU-bound.
 

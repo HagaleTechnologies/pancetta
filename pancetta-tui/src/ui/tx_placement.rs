@@ -91,13 +91,8 @@ pub fn render_tx_placement(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
 /// compact BEST row (top 5, 4 fields squeezed onto one line), this shows
 /// the SAME allocator snapshot (`app.placement`, top-10 — the coordinator
 /// already requests `placement_snapshot(10)`) as a proper ranked table with
-/// more columns: `#, Freq, Windows, Score, Gap(Hz), Quiet`.
-///
-/// `Quiet` is a **deliberate placeholder** — the instrument only carries a
-/// single per-snapshot `received_at` timestamp, not per-slice decode-
-/// activity history, so a real "time since activity near this frequency"
-/// value isn't available in v1. Every row renders `-` rather than fabricate
-/// one; a real per-slice quiet-duration column is a documented follow-up.
+/// columns: `#, Freq, Windows, Score, Gap(Hz), Assigned`.
+/// Assigned names the live QSO occupying that candidate bin, with `*` while keyed.
 pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::TxPlacement);
     let block = create_panel_block("TX Placement \u{2014} Top 10", is_active, app);
@@ -115,7 +110,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         return Ok(());
     };
 
-    let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Live", "Quiet"]
+    let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Assigned"]
         .iter()
         .map(|h| {
             Cell::from(*h).style(
@@ -128,7 +123,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
 
     let n_bins = placement.openness.len();
     let live = app.live_tx_assignments();
-    let mut rows: Vec<Row> = placement
+    let rows: Vec<Row> = placement
         .slices
         .iter()
         .take(10)
@@ -167,22 +162,12 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
                 Cell::from(format!("{:.0}", slice.score)),
                 Cell::from(gap),
                 Cell::from(owner),
-                Cell::from("-"),
             ])
         })
         .collect();
 
-    if rows.is_empty() {
-        rows.push(Row::new([
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("no clear placement candidates yet"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-        ]));
-    }
+    let empty = rows.is_empty();
+    let inner = block.inner(area);
 
     let widths = [
         Constraint::Length(1), // #
@@ -193,8 +178,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         // `=` + callsign + optional `*`. Sized for compound/portable calls
         // (`VK9/G4ABC/P`); a narrower column truncated them into a different,
         // still-plausible callsign. The zoom table has ~60 spare columns.
-        Constraint::Length(16), // Live
-        Constraint::Length(6),  // Quiet
+        Constraint::Length(16), // Assigned
     ];
 
     let table = Table::new(rows, widths)
@@ -204,6 +188,18 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         .style(Style::default().fg(app.theme.foreground_color()));
 
     f.render_widget(table, area);
+    if empty && inner.width > 0 && inner.height > 1 {
+        // An empty-state sentence spans the body rather than one narrow column.
+        f.render_widget(
+            Paragraph::new("no clear placement candidates yet")
+                .style(Style::default().fg(app.theme.muted_color())),
+            Rect {
+                y: inner.y + 1,
+                height: 1,
+                ..inner
+            },
+        );
+    }
     Ok(())
 }
 
