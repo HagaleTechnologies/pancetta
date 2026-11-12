@@ -35,7 +35,8 @@ the native AP pass concurrently through the shared helper
   the fan-out (TUI rows, allocator feed, remote `SpectrumRow`) is
   unchanged for both sources.
 
-`pancetta/src/coordinator/ft8/timing.rs` adds bounded histograms over
+The `timing` module inside `pancetta/src/coordinator/ft8.rs` adds bounded
+histograms over
 `ft8lib_ms` / `waterfall_ms` / `pre_native_ms` (microsecond samples,
 fixed 1..2000 ms buckets + overflow, one debug distribution line every
 32 windows on the `decode.budget` target).
