@@ -89,6 +89,11 @@ coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
 
+Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
+only marks a grid when both rows have the same canonical square. A later rover
+locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
+and middle width tiers start at 77/64.
+
 Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
 PTT and view labels are separate from Debug and persistence strings. Rarity
 cells use words in a nine-cell column. Band Activity uses integer kilometres
