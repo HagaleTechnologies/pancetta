@@ -275,7 +275,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta doctor` | Station health check with a printed fix per failure. |
 | `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
 | `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
-| `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
+| `pancetta test-rig` | Test a running rigctld; exits 1 on failure. `--ptt` keys CAT/RTS for 1 s after the band-plan check (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
 | `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
