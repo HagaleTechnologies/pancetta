@@ -69,12 +69,6 @@ its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
 
-<<<<<<< HEAD
-Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
-only marks a grid when both rows have the same canonical square. A later rover
-locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
-and middle width tiers start at 77/64.
-=======
 Space on a network spot (PAN-287): a DX Hunter row from the DX cluster or
 cqdx.io that was never heard locally is called through
 `TuiCommand::CallNetworkSpot`, not `CallStation`. The TUI resolves the spot's
@@ -84,7 +78,11 @@ waiting for PTT-off. Gotcha: the TUI switches its band only when the
 coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
->>>>>>> a0735e17c4275c704eb114467f866afae914bac8
+
+Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
+only marks a grid when both rows have the same canonical square. A later rover
+locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
+and middle width tiers start at 77/64.
 
 Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
 PTT and view labels are separate from Debug and persistence strings. Rarity
