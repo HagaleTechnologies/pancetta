@@ -1,3 +1,4 @@
+use super::need_display::{atno_style, band_marker, need_marker, needed_style};
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
@@ -33,6 +34,7 @@ const HIGHLIGHT_SYMBOL: &str = "▶ ";
 pub(super) enum DxHunterColumn {
     Src,
     Call,
+    Band,
     Entity,
     Grid,
     Snr,
@@ -45,9 +47,10 @@ pub(super) enum DxHunterColumn {
 
 impl DxHunterColumn {
     /// Display order (left to right).
-    pub(super) const ALL: [DxHunterColumn; 10] = [
+    pub(super) const ALL: [DxHunterColumn; 11] = [
         DxHunterColumn::Src,
         DxHunterColumn::Call,
+        DxHunterColumn::Band,
         DxHunterColumn::Entity,
         DxHunterColumn::Grid,
         DxHunterColumn::Snr,
@@ -59,11 +62,13 @@ impl DxHunterColumn {
     ];
 
     /// The order columns join as the panel widens: the call (with its need
-    /// markers), what entity it is, how strong it is and how much pancetta
-    /// wants it come first; `Src`/`Rpt` are diagnostics. Freshness is
-    /// already shown by dimming stale rows, so `Last` can wait for room.
-    const PRIORITY: [DxHunterColumn; 10] = [
+    /// markers), its band (PAN-345: cluster spots span every band), what
+    /// entity it is, how strong it is and how much pancetta wants it come
+    /// first; `Src`/`Rpt` are diagnostics. Freshness is already shown by
+    /// dimming stale rows, so `Last` can wait for room.
+    const PRIORITY: [DxHunterColumn; 11] = [
         DxHunterColumn::Call,
+        DxHunterColumn::Band,
         DxHunterColumn::Entity,
         DxHunterColumn::Snr,
         DxHunterColumn::Pri,
@@ -79,6 +84,7 @@ impl DxHunterColumn {
         match self {
             DxHunterColumn::Src => "Src",
             DxHunterColumn::Call => "Call",
+            DxHunterColumn::Band => "Band",
             DxHunterColumn::Entity => "Entity",
             DxHunterColumn::Grid => "Grid",
             DxHunterColumn::Snr => "SNR",
@@ -95,6 +101,8 @@ impl DxHunterColumn {
             DxHunterColumn::Src => Constraint::Length(4),
             // !/+ need + ★ markers + up to ~8 chars.
             DxHunterColumn::Call => Constraint::Length(12),
+            // "160m", "70cm" and the "Band" heading, whole (PAN-345).
+            DxHunterColumn::Band => Constraint::Length(5),
             // Flexes into the freed Freq space.
             DxHunterColumn::Entity => Constraint::Min(8),
             DxHunterColumn::Grid => Constraint::Length(5),
@@ -145,10 +153,9 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     let block = create_panel_block("DX Hunter", is_active, app);
 
     // Prepare table data
-    // "Freq" dropped — every DX Hunter spot is on the current band's FT8 dial,
-    // so the column was always identical. Replaced with the DXCC "Entity" the
-    // operator actually wants to scan. PAN-88: narrow panels show fewer,
-    // whole columns (see `visible_columns`).
+    // "Freq" is not shown; each row's "Band" (PAN-345) says where it is, and
+    // the DXCC "Entity" is what the operator scans for. PAN-88: narrow panels
+    // show fewer, whole columns (see `visible_columns`).
     let columns = visible_columns(area.width);
     let now = chrono::Utc::now();
     let header_cells = columns.iter().map(|c| {
@@ -249,6 +256,14 @@ fn entity_cell_text(station: &DxStation, state: Option<&str>) -> String {
     }
 }
 
+/// The Band cell: the band the row derived from its source's frequency
+/// (PAN-345), or `"---"` when it is outside every band.
+fn band_cell_text(station: &DxStation) -> String {
+    station
+        .band
+        .map_or_else(|| "---".to_string(), |band| band.to_string())
+}
+
 /// Needed Grid and state tokens share the existing DXCC `+`/bold convention.
 fn needed_span(
     value: String,
@@ -332,9 +347,7 @@ fn create_dx_row<'a>(
     } else if atno {
         // ATNO — the highest-value catch. Bold magenta + underline so it
         // stands apart from merely-notable (bold magenta) rows.
-        Style::default()
-            .fg(ratatui::style::Color::Magenta)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        atno_style()
     } else if station.is_notable {
         Style::default()
             .fg(ratatui::style::Color::Magenta)
@@ -342,10 +355,8 @@ fn create_dx_row<'a>(
     } else if station.worked_before {
         Style::default().fg(app.theme.muted_color())
     } else if needed {
-        // Needed DXCC (band-fill, not ATNO): bold accent.
-        Style::default()
-            .fg(app.theme.error_color())
-            .add_modifier(Modifier::BOLD)
+        // Needed DXCC (band-fill, not ATNO).
+        needed_style(&app.theme)
     } else if is_rare_dx_from_tier(station) {
         Style::default()
             .fg(app.theme.error_color())
@@ -382,6 +393,7 @@ fn create_dx_row<'a>(
         .unwrap_or_default();
     let last_str = format_time_ago(station.last_seen);
     let pri_str = format!("{}", station.priority_score);
+    let band_str = band_cell_text(station);
 
     let dim = if is_stale {
         Style::default().fg(app.theme.muted_color())
@@ -491,6 +503,7 @@ fn create_dx_row<'a>(
                 DxHunterColumn::Call,
                 Cell::from(call_display).style(call_style),
             ),
+            (DxHunterColumn::Band, Cell::from(band_str).style(dim)),
             (DxHunterColumn::Entity, Cell::from(Line::from(entity_spans))),
             (DxHunterColumn::Grid, Cell::from(Line::from(grid_span))),
             (DxHunterColumn::Snr, Cell::from(snr_str).style(snr_style)),
@@ -520,11 +533,7 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
     format!(
         "{}{}{}{}{}",
         need_marker(atno, needed, station.is_notable),
-        if station.band_needed && !atno {
-            "▲"
-        } else {
-            ""
-        },
+        band_marker(station.band_needed, atno),
         if station.pinned {
             "◆"
         } else if station.watchlisted {
@@ -537,6 +546,7 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
     )
 }
 
+<<<<<<< HEAD
 /// Build the callsign-prefix marker string for the DX Hunter:
 /// `!` for ATNO, `+` for a needed (non-ATNO) DXCC, then `★` for notable.
 /// ATNO and needed are mutually exclusive (ATNO wins). Returns `""` for a
@@ -552,6 +562,14 @@ fn need_marker(atno: bool, needed: bool, notable: bool) -> String {
         s.push('★');
     }
     s
+=======
+fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
+    match snr {
+        snr if snr >= 0 => theme.success_color(),
+        snr if snr >= -10 => theme.warning_color(),
+        _ => theme.error_color(),
+    }
+>>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
 }
 
 /// Check if a station is rare DX using cqdx.io rarity tier (preferred)
@@ -688,6 +706,158 @@ mod tests {
         panic!("missing {needle:?} in {}", text(buf));
     }
 
+    /// Column (in cells) where `needle` starts on row `y`, if present.
+    fn x_of(buf: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Option<u16> {
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        row.find(needle)
+            .map(|byte| row[..byte].chars().count() as u16)
+    }
+
+    /// First row holding `needle`.
+    fn y_of(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<u16> {
+        (0..buf.area.height).find(|&y| x_of(buf, y, needle).is_some())
+    }
+
+    /// The `len` cells of row `y` from column `x`, trimmed.
+    fn cells(buf: &ratatui::buffer::Buffer, y: u16, x: u16, len: u16) -> String {
+        (x..(x + len).min(buf.area.width))
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// The text under the "Band" heading on the row holding `call`.
+    fn band_cell(buf: &ratatui::buffer::Buffer, call: &str) -> String {
+        let header_y = y_of(buf, "Call").expect("header row");
+        let band_x = x_of(buf, header_y, "Band").expect("Band heading");
+        let y = y_of(buf, call).unwrap_or_else(|| panic!("row {call}: {}", text(buf)));
+        cells(buf, y, band_x, 5)
+    }
+
+    fn cluster_app_station(app: &mut App, call: &str, hz: f64, band: Option<pancetta_core::Band>) {
+        app.add_dx_spot(
+            call.into(),
+            hz,
+            band,
+            "FT8".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_row_shows_20m() {
+        // PAN-345: a 14074.0 kHz cluster spot's row reads 20m under Band at
+        // every canonical panel width, including the 32-cell Operate panel.
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        cluster_app_station(
+            &mut app,
+            "JA1XYZ",
+            14_074_000.0,
+            Some(pancetta_core::Band::Band20m),
+        );
+        for width in [32, 40, 48, 53, 66, 80, 91, 97, 120] {
+            let buf = render_buffer(&app, width, 8);
+            crate::presentation::assert_readable_buffer(&buf);
+            assert_eq!(
+                band_cell(&buf, "JA1XYZ"),
+                "20m",
+                "width {width}: {}",
+                text(&buf)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn band_column_adapts_without_clipping() {
+        use pancetta_core::Band;
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        let rows = [
+            ("JA1AAA", 14_074_000.0, Some(Band::Band20m), "20m"),
+            ("W1BBB", 1_840_000.0, Some(Band::Band160m), "160m"),
+            ("VK2CCC", 432_174_000.0, Some(Band::Band70cm), "70cm"),
+            ("ZL3DDD", 1_000_000.0, None, "---"),
+        ];
+        for (call, hz, band, _) in rows {
+            cluster_app_station(&mut app, call, hz, band);
+        }
+        for selected in [false, true] {
+            app.active_panel = if selected {
+                ActivePanel::DxHunter
+            } else {
+                ActivePanel::BandActivity
+            };
+            for (w, h) in [(0, 0), (1, 1), (2, 2), (4, 3)] {
+                render_buffer(&app, w, h);
+            }
+            for width in 16..=200u16 {
+                let buf = render_buffer(&app, width, 10);
+                crate::presentation::assert_readable_buffer(&buf);
+                let header_y = y_of(&buf, "Call").expect("header row");
+                if visible_columns(width).contains(&DxHunterColumn::Band) {
+                    assert!(x_of(&buf, header_y, "Band").is_some(), "width {width}");
+                    for (call, _, _, shown) in rows {
+                        assert_eq!(
+                            band_cell(&buf, call),
+                            shown,
+                            "width {width} {call}: {}",
+                            text(&buf)
+                        );
+                    }
+                } else {
+                    assert!(x_of(&buf, header_y, "Band").is_none(), "width {width}");
+                    assert!(x_of(&buf, header_y, "Ban").is_none(), "no stub heading");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn band_column_empty_unknown_and_stale_states() {
+        // Empty: the existing placeholder, with a blank Band cell.
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        let buf = render_buffer(&app, 32, 8);
+        let output = text(&buf);
+        assert!(
+            output.contains("No DX") && output.contains("stations"),
+            "{output}"
+        );
+        assert_eq!(band_cell(&buf, "No DX"), "", "{output}");
+
+        // Unknown band reads "---".
+        cluster_app_station(&mut app, "ZL3DDD", 1_000_000.0, None);
+        let buf = render_buffer(&app, 40, 8);
+        assert_eq!(band_cell(&buf, "ZL3DDD"), "---");
+
+        // Stale network rows dim the Band cell; a selected row is reversed.
+        let mut row = make_test_station("JA1STL");
+        row.band = Some(pancetta_core::Band::Band20m);
+        row.source = SpotSource::Network;
+        row.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        app.dx_stations.clear();
+        app.dx_stations.insert(row.call_sign.clone(), row);
+        for selected in [false, true] {
+            app.active_panel = if selected {
+                ActivePanel::DxHunter
+            } else {
+                ActivePanel::BandActivity
+            };
+            let buf = render_buffer(&app, 40, 8);
+            crate::presentation::assert_readable_buffer(&buf);
+            assert_eq!(band_cell(&buf, "JA1STL"), "20m");
+            let header_y = y_of(&buf, "Call").unwrap();
+            let band_x = x_of(&buf, header_y, "Band").unwrap();
+            let y = y_of(&buf, "JA1STL").unwrap();
+            let cell = &buf[(band_x, y)];
+            assert_eq!(cell.fg, app.theme.muted_color());
+            assert_eq!(cell.modifier.contains(Modifier::REVERSED), selected);
+        }
+    }
+
     async fn needed_app() -> App {
         let mut app = App::new(crate::Config::default(), None).await.unwrap();
         let mut station = make_test_station("W5ABC");
@@ -733,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn needed_grid_and_state_render_glyphs_and_only_their_own_highlight() {
         let mut app = needed_app().await;
-        let buf = render_buffer(&app, 100, 8);
+        let buf = render_buffer(&app, 106, 8);
         assert!(text(&buf).contains("United States - +AR"));
         assert!(
             text(&buf).contains("+W5ABC"),
@@ -752,7 +922,7 @@ mod tests {
             Some("em34ab")
         );
         refresh_need(&mut app, Some(false));
-        let buf = render_buffer(&app, 100, 8);
+        let buf = render_buffer(&app, 106, 8);
         assert!(text(&buf).contains("United States - AR"));
         assert!(!text(&buf).contains("+AR"));
         assert!(!text(&buf).contains("+EM34"));
@@ -775,7 +945,7 @@ mod tests {
             } else {
                 ActivePanel::BandActivity
             };
-            let buf = render_buffer(&app, 102, 8);
+            let buf = render_buffer(&app, 108, 8);
             for token in ["+EM34", "+AR"] {
                 let cell = cell_at_text(&buf, token);
                 assert_eq!(cell.fg, app.theme.muted_color());
@@ -790,13 +960,13 @@ mod tests {
         let mut app = needed_app().await;
         for history in [None, Some(false)] {
             refresh_need(&mut app, history);
-            let buf = render_buffer(&app, 100, 8);
+            let buf = render_buffer(&app, 106, 8);
             assert!(text(&buf).contains("United States - AR"));
             assert!(!text(&buf).contains("+EM34"));
             assert!(!text(&buf).contains("+AR"));
         }
         app.refresh_dx_need(None);
-        let buf = render_buffer(&app, 100, 8);
+        let buf = render_buffer(&app, 106, 8);
         assert!(text(&buf).contains("United States - AR"));
         assert!(!text(&buf).contains("+EM34"));
     }
@@ -825,7 +995,7 @@ mod tests {
                 state_needed: Some(true),
                 ..Default::default()
             })));
-            let buf = render_buffer(&app, 100, 8);
+            let buf = render_buffer(&app, 106, 8);
             let output = text(&buf);
             assert!(output.contains(expected), "{call}: {output}");
             assert!(!output.contains("+EM"));
@@ -838,10 +1008,10 @@ mod tests {
 
     #[tokio::test]
     async fn five_cell_grid_is_whole_or_absent_and_empty_tiny_panels_do_not_panic() {
-        assert_eq!(visible_columns(66), DxHunterColumn::ALL[..9]);
-        assert_ne!(visible_columns(65), DxHunterColumn::ALL[..9]);
-        assert!(!visible_columns(56).contains(&DxHunterColumn::Grid));
-        assert!(visible_columns(57).contains(&DxHunterColumn::Grid));
+        assert_eq!(visible_columns(72), DxHunterColumn::ALL[..10]);
+        assert_ne!(visible_columns(71), DxHunterColumn::ALL[..10]);
+        assert!(!visible_columns(62).contains(&DxHunterColumn::Grid));
+        assert!(visible_columns(63).contains(&DxHunterColumn::Grid));
         let mut app = needed_app().await;
         app.active_panel = ActivePanel::DxHunter;
         for width in 16..=110 {
@@ -895,27 +1065,32 @@ mod tests {
     }
 
     #[test]
-    fn why_column_joins_last_at_width_91() {
-        assert!(!visible_columns(90).contains(&DxHunterColumn::Why));
-        assert_eq!(visible_columns(91).last(), Some(&DxHunterColumn::Why));
+    fn why_column_joins_last_at_width_97() {
+        // PAN-345: the five-cell Band column (plus its spacing) moved every
+        // later column's threshold six cells wider.
+        assert!(!visible_columns(96).contains(&DxHunterColumn::Why));
+        assert_eq!(visible_columns(97).last(), Some(&DxHunterColumn::Why));
     }
 
     #[test]
     fn visible_columns_compact_tier_at_operate_80() {
         use DxHunterColumn::*;
-        assert_eq!(visible_columns(32), vec![Call, Entity, Snr]);
+        assert_eq!(visible_columns(32), vec![Call, Band, Entity]);
     }
 
     #[test]
     fn visible_columns_at_operate_100() {
         use DxHunterColumn::*;
-        assert_eq!(visible_columns(40), vec![Call, Entity, Snr, Pri]);
+        assert_eq!(visible_columns(40), vec![Call, Band, Entity, Snr]);
     }
 
     #[test]
     fn visible_columns_at_operate_120() {
         use DxHunterColumn::*;
-        assert_eq!(visible_columns(48), vec![Call, Entity, Snr, Last, Pri]);
+        assert_eq!(
+            visible_columns(48),
+            vec![Call, Band, Entity, Snr, Last, Pri]
+        );
     }
 
     #[test]
@@ -923,15 +1098,28 @@ mod tests {
         use DxHunterColumn::*;
         assert_eq!(
             visible_columns(53),
-            vec![Call, Entity, Snr, Rarity, Last, Pri]
+            vec![Call, Band, Entity, Snr, Last, Pri]
         );
     }
 
     #[test]
     fn visible_columns_wide_tier_shows_all() {
-        assert_eq!(visible_columns(66), DxHunterColumn::ALL[..9]);
-        assert_eq!(visible_columns(80), DxHunterColumn::ALL[..9]);
-        assert_eq!(visible_columns(91), DxHunterColumn::ALL);
+        use DxHunterColumn::*;
+        assert_eq!(
+            visible_columns(66),
+            vec![Call, Band, Entity, Grid, Snr, Rarity, Last, Pri]
+        );
+        assert_eq!(visible_columns(80), DxHunterColumn::ALL[..10]);
+        assert_eq!(visible_columns(91), DxHunterColumn::ALL[..10]);
+        assert_eq!(visible_columns(97), DxHunterColumn::ALL);
+    }
+
+    #[test]
+    fn band_column_joins_right_after_call() {
+        use DxHunterColumn::*;
+        assert_eq!(visible_columns(21), vec![Call]);
+        assert_eq!(visible_columns(22), vec![Call, Band]);
+        assert_eq!(visible_columns(31), vec![Call, Band, Entity]);
     }
 
     #[test]
@@ -1172,6 +1360,7 @@ mod tests {
             call_sign: call.to_string(),
             grid_square: None,
             frequency: 14.074,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -10,

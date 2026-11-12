@@ -24,8 +24,58 @@ use ratatui::{
 };
 
 use super::{create_panel_block, format_distance, format_time_ago};
-use crate::app::{App, DecodedMessageView};
+use crate::app::{App, DecodedMessageView, RecentQsoOutcome};
 use crate::dx_need::EntityStanding;
+use crate::upload_status::QsoUploadStatus;
+
+/// PAN-344: upload-detail lines for the SELECTED Recent-QSOs contact's
+/// Station card. Driven by the selected QSO's UUID — never the live
+/// `focused_callsign` — so an older contact's results are never attributed
+/// to a live station with the same callsign. Long reasons clip with `…`,
+/// retaining target and state.
+pub fn upload_detail_lines(
+    qso: &RecentQsoOutcome,
+    status: Option<&QsoUploadStatus>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let muted = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+    };
+    let limit = width.saturating_sub(1) as usize;
+    let clip = |text: String| -> String {
+        if text.chars().count() > limit {
+            let prefix: String = text.chars().take(limit.saturating_sub(1)).collect();
+            format!("{prefix}\u{2026}")
+        } else {
+            text
+        }
+    };
+    match (&qso.outcome, status) {
+        (crate::app::QsoOutcome::Failed(_), _) => vec![muted("Uploads: not applicable".into())],
+        (_, None) => vec![muted("Uploads: checking\u{2026}".into())],
+        (_, Some(status)) if status.targets.is_empty() => {
+            vec![muted("Uploads: disabled".into())]
+        }
+        (_, Some(status)) => status
+            .targets
+            .iter()
+            .map(|(target, slot)| {
+                let detail = if slot.reason.is_empty() || slot.reason == slot.state.word() {
+                    slot.state.word().to_string()
+                } else {
+                    format!("{} \u{b7} {}", slot.state.word(), slot.reason)
+                };
+                Line::from(Span::styled(
+                    clip(format!("{}: {}", target.label(), detail)),
+                    Style::default(),
+                ))
+            })
+            .collect(),
+    }
+}
 
 /// Render four content lines: call/entity/status, ranking reason,
 /// grid/distance/last-message, and engagement or transmit window;
@@ -352,6 +402,113 @@ pub(in crate::ui) mod tests {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    #[test]
+    fn pan344_selected_qso_upload_details() {
+        use crate::app::{QsoOutcome, RecentQsoOutcome};
+        use crate::upload_status::{
+            QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget,
+        };
+        let qso = |outcome: QsoOutcome| RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        };
+        let row = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+
+        // Mixed states: each target's state and reason, in order.
+        let status = QsoUploadStatus {
+            uuid: "u-1".into(),
+            callsign: "K1ABC".into(),
+            revision: 3,
+            targets: vec![
+                (
+                    UploadTarget::Qrz,
+                    TargetUploadStatus::new(UploadState::Accepted, ""),
+                ),
+                (
+                    UploadTarget::ClubLog,
+                    TargetUploadStatus::pending("retrying \u{b7} temporary service failure"),
+                ),
+                (
+                    UploadTarget::Eqsl,
+                    TargetUploadStatus::new(
+                        UploadState::Rejected,
+                        "record rejected \u{b7} invalid record",
+                    ),
+                ),
+            ],
+        };
+        let text = row(&upload_detail_lines(
+            &qso(QsoOutcome::Completed),
+            Some(&status),
+            70,
+        ));
+        assert!(text.contains("QRZ Logbook: accepted"), "{text}");
+        assert!(
+            text.contains("ClubLog: pending \u{b7} retrying \u{b7} temporary service failure"),
+            "{text}"
+        );
+        assert!(
+            text.contains("eQSL: rejected \u{b7} record rejected \u{b7} invalid record"),
+            "{text}"
+        );
+
+        // Completion before any snapshot: checking.
+        assert!(
+            row(&upload_detail_lines(&qso(QsoOutcome::Completed), None, 70))
+                .contains("Uploads: checking\u{2026}")
+        );
+        // Confirmed empty target set: disabled.
+        let empty = QsoUploadStatus {
+            targets: Vec::new(),
+            ..status.clone()
+        };
+        assert!(row(&upload_detail_lines(
+            &qso(QsoOutcome::Completed),
+            Some(&empty),
+            70
+        ))
+        .contains("Uploads: disabled"));
+        // Failed QSO: uploads not applicable.
+        assert!(row(&upload_detail_lines(
+            &qso(QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)),
+            Some(&status),
+            70
+        ))
+        .contains("Uploads: not applicable"));
+        // Long reasons clip with …, retaining target and state.
+        let long = QsoUploadStatus {
+            targets: vec![(
+                UploadTarget::Qrz,
+                TargetUploadStatus::pending(&"service unavailable because ".repeat(10)),
+            )],
+            ..status
+        };
+        let clipped = row(&upload_detail_lines(
+            &qso(QsoOutcome::Completed),
+            Some(&long),
+            40,
+        ));
+        assert!(clipped.contains("QRZ Logbook: pending"), "{clipped}");
+        assert!(clipped.ends_with('\u{2026}'), "{clipped}");
+        assert!(clipped.chars().count() <= 40, "{clipped}");
+    }
+
     #[tokio::test]
     async fn focused_ranked_station_shows_why_line_second() {
         let app = ranked_app("JA1ABC", true, false).await;
@@ -650,6 +807,7 @@ pub(in crate::ui) mod tests {
                 call_sign: "JA1ABC".to_string(),
                 grid_square: None,
                 frequency: 14.074,
+                band: None,
                 mode: "FT8".to_string(),
                 last_seen: chrono::Utc::now(),
                 snr: 3,

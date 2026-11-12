@@ -890,6 +890,50 @@ backlog goes out in datagrams of at most 1400 bytes. The queue is in
 memory only, so a restart empties it. It must be at least 1 when
 `enabled = true`.
 
+### `[network.dx_cluster.filtering]` — which cluster spots reach DX Hunter
+
+With `[network.dx_cluster] enabled = true`, pancetta filters every cluster spot
+locally before it reaches DX Hunter. It does not rely on the cluster server's
+own filters.
+
+```toml
+[network.dx_cluster.filtering]
+bands = ["20m"]
+modes = ["FT8"]
+dxcc_filters = []
+min_frequency = 14000000
+max_frequency = 14350000
+duplicate_window_minutes = 10
+```
+
+This admits FT8 spots on 20m between 14,000,000 and 14,350,000 Hz, limits
+included. A spot whose comment says `CW 25 WPM` is excluded, even at 14074.0
+kHz. An FT8 spot at 7074.0 kHz is excluded.
+
+- `bands` and `modes` are allowlists that combine with AND. An empty list
+  turns off that restriction. Names are trimmed; bands are matched after
+  lowercasing (`20M` works) and modes use pancetta's mode names (`ft8` works).
+  A spot comment saying `SSB` counts as `USB`, so list `USB` to keep SSB spots.
+  Only FT8, FT4, CW, USB, RTTY and PSK31 are read from comments, so listing
+  another valid mode name, such as `LSB`, matches no spot.
+- A spot's band comes from its frequency through pancetta's shared band table.
+  Its mode comes from the comment (FT8, FT4, CW, SSB, RTTY, PSK31). A spot
+  whose band or mode is unknown is excluded only when that list is nonempty.
+- `min_frequency` and `max_frequency` are in Hz and inclusive. Either may be
+  left out.
+- `duplicate_window_minutes` hides a repeat spot of the same call on the same
+  kHz for that many minutes (default 10). `0` shows every repeat. A spot the
+  filters exclude does not start this window.
+- `dxcc_filters` is not applied to cluster spots yet.
+- With the cluster enabled, an unknown band or mode name, or `min_frequency`
+  above `max_frequency`, is a startup error: pancetta reports, for example,
+  `Invalid DX cluster band filter "bogus"` and does not start. It does not drop
+  the bad entry and widen the list.
+- Changes take effect when the DX cluster component starts or restarts, not on
+  a live config edit.
+
+DX Hunter shows each spot's band in a `Band` column (`---` when unknown).
+
 ### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
 
 Pancetta can speak the WSJT-X-compatible UDP protocol that GridTracker,

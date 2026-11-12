@@ -480,7 +480,16 @@ pub enum RankOrigin {
 pub struct DxStation {
     pub call_sign: String,
     pub grid_square: Option<String>,
+    /// Source-dependent unit: MHz for local decodes and cqdx spots, Hz for
+    /// DX-cluster spots. Read [`DxStation::band`] for the band instead of
+    /// guessing it from this value's magnitude (PAN-345).
     pub frequency: f64,
+    /// Band of `frequency`, derived at each source boundary from that
+    /// source's own unit through `pancetta_core::Band::from_frequency`:
+    /// cluster Hz, cqdx `frequency_hz`, local decode MHz × 1,000,000. `None`
+    /// when the frequency is outside every band. Refreshed whenever
+    /// `frequency` changes (PAN-345).
+    pub band: Option<pancetta_core::Band>,
     pub mode: String,
     pub last_seen: DateTime<Utc>,
     pub snr: i32,
@@ -600,6 +609,17 @@ impl DxStation {
     }
 }
 
+/// Band of a local decode's dial frequency, which the decoded view carries
+/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
+/// out-of-band value has no band.
+fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+    let hz = (mhz * 1_000_000.0).round();
+    if !hz.is_finite() || hz <= 0.0 {
+        return None;
+    }
+    pancetta_core::Band::from_frequency(hz as u64)
+}
+
 /// Exact station identity for worked status: a resolved hash render matches
 /// its plain call, but a portable variant is a different station, matching
 /// the scorer's exact-call duplicate check (PAN-94, PAN-228).
@@ -697,6 +717,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the only safe correlation key for upload state
+    /// (PAN-344); repeated callsigns stay independent.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed").
@@ -1484,6 +1507,14 @@ pub struct App {
     /// Scroll cursor into `recent_qsos` while the overlay is open. Same
     /// semantics as `diagnostics_scroll`.
     pub recent_qsos_scroll: usize,
+    /// PAN-344: latest per-QSO upload statuses, merged by UUID and revision
+    /// from the relay's full bounded snapshots (2 s health tick). Bounded to
+    /// 100 entries; rows look their UUID up here.
+    pub qso_uploads: Vec<crate::upload_status::QsoUploadStatus>,
+    /// PAN-344: the typed completion toast, owned by a QSO UUID. Rendered
+    /// through the status-text slot (after compose precedence) so periodic
+    /// component status updates cannot erase it.
+    pub completion_toast: Option<crate::upload_status::CompletionToast>,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
     /// from the diagnostic-event stream that already flows — no new bus
     /// message — by matching the exact completion text the coordinator
@@ -1701,9 +1732,8 @@ pub struct App {
     /// pick the right budget. Loaded from `~/.pancetta/tui_state.json` at
     /// startup and persisted alongside `active_view` on every change; the
     /// coordinator's startup echo corrects a stale persisted guess within
-    /// the first health tick regardless. Drives the "DECODE: <PRESET>
-    /// <ms>ms" title-bar chip (the elapsed-ms/exhausted half comes from
-    /// `pipeline_health` separately).
+    /// the first health tick regardless. Drives the "DECODE: <PRESET>"
+    /// title-bar chip. Decode timing and budget exhaustion appear in Shift+S health.
     pub decode_effort: String,
     /// The message currently being transmitted (NOW-SENDING), if any.
     /// Updated from the coordinator's `TxQueueUpdate`.
@@ -1887,6 +1917,8 @@ impl App {
             why_scroll: 0,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
+            qso_uploads: Vec::new(),
+            completion_toast: None,
             session_completed: 0,
             session_failed: 0,
             session_tx_drops: 0,
@@ -2471,6 +2503,7 @@ impl App {
                 Some(entry) => {
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
+                    entry.band = band_from_mhz(message.frequency);
                     entry.mode = message.mode.clone();
                     entry.last_seen = message.timestamp;
                     entry.snr = message.snr;
@@ -2500,6 +2533,7 @@ impl App {
                             call_sign: call_sign.clone(),
                             grid_square,
                             frequency: message.frequency,
+                            band: band_from_mhz(message.frequency),
                             mode: message.mode.clone(),
                             last_seen: message.timestamp,
                             snr: message.snr,
@@ -3382,11 +3416,14 @@ impl App {
         pancetta_core::callsign::callsigns_match(call, ours)
     }
 
+    /// Insert a DX-cluster spot row. `freq` is the cluster's Hz value and
+    /// `band` the band the coordinator derived from it (PAN-345).
     #[allow(clippy::too_many_arguments)]
     pub fn add_dx_spot(
         &mut self,
         callsign: String,
         freq: f64,
+        band: Option<pancetta_core::Band>,
         mode: String,
         snr: i32,
         worked_before: bool,
@@ -3403,6 +3440,7 @@ impl App {
             call_sign: callsign.clone(),
             grid_square: None,
             frequency: freq,
+            band,
             mode,
             last_seen: Utc::now(),
             snr,
@@ -3546,6 +3584,21 @@ impl App {
     /// behavior (Task 3: the Recent-QSOs panel).
     pub fn push_recent_qso_outcome(&mut self, outcome: RecentQsoOutcome) {
         const MAX_RECENT_QSOS: usize = 50;
+        // PAN-344: only a COMPLETED terminal outcome owns the toast; a
+        // failed QSO never gets a "logged" wording.
+        if matches!(outcome.outcome, QsoOutcome::Completed) {
+            let status = self
+                .qso_uploads
+                .iter()
+                .find(|s| s.uuid == outcome.qso_uuid)
+                .cloned();
+            self.completion_toast = Some(crate::upload_status::CompletionToast::start(
+                &outcome.qso_uuid,
+                &outcome.callsign,
+                status.as_ref(),
+                chrono::Utc::now(),
+            ));
+        }
         let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
         self.recent_qsos.push_back(outcome);
         while self.recent_qsos.len() > MAX_RECENT_QSOS {
@@ -3554,6 +3607,61 @@ impl App {
         if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
             self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
+    }
+
+    /// PAN-344: merge one relayed upload-status snapshot batch. Full
+    /// snapshots arrive repeatedly, so correctness never relies on an
+    /// individual best-effort transition: each entry merges by UUID and only
+    /// a monotonic revision (>= current) replaces known state, and a missing
+    /// entry never erases a known row result. Entries arriving before their
+    /// row are retained here (bounded) so the row can match later.
+    pub fn apply_qso_upload_statuses(
+        &mut self,
+        statuses: Vec<crate::upload_status::QsoUploadStatus>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        const MAX_UPLOAD_STATUSES: usize = 100;
+        for status in statuses {
+            match self.qso_uploads.iter_mut().find(|e| e.uuid == status.uuid) {
+                Some(entry) => {
+                    if status.revision >= entry.revision {
+                        *entry = status.clone();
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    self.qso_uploads.push(status.clone());
+                    while self.qso_uploads.len() > MAX_UPLOAD_STATUSES {
+                        // Preserve status for every visible row, even when late
+                        // results for older registrations arrive afterwards.
+                        let evict = self
+                            .qso_uploads
+                            .iter()
+                            .position(|s| !self.recent_qsos.iter().any(|q| q.qso_uuid == s.uuid))
+                            .unwrap_or(0);
+                        self.qso_uploads.remove(evict);
+                    }
+                }
+            }
+            if let Some(toast) = self.completion_toast.as_mut() {
+                toast.apply_status(&status, now);
+            }
+        }
+    }
+
+    /// The retained upload status for a QSO UUID, if any (PAN-344).
+    pub fn upload_status_for(&self, uuid: &str) -> Option<&crate::upload_status::QsoUploadStatus> {
+        self.qso_uploads.iter().find(|s| s.uuid == uuid)
+    }
+
+    /// The visible completion-toast text, or `None` when no toast is active
+    /// or it has expired (PAN-344).
+    pub fn active_toast_text(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        self.completion_toast
+            .as_ref()
+            .and_then(|t| t.text_at(now))
+            .map(str::to_string)
     }
 
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
@@ -4648,6 +4756,7 @@ impl App {
                     call_sign: spot.dx_call.clone(),
                     grid_square: spot.grid.clone(),
                     frequency: spot.frequency_hz as f64 / 1_000_000.0,
+                    band: pancetta_core::Band::from_frequency(spot.frequency_hz),
                     mode: spot.mode.clone(),
                     last_seen: chrono::Utc::now(),
                     snr: spot.best_snr.unwrap_or(0),
@@ -5197,6 +5306,60 @@ fn band_plan_candidate_ranges(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dx_row_band_is_source_unit_correct() {
+        use pancetta_core::Band;
+        // PAN-345: each source derives band from its own unit — cluster Hz,
+        // cqdx `frequency_hz`, local decode MHz — never from the magnitude.
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_dx_spot(
+            "JA1CL".into(),
+            14_074_000.0,
+            Some(Band::Band20m),
+            "CW".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.merge_spot_groups(&[reason_spot("VK3NET", false)]);
+        let mut local = fixture_view("K1LOC", -7);
+        local.frequency = 14.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        for call in ["JA1CL", "VK3NET", "K1LOC"] {
+            assert_eq!(app.dx_stations[call].band, Some(Band::Band20m), "{call}");
+        }
+        assert_eq!(app.dx_stations["JA1CL"].frequency, 14_074_000.0);
+        assert_eq!(app.dx_stations["VK3NET"].frequency, 14.074);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 14.074);
+
+        // An existing row's band follows its frequency when the frequency
+        // changes ...
+        local.frequency = 7.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+        // ... and a metadata-only cqdx merge keeps the retained frequency's
+        // band.
+        app.merge_spot_groups(&[reason_spot("K1LOC", false)]);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 7.074);
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+
+        // Outside every band (or unknown), no band.
+        local.frequency = 1.0;
+        app.add_decoded_message(local).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, None);
+        let mut off_band = reason_spot("ZL1OFF", false);
+        off_band.frequency_hz = 1_000_000;
+        app.merge_spot_groups(&[off_band]);
+        assert_eq!(app.dx_stations["ZL1OFF"].band, None);
+        assert_eq!(super::band_from_mhz(f64::NAN), None);
+        assert_eq!(super::band_from_mhz(-14.074), None);
+        // The shared table's inclusive edges, through the MHz conversion.
+        assert_eq!(super::band_from_mhz(14.0), Some(Band::Band20m));
+        assert_eq!(super::band_from_mhz(14.35), Some(Band::Band20m));
+    }
+
     fn reason_spot(call: &str, needed: bool) -> crate::tui_runner::CqdxSpotInfo {
         crate::tui_runner::CqdxSpotInfo {
             dx_call: call.into(),
@@ -5578,6 +5741,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6063,6 +6227,7 @@ mod tests {
         app.add_dx_spot(
             "JA1XYZ".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6106,6 +6271,7 @@ mod tests {
         app.add_dx_spot(
             "<W5ABC>".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6174,6 +6340,7 @@ mod tests {
         app.add_dx_spot(
             "W5ABC".into(),
             7.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6784,12 +6951,139 @@ mod tests {
     fn fixture_recent_qso(callsign: &str) -> RecentQsoOutcome {
         RecentQsoOutcome {
             callsign: callsign.to_string(),
+            qso_uuid: format!("uuid-{callsign}"),
             outcome: QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
             ts: Utc::now(),
             brief_timeline: vec!["QSO with X logged".to_string()],
         }
+    }
+
+    /// PAN-344 AC3: UUID correlation keeps repeated callsigns independent;
+    /// snapshots arriving in any order converge, and stale (lower-revision)
+    /// snapshots cannot regress accepted results.
+    #[tokio::test]
+    async fn pan344_upload_updates_are_order_independent() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut a = fixture_recent_qso("K1ABC");
+        a.qso_uuid = "u-a".into();
+        let mut b = fixture_recent_qso("K1ABC");
+        b.qso_uuid = "u-b".into();
+        app.push_recent_qso_outcome(a);
+        app.push_recent_qso_outcome(b);
+
+        let now = Utc::now();
+        let accepted = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 2,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::new(
+                    crate::upload_status::UploadState::Accepted,
+                    "accepted",
+                ),
+            )],
+        };
+        let pending = crate::upload_status::QsoUploadStatus {
+            uuid: "u-b".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("retrying"),
+            )],
+        };
+
+        // An early snapshot converges with the normal outcome-first path.
+        let mut early = App::new(Config::default(), None).await.unwrap();
+        early.apply_qso_upload_statuses(vec![accepted.clone()], now);
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-a".into();
+        early.push_recent_qso_outcome(row);
+        assert_eq!(
+            early.active_toast_text(now).as_deref(),
+            Some("K1ABC uploaded")
+        );
+
+        // Reverse arrival order converges to the same display.
+        app.apply_qso_upload_statuses(vec![accepted.clone(), pending.clone()], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            app.upload_status_for("u-b")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Pending)
+        );
+
+        // An older snapshot for u-a cannot regress the accepted result.
+        let stale = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("queued"),
+            )],
+        };
+        app.apply_qso_upload_statuses(vec![stale], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+
+        // A missing snapshot entry never erases a known row result.
+        app.apply_qso_upload_statuses(Vec::new(), now);
+        assert!(app.upload_status_for("u-a").is_some());
+    }
+
+    /// PAN-344 AC6: the App-side upload cache is bounded and does not evict
+    /// the rows' own lookups (row ring stays capped at 50 independently).
+    #[tokio::test]
+    async fn pan344_upload_history_bounds() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let now = Utc::now();
+        for i in 0..120 {
+            let s = crate::upload_status::QsoUploadStatus {
+                uuid: format!("u-{i}"),
+                callsign: format!("N{i}TEST"),
+                revision: 0,
+                targets: vec![(
+                    crate::upload_status::UploadTarget::Qrz,
+                    crate::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            };
+            app.apply_qso_upload_statuses(vec![s], now);
+        }
+        assert!(app.qso_uploads.len() <= 100, "cache bounded at 100");
+        assert!(app.upload_status_for("u-0").is_none(), "oldest evicted");
+        assert!(app.upload_status_for("u-119").is_some(), "newest retained");
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-20".into();
+        app.push_recent_qso_outcome(row);
+        for i in 120..240 {
+            app.apply_qso_upload_statuses(
+                vec![crate::upload_status::QsoUploadStatus {
+                    uuid: format!("u-{i}"),
+                    callsign: "K1ABC".into(),
+                    revision: 0,
+                    targets: vec![],
+                }],
+                now,
+            );
+        }
+        assert!(
+            app.upload_status_for("u-20").is_some(),
+            "visible row survives late unrelated statuses"
+        );
     }
 
     /// docs/observability-diagnostics-plan.md Layer 2 (Recent-QSOs panel):
@@ -7478,6 +7772,7 @@ mod tests {
         app.add_dx_spot(
             "K5ARH".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7488,6 +7783,7 @@ mod tests {
         app.add_dx_spot(
             "k5arh".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7504,6 +7800,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -5,
             false,
@@ -7603,6 +7900,7 @@ mod tests {
                 call_sign: "K5ARH".to_string(),
                 grid_square: None,
                 frequency: 14.074,
+                band: None,
                 mode: "FT8".to_string(),
                 last_seen: chrono::Utc::now(),
                 snr: -10,
@@ -7770,6 +8068,7 @@ mod tests {
             call_sign: call.to_string(),
             grid_square: None,
             frequency: freq,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: Utc::now(),
             snr,
@@ -8030,6 +8329,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8058,6 +8358,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_074_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8086,6 +8387,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_025_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8188,6 +8490,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,

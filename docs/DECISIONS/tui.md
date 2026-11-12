@@ -200,6 +200,25 @@ Tests: `bar_fit::tests`, `ui::view_render_tests::title_bar_*` / `*_headings_are_
 `tui_runner::key_tests::help_overlay_*`.
 
 
+## Slot and parity clock in the title bar (PAN-352, 2026-11-11)
+
+The shared title row starts with `[E ▮▮▯▯▯▯ 06s │ TX:O]`. It shows current
+slot parity, six rounded progress cells, whole elapsed seconds and resolved
+station TX parity. Unknown TX parity is `-`. FT8 uses 15 s, FT4 7.5 s and
+FT2 3.2 s slots. Slot and UTC clocks use the same instant on each frame.
+
+The slot chip has admit rank 1, just below pinned callsign and TX policy.
+If it cannot fit, every droppable chip is hidden, including the application
+name. Pinned state and UTC can outlive it under extreme width pressure.
+The title row also appears on the too-small screen, with contest scores
+starting on row 1. The panel minimum stays 80×20.
+
+The decode chip retains the preset only. Elapsed milliseconds and budget
+exhaustion remain in Shift+S station health. At 80 columns with live TX and
+the presence-pause prompt both active, the pause prompt can drop to keep
+the clock. It returns when TX clears, or fits from 85 columns with a
+six-character callsign. This follows the clock's last-item-dropped rule.
+
 ## Readiness strip — durable blockers vs acknowledgeable warnings vs transient status (PAN-89, 2026-10-12)
 
 `pancetta-tui/src/readiness.rs` (model), `pancetta-tui/src/ui/readiness_strip.rs` (render),
@@ -459,6 +478,7 @@ and say nothing about any one station. The strip chip and the Why text carry
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
 
+<<<<<<< HEAD
 
 ## Honest QSO values and operator offsets (PAN-354)
 
@@ -488,6 +508,24 @@ The unused public SignalMeter, Modal and SpectrumDisplay widgets remain for a
 separate compatibility review. They are not an alternate production SNR scale.
 Physical tmux and Windows Terminal glyph checks still need operator qualification.
 
+=======
+## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
+
+Each Recent-QSOs row shows one glyph cell per enabled upload target in
+fixed order Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW
+(✓ accepted, ~ pending, × rejected, ! failed, ? unknown), with per-target
+state and reason on the selected-contact Station card. The card follows the
+overlay cursor's QSO UUID, never the live focused station, so an older
+contact's results are never attributed to a same-callsign live station.
+The completion toast is typed App state ("{call} logged · uploads queued"
+until every explicitly accepted target yields "{call} uploaded"); compose
+input outranks it and ordinary status text returns on expiry. Acceptance is
+only ever an explicit service result — an empty captured target set renders
+"uploads off", a missing result renders "?", and colour supplements glyphs.
+History is session-only: the coordinator retains the last 100 completion
+registrations and the TUI mirrors them; a restart invents no accepted
+history.
+>>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
 
 `pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.
@@ -506,3 +544,23 @@ Physical tmux and Windows Terminal glyph checks still need operator qualificatio
 - **A13 (rig data mode).** No `SetMode` is sent from `qsy_send`. Since PAN-276, with `[rig] data_mode` set, the rigctld backend reapplies the configured mode after every commanded frequency change, spot QSY included; unset, the mode is left to the operator.
 
 Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
+
+## Band Activity need markers (PAN-350, 2026-11-11)
+
+Band Activity consumes the same prepared entity verdict as DX Hunter, falling
+back to stored decode flags when no verdict exists. Both use shared need glyph
+and style helpers: ATNO `!` suppresses needed `+` and band-new `▲`; otherwise
+`+` precedes `▲`. Band Activity puts these before its directed or engaged
+prefix. ATNO is bold magenta and underlined, ahead of worked-before; ordinary
+needed is bold error colour, behind worked-before. Own TX, directed and global
+focus styles win first; engaged adds green underline and selection retains
+black text on accent. Own TX and missing calls have no need markers.
+
+A new-grid `+` appears only when the prepared verdict is true and the decode's
+canonical grid matches the current DX row's canonical grid. Historical decodes
+retain their grid and band-needed flag. Unknown, invalid, absent or mismatched
+grid history adds no marker and triggers no lookup during rendering.
+
+Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
+borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
+below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.
