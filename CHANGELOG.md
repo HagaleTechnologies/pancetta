@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PAN-345: DX-cluster spots now honour `[network.dx_cluster.filtering]`. `bands` and `modes` allowlists, inclusive Hz limits and `duplicate_window_minutes` (`0` turns it off) apply locally before a spot reaches DX Hunter, and a filtered spot no longer suppresses the next accepted one. With the cluster enabled, an invalid band or mode name, or inverted limits, is now a startup error instead of being ignored. Spots keep their parsed mode (CW stays CW, unknown is `Unknown`, never FT8), and DX Hunter gains a `Band` column for every row. `dxcc_filters` is still not applied. Live-cluster qualification is pending.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
+- PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
 
 ### Changed
 
@@ -18,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
+=======
+- PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.
+>>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1
 - PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
 - Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.

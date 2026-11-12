@@ -1480,7 +1480,7 @@ pub fn render_watchlist_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Off
 
 /// Render the `o`-key TX-audio-offset modal.
 ///
-/// One integer Hz field in [300, 2700]; blank Enter = Auto; Esc = cancel.
+/// One integer Hz field in the allocator default range; blank Enter = Auto; Esc = cancel.
 /// Mirrors the `render_freq_modal` layout and sizing.
 pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
     if area.width < 10 || area.height < 4 {
@@ -1496,7 +1496,9 @@ pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Offset
     };
     f.render_widget(ratatui::widgets::Clear, modal_area);
     let body = format!(
-        " TX audio offset (Hz, 300–2700): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        " TX audio offset (Hz, {}–{}): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        crate::app::operator_tx_offset_range().0,
+        crate::app::operator_tx_offset_range().1,
         m.buffer,
     );
     let block = Block::default()
@@ -4256,6 +4258,101 @@ mod view_render_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_offset_modal_uses_allocator_default_range() {
+        let range = pancetta_qso::frequency::FrequencyAllocatorConfig::default().range;
+        assert_eq!(crate::app::TX_OFFSET_MIN_HZ as f64, range.0);
+        assert_eq!(crate::app::TX_OFFSET_MAX_HZ as f64, range.1);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            render_offset_modal(
+                f,
+                f.area(),
+                &crate::app::OffsetModalState {
+                    visible: true,
+                    buffer: String::new(),
+                },
+            )
+        })
+        .unwrap();
+        assert!(buffer_contains(term.backend().buffer(), "200–2800"));
+    }
+
+    #[tokio::test]
+    async fn numeric_snr_cells_share_theme_scale_across_panels() {
+        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+            let mut app = default_app().await;
+            app.theme = theme;
+            app.active_panel = ActivePanel::QsoStatus;
+            for snr in [-15, -11, -10, -1, 0, 5, 10] {
+                let mut station = fixture_dx_station("JA1ABC");
+                station.snr = snr;
+                app.dx_stations.insert("JA1ABC".into(), station);
+                let mut message = fixture_caller(&app, "JA1ABC");
+                message.snr = snr;
+                message.is_directed_at_us = false;
+                app.decoded_messages.clear();
+                app.decoded_messages.push_back(message);
+                // The selected single-QSO detail uses the same measured report.
+                app.qso_statuses = vec![crate::app::QsoStatus {
+                    active: true,
+                    snr_tx: Some(snr),
+                    snr_rx: Some(snr),
+                    ..Default::default()
+                }];
+                let expected = get_snr_color(snr, &theme);
+                for panel in 0..3 {
+                    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+                    term.draw(|f| match panel {
+                        0 => dx_hunter::render_dx_hunter(f, f.area(), &app).unwrap(),
+                        1 => band_activity::render_band_activity(f, f.area(), &app).unwrap(),
+                        _ => qso_status::render_qso_status(f, f.area(), &app).unwrap(),
+                    })
+                    .unwrap();
+                    let buf = term.backend().buffer();
+                    let needle = if panel == 2 {
+                        format!("{snr:+} dB")
+                    } else {
+                        format!("{snr:+}")
+                    };
+                    let mut found = false;
+                    for y in 1..buf.area.height {
+                        let row = row_text(buf, y);
+                        if let Some(byte) = row.find(&needle) {
+                            let x = row[..byte].chars().count() as u16;
+                            assert_eq!(
+                                buf[(x, y)].fg,
+                                expected,
+                                "panel {panel}, SNR {snr}, theme {theme:?}"
+                            );
+                            found = true;
+                        }
+                    }
+                    assert!(found, "missing SNR {needle} in panel {panel}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qso_panels_render_through_production_draw_at_supported_sizes() {
+        let mut app = default_app().await;
+        app.active_view = crate::view::ActiveView::Operate;
+        for (w, h) in [(80, 24), (100, 30), (120, 40)] {
+            let idle = render_app(&app, w, h);
+            assert!(!buffer_contains(&idle, "-50 dB"));
+            app.qso_statuses = vec![crate::app::QsoStatus {
+                active: true,
+                call_sign: Some("JA1ABC".into()),
+                snr_tx: Some(-12),
+                ..Default::default()
+            }];
+            let active = render_app(&app, w, h);
+            assert!(buffer_contains(&active, "JA1ABC"));
+            app.qso_statuses.clear();
         }
     }
 
