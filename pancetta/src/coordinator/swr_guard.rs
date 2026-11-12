@@ -307,6 +307,7 @@ pub(crate) async fn swr_poll_step(
     keyed: bool,
     bus: &MessageBus,
     halt: &TxHaltHandles,
+    display_feed_enabled: &AtomicBool,
 ) {
     let reading = if keyed {
         match rig.get_swr().await {
@@ -327,11 +328,22 @@ pub(crate) async fn swr_poll_step(
     } else {
         None
     };
-    act(guard.observe(keyed, reading), bus, halt).await;
+    act(
+        guard.observe(keyed, reading),
+        bus,
+        halt,
+        display_feed_enabled,
+    )
+    .await;
 }
 
 /// Carry out a guard decision.
-pub(crate) async fn act(action: SwrAction, bus: &MessageBus, halt: &TxHaltHandles) {
+pub(crate) async fn act(
+    action: SwrAction,
+    bus: &MessageBus,
+    halt: &TxHaltHandles,
+    display_feed_enabled: &AtomicBool,
+) {
     match action {
         SwrAction::Trip { swr, max_swr } => {
             // Synchronous: the PTT-on gate is closed before any await.
@@ -345,6 +357,20 @@ pub(crate) async fn act(action: SwrAction, bus: &MessageBus, halt: &TxHaltHandle
                      watchdog still unkey"
                 );
             }
+            // PAN-341: announce the halt to remote service peers — after the
+            // safety gate closes and the synchronous PTT-off enqueue, before
+            // QSO cancellation and the best-effort TUI sends. Same additive
+            // pattern as every other display-feed relay; a no-op when nobody
+            // needs the feed.
+            super::remote_gateway::relay_to_gateway(
+                bus,
+                display_feed_enabled,
+                ComponentId::Hamlib,
+                MessageType::TxPolicyStatus {
+                    policy: pancetta_core::TxPolicy::Disabled,
+                },
+            )
+            .await;
             let detail = trip_detail(swr, max_swr);
             error!(target: "rig.swr", "{}", detail);
             if super::tx_halt::cancel_all_qsos(bus, ComponentId::Hamlib).await
@@ -782,6 +808,7 @@ mod tests {
         qso: crossbeam_channel::Receiver<ComponentMessage>,
         tui: crossbeam_channel::Receiver<ComponentMessage>,
         hamlib: crossbeam_channel::Receiver<ComponentMessage>,
+        gateway: crossbeam_channel::Receiver<ComponentMessage>,
     }
 
     async fn inboxes() -> Inboxes {
@@ -789,12 +816,21 @@ mod tests {
         let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (_, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
         let (_, hamlib) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
         Inboxes {
             bus,
             qso,
             tui,
             hamlib,
+            gateway,
         }
+    }
+
+    fn feed_on() -> AtomicBool {
+        AtomicBool::new(true)
     }
 
     fn drain(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> Vec<MessageType> {
@@ -854,7 +890,7 @@ mod tests {
         assert_eq!(hard_mute_reason(&halt), None);
         let mut g = guard(false);
 
-        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt, &feed_on()).await;
 
         assert!(halt.abort_current_tx.load(Ordering::Acquire));
         assert!(!halt.autonomous_enabled.load(Ordering::Acquire));
@@ -874,6 +910,18 @@ mod tests {
             qso.iter()
                 .any(|m| matches!(m, MessageType::QsoMessage(QsoMessage::CancelAllQsos))),
             "{qso:?}"
+        );
+        // PAN-341: the trip also relays the Disabled policy to the display
+        // feed (addressed to RemoteGateway, source Hamlib).
+        let gateway = drain(&ib.gateway);
+        assert!(
+            gateway.iter().any(|m| matches!(
+                m,
+                MessageType::TxPolicyStatus {
+                    policy: pancetta_core::TxPolicy::Disabled
+                }
+            )),
+            "{gateway:?}"
         );
         let tui = drain(&ib.tui);
         assert!(tui.iter().any(|m| matches!(
@@ -900,6 +948,84 @@ mod tests {
         )));
     }
 
+    /// PAN-341: an SWR trip relays `TxPolicyStatus { Disabled }` to the
+    /// display feed even with NO TUI channel on the bus (headless has no
+    /// TUI): the gateway relay does not depend on the best-effort TUI sends.
+    #[tokio::test]
+    async fn trip_relays_policy_without_tui() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, hamlib) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (_, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        // Deliberately NO ComponentId::Tui channel: headless.
+        let halt = halt_handles();
+
+        act(
+            SwrAction::Trip {
+                swr: 4.2,
+                max_swr: 3.0,
+            },
+            &bus,
+            &halt,
+            &feed_on(),
+        )
+        .await;
+
+        // Safety behavior is unchanged: halt + PTT-off + QSO cancel.
+        assert_eq!(policy(&halt), pancetta_core::TxPolicy::Disabled);
+        assert!(halt.abort_current_tx.load(Ordering::Acquire));
+        assert!(!halt.autonomous_enabled.load(Ordering::Acquire));
+        let hamlib = drain(&hamlib);
+        assert!(hamlib.iter().any(|m| matches!(
+            m,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: false, .. })
+        )));
+        let qso = drain(&qso);
+        assert!(qso
+            .iter()
+            .any(|m| matches!(m, MessageType::QsoMessage(QsoMessage::CancelAllQsos))));
+        // The policy announcement reached the display feed.
+        let gateway: Vec<_> = drain(&gateway);
+        assert!(
+            gateway.iter().any(|m| matches!(
+                m,
+                MessageType::TxPolicyStatus {
+                    policy: pancetta_core::TxPolicy::Disabled
+                }
+            )),
+            "{gateway:?}"
+        );
+    }
+
+    /// PAN-341: only the TRIP announces a policy transition. Reassert-unkey
+    /// and availability warnings halt nothing and change no policy, so they
+    /// must enqueue no gateway message at all.
+    #[tokio::test]
+    async fn non_trip_actions_do_not_relay_policy() {
+        let ib = inboxes().await;
+        let halt = halt_handles();
+
+        act(SwrAction::None, &ib.bus, &halt, &feed_on()).await;
+        act(SwrAction::ReassertUnkey, &ib.bus, &halt, &feed_on()).await;
+        act(
+            SwrAction::ReportUnavailable(SwrUnavailable::NotReported),
+            &ib.bus,
+            &halt,
+            &feed_on(),
+        )
+        .await;
+
+        assert_eq!(policy(&halt), pancetta_core::TxPolicy::Full);
+        assert_eq!(
+            drain(&ib.gateway).len(),
+            0,
+            "no SWR action short of a trip may reach the display feed"
+        );
+    }
+
     #[tokio::test]
     async fn step_below_limit_only_displays() {
         let ib = inboxes().await;
@@ -910,7 +1036,7 @@ mod tests {
         .await;
         let halt = halt_handles();
         let mut g = guard(false);
-        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt, &feed_on()).await;
 
         let tui = drain(&ib.tui);
         assert_eq!(tui.len(), 1, "{tui:?}");
@@ -934,7 +1060,7 @@ mod tests {
         .await;
         let halt = halt_handles();
         let mut g = guard(false);
-        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt, &feed_on()).await;
         assert!(drain(&ib.tui).is_empty());
         assert_eq!(policy(&halt), pancetta_core::TxPolicy::Full);
     }
@@ -1021,9 +1147,9 @@ mod tests {
         let rig = counting_rig().await;
         let halt = halt_handles();
         let mut g = guard(false);
-        swr_poll_step(&rig, &mut g, false, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, false, &ib.bus, &halt, &feed_on()).await;
         assert_eq!(rig.swr_reads.load(Ordering::SeqCst), 0);
-        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, true, &ib.bus, &halt, &feed_on()).await;
         assert_eq!(rig.swr_reads.load(Ordering::SeqCst), 1);
     }
 
@@ -1038,9 +1164,9 @@ mod tests {
         let halt = halt_handles();
         let mut g = guard(true);
         for _ in 0..SWR_UNAVAILABLE_MIN_ATTEMPTS {
-            swr_poll_step(&rig, &mut g, true, &ib.bus, &halt).await;
+            swr_poll_step(&rig, &mut g, true, &ib.bus, &halt, &feed_on()).await;
         }
-        swr_poll_step(&rig, &mut g, false, &ib.bus, &halt).await;
+        swr_poll_step(&rig, &mut g, false, &ib.bus, &halt, &feed_on()).await;
 
         let tui = drain(&ib.tui);
         let errors: Vec<_> = tui

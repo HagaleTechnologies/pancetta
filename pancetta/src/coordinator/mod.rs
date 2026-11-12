@@ -722,6 +722,16 @@ pub(crate) async fn forward_split_change(
     }
 }
 
+/// Select the next runtime mode supported by this binary.
+fn next_operating_mode(mode: pancetta_config::OperatingMode) -> pancetta_config::OperatingMode {
+    let next = mode.cycle();
+    #[cfg(not(feature = "ft2"))]
+    if next == pancetta_config::OperatingMode::Ft2 {
+        return next.cycle();
+    }
+    next
+}
+
 /// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
 /// [`pancetta_ft8::Protocol`]. The config crate intentionally does not depend
 /// on `pancetta-ft8`, so the coordinator owns this mapping. Derived once at
@@ -5009,6 +5019,91 @@ mod tests {
             pancetta_config::OperatingMode::Ft8.as_u8()
         );
         assert_eq!(active_slot_ns.load(Ordering::Relaxed), 15_000_000_000);
+    }
+
+    #[cfg(not(feature = "ft2"))]
+    #[tokio::test]
+    async fn runtime_mode_cycle_without_ft2() {
+        use pancetta_config::OperatingMode::{Ft2, Ft4, Ft8};
+        use pancetta_ft8::Protocol;
+        assert_runtime_mode_cycle(&[
+            (Ft4, Protocol::Ft4, "FT4"),
+            (Ft8, Protocol::Ft8, "FT8"),
+            (Ft4, Protocol::Ft4, "FT4"),
+            (Ft8, Protocol::Ft8, "FT8"),
+        ])
+        .await;
+        assert_eq!(next_operating_mode(Ft2), Ft8);
+    }
+
+    #[cfg(feature = "ft2")]
+    #[tokio::test]
+    async fn runtime_mode_cycle_with_ft2() {
+        use pancetta_config::OperatingMode::{Ft2, Ft4, Ft8};
+        use pancetta_ft8::Protocol;
+        assert_runtime_mode_cycle(&[
+            (Ft4, Protocol::Ft4, "FT4"),
+            (Ft2, Protocol::Ft2, "FT2"),
+            (Ft8, Protocol::Ft8, "FT8"),
+            (Ft4, Protocol::Ft4, "FT4"),
+            (Ft2, Protocol::Ft2, "FT2"),
+            (Ft8, Protocol::Ft8, "FT8"),
+        ])
+        .await;
+    }
+
+    async fn assert_runtime_mode_cycle(
+        expected: &[(pancetta_config::OperatingMode, pancetta_ft8::Protocol, &str)],
+    ) {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft8.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Standard.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+
+        for &(expected_mode, expected_protocol, expected_label) in expected {
+            let current = pancetta_config::OperatingMode::from_u8(
+                active_protocol_mode.load(Ordering::Relaxed),
+            );
+            let next = next_operating_mode(current);
+            assert_eq!(next, expected_mode);
+            try_switch_operating_mode(
+                next,
+                &active_tx_qsos,
+                &decode_window,
+                &active_protocol_mode,
+                &active_slot_ns,
+                &active_decode_phase_ns,
+                &current_decode_effort,
+                &resolved_hardware_tier,
+            )
+            .expect("idle mode switch");
+            let selected = pancetta_config::OperatingMode::from_u8(
+                active_protocol_mode.load(Ordering::Relaxed),
+            );
+            assert_eq!(selected, expected_mode);
+            assert_eq!(mode_str(selected), expected_label);
+            assert_eq!(decode_window.read().await.ft8().protocol, expected_protocol);
+            let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(
+                expected_protocol,
+            ));
+            assert_eq!(active_slot_ns.load(Ordering::Relaxed), timing.slot_ns);
+            assert_eq!(
+                active_decode_phase_ns.load(Ordering::Relaxed),
+                timing.decode_phase.num_nanoseconds().unwrap(),
+            );
+        }
     }
 
     #[tokio::test]

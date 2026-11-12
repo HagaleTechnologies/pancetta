@@ -494,6 +494,35 @@ only ever an explicit service result — an empty captured target set renders
 History is session-only: the coordinator retains the last 100 completion
 registrations and the TUI mirrors them; a restart invents no accepted
 history.
+
+## Honest QSO values and operator offsets (PAN-354)
+
+Missing QSO reports render as a muted "—" with zero gauge fill. A measured
+-50 dB remains a report. QSO Status, DX Hunter, Band Activity and Callers
+use `ui::get_snr_color`: below -10 dB is error, -10 through -1 is warning,
+and 0 or higher is success. Audio-level colours remain a separate scale.
+
+Operator arrows and offset entry use the allocator default range, 200–2800 Hz.
+The modal, validation and opening hint derive their limits from that range.
+Nonzero Hold also uses it when creating a manual QSO, including collision
+avoidance. Auto and held-zero retain fresh-autonomous bounds of 300–2700 Hz;
+active relocation retains its separate 200–2900 Hz policy.
+
+Placement zoom labels real live ownership as Assigned, preserving the full
+callsign and keyed star. Quiet was removed because the snapshot has no
+per-frequency quiet history. The renderer continues to use allocator snapshots.
+Callers draws one outer border and reserves its final inner row for the hint.
+
+Single-QSO detail uses its full layout only when every mandatory section fits,
+including the optional queue and combined DX/drift row. Short panels admit
+complete lines in this priority: status/callsign, TX, RX, queued parity, control
+hint, SNR, NOW, NEXT. Admitted lines retain their normal display order.
+The multi-QSO table is unchanged.
+
+The unused public SignalMeter, Modal and SpectrumDisplay widgets remain for a
+separate compatibility review. They are not an alternate production SNR scale.
+Physical tmux and Windows Terminal glyph checks still need operator qualification.
+
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
 
 `pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.
