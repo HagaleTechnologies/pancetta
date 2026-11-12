@@ -4599,7 +4599,7 @@ mod pan333_panic_tests {
         // A private PTY keeps this process-global hook test off the user's terminal.
         let (mut master, slave, saved_stdout, saved_stdin) = unsafe {
             let (mut master, mut slave) = (0, 0);
-            let size = libc::winsize {
+            let mut size = libc::winsize {
                 ws_row: 40,
                 ws_col: 120,
                 ws_xpixel: 0,
@@ -4610,8 +4610,8 @@ mod pan333_panic_tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &size
+                    std::ptr::null_mut(),
+                    &mut size
                 ),
                 0
             );
