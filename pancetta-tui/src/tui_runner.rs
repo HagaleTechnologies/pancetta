@@ -227,6 +227,16 @@ pub enum TuiMessage {
     StatusUpdate {
         component: String,
         status: String,
+
+        level: pancetta_core::DiagnosticLevel,
+    },
+    /// A transient condition update. A new update replaces the same code,
+    /// including when a warning recovers, without changing readiness alerts.
+    CodedStatusUpdate {
+        component: String,
+        status: String,
+        level: pancetta_core::DiagnosticLevel,
+        code: u32,
     },
     /// PAN-287: the coordinator commanded a spot-call QSY to `dial_hz`. The
     /// TUI applies its band state now (`App::apply_spot_qsy`), not at the
@@ -1000,11 +1010,26 @@ impl TuiRunner {
             }
             TuiMessage::ErrorResolved { component, code } => {
                 if app.resolve_alerts(code) > 0 {
-                    app.status_message = format!("{component} recovered — alert cleared");
+                    app.set_relay_status(
+                        format!("{component} recovered — alert cleared"),
+                        pancetta_core::DiagnosticLevel::Info,
+                    );
                 }
             }
-            TuiMessage::StatusUpdate { component, status } => {
-                app.update_component_status(component, status);
+            TuiMessage::StatusUpdate {
+                component,
+                status,
+                level,
+            } => {
+                app.update_component_status(component, status, level);
+            }
+            TuiMessage::CodedStatusUpdate {
+                component,
+                status,
+                level,
+                code,
+            } => {
+                app.update_coded_component_status(component, status, level, code);
             }
             // PAN-287: the coordinator commanded a spot-call QSY; follow it.
             TuiMessage::SpotQsy { dial_hz } => {
@@ -1116,7 +1141,10 @@ impl TuiRunner {
                 // the Run view, but we never change the operator's view for
                 // them — just hint that `v` is available.
                 if on && app.active_view != crate::view::ActiveView::Run {
-                    app.status_message = "FOX on — press v for Run view".to_string();
+                    app.set_relay_status(
+                        "FOX on — press v for Run view".to_string(),
+                        pancetta_core::DiagnosticLevel::Info,
+                    );
                 }
             }
             TuiMessage::TxFreqModeUpdate { mode } => {
@@ -1245,10 +1273,16 @@ impl TuiRunner {
         match (app.selected_qso_id(), app.selected_qso_callsign()) {
             (Some(qso_id), Some(call)) => {
                 self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
-                app.status_message = format!("Aborting QSO with {}", call);
+                {
+                    let text = format!("Aborting QSO with {}", call);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             _ => {
-                app.status_message = "No active QSO to abort".to_string();
+                {
+                    let text = "No active QSO to abort".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                };
             }
         }
         Ok(())
@@ -1262,9 +1296,12 @@ impl TuiRunner {
         // banner immediately; the coordinator confirms via
         // TxPolicyUpdate.
         app.tx_policy = pancetta_core::TxPolicy::Disabled;
-        app.status_message =
-            "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
-                .to_string();
+        {
+            let text =
+                "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
+                    .to_string();
+            app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+        };
         warn!(
             target: "operator.override",
             "Operator pressed Q emergency stop key — halting station"
@@ -1334,7 +1371,10 @@ impl TuiRunner {
         match action {
             Action::AckOutOfBand => {
                 app.out_of_band_ack_visible = false;
-                app.status_message = "Out-of-band TX acknowledged".to_string();
+                {
+                    let text = "Out-of-band TX acknowledged".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::ConfirmQuit => {
@@ -1345,7 +1385,10 @@ impl TuiRunner {
 
             Action::CancelQuit => {
                 app.quit_confirm_visible = false;
-                app.status_message = "Quit cancelled".to_string();
+                {
+                    let text = "Quit cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::HelpScrollUp => app.help_scroll = app.help_scroll.saturating_sub(1),
@@ -1374,7 +1417,10 @@ impl TuiRunner {
 
             Action::CancelDevicePicker => {
                 app.device_selection.visible = false;
-                app.status_message = "Device selection cancelled".to_string();
+                {
+                    let text = "Device selection cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::DevicePickerSwitchList => {
@@ -1399,7 +1445,10 @@ impl TuiRunner {
                     input.as_deref().unwrap_or("(none)"),
                     output.as_deref().unwrap_or("(none)")
                 );
-                app.status_message = msg;
+                {
+                    let text = msg;
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
 
                 self.message_tx.send(TuiCommand::SelectDevice {
                     input_device: input,
@@ -1410,7 +1459,10 @@ impl TuiRunner {
             Action::CancelBookmarkName => {
                 app.rig_selection.naming_bookmark = false;
                 app.rig_selection.bookmark_name_input.clear();
-                app.status_message = "Save bookmark cancelled".to_string();
+                {
+                    let text = "Save bookmark cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::BookmarkNameBackspace => {
@@ -1425,13 +1477,19 @@ impl TuiRunner {
                 let name = app.rig_selection.bookmark_name_input.trim().to_string();
                 let port = app.rig_selection.selected_port();
                 if name.is_empty() {
-                    app.status_message = "Bookmark name cannot be empty".to_string();
+                    {
+                        let text = "Bookmark name cannot be empty".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else if port.is_empty() {
                     // Mirrors the I-2b fix on the main form's Enter
                     // key (below): an empty port would silently
                     // reselect whatever device happens to be first
                     // in `available_ports` on load. Refuse instead.
-                    app.status_message = "No port selected — cannot save bookmark".to_string();
+                    {
+                        let text = "No port selected — cannot save bookmark".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else {
                     app.rig_selection.naming_bookmark = false;
                     app.rig_selection.bookmark_name_input.clear();
@@ -1442,13 +1500,19 @@ impl TuiRunner {
                         baud_rate: app.rig_selection.selected_baud(),
                         ptt_method: app.rig_selection.selected_ptt(),
                     })?;
-                    app.status_message = "Saving bookmark…".to_string();
+                    {
+                        let text = "Saving bookmark…".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
             }
 
             Action::CancelBookmarkList => {
                 app.rig_selection.bookmark_overlay_visible = false;
-                app.status_message = "Load bookmark cancelled".to_string();
+                {
+                    let text = "Load bookmark cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::BookmarkListUp => {
@@ -1461,7 +1525,10 @@ impl TuiRunner {
 
             Action::LoadBookmark => {
                 if app.rig_selection.bookmarks.is_empty() {
-                    app.status_message = "No saved bookmarks".to_string();
+                    {
+                        let text = "No saved bookmarks".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else {
                     let idx = app.rig_selection.selected_bookmark_idx;
                     // I-12 fix (PAN-61 review round 5): load_bookmark
@@ -1475,10 +1542,16 @@ impl TuiRunner {
                     match app.rig_selection.load_bookmark(idx) {
                         Ok(()) => {
                             app.rig_selection.bookmark_overlay_visible = false;
-                            app.status_message = "Bookmark loaded — Enter to apply".to_string();
+                            {
+                                let text = "Bookmark loaded — Enter to apply".to_string();
+                                app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                            };
                         }
                         Err(reason) => {
-                            app.status_message = reason;
+                            {
+                                let text = reason;
+                                app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                            };
                         }
                     }
                 }
@@ -1493,7 +1566,10 @@ impl TuiRunner {
                     let name = bookmark.name.clone();
                     self.message_tx
                         .send(TuiCommand::DeleteRigBookmark { name })?;
-                    app.status_message = "Deleting bookmark…".to_string();
+                    {
+                        let text = "Deleting bookmark…".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
             }
 
@@ -1506,7 +1582,10 @@ impl TuiRunner {
                 // time the modal opens.
                 app.rig_selection.restore_committed();
                 app.rig_selection.visible = false;
-                app.status_message = "Rig config picker cancelled".to_string();
+                {
+                    let text = "Rig config picker cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::RigNextField => {
@@ -1532,15 +1611,21 @@ impl TuiRunner {
             Action::OpenBookmarkList => {
                 app.rig_selection.bookmark_overlay_visible = true;
                 app.rig_selection.selected_bookmark_idx = 0;
-                app.status_message =
-                    "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
-                        .to_string();
+                {
+                    let text =
+                        "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
+                            .to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::StartBookmarkName => {
                 app.rig_selection.naming_bookmark = true;
                 app.rig_selection.bookmark_name_input.clear();
-                app.status_message = "Name this bookmark (Enter: save, Esc: cancel)".to_string();
+                {
+                    let text = "Name this bookmark (Enter: save, Esc: cancel)".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::ApplyRig => {
@@ -1552,7 +1637,10 @@ impl TuiRunner {
                     // ~/.pancetta/pancetta.toml, destroying whatever
                     // was previously configured there. Refuse and keep
                     // the modal open instead.
-                    app.status_message = "No port selected — cannot apply".to_string();
+                    {
+                        let text = "No port selected — cannot apply".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else {
                     app.rig_selection.visible = false;
                     self.message_tx.send(TuiCommand::SelectRig {
@@ -1568,7 +1656,10 @@ impl TuiRunner {
                     // PAN-60 review: replies read before the coordinator
                     // handles this SelectRig must not revert the form.
                     app.rig_selection.submits_sent += 1;
-                    app.status_message = "Applying rig config…".to_string();
+                    {
+                        let text = "Applying rig config…".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
             }
 
@@ -1583,14 +1674,20 @@ impl TuiRunner {
             Action::SubmitWatchlist => {
                 let callsign = app.watchlist_modal.buffer.trim().to_uppercase();
                 if callsign.is_empty() {
-                    app.status_message = "Enter a callsign to watch".into();
+                    {
+                        let text = "Enter a callsign to watch".into();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 } else {
                     let action = if app.pinned_callsigns.contains(&callsign) {
                         "removed from"
                     } else {
                         "added to"
                     };
-                    app.status_message = format!("{callsign} {action} watchlist");
+                    {
+                        let text = format!("{callsign} {action} watchlist");
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                     self.message_tx
                         .send(TuiCommand::WatchlistToggle { callsign })?;
                     app.watchlist_modal.visible = false;
@@ -1599,7 +1696,10 @@ impl TuiRunner {
 
             Action::CancelFreqModal => {
                 app.freq_modal.visible = false;
-                app.status_message = "Frequency entry cancelled".to_string();
+                {
+                    let text = "Frequency entry cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::FreqModalSwitchField => {
@@ -1628,7 +1728,10 @@ impl TuiRunner {
                 let tx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.tx_buffer); // None = simplex
                 match rx_hz {
                     None => {
-                        app.status_message = "Invalid RX dial — enter MHz e.g. 14.085".to_string();
+                        {
+                            let text = "Invalid RX dial — enter MHz e.g. 14.085".to_string();
+                            app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                        };
                     }
                     Some(rx) => {
                         app.freq_modal.visible = false;
@@ -1655,14 +1758,17 @@ impl TuiRunner {
                             app.out_of_band_ack_visible = true;
                             app.out_of_band_rf_hz = tx_rf;
                         }
-                        app.status_message = if split_enabled {
-                            format!(
-                                "Dial {:.3} MHz, SPLIT TX {:.3} MHz",
-                                rx as f64 / 1e6,
-                                split_freq as f64 / 1e6
-                            )
-                        } else {
-                            format!("Dial {:.3} MHz (simplex)", rx as f64 / 1e6)
+                        {
+                            let text = if split_enabled {
+                                format!(
+                                    "Dial {:.3} MHz, SPLIT TX {:.3} MHz",
+                                    rx as f64 / 1e6,
+                                    split_freq as f64 / 1e6
+                                )
+                            } else {
+                                format!("Dial {:.3} MHz (simplex)", rx as f64 / 1e6)
+                            };
+                            app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
                         };
                         app.freq_modal.rx_buffer.clear();
                         app.freq_modal.tx_buffer.clear();
@@ -1673,7 +1779,10 @@ impl TuiRunner {
 
             Action::CancelOffsetModal => {
                 app.offset_modal.visible = false;
-                app.status_message = "TX offset entry cancelled".to_string();
+                {
+                    let text = "TX offset entry cancelled".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             Action::OffsetModalChar(c) => {
@@ -1692,7 +1801,10 @@ impl TuiRunner {
                     app.offset_modal.buffer.clear();
                     app.tx_offset_hold_hz = None;
                     app.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
-                    app.status_message = "TX offset auto (Tx=Rx)".to_string();
+                    {
+                        let text = "TX offset auto (Tx=Rx)".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                     self.message_tx
                         .send(TuiCommand::SetTxOffset { offset_hz: None })?;
                 } else {
@@ -1706,17 +1818,23 @@ impl TuiRunner {
                             app.offset_modal.buffer.clear();
                             app.tx_offset_hold_hz = Some(hz);
                             app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                            app.status_message = format!("TX offset held @ {} Hz", hz);
+                            {
+                                let text = format!("TX offset held @ {} Hz", hz);
+                                app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                            };
                             self.message_tx.send(TuiCommand::SetTxOffset {
                                 offset_hz: Some(hz),
                             })?;
                         }
                         _ => {
-                            app.status_message = format!(
-                                "Invalid offset — enter {} to {} Hz (blank = Auto)",
-                                crate::app::operator_tx_offset_range().0,
-                                crate::app::operator_tx_offset_range().1
-                            );
+                            {
+                                let text = format!(
+                                    "Invalid offset — enter {} to {} Hz (blank = Auto)",
+                                    crate::app::operator_tx_offset_range().0,
+                                    crate::app::operator_tx_offset_range().1
+                                );
+                                app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                            };
                         }
                     }
                 }
@@ -1737,7 +1855,10 @@ impl TuiRunner {
                     })?;
                     app.clear_input();
                     app.compose_mode = false;
-                    app.status_message = format!("TX sent: {}", text);
+                    {
+                        let text = format!("TX sent: {}", text);
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
             }
 
@@ -1811,7 +1932,10 @@ impl TuiRunner {
 
             Action::ClearStopBanner => {
                 app.stopped_by_operator = false;
-                app.status_message = "Operator-stop banner cleared".to_string();
+                {
+                    let text = "Operator-stop banner cleared".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                };
             }
 
             // `z` panel zoom: Esc restores the normal view layout (in
@@ -1819,7 +1943,10 @@ impl TuiRunner {
             // fires when nothing else claimed this Esc press above.
             Action::ClearZoom => {
                 app.zoomed = false;
-                app.status_message = "Zoom cleared".to_string();
+                {
+                    let text = "Zoom cleared".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // PAN-89: acknowledge every visible yellow readiness warning (and
@@ -1831,12 +1958,15 @@ impl TuiRunner {
                 let anything_visible = crate::readiness::readiness_items(&app)
                     .iter()
                     .any(|i| i.is_visible());
-                app.status_message = if acknowledged > 0 {
-                    format!("Acknowledged {acknowledged} warning(s) — Shift+S lists them")
-                } else if anything_visible {
-                    "Nothing to acknowledge — red items clear when resolved".to_string()
-                } else {
-                    "Nothing to acknowledge".to_string()
+                {
+                    let text = if acknowledged > 0 {
+                        format!("Acknowledged {acknowledged} warning(s) — Shift+S lists them")
+                    } else if anything_visible {
+                        "Nothing to acknowledge — red items clear when resolved".to_string()
+                    } else {
+                        "Nothing to acknowledge".to_string()
+                    };
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
                 };
             }
 
@@ -1881,11 +2011,17 @@ impl TuiRunner {
             // operator never needs a modifier.
             Action::JumpNewest => {
                 app.scroll_to_top();
-                app.status_message = "Jumped to newest (realtime)".to_string();
+                {
+                    let text = "Jumped to newest (realtime)".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::JumpOldest => {
                 app.scroll_to_bottom();
-                app.status_message = "Jumped to oldest".to_string();
+                {
+                    let text = "Jumped to oldest".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::ListPageUp => {
                 app.page_up();
@@ -1906,8 +2042,10 @@ impl TuiRunner {
             Action::PrevReplyStep => {
                 app.cycle_caller_reply(false);
                 let step = app.current_caller_reply_step();
-                app.status_message =
-                    format!("Reply step: {}", crate::presentation::reply_label(step));
+                {
+                    let text = format!("Reply step: {}", crate::presentation::reply_label(step));
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::PlacementCursorLeft => {
                 app.placement_cursor = app.placement_cursor.saturating_sub(1);
@@ -1915,8 +2053,10 @@ impl TuiRunner {
             Action::NextReplyStep => {
                 app.cycle_caller_reply(true);
                 let step = app.current_caller_reply_step();
-                app.status_message =
-                    format!("Reply step: {}", crate::presentation::reply_label(step));
+                {
+                    let text = format!("Reply step: {}", crate::presentation::reply_label(step));
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::PlacementCursorRight => {
                 if let Some(max_index) = app
@@ -1934,14 +2074,20 @@ impl TuiRunner {
                     crate::app::operator_tx_offset_range().0 as f64,
                     crate::app::operator_tx_offset_range().1 as f64,
                 );
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                {
+                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::TxOffsetUp => {
                 app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).clamp(
                     crate::app::operator_tx_offset_range().0 as f64,
                     crate::app::operator_tx_offset_range().1 as f64,
                 );
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                {
+                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // Band switching: = = band up (+ dropped; Shift not required),
@@ -1971,30 +2117,48 @@ impl TuiRunner {
             // 5=Placement.
             Action::FocusBandActivity => {
                 app.active_panel = crate::app::ActivePanel::BandActivity;
-                app.status_message = "Panel: Band Activity".to_string();
+                {
+                    let text = "Panel: Band Activity".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::FocusQsoStatus => {
                 app.active_panel = crate::app::ActivePanel::QsoStatus;
-                app.status_message = "Panel: QSO Status".to_string();
+                {
+                    let text = "Panel: QSO Status".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::FocusCallers => {
                 app.active_panel = crate::app::ActivePanel::Callers;
-                app.status_message = "Panel: Callers".to_string();
+                {
+                    let text = "Panel: Callers".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::FocusDxHunter => {
                 app.active_panel = crate::app::ActivePanel::DxHunter;
-                app.status_message = "Panel: DX Hunter".to_string();
+                {
+                    let text = "Panel: DX Hunter".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::FocusTxPlacement => {
                 app.active_panel = crate::app::ActivePanel::TxPlacement;
-                app.status_message = "Panel: TX Placement".to_string();
+                {
+                    let text = "Panel: TX Placement".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // === Quit (with confirm modal) ===
             Action::OpenQuitConfirm => {
                 app.quit_confirm_visible = true;
-                app.status_message =
-                    "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
+                {
+                    let text =
+                        "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // Shift+Q (emergency stop) resolves in the Global scope, ahead of
@@ -2011,12 +2175,18 @@ impl TuiRunner {
                 if app.device_selection.input_devices.is_empty()
                     && app.device_selection.output_devices.is_empty()
                 {
-                    app.status_message =
-                        "No audio devices reported — check coordinator connection".to_string();
+                    {
+                        let text =
+                            "No audio devices reported — check coordinator connection".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 } else {
-                    app.status_message =
-                        "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
-                            .to_string();
+                    {
+                        let text =
+                            "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
+                                .to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
             }
             Action::OpenRigPicker => {
@@ -2026,9 +2196,11 @@ impl TuiRunner {
                 // correct values to restore.
                 app.rig_selection.snapshot_committed();
                 app.rig_selection.visible = true;
-                app.status_message =
-                    "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
+                {
+                    let text = "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
                 // PAN-60: ask the coordinator to re-enumerate serial ports
                 // so a rig plugged in after startup is listed. The reply
                 // lands a frame or two later; `apply_rig_config_update`
@@ -2100,14 +2272,23 @@ impl TuiRunner {
                         dx_parity,
                         fox_grid,
                     })?;
-                    app.status_message = format!("Hound: engaging {} as Fox...", callsign);
+                    {
+                        let text = format!("Hound: engaging {} as Fox...", callsign);
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 } else {
-                    app.status_message = "No DX station selected for Hound".to_string();
+                    {
+                        let text = "No DX station selected for Hound".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 }
             }
             Action::HoundFocusHint => {
-                app.status_message =
-                    "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
+                {
+                    let text =
+                        "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             // Shift+X — toggle Fox (DXpedition) mode. Lowercase `x` is taken
             // by ClearMessages, so Fox uses Shift+X (spec's documented fallback).
@@ -2128,8 +2309,11 @@ impl TuiRunner {
                 // relay enforces the real ON-transition gate. PTT-OFF is never
                 // blocked there.
                 if !app.tx_policy.allows_any_tx() {
-                    app.status_message =
-                        "Can't key PTT — TX is DISABLED (press g to re-enable)".to_string();
+                    {
+                        let text =
+                            "Can't key PTT — TX is DISABLED (press g to re-enable)".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else {
                     self.message_tx.send(TuiCommand::TogglePtt)?;
                 }
@@ -2143,10 +2327,16 @@ impl TuiRunner {
             Action::ResendLastTx => match (app.selected_qso_id(), app.selected_qso_callsign()) {
                 (Some(qso_id), Some(call)) => {
                     self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
-                    app.status_message = format!("Re-sending last TX to {}", call);
+                    {
+                        let text = format!("Re-sending last TX to {}", call);
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
                 _ => {
-                    app.status_message = "No active QSO to re-send".to_string();
+                    {
+                        let text = "No active QSO to re-send".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 }
             },
             // k - kill/abort the selected QSO, from ANY panel (PAN-21). The
@@ -2188,7 +2378,10 @@ impl TuiRunner {
             }
             // r pressed outside the QSO Status panel: hint, don't act.
             Action::ResendFocusHint => {
-                app.status_message = "Focus the QSO Status panel (2) to re-send (r)".to_string();
+                {
+                    let text = "Focus the QSO Status panel (2) to re-send (r)".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // === Tune / clear-offset (case-sensitive) ===
@@ -2200,8 +2393,10 @@ impl TuiRunner {
                 // in flight while Disabled — cycling to Disabled aborts any
                 // active tune — so blocking the toggle wholesale is safe.
                 if !app.tx_policy.allows_any_tx() {
-                    app.status_message =
-                        "Can't tune — TX is DISABLED (press g to re-enable)".to_string();
+                    {
+                        let text = "Can't tune — TX is DISABLED (press g to re-enable)".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 } else {
                     self.message_tx.send(TuiCommand::ToggleTune)?;
                 }
@@ -2229,20 +2424,26 @@ impl TuiRunner {
                         app.tx_offset_hold_hz = Some(hz_u64);
                         app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
                         app.parked_since = Some(chrono::Utc::now());
-                        app.status_message = if is_clear {
-                            format!("TX cursor → {:.0} Hz (clear, held)", hz)
-                        } else {
-                            format!(
-                                "TX cursor → {:.0} Hz (best available — band is busy, held)",
-                                hz
-                            )
+                        {
+                            let text = if is_clear {
+                                format!("TX cursor → {:.0} Hz (clear, held)", hz)
+                            } else {
+                                format!(
+                                    "TX cursor → {:.0} Hz (best available — band is busy, held)",
+                                    hz
+                                )
+                            };
+                            app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
                         };
                         self.message_tx.send(TuiCommand::SetTxOffset {
                             offset_hz: Some(hz_u64),
                         })?;
                     }
                     None => {
-                        app.status_message = "No TX offset available".to_string();
+                        {
+                            let text = "No TX offset available".to_string();
+                            app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                        };
                     }
                 }
             }
@@ -2286,13 +2487,19 @@ impl TuiRunner {
                 let band = pancetta_core::Band::from_frequency(frequency)
                     .map(|band| band.to_string())
                     .unwrap_or_else(|| "unknown band".into());
-                app.status_message = format!("Saving {} gain preset…", band);
+                {
+                    let text = format!("Saving {} gain preset…", band);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
                 self.message_tx.send(TuiCommand::SaveReceiveGainPreset)?;
             }
             Action::CycleTxPolicy => {
                 let next = app.tx_policy.cycle();
                 app.tx_policy = next;
-                app.status_message = format!("TX policy: {}", next.label());
+                {
+                    let text = format!("TX policy: {}", next.label());
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
                 self.message_tx.send(TuiCommand::CycleTxPolicy)?;
             }
 
@@ -2331,10 +2538,13 @@ impl TuiRunner {
             // back off (Esc also clears it; see the guarded Esc arm above).
             Action::ToggleZoom => {
                 app.zoomed = !app.zoomed;
-                app.status_message = if app.zoomed {
-                    "Panel zoomed".to_string()
-                } else {
-                    "Zoom cleared".to_string()
+                {
+                    let text = if app.zoomed {
+                        "Panel zoomed".to_string()
+                    } else {
+                        "Zoom cleared".to_string()
+                    };
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
                 };
             }
             // f - toggle TX-frequency mode Hold ↔ Auto. Hold (default) keeps the
@@ -2344,7 +2554,10 @@ impl TuiRunner {
             Action::ToggleTxFreqMode => {
                 let next = app.tx_freq_mode.toggle();
                 app.tx_freq_mode = next;
-                app.status_message = format!("TX freq: {}", next.label());
+                {
+                    let text = format!("TX freq: {}", next.label());
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
                 self.message_tx.send(TuiCommand::ToggleTxFreqMode)?;
             }
             // Shift+F — open the arbitrary-frequency / split entry modal.
@@ -2353,7 +2566,10 @@ impl TuiRunner {
                 app.freq_modal.field = crate::app::FreqModalField::RxDial;
                 app.freq_modal.rx_buffer.clear();
                 app.freq_modal.tx_buffer.clear();
-                app.status_message = "Freq entry: dial MHz, Tab→split, Enter, Esc".to_string();
+                {
+                    let text = "Freq entry: dial MHz, Tab→split, Enter, Esc".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             // `o` — open the TX-audio-offset modal. Prompts for an integer Hz
             // value in the operator range; blank Enter = clear (→ Auto). Mirrors the
@@ -2373,11 +2589,14 @@ impl TuiRunner {
             Action::OpenOffsetModal => {
                 app.offset_modal.visible = true;
                 app.offset_modal.buffer.clear();
-                app.status_message = format!(
-                    "TX offset: enter Hz ({}–{}), blank=Auto, Enter, Esc",
-                    crate::app::operator_tx_offset_range().0,
-                    crate::app::operator_tx_offset_range().1
-                );
+                {
+                    let text = format!(
+                        "TX offset: enter Hz ({}–{}), blank=Auto, Enter, Esc",
+                        crate::app::operator_tx_offset_range().0,
+                        crate::app::operator_tx_offset_range().1
+                    );
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::ToggleMonitoring => {
                 app.toggle_monitoring().await?;
@@ -2433,11 +2652,14 @@ impl TuiRunner {
                         step,
                         snr,
                     })?;
-                    app.status_message = format!(
-                        "Replying {} to {}",
-                        crate::app::reply_step_label(step),
-                        callsign
-                    );
+                    {
+                        let text = format!(
+                            "Replying {} to {}",
+                            crate::app::reply_step_label(step),
+                            callsign
+                        );
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
                 Some(crate::app::SpaceAction::Call {
                     callsign,
@@ -2449,7 +2671,10 @@ impl TuiRunner {
                         frequency,
                         dx_parity,
                     })?;
-                    app.status_message = format!("Calling {}...", callsign);
+                    {
+                        let text = format!("Calling {}...", callsign);
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 }
                 // PAN-287: a DX Hunter network spot — the coordinator QSYs
                 // to its dial (after PTT-off when keyed), then calls.
@@ -2463,12 +2688,15 @@ impl TuiRunner {
                         Some(o) => format!("{o} Hz"),
                         None => "auto offset".to_string(),
                     };
-                    app.status_message = format!(
-                        "Calling {} — {} {:.3} MHz @ {}...",
-                        callsign,
-                        band,
-                        dial_hz as f64 / 1_000_000.0,
-                        offset
+                    app.set_local_status(
+                        format!(
+                            "Calling {} — {} {:.3} MHz @ {}...",
+                            callsign,
+                            band,
+                            dial_hz as f64 / 1_000_000.0,
+                            offset
+                        ),
+                        pancetta_core::DiagnosticLevel::Info,
                     );
                     self.message_tx.send(TuiCommand::CallNetworkSpot {
                         callsign,
@@ -2480,14 +2708,17 @@ impl TuiRunner {
                 // PAN-287: the spot can't be called in the active mode;
                 // nothing is sent.
                 Some(crate::app::SpaceAction::Refused { message }) => {
-                    app.status_message = message;
+                    app.set_local_status(message, pancetta_core::DiagnosticLevel::Warn);
                 }
                 None => {
-                    app.status_message = match app.focused_callsign() {
-                        Some(call) if app.is_engaged(&call) => {
-                            format!("{} already has an active QSO — cancel it first", call)
-                        }
-                        _ => "No station selected".to_string(),
+                    {
+                        let text = match app.focused_callsign() {
+                            Some(call) if app.is_engaged(&call) => {
+                                format!("{} already has an active QSO — cancel it first", call)
+                            }
+                            _ => "No station selected".to_string(),
+                        };
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
                     };
                 }
             },
@@ -2518,13 +2749,19 @@ impl TuiRunner {
                         step,
                         snr,
                     })?;
-                    app.status_message = format!(
-                        "Replying to {} ({})",
-                        callsign,
-                        crate::presentation::reply_label(step)
-                    );
+                    {
+                        let text = format!(
+                            "Replying to {} ({})",
+                            callsign,
+                            crate::presentation::reply_label(step)
+                        );
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                 } else {
-                    app.status_message = "No caller selected".to_string();
+                    {
+                        let text = "No caller selected".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 }
             }
             Action::ParkAtPlacement => {
@@ -2542,16 +2779,25 @@ impl TuiRunner {
                     app.tx_offset_hold_hz = Some(hz);
                     app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
                     app.parked_since = Some(chrono::Utc::now());
-                    app.status_message = format!("Parked at {hz} Hz ({coverage})");
+                    {
+                        let text = format!("Parked at {hz} Hz ({coverage})");
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                    };
                     self.message_tx.send(TuiCommand::SetTxOffset {
                         offset_hz: Some(hz),
                     })?;
                 } else {
-                    app.status_message = "No placement candidate selected".to_string();
+                    {
+                        let text = "No placement candidate selected".to_string();
+                        app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                    };
                 }
             }
             Action::ComposeHint => {
-                app.status_message = "Press / to compose a free-text TX message".to_string();
+                {
+                    let text = "Press / to compose a free-text TX message".to_string();
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
         }
 
@@ -2561,6 +2807,7 @@ impl TuiRunner {
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
         let mut app = self.app.write().await;
+        app.prune_status();
         app.refresh_dx_need(self.dx_need_lookup.as_deref());
 
         let Some(terminal) = self.terminal.as_mut() else {
@@ -3397,6 +3644,49 @@ mod key_tests {
         std::sync::atomic::AtomicU64::new(0);
 
     #[tokio::test]
+    async fn pan351_health_recovery_removes_only_matching_warning() {
+        use pancetta_core::DiagnosticLevel::{Info, Warn};
+        let (mut runner, _, app) = make_runner().await;
+        // Both conditions can be active. Recovering one must leave the other.
+        for (code, component) in [(101, "dsp"), (102, "audio")] {
+            runner
+                .handle_message(TuiMessage::CodedStatusUpdate {
+                    component: component.into(),
+                    status: "fault".into(),
+                    level: Warn,
+                    code,
+                })
+                .await
+                .unwrap();
+        }
+        runner
+            .handle_message(TuiMessage::CodedStatusUpdate {
+                component: "audio".into(),
+                status: "restored".into(),
+                level: Info,
+                code: 102,
+            })
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.status_message(), "dsp: fault");
+        runner
+            .handle_message(TuiMessage::CodedStatusUpdate {
+                component: "dsp".into(),
+                status: "resumed".into(),
+                level: Info,
+                code: 101,
+            })
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert_eq!(a.selected_status(), Some(("dsp: resumed", Info)));
+        assert!(
+            a.alerts.is_empty(),
+            "transient health feedback must not create strip alerts"
+        );
+    }
+
+    #[tokio::test]
     async fn contest_score_ignores_old_generation_and_survives_status_updates() {
         use pancetta_qso::contest::ledger::*;
         let (mut runner, _, app) = make_runner().await;
@@ -3423,6 +3713,8 @@ mod key_tests {
             .handle_message(TuiMessage::StatusUpdate {
                 component: "qso".into(),
                 status: "update".into(),
+
+                level: pancetta_core::DiagnosticLevel::Info,
             })
             .await
             .unwrap();
@@ -3437,6 +3729,175 @@ mod key_tests {
             .await
             .unwrap();
         assert_eq!(app.read().await.contest_score.as_ref(), Some(&recovered));
+    }
+
+    #[tokio::test]
+    async fn pan351_error_survives_decodes_and_service_info() {
+        let (mut r, _, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Logbook".into(),
+            message: "ADIF write failed".into(),
+            code: Some(351),
+        })
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 28).await;
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "Autonomous".into(),
+            status: "Idle".into(),
+            level: pancetta_core::DiagnosticLevel::Info,
+        })
+        .await
+        .unwrap();
+        r.handle_message(TuiMessage::DecodeEffortUpdate {
+            effort: "DEEP".into(),
+            budget_ms: 1000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.status_message(),
+            "Error: ADIF write failed"
+        );
+    }
+    #[tokio::test]
+    async fn pan351_status_message_levels() {
+        for level in [
+            pancetta_core::DiagnosticLevel::Info,
+            pancetta_core::DiagnosticLevel::Warn,
+        ] {
+            let (mut r, _, app) = make_runner().await;
+            r.handle_message(TuiMessage::StatusUpdate {
+                component: "Test".into(),
+                status: "feedback".into(),
+                level,
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.read().await.selected_status().unwrap().1, level);
+        }
+        let (mut r, _, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Test".into(),
+            message: "failure".into(),
+            code: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.selected_status().unwrap().1,
+            pancetta_core::DiagnosticLevel::Error
+        );
+    }
+    #[tokio::test]
+    async fn pan351_idle_frame_prunes_expired_status() {
+        let (mut r, _, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.clear_status_for_test();
+            a.status_test_push(
+                "old",
+                pancetta_core::DiagnosticLevel::Info,
+                std::time::Instant::now() - Duration::from_secs(5),
+            );
+            assert_eq!(a.status_test_len(), 1);
+        }
+        r.render_frame().await.unwrap();
+        let a = app.read().await;
+        assert_eq!(a.status_test_len(), 0);
+        assert!(a.status_message().is_empty());
+    }
+    #[tokio::test]
+    async fn pan351_resolve_and_acknowledge_status() {
+        let (mut r, _, app) = make_runner().await;
+        for (code, message) in [(1, "one"), (2, "two")] {
+            r.handle_message(TuiMessage::Error {
+                component: "Audio".into(),
+                message: message.into(),
+                code: Some(code),
+            })
+            .await
+            .unwrap();
+        }
+        r.handle_message(TuiMessage::ErrorResolved {
+            component: "Audio".into(),
+            code: 1,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.read().await.status_message(), "Error: two");
+        {
+            let mut a = app.write().await;
+            a.set_local_status("key echo".into(), pancetta_core::DiagnosticLevel::Info);
+            a.acknowledge_readiness();
+            a.status_test_prune(std::time::Instant::now() + Duration::from_secs(5));
+            assert!(a.selected_status().is_none());
+        }
+        // Resolution still clears a transient whose readiness identity was evicted.
+        {
+            let mut a = app.write().await;
+            a.add_coded_error_message("lost alert".into(), Some(3));
+            a.alerts.clear();
+        }
+        r.handle_message(TuiMessage::ErrorResolved {
+            component: "Audio".into(),
+            code: 3,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.status_message(),
+            "Audio recovered — alert cleared"
+        );
+        // More than eight errors evict the oldest transient but not its readiness alert.
+        {
+            let mut a = app.write().await;
+            a.add_coded_error_message("failure 10".into(), Some(10));
+            for code in 11..19 {
+                a.status_test_push(
+                    &format!("Error: failure {code}"),
+                    pancetta_core::DiagnosticLevel::Error,
+                    std::time::Instant::now(),
+                );
+            }
+            assert!(a.alerts.iter().any(|a| a.code == Some(10)));
+            assert_eq!(a.resolve_alerts(10), 1);
+            assert_eq!(a.status_message(), "Error: failure 18");
+            a.acknowledge_readiness();
+        }
+        // Recovery still clears readiness when the transient has already expired.
+        {
+            let mut a = app.write().await;
+            a.add_coded_error_message("expired transient".into(), Some(4));
+            a.status_test_prune(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        r.handle_message(TuiMessage::ErrorResolved {
+            component: "Audio".into(),
+            code: 4,
+        })
+        .await
+        .unwrap();
+        assert!(app.read().await.alerts.iter().all(|a| a.code != Some(4)));
+    }
+    #[tokio::test]
+    async fn pan351_status_expiry_preserves_readiness() {
+        let (_, _, app) = make_runner().await;
+        let mut a = app.write().await;
+        a.add_coded_error_message("sticky".into(), Some(351));
+        let before = crate::readiness::readiness_items(&a);
+        a.status_test_prune(std::time::Instant::now() + Duration::from_secs(30));
+        assert_eq!(a.alerts.len(), 1);
+        assert!(!a.alerts[0].acknowledged);
+        assert_eq!(crate::readiness::readiness_items(&a), before);
+        for i in 0..28 {
+            a.status_test_push(
+                &i.to_string(),
+                pancetta_core::DiagnosticLevel::Info,
+                std::time::Instant::now(),
+            );
+        }
+        assert_eq!(a.alerts.len(), 1);
+        assert!(!a.alerts[0].acknowledged);
     }
 
     #[tokio::test]
@@ -3816,7 +4277,7 @@ mod key_tests {
         for c in ['G', 'W', 'w'] {
             for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
                 let (mut runner, cmd_rx, app) = make_runner().await;
-                let before = app.read().await.status_message.clone();
+                let before = app.read().await.status_message().clone();
                 runner
                     .handle_key_event(KeyEvent::new(KeyCode::Char(c), mods))
                     .await
@@ -3829,7 +4290,8 @@ mod key_tests {
                 );
                 assert!(!app.show_why, "{c:?}+{mods:?} opened Why");
                 assert_eq!(
-                    app.status_message, before,
+                    app.status_message(),
+                    before,
                     "{c:?}+{mods:?} wrote the status line"
                 );
                 assert!(runner.dispatched.is_empty());
@@ -3988,7 +4450,7 @@ mod key_tests {
         r.handle_key_event(key_shift('!')).await.unwrap();
         let app = app.read().await;
         assert_eq!(
-            app.status_message,
+            app.status_message(),
             "Acknowledged 1 warning(s) — Shift+S lists them"
         );
         assert!(app
@@ -4009,7 +4471,7 @@ mod key_tests {
         r.handle_key_event(key('!')).await.unwrap();
         let app = app.read().await;
         assert_eq!(
-            app.status_message,
+            app.status_message(),
             "Nothing to acknowledge — red items clear when resolved"
         );
         assert!(app.acknowledged_readiness.is_empty());
@@ -4029,7 +4491,7 @@ mod key_tests {
         r.handle_key_event(key_shift('!')).await.unwrap();
         let app = app.read().await;
         assert!(app.acknowledged_readiness.is_empty());
-        assert!(!app.status_message.contains("cknowledge"));
+        assert!(!app.status_message().contains("cknowledge"));
     }
 
     /// Gherkin Scenario 1: a durable blocker survives incoming decode
@@ -4119,6 +4581,8 @@ mod key_tests {
         r.handle_message(TuiMessage::StatusUpdate {
             component: "QSO".to_string(),
             status: "Calling K1ABC".to_string(),
+
+            level: pancetta_core::DiagnosticLevel::Info,
         })
         .await
         .unwrap();
@@ -4164,6 +4628,8 @@ mod key_tests {
         r.handle_message(TuiMessage::StatusUpdate {
             component: "QSO".to_string(),
             status: "Calling K1ABC".to_string(),
+
+            level: pancetta_core::DiagnosticLevel::Info,
         })
         .await
         .unwrap();
@@ -4289,7 +4755,7 @@ mod key_tests {
             assert!(!a.quit_confirm_visible);
             assert!(!a.help_visible);
             assert!(!a.compose_mode);
-            a.status_message.clone()
+            a.status_message().clone()
         };
         for modified_key in [key_ctrl('c'), key_alt('c')] {
             r.handle_key_event(modified_key).await.unwrap();
@@ -4297,7 +4763,7 @@ mod key_tests {
                 cmd_rx.try_recv().is_err(),
                 "{modified_key:?} must not start CQ"
             );
-            assert_eq!(app.read().await.status_message, status_before);
+            assert_eq!(app.read().await.status_message(), status_before);
         }
         r.handle_key_event(key('c')).await.unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
@@ -4340,7 +4806,7 @@ mod key_tests {
                         a.clamp_dx_hunter_selection();
                         assert_eq!(a.focused_callsign().as_deref(), Some("VK9XX"));
                     }
-                    a.status_message.clone()
+                    a.status_message().clone()
                 };
                 r.handle_key_event(modified_key).await.unwrap();
                 assert!(
@@ -4349,7 +4815,8 @@ mod key_tests {
                 );
                 let a = app.read().await;
                 assert_eq!(
-                    a.status_message, status_before,
+                    a.status_message(),
+                    status_before,
                     "{modified_key:?} on {panel:?}"
                 );
                 assert_eq!(a.tx_policy, TxPolicy::Full, "{modified_key:?}");
@@ -4369,7 +4836,7 @@ mod key_tests {
             a.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
             a.active_panel = crate::app::ActivePanel::QsoStatus;
             a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
-            a.status_message.clone()
+            a.status_message().clone()
         };
         for modified_key in [key_ctrl('u'), key_alt('u')] {
             r.handle_key_event(modified_key).await.unwrap();
@@ -4378,7 +4845,7 @@ mod key_tests {
                 "{modified_key:?} must not nudge (and re-key) the TX offset"
             );
             let a = app.read().await;
-            assert_eq!(a.status_message, status_before, "{modified_key:?}");
+            assert_eq!(a.status_message(), status_before, "{modified_key:?}");
             assert_eq!(a.tx_freq_mode, pancetta_core::TxFreqMode::Auto);
         }
         r.handle_key_event(key('u')).await.unwrap();
@@ -4416,7 +4883,7 @@ mod key_tests {
                 });
             a.callers_scroll = 0;
             assert!(a.get_selected_station().is_some());
-            a.status_message.clone()
+            a.status_message().clone()
         };
         for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             let modified_key = KeyEvent::new(KeyCode::Enter, modifier);
@@ -4425,7 +4892,7 @@ mod key_tests {
                 cmd_rx.try_recv().is_err(),
                 "{modified_key:?} on Callers must not reply"
             );
-            assert_eq!(app.read().await.status_message, status_before);
+            assert_eq!(app.read().await.status_message(), status_before);
         }
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -4614,7 +5081,7 @@ mod key_tests {
         app.write().await.active_view = crate::view::ActiveView::Operate;
         r.handle_key_event(key('v')).await.unwrap();
         assert_eq!(app.read().await.active_view, crate::view::ActiveView::Hunt);
-        assert_eq!(app.read().await.status_message, "Hunt view");
+        assert_eq!(app.read().await.status_message(), "Hunt view");
         assert!(
             cmd_rx.try_recv().is_err(),
             "view cycling is local-only, no coordinator command should be sent"
@@ -4929,7 +5396,7 @@ mod key_tests {
         assert!(cmd_rx.try_recv().is_err(), "first press must not clear yet");
         assert!(app.read().await.clear_armed_at.is_some());
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "press x again within 3s to clear decodes"
         );
 
@@ -5790,6 +6257,7 @@ mod key_tests {
         r.handle_message(TuiMessage::StatusUpdate {
             component: "dsp".into(),
             status: "decoding".into(),
+            level: pancetta_core::DiagnosticLevel::Info,
         })
         .await
         .unwrap();
@@ -5993,7 +6461,7 @@ mod key_tests {
             .unwrap();
         {
             let mut a = app.write().await;
-            a.status_message.clear();
+            a.clear_status_for_test();
         }
 
         // A fresh snapshot where the bin nearest 500 Hz (now unheld) is
@@ -6007,9 +6475,9 @@ mod key_tests {
 
         let a = app.read().await;
         assert!(
-            !a.status_message.contains("parked 500"),
+            !a.status_message().contains("parked 500"),
             "must not warn about the OLD 500 Hz frequency after re-park to 920: {}",
-            a.status_message
+            a.status_message()
         );
     }
 
@@ -6167,7 +6635,7 @@ mod key_tests {
             cmd_rx.try_recv().is_err(),
             "p must not emit TogglePtt while TX is Disabled"
         );
-        assert!(app.read().await.status_message.contains("Can't key PTT"));
+        assert!(app.read().await.status_message().contains("Can't key PTT"));
     }
 
     /// `p` still keys PTT under Full / RespondOnly.
@@ -6189,7 +6657,7 @@ mod key_tests {
             cmd_rx.try_recv().is_err(),
             "Shift+T must not emit ToggleTune while TX is Disabled"
         );
-        assert!(app.read().await.status_message.contains("Can't tune"));
+        assert!(app.read().await.status_message().contains("Can't tune"));
     }
 
     // === PAN-21: global `k` abort ===================================
@@ -6211,7 +6679,7 @@ mod key_tests {
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         let a = app.read().await;
-        assert!(a.status_message.contains("W1AW"));
+        assert!(a.status_message().contains("W1AW"));
         assert_eq!(
             a.active_panel,
             crate::app::ActivePanel::DxHunter,
@@ -6248,7 +6716,7 @@ mod key_tests {
         ));
         assert!(cmd_rx.try_recv().is_err(), "exactly one command per k");
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             format!("Aborting QSO with {selected_call}")
         );
 
@@ -6308,7 +6776,7 @@ mod key_tests {
             cmd_rx.try_recv(),
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
-        assert!(app.read().await.status_message.contains("W1AW"));
+        assert!(app.read().await.status_message().contains("W1AW"));
     }
 
     /// PAN-21 round-2 remediation (Codex P1): crossterm reports Ctrl+K /
@@ -6331,7 +6799,7 @@ mod key_tests {
                 "{modified_key:?} must not abort the QSO"
             );
             assert!(
-                !app.read().await.status_message.contains("Aborting"),
+                !app.read().await.status_message().contains("Aborting"),
                 "{modified_key:?} must not even attempt an abort status update"
             );
         }
@@ -6443,7 +6911,7 @@ mod key_tests {
             assert!(
                 app.read()
                     .await
-                    .status_message
+                    .status_message()
                     .contains("No active QSO to abort"),
                 "expected the no-active-QSO hint from {panel:?}"
             );
@@ -6884,7 +7352,7 @@ mod key_tests {
         }
         r.handle_key_event(key('r')).await.unwrap();
         assert!(cmd_rx.try_recv().is_err(), "r gated off DX Hunter panel");
-        let msg = app.read().await.status_message.clone();
+        let msg = app.read().await.status_message().clone();
         assert!(
             msg.contains("re-send"),
             "hint should mention re-send: {msg}"
@@ -7060,7 +7528,7 @@ mod key_tests {
             other => panic!("Expected EngageHound, got {:?}", other),
         }
         assert!(
-            app.read().await.status_message.contains("VK9XX"),
+            app.read().await.status_message().contains("VK9XX"),
             "status message echoes the Fox callsign"
         );
     }
@@ -7077,7 +7545,7 @@ mod key_tests {
             "Shift+H outside DX Hunter must not emit EngageHound"
         );
         assert!(
-            app.read().await.status_message.contains("DX Hunter"),
+            app.read().await.status_message().contains("DX Hunter"),
             "shows a panel-focus hint"
         );
     }
@@ -7098,7 +7566,7 @@ mod key_tests {
             "Shift+H with no station selected must not emit EngageHound"
         );
         assert!(
-            app.read().await.status_message.contains("selected"),
+            app.read().await.status_message().contains("selected"),
             "shows a 'no station selected' hint"
         );
     }
@@ -7111,7 +7579,10 @@ mod key_tests {
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.read().await.status_message, "Enter a callsign to watch");
+        assert_eq!(
+            app.read().await.status_message(),
+            "Enter a callsign to watch"
+        );
         assert!(app.read().await.watchlist_modal.visible);
         for c in " vp8pj ".chars() {
             r.handle_key_event(key(c)).await.unwrap();
@@ -7120,7 +7591,10 @@ mod key_tests {
             .await
             .unwrap();
         assert!(!app.read().await.watchlist_modal.visible);
-        assert_eq!(app.read().await.status_message, "VP8PJ added to watchlist");
+        assert_eq!(
+            app.read().await.status_message(),
+            "VP8PJ added to watchlist"
+        );
         assert!(
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::WatchlistToggle { callsign }) if callsign == "VP8PJ")
         );
@@ -7131,7 +7605,7 @@ mod key_tests {
             .await
             .unwrap();
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "VP8PJ removed from watchlist"
         );
         assert!(
@@ -7223,7 +7697,7 @@ mod key_tests {
         let a = app.read().await;
         assert!(a.offset_modal.visible, "modal stays open on bad input");
         assert!(
-            a.status_message.contains("Invalid"),
+            a.status_message().contains("Invalid"),
             "status message says invalid"
         );
         drop(a);
@@ -7238,7 +7712,7 @@ mod key_tests {
         for input in ["200", "2800", "199", "2801", "abc", "18446744073709551616"] {
             let (mut r, cmd_rx, app) = make_runner().await;
             r.handle_key_event(key('o')).await.unwrap();
-            assert!(app.read().await.status_message.contains("200–2800"));
+            assert!(app.read().await.status_message().contains("200–2800"));
             app.write().await.offset_modal.buffer = input.to_string();
             r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .await
@@ -7246,14 +7720,14 @@ mod key_tests {
             let a = app.read().await;
             if let Ok(hz @ (200 | 2800)) = input.parse::<u64>() {
                 assert!(!a.offset_modal.visible);
-                assert_eq!(a.status_message, format!("TX offset held @ {hz} Hz"));
+                assert_eq!(a.status_message(), format!("TX offset held @ {hz} Hz"));
                 assert!(
                     matches!(cmd_rx.try_recv(), Ok(TuiCommand::SetTxOffset { offset_hz: Some(v) }) if v == hz)
                 );
             } else {
                 assert!(a.offset_modal.visible);
                 assert_eq!(
-                    a.status_message,
+                    a.status_message(),
                     "Invalid offset — enter 200 to 2800 Hz (blank = Auto)"
                 );
                 assert!(cmd_rx.try_recv().is_err());
@@ -7488,14 +7962,14 @@ mod key_tests {
             "mode flipped to Hold"
         );
         assert!(
-            a.status_message.contains("Parked at 920 Hz"),
+            a.status_message().contains("Parked at 920 Hz"),
             "status message announces park: {}",
-            a.status_message
+            a.status_message()
         );
         assert!(
-            a.status_message.contains('O'),
+            a.status_message().contains('O'),
             "status message includes the O coverage label: {}",
-            a.status_message
+            a.status_message()
         );
         drop(a);
         assert!(
@@ -7730,9 +8204,9 @@ mod key_tests {
             "FoxModeUpdate must never auto-switch the operator's view"
         );
         assert!(
-            a.status_message.contains("press v"),
+            a.status_message().contains("press v"),
             "expected a hint to press v, got: {}",
-            a.status_message
+            a.status_message()
         );
     }
 
@@ -7849,7 +8323,7 @@ mod key_tests {
             other => panic!("Expected CallNetworkSpot, got {:?}", other),
         }
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "Calling ZL1ABC — 20M 14.074 MHz @ 1210 Hz..."
         );
     }
@@ -7867,7 +8341,7 @@ mod key_tests {
             other => panic!("Expected CallNetworkSpot, got {:?}", other),
         }
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "Calling ZL1ABC — 20M 14.074 MHz @ auto offset..."
         );
     }
@@ -7884,7 +8358,7 @@ mod key_tests {
             "a refused spot sends no command"
         );
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "Can't call ZL1ABC — spot 14.0250 MHz is not on the 20M FT8 sub-band"
         );
     }
@@ -7990,7 +8464,7 @@ mod key_tests {
         );
         let a = app.read().await;
         assert_eq!(
-            a.status_message,
+            a.status_message(),
             "JA1ABC already has an active QSO — cancel it first"
         );
     }
@@ -8112,7 +8586,7 @@ mod key_tests {
             app.rig_selection.visible,
             "the modal must stay open when the submission is refused"
         );
-        assert!(app.status_message.contains("No port selected"));
+        assert!(app.status_message().contains("No port selected"));
     }
 
     /// I-3 fix (PAN-59 final review): Esc after an abandoned edit must
@@ -8704,7 +9178,7 @@ mod key_tests {
             commands.try_recv(),
             Ok(TuiCommand::SaveReceiveGainPreset)
         ));
-        assert_eq!(app.read().await.status_message, "Saving 15m gain preset…");
+        assert_eq!(app.read().await.status_message(), "Saving 15m gain preset…");
         assert!(crate::keymap::KEYBINDINGS
             .iter()
             .any(|binding| binding.key == "G" && binding.action.contains("save gain preset")));

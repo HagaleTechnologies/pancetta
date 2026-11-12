@@ -89,6 +89,8 @@ coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
 
+PAN-351: transient statuses expire independently of readiness alerts. Pass an explicit severity through the bus and use Relay for service feedback. Local feedback may temporarily cover a held error. Do not restore decode echoes or use transient expiry to clear readiness.
+
 Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
 only marks a grid when both rows have the same canonical square. A later rover
 locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full

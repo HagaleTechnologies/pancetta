@@ -35,6 +35,8 @@ mod health;
 mod pipeline;
 mod psk_reporter;
 mod qso;
+#[doc(hidden)]
+pub use qso::{prepare_local_qso_index, LocalIndex};
 mod qso_filter;
 mod qso_upload_status;
 mod raw_capture;
@@ -2639,6 +2641,9 @@ impl ApplicationCoordinator {
             qso_consumer_ready: tokio::sync::watch::channel(false).0,
         };
 
+        coordinator
+            .cached_lookup
+            .set_needed_means(coordinator.config.read().await.autonomous.needed_means);
         info!("Application Coordinator initialized with ID: {}", id);
         Ok(coordinator)
     }
@@ -2833,9 +2838,10 @@ impl ApplicationCoordinator {
             info!(
                 target: "priority",
                 "needed fallback: home entity {} (from {}); the local logbook answers \
-                 needed and ATNO until cqdx.io loads",
+                 needed and ATNO when selected by the local needed policy {:?}",
                 home.unwrap_or("unknown"),
-                operator_callsign
+                operator_callsign,
+                self.config.read().await.autonomous.needed_means
             );
         }
 

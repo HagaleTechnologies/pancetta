@@ -138,6 +138,21 @@ pub struct AdifParse {
     pub records: Vec<Result<AdifRecord, AdifRecordError>>,
     /// The unit this file's lengths were read in (PAN-214).
     pub length_unit: LengthUnit,
+    pub(crate) spans: Vec<RecordSpans>,
+    pub(crate) unsafe_syntax: bool,
+    pub(crate) header_seen: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RecordSpans {
+    pub fields: Vec<FieldSpan>,
+    pub terminator: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct FieldSpan {
+    pub name: String,
+    pub whole: std::ops::Range<usize>,
 }
 
 /// ADIF file header
@@ -406,6 +421,9 @@ impl AdifProcessor {
         let mut error: Option<AdifError> = None;
         let mut against = 0;
         let mut pos = 0;
+        let mut spans = Vec::new();
+        let mut field_spans = Vec::new();
+        let mut unsafe_syntax = false;
 
         loop {
             let tag = next_tag(data, pos);
@@ -414,6 +432,7 @@ impl AdifProcessor {
             // makes the record unreadable instead (PR #451 review).
             let scanned_to = tag.map_or(data.len(), |(open, _)| open);
             if let Some((start, end)) = abandoned_field_tag(data, pos, scanned_to) {
+                unsafe_syntax = true;
                 error.get_or_insert(AdifError::InvalidField {
                     field: decode(data, text, start, end).trim_end().to_string(),
                 });
@@ -425,19 +444,28 @@ impl AdifProcessor {
             pos = close + 1;
 
             if spec.eq_ignore_ascii_case("EOH") {
+                unsafe_syntax |= !records.is_empty() || header_fields.is_some();
                 // The header holds nothing records need, so its field errors
                 // are dropped rather than reported against a record.
                 if records.is_empty() && header_fields.is_none() {
                     header_fields = Some(std::mem::take(&mut fields));
                     error = None;
+                    field_spans.clear();
                 }
                 continue;
             }
             if spec.eq_ignore_ascii_case("EOR") {
+                if !fields.is_empty() || error.is_some() {
+                    spans.push(RecordSpans {
+                        fields: std::mem::take(&mut field_spans),
+                        terminator: open,
+                    });
+                }
                 push_record(&mut records, &mut fields, &mut error);
                 continue;
             }
             if spec.is_empty() {
+                unsafe_syntax = true;
                 continue;
             }
 
@@ -449,6 +477,7 @@ impl AdifProcessor {
                 // non-numeric one: reading it as zero would import the
                 // contact with the value silently dropped (PR #451 review).
                 None | Some(Err(_)) => {
+                    unsafe_syntax = true;
                     // First error wins; the text up to the next tag is skipped.
                     error.get_or_insert(AdifError::InvalidField {
                         field: spec.clone(),
@@ -466,6 +495,10 @@ impl AdifProcessor {
                 } => {
                     against += usize::from(contradicts);
                     pos = end;
+                    field_spans.push(FieldSpan {
+                        name: name.clone(),
+                        whole: open..end,
+                    });
                     fields.insert(
                         name.clone(),
                         AdifField {
@@ -481,6 +514,7 @@ impl AdifProcessor {
                 // would have swallowed still closes this record and the next
                 // one reads (PAN-214).
                 Cut::Mismatch => {
+                    unsafe_syntax = true;
                     error.get_or_insert(AdifError::LengthMismatch {
                         field: spec.clone(),
                     });
@@ -489,12 +523,22 @@ impl AdifProcessor {
         }
 
         // A trailing record with no <EOR> still counts.
+        if !fields.is_empty() || error.is_some() {
+            spans.push(RecordSpans {
+                fields: field_spans,
+                terminator: data.len(),
+            });
+        }
         push_record(&mut records, &mut fields, &mut error);
 
+        let header_seen = header_fields.is_some();
         let parsed = AdifParse {
             header: self.header_from_fields(header_fields.unwrap_or_default()),
             records,
             length_unit: unit,
+            spans,
+            unsafe_syntax,
+            header_seen,
         };
         (parsed, against)
     }

@@ -239,7 +239,7 @@ raw_capture_minutes = 30
 
 ```toml
 [rig]
-model = "FTdx10"            # Display name; Pancetta maps to a hamlib model ID
+model = "FTdx10"            # Hamlib model name or numeric ID; see below
 
 [rig.interface]
 enabled = true              # false → mock rig, no real PTT or freq readback
@@ -249,10 +249,17 @@ baud_rate = 38400
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `model` | string | `"Generic"` | Set to a name from [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md) (`FTdx10`, `IC-7300`, etc.) so Pancetta can resolve the Hamlib model number and start `rigctld`. |
+| `model` | string | `"Generic"` | A model name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, ...) or a numeric Hamlib model ID (`"1045"`). Case, hyphens and spaces are ignored; ambiguous names require the numeric ID; for an all-digit model name include the manufacturer (`"Barrett 950"`). Unknown, malformed or ambiguous values fail validation with the closest matches and numeric-ID hint. Empty and `"Generic"` stay placeholders (no model check). See [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md). |
 | `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
 | `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
+
+`rig.model` resolution is offline: Pancetta matches against a Hamlib 4.5.5
+model list vendored in this repository, not against your installed Hamlib.
+`rigctl -l` lists the models your installed Hamlib supports; a numeric ID
+also works for models newer than the bundled catalog. Names must be spelled
+as `rigctl -l` prints them (spaces included); the match itself ignores case,
+hyphens and spaces.
 
 ### Optional rig data mode
 
@@ -548,6 +555,29 @@ exemption.
 > always both: answer scored CQs above `min_dx_score`, and fall back to
 > calling CQ after `cq_after_idle_cycles` idle cycles. Startup now warns
 > about unknown top-level sections, so a stale config will tell you.
+
+### Local confirmation policy
+
+`[autonomous] needed_means = "unworked"` is the default. It keeps cqdx-first
+needed status and the local never-worked fallback. Set `needed_means =
+"unconfirmed"` to evaluate need from local confirmations after the logbook has
+loaded. It applies even with autonomous disabled and requires a restart.
+Unsupported values are errors.
+
+A positive `QSL_RCVD` or `LOTW_QSL_RCVD` of Y or V confirms an entity.
+Global need means no confirmation on any band; band need means no confirmation
+on that band, across modes. ATNO remains never worked. eQSL alone does not count.
+Before the first successful local seed, cqdx and unknown behavior are unchanged.
+
+Use `pancetta import-confirmations lotw-report.adi` for your own LoTW report.
+It requires a unique call/band/effective-mode match within 30 UTC minutes and a
+positive confirmation with a valid date. It adds no contacts. Conflicting pairs
+and ambiguous matches are skipped with diagnostics. It writes a verified backup
+and restart rebuild marker before changing the logbook in place. Restart to apply
+the changes; no running index or cache is refreshed. For interrupted writes, stop
+the station, restore the printed backup to `qsos.adi` and keep the marker for the
+next start. Ordinary import undo refuses a block altered by this merge. See
+README's LoTW confirmations section for field rules and recovery details.
 
 ### `[autonomous.priorities]` — what to prioritize
 

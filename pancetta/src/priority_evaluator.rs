@@ -194,9 +194,10 @@ pub struct CachedStationLookup {
     /// Network last-seen timestamps: callsign -> unix timestamp.
     network_last_seen: Arc<RwLock<HashMap<String, i64>>>,
     /// PAN-347: per-entity worked, confirmed and per-mode sets from the
-    /// local logbook, with whether its first full read has succeeded. While
-    /// no cqdx list has loaded, it answers needed and ATNO.
+    /// local logbook, with whether its first full read has succeeded.
+    /// Answers need according to the selected local policy.
     local_log: Arc<RwLock<LocalLog>>,
+    needed_means: Arc<RwLock<pancetta_config::NeededMeans>>,
     /// PAN-347: the operator's own DXCC entity, from `[station] callsign`.
     /// Never needed, ATNO, new on band or new in mode. Replaces the
     /// letter-prefix exclusions that treated KH6/KL7/KP4 as home.
@@ -236,12 +237,26 @@ impl CachedStationLookup {
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
             local_log: Arc::new(RwLock::new(LocalLog::default())),
+            needed_means: Arc::new(RwLock::new(pancetta_config::NeededMeans::Unworked)),
             home_entity: Arc::new(RwLock::new(None)),
             station_states: Arc::new(RwLock::new(HashMap::new())),
             worked_states: Arc::new(RwLock::new(HashSet::new())),
             grid_history_available: Arc::new(RwLock::new(false)),
             state_history_available: Arc::new(RwLock::new(false)),
         }
+    }
+
+    /// Set the local needed policy before components begin scoring.
+    pub fn set_needed_means(&self, policy: pancetta_config::NeededMeans) {
+        *self.needed_means.write() = policy;
+    }
+
+    fn confirmation_policy(&self) -> bool {
+        *self.needed_means.read() == pancetta_config::NeededMeans::Unconfirmed
+    }
+
+    fn local_is_atno(&self, entity: Option<&str>) -> bool {
+        entity.is_some_and(|e| !self.is_home_entity(Some(e)) && !self.local_log.read().is_worked(e))
     }
 
     /// PAN-347: the operator's own DXCC entity, never needed, ATNO, new on
@@ -634,9 +649,9 @@ impl CachedStationLookup {
         )
     }
 
-    /// PAN-347: needed-entity verdict and who answered. cqdx once its list
-    /// loaded; else the local logbook once seeded, for a call that resolves
-    /// to an entity; else `(Unknown, Guess)`.
+    /// Needed-entity verdict and source. The unconfirmed policy uses a
+    /// successfully seeded local log first; the default prefers cqdx.
+    /// Without either answer this returns `(Unknown, Guess)`.
     pub fn dxcc_need_verdict(&self, callsign: &str) -> (NeedStatus, NeedSource) {
         let Some(upper) = resolved_identity(callsign) else {
             return (NeedStatus::Unknown, NeedSource::Guess);
@@ -645,8 +660,8 @@ impl CachedStationLookup {
         self.verdict_for(&upper, entity)
     }
 
-    /// PAN-347: `(needed, atno)` for the local TUI: cqdx's answer, else the
-    /// local logbook's, never the scorer's guess.
+    /// `(needed, atno)` for the local TUI under the configured policy.
+    /// Never exposes the scorer's guess as a known verdict.
     pub fn needed_atno_shown(&self, callsign: &str) -> (bool, bool) {
         let Some(call) = resolved_identity(callsign) else {
             return (false, false);
@@ -656,7 +671,7 @@ impl CachedStationLookup {
             (NeedStatus::Needed, NeedSource::Cqdx) => {
                 (true, self.needed_atno.read().matches(&call, entity))
             }
-            (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, true),
+            (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, self.local_is_atno(entity)),
             _ => (false, false),
         }
     }
@@ -665,7 +680,9 @@ impl CachedStationLookup {
     /// so a per-frame caller resolves nothing (PAN-284).
     fn verdict_for(&self, upper: &str, entity: Option<&'static str>) -> (NeedStatus, NeedSource) {
         let cqdx = self.needed_status_for(upper, entity);
-        if cqdx != NeedStatus::Unknown {
+        if cqdx != NeedStatus::Unknown
+            && !(self.confirmation_policy() && self.local_log_available() && entity.is_some())
+        {
             return (cqdx, NeedSource::Cqdx);
         }
         let Some(entity) = entity else {
@@ -676,7 +693,11 @@ impl CachedStationLookup {
             if !log.available {
                 return (NeedStatus::Unknown, NeedSource::Guess);
             }
-            log.is_worked(entity)
+            if self.confirmation_policy() {
+                log.is_confirmed(entity)
+            } else {
+                log.is_worked(entity)
+            }
         };
         if worked || self.is_home_entity(Some(entity)) {
             (NeedStatus::NotNeeded, NeedSource::LocalLogbook)
@@ -793,7 +814,11 @@ impl CachedStationLookup {
         date: DateTime<Utc>,
     ) {
         if let Some(entity) = self.record_worked_at(callsign, band, date) {
-            self.local_log.write().record(entity, mode, confirmed);
+            let mut log = self.local_log.write();
+            log.record(entity, mode, confirmed);
+            if confirmed {
+                log.record_confirmation_on_band(entity, band);
+            }
         }
     }
 
@@ -920,6 +945,8 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
             dxcc_source,
             entity_standing,
             new_mode,
+            unconfirmed_policy: (source == NeedSource::LocalLogbook && self.confirmation_policy())
+                .then_some(true),
         }
     }
 }
@@ -992,14 +1019,13 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_atno(&self, callsign: &str) -> bool {
-        // PAN-347: the local logbook's ATNO is its needed verdict (never
-        // logged on any band or mode); otherwise cqdx's ATNO list.
+        // Confirmation need cannot turn a worked entity into ATNO.
         let Some(call) = resolved_identity(callsign) else {
             return false;
         };
         let entity = pancetta_core::dxcc::entity_for_callsign(&call);
         match self.verdict_for(&call, entity) {
-            (status, NeedSource::LocalLogbook) => status == NeedStatus::Needed,
+            (_, NeedSource::LocalLogbook) => self.local_is_atno(entity),
             _ => self.needed_atno.read().matches(&call, entity),
         }
     }
@@ -1029,7 +1055,7 @@ impl WorkedStationLookup for CachedStationLookup {
         // instead: with no real per-band evidence, this signal contributes
         // nothing, and `needed_dxcc` correctly falls back to the reliable
         // global `is_needed_dxcc` check alone.
-        if freq_hz <= 0.0 {
+        if !freq_hz.is_finite() || freq_hz <= 0.0 {
             return false;
         }
 
@@ -1053,6 +1079,12 @@ impl WorkedStationLookup for CachedStationLookup {
             return false;
         }
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
+        if band.ends_with("MHZ") {
+            return false;
+        }
+        if self.confirmation_policy() && self.local_log_available() {
+            return !self.local_log.read().is_confirmed_on_band(entity, &band);
+        }
         let worked = self.worked_dxcc_on_band.read();
         !worked
             .get(&band)
@@ -2759,5 +2791,117 @@ pub(crate) mod test_support {
         l.set_home_entity(pancetta_core::dxcc::entity_for_callsign(operator));
         l.seed_worked_history(&db).await.unwrap();
         (tmp, l)
+    }
+}
+
+#[cfg(test)]
+mod pan348 {
+    use super::test_support::{adif, seeded_lookup};
+    use super::*;
+    use pancetta_config::NeededMeans;
+    use pancetta_qso::priority::{PriorityScorer, PriorityTier, PriorityWeights};
+
+    #[tokio::test]
+    async fn confirmation_policy_shares_subdivision_identity() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("TA1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        l.set_needed_means(NeededMeans::Unconfirmed);
+        assert_eq!(l.needed_atno_shown("TA2ABC"), (true, false));
+        assert!(!l.is_atno("TA2ABC"));
+        l.record_logged_contact("TA2ABC", "20M", "FT8", true, Utc::now());
+        for call in ["TA1ABC", "TA2ABC"] {
+            assert_eq!(l.needed_atno_shown(call), (false, false));
+            assert!(!l.is_needed_dxcc(call));
+            assert!(!l.is_dxcc_needed_on_band(call, 14_074_000.0));
+            assert!(l.is_dxcc_needed_on_band(call, 7_074_000.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_need_is_entity_and_band_scoped() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("DL1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        assert!(!l.is_needed_dxcc("DL1XYZ"));
+        l.set_needed_means(NeededMeans::Unconfirmed);
+        assert!(l.is_needed_dxcc("DL1XYZ"));
+        assert!(l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
+        l.record_logged_contact("DL2ABC", "40m", "FT4", true, Utc::now());
+        assert!(!l.is_needed_dxcc("DL1XYZ"));
+        assert!(l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
+        assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 7_074_000.0));
+        l.record_logged_contact("DA1ABC", "20m", "FT4", true, Utc::now());
+        assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
+        assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 0.0));
+        assert!(!l.is_dxcc_needed_on_band("DL1XYZ", f64::NAN));
+        assert!(!l.is_dxcc_needed_on_band("Q1ABC", 14_074_000.0));
+        assert!(!l.is_needed_dxcc("K1ABC"));
+        l.record_logged_contact("DL3ABC", "20M", "FT8", false, Utc::now());
+        assert!(!l.is_dxcc_needed_on_band("DL1XYZ", 14_074_000.0));
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_need_does_not_create_atno() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("DL1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        l.set_needed_means(NeededMeans::Unconfirmed);
+        let clone = l.clone();
+        assert_eq!(clone.needed_atno_shown("DL1XYZ"), (true, false));
+        assert!(!clone.is_atno("DL1XYZ"));
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(clone));
+        assert_eq!(
+            scorer
+                .score_tiered_explained("DL1XYZ", None, -10, 14_074_000.0)
+                .score
+                .tier,
+            PriorityTier::PerBandDxccNew
+        );
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (true, true));
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq_manual("ZL1ABC".into(), 14_074_000.0, None)
+            .await
+            .unwrap();
+        let metadata = manager.get_qso(id).await.unwrap().metadata;
+        l.record_completed_contact(&metadata);
+        assert_eq!(l.needed_atno_shown("ZL1ABC"), (true, false));
+        assert!(l.is_dxcc_needed_on_band("ZL1ABC", 14_074_000.0));
+    }
+
+    #[tokio::test]
+    async fn confirmation_policy_precedence_and_wire_isolation() {
+        let l = CachedStationLookup::new();
+        l.set_needed_means(NeededMeans::Unconfirmed);
+        l.update_needed_dxcc(HashSet::new());
+        assert_eq!(
+            l.dxcc_need_verdict("DL1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::Cqdx)
+        );
+        let failed = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        failed.close().await;
+        assert!(l.seed_worked_history(&failed).await.is_err());
+        assert!(!l.local_log_available());
+        assert_eq!(
+            l.dxcc_need_verdict("DL1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::Cqdx)
+        );
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        l.seed_worked_history(&db).await.unwrap();
+        assert_eq!(
+            l.dxcc_need_verdict("DL1XYZ"),
+            (NeedStatus::Needed, NeedSource::LocalLogbook)
+        );
+        assert_eq!(l.display_needed_atno("DL1XYZ"), (false, false));
+        db.close().await;
+        assert!(l.seed_worked_history(&db).await.is_err());
+        assert_eq!(l.needed_atno_shown("DL1XYZ"), (true, true));
+        l.set_needed_means(NeededMeans::Unworked);
+        assert_eq!(
+            l.dxcc_need_verdict("DL1XYZ"),
+            (NeedStatus::NotNeeded, NeedSource::Cqdx)
+        );
     }
 }
