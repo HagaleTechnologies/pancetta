@@ -642,7 +642,7 @@ pub fn render_supported_rigs_markdown() -> String {
 
     out.push_str(
         "\n## What the columns mean\n\n\
-         - CAT: Pancetta reads and sets frequency and split, and keys PTT, through `rigctld`. Pancetta does not set the rig mode.\n\
+         - CAT: Pancetta controls frequency, split and PTT. Optional `[rig] data_mode` sets the CAT mode on connection and after commanded retunes. Omit it for manual mode control. This option is hardware-unverified.\n\
          - Audio: Pancetta decodes from and transmits into the rig's USB sound device, which you pick as input and output in `pancetta setup`. Pancetta has no rig-specific audio code.\n\
          - TX: Pancetta keys the rig and sends FT8 on air.\n\
          - Tested: used on a real station with this rig, as recorded in the README [Capability status](../README.md#capability-status) table.\n\

@@ -1,8 +1,9 @@
 # QSO-engine bugs — triage (2026-07-03)
 
+Historical triage. Both primary bugs are fixed; see [QSO-engine decisions](../DECISIONS/qso-engine.md). Callsigns in examples have been normalized. The secondary self-decode observation below is historical and is not claimed fixed.
+
 Two operator-reported live bugs in the autonomous/always-answer QSO path, both
-root-caused against the running `main` checkout's logs and the code. **Triage only —
-not yet fixed.** Both are in the always-on QSO engine, so they affect real on-air
+root-caused against the running `main` checkout's logs and the code. **Historical triage, before the fixes.** Both are in the always-on QSO engine, so they affect real on-air
 operation regardless of the autonomous toggle.
 
 ---
@@ -55,15 +56,15 @@ in the interim.
 (who is still an earlier stage) — the contact stalls or completes incorrectly.
 
 **Evidence (log `~/.pancetta/logs/pancetta.log.2026-07-03`, QSO 237952e5 @ 1650 Hz,
-us=K5ARH, DX=KJ5NJF):**
+us=W5AU, DX=KJ5NJF):**
 
 | Time | Event |
 |---|---|
-| 03:09:44 | RX `K5ARH KJ5NJF EM12` — KJ5NJF answers us with grid |
-| 03:09:44 | We answer at step Report → TX `KJ5NJF K5ARH -14` (our report) |
-| 03:10:02, :22, :42, 03:11:02… | We TX `KJ5NJF K5ARH R-14` **every slot** — no DX report received |
-| 03:10:13 | RX `K5ARH KJ5NJF EM12` — DX is **still sending grid** (never copied our report) |
-| 03:12:14 | RX `K5ARH KJ5NJF R-10` — DX *finally* sends a report (2+ min later) |
+| 03:09:44 | RX `W5AU KJ5NJF EM12` — KJ5NJF answers us with grid |
+| 03:09:44 | We answer at step Report → TX `KJ5NJF W5AU -14` (our report) |
+| 03:10:02, :22, :42, 03:11:02… | We TX `KJ5NJF W5AU R-14` **every slot** — no DX report received |
+| 03:10:13 | RX `W5AU KJ5NJF EM12` — DX is **still sending grid** (never copied our report) |
+| 03:12:14 | RX `W5AU KJ5NJF R-10` — DX *finally* sends a report (2+ min later) |
 
 The `R-14` sends are the **per-slot keep-call rearm**, not decode-triggered (they fire
 at regular ~15 s ticks; the only decode in between was our own transmission echoed
@@ -110,5 +111,5 @@ whole class of self-advance risks cheaply. Worth adding alongside the BUG-2 fix.
 ---
 
 *Both bugs were triaged read-only: `main`-checkout **logs** were read via
-`~/.pancetta/logs/`, and all code was read in the working checkout. No fix has been
-applied — these are queued for implementation.*
+`~/.pancetta/logs/`, and all code was read in the working checkout. No fix had been
+applied at the time of this triage.*

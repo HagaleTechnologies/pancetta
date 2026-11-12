@@ -66,10 +66,6 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).
 
-<!-- TODO (maintainer): drop a PSKReporter map capture at assets/pskreporter.png
-     and reference it here as on-air proof. Requires a real pskreporter.info
-     session, so it could not be captured automatically. -->
-
 ## What it looks like
 
 Every capture below — and the GIF further down, and the hero GIF above — was
@@ -317,15 +313,15 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT. Optional `rig.data_mode` applies the CAT mode before TX at connection and after commanded retunes; this new option is hardware-unverified. Omit it for manual rig-mode control. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
-| SWR protection | Integration-tested, *Unreleased* | Halts all TX on one SWR reading above `max_swr` (default 3.0) while keyed; needs CAT. Mock rig and fake `rigctld` only; no real-rig trip recorded | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
+| SWR protection | Integration-tested, *Unreleased* | Halts all TX after high-SWR keyed time reaches `swr_trip_delay_ms`, default 5000 ms, above `max_swr`, default 3.0. High keyed time accumulates across transmissions; unkeyed time does not count. A reading at or below the limit resets it, as does more than two minutes without a high reading. Zero delay trips on the first high reading. CAT support is required; real-rig trip qualification is pending. | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
 | Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
-| ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Retry mechanism is *Unreleased*. ClubLog, QRZ, eQSL and cqdx.io uploads use a persistent outbox. Transient failures retry on `[network.reliability.retry]`, then every five minutes. Login rejection pauses a destination for the session; record rejection holds that entry until restart. Startup drains pending entries. LoTW remains a single TQSL attempt outside the outbox. Local ADIF remains the durable log. | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
 | LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
-| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
+| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info. Queue bounds and datagram chunking are tested; live delivery is unverified | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
@@ -356,8 +352,8 @@ Honest gaps, so you can judge whether it fits your station:
 
 - **Pre-1.0.** Config keys, CLI surface, and on-disk formats can still change
   between releases.
-- **Uploads are best-effort.** A failed upload is logged and not retried;
-  see [Capability status](#capability-status).
+- Upload retries are *Unreleased*. ClubLog, QRZ, eQSL and cqdx.io uploads use a persistent outbox. Transient failures retry on `[network.reliability.retry]`, then every five minutes. Login rejection pauses a destination for the session; record rejection holds that entry until restart. Startup drains pending entries. LoTW remains a single TQSL attempt outside the outbox. Local ADIF remains the durable log.
+  Service qualification limits remain in [Capability status](#capability-status).
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
   Linux, deployed on a Windows 11 MiniPC. Prebuilt Linux aarch64 binaries are
   published for Pi-class ARM, but real-hardware validation (the
