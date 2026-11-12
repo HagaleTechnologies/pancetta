@@ -146,16 +146,19 @@ fn show_fails_on_auto_discovered_invalid_config() {
 
 #[test]
 fn validate_and_doctor_agree_on_broken_file() {
-    let s = Scratch::new();
-    s.write_default_config(SYNTAX_ERROR);
-    let validate = s.validate(None);
-    let doctor = s.command().arg("doctor").output().unwrap();
-    assert!(
-        !validate.status.success(),
-        "validate: {}",
-        stdout(&validate)
-    );
-    assert!(!doctor.status.success(), "doctor: {}", stdout(&doctor));
+    for broken in [SYNTAX_ERROR, "[autonomous]\ncq_after_idle_cycles = 0\n"] {
+        let s = Scratch::new();
+        s.write_default_config(broken);
+        let validate = s.validate(None);
+        let doctor = s.command().arg("doctor").output().unwrap();
+        assert!(
+            !validate.status.success(),
+            "validate: {}",
+            stdout(&validate)
+        );
+        assert_eq!(doctor.status.code(), Some(3), "doctor: {}", stdout(&doctor));
+        assert!(stdout(&doctor).contains("Result: NOT READY."));
+    }
 }
 
 /// Gherkin scenario 1, end to end: the README toggle, auto-discovered.
@@ -308,6 +311,7 @@ fn generate_creates_missing_parent_directories_owner_only() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn doctor_lists_field_checks() {
     let scratch = Scratch::new();
     let out = scratch.command().arg("doctor").output().unwrap();
@@ -333,5 +337,83 @@ fn doctor_lists_field_checks() {
     assert!(text.contains("not applicable on this OS") || cfg!(target_os = "macos"));
     for line in text.lines().filter(|line| line.contains("fix:")) {
         assert!(line.starts_with("       fix: "));
+=======
+fn doctor_missing_config_exits_2() {
+    let s = Scratch::new();
+    for explicit in [false, true] {
+        let mut cmd = s.command();
+        if explicit {
+            cmd.arg("--config").arg(s.home.path().join("missing.toml"));
+        }
+        let out = cmd.arg("doctor").output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+        assert!(stdout(&out).contains(
+            "Result: NOT CONFIGURED. Run `pancetta setup`, then re-run `pancetta doctor`."
+        ));
+    }
+}
+
+fn assert_doctor_json(out: &std::process::Output, verdict: &str, code: i32) {
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: stdout={} stderr={}", stdout(out), stderr(out)));
+    assert_eq!(out.status.code(), Some(code));
+    assert_eq!(report["verdict"], verdict);
+    assert_eq!(report["exit_code"], code);
+    assert!(report["config_path"].is_string());
+    let checks = report["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 7);
+    for check in checks {
+        assert!(check["name"].is_string());
+        assert!(["PASS", "WARN", "FAIL"].contains(&check["status"].as_str().unwrap()));
+        assert!(check["detail"].is_string());
+        assert!(check.as_object().unwrap().contains_key("fix"));
+        assert!(check["fix"].is_null() || check["fix"].is_string());
+    }
+    assert!(out.stdout.ends_with(b"\n"));
+}
+
+#[test]
+fn doctor_json_is_one_document() {
+    let s = Scratch::new();
+    let missing = s.command().args(["doctor", "--json"]).output().unwrap();
+    assert_doctor_json(&missing, "NOT CONFIGURED", 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let path = s
+            .home
+            .path()
+            .join(std::ffi::OsString::from_vec(b"missing-\xff.toml".to_vec()));
+        let out = s
+            .command()
+            .arg("--config")
+            .arg(&path)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        assert_doctor_json(&out, "NOT CONFIGURED", 2);
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["config_path"], path.to_string_lossy().as_ref());
+    }
+    s.write_default_config(SYNTAX_ERROR);
+    let invalid = s.command().args(["doctor", "--json"]).output().unwrap();
+    assert_doctor_json(&invalid, "NOT READY", 3);
+}
+
+#[test]
+fn doctor_json_logging_stays_on_stderr() {
+    let s = Scratch::new();
+    for format in ["text", "json"] {
+        for verbose in [false, true] {
+            let mut cmd = s.command();
+            cmd.args(["--log-format", format]);
+            if verbose {
+                cmd.arg("--verbose");
+            }
+            let out = cmd.args(["doctor", "--json"]).output().unwrap();
+            assert_doctor_json(&out, "NOT CONFIGURED", 2);
+            assert!(stderr(&out).contains("Starting Pancetta"));
+        }
+>>>>>>> 271f785b629d38e7f07350848cba3f517343e546
     }
 }

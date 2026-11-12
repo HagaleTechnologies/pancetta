@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-core
 //!
 //! Shared types, errors, and utilities used by every other crate in the workspace.
@@ -31,6 +32,7 @@ mod dxcc_registry;
 mod dxcc_table;
 pub mod error;
 pub mod freq_bin;
+pub mod ft8_tokens;
 pub mod gridsquare;
 pub mod response_step;
 pub mod slot;

@@ -383,7 +383,7 @@ jobs:
         # pancetta-research is a local-only iteration harness (CLAUDE.md): never
         # built in CI. Excluded explicitly so its research internals never gate
         # or ship through the public CI lane.
-        run: cargo clippy --workspace --exclude pancetta-research --features transmit
+        run: cargo clippy --workspace --exclude pancetta-research --all-targets --features transmit -- -D clippy::undocumented_unsafe_blocks
 
   fmt:
     name: Format
@@ -547,6 +547,12 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --exclude pancetta-research --features transmit
+
+      - name: Real TX worker integration tests
+        run: cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
+
+      - name: Real TX worker integration clippy
+        run: cargo clippy -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
 
       # PAN-284: one DXCC entity lookup must stay under 2 µs on the CI host.
       # CI builds no other bench; this one is an acceptance criterion. The rm

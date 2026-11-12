@@ -248,19 +248,13 @@ impl AudioManager {
 
     /// Stop audio processing
     pub fn stop(&mut self) -> Result<(), AudioError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.process_handle.take() {
+            // Cancellation is requested synchronously; Tokio drops the task at its next yield.
+            handle.abort();
+        }
         if let Some(ref mut stream) = self.stream {
             info!("Stopping audio stream");
-            self.shutdown.store(true, Ordering::Relaxed);
-
-            // Stop the processing task
-            if let Some(handle) = self.process_handle.take() {
-                // rationale: `stop` is sync; the handle is dropped (aborting the task
-                // on drop) rather than awaited. Preserving existing behavior — this is
-                // lint hygiene only, not a logic change.
-                #[allow(clippy::let_underscore_future)]
-                let _ = tokio::time::timeout(Duration::from_secs(1), handle);
-            }
-
             stream.stop()?;
             info!("Audio stream stopped");
         }
@@ -818,6 +812,55 @@ pub enum AudioCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_cancels_processing_task_within_one_second() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        for without_stream in [false, true] {
+            let mut manager = AudioManager::new().expect("device-free construction");
+            if without_stream {
+                manager.stream = None;
+            }
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _notify = NotifyOnDrop(Some(drop_tx));
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let cleanup = handle.abort_handle();
+            manager.process_handle = Some(handle);
+            ready_rx.await.unwrap();
+            manager.stop().unwrap();
+            let cancelled = tokio::time::timeout(Duration::from_secs(1), drop_rx).await;
+            cleanup.abort();
+            assert!(
+                cancelled.is_ok(),
+                "stop left the processing task alive after one second"
+            );
+            cancelled.unwrap().unwrap();
+            assert!(manager.process_handle.is_none());
+            assert!(manager.shutdown.load(Ordering::Relaxed));
+            manager.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn stop_without_processing_task_is_idempotent() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        manager.stream = None;
+        manager.stop().unwrap();
+        manager.stop().unwrap();
+        assert!(manager.process_handle.is_none());
+        assert!(manager.shutdown.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn queue_output_marked_reports_played_after_the_callback_pops_the_buffer() {

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-dx
 //!
 //! Network integrations for amateur radio data sources that don't fit
@@ -79,7 +80,7 @@ pub type Result<T> = std::result::Result<T, DxError>;
 
 /// DX hunting specific errors
 #[derive(Error, Debug)]
-pub enum DxError {
+pub enum DxErrorInner {
     #[error("Network error: {0}")]
     Network(#[from] NetworkError),
 
@@ -132,12 +133,28 @@ pub enum DxError {
     Format(#[from] std::fmt::Error),
 }
 
+/// A pointer-sized DX failure with a borrowed inspection API.
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub struct DxError(Box<DxErrorInner>);
+
+impl From<DxErrorInner> for DxError {
+    fn from(inner: DxErrorInner) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
 impl DxError {
+    /// Inspect the failure without moving it out of its box.
+    pub fn kind(&self) -> &DxErrorInner {
+        &self.0
+    }
+
     /// Whether a retry of the failed upload can help (PAN-57).
     pub fn upload_failure_class(&self) -> UploadFailureClass {
-        match self {
-            DxError::Upload { class, .. } => *class,
-            DxError::ResponseTooLarge { .. } => UploadFailureClass::RecordRejected,
+        match self.kind() {
+            DxErrorInner::Upload { class, .. } => *class,
+            DxErrorInner::ResponseTooLarge { .. } => UploadFailureClass::RecordRejected,
             // Network, Parse, Io, …: retrying never loses data.
             _ => UploadFailureClass::Transient,
         }
@@ -146,10 +163,58 @@ impl DxError {
     /// The operator-facing failure text: the message alone for `Upload`,
     /// otherwise `Display`.
     pub fn upload_failure_text(&self) -> String {
-        match self {
-            DxError::Upload { message, .. } => message.clone(),
+        match self.kind() {
+            DxErrorInner::Upload { message, .. } => message.clone(),
             other => other.to_string(),
         }
+    }
+}
+
+impl From<NetworkError> for DxError {
+    fn from(error: NetworkError) -> Self {
+        DxErrorInner::Network(error).into()
+    }
+}
+
+impl From<std::io::Error> for DxError {
+    fn from(error: std::io::Error) -> Self {
+        DxErrorInner::Io(error).into()
+    }
+}
+
+impl From<serde_json::Error> for DxError {
+    fn from(error: serde_json::Error) -> Self {
+        DxErrorInner::Serialization(error).into()
+    }
+}
+
+impl From<csv::Error> for DxError {
+    fn from(error: csv::Error) -> Self {
+        DxErrorInner::Csv(error).into()
+    }
+}
+
+impl From<quick_xml::Error> for DxError {
+    fn from(error: quick_xml::Error) -> Self {
+        DxErrorInner::Xml(error).into()
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for DxError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        DxErrorInner::WebSocket(error).into()
+    }
+}
+
+impl From<tokio::task::JoinError> for DxError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        DxErrorInner::Join(error).into()
+    }
+}
+
+impl From<std::fmt::Error> for DxError {
+    fn from(error: std::fmt::Error) -> Self {
+        DxErrorInner::Format(error).into()
     }
 }
 
@@ -157,7 +222,7 @@ impl DxError {
 /// URL (see [`NetworkError`]).
 impl From<reqwest::Error> for DxError {
     fn from(e: reqwest::Error) -> Self {
-        DxError::Network(e.into())
+        DxError::from(DxErrorInner::Network(e.into()))
     }
 }
 
@@ -249,6 +314,101 @@ pub struct DxQso {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dx_error_is_pointer_sized() {
+        assert_eq!(std::mem::size_of::<DxError>(), std::mem::size_of::<usize>());
+    }
+
+    #[test]
+    fn boxed_error_preserves_display_and_classification() {
+        for class in [
+            UploadFailureClass::Transient,
+            UploadFailureClass::LoginRejected,
+            UploadFailureClass::RecordRejected,
+        ] {
+            let err = DxError::from(DxErrorInner::Upload {
+                class,
+                message: "refused".into(),
+            });
+            assert_eq!(err.to_string(), "External service error: refused");
+            assert_eq!(err.upload_failure_text(), "refused");
+            assert_eq!(err.upload_failure_class(), class);
+        }
+        let err = DxError::from(DxErrorInner::ResponseTooLarge { limit: 65536 });
+        assert_eq!(err.to_string(), "Response too large: more than 65536 bytes");
+        assert_eq!(
+            err.upload_failure_class(),
+            UploadFailureClass::RecordRejected
+        );
+        for (inner, text) in [
+            (
+                DxErrorInner::Parse("invalid".into()),
+                "Parse error: invalid",
+            ),
+            (
+                DxErrorInner::Configuration("missing".into()),
+                "Configuration error: missing",
+            ),
+            (
+                DxErrorInner::ExternalService("unavailable".into()),
+                "External service error: unavailable",
+            ),
+        ] {
+            let err: DxError = inner.into();
+            assert_eq!(err.to_string(), text);
+            assert_eq!(err.upload_failure_text(), text);
+            assert_eq!(err.upload_failure_class(), UploadFailureClass::Transient);
+        }
+    }
+
+    #[tokio::test]
+    async fn boxed_error_preserves_source_conversions() {
+        use std::error::Error;
+        let io: DxError = std::io::Error::other("disk unavailable").into();
+        assert_eq!(io.source().unwrap().to_string(), "disk unavailable");
+        fn check_source(error: impl Error + Into<DxError>, prefix: &str) {
+            let text = error.to_string();
+            let wrapped: DxError = error.into();
+            assert_eq!(wrapped.to_string(), format!("{prefix}: {text}"));
+            assert_eq!(wrapped.source().unwrap().to_string(), text);
+            assert_eq!(
+                wrapped.upload_failure_class(),
+                UploadFailureClass::Transient
+            );
+        }
+        check_source(std::fmt::Error, "Format error");
+        check_source(
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            "Serialization error",
+        );
+        check_source(
+            csv::Error::from(std::io::Error::other("csv read failed")),
+            "CSV error",
+        );
+        check_source(
+            quick_xml::Error::from(std::io::Error::other("xml read failed")),
+            "XML error",
+        );
+        check_source(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+            "Websocket error",
+        );
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        check_source(task.await.unwrap_err(), "Join error");
+        let raw = reqwest::Client::new()
+            .get(format!(
+                "http://{}/?token=private",
+                crate::test_support::closed_port()
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        let network: DxError = raw.into();
+        assert!(network.source().is_some());
+        crate::test_support::assert_network_error_omits(&network, &["private"]);
+    }
 
     #[test]
     fn test_band_frequency_detection() {

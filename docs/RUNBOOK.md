@@ -292,8 +292,12 @@ operator-supervised.
    confirm SWR is sane on a brief tune-up tone. (Don't tune through
    pancetta — use the rig's tune button.) Pancetta does not currently
    tune the rig. With `swr_protection` on (the default), pancetta also
-   reads the rig's SWR meter while keyed and halts all TX on a reading
-   above `max_swr`. The strip then shows `■ RX ONLY` and
+   reads the rig's SWR meter while keyed and halts all TX once keyed
+   time with readings above `max_swr` reaches `swr_trip_delay_ms`
+   (default 5000 ms; `0` trips on the first high reading). Keyed high
+   time adds up across transmissions; a reading at or below `max_swr`
+   resets it, and so does more than two minutes without a high reading.
+   The strip then shows `■ RX ONLY` and
    `⚠ High SWR …`. Fix the antenna, then press `g`. If the strip shows
    `⚠ SWR protection is unavailable on this rig`, your rig or Hamlib
    build does not report SWR, so keep watching an external meter.

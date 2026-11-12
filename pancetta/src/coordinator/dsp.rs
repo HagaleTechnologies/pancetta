@@ -87,23 +87,12 @@ pub(super) fn is_dead_air(samples: &[f32]) -> bool {
 /// (or when the frequency is unknown, i.e. 0 — no rig / not yet polled),
 /// in which case the filename carries no band suffix and stays backward
 /// compatible with the legacy `ft8_<date>_<time>.wav` form.
+///
+/// PAN-330: core band membership plus the core lowercase name — the old
+/// integer-kHz table's 60 m spillover (5,410 kHz still labeling `60m`) is
+/// gone.
 pub(super) fn band_for_freq_hz(hz: u64) -> Option<&'static str> {
-    let khz = hz / 1000;
-    Some(match khz {
-        1_800..=2_000 => "160m",
-        3_500..=4_000 => "80m",
-        5_300..=5_410 => "60m",
-        7_000..=7_300 => "40m",
-        10_100..=10_150 => "30m",
-        14_000..=14_350 => "20m",
-        18_068..=18_168 => "17m",
-        21_000..=21_450 => "15m",
-        24_890..=24_990 => "12m",
-        28_000..=29_700 => "10m",
-        50_000..=54_000 => "6m",
-        144_000..=148_000 => "2m",
-        _ => return None,
-    })
+    pancetta_core::Band::from_frequency(hz).map(|band| band.name())
 }
 
 /// Decide whether the in-flight audio window must be flushed because the rig
@@ -2353,6 +2342,78 @@ mod band_tests {
         assert_eq!(band_for_freq_hz(14_350_000), Some("20m"));
         assert_eq!(band_for_freq_hz(13_999_000), None);
         assert_eq!(band_for_freq_hz(14_351_000), None);
+    }
+
+    /// PAN-330 AC3: recording classification is core band membership with
+    /// the core lowercase label — including the old 60 m spillover fix at
+    /// 5,410 kHz and endpoint ±1 Hz for every standard band.
+    #[test]
+    fn band_vocabulary_table() {
+        let edges: [(u64, u64, &str); 13] = [
+            (1_800_000, 2_000_000, "160m"),
+            (3_500_000, 4_000_000, "80m"),
+            (5_330_000, 5_405_000, "60m"),
+            (7_000_000, 7_300_000, "40m"),
+            (10_100_000, 10_150_000, "30m"),
+            (14_000_000, 14_350_000, "20m"),
+            (18_068_000, 18_168_000, "17m"),
+            (21_000_000, 21_450_000, "15m"),
+            (24_890_000, 24_990_000, "12m"),
+            (28_000_000, 29_700_000, "10m"),
+            (50_000_000, 54_000_000, "6m"),
+            (144_000_000, 148_000_000, "2m"),
+            (420_000_000, 450_000_000, "70cm"),
+        ];
+        for (low, high, label) in edges {
+            assert_eq!(band_for_freq_hz(low), Some(label), "low edge {label}");
+            assert_eq!(band_for_freq_hz(high), Some(label), "high edge {label}");
+            assert_eq!(band_for_freq_hz(low - 1), None, "below low {label}");
+            assert_eq!(band_for_freq_hz(high + 1), None, "above high {label}");
+        }
+        // The old final-kHz spillover at the 60 m edge is fixed.
+        assert_eq!(band_for_freq_hz(5_357_500), Some("60m"));
+        assert_eq!(band_for_freq_hz(5_410_000), None);
+        assert_eq!(band_for_freq_hz(5_300_000), None);
+    }
+
+    /// PAN-330 AC3: every frequency classifier in the main crate's reach
+    /// agrees on the same fixture set — core membership, cqdx, QSO (ADIF
+    /// adapter) and the DSP recording label are one vocabulary.
+    #[test]
+    fn cross_consumer_band_identity() {
+        for (hz, core_band) in [
+            (5_330_000u64, Some(pancetta_core::Band::Band60m)),
+            (5_357_500, Some(pancetta_core::Band::Band60m)),
+            (5_405_000, Some(pancetta_core::Band::Band60m)),
+            (5_410_000, None),
+            (14_074_000, Some(pancetta_core::Band::Band20m)),
+            (14_350_000, Some(pancetta_core::Band::Band20m)),
+            (14_351_000, None),
+            (0, None),
+        ] {
+            assert_eq!(
+                pancetta_core::Band::from_frequency(hz),
+                core_band,
+                "core {hz}"
+            );
+            assert_eq!(
+                pancetta_cqdx::frequency_to_band(hz),
+                core_band.map(|b| b.name().to_string()),
+                "cqdx {hz}"
+            );
+            assert_eq!(
+                band_for_freq_hz(hz),
+                core_band.map(|b| b.name()),
+                "dsp {hz}"
+            );
+            // The QSO/ADIF adapter formats the same membership uppercase,
+            // with its documented rounded-MHz fallback outside the bands.
+            let adif = pancetta_qso::utils::frequency_to_band(hz as f64);
+            match core_band {
+                Some(b) => assert_eq!(adif, b.name().to_uppercase(), "adif {hz}"),
+                None => assert!(adif.ends_with("MHZ"), "adif fallback {hz}: {adif}"),
+            }
+        }
     }
 }
 

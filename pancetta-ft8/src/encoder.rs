@@ -1106,19 +1106,12 @@ fn parse_cq_modifier(modifier: &str) -> Option<u32> {
     }
 }
 
-/// Check if a token is a CQ modifier (DX, 3-digit number, or 1-4 letter code)
+/// Check if a token is a CQ modifier the encoder can pack (1–4 uppercase
+/// letters, or exactly 3 digits). Delegates to the shared core packable
+/// policy (PAN-330); the separate *decoded* policy for free-text CQ lines
+/// lives in `pancetta_core::ft8_tokens::is_decoded_cq_modifier`.
 fn is_cq_modifier(token: &str) -> bool {
-    if token == "DX" {
-        return true;
-    }
-    let bytes = token.as_bytes();
-    if bytes.len() == 3 && bytes.iter().all(|b| b.is_ascii_digit()) {
-        return true;
-    }
-    if bytes.len() <= 4 && !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_uppercase()) {
-        return true;
-    }
-    false
+    pancetta_core::ft8_tokens::is_packable_cq_modifier(token)
 }
 
 // ============================================================================
@@ -1577,6 +1570,53 @@ impl Default for Ft8EncodingConfig {
 mod tests {
     use super::*;
 
+    /// PAN-330 AC7: the encoder's CQ-modifier rule is unchanged after the
+    /// move to the shared core packable policy — packing constraints are
+    /// untouched, and the known packable/decoded divergences (`12` decodes
+    /// but does not pack; `ABCD` packs but is not a decoded token) hold.
+    #[test]
+    fn cq_modifier_encoding_unchanged() {
+        // Packable: DX + 1-4 uppercase letters + exactly 3 digits.
+        for ok in ["DX", "QRP", "NA", "A", "ABCD", "123"] {
+            assert!(is_cq_modifier(ok), "expected packable: {ok:?}");
+            assert!(pancetta_core::ft8_tokens::is_packable_cq_modifier(ok));
+        }
+        // Not packable: lowercase, >4 letters, non-3-digit numbers, junk.
+        for bad in [
+            "", "dx", "Dx", "ABCDE", "1", "12", "1234", "AB1", "D-X", "DX ",
+        ] {
+            assert!(!is_cq_modifier(bad), "expected unpackable: {bad:?}");
+            assert!(!pancetta_core::ft8_tokens::is_packable_cq_modifier(bad));
+        }
+        // The delegation is equivalent to the previous inline rule, checked
+        // token-by-token against a literal copy of it.
+        let old_rule = |token: &str| {
+            let bytes = token.as_bytes();
+            if token == "DX" {
+                return true;
+            }
+            if bytes.len() == 3 && bytes.iter().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+            bytes.len() <= 4 && !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_uppercase())
+        };
+        for token in [
+            "", "A", "D", "DX", "NA", "QRP", "ABCD", "ABCDE", "dx", "Dx", "1", "12", "123", "1234",
+            "AB1", "D-X", "DX ", "POTA", "TEST", "Δ",
+        ] {
+            assert_eq!(
+                is_cq_modifier(token),
+                old_rule(token),
+                "encoder rule drifted for {token:?}"
+            );
+        }
+        // The named packable/decoded divergence stays explicit.
+        assert!(!is_cq_modifier("12") && pancetta_core::ft8_tokens::is_decoded_cq_modifier("12"));
+        assert!(
+            is_cq_modifier("ABCD") && !pancetta_core::ft8_tokens::is_decoded_cq_modifier("ABCD")
+        );
+    }
+
     #[test]
     fn try_packgrid_is_none_exactly_where_packgrid_falls_back() {
         // From the PAN-331 research divergence table, plus the report range edges.
@@ -1945,6 +1985,7 @@ mod tests {
     #[test]
     fn test_encode_dxpedition_contacts_matches_ft8lib_symbols() {
         let mut reference = [0u8; NUM_SYMBOLS];
+        // SAFETY: payload has 10 live bytes and the exclusive output has 79 bytes; C retains neither pointer.
         unsafe {
             crate::ft8_lib_ffi::ft8_encode(
                 DXPEDITION_REFERENCE_PAYLOAD.as_ptr(),

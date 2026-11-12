@@ -87,7 +87,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). Not used for needed or ATNO: pancetta takes your home entity from `callsign`. |
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
-| `operator_name` | string | `""` | Your name (optional, for log export). |
+| `operator_name` | string | absent | Your name (optional, for log export). |
 | `tx_late_max_ms` | integer | `3000` | Hard cap on elapsed slot time at keying: a frame that would key past it is dropped at the final pre-PTT gate, never keyed undecodably. The queue-time same-slot acceptance reserves the unconditional coalesce window + safety margin below the cap — at the default, a request within roughly the first 1.7s of the slot still keys the current slot; later arrivals defer 30s to the next opposite-parity slot. A multi-TX bundle the worker receives already assembled skips that coalesce wait, so it reserves only the 0.5s margin and still keys the current slot if it arrives within roughly the first 2.5s at the default. 3s keeps both the middle and end Costas sync arrays and 49 of 58 data symbols (147 coded bits vs the 91 information bits LDPC needs) on the air. |
 | `tx_self_parity` | string | `"auto"` | When calling CQ (no DX heard), pick TX slot parity by this rule. `"auto"` picks whichever next slot is closer; `"even"` / `"odd"` lock to the named parity. |
 | `ptt_lead_ms` | integer | `80` | PTT engage lead time before the slot boundary. Drop to 50ms for fast solid-state keying; bump up to 150–200ms for slow mechanical relays. |
@@ -251,7 +251,7 @@ baud_rate = 38400
 |---|---|---|---|
 | `model` | string | `"Generic"` | A model name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, ...) or a numeric Hamlib model ID (`"1045"`). Case, hyphens and spaces are ignored; ambiguous names require the numeric ID; for an all-digit model name include the manufacturer (`"Barrett 950"`). Unknown, malformed or ambiguous values fail validation with the closest matches and numeric-ID hint. Empty and `"Generic"` stay placeholders (no model check). See [SUPPORTED_RIGS.md](SUPPORTED_RIGS.md). |
 | `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
-| `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
+| `interface.port` | string | `"/dev/ttyUSB0"` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
 | `interface.baud_rate` | integer | `9600` | Must match the rig's CAT port setting. |
 
 `rig.model` resolution is offline: Pancetta matches against a Hamlib 4.5.5
@@ -510,7 +510,7 @@ dry_run = false            # Log autonomous TX decisions without keying the rig
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
 | `cq_no_response_switch_after` | integer | `4` | Consecutive self-CQs with zero responses before switching TX frequency. Auto mode only (Hold mode tracks but never acts). Must be ≥ 1. |
 | `qso_stall_switch_after` | integer | `4` | Consecutive stalled mid-QSO cycles before switching/reverting the QSO's TX offset. Auto mode only. Threaded into `pancetta_qso::QsoManagerConfig::TimeoutConfig::qso_stall_switch_after` by the coordinator. Must be ≥ 1. |
-| `max_concurrent_qsos` | integer | `1` | Simultaneous active QSOs (multi-stream TX). Also caps manual opens (PAN-78): a new manual call, caller reply, Hound engage or CQ is refused while this many QSOs are active (Fox mode uses `fox_max_streams`). Must be ≥ 1. |
+| `max_concurrent_qsos` | integer | `1` | Simultaneous active QSOs (multi-stream TX). Also caps manual opens (PAN-78): a new manual call, caller reply, Hound engage or CQ is refused while this many QSOs are active (Fox mode uses `[fox].max_streams`). Must be ≥ 1. |
 | `tx_offset_hz` | float | `1500.0` | Validated to 100–3000 Hz. |
 | `min_dx_score` | float | `0.3` | 0.0–1.0. Decoded CQs scoring below this are not answered. |
 | `min_multi_slot_score` | float | `0.7` | 0.0–1.0. Applies only to second-and-later concurrent QSOs. |
@@ -995,7 +995,7 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 | `multicast_ttl` | integer (`u32`) | `3` | IP multicast TTL/hop-limit. Only used for multicast destinations; GridTracker uses `3` for its own sends, so `3` is a safe match. |
 | `instance_id` | string | `"WSJT-X - pancetta"` | The protocol's `Id` field. Companion apps display and route by it; a second pancetta instance should get a distinct value. Must be non-empty when `enabled = true`. |
 | `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
-| `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
+| `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `[network.station_agent].remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
 | `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (only the configured destination host is accepted) and this list is unused. |
 
 `destination` must parse as a valid `host:port` socket address, and
@@ -1156,18 +1156,13 @@ section. With the old values a WSJT-X Fox never sees your call.
 
 ## `[ui]` — TUI behaviour
 
-```toml
-[ui]
-theme = "dark"   # "dark" or "light"
-```
-
-The remaining `[ui]` keys are in `defaults.toml`; `theme` above is the
-one with practical effect (`pancetta-tui/src/app.rs` reads `config.ui.theme`
-directly). Keybindings are not configurable — the full
-map is [`docs/KEYBINDINGS.md`](KEYBINDINGS.md) (or `?` in the TUI). A
-`[ui.keyboard]` block is present in `defaults.toml` (it mirrors a real
-`KeyboardConfig` struct in the Rust schema) but nothing in the runtime
-reads it; it's inert scaffolding, not a way to remap keys.
+> The `[ui]` settings are accepted by the configuration schema but do not
+> currently change the TUI. The coordinator constructs its TUI settings with
+> the built-in dark theme. Setting `theme` to `"light"` has no effect,
+> including after restart. The remaining schema keys are listed in
+> `defaults.toml`. Keybindings are not configurable; see
+> [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
+> `[ui.keyboard]` schema is also unused by the runtime.
 
 ---
 
@@ -1264,9 +1259,11 @@ moment longer before reloading.
   `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
   Nothing outside the live list above is applied to a running process,
   not even to its in-memory copy of the config; restart pancetta to
-  enforce them. (`[station].callsign`, `[station].grid_square` and
-  `[autonomous].slot_parity` in particular can never change under an
-  in-progress QSO.)
+  enforce them. Non-security changes are all classified restart-required,
+  but a restart does not activate the unused `[ui]` settings (see
+  `[ui]` — TUI behaviour above). (`[station].callsign`,
+  `[station].grid_square` and `[autonomous].slot_parity` in particular
+  can never change under an in-progress QSO.)
 
 When a reload succeeds you see a `Config reloaded` line in the TUI
 diagnostics, plus one line per security action and, when other keys

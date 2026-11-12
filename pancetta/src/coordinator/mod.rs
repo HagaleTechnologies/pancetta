@@ -812,6 +812,7 @@ pub enum ModeSwitchError {
 /// atomic store, so a failure here leaves every consumer (DSP, decode, TX,
 /// QSO) seeing the OLD mode consistently — never a torn state where some
 /// consumers see new atomics but the decoder config is still old.
+#[allow(clippy::too_many_arguments)] // Keep mode-switch state explicit so the synchronous safety critical section remains unchanged.
 pub fn try_switch_operating_mode(
     new_mode: pancetta_config::OperatingMode,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
@@ -966,6 +967,20 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 use restart_budget::RestartBudget;
 use util::resample_linear;
 
+/// Decoder frequency hints, with read-time expiry for a recently vacated offset.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct ActiveQsoFreq {
+    primary_hz: f64,
+    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
+}
+
+impl ActiveQsoFreq {
+    fn live_secondary_hz(&self, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+        self.secondary
+            .and_then(|(hz, expires_at)| (now < expires_at).then_some(hz))
+    }
+}
+
 /// Application coordinator that manages all Pancetta components
 pub struct ApplicationCoordinator {
     gain_sweep_original: Arc<std::sync::Mutex<Option<pancetta_hamlib::ReceiveGain>>>,
@@ -981,6 +996,7 @@ pub struct ApplicationCoordinator {
     message_bus: MessageBus,
 
     /// Named component task handles for health monitoring
+    tui_failure: Arc<std::sync::Mutex<Option<String>>>,
     named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
 
     decode_handles: Option<pipeline::DecodePipelineHandles>,
@@ -1415,11 +1431,11 @@ pub struct ApplicationCoordinator {
     /// early scoped decode pass at the partner's known location.
     /// `None` when no QSO is active.
     ///
-    /// PAN-72 round-8 redesign (fix 2): `.0` is the primary hint (this
-    /// field's original single-`f64` meaning, unchanged derivation); `.1` is
+    /// PAN-72 round-8 redesign (fix 2): `primary_hz` is the primary hint (this
+    /// field's original single-`f64` meaning, unchanged derivation); `secondary` is
     /// an optional SECONDARY hint — the still-in-grace offset an unanswered
     /// `CallingCq` relocated away from (see `coordinator::qso`'s
-    /// `secondary_decoder_hint_freq_for`). `.1` is `None` for every case
+    /// `secondary_decoder_hint_freq_for`). `secondary` is `None` for every case
     /// except that one (established QSO, no pre-switch offset, or grace
     /// expired), so `compute_narrow_filter_bins_default_dual(primary, None,
     /// ..)` behaves byte-identically to the old single-frequency form.
@@ -1433,10 +1449,7 @@ pub struct ApplicationCoordinator {
     /// re-derive freshness at every READ instead
     /// (`compute_narrow_filter_bins_dual_with_expiry`), without a lock
     /// upgrade or extra write contention.
-    #[allow(clippy::type_complexity)]
-    active_qso_freq_hz: std::sync::Arc<
-        std::sync::RwLock<Option<(f64, Option<(f64, chrono::DateTime<chrono::Utc>)>)>>,
-    >,
+    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<ActiveQsoFreq>>>,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the
     /// FT8 thread. Inner `None` = filter disabled (default). When enabled,
@@ -2432,6 +2445,7 @@ impl ApplicationCoordinator {
             id,
             config,
             message_bus,
+            tui_failure: Arc::new(std::sync::Mutex::new(None)),
             named_task_handles: Vec::new(),
             decode_handles: None,
             restart_budget: RestartBudget::new(),
@@ -5628,3 +5642,33 @@ pub(crate) mod audit_test_util {
 }
 
 mod contest;
+
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+#[path = "tx/test_harness.rs"]
+pub mod testing;
+
+#[cfg(test)]
+mod active_qso_freq_tests {
+    use super::ActiveQsoFreq;
+
+    #[test]
+    fn active_qso_freq_secondary_expires_without_write() {
+        let expires_at = chrono::Utc::now();
+        let hint = ActiveQsoFreq {
+            primary_hz: 1900.0,
+            secondary: Some((1500.0, expires_at)),
+        };
+        assert_eq!(
+            hint.live_secondary_hz(expires_at - chrono::Duration::nanoseconds(1)),
+            Some(1500.0)
+        );
+        assert_eq!(hint.live_secondary_hz(expires_at), None);
+        assert_eq!(
+            hint.live_secondary_hz(expires_at + chrono::Duration::nanoseconds(1)),
+            None
+        );
+        assert_eq!(hint.primary_hz, 1900.0);
+        assert_eq!(hint.secondary, Some((1500.0, expires_at)));
+    }
+}

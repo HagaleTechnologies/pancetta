@@ -12332,6 +12332,7 @@ fn par_try_ldpc_with_ap(
 /// a fixed protocol token, not a personal callsign — so, unlike every
 /// other AP level, this can run unconditionally on every candidate that
 /// reaches AP injection, gated only by `Ft8Config::cq_ap_enabled`.
+#[allow(clippy::too_many_arguments)] // Keep candidate measurements explicit alongside the shared decode context.
 fn par_try_ldpc_with_cq(
     ctx: &DecodeContext,
     ldpc: &LdpcDecoder,
@@ -13162,6 +13163,7 @@ fn reverse_derive_candidate(
 /// window. Refreshes `spectrogram.power` consistently so the sync search
 /// on the residual sees the updated dB view. No-op when the spectrogram
 /// has no complex retention.
+#[allow(clippy::too_many_arguments)] // Keep coherent subtraction inputs and phase corrections explicit without changing decoder math.
 fn subtract_decode_coherent(
     spectrogram: &mut Spectrogram,
     pp: &ProtocolParams,

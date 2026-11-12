@@ -257,27 +257,6 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     output
 }
 
-/// Use rand for noise generation in tests
-mod rand {
-    pub fn random<T>() -> T 
-    where
-        T: RandomValue,
-    {
-        T::random()
-    }
-    
-    pub trait RandomValue {
-        fn random() -> Self;
-    }
-    
-    impl RandomValue for f32 {
-        fn random() -> Self {
-            // Simple pseudo-random generator for testing
-            static mut SEED: u32 = 12345;
-            unsafe {
-                SEED = SEED.wrapping_mul(1103515245).wrapping_add(12345);
-                ((SEED / 65536) % 1000) as f32 / 1000.0
-            }
-        }
-    }
-}
+/// Use the shared atomic LCG for noise generation in tests.
+#[path = "accuracy_rng.rs"]
+mod rand;

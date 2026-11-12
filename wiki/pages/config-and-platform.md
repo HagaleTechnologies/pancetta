@@ -54,6 +54,14 @@ Second gotcha (PAN-90): **a new config struct needs container-level
 fails — every table must accept a partial table. Record/map entry types are the
 only allowlisted exceptions. Config snippets added to `README.md` or top-level
 `docs/*.md` are loaded by `tests/docs_snippets.rs` and must parse with zero warnings.
+PAN-323 adds two more doc-drift guards in the same crate: `tests/config_md_tables.rs`
+checks every `| Key | Type | Default | Notes |` table in `docs/CONFIG.md` against the
+real loader and `Config::default()` (key existence is judged by loader acceptance —
+an `Option` field absent from serialized defaults is still a real key, and `absent`
+in the Default column means no default, never `""`), and
+`tests/architecture_drift.rs` regenerates the coordinator module table in
+`docs/ARCHITECTURE.md` from `ls pancetta/src/coordinator`
+(`PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`).
 
 Queue recovery gotcha (PAN-150): restoring a missing native queue rule does not
 schedule a retry. Rerun the failed handler after restoration. An interrupted

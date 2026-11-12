@@ -14,6 +14,7 @@
 //! and forwards it to the TUI and the autonomous operator's frequency
 //! allocator.
 
+use super::ActiveQsoFreq;
 use anyhow::Result;
 use pancetta_ft8::merge::{drop_unresolved_hash_twins, merge_ft8lib_first, MergedDecodes};
 use pancetta_ft8::Ft8Decoder;
@@ -1016,21 +1017,14 @@ impl super::ApplicationCoordinator {
                                 // (with no further StateChanged/
                                 // TxOffsetApplied event to refresh it) kept
                                 // widening this scoped window forever.
-                                #[allow(clippy::type_complexity)]
-                                let partner_freq_pair: Option<(
-                                    f64,
-                                    Option<(f64, chrono::DateTime<chrono::Utc>)>,
-                                )> = active_qso_freq_hz.read().ok().and_then(|g| *g);
-                                if let Some((freq_hz, secondary_freq_pair)) = partner_freq_pair {
-                                    let center = (freq_hz / 6.25).round() as usize;
+                                let partner_freq: Option<ActiveQsoFreq> =
+                                    active_qso_freq_hz.read().ok().and_then(|g| *g);
+                                if let Some(hint) = partner_freq {
+                                    let center = (hint.primary_hz / 6.25).round() as usize;
                                     let mut lo = center.saturating_sub(SCOPED_HALF_WIDTH);
                                     let mut hi = center.saturating_add(SCOPED_HALF_WIDTH);
-                                    let live_secondary_hz = secondary_freq_pair.and_then(
-                                        |(secondary_hz, expires_at)| {
-                                            (chrono::Utc::now() < expires_at)
-                                                .then_some(secondary_hz)
-                                        },
-                                    );
+                                    let live_secondary_hz =
+                                        hint.live_secondary_hz(chrono::Utc::now());
                                     if let Some(secondary_hz) = live_secondary_hz {
                                         let secondary_center =
                                             (secondary_hz / 6.25).round() as usize;
@@ -1218,13 +1212,10 @@ impl super::ApplicationCoordinator {
                         // exactly that a secondary whose grace lapsed with
                         // no further event kept widening this filter
                         // forever.
-                        #[allow(clippy::type_complexity)]
-                        let qso_freq_pair: Option<(
-                            f64,
-                            Option<(f64, chrono::DateTime<chrono::Utc>)>,
-                        )> = active_qso_freq_hz.read().ok().and_then(|g| *g);
-                        let partner_freq_for_main = qso_freq_pair.map(|(primary, _)| primary);
-                        let secondary_for_main = qso_freq_pair.and_then(|(_, secondary)| secondary);
+                        let qso_freq: Option<ActiveQsoFreq> =
+                            active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        let partner_freq_for_main = qso_freq.map(|hint| hint.primary_hz);
+                        let secondary_for_main = qso_freq.and_then(|hint| hint.secondary);
                         let narrow_filter_bins =
                             super::qso_filter::compute_narrow_filter_bins_default_dual_with_expiry(
                                 partner_freq_for_main,

@@ -136,6 +136,58 @@ pub fn resolve_hash_render(call: &str) -> Option<&str> {
     }
 }
 
+/// Is `token` shaped like a callsign *token* as it appears in decoded FT8
+/// text — the shared character/shape policy for extracting callsign-shaped
+/// tokens (PAN-330)?
+///
+/// A token is callsign-shaped when it is 3–11 characters of ASCII
+/// alphanumeric plus `/` (the FT8 callsign charset), contains at least one
+/// letter AND one digit, has no empty `/`-separated component, and is not a
+/// bare 4-character Maidenhead grid shape (see [`is_grid_shape`]). Compound
+/// portable forms (`EA8/K5ARH`, `K5ARH/P`) qualify.
+///
+/// This is deliberately looser than [`is_plausible_callsign`], which adds
+/// prefix/suffix plausibility scoring for display ranking; callers with
+/// protocol-specific limits (e.g. the packed 28-bit 3–6 char form) keep
+/// those constraints as adapters around this check. Replaces the three
+/// private `looks_like_callsign` copies in pancetta-qso continuity,
+/// simulation and scoring paths.
+pub fn is_callsign_token(token: &str) -> bool {
+    if !(3..=11).contains(&token.len()) {
+        return false;
+    }
+    if is_grid_shape(token) {
+        return false;
+    }
+    if !token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/')
+    {
+        return false;
+    }
+    if token.split('/').any(str::is_empty) {
+        return false;
+    }
+    token.bytes().any(|b| b.is_ascii_digit()) && token.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Is a decoded frame's `to` field addressed to `our_callsign`? (PAN-330)
+///
+/// The shared directed-decode predicate for both coordinator relays (the
+/// TUI relay and the remote gateway translator). Delegates to
+/// [`callsigns_match`] so prefix/suffix-portable forms (`EA8/K5ARH`
+/// directed at `K5ARH`), mixed case, and resolved hash renders
+/// (`<K5ARH>`) all match. `None`, an absent/empty/whitespace-only
+/// destination, or an unresolved hash render (`<...>`) never match — the
+/// trimmed-empty guard keeps `callsigns_match("", "")`'s legacy
+/// empty-equals-empty compatibility from ever marking a decode directed.
+pub fn decode_directed_at_us(to: Option<&str>, our_callsign: &str) -> bool {
+    let Some(to) = to else { return false };
+    let to = to.trim();
+    let our = our_callsign.trim();
+    !to.is_empty() && !our.is_empty() && callsigns_match(to, our)
+}
+
 /// Is `t` shaped like a bare 4-character Maidenhead grid square (two field
 /// letters, two square digits — e.g. `FN42`)? Promoted from
 /// `pancetta_qso::callsign_continuity`'s identical private check so both
@@ -426,5 +478,26 @@ mod tests {
     #[test]
     fn callsigns_match_hash_render_rejects_wrong_station() {
         assert!(!callsigns_match("<K5ARH>", "K5ARG"));
+    }
+
+    /// PAN-330 AC1 core predicate: prefix/suffix portable and resolved-hash
+    /// destinations match; absent, empty, whitespace-only and unresolved-hash
+    /// destinations never do (including the empty/empty legacy matcher
+    /// compatibility).
+    #[test]
+    fn decode_directed_at_us_table() {
+        assert!(decode_directed_at_us(Some("EA8/K5ARH"), "K5ARH"));
+        assert!(decode_directed_at_us(Some("K5ARH/P"), "K5ARH"));
+        assert!(decode_directed_at_us(Some("k5arh"), "K5ARH"));
+        assert!(decode_directed_at_us(Some("<K5ARH>"), "K5ARH"));
+        assert!(decode_directed_at_us(Some("K5ARH"), "EA8/K5ARH"));
+        assert!(!decode_directed_at_us(Some("EA8/K5ARG"), "K5ARH"));
+        assert!(!decode_directed_at_us(None, "K5ARH"));
+        assert!(!decode_directed_at_us(Some(""), "K5ARH"));
+        assert!(!decode_directed_at_us(Some("   "), "K5ARH"));
+        assert!(!decode_directed_at_us(Some("K5ARH"), ""));
+        assert!(!decode_directed_at_us(Some("K5ARH"), "   "));
+        assert!(!decode_directed_at_us(Some("<...>"), "K5ARH"));
+        assert!(!decode_directed_at_us(Some(""), ""));
     }
 }

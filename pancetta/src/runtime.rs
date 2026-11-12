@@ -449,6 +449,7 @@ impl Drop for PancettaRuntime {
 fn set_thread_priority(priority: i32) {
     use std::ffi::c_int;
 
+    // SAFETY: setpriority takes only integer arguments, with PRIO_PROCESS and pid 0 selecting this thread. Errors are checked below.
     unsafe {
         let result = libc::setpriority(libc::PRIO_PROCESS, 0, priority as c_int);
         if result != 0 {

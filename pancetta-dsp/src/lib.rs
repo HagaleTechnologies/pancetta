@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-dsp
 //!
 //! DSP pipeline: decimation (48kHz->12kHz), bandpass filter, AGC, and FT8 window extraction.
