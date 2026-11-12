@@ -8121,6 +8121,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8149,6 +8150,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_074_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8177,6 +8179,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_025_000.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,
@@ -8279,6 +8282,7 @@ mod tests {
         app.add_dx_spot(
             "ZL1ABC".into(),
             14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
             "FT8".into(),
             0,
             false,

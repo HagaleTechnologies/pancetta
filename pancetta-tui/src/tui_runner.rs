@@ -7550,6 +7550,7 @@ mod key_tests {
         a.add_dx_spot(
             call.to_string(),
             rf_hz,
+            pancetta_core::Band::from_frequency(rf_hz.round() as u64),
             "FT8".to_string(),
             0,
             false,
