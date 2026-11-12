@@ -8,11 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
-<<<<<<< HEAD
 - Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
-=======
 - PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
->>>>>>> 69c84e618b719b0dc916bb16ade4ef149b4dd3c3
 
 ### Added
 
