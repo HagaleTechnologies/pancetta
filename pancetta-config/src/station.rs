@@ -300,64 +300,40 @@ impl StationConfig {
     }
 
     /// Validate the Maidenhead grid square format
+    ///
+    /// PAN-330: semantic validity (field letters A–R, square digits,
+    /// subsquare A–X, extended digits) is owned by
+    /// `pancetta_core::gridsquare::validate_grid`; this adapter pins the
+    /// station context's 4/6/8-character precision and conventional
+    /// presentation case (uppercase field/square, lowercase subsquare).
     fn validate_grid_square(&self) -> ConfigResult<()> {
         let grid = &self.grid_square;
+        let invalid = || ConfigError::InvalidValue {
+            field: "grid_square".to_string(),
+            value: grid.clone(),
+        };
 
         // Grid square must be 4, 6, or 8 characters
         if ![4, 6, 8].contains(&grid.len()) {
-            return Err(ConfigError::InvalidValue {
-                field: "grid_square".to_string(),
-                value: grid.clone(),
-            });
+            return Err(invalid());
         }
 
-        // Validate format: LLNNLLNN (letters, numbers, letters, numbers)
+        // Core semantic validation (pair ranges and structure).
+        if pancetta_core::gridsquare::validate_grid(grid).is_err() {
+            return Err(invalid());
+        }
+
+        // Presentation case: LLNN (uppercase), then lowercase subsquare pair
+        // when 6 or 8 characters, then digits when 8.
         let chars: Vec<char> = grid.chars().collect();
-
-        // First two characters must be letters (A-R)
-        if chars.len() >= 2
-            && (!chars[0].is_ascii_uppercase()
-                || !chars[1].is_ascii_uppercase()
-                || chars[0] < 'A'
-                || chars[0] > 'R'
-                || chars[1] < 'A'
-                || chars[1] > 'R')
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "grid_square".to_string(),
-                value: grid.clone(),
-            });
+        if !chars[0].is_ascii_uppercase() || !chars[1].is_ascii_uppercase() {
+            return Err(invalid());
         }
-
-        // Next two characters must be digits (0-9)
-        if chars.len() >= 4 && (!chars[2].is_ascii_digit() || !chars[3].is_ascii_digit()) {
-            return Err(ConfigError::InvalidValue {
-                field: "grid_square".to_string(),
-                value: grid.clone(),
-            });
+        if chars.len() >= 6 && (!chars[4].is_ascii_lowercase() || !chars[5].is_ascii_lowercase()) {
+            return Err(invalid());
         }
-
-        // If 6 or 8 characters, next two must be lowercase letters (a-x)
-        if chars.len() >= 6
-            && (!chars[4].is_ascii_lowercase()
-                || !chars[5].is_ascii_lowercase()
-                || chars[4] < 'a'
-                || chars[4] > 'x'
-                || chars[5] < 'a'
-                || chars[5] > 'x')
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "grid_square".to_string(),
-                value: grid.clone(),
-            });
-        }
-
-        // If 8 characters, last two must be digits (0-9)
         if chars.len() == 8 && (!chars[6].is_ascii_digit() || !chars[7].is_ascii_digit()) {
-            return Err(ConfigError::InvalidValue {
-                field: "grid_square".to_string(),
-                value: grid.clone(),
-            });
+            return Err(invalid());
         }
 
         Ok(())
@@ -464,6 +440,33 @@ impl Coordinates {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC6: station grid validation delegates to core Maidenhead
+    /// semantics, with this caller's 4/6/8 precision and conventional
+    /// uppercase-field / lowercase-subsquare presentation pinned.
+    #[test]
+    fn station_grid_policy_table() {
+        let mut cfg = StationConfig::default();
+        for ok in ["FN42", "FN31pr", "AA00aa", "FN42ab12", "EM00"] {
+            cfg.grid_square = ok.to_string();
+            assert!(cfg.validate_section().is_ok(), "expected valid: {ok:?}");
+        }
+        for bad in [
+            "fn42",       // presentation case: field must be uppercase
+            "FN42PR",     // subsquare must be lowercase here
+            "FN4",        // wrong length
+            "FN42X",      // odd length
+            "FN4212",     // wrong character classes
+            "ZZ99",       // field letters outside A–R
+            "FN42yy",     // subsquare outside a–x
+            "FN42AB12CD", // 10 chars: beyond 4/6/8 precision
+            "",
+            "   ",
+        ] {
+            cfg.grid_square = bad.to_string();
+            assert!(cfg.validate_section().is_err(), "expected invalid: {bad:?}");
+        }
+    }
 
     #[test]
     fn test_default_station_config() {

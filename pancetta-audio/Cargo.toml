@@ -23,3 +23,6 @@ serde = { workspace = true }
 default = []
 # Feature for even more aggressive real-time optimizations
 rt-optimized = []
+
+[lints]
+workspace = true

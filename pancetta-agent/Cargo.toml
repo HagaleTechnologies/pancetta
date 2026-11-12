@@ -34,3 +34,6 @@ tracing-subscriber = { workspace = true }
 # `pancetta` enables it only through its dev-dependency, so a plain
 # `cargo build` never compiles it.
 test-hooks = []
+
+[lints]
+workspace = true

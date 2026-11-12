@@ -3,27 +3,23 @@
 //! `reqwest::Response::{text, bytes, json}` buffer the whole body before the
 //! caller sees its size. These read with `Response::chunk()` and stop once the
 //! running total passes the budget, so at most `limit` bytes plus one chunk
-//! are held. Read failures stay `DxError::Network`, which carries no URL.
+//! are held. Read failures stay `DxErrorInner::Network`, which carries no URL.
 
-// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum
-// for ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope.
-#![allow(clippy::result_large_err)]
-
-use crate::{DxError, Result};
+use crate::{DxError, DxErrorInner, Result};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Response;
 
 /// Budget for a body that only feeds an error message.
 pub(crate) const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 
-/// The whole body, or [`DxError::ResponseTooLarge`] once it passes `limit`.
+/// The whole body, or [`DxErrorInner::ResponseTooLarge`] once it passes `limit`.
 pub(crate) async fn bytes_within(mut resp: Response, limit: usize) -> Result<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
-        return Err(DxError::ResponseTooLarge { limit });
+        return Err(DxError::from(DxErrorInner::ResponseTooLarge { limit }));
     }
     let (bytes, truncated) = read_capped(&mut resp, limit).await?;
     if truncated {
-        return Err(DxError::ResponseTooLarge { limit });
+        return Err(DxError::from(DxErrorInner::ResponseTooLarge { limit }));
     }
     Ok(bytes)
 }
@@ -112,7 +108,7 @@ mod tests {
         let (addr, h) = serve_chunked("HTTP/1.1 200 OK", b"", 1025);
         let err = bytes_within(get(addr).await, 1024).await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit: 1024 }),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit: 1024 }),
             "got {err:?}"
         );
         served(h).await;
@@ -128,7 +124,7 @@ mod tests {
         );
         let err = bytes_within(get(addr).await, 1024).await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit: 1024 }),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit: 1024 }),
             "got {err:?}"
         );
     }
@@ -138,7 +134,7 @@ mod tests {
         let (addr, h) = serve_chunked("HTTP/1.1 200 OK", b"", 64 * MIB);
         let err = text_within(get(addr).await, 64 * 1024).await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == 64 * 1024),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == 64 * 1024),
             "got {err:?}"
         );
         let s = served(h).await;
@@ -209,7 +205,7 @@ mod tests {
     #[test]
     fn response_too_large_renders_its_limit() {
         assert_eq!(
-            DxError::ResponseTooLarge { limit: 65536 }.to_string(),
+            DxError::from(DxErrorInner::ResponseTooLarge { limit: 65536 }).to_string(),
             "Response too large: more than 65536 bytes"
         );
     }

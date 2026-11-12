@@ -1,5 +1,6 @@
 # pancetta wiki index
 
+- [What will bite you about the shared radio vocabulary?](pages/shared-radio-vocabulary.md) — PAN-330: grid shape versus validity (`ZZ99`), decoded versus packable CQ modifiers (`12` vs `ABCD`), the one band table with the ADIF case adapter, and callsign identity for directed decodes.
 - [pancetta — what is this and where do things live?](pages/overview.md) — pancetta is an autonomous FT8/FT4 ham-radio station in Rust: it decodes,
 - [How do operating modes (FT8/FT4/FT2, Hound) work?](pages/modes.md) — pancetta runs a single station-wide operating mode — FT8, FT4, or FT2 — chosen
 - [How does the QSO engine work and why is it shaped this way?](pages/qso-engine.md) — The QSO engine is the state machine in `pancetta-qso` that advances a contact

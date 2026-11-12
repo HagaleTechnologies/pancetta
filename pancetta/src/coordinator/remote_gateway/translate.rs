@@ -55,17 +55,13 @@ pub(crate) fn pending_item_to_call(item: &PendingCallSnapshotItem) -> PendingCal
 /// Return `true` when `to` (the `to_callsign` field of a decoded frame) is
 /// addressed to `our_callsign`.
 ///
-/// Mirrors the logic in `coordinator/tui_relay.rs`: strip any `/`-suffix from
-/// BOTH sides (take the part before the first `/`), compare
-/// case-insensitively, require both to be non-empty. `None` → `false`.
+/// PAN-330: delegates to the shared core predicate
+/// (`pancetta_core::callsign::decode_directed_at_us`) — the same one the
+/// TUI relay uses — so prefix-portable destinations (`EA8/K5ARH` directed
+/// at `K5ARH`), mixed case and resolved hash renders match, while `None`,
+/// empty/whitespace-only and unresolved-hash (`<...>`) destinations do not.
 pub(crate) fn directed_at_us(to: Option<&str>, our_callsign: &str) -> bool {
-    let to = match to {
-        Some(t) => t,
-        None => return false,
-    };
-    let to_base = to.split('/').next().unwrap_or(to);
-    let our_base = our_callsign.split('/').next().unwrap_or(our_callsign);
-    !to_base.is_empty() && !our_base.is_empty() && to_base.eq_ignore_ascii_case(our_base)
+    pancetta_core::callsign::decode_directed_at_us(to, our_callsign)
 }
 
 /// Convert a decoded FT8 frame into the wire `DecodedView` type.
@@ -322,6 +318,38 @@ mod tests {
     }
 
     // ── decoded_to_view ───────────────────────────────────────────────────────
+
+    /// PAN-330 AC1: the gateway's `decoded_to_view` marks prefix/suffix
+    /// portable, mixed-case and resolved-hash destinations directed at us,
+    /// and does not mark absent, empty, whitespace-only, unresolved-hash or
+    /// wrong-call destinations.
+    #[test]
+    fn directed_decode_table() {
+        let view = |to: Option<&str>| {
+            let mut ft8_msg = Ft8Message::default();
+            ft8_msg.from_callsign = Some("DL1ABC".into());
+            ft8_msg.to_callsign = to.map(str::to_string);
+            let mut msg = DecodedMessage::new(ft8_msg, -10.0, 0.0, 1000.0, 0.0);
+            msg.text = match to {
+                Some(t) => format!("{t} DL1ABC -10"),
+                None => "DL1ABC -10".into(),
+            };
+            decoded_to_view(&msg, 14_074_000.0, "K5ARH", false, false, false)
+        };
+        // The ticket's headline: `EA8/K5ARH DL1ABC -10` is directed at us.
+        assert!(view(Some("EA8/K5ARH")).is_directed_at_us);
+        assert!(view(Some("K5ARH/P")).is_directed_at_us);
+        assert!(view(Some("k5arh")).is_directed_at_us);
+        assert!(view(Some("<K5ARH>")).is_directed_at_us); // resolved hash render
+        assert!(view(Some("K5ARH")).is_directed_at_us); // plain reply to our CQ
+                                                        // Not directed at us.
+        assert!(!view(Some("EA8/K5ARG")).is_directed_at_us);
+        assert!(!view(Some("DL1ABC")).is_directed_at_us);
+        assert!(!view(Some("<...>")).is_directed_at_us); // unresolved hash
+        assert!(!view(None).is_directed_at_us);
+        assert!(!view(Some("")).is_directed_at_us);
+        assert!(!view(Some("   ")).is_directed_at_us);
+    }
 
     #[test]
     fn decoded_to_view_fields() {

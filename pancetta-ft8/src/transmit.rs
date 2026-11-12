@@ -8,17 +8,6 @@
 //! - Audio output management
 //! - Transmission scheduling and coordination
 
-// rationale: the PTT/audio mutex guards are taken in short, explicitly-scoped
-// blocks; the `.await` points sit between (not inside) those scopes. Refactoring
-// the locking shape is a correctness-sensitive change out of scope for lint
-// hygiene, so the guard lifetimes are left exactly as-is and the lint is silenced
-// with this note for a future dedicated review.
-#![allow(clippy::await_holding_lock)]
-// rationale: `AudioOutput` / `PttController` wrap platform handles that aren't
-// Send+Sync; the `Arc<Mutex<..>>` is the intentional single-owner-shared shape and
-// access is confined to this module's task. Changing it is out of scope here.
-#![allow(clippy::arc_with_non_send_sync)]
-
 use crate::{
     encoder::Ft8Encoder,
     modulator::{convert_samples, AudioFormat, Ft8Modulator},
@@ -79,6 +68,8 @@ pub struct Ft8Transmitter {
 
 impl Ft8Transmitter {
     /// Create a new FT8 transmitter
+    // cpal platform handles stay module-confined behind these shared controllers.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(config: TransmissionConfig) -> Ft8Result<Self> {
         let encoder = Ft8Encoder::new();
         let modulator = Ft8Modulator::new(
@@ -386,6 +377,8 @@ impl Ft8Transmitter {
     }
 
     /// Execute the actual transmission
+    // Retain the configuration read guard across the transmission for a stable snapshot.
+    #[allow(clippy::await_holding_lock)]
     async fn execute_transmission(
         &mut self,
         audio_samples: Vec<f32>,
@@ -527,6 +520,8 @@ impl Ft8Transmitter {
     }
 
     /// Test PTT control functionality
+    // Exclusive PTT access spans the assertion/release interval of the hardware test.
+    #[allow(clippy::await_holding_lock)]
     async fn test_ptt_control(&mut self) -> Ft8Result<PttTestResult> {
         let test_start = Instant::now();
 
@@ -549,6 +544,8 @@ impl Ft8Transmitter {
     }
 
     /// Test audio output functionality
+    // Keep the configuration snapshot and exclusive audio access throughout the test tone.
+    #[allow(clippy::await_holding_lock)]
     async fn test_audio_output(&mut self, duration_seconds: f64) -> Ft8Result<AudioTestResult> {
         let test_start = Instant::now();
 
