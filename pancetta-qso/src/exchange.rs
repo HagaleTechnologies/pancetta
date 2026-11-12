@@ -84,9 +84,6 @@ lazy_static! {
         r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,3}[A-Z]$|^[A-Z]{1,2}[0-9][A-Z0-9]{0,4}$"
     ).unwrap();
 
-    /// Grid square validation regex (4 or 6 characters)
-    static ref GRID_REGEX: Regex = Regex::new(r"^[A-R]{2}[0-9]{2}([A-X]{2})?$").unwrap();
-
     /// A callsign TOKEN as it can appear inside a decoded FT8 message's
     /// rendered text: either a normal (possibly compound) callsign, or an
     /// i3=4 hash-rendered callsign — `"<K5ARH>"` (resolved 12-bit hash) or
@@ -122,6 +119,18 @@ lazy_static! {
 // QSO engine and the TUI); re-exported here so every existing pancetta-qso
 // caller and test keeps compiling unchanged.
 pub use pancetta_core::callsign::{base_callsign, callsigns_match};
+
+/// Uppercase 4/6-character Maidenhead grid check — the exchange wire
+/// format's grid policy, backed by core semantic validation instead of a
+/// private regex (PAN-330). Field letters A–R, square digits, optional
+/// subsquare letters A–X, all uppercase (`FN42`, `FN42AB`).
+fn is_exchange_grid(grid: &str) -> bool {
+    matches!(grid.len(), 4 | 6)
+        && grid
+            .chars()
+            .all(|c| !c.is_ascii_alphabetic() || c.is_ascii_uppercase())
+        && pancetta_core::gridsquare::validate_grid(grid).is_ok()
+}
 
 /// Split a (possibly compound) callsign into its base and the *extra*
 /// (non-base) `/`-separated tokens, uppercased.
@@ -451,7 +460,7 @@ impl MessageExchange {
 
     /// Validate a grid square format
     pub fn validate_grid(&self, grid: &str) -> Result<(), ExchangeError> {
-        if !GRID_REGEX.is_match(grid) {
+        if !is_exchange_grid(grid) {
             return Err(ExchangeError::InvalidGrid {
                 grid: grid.to_string(),
             });
@@ -808,7 +817,7 @@ impl MessageExchange {
 
             // Check for the protocol close tokens FIRST. "RR73" is a
             // syntactically valid Maidenhead grid (field RR, square 73), so it
-            // ALSO matches GRID_REGEX — if we tested the grid first, a DX's
+            // ALSO matches is_exchange_grid — if we tested the grid first, a DX's
             // closing "DX K5ARH RR73" would be misclassified as a CqResponse
             // carrying grid "RR73", the FinalConfirmation arm would never fire,
             // and the QSO would stall one message short of completion (the DX's
@@ -835,7 +844,7 @@ impl MessageExchange {
                 })
             }
             // Check if it's a grid square
-            else if GRID_REGEX.is_match(third_field) {
+            else if is_exchange_grid(third_field) {
                 Ok(MessageType::CqResponse {
                     calling_station: station1,
                     responding_station: station2,
@@ -1051,6 +1060,32 @@ enum QsoSequenceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC6: exchange grid validation delegates to core Maidenhead
+    /// semantics with an uppercase 4/6-character adapter (the old
+    /// `GRID_REGEX` contract, one owner).
+    #[test]
+    fn exchange_grid_policy_table() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        for ok in ["FN42", "FN42AB", "EM00", "RR73"] {
+            assert!(exchange.validate_grid(ok).is_ok(), "expected valid: {ok:?}");
+        }
+        for bad in [
+            "fn42", // exchange wire format is uppercase-only
+            "fn42ab", "FN42ab",   // mixed case rejected at this boundary
+            "ZZ99",     // field letters outside A–R
+            "FN42YY",   // subsquare letters outside A–X
+            "FN42X",    // odd length
+            "FN4212",   // wrong character classes
+            "FN42AB12", // 8 chars: beyond exchange's 4/6 precision
+            "", "   ",
+        ] {
+            assert!(
+                exchange.validate_grid(bad).is_err(),
+                "expected invalid: {bad:?}"
+            );
+        }
+    }
 
     // --- Fix 1 (security): safe compound-callsign upgrade gate ----------
 
