@@ -2088,7 +2088,8 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleOperatingMode => {
                             // Operator pressed Shift+M: cycle the station-wide
-                            // operating mode FT8 → FT4 → FT2 → FT8. Unlike
+                            // operating mode FT8 → FT4 → FT8 (also FT2 with
+                            // the `ft2` feature). Unlike
                             // CycleTxPolicy this can be REFUSED (a QSO is
                             // active) — no optimistic local flip; the TUI
                             // waits for either a ModeUpdate (success) or a
@@ -2096,7 +2097,7 @@ impl super::ApplicationCoordinator {
                             let current = pancetta_config::OperatingMode::from_u8(
                                 cmd_active_protocol_mode.load(Ordering::Relaxed),
                             );
-                            let next = current.cycle();
+                            let next = super::next_operating_mode(current);
                             // PAN-287: a parked spot call's dial was resolved
                             // for the old mode; a successful switch cancels it.
                             let switched =
@@ -2157,25 +2158,6 @@ impl super::ApplicationCoordinator {
                                             mode: mode_str,
                                         },
                                     );
-                                    // FT2 is feature-gated in pancetta-ft8 behind `ft2`
-                                    // (see `protocol_from_mode`). On a build without it,
-                                    // switching TO "FT2" silently runs FT8 protocol
-                                    // params/timing under the FT2 label — ADIF logs
-                                    // MODE:FT2 while actually on-air FT8. Warn the
-                                    // operator rather than switch silently; no-op on an
-                                    // `ft2`-enabled build.
-                                    #[cfg(not(feature = "ft2"))]
-                                    if next == pancetta_config::OperatingMode::Ft2 {
-                                        let _ = cmd_tui_msg_tx.send(
-                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                                component: "Mode".to_string(),
-                                                status: "FT2 protocol is not yet implemented \
-                                                    on this build — running FT8 timing under \
-                                                    the FT2 label"
-                                                    .to_string(),
-                                            },
-                                        );
-                                    }
                                     // Last, so no status line above overwrites it.
                                     if let Some(call) = cancelled_spot_call {
                                         super::spot_call::report_mode_change_cancel(
