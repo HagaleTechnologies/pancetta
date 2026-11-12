@@ -32,7 +32,7 @@ The `SmartFrequencyAllocator` scores candidate TX frequencies across seven soft 
 
 ## DSP Pipeline
 
-The live receive path takes the left channel of the incoming 48 kHz audio and subsamples it 48→12 kHz (every fourth sample; FT8 occupies 0–3 kHz, well under the 6 kHz Nyquist limit), then hands 12.64-second windows, cut on slot boundaries, to the decoder. The `pancetta-dsp` crate also contains SINC resampling, biquad bandpass filters, automatic gain control and spectral subtraction, but the live receive path does not use them.
+The live receive path takes the left channel of the incoming 48 kHz audio and decimates it 48→12 kHz. The default is the original every-fourth-sample subsampling; `[audio] decimation_antialias_filter = true` (48 kHz only, restart required) swaps in a unity-gain 31-tap FIR anti-alias filter that suppresses the out-of-band energy subsampling folds into the decode band. The filter's station qualification is pending — the shipped default stays `subsample` until the recorded quiet/busy/TX-desense comparison shows the FIR decoding strictly more messages ([PAN-320 measurement record](docs/measurements/PAN-320-decimation.md)). 12.64-second windows cut on slot boundaries then go to the decoder. The `pancetta-dsp` crate also contains SINC resampling, biquad bandpass filters, automatic gain control and spectral subtraction; none of those run in the live receive path (the FIR decimator is the crate's one live-path component).
 
 ## Slot-Parity-Aware TX Scheduling
 

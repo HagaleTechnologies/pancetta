@@ -32,6 +32,12 @@ parking_lot = "0.12"
 [dev-dependencies]
 tracing-subscriber = "0.3"
 rand = "0.10"
+# PAN-320: CPU budget bench (see benches/decimation.rs).
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "decimation"
+harness = false
 
 [[example]]
 name = "ft8_pipeline_demo"

@@ -81,3 +81,29 @@ as the PAN-393 raw capture (it abandons a slot whose sample position drifts
 250 ms from the wall clock), needs `input_channels = 1` and
 `buffer_size = 4096` in stub tests; `pancetta/tests/wav_recording.rs` uses
 exactly that.
+
+## Decimation after the channel split (PAN-320)
+
+The decimation stage downstream of the channel-0 extraction has two arms
+(`DecimationStage` in `coordinator/dsp.rs`): the historical subsampler
+(counter starts 0, retains indices 3, 7, 11, …) and the opt-in 31-tap FIR
+(`[audio] decimation_antialias_filter = true`, 48 kHz only). Three framing
+pitfalls the tests pin:
+
+- **Channel 0 alone feeds the decoder — never a channel average.** The
+  A/B harness (`pancetta-research` `decimation_ab`) uses the same channel-0
+  extraction; a stereo capture with signal only in the right channel must
+  decode like silence in both arms.
+- **Every destructive `ft8_buffer` flush must also reset the stage.** A
+  filter history (or subsample counter phase) that survives a dial/mode/
+  gain/clock-jump flush splices two unrelated audio streams into one
+  window — the same class of bug as mixing two dials (PAN-70), one layer
+  down. `destructive_capture_flush` is the single action for this.
+- **A causal filter delays the stream by (taps−1)/2 input samples.** The
+  FIR's outputs lag 15 samples (312.5 µs); anything that maps buffer
+  positions to wall clock (the `boundary_anchored_slice` anchor) must
+  compensate at that mapping, not shift the scheduler.
+
+The raw48 capture (PAN-393) taps the stream *before* decimation, so
+recordings are arm-independent — that is the property that makes the
+decimation A/B comparable.

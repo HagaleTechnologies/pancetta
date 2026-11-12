@@ -137,6 +137,7 @@
 
 pub mod agc;
 pub mod buffer;
+pub mod decimation;
 pub mod filter;
 pub mod pipeline;
 pub mod resampler;
@@ -144,6 +145,7 @@ pub mod resampler;
 // Re-export main types for convenience
 pub use agc::{AgcConfig, AgcMode, AutomaticGainControl};
 pub use buffer::{AudioRingBuffer, WindowExtractor};
+pub use decimation::DecimationFilter;
 pub use filter::{FilterConfig, FilterType, IirFilter, NoiseReductionFilter};
 pub use pipeline::{
     AudioFrame, DspPipeline, PipelineBuilder, PipelineConfig, PipelineStage, PipelineStats,
