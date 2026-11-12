@@ -35,6 +35,10 @@ fn lifecycle(answer_queries: bool) {
     }
     wav.finalize().unwrap();
 
+    // SAFETY: openpty receives writable fd slots and a valid winsize; null
+    // name/termios pointers request defaults. Success is checked before fd use.
+    // termios has integer fields/arrays valid when zeroed, and tcgetattr writes
+    // to that live value. Each returned fd is transferred to exactly one File.
     let (mut master, slave, before) = unsafe {
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize {
@@ -139,6 +143,8 @@ fn lifecycle(answer_queries: bool) {
     assert!(text.contains("\x1b[?1049h"), "{text} {stderr}");
     assert!(text.contains("\x1b[?1049l"), "{text} {stderr}");
     assert!(text.contains("\x1b[?25h"), "{text} {stderr}");
+    // SAFETY: termios has integer fields/arrays valid when zeroed. slave owns
+    // an open PTY fd and tcgetattr receives a writable termios pointer.
     let after = unsafe {
         let mut term = std::mem::zeroed::<libc::termios>();
         assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut term), 0);

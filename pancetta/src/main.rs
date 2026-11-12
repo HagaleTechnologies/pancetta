@@ -4593,7 +4593,10 @@ mod pan333_panic_tests {
             pancetta_tui::tui_runner::restore_terminal();
             return;
         }
-        // A private PTY keeps this process-global hook test off the user's terminal.
+        // SAFETY: openpty receives writable fd slots and a valid winsize; null
+        // name/termios pointers request defaults. Success is checked before using
+        // the fds, which become uniquely owned Files. dup saves stdin/stdout before
+        // dup2 redirects them in this isolated child process.
         let (mut master, slave, saved_stdout, saved_stdin) = unsafe {
             let (mut master, mut slave) = (0, 0);
             let mut size = libc::winsize {
@@ -4692,7 +4695,9 @@ mod pan333_panic_tests {
             assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
             // Raw mode must still be active: the hook skipped restoration,
             // so the TUI keeps its alternate screen and input handling.
+            // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
             let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+            // SAFETY: slave owns an open PTY fd and term is writable for the call.
             assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
             assert_eq!(
                 term.c_lflag & libc::ICANON,
@@ -4715,6 +4720,8 @@ mod pan333_panic_tests {
         }
         drop(runner);
         std::io::stdout().flush().unwrap();
+        // SAFETY: saved_stdout and saved_stdin are live dup-owned fds. Restore
+        // their standard descriptors before closing each saved fd exactly once.
         unsafe {
             libc::dup2(saved_stdout, 1);
             libc::close(saved_stdout);
@@ -4735,7 +4742,9 @@ mod pan333_panic_tests {
             assert!(output.find("\x1b[?1049l").unwrap() < diagnostic, "{output}");
             assert!(output.find("\x1b[?25h").unwrap() < diagnostic, "{output}");
         }
+        // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
         let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: slave owns an open PTY fd and term is writable for the call.
         assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
         assert_ne!(term.c_lflag & libc::ICANON, 0);
     }
