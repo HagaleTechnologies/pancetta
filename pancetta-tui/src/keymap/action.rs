@@ -274,11 +274,13 @@ pub enum Action {
     WhyUp,
     /// Why Down: why down.
     WhyDown,
+    /// Shift+L: look up the focused callsign on QRZ.
+    LookupSelectedStation,
 }
 
 impl Action {
     /// Every variant once, in declaration order (`ALL[i].ordinal() == i`).
-    pub const ALL: [Action; 133] = [
+    pub const ALL: [Action; 134] = [
         Action::EmergencyStop,
         Action::OpenQuitConfirm,
         Action::ToggleHelp,
@@ -412,6 +414,7 @@ impl Action {
         Action::CloseWhy,
         Action::WhyUp,
         Action::WhyDown,
+        Action::LookupSelectedStation,
     ];
 
     /// Position in [`Action::ALL`]. Exhaustive with no `_` arm, so a new
@@ -474,6 +477,7 @@ impl Action {
             Action::SaveGainPreset => 52,
             Action::ToggleAutonomous => 53,
             Action::ToggleAutonomousPause => 54,
+            Action::LookupSelectedStation => 133,
             Action::CycleOperatingMode => 55,
             Action::CycleDecodeEffort => 56,
             Action::EngageHound => 57,
@@ -622,6 +626,7 @@ impl Action {
             | Action::ToggleTxFreqMode
             | Action::SaveGainPreset
             | Action::ToggleAutonomousPause
+            | Action::LookupSelectedStation
             | Action::CycleOperatingMode
             | Action::CycleDecodeEffort
             | Action::HoundFocusHint
