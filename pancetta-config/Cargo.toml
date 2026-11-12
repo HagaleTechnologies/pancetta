@@ -9,6 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# PAN-340: offline Hamlib model-name/ID resolver for `rig.model` validation.
+# Pure lookup only — this crate must never construct a client or spawn a
+# process, so the mock-rig default feature stays off here.
+pancetta-hamlib = { path = "../pancetta-hamlib", default-features = false }
+
 # Configuration and serialization
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"

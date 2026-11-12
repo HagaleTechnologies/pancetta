@@ -1700,14 +1700,49 @@ impl super::ApplicationCoordinator {
         }
     }
 
-    /// Map a configured `rig.model` name to its Hamlib model number.
+    /// Map a configured `rig.model` value to its Hamlib model number.
     ///
-    /// The rig table is `pancetta_hamlib::SUPPORTED_RIGS`, published as
-    /// `docs/SUPPORTED_RIGS.md`. Public so `pancetta doctor` (in the bin crate)
-    /// can pre-validate the configured model against the same table the
-    /// spawner uses.
+    /// PAN-340: resolution runs through the shared offline resolver
+    /// (`pancetta_hamlib::resolve_model`), which accepts any name in the
+    /// bundled Hamlib catalog, a manufacturer-qualified name, or a numeric
+    /// model ID. Kept as an `Option` wrapper for callers that only need
+    /// recognition (the TUI live-switch gate); callers that report to an
+    /// operator use the resolver's error body directly.
     pub fn hamlib_model_id(model: &str) -> Option<u32> {
-        pancetta_hamlib::find_supported_rig(model).map(|rig| rig.hamlib_id)
+        pancetta_hamlib::resolve_model(model).ok()
+    }
+
+    /// Build the managed `rigctld` command for a resolved model ID (PAN-340).
+    ///
+    /// The model ID arrives already resolved ([`Self::hamlib_model_id`] /
+    /// `pancetta_hamlib::resolve_model`) and is passed as its own argv
+    /// element — never concatenated into a shell string, and never the raw
+    /// `rig.model` input. Host, TCP port, serial port and baud behavior are
+    /// unchanged from the inline construction this replaced.
+    pub(crate) fn rigctld_command(
+        model_id: u32,
+        serial_port: &str,
+        baud_rate: u32,
+        listen_host: &str,
+        listen_port: u16,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new("rigctld");
+        command.args([
+            "-m",
+            &model_id.to_string(),
+            "-r",
+            serial_port,
+            "-s",
+            &baud_rate.to_string(),
+            "-t",
+            &listen_port.to_string(),
+            "-T",
+            listen_host,
+        ]);
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
     }
 
     /// SECURITY (I-10 / I-11): validate the `station.interface.port` device
@@ -1927,7 +1962,7 @@ impl super::ApplicationCoordinator {
                     "rigctld already running on {}:{}",
                     rigctld_host, rigctld_port
                 );
-            } else if let Some(model_id) = Self::hamlib_model_id(&rig_config.model) {
+            } else if let Ok(model_id) = pancetta_hamlib::resolve_model(&rig_config.model) {
                 // rigctld knows the correct serial parameters (stop bits, parity,
                 // flow control) for each rig model -- we only need to specify
                 // model, port, and baud rate.
@@ -1939,22 +1974,14 @@ impl super::ApplicationCoordinator {
                     rig_config.interface.baud_rate
                 );
 
-                match std::process::Command::new("rigctld")
-                    .args([
-                        "-m",
-                        &model_id.to_string(),
-                        "-r",
-                        &rig_config.interface.port,
-                        "-s",
-                        &rig_config.interface.baud_rate.to_string(),
-                        "-t",
-                        &rigctld_port.to_string(),
-                        "-T",
-                        &rigctld_host,
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
+                match Self::rigctld_command(
+                    model_id,
+                    &rig_config.interface.port,
+                    rig_config.interface.baud_rate,
+                    &rigctld_host,
+                    rigctld_port,
+                )
+                .spawn()
                 {
                     Ok(child) => {
                         info!("rigctld spawned (PID {})", child.id());
@@ -1980,18 +2007,21 @@ impl super::ApplicationCoordinator {
                     }
                 }
             } else {
-                warn!(
-                    "Unknown rig model '{}' -- cannot determine hamlib ID. \
-                     Set RIGCTLD_HOST/RIGCTLD_PORT to use an external rigctld.",
-                    rig_config.model
-                );
+                // PAN-340: the same resolver message config validation shows.
+                // Validation normally catches this earlier, but startup can
+                // receive constructed configs and must still refuse to spawn
+                // with an unresolved model.
+                let reason = pancetta_hamlib::resolve_model(&rig_config.model)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unresolved rig.model".to_string());
+                warn!("Unresolved rig.model: {reason}");
                 report_rig_error(
                     &self.message_bus,
                     format!(
-                        "Unknown rig model '{}' — cannot spawn rigctld (no CAT/PTT). \
-                         Run `pancetta setup` to pick a supported model, or run an \
-                         external rigctld and set RIGCTLD_HOST/RIGCTLD_PORT.",
-                        rig_config.model
+                        "Rig CAT disabled: {reason}. Run `rigctl -l` to find your model, \
+                         then set rig.model to its numeric ID, or run an external rigctld \
+                         and set RIGCTLD_HOST/RIGCTLD_PORT."
                     ),
                 )
                 .await;
@@ -8007,6 +8037,110 @@ mod model_recognized_tests {
     fn rejects_an_unrecognized_model() {
         assert!(!model_recognized("totally-bogus-unrecognized-model"));
         assert!(!model_recognized(""));
+    }
+
+    /// PAN-340: recognition follows the shared resolver, so numeric IDs,
+    /// catalog names beyond the curated sixteen (KX3), manufacturer-qualified
+    /// names and curated aliases are all recognized — and malformed or
+    /// ambiguous values are not.
+    #[test]
+    fn numeric_and_catalog_models_are_recognized() {
+        for model in [
+            "1045",
+            " 1045 ",
+            "2147483647", // in range, newer than the bundled catalog
+            "KX3",
+            "K3S",
+            "ic 7300",
+            "Barrett 950",
+            "mcHF QRP",
+        ] {
+            assert!(model_recognized(model), "{model:?} must be recognized");
+            assert!(
+                super::super::ApplicationCoordinator::hamlib_model_id(model).is_some(),
+                "{model:?} must resolve through the same wrapper"
+            );
+        }
+        for model in [
+            "FT-9999",
+            "totally-bogus-unrecognized-model",
+            "0",
+            "-7",
+            "1045 -t 4532",
+            "SW/FM radio", // ambiguous
+            "Generic",
+            "",
+        ] {
+            assert!(!model_recognized(model), "{model:?} must not be recognized");
+        }
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("1045"),
+            Some(1045)
+        );
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("IC-7300"),
+            Some(3073)
+        );
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("KX3"),
+            Some(2045)
+        );
+    }
+}
+
+/// PAN-340 AC1: the managed rigctld launch is built from the resolved model
+/// ID through [`ApplicationCoordinator::rigctld_command`], the same helper
+/// `start_hamlib_component`'s `.spawn()` call uses.
+#[cfg(test)]
+mod tests {
+    use super::super::ApplicationCoordinator;
+
+    #[test]
+    fn managed_rigctld_argv_uses_resolved_model() {
+        // A numeric model absent from the catalog, a catalog name, and a
+        // curated alias all resolve to their ID first.
+        for (model, model_id) in [
+            ("1045", 1045_u32),
+            ("IC-7300", 3073),
+            ("KX3", 2045),
+            ("123456", 123456), // not in the bundled catalog at all
+        ] {
+            let resolved = ApplicationCoordinator::hamlib_model_id(model)
+                .unwrap_or_else(|| panic!("{model} must resolve"));
+            assert_eq!(resolved, model_id);
+            let command = ApplicationCoordinator::rigctld_command(
+                resolved,
+                "/dev/ttyUSB0",
+                38400,
+                "127.0.0.1",
+                4532,
+            );
+            assert_eq!(command.get_program(), "rigctld");
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // `-m` and the ID are separate argv elements — the ID is its own
+            // argument, never concatenated into a shell string.
+            assert_eq!(args[0], "-m");
+            assert_eq!(args[1], model_id.to_string(), "for model {model:?}");
+            assert_eq!(
+                args,
+                vec![
+                    "-m",
+                    &model_id.to_string(),
+                    "-r",
+                    "/dev/ttyUSB0",
+                    "-s",
+                    "38400",
+                    "-t",
+                    "4532",
+                    "-T",
+                    "127.0.0.1",
+                ],
+                "for model {model:?}"
+            );
+        }
     }
 }
 

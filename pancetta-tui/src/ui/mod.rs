@@ -402,9 +402,9 @@ struct HuntRects {
     qso_status: Rect,
 }
 
-fn compute_hunt_rects(content_area: Rect) -> HuntRects {
-    // Four content lines and two borders.
-    const STATION_CARD_HEIGHT: u16 = 6;
+fn compute_hunt_rects(content_area: Rect, has_qrz_info: bool) -> HuntRects {
+    // Four content lines, optional QRZ identity, and two borders.
+    let station_card_height = 6 + u16::from(has_qrz_info);
     // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
     // content_area ~15 rows) never shows the card, while a normally-sized
     // terminal (TestBackend's 120x40 fixture → content_area 34 rows) does.
@@ -417,7 +417,7 @@ fn compute_hunt_rects(content_area: Rect) -> HuntRects {
         Constraint::Percentage(45), // DX Hunter (full width)
     ];
     if show_card {
-        constraints.push(Constraint::Length(STATION_CARD_HEIGHT)); // Station card
+        constraints.push(Constraint::Length(station_card_height)); // Station card
     }
     constraints.push(Constraint::Percentage(25)); // Band Activity (full width, CQs-only)
     constraints.push(Constraint::Min(5)); // QSO Status
@@ -467,9 +467,9 @@ fn compute_hunt_rects(content_area: Rect) -> HuntRects {
 /// MIN_W/MIN_H resize-guard floor, whose content area is ~15 rows) keeps the
 /// pre-card layout untouched rather than starving DX Hunter/Band
 /// Activity/QSO Status for a card that would barely fit; a taller terminal
-/// gets a six-row block (four content lines and two borders).
+/// gets a six-row block, or seven with a cached QRZ identity.
 fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
-    let r = compute_hunt_rects(content_area);
+    let r = compute_hunt_rects(content_area, station_card::focused_qrz_info(app).is_some());
 
     render_active_qsos(f, r.banner, app);
     render_tx_placement(f, r.tx_placement, app)?;
@@ -554,6 +554,7 @@ pub fn view_rects(
     zoomed: bool,
     active_panel: ActivePanel,
     area: Rect,
+    has_qrz_info: bool,
 ) -> Vec<(ActivePanel, Rect)> {
     if zoomed {
         // Mirrors `render_zoomed_panel`: the focused panel fills the content
@@ -576,7 +577,7 @@ pub fn view_rects(
             vec![(ActivePanel::BandActivity, r.band_activity)]
         }
         crate::view::ActiveView::Hunt => {
-            let r = compute_hunt_rects(area);
+            let r = compute_hunt_rects(area, has_qrz_info);
             vec![
                 (ActivePanel::TxPlacement, r.tx_placement),
                 (ActivePanel::DxHunter, r.dx_hunter),
@@ -623,6 +624,7 @@ fn panel_row_offset(panel: ActivePanel) -> u16 {
 /// Pure geometry — computed from the SAME `view_rects` the renderer's
 /// `layout_*` functions draw from, so a click always lands on the panel
 /// boundary the operator actually sees on screen.
+#[allow(clippy::too_many_arguments)] // Mirror `view_rects`' geometry inputs plus the focused-station card flag (PAN-343); hit-test and layout must stay in lockstep.
 pub fn hit_test(
     view: crate::view::ActiveView,
     zoomed: bool,
@@ -631,6 +633,7 @@ pub fn hit_test(
     contest_score: Option<&pancetta_qso::contest::ledger::ContestScoreUpdate>,
     x: u16,
     y: u16,
+    has_qrz_info: bool,
 ) -> Option<(ActivePanel, u16)> {
     // `area` here is the CONTENT area (title bar/TX strip/status bar already
     // stripped off, see `content_area`), which is always a few rows shorter
@@ -649,7 +652,7 @@ pub fn hit_test(
     if area.width < min_content.width || area.height < min_content.height {
         return None;
     }
-    for (panel, rect) in view_rects(view, zoomed, active_panel, area) {
+    for (panel, rect) in view_rects(view, zoomed, active_panel, area, has_qrz_info) {
         if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
             continue;
         }
@@ -771,14 +774,20 @@ fn title_bar_segments(
         title_rank::MODE,
     ));
 
-    // Bold, color-coded global TX-policy banner chip. Always visible (pinned)
-    // so the operator can tell at a glance which of the three states is
-    // active: GREEN "TX: FULL", YELLOW "TX: RESPOND-ONLY", RED
-    // "TX: DISABLED — RX ONLY". Reversed/bold for visual dominance.
-    let (policy_text, policy_bg) = match app.tx_policy {
-        pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
-        pancetta_core::TxPolicy::RespondOnly => (" TX: RESPOND-ONLY ".to_string(), Color::Yellow),
-        pancetta_core::TxPolicy::Disabled => (" TX: DISABLED — RX ONLY ".to_string(), Color::Red),
+    // Pinned TX banner: replay is a neutral session fact from the first draw.
+    // Live sessions retain the green/yellow/red policy states.
+    let (policy_text, policy_bg) = if app.config.replay {
+        (" TX: REPLAY ".to_string(), Color::Gray)
+    } else {
+        match app.tx_policy {
+            pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
+            pancetta_core::TxPolicy::RespondOnly => {
+                (" TX: RESPOND-ONLY ".to_string(), Color::Yellow)
+            }
+            pancetta_core::TxPolicy::Disabled => {
+                (" TX: DISABLED — RX ONLY ".to_string(), Color::Red)
+            }
+        }
     };
     segs.push(BarSegment::new(
         " ",
@@ -3048,7 +3057,7 @@ mod view_render_tests {
 
     #[test]
     fn hunt_station_card_is_six_rows_when_shown() {
-        let rects = compute_hunt_rects(Rect::new(0, 0, 120, 40));
+        let rects = compute_hunt_rects(Rect::new(0, 0, 120, 40), false);
         assert_eq!(rects.station_card.unwrap().height, 6);
     }
 
@@ -4039,6 +4048,46 @@ mod view_render_tests {
         crate::view::ActiveView::Monitor,
     ];
 
+    #[tokio::test]
+    async fn replay_title_bar_is_neutral_from_first_draw_for_every_policy() {
+        use crate::config::{Config, Theme};
+        use pancetta_core::TxPolicy;
+
+        for theme in [Theme::Dark, Theme::Light] {
+            for policy in [TxPolicy::Full, TxPolicy::RespondOnly, TxPolicy::Disabled] {
+                let mut config = Config {
+                    replay: true,
+                    ..Config::default()
+                };
+                config.ui.theme = theme;
+                let mut app = App::new(config, None).await.unwrap();
+                app.tx_policy = policy;
+                for view in ALL_VIEWS {
+                    app.active_view = view;
+                    for width in [80, 160] {
+                        let buf = render_app(&app, width, 24);
+                        let row = row_text(&buf, 0);
+                        let chip = " TX: REPLAY ";
+                        let start = row.find(chip).unwrap_or_else(|| {
+                            panic!("{theme:?} {policy:?} {view:?} {width}: [{row}]")
+                        });
+                        for text in ["TX: FULL", "TX: RESPOND-ONLY", "TX: DISABLED"] {
+                            assert!(!row.contains(text), "[{row}]");
+                        }
+                        assert!(ends_with_utc_clock(&row), "[{row}]");
+                        let start_col = row[..start].chars().count() as u16;
+                        for x in start_col..start_col + chip.len() as u16 {
+                            let cell = &buf[(x, 0)];
+                            assert_eq!(cell.fg, Color::Black);
+                            assert_eq!(cell.bg, Color::Gray);
+                            assert!(cell.modifier.contains(Modifier::BOLD));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Gherkin 1: the UTC clock stays visible in the header at the
     /// documented minimum terminal size, in all four main views.
     #[tokio::test]
@@ -4357,7 +4406,7 @@ mod view_render_tests {
                 let output: String = buf.content.iter().map(|cell| cell.symbol()).collect();
                 let content = content_area(Rect::new(0, 0, w, h));
                 let panel = if view == crate::view::ActiveView::Hunt {
-                    compute_hunt_rects(content).dx_hunter
+                    compute_hunt_rects(content, false).dx_hunter
                 } else {
                     compute_operate_rects(content).dx_hunter
                 };
@@ -4394,7 +4443,7 @@ mod view_render_tests {
             ] {
                 app.active_view = view;
                 let rect = match view {
-                    crate::view::ActiveView::Hunt => compute_hunt_rects(content).dx_hunter,
+                    crate::view::ActiveView::Hunt => compute_hunt_rects(content, false).dx_hunter,
                     _ => compute_operate_rects(content).dx_hunter,
                 };
                 let buf = render_app(&app, w, h);
@@ -4629,7 +4678,13 @@ mod hit_test_tests {
     #[test]
     fn view_rects_operate_returns_5_nonoverlapping_rects_covering_content() {
         let area = Rect::new(0, 0, 120, 40);
-        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        let rects = view_rects(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            false,
+        );
         assert_eq!(rects.len(), 5, "Operate should show exactly 5 panels");
 
         let mut seen: Vec<ActivePanel> = Vec::new();
@@ -4666,7 +4721,13 @@ mod hit_test_tests {
     #[test]
     fn view_rects_monitor_returns_only_band_activity() {
         let area = Rect::new(0, 0, 120, 40);
-        let rects = view_rects(ActiveView::Monitor, false, ActivePanel::BandActivity, area);
+        let rects = view_rects(
+            ActiveView::Monitor,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            false,
+        );
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].0, ActivePanel::BandActivity);
     }
@@ -4674,12 +4735,12 @@ mod hit_test_tests {
     #[test]
     fn view_rects_hunt_has_no_callers_and_run_has_no_dx_hunter() {
         let area = Rect::new(0, 0, 120, 40);
-        let hunt = view_rects(ActiveView::Hunt, false, ActivePanel::DxHunter, area);
+        let hunt = view_rects(ActiveView::Hunt, false, ActivePanel::DxHunter, area, false);
         assert!(hunt.iter().any(|(p, _)| *p == ActivePanel::DxHunter));
         assert!(!hunt.iter().any(|(p, _)| *p == ActivePanel::Callers));
         assert_no_overlaps(&hunt);
 
-        let run = view_rects(ActiveView::Run, false, ActivePanel::Callers, area);
+        let run = view_rects(ActiveView::Run, false, ActivePanel::Callers, area, false);
         assert!(run.iter().any(|(p, _)| *p == ActivePanel::Callers));
         assert!(!run.iter().any(|(p, _)| *p == ActivePanel::DxHunter));
         assert_no_overlaps(&run);
@@ -4688,7 +4749,7 @@ mod hit_test_tests {
     #[test]
     fn view_rects_zoomed_reserves_the_banner_row_above_the_active_panel() {
         let area = Rect::new(0, 0, 120, 40);
-        let rects = view_rects(ActiveView::Run, true, ActivePanel::DxHunter, area);
+        let rects = view_rects(ActiveView::Run, true, ActivePanel::DxHunter, area, false);
         assert_eq!(
             rects,
             vec![(ActivePanel::DxHunter, Rect::new(0, 1, 120, 39))]
@@ -4701,7 +4762,13 @@ mod hit_test_tests {
     #[test]
     fn hit_test_band_activity_row_3() {
         let area = Rect::new(0, 0, 120, 40);
-        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        let rects = view_rects(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            false,
+        );
         let (_, band_activity_rect) = rects
             .into_iter()
             .find(|(p, _)| *p == ActivePanel::BandActivity)
@@ -4719,6 +4786,7 @@ mod hit_test_tests {
             None,
             x,
             y,
+            false,
         );
         assert_eq!(hit, Some((ActivePanel::BandActivity, 3)));
     }
@@ -4738,6 +4806,7 @@ mod hit_test_tests {
             None,
             5,
             area.y + area.height + 1,
+            false,
         );
         assert_eq!(hit, None);
     }
@@ -4750,7 +4819,7 @@ mod hit_test_tests {
     #[test]
     fn hit_test_tx_placement_strip_row_vs_other_rows() {
         let area = Rect::new(0, 0, 120, 40);
-        let rects = view_rects(ActiveView::Run, false, ActivePanel::Callers, area);
+        let rects = view_rects(ActiveView::Run, false, ActivePanel::Callers, area, false);
         let (_, tx_rect) = rects
             .into_iter()
             .find(|(p, _)| *p == ActivePanel::TxPlacement)
@@ -4764,6 +4833,7 @@ mod hit_test_tests {
             None,
             tx_rect.x + 2,
             tx_rect.y + 1, // border(1) + row 0 (strip)
+            false,
         );
         assert_eq!(strip_hit, Some((ActivePanel::TxPlacement, 0)));
 
@@ -4775,6 +4845,7 @@ mod hit_test_tests {
             None,
             tx_rect.x + 2,
             tx_rect.y + 1 + 3, // border(1) + row 3 (park line)
+            false,
         );
         assert_eq!(park_line_hit, Some((ActivePanel::TxPlacement, 3)));
     }
@@ -4793,6 +4864,7 @@ mod hit_test_tests {
             None,
             10,
             area.y + 2 + 5,
+            false,
         );
         assert_eq!(hit, Some((ActivePanel::DxHunter, 4)));
     }
@@ -4811,6 +4883,7 @@ mod hit_test_tests {
             None,
             5,
             too_narrow.y + 2,
+            false,
         );
         assert_eq!(hit, None, "too-narrow content area must never hit a panel");
 
@@ -4823,6 +4896,7 @@ mod hit_test_tests {
             None,
             5,
             too_short.y + 2,
+            false,
         );
         assert_eq!(hit, None, "too-short content area must never hit a panel");
     }
@@ -4840,6 +4914,7 @@ mod hit_test_tests {
             false,
             ActivePanel::BandActivity,
             at_floor,
+            false,
         );
         let (_, band_activity_rect) = rects
             .into_iter()
@@ -4854,6 +4929,7 @@ mod hit_test_tests {
             None,
             band_activity_rect.x + 2,
             band_activity_rect.y + 2,
+            false,
         );
         assert_eq!(hit, Some((ActivePanel::BandActivity, 0)));
     }
@@ -4887,7 +4963,13 @@ mod hit_test_tests {
         let full = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT));
         let area = crate::contest_score::content(full, Some(&update));
         assert_eq!(area.height, 13);
-        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        let rects = view_rects(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            false,
+        );
         let (_, band_activity_rect) = rects
             .into_iter()
             .find(|(p, _)| *p == ActivePanel::BandActivity)
@@ -4901,6 +4983,7 @@ mod hit_test_tests {
             Some(&update),
             band_activity_rect.x + 2,
             band_activity_rect.y + 2,
+            false,
         );
         assert_eq!(hit, Some((ActivePanel::BandActivity, 0)));
     }

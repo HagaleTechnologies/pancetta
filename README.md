@@ -355,6 +355,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
 | LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| TUI QRZ station lookup | Implemented, *Unreleased* | Shift+L looks up the focused callsign with configured XML credentials. Name, QTH, grid and entity appear in the station card; results are cached for the session with a two-second network deadline. Mock-tested; live-account qualification pending | [lookup handler](pancetta/src/coordinator/qrz_lookup.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
 | PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
@@ -396,8 +397,10 @@ Honest gaps, so you can judge whether it fits your station:
   the binary builds and decodes correctly on an ARM64 cloud runner, not on a
   Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
-  Other hamlib-supported rigs should work; nobody has proven it. The
-  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status.
+  `rig.model` accepts any name from the bundled Hamlib catalog or a numeric
+  Hamlib model ID, but no other rig has been proven on air. The
+  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status
+  and which models are accepted.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI
   and unsupported.
 

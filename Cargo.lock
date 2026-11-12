@@ -3156,6 +3156,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "notify",
+ "pancetta-hamlib",
  "serde",
  "serde_json",
  "shellexpand",
