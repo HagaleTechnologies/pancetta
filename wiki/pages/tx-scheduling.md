@@ -147,7 +147,14 @@ ordering.
 PTT-method gotcha (PAN-121): `[rig.ptt].method` does not choose how TX is keyed.
 Normal PTT always goes to rigctld as `T 1`/`T 0`, and managed rigctld is spawned
 without a PTT option. Setup, the rig picker and bookmarks only store or print the
-method; only `test-rig --ptt` acts on it (Serial pulses RTS).
+method; only `test-rig --ptt` acts on it. PAN-339 makes that diagnostic use
+the existing daemon for link checks and CAT PTT; Serial still pulses RTS.
+Link-only testing never opens the configured serial device.
+CAT and Serial pulses both require fresh split-aware band admission.
+Unknown split state refuses PTT even with edge warnings disabled. PTT setters
+require `RPRT 0`, and the diagnostic attempts unkey after key-down errors or
+Ctrl+C. Mock-daemon tests in `pancetta/tests/test_rig_cli.rs` prove protocol
+behavior, not physical rig operation.
 There is no CM108 variant. See
 [the audit](../../docs/DECISIONS/tx-scheduling.md#what-the-configured-ptt-method-actually-controls-pan-121-2026-11-01).
 

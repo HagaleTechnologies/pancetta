@@ -20,6 +20,7 @@ Press `?` inside the TUI for the same list as an overlay.
 
 | Key | Action |
 |---|---|
+| `Shift+L` | QRZ: look up the focused callsign (cached for the session) |
 | `Shift+W` | Watchlist: toggle focused/typed callsign (persists; removed when worked) |
 | `Space` | Call selected station (a DX Hunter cluster/cqdx spot QSYs the rig to its dial first; waits for PTT-off) |
 | `/` | Compose free-text TX (Enter sends, Esc cancels) |

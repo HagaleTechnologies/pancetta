@@ -7,6 +7,58 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+const RIGCTLD_STDERR_MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Drain continuously, retaining only a bounded prefix even without newlines.
+/// The file logger uses a nonblocking writer; no queue backpressure is added here.
+fn drain_child_stderr_to_warn(mut stderr: impl std::io::Read + Send + 'static) {
+    fn emit(bytes: &[u8], overflow: usize) {
+        let bytes = if overflow == 0 {
+            bytes.strip_suffix(b"\r").unwrap_or(bytes)
+        } else {
+            bytes
+        };
+        if bytes.is_empty() && overflow == 0 {
+            return;
+        }
+        let line = String::from_utf8_lossy(bytes);
+        if overflow == 0 {
+            warn!(target: "rigctld", "{line}");
+        } else {
+            warn!(target: "rigctld", "{line} [+{overflow} bytes]");
+        }
+    }
+
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::with_capacity(RIGCTLD_STDERR_MAX_LINE_BYTES);
+    let mut overflow = 0usize;
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => {
+                emit(&line, overflow);
+                return;
+            }
+            Ok(count) => {
+                for &byte in &chunk[..count] {
+                    if byte == b'\n' {
+                        emit(&line, overflow);
+                        line.clear();
+                        overflow = 0;
+                    } else if line.len() < RIGCTLD_STDERR_MAX_LINE_BYTES {
+                        line.push(byte);
+                    } else {
+                        overflow = overflow.saturating_add(1);
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(target: "rigctld", "stderr read failed: {error}");
+                return;
+            }
+        }
+    }
+}
+
 // Serialize tests that replace the process-wide external-rigctld address.
 #[cfg(test)]
 static RIGCTLD_TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1700,14 +1752,51 @@ impl super::ApplicationCoordinator {
         }
     }
 
-    /// Map a configured `rig.model` name to its Hamlib model number.
+    /// Map a configured `rig.model` value to its Hamlib model number.
     ///
-    /// The rig table is `pancetta_hamlib::SUPPORTED_RIGS`, published as
-    /// `docs/SUPPORTED_RIGS.md`. Public so `pancetta doctor` (in the bin crate)
-    /// can pre-validate the configured model against the same table the
-    /// spawner uses.
+    /// PAN-340: resolution runs through the shared offline resolver
+    /// (`pancetta_hamlib::resolve_model`), which accepts any name in the
+    /// bundled Hamlib catalog, a manufacturer-qualified name, or a numeric
+    /// model ID. Kept as an `Option` wrapper for callers that only need
+    /// recognition (the TUI live-switch gate); callers that report to an
+    /// operator use the resolver's error body directly.
     pub fn hamlib_model_id(model: &str) -> Option<u32> {
-        pancetta_hamlib::find_supported_rig(model).map(|rig| rig.hamlib_id)
+        pancetta_hamlib::resolve_model(model).ok()
+    }
+
+    /// Build the managed `rigctld` command for a resolved model ID (PAN-340).
+    ///
+    /// The model ID arrives already resolved ([`Self::hamlib_model_id`] /
+    /// `pancetta_hamlib::resolve_model`) and is passed as its own argv
+    /// element — never concatenated into a shell string, and never the raw
+    /// `rig.model` input. Host, TCP port, serial port and baud behavior are
+    /// unchanged from the inline construction this replaced. Stdout is
+    /// discarded; stderr is piped (PAN-332) so the managed spawn's
+    /// `drain_child_stderr_to_warn` reader can log it at WARN.
+    pub(crate) fn rigctld_command(
+        model_id: u32,
+        serial_port: &str,
+        baud_rate: u32,
+        listen_host: &str,
+        listen_port: u16,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new("rigctld");
+        command.args([
+            "-m",
+            &model_id.to_string(),
+            "-r",
+            serial_port,
+            "-s",
+            &baud_rate.to_string(),
+            "-t",
+            &listen_port.to_string(),
+            "-T",
+            listen_host,
+        ]);
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        command
     }
 
     /// SECURITY (I-10 / I-11): validate the `station.interface.port` device
@@ -1927,7 +2016,7 @@ impl super::ApplicationCoordinator {
                     "rigctld already running on {}:{}",
                     rigctld_host, rigctld_port
                 );
-            } else if let Some(model_id) = Self::hamlib_model_id(&rig_config.model) {
+            } else if let Ok(model_id) = pancetta_hamlib::resolve_model(&rig_config.model) {
                 // rigctld knows the correct serial parameters (stop bits, parity,
                 // flow control) for each rig model -- we only need to specify
                 // model, port, and baud rate.
@@ -1939,25 +2028,21 @@ impl super::ApplicationCoordinator {
                     rig_config.interface.baud_rate
                 );
 
-                match std::process::Command::new("rigctld")
-                    .args([
-                        "-m",
-                        &model_id.to_string(),
-                        "-r",
-                        &rig_config.interface.port,
-                        "-s",
-                        &rig_config.interface.baud_rate.to_string(),
-                        "-t",
-                        &rigctld_port.to_string(),
-                        "-T",
-                        &rigctld_host,
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
+                match Self::rigctld_command(
+                    model_id,
+                    &rig_config.interface.port,
+                    rig_config.interface.baud_rate,
+                    &rigctld_host,
+                    rigctld_port,
+                )
+                .spawn()
                 {
-                    Ok(child) => {
+                    Ok(mut child) => {
                         info!("rigctld spawned (PID {})", child.id());
+                        if let Some(stderr) = child.stderr.take() {
+                            // Detached reader ends at EOF when the managed child exits.
+                            tokio::task::spawn_blocking(move || drain_child_stderr_to_warn(stderr));
+                        }
                         self.rigctld_process = Some(child);
                         // Give rigctld time to bind the port and open the serial device
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1980,18 +2065,21 @@ impl super::ApplicationCoordinator {
                     }
                 }
             } else {
-                warn!(
-                    "Unknown rig model '{}' -- cannot determine hamlib ID. \
-                     Set RIGCTLD_HOST/RIGCTLD_PORT to use an external rigctld.",
-                    rig_config.model
-                );
+                // PAN-340: the same resolver message config validation shows.
+                // Validation normally catches this earlier, but startup can
+                // receive constructed configs and must still refuse to spawn
+                // with an unresolved model.
+                let reason = pancetta_hamlib::resolve_model(&rig_config.model)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unresolved rig.model".to_string());
+                warn!("Unresolved rig.model: {reason}");
                 report_rig_error(
                     &self.message_bus,
                     format!(
-                        "Unknown rig model '{}' — cannot spawn rigctld (no CAT/PTT). \
-                         Run `pancetta setup` to pick a supported model, or run an \
-                         external rigctld and set RIGCTLD_HOST/RIGCTLD_PORT.",
-                        rig_config.model
+                        "Rig CAT disabled: {reason}. Run `rigctl -l` to find your model, \
+                         then set rig.model to its numeric ID, or run an external rigctld \
+                         and set RIGCTLD_HOST/RIGCTLD_PORT."
                     ),
                 )
                 .await;
@@ -8008,6 +8096,110 @@ mod model_recognized_tests {
         assert!(!model_recognized("totally-bogus-unrecognized-model"));
         assert!(!model_recognized(""));
     }
+
+    /// PAN-340: recognition follows the shared resolver, so numeric IDs,
+    /// catalog names beyond the curated sixteen (KX3), manufacturer-qualified
+    /// names and curated aliases are all recognized — and malformed or
+    /// ambiguous values are not.
+    #[test]
+    fn numeric_and_catalog_models_are_recognized() {
+        for model in [
+            "1045",
+            " 1045 ",
+            "2147483647", // in range, newer than the bundled catalog
+            "KX3",
+            "K3S",
+            "ic 7300",
+            "Barrett 950",
+            "mcHF QRP",
+        ] {
+            assert!(model_recognized(model), "{model:?} must be recognized");
+            assert!(
+                super::super::ApplicationCoordinator::hamlib_model_id(model).is_some(),
+                "{model:?} must resolve through the same wrapper"
+            );
+        }
+        for model in [
+            "FT-9999",
+            "totally-bogus-unrecognized-model",
+            "0",
+            "-7",
+            "1045 -t 4532",
+            "SW/FM radio", // ambiguous
+            "Generic",
+            "",
+        ] {
+            assert!(!model_recognized(model), "{model:?} must not be recognized");
+        }
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("1045"),
+            Some(1045)
+        );
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("IC-7300"),
+            Some(3073)
+        );
+        assert_eq!(
+            super::super::ApplicationCoordinator::hamlib_model_id("KX3"),
+            Some(2045)
+        );
+    }
+}
+
+/// PAN-340 AC1: the managed rigctld launch is built from the resolved model
+/// ID through [`ApplicationCoordinator::rigctld_command`], the same helper
+/// `start_hamlib_component`'s `.spawn()` call uses.
+#[cfg(test)]
+mod tests {
+    use super::super::ApplicationCoordinator;
+
+    #[test]
+    fn managed_rigctld_argv_uses_resolved_model() {
+        // A numeric model absent from the catalog, a catalog name, and a
+        // curated alias all resolve to their ID first.
+        for (model, model_id) in [
+            ("1045", 1045_u32),
+            ("IC-7300", 3073),
+            ("KX3", 2045),
+            ("123456", 123456), // not in the bundled catalog at all
+        ] {
+            let resolved = ApplicationCoordinator::hamlib_model_id(model)
+                .unwrap_or_else(|| panic!("{model} must resolve"));
+            assert_eq!(resolved, model_id);
+            let command = ApplicationCoordinator::rigctld_command(
+                resolved,
+                "/dev/ttyUSB0",
+                38400,
+                "127.0.0.1",
+                4532,
+            );
+            assert_eq!(command.get_program(), "rigctld");
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // `-m` and the ID are separate argv elements — the ID is its own
+            // argument, never concatenated into a shell string.
+            assert_eq!(args[0], "-m");
+            assert_eq!(args[1], model_id.to_string(), "for model {model:?}");
+            assert_eq!(
+                args,
+                vec![
+                    "-m",
+                    &model_id.to_string(),
+                    "-r",
+                    "/dev/ttyUSB0",
+                    "-s",
+                    "38400",
+                    "-t",
+                    "4532",
+                    "-T",
+                    "127.0.0.1",
+                ],
+                "for model {model:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10772,5 +10964,165 @@ mod pan272_ptt_off_watchdog_tests {
 
         s.rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
         c.shutdown_signal.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod rigctld_stderr_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let writer = self.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(true)
+                .with_writer(move || writer.clone())
+                .finish()
+        }
+    }
+
+    fn capture(script: &str) -> String {
+        let output = LogBuffer::default();
+        let _subscriber = tracing::subscriber::set_default(output.subscriber());
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drain_child_stderr_to_warn(child.stderr.take().unwrap());
+        assert!(child.wait().unwrap().success());
+        output.text()
+    }
+
+    #[test]
+    fn stderr_lines_are_logged_at_warn_with_rigctld_prefix() {
+        let logs = capture("printf 'first\\r\\n\\nsecond\\n' >&2");
+        assert_eq!(logs, " WARN rigctld: first\n WARN rigctld: second\n");
+    }
+
+    #[test]
+    fn oversized_lines_are_truncated_and_draining_continues() {
+        let logs = capture("head -c 65536 /dev/zero | tr '\\000' x >&2; printf '\\nnext\\n' >&2");
+        let retained = "x".repeat(RIGCTLD_STDERR_MAX_LINE_BYTES);
+        assert_eq!(
+            logs,
+            format!(" WARN rigctld: {retained} [+57344 bytes]\n WARN rigctld: next\n")
+        );
+    }
+
+    #[test]
+    fn unterminated_final_line_and_invalid_utf8_are_logged() {
+        let logs = capture("printf '\\377\\376\\ntail without newline' >&2");
+        assert_eq!(
+            logs,
+            " WARN rigctld: \u{fffd}\u{fffd}\n WARN rigctld: tail without newline\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_spawn_pipes_rigctld_stderr_into_the_log() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "PAN332_MANAGED_STDERR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "coordinator::hamlib::rigctld_stderr_tests::managed_spawn_pipes_rigctld_stderr_into_the_log", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let output = LogBuffer::default();
+        tracing::subscriber::set_global_default(output.subscriber()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("rigctld");
+        let pid_file = dir.path().join("pid");
+        std::fs::write(&shim, "#!/bin/sh\necho $$ > \"$PAN332_PID_FILE\"\necho 'stdout is discarded'\necho 'open of /dev/ttyUSB0 failed' >&2\nexec sleep 120\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("PAN332_PID_FILE", &pid_file);
+        std::env::remove_var("PANCETTA_MOCK_RIG");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::env::set_var(
+            "RIGCTLD_PORT",
+            listener.local_addr().unwrap().port().to_string(),
+        );
+        std::env::set_var("RIGCTLD_HOST", "127.0.0.1");
+        drop(listener);
+        let mut config = pancetta_config::Config::default();
+        config.rig.interface.enabled = true;
+        config.rig.model = "IC-7300".into();
+        config.rig.interface.port = "/dev/ttyUSB0".into();
+        let mut coordinator = super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Vec::new(),
+            dir.path().join("config.toml"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        coordinator.start_hamlib_component().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output
+                .text()
+                .contains("WARN rigctld: open of /dev/ttyUSB0 failed")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!output.text().contains("stdout is discarded"));
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(coordinator);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // SAFETY: signal 0 only probes whether this shim PID still exists.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

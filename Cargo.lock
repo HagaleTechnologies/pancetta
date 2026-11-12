@@ -3156,7 +3156,11 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "notify",
+<<<<<<< HEAD
  "pancetta-core",
+=======
+ "pancetta-hamlib",
+>>>>>>> 69c84e618b719b0dc916bb16ade4ef149b4dd3c3
  "serde",
  "serde_json",
  "shellexpand",

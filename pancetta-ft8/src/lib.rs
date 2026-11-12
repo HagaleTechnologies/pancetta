@@ -1,3 +1,6 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Crate-level warn overrides command-line -D, so Clippy must also deny here.
+#![cfg_attr(clippy, deny(clippy::undocumented_unsafe_blocks))]
 //! # pancetta-ft8
 //!
 //! FT8 protocol encoder, decoder, modulator, and OSD — bit-exact with WSJT-X / ft8_lib.

@@ -1,3 +1,6 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Crate-level warn overrides command-line -D, so Clippy must also deny here.
+#![cfg_attr(clippy, deny(clippy::undocumented_unsafe_blocks))]
 //! PAN-259: WSJT-X DXpedition (i3=0 n3=1) type 0.1 interoperability.
 //!
 //! The reference payload below was produced by
@@ -119,6 +122,7 @@ fn dxpedition_reference_audio_crosses_both_production_decoders() {
     use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Modulator, Protocol, WINDOW_SAMPLES};
     let mut symbols = [0u8; 79];
     // Independent pinned payload -> reference C channel encoder, not our packer.
+    // SAFETY: REFERENCE_PAYLOAD has 10 live bytes and symbols has 79 writable bytes; C retains neither pointer.
     unsafe {
         pancetta_ft8::ft8_lib_ffi::ft8_encode(REFERENCE_PAYLOAD.as_ptr(), symbols.as_mut_ptr());
     }

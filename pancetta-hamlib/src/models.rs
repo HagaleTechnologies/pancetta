@@ -472,13 +472,16 @@ const fn untested_rig(
     manufacturer: &'static str,
     model: &'static str,
     config_names: &'static [&'static str],
-    hamlib_id: u32,
+    catalog_macro: &'static str,
 ) -> SupportedRig {
     SupportedRig {
         manufacturer,
         model,
         config_names,
-        hamlib_id,
+        // The ID is looked up from the vendored Hamlib catalog at compile
+        // time (PAN-340), so this curated metadata table cannot drift from
+        // the authoritative ID source.
+        hamlib_id: crate::model_catalog::catalog_id(catalog_macro),
         cat: HardwareTest::Untested,
         audio: HardwareTest::Untested,
         tx: HardwareTest::Untested,
@@ -489,32 +492,50 @@ const fn untested_rig(
 /// The one table of rigs Pancetta starts `rigctld` for.
 ///
 /// The coordinator's `rigctld` spawner, `pancetta doctor`, the TUI rig
-/// picker's model check (`model_recognized`) and `docs/SUPPORTED_RIGS.md` all
-/// read this table. After adding or changing
+/// picker's model check (`model_recognized`), `docs/SUPPORTED_RIGS.md` and
+/// the curated legacy aliases of [`crate::model_catalog::resolve_model`]
+/// all read this table. Each `hamlib_id` is a compile-time lookup into the
+/// vendored Hamlib catalog by its upstream `RIG_MODEL_*` macro
+/// ([`crate::model_catalog::catalog_id`]). After adding or changing
 /// an entry, regenerate the page with
 /// `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current`
 /// and pin the upstream Hamlib number in `hamlib_ids_match_upstream_riglist`.
 /// Mark a capability [`HardwareTest::Tested`] only when the repository records
 /// a hardware test, and name that record in `evidence`.
 pub static SUPPORTED_RIGS: &[SupportedRig] = &[
-    untested_rig("Icom", "IC-7300", &["IC-7300"], 3073),
-    untested_rig("Icom", "IC-705", &["IC-705"], 3085),
-    untested_rig("Icom", "IC-7610", &["IC-7610"], 3078),
-    untested_rig("Icom", "IC-7851", &["IC-7851"], 3075),
-    untested_rig("Icom", "IC-9700", &["IC-9700"], 3081),
-    untested_rig("Kenwood", "TS-590S", &["TS-590", "TS-590S"], 2031),
-    untested_rig("Kenwood", "TS-590SG", &["TS-590SG"], 2037),
-    untested_rig("Kenwood", "TS-890S", &["TS-890", "TS-890S"], 2041),
-    untested_rig("Yaesu", "FT-710", &["FT-710"], 1049),
-    untested_rig("Yaesu", "FT-817", &["FT-817", "FT-817ND"], 1020),
-    untested_rig("Yaesu", "FT-857", &["FT-857", "FT-857D"], 1022),
-    untested_rig("Yaesu", "FT-891", &["FT-891"], 1036),
-    untested_rig("Yaesu", "FT-991", &["FT-991", "FT-991A"], 1035),
+    untested_rig("Icom", "IC-7300", &["IC-7300"], "RIG_MODEL_IC7300"),
+    untested_rig("Icom", "IC-705", &["IC-705"], "RIG_MODEL_IC705"),
+    untested_rig("Icom", "IC-7610", &["IC-7610"], "RIG_MODEL_IC7610"),
+    untested_rig("Icom", "IC-7851", &["IC-7851"], "RIG_MODEL_IC785x"),
+    untested_rig("Icom", "IC-9700", &["IC-9700"], "RIG_MODEL_IC9700"),
+    untested_rig(
+        "Kenwood",
+        "TS-590S",
+        &["TS-590", "TS-590S"],
+        "RIG_MODEL_TS590S",
+    ),
+    untested_rig("Kenwood", "TS-590SG", &["TS-590SG"], "RIG_MODEL_TS590SG"),
+    untested_rig(
+        "Kenwood",
+        "TS-890S",
+        &["TS-890", "TS-890S"],
+        "RIG_MODEL_TS890S",
+    ),
+    untested_rig("Yaesu", "FT-710", &["FT-710"], "RIG_MODEL_FT710"),
+    untested_rig(
+        "Yaesu",
+        "FT-817",
+        &["FT-817", "FT-817ND"],
+        "RIG_MODEL_FT817",
+    ),
+    untested_rig("Yaesu", "FT-857", &["FT-857", "FT-857D"], "RIG_MODEL_FT857"),
+    untested_rig("Yaesu", "FT-891", &["FT-891"], "RIG_MODEL_FT891"),
+    untested_rig("Yaesu", "FT-991", &["FT-991", "FT-991A"], "RIG_MODEL_FT991"),
     SupportedRig {
         manufacturer: "Yaesu",
         model: "FTdx10",
         config_names: &["FTdx10"],
-        hamlib_id: 1042,
+        hamlib_id: crate::model_catalog::catalog_id("RIG_MODEL_FTDX10"),
         cat: HardwareTest::Tested,
         audio: HardwareTest::Tested,
         tx: HardwareTest::Tested,
@@ -523,8 +544,8 @@ pub static SUPPORTED_RIGS: &[SupportedRig] = &[
              PSKReporter spots across NA and EU); manual on-air QSOs since 2026-09.",
         ),
     },
-    untested_rig("Yaesu", "FTdx101D", &["FTdx101D"], 1040),
-    untested_rig("Yaesu", "FTdx101MP", &["FTdx101MP"], 1044),
+    untested_rig("Yaesu", "FTdx101D", &["FTdx101D"], "RIG_MODEL_FTDX101D"),
+    untested_rig("Yaesu", "FTdx101MP", &["FTdx101MP"], "RIG_MODEL_FTDX101MP"),
 ];
 
 /// Rigs listed first on the supported-rig page, by [`SupportedRig::model`]:
@@ -539,6 +560,11 @@ pub fn normalize_rig_model(name: &str) -> String {
 }
 
 /// Look up a configured `rig.model` value in [`SUPPORTED_RIGS`].
+///
+/// This is the *curated metadata* lookup (capabilities, qualification,
+/// page row), not the acceptance test: any Hamlib model — catalog name,
+/// manufacturer-qualified name or numeric ID — resolves through
+/// [`crate::model_catalog::resolve_model`].
 pub fn find_supported_rig(name: &str) -> Option<&'static SupportedRig> {
     let wanted = normalize_rig_model(name);
     if wanted.is_empty() {
@@ -581,9 +607,15 @@ pub fn render_supported_rigs_markdown() -> String {
          Source: pancetta-hamlib/src/models.rs (SUPPORTED_RIGS).\n     \
          Regenerate: PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-hamlib supported_rigs_doc_is_current -->\n\n\
          # Supported rigs\n\n\
-         Pancetta controls a rig through Hamlib's `rigctld`. It starts `rigctld` itself for the rigs below.\n\
-         Set `rig.model` in `~/.pancetta/pancetta.toml` to a name from the `rig.model` column.\n\
-         Case, hyphens and spaces are ignored.\n\n",
+         Pancetta controls a rig through Hamlib's `rigctld`.\n\
+         Set `rig.model` in `~/.pancetta/pancetta.toml` to a model name from the bundled \
+         Hamlib 4.5.5 catalog or a numeric Hamlib model ID, for example \"IC-7300\" or \"1045\".\n\
+         Case, hyphens and spaces are ignored when matching names. Ambiguous names require a numeric ID.\n\
+         Run `rigctl -l` to see the models your installed Hamlib supports. A numeric ID also \
+         permits models newer than the bundled catalog.\n\
+         For an all-digit model name, include the manufacturer, for example \"Barrett 950\".\n\
+         The table below records selected rigs and their hardware test status. It is not the \
+         full list of accepted models.\n\n",
     );
     match tested.as_slice() {
         [] => out.push_str("No rig has a recorded hardware test.\n"),
@@ -654,8 +686,8 @@ pub fn render_supported_rigs_markdown() -> String {
          No remote session on a real rig is recorded. Remote operation is integration-tested only.\n\
          \n## Rigs not in this list\n\n\
          If a `rigctld` is already listening on `RIGCTLD_HOST`:`RIGCTLD_PORT` (default `127.0.0.1:4532`), Pancetta connects to it and does not start its own.\n\
-         To use another rig Hamlib supports, start `rigctld -m <model> -r <port>` yourself before Pancetta.\n\
-         `pancetta doctor` still reports a `rig.model` that is not in this list as unknown.\n\
+         A nonempty `rig.model` name outside the bundled catalog now fails validation, even for external-daemon users; use the model's numeric ID instead (`rigctl -l` lists it).\n\
+         Empty and `Generic` keep their existing placeholder behavior.\n\
          \nSWR readings, attenuator steps and preamp steps differ between rigs. Pancetta reads them from `rigctld` when it connects, so this page does not list them.\n",
     );
     out
@@ -769,6 +801,31 @@ mod tests {
             SUPPORTED_RIGS.len(),
             UPSTREAM_RIGLIST.len(),
             "UPSTREAM_RIGLIST pins a rig that SUPPORTED_RIGS no longer lists"
+        );
+    }
+
+    /// PAN-340: every curated ID comes from the vendored Hamlib catalog via
+    /// its upstream `RIG_MODEL_*` macro, so the curated table cannot drift
+    /// from the authoritative ID source. `hamlib_ids_match_upstream_riglist`
+    /// stays as independent hand-copied regression evidence.
+    #[test]
+    fn curated_ids_come_from_catalog() {
+        for (model, _, macro_name) in UPSTREAM_RIGLIST {
+            let rig = SUPPORTED_RIGS
+                .iter()
+                .find(|r| r.model == *model)
+                .unwrap_or_else(|| panic!("{model} is no longer curated"));
+            assert_eq!(
+                crate::model_catalog::catalog_id_by_macro(macro_name),
+                Some(rig.hamlib_id),
+                "{model}: SUPPORTED_RIGS id {} disagrees with the catalog macro {macro_name}",
+                rig.hamlib_id
+            );
+        }
+        // The compile-time lookup also refuses unknown macros outright.
+        assert_eq!(
+            crate::model_catalog::catalog_id_by_macro("RIG_MODEL_NOPE"),
+            None
         );
     }
 
@@ -890,5 +947,44 @@ mod tests {
         assert_eq!(rows.len(), SUPPORTED_RIGS.len());
         assert!(rows[0].starts_with("| Icom IC-7300 |"), "{}", rows[0]);
         assert!(rows[1].starts_with("| Icom IC-705 |"), "{}", rows[1]);
+    }
+
+    /// PAN-340: the page explains the expanded acceptance (bundled catalog
+    /// names and numeric IDs) while never claiming extra hardware
+    /// qualification — the hardware rows stay evidence-bound.
+    #[test]
+    fn supported_rigs_page_distinguishes_catalog_from_test_evidence() {
+        let page = render_supported_rigs_markdown();
+        assert!(
+            page.contains(
+                "model name from the bundled Hamlib 4.5.5 catalog or a numeric Hamlib \
+                 model ID, for example \"IC-7300\" or \"1045\""
+            ),
+            "the intro must explain catalog names and numeric IDs"
+        );
+        assert!(
+            page.contains("Ambiguous names require a numeric ID"),
+            "the intro must explain ambiguity"
+        );
+        assert!(
+            page.contains("For an all-digit model name, include the manufacturer"),
+            "the intro must explain all-digit model names"
+        );
+        assert!(
+            page.contains("It is not the full list of accepted models."),
+            "the intro must not claim the table is the acceptance list"
+        );
+        // The catalog-vs-evidence distinction keeps the qualification row:
+        // only FTdx10 carries a Test record today.
+        assert!(page.contains("| Yaesu FTdx10 | `FTdx10` | 1042 | Tested | Tested | Tested |"));
+        assert!(page.contains("No remote session on a real rig is recorded"));
+        // Numeric IDs work for rigs beyond the bundled catalog.
+        assert!(page.contains("permits models newer than the bundled catalog"));
+        // External-daemon users keep the already-listening escape hatch.
+        assert!(page.contains("Pancetta connects to it and does not start its own"));
+        assert!(
+            page.contains("fails validation, even for external-daemon users"),
+            "unknown names failing validation must be documented for external-daemon users"
+        );
     }
 }

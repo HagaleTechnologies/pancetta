@@ -9,8 +9,16 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+<<<<<<< HEAD
 # Shared radio-domain vocabulary: band names for rig preset validation (PAN-330)
 pancetta-core = { path = "../pancetta-core" }
+=======
+# PAN-340: offline Hamlib model-name/ID resolver for `rig.model` validation.
+# Pure lookup only — this crate must never construct a client or spawn a
+# process, so the mock-rig default feature stays off here.
+pancetta-hamlib = { path = "../pancetta-hamlib", default-features = false }
+
+>>>>>>> 69c84e618b719b0dc916bb16ade4ef149b4dd3c3
 # Configuration and serialization
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"

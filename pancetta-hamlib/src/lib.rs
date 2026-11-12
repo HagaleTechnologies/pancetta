@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-hamlib
 //!
 //! Hamlib CAT control over `rigctld` — frequency, mode, and PTT for the
@@ -47,6 +48,8 @@
 
 pub mod data_mode;
 pub mod error;
+pub mod model_catalog;
+mod model_catalog_generated;
 pub mod models;
 pub mod rig;
 pub mod rigctld;
@@ -57,6 +60,9 @@ pub mod mock;
 // Public surface — what the rest of the workspace depends on.
 pub use data_mode::{DataModePolicy, DataModeReadiness};
 pub use error::{ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError};
+pub use model_catalog::{
+    catalog_id_by_macro, resolve_model, CatalogEntry, ModelResolutionError, HAMLIB_MODEL_CATALOG,
+};
 pub use models::{
     find_supported_rig, normalize_rig_model, render_supported_rigs_markdown, Band, HardwareTest,
     Mode, RigCapabilities, RigModelType, SupportedRig, Vfo, SUPPORTED_RIGS,

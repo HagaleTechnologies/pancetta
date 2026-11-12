@@ -812,6 +812,13 @@ const fn kb(
 /// by each modal's own footer, not here.
 pub const KEYBINDINGS: &[KeyBinding] = &[
     kb(
+        "Shift+L",
+        "QRZ: look up the focused callsign (cached for the session)",
+        Category::QsoOperation,
+        false,
+        &[main_no_ctrl_alt(c('L'), Action::LookupSelectedStation)],
+    ),
+    kb(
         "Shift+W",
         "Watchlist: toggle focused/typed callsign (persists; removed when worked)",
         Category::QsoOperation,
@@ -1851,7 +1858,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 46);
+        assert_eq!(KEYBINDINGS.len(), 47);
     }
 
     #[test]
