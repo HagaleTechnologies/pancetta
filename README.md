@@ -366,8 +366,10 @@ Honest gaps, so you can judge whether it fits your station:
   the binary builds and decodes correctly on an ARM64 cloud runner, not on a
   Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
-  Other hamlib-supported rigs should work; nobody has proven it. The
-  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status.
+  `rig.model` accepts any name from the bundled Hamlib catalog or a numeric
+  Hamlib model ID, but no other rig has been proven on air. The
+  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status
+  and which models are accepted.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI
   and unsupported.
 

@@ -11,7 +11,8 @@ without operator intervention.
 ## Crate Dependency Graph
 
 ```
-Layer 0 — no internal deps:
+Layer 0 — no internal deps (except the PAN-340 note below: config → hamlib's
+         pure model resolver, itself core-only):
   pancetta-core    — shared types, error handling, offline DXCC entity resolver
   pancetta-audio   — real-time audio I/O (cpal + ringbuf)
   pancetta-dsp     — DSP pipeline (FFT, filtering, resampling)
@@ -35,6 +36,13 @@ Layer 1 — depends on core/ft8:
                       dependency back on pancetta-tui)
   pancetta-research — local-only decoder harness (depends on ft8 + qso);
                       excluded from CI
+
+  PAN-340: pancetta-config also depends on pancetta-hamlib (path dependency,
+  default features off) for one thing only — the pure offline
+  `rig.model` resolver over the vendored Hamlib catalog
+  (pancetta-hamlib/src/model_catalog.rs). Config validation never constructs
+  a client, spawns a process or queries a daemon; the dependency adds no
+  cycle because pancetta-hamlib depends only on pancetta-core.
 
 Layer 2 — orchestrator:
   pancetta         — coordinator, message bus, runtime (depends on all above)

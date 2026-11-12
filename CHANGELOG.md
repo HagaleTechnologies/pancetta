@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-340: `rig.model` now accepts any Hamlib model — a name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, `"Barrett 950"`), a manufacturer-qualified name, or a numeric Hamlib model ID (`"1045"`), so rigs newer than the bundled catalog still work by number. Case, hyphens and spaces are ignored when matching names; ambiguous names and all-digit model names require the manufacturer-qualified form or the numeric ID. Unknown, malformed or ambiguous values fail config validation with the closest matches and a `rigctl -l` numeric-ID hint, and `pancetta doctor` reports the same message. Selecting more models adds no hardware qualification: only the FTdx10 is radio-qualified. Empty and `Generic` keep their placeholder behavior, and external `rigctld` users with an unknown name must now use its numeric ID.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
 
 ### Changed
