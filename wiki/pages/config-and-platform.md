@@ -110,7 +110,6 @@ macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
 
-<<<<<<< HEAD
 Service readiness gotcha (PAN-335): spawning an audio thread or decoder task
 does not mean initialization succeeded. Owner readiness must follow successful
 stream start or decoder construction and clear on owner exit. READY also waits
@@ -118,7 +117,7 @@ for full startup and the rig loop. The watchdog sends only after completed
 coordinator health passes, so a second heartbeat task would hide the failure
 it is supposed to detect. Receive-only systemd host qualification is still
 pending. See [the service liveness decision](../../docs/DECISIONS/config-and-platform.md#service-liveness-and-field-diagnostics-pan-335-2026-11-12).
-=======
+
 Rig-model gotcha (PAN-340): **`rig.model` resolves through one offline
 catalog, and that catalog is not the qualification table.** Acceptance comes
 from the vendored Hamlib 4.5.5 `rigctl -l` snapshot
@@ -138,4 +137,3 @@ re-capturing the data file you must rerun
 `docs/SUPPORTED_RIGS.md`; upstream reuses one macro for two rows
 (RIG_MODEL_FT450 → 1027 and 1046), so curated tables must pin macros only
 the catalog carries once.
->>>>>>> 495015e1d1bcb74a618a6b0a90d3a7f06fecad72
