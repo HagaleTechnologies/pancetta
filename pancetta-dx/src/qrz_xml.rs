@@ -30,11 +30,7 @@
 //! lookups; it is re-fetched on first use and whenever QRZ reports the session
 //! has expired.
 
-// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum
-// for ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope.
-#![allow(clippy::result_large_err)]
-
-use crate::{DxError, Result};
+use crate::{DxError, DxErrorInner, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Client;
@@ -131,14 +127,15 @@ impl QrzXmlClient {
     /// [`DxError`]; **no credential or session-key value is ever included** in
     /// an error or log line; network failures carry no URL (see
     /// [`NetworkError`](crate::NetworkError)). A response body over 64 KiB is
-    /// refused with [`DxError::ResponseTooLarge`] once that much has been read.
+    /// refused with [`DxErrorInner::ResponseTooLarge`] once that much has been read.
     pub async fn lookup(&self, callsign: &str) -> Result<QrzLookup> {
         // Ensure we hold a session key (auth on first use).
         let key = self.session_key().await?;
 
         match self.lookup_with_key(&key, callsign).await {
             Ok(lookup) => Ok(lookup),
-            Err(DxError::ExternalService(msg)) if is_session_expired(&msg) => {
+            Err(ref err) if matches!(err.kind(), DxErrorInner::ExternalService(msg) if is_session_expired(msg)) =>
+            {
                 // Session expired between auth and lookup (or was stale in the
                 // cache). Drop the cached key, re-auth, and retry once.
                 debug!(target: "dx.qrz", "QRZ session expired; re-authenticating");
@@ -189,13 +186,13 @@ impl QrzXmlClient {
             SessionResult::Error(msg) => {
                 // `msg` is QRZ's own error text (e.g. "Username/password
                 // incorrect"), never our credentials.
-                Err(DxError::ExternalService(format!(
+                Err(DxError::from(DxErrorInner::ExternalService(format!(
                     "QRZ authentication failed: {msg}"
-                )))
+                ))))
             }
-            SessionResult::None => Err(DxError::ExternalService(
+            SessionResult::None => Err(DxError::from(DxErrorInner::ExternalService(
                 "QRZ authentication returned no session key or error".to_string(),
-            )),
+            ))),
         }
     }
 
@@ -210,14 +207,16 @@ impl QrzXmlClient {
         // A session error in the response (timeout/invalid) is surfaced as an
         // ExternalService error so `lookup` can decide whether to re-auth.
         if let SessionResult::Error(msg) = parse_session(&body)? {
-            return Err(DxError::ExternalService(format!("QRZ lookup error: {msg}")));
+            return Err(DxError::from(DxErrorInner::ExternalService(format!(
+                "QRZ lookup error: {msg}"
+            ))));
         }
 
         let lookup = parse_callsign(&body)?;
         if lookup == QrzLookup::default() {
-            return Err(DxError::ExternalService(format!(
+            return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "QRZ returned no callsign data for '{callsign}'"
-            )));
+            ))));
         }
         Ok(lookup)
     }
@@ -322,7 +321,7 @@ fn extract_tag_text(xml: &str, tag: &str) -> Result<Option<String>> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(DxError::Xml(e)),
+            Err(e) => return Err(DxError::from(DxErrorInner::Xml(e))),
             _ => {}
         }
         buf.clear();
@@ -733,7 +732,7 @@ mod tests {
         );
         let err = client_at(addr).lookup("AA7BQ").await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == QRZ_XML_MAX_BODY_BYTES),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == QRZ_XML_MAX_BODY_BYTES),
             "got {err:?}"
         );
         let s = served(h).await;
@@ -749,7 +748,7 @@ mod tests {
         );
         let result = session_client_at(addr).await.lookup("AA7BQ").await;
         assert!(
-            matches!(result, Err(DxError::ResponseTooLarge { limit }) if limit == QRZ_XML_MAX_BODY_BYTES),
+            matches!(result.as_ref().map_err(DxError::kind), Err(DxErrorInner::ResponseTooLarge { limit }) if *limit == QRZ_XML_MAX_BODY_BYTES),
             "got {result:?}"
         );
         let s = served(h).await;

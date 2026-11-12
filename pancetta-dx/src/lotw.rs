@@ -3,11 +3,7 @@
 //! This module provides integration with ARRL's Logbook of the World
 //! for QSL confirmation and award tracking.
 
-// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
-// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
-#![allow(clippy::result_large_err)]
-
-use crate::{body, ConfirmationStatus, DxError, DxQso, Result};
+use crate::{body, ConfirmationStatus, DxError, DxErrorInner, DxQso, Result};
 use chrono::{NaiveDate, Utc};
 use reqwest::{multipart::Form, Client};
 use serde::{Deserialize, Serialize};
@@ -220,9 +216,9 @@ impl LotwClient {
     /// Login to LoTW
     pub async fn login(&mut self) -> Result<()> {
         if self.config.username.is_empty() || self.config.password.is_empty() {
-            return Err(DxError::Configuration(
+            return Err(DxError::from(DxErrorInner::Configuration(
                 "LoTW username and password required".to_string(),
-            ));
+            )));
         }
 
         // Refuse to send credentials over plaintext. LoTW's real endpoint is
@@ -231,11 +227,11 @@ impl LotwClient {
         // username/password in form data.
         let url_lower = self.config.base_url.to_lowercase();
         if !url_lower.starts_with("https://") {
-            return Err(DxError::Configuration(format!(
+            return Err(DxError::from(DxErrorInner::Configuration(format!(
                 "LoTW base_url must use https:// (got: {}). Refusing to \
                  send credentials over an unencrypted connection.",
                 self.config.base_url
-            )));
+            ))));
         }
 
         info!("Logging into LoTW as {}", self.config.username);
@@ -254,9 +250,9 @@ impl LotwClient {
             let text = body::text_within(response, LOTW_PAGE_MAX_BYTES).await?;
 
             if text.contains("Invalid username") || text.contains("Invalid password") {
-                return Err(DxError::ExternalService(
+                return Err(DxError::from(DxErrorInner::ExternalService(
                     "Invalid LoTW credentials".to_string(),
-                ));
+                )));
             }
 
             if text.contains("Welcome") || text.contains("My LoTW") {
@@ -265,7 +261,9 @@ impl LotwClient {
             }
         }
 
-        Err(DxError::ExternalService("LoTW login failed".to_string()))
+        Err(DxError::from(DxErrorInner::ExternalService(
+            "LoTW login failed".to_string(),
+        )))
     }
 
     /// Upload QSOs to LoTW (ADIF format)
@@ -294,9 +292,12 @@ impl LotwClient {
         &mut self,
         file_path: P,
     ) -> Result<LotwUploadResponse> {
-        let adif_data = fs::read_to_string(file_path)
-            .await
-            .map_err(|e| DxError::ExternalService(format!("Failed to read ADIF file: {}", e)))?;
+        let adif_data = fs::read_to_string(file_path).await.map_err(|e| {
+            DxError::from(DxErrorInner::ExternalService(format!(
+                "Failed to read ADIF file: {}",
+                e
+            )))
+        })?;
 
         self.upload_adif(&adif_data).await
     }
@@ -362,10 +363,10 @@ impl LotwClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(DxError::ExternalService(format!(
+            return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "LoTW download failed: HTTP {}",
                 response.status()
-            )));
+            ))));
         }
 
         body::text_within(response, LOTW_REPORT_MAX_BYTES).await
@@ -566,7 +567,9 @@ impl LotwClient {
         }
 
         if qsl.call.is_empty() {
-            return Err(DxError::Parse("Missing required CALL field".to_string()));
+            return Err(DxError::from(DxErrorInner::Parse(
+                "Missing required CALL field".to_string(),
+            )));
         }
 
         Ok(qsl)
@@ -1055,7 +1058,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == LOTW_REPORT_MAX_BYTES),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == LOTW_REPORT_MAX_BYTES),
             "got {err:?}"
         );
         crate::test_support::served(h).await;

@@ -4880,6 +4880,7 @@ impl App {
     /// the reply was read before the coordinator handled the operator's latest
     /// `SelectRig`, it merges only the refreshed port and bookmark lists
     /// instead of overwriting the form.
+    #[allow(clippy::too_many_arguments)] // Mirror the rig update message fields and ordering token without changing modal merge behavior.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,

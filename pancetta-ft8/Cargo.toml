@@ -109,3 +109,6 @@ ft2 = []
 # reduction in OSD trials for failed-BP frames. Disable for minimal
 # builds where the weight blob and inference cost aren't acceptable.
 neural_osd = []
+
+[lints]
+workspace = true

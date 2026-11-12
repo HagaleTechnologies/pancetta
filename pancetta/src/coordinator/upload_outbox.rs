@@ -466,6 +466,7 @@ impl UploadOutboxHandle {
 }
 
 /// Start the one process-wide upload worker.
+#[allow(clippy::too_many_arguments)] // Keep worker transport, persistence, retry and shutdown dependencies explicit at startup.
 pub(crate) fn start_upload_outbox<T: OutboxTransport>(
     path: PathBuf,
     transport: Arc<T>,
