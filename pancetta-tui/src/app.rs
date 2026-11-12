@@ -1479,12 +1479,8 @@ pub struct App {
 
     // UI State
     pub terminal_size: (u16, u16),
-<<<<<<< HEAD
     pub qrz_stations: HashMap<String, QrzStationInfo>,
-    pub status_message: String,
-=======
     statuses: crate::status::StatusMessages,
->>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
     pub theme: Theme,
     /// Retained diagnostic-event history (docs/observability-diagnostics-
     /// plan.md Layer 1) — unlike the expiring transient status ring, this is a bounded scrollback of WHY things happened:
@@ -1918,10 +1914,7 @@ impl App {
             should_quit: false,
             active_panel: ActivePanel::BandActivity,
             terminal_size: (80, 24),
-<<<<<<< HEAD
             qrz_stations: HashMap::new(),
-            status_message: "Pancetta TUI Ready".to_string(),
-=======
             statuses: {
                 let mut statuses = crate::status::StatusMessages::default();
                 statuses.push(
@@ -1934,7 +1927,6 @@ impl App {
                 );
                 statuses
             },
->>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),
             recent_qsos: VecDeque::with_capacity(50),

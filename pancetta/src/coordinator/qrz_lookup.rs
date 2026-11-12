@@ -43,12 +43,17 @@ fn reply(tx: &crossbeam_channel::Sender<TuiMessage>, message: TuiMessage) {
     }
 }
 
-fn status(tx: &crossbeam_channel::Sender<TuiMessage>, text: String) {
+fn status(
+    tx: &crossbeam_channel::Sender<TuiMessage>,
+    text: String,
+    level: pancetta_core::DiagnosticLevel,
+) {
     reply(
         tx,
         TuiMessage::StatusUpdate {
             component: "QRZ".into(),
             status: text,
+            level,
         },
     );
 }
@@ -67,7 +72,11 @@ fn result(tx: &crossbeam_channel::Sender<TuiMessage>, callsign: String, lookup: 
             },
         );
     } else {
-        status(tx, format!("{callsign} not found on QRZ"));
+        status(
+            tx,
+            format!("{callsign} not found on QRZ"),
+            pancetta_core::DiagnosticLevel::Info,
+        );
     }
 }
 
@@ -86,6 +95,7 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
         status(
             &ctx.tx,
             "lookups need [network.qrz_xml] username/password".into(),
+            pancetta_core::DiagnosticLevel::Warn,
         );
         return;
     }
@@ -98,7 +108,11 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        status(&ctx.tx, "lookup already in progress, try again".into());
+        status(
+            &ctx.tx,
+            "lookup already in progress, try again".into(),
+            pancetta_core::DiagnosticLevel::Info,
+        );
         return;
     }
     let guard = FlightGuard(ctx.in_flight.clone());
@@ -138,8 +152,16 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
                 cache.lock().await.insert(callsign.clone(), None);
                 result(&tx, callsign, None);
             }
-            Ok(Err(_)) => status(&tx, format!("{callsign} lookup failed")),
-            Err(_) => status(&tx, format!("{callsign} lookup timed out")),
+            Ok(Err(_)) => status(
+                &tx,
+                format!("{callsign} lookup failed"),
+                pancetta_core::DiagnosticLevel::Warn,
+            ),
+            Err(_) => status(
+                &tx,
+                format!("{callsign} lookup timed out"),
+                pancetta_core::DiagnosticLevel::Warn,
+            ),
         }
     });
 }
@@ -218,7 +240,7 @@ mod tests {
         let (ctx, rx) = context(false, None);
         handle_lookup_callsign(&ctx, "DL1ABC".into()).await;
         assert!(
-            matches!(next(&rx).await, TuiMessage::StatusUpdate {component, status}
+            matches!(next(&rx).await, TuiMessage::StatusUpdate {component, status, ..}
             if component == "QRZ" && status == "lookups need [network.qrz_xml] username/password")
         );
     }

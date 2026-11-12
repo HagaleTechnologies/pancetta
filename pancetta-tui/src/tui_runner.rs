@@ -959,7 +959,6 @@ impl TuiRunner {
                     );
                 }
             }
-<<<<<<< HEAD
             TuiMessage::QrzLookupUpdate {
                 callsign,
                 name,
@@ -979,9 +978,6 @@ impl TuiRunner {
                     },
                 );
             }
-            TuiMessage::StatusUpdate { component, status } => {
-                app.update_component_status(component, status);
-=======
             TuiMessage::StatusUpdate {
                 component,
                 status,
@@ -996,7 +992,6 @@ impl TuiRunner {
                 code,
             } => {
                 app.update_coded_component_status(component, status, level, code);
->>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
             }
             // PAN-287: the coordinator commanded a spot-call QSY; follow it.
             TuiMessage::SpotQsy { dial_hz } => {
@@ -2430,7 +2425,10 @@ impl TuiRunner {
                     self.message_tx
                         .send(TuiCommand::LookupCallsign { callsign })?;
                 } else {
-                    app.status_message = "no station focused — Tab to a list, ↑/↓ to pick".into();
+                    app.set_local_status(
+                        "no station focused — Tab to a list, ↑/↓ to pick".into(),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    );
                 }
             }
 
@@ -5947,7 +5945,7 @@ mod key_tests {
         runner.handle_key_event(key('L')).await.unwrap();
         assert!(commands.try_recv().is_err());
         assert_eq!(
-            app.read().await.status_message,
+            app.read().await.status_message(),
             "no station focused — Tab to a list, ↑/↓ to pick"
         );
     }

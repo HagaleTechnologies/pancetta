@@ -32,12 +32,8 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
-<<<<<<< HEAD
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending. Space-to-call QSY on network spots (PAN-287) is implemented, unreleased: it QSYs to the spot's FT8/FT4 dial and calls at the derived offset (the rig mode follows `rig.data_mode` when set, PAN-276), and cqdx spots do not reach DX Hunter yet; on-air qualification is pending.
-=======
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending. Space-to-call QSY on network spots (PAN-287) is implemented, unreleased: it QSYs to the spot's FT8/FT4 dial and calls at the derived offset (the rig mode follows `rig.data_mode` when set, PAN-276), and cqdx spots do not reach DX Hunter yet; on-air qualification is pending.
->>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
 
 ## Building and Testing
 
