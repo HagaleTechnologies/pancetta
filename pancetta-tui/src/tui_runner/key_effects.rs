@@ -479,7 +479,7 @@ fn snapshot(app: &App) -> Vec<(&'static str, String)> {
         .collect();
     ack.sort();
     vec![
-        ("status_message", format!("{:?}", app.status_message)),
+        ("status_message", format!("{:?}", app.status_message())),
         (
             "stopped_by_operator",
             format!("{:?}", app.stopped_by_operator),

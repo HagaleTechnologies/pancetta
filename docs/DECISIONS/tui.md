@@ -542,6 +542,12 @@ Physical tmux and Windows Terminal glyph checks still need operator qualificatio
 
 Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
 
+## PAN-351: transient feedback lifetimes
+
+The transient status row holds at most eight entries. Producers supply Info, Warn or Error explicitly. Their lifetimes are five, fifteen and thirty seconds, measured with a monotonic clock. The highest severity wins, then the newest entry. A newer local key echo temporarily covers an older error; a new error supersedes an older echo. Compose retains its live prompt.
+
+Repeated identical entries refresh their deadline. Overflow drops the oldest entry at the lowest severity, so routine updates cannot evict held errors. Idle frames prune expired entries. Error recovery clears matching coded entries, and readiness acknowledgment clears entries linked to the alerts it acknowledges. Transient expiry and eviction never acknowledge readiness alerts or dismiss blockers.
+
 ## Band Activity need markers (PAN-350, 2026-11-11)
 
 Band Activity consumes the same prepared entity verdict as DX Hunter, falling

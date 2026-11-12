@@ -294,6 +294,7 @@ pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
         .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
             component: "TX".to_string(),
             status: format!("TX policy: {}", next.label()),
+            level: pancetta_core::DiagnosticLevel::Info,
         });
 }
 
@@ -528,7 +529,7 @@ impl super::ApplicationCoordinator {
                 if let Ok(mut pending) = relay_pending_gain_save.lock() {
                     if pending.is_some_and(|(_, since, _)| since.elapsed() >= Duration::from_secs(10)) {
                         pending.take();
-                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into()));
+                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
                     }
                 }
                 if !ft8_disconnected {
@@ -704,6 +705,7 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "Autonomous".to_string(),
                                     status: status.state.clone(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -867,7 +869,7 @@ impl super::ApplicationCoordinator {
                         ) => {
                             if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
                                 if relay_gain_frequency.load(Ordering::Acquire) != frequency {
-                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into()));
+                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
                                 } else if let Some(band) = pancetta_core::Band::from_frequency(frequency) {
                                     let _ = relay_gain_mutation_tx.send((band.to_string(), pancetta_config::rig::ReceiveGainPreset { preamp_db, attenuator_db: att_db }));
                                 }
@@ -877,7 +879,7 @@ impl super::ApplicationCoordinator {
                             crate::message_bus::RigControlMessage::ReceiveGainError { frequency, request_id, error },
                         ) => {
                             if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
-                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error)));
+                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error), pancetta_core::DiagnosticLevel::Warn));
                             }
                         }
                         MessageType::RigControl(
@@ -956,17 +958,14 @@ impl super::ApplicationCoordinator {
                                 },
                             ));
                         }
-                        MessageType::StatusUpdate(text) => {
+                        MessageType::StatusUpdate { text, level } => {
                             // Free-form status emitted by other components (e.g. QSO
                             // component reports respond_to_cq success/failure here so
                             // Space-to-call surfaces "Calling X — TX queued" or the
                             // actual rejection reason instead of just an optimistic
                             // "Calling X..." that hides silent failures.
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: format!("{}", bus_msg.source),
-                                    status: text,
-                                },
+                                relayed_status(format!("{}", bus_msg.source), text, level),
                             );
                         }
                         MessageType::Error {
@@ -1223,19 +1222,23 @@ impl super::ApplicationCoordinator {
                     match edges.rf_no_decode {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "dsp".to_string(),
+                                    code: RF_NO_DECODE_STATUS_CODE,
                                     status: "⚠ RF present but no decodes — check mode/clock?"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
                                 },
                             );
                         }
                         Some(false) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "dsp".to_string(),
+                                    code: RF_NO_DECODE_STATUS_CODE,
                                     status: "Decodes resumed — RF/no-decode warning cleared"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -1248,20 +1251,24 @@ impl super::ApplicationCoordinator {
                     match edges.silent_input {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "audio".to_string(),
+                                    code: SILENT_INPUT_STATUS_CODE,
                                     status: "⚠ INPUT SILENT (RMS≈0) — check Sound input device, \
                                              mic permission, and that nothing else grabbed the CODEC"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
                                 },
                             );
                         }
                         Some(false) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "audio".to_string(),
+                                    code: SILENT_INPUT_STATUS_CODE,
                                     status: "Audio input restored — silence warning cleared"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -1656,6 +1663,8 @@ impl super::ApplicationCoordinator {
                 let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                     component: "Session".to_string(),
                     status: status.clone(),
+
+                    level: pancetta_core::DiagnosticLevel::Info,
                 });
             }
             if let Some(message) = &cmd_session_report.error {
@@ -1781,6 +1790,8 @@ impl super::ApplicationCoordinator {
                                             "Refusing to call our own station ({})",
                                             callsign
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1800,6 +1811,8 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1879,6 +1892,8 @@ impl super::ApplicationCoordinator {
                                             "Refusing Hound on our own station ({})",
                                             callsign
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1899,6 +1914,8 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1914,6 +1931,7 @@ impl super::ApplicationCoordinator {
                                     // the Fox, not where we call it, so the
                                     // status claims no call offset here.
                                     status: format!("Hound: engaging {} as Fox...", callsign),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                             let msg = ComponentMessage::new(
@@ -2073,6 +2091,8 @@ impl super::ApplicationCoordinator {
                                             "Can't start CQ — TX policy is {} (press g for Full)",
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -2235,6 +2255,8 @@ impl super::ApplicationCoordinator {
                                                 "can't switch mode: {} QSO(s) active",
                                                 n
                                             ),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2244,6 +2266,8 @@ impl super::ApplicationCoordinator {
                                             component: "Mode".to_string(),
                                             status: "can't switch mode: QSO state unavailable"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2252,6 +2276,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "Mode".to_string(),
                                             status: "mode switch busy, try again".to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2375,6 +2401,8 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "TX".to_string(),
                                     status: format!("TX freq: {}", next.label()),
+
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -2418,6 +2446,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
                                             status: format!("TX offset held @ {} Hz", hz),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2453,6 +2483,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
                                             status: "TX offset auto (Tx=Rx)".to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2558,6 +2590,8 @@ impl super::ApplicationCoordinator {
                                             component: "TX".to_string(),
                                             status: "Nudging active QSO to a new offset"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2574,6 +2608,8 @@ impl super::ApplicationCoordinator {
                                                 "CQ-offset nudge armed — takes effect only if the \
                                                       next autonomous cycle is CQ-hunting"
                                                     .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2596,6 +2632,8 @@ impl super::ApplicationCoordinator {
                                             status: "TX offset is Hold — press `f` for Auto to \
                                                      enable nudging"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2616,6 +2654,8 @@ impl super::ApplicationCoordinator {
                                             status: "Nudge ignored — the active QSO's current \
                                                      state can't retransmit a frame"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2683,6 +2723,8 @@ impl super::ApplicationCoordinator {
                                             status: "Can't tune — TX is DISABLED (press g \
                                                      to re-enable)"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                     continue;
@@ -2727,6 +2769,8 @@ impl super::ApplicationCoordinator {
                                         status: "Autonomous disabled in config — restart with \
                                                  autonomous.enabled=true"
                                             .to_string(),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -2754,6 +2798,8 @@ impl super::ApplicationCoordinator {
                                             "Autonomous TX disabled (runtime gate closed)"
                                                 .to_string()
                                         },
+
+                                        level: pancetta_core::DiagnosticLevel::Info,
                                     },
                                 );
                             }
@@ -2827,6 +2873,8 @@ impl super::ApplicationCoordinator {
                                             pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                                 component: "TX".to_string(),
                                                 status,
+
+                                                level: pancetta_core::DiagnosticLevel::Warn,
                                             },
                                         );
                                         continue;
@@ -2902,6 +2950,8 @@ impl super::ApplicationCoordinator {
                                         status: "Device choice applied live, but not persisted \
                                                  (config file isn't TOML)"
                                             .to_string(),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -2944,7 +2994,8 @@ impl super::ApplicationCoordinator {
                                                             "Failed to save device choice: {}",
                                                             e
                                                         ),
-                                                    },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                                 );
                                             }
                                             Err(_) => {
@@ -2982,6 +3033,7 @@ impl super::ApplicationCoordinator {
                                         force: true,
                                         respond: resp_tx,
                                     };
+                                    let mut status_level = pancetta_core::DiagnosticLevel::Warn;
                                     let status = if reopen_tx.send(req).is_err() {
                                         warn!(
                                             "Audio reopen channel closed; device not switched live"
@@ -2997,6 +3049,7 @@ impl super::ApplicationCoordinator {
                                             .await
                                         {
                                             Ok(Ok(Ok(()))) => {
+                                                status_level = pancetta_core::DiagnosticLevel::Info;
                                                 info!(
                                                     "Live audio device switch succeeded: {}",
                                                     picked
@@ -3030,6 +3083,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "audio".to_string(),
                                             status,
+
+                                            level: status_level,
                                         },
                                     );
                                 }
@@ -3042,7 +3097,8 @@ impl super::ApplicationCoordinator {
                                                 "Device {} saved — restart to apply (no live audio in this mode)",
                                                 picked
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Info,
+                                },
                                     );
                                 }
                             }
@@ -3081,6 +3137,8 @@ impl super::ApplicationCoordinator {
                                         status: format!(
                                             "Unknown rig model '{model}' — not applied"
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -3127,6 +3185,8 @@ impl super::ApplicationCoordinator {
                                             status: "Rig applied live, but not persisted (config \
                                                      file isn't TOML)"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 } else {
@@ -3212,6 +3272,8 @@ impl super::ApplicationCoordinator {
                                             // retries) plus margin, so a slow-
                                             // but-genuinely-in-progress reconnect
                                             // isn't misreported as timed out.
+                                            let mut status_level =
+                                                pancetta_core::DiagnosticLevel::Warn;
                                             let status = match tokio::time::timeout(
                                                 Duration::from_secs(20),
                                                 resp_rx,
@@ -3219,6 +3281,8 @@ impl super::ApplicationCoordinator {
                                             .await
                                             {
                                                 Ok(Ok(Ok(()))) => {
+                                                    status_level =
+                                                        pancetta_core::DiagnosticLevel::Info;
                                                     info!(
                                                         "Live rig reconnect succeeded: {}",
                                                         report_model
@@ -3253,7 +3317,8 @@ impl super::ApplicationCoordinator {
                                             pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                                 component: "rig".to_string(),
                                                 status,
-                                            },
+                                    level: status_level,
+                                },
                                         );
                                         });
                                     }
@@ -3268,7 +3333,8 @@ impl super::ApplicationCoordinator {
                                                 "Rig config saved ({}) — a rig switch is already in progress; try again shortly",
                                                 model
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                     );
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -3282,7 +3348,8 @@ impl super::ApplicationCoordinator {
                                                 "Rig config saved ({}) — live switch unavailable; restart to apply",
                                                 model
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                     );
                                     }
                                 }
@@ -3296,6 +3363,7 @@ impl super::ApplicationCoordinator {
                             {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Rig not connected — preset not saved".into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3303,6 +3371,7 @@ impl super::ApplicationCoordinator {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Could not read rig gain: unknown band — preset not saved"
                                         .into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3310,6 +3379,7 @@ impl super::ApplicationCoordinator {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Gain presets aren't supported for a non-TOML config file"
                                         .into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3344,10 +3414,13 @@ impl super::ApplicationCoordinator {
                             );
                             if let Err(error) = cmd_message_bus.send_message(request).await {
                                 take_pending_gain_save(&pending_gain_save, frequency, request_id);
-                                let _ = cmd_tui_msg_tx.send(gain_status(format!(
-                                    "Could not read rig gain: {} — preset not saved",
-                                    error
-                                )));
+                                let _ = cmd_tui_msg_tx.send(gain_status(
+                                    format!(
+                                        "Could not read rig gain: {} — preset not saved",
+                                        error
+                                    ),
+                                    pancetta_core::DiagnosticLevel::Warn,
+                                ));
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::SaveRigBookmark {
@@ -4348,10 +4421,31 @@ fn spawn_config_file_write_worker() -> (
     (tx, handle)
 }
 
-fn gain_status(status: String) -> pancetta_tui::tui_runner::TuiMessage {
+// Transient-only health identities, distinct from service error codes.
+const RF_NO_DECODE_STATUS_CODE: u32 = 0xC200_0001;
+const SILENT_INPUT_STATUS_CODE: u32 = 0xC200_0002;
+
+fn relayed_status(
+    component: String,
+    status: String,
+    level: pancetta_core::DiagnosticLevel,
+) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+        component,
+        status,
+        level,
+    }
+}
+
+fn gain_status(
+    status: String,
+    level: pancetta_core::DiagnosticLevel,
+) -> pancetta_tui::tui_runner::TuiMessage {
     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
         component: "rig".into(),
         status,
+
+        level,
     }
 }
 
@@ -4393,12 +4487,14 @@ fn spawn_receive_gain_preset_mutation_worker(
             if !config_is_toml {
                 let _ = tui_tx.send(gain_status(
                     "Gain presets aren't supported for a non-TOML config file".into(),
+                    pancetta_core::DiagnosticLevel::Warn,
                 ));
                 continue;
             }
             if preset.preamp_db < 0 || preset.attenuator_db < 0 {
                 let _ = tui_tx.send(gain_status(
                     "Could not save gain preset: negative rig gain".into(),
+                    pancetta_core::DiagnosticLevel::Warn,
                 ));
                 continue;
             }
@@ -4455,23 +4551,29 @@ fn spawn_receive_gain_preset_mutation_worker(
                     Err(e) => Err(e.to_string()),
                 }
             };
-            let status = match result {
-                Err(error) => format!("Could not save gain preset: {}", error),
+            let (status, level) = match result {
+                Err(error) => (
+                    format!("Could not save gain preset: {}", error),
+                    pancetta_core::DiagnosticLevel::Warn,
+                ),
                 Ok(()) => {
                     if let Ok(written) = written_rx.await {
                         staged = written;
                     }
                     config.write().await.rig.receive_gain_presets = Some(staged);
-                    format!(
-                        "Saved {} receive-gain preset: preamp {} ({} dB), attenuator {} dB",
-                        band,
-                        super::hamlib::preamp_label(preset.preamp_db),
-                        preset.preamp_db,
-                        preset.attenuator_db
+                    (
+                        format!(
+                            "Saved {} receive-gain preset: preamp {} ({} dB), attenuator {} dB",
+                            band,
+                            super::hamlib::preamp_label(preset.preamp_db),
+                            preset.preamp_db,
+                            preset.attenuator_db
+                        ),
+                        pancetta_core::DiagnosticLevel::Info,
                     )
                 }
             };
-            let _ = tui_tx.send(gain_status(status));
+            let _ = tui_tx.send(gain_status(status, level));
         }
         Ok(())
     });
@@ -4545,6 +4647,8 @@ fn spawn_bookmark_mutation_worker(
                 let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                     component: "rig".to_string(),
                     status: "Bookmarks aren't supported for a non-TOML config file".to_string(),
+
+                    level: pancetta_core::DiagnosticLevel::Warn,
                 });
                 continue;
             }
@@ -4573,6 +4677,8 @@ fn spawn_bookmark_mutation_worker(
                             tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                 component: "rig".to_string(),
                                 status: format!("No bookmark named '{}'", name),
+
+                                level: pancetta_core::DiagnosticLevel::Warn,
                             });
                         continue;
                     }
@@ -4634,6 +4740,13 @@ fn spawn_bookmark_mutation_worker(
                 BookmarkMutation::Save(_) => "save",
                 BookmarkMutation::Delete(_) => "delete",
             };
+            let level = if persist_result.is_err()
+                || (matches!(mutation, BookmarkMutation::Save(_)) && staged.len() >= 20)
+            {
+                pancetta_core::DiagnosticLevel::Warn
+            } else {
+                pancetta_core::DiagnosticLevel::Info
+            };
             let status = if let Err(e) = persist_result {
                 warn!("Failed to persist rig bookmark {}: {}", verb, e);
                 format!("Failed to {} bookmark '{}': {}", verb, name, e)
@@ -4670,6 +4783,8 @@ fn spawn_bookmark_mutation_worker(
             let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                 component: "rig".to_string(),
                 status,
+
+                level,
             });
         }
         Ok(())
@@ -4765,6 +4880,45 @@ where
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
     }))
+}
+
+#[cfg(test)]
+mod pan351_tests {
+    use super::*;
+    #[test]
+    fn pan351_relay_preserves_status_level() {
+        for expected in [
+            pancetta_core::DiagnosticLevel::Info,
+            pancetta_core::DiagnosticLevel::Warn,
+            pancetta_core::DiagnosticLevel::Error,
+        ] {
+            let bus = MessageType::StatusUpdate {
+                text: "feedback".into(),
+                level: expected,
+            };
+            let MessageType::StatusUpdate { text, level } = bus else {
+                unreachable!()
+            };
+            let message = relayed_status("Qso".into(), text, level);
+            let pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component,
+                status,
+                level,
+            } = message
+            else {
+                panic!("wrong TUI variant")
+            };
+            assert_eq!(component, "Qso");
+            assert_eq!(status, "feedback");
+            assert_eq!(level, expected);
+        }
+        let pancetta_tui::tui_runner::TuiMessage::StatusUpdate { level, .. } =
+            gain_status("refusal".into(), pancetta_core::DiagnosticLevel::Warn)
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(level, pancetta_core::DiagnosticLevel::Warn);
+    }
 }
 
 #[cfg(test)]
@@ -6452,6 +6606,8 @@ mod tui_relay_tests {
             .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                 component: "test".to_string(),
                 status: "channel full".to_string(),
+
+                level: pancetta_core::DiagnosticLevel::Info,
             })
             .unwrap();
         let in_flight = Arc::new(AtomicBool::new(false));
