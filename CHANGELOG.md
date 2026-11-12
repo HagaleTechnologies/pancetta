@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
 - Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.
 - Legacy QSO migration keeps a backup and refuses unreadable rows instead of writing a partial logbook.

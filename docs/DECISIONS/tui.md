@@ -512,3 +512,23 @@ history.
 - **A13 (rig data mode).** No `SetMode` is sent from `qsy_send`. Since PAN-276, with `[rig] data_mode` set, the rigctld backend reapplies the configured mode after every commanded frequency change, spot QSY included; unset, the mode is left to the operator.
 
 Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
+
+## Band Activity need markers (PAN-350, 2026-11-11)
+
+Band Activity consumes the same prepared entity verdict as DX Hunter, falling
+back to stored decode flags when no verdict exists. Both use shared need glyph
+and style helpers: ATNO `!` suppresses needed `+` and band-new `▲`; otherwise
+`+` precedes `▲`. Band Activity puts these before its directed or engaged
+prefix. ATNO is bold magenta and underlined, ahead of worked-before; ordinary
+needed is bold error colour, behind worked-before. Own TX, directed and global
+focus styles win first; engaged adds green underline and selection retains
+black text on accent. Own TX and missing calls have no need markers.
+
+A new-grid `+` appears only when the prepared verdict is true and the decode's
+canonical grid matches the current DX row's canonical grid. Historical decodes
+retain their grid and band-needed flag. Unknown, invalid, absent or mismatched
+grid history adds no marker and triggers no lookup during rendering.
+
+Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
+borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
+below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.

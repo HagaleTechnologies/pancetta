@@ -1,3 +1,4 @@
+use super::need_display::{atno_style, band_marker, need_marker, needed_style};
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
@@ -332,9 +333,7 @@ fn create_dx_row<'a>(
     } else if atno {
         // ATNO — the highest-value catch. Bold magenta + underline so it
         // stands apart from merely-notable (bold magenta) rows.
-        Style::default()
-            .fg(ratatui::style::Color::Magenta)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        atno_style()
     } else if station.is_notable {
         Style::default()
             .fg(ratatui::style::Color::Magenta)
@@ -342,10 +341,8 @@ fn create_dx_row<'a>(
     } else if station.worked_before {
         Style::default().fg(app.theme.muted_color())
     } else if needed {
-        // Needed DXCC (band-fill, not ATNO): bold accent.
-        Style::default()
-            .fg(app.theme.error_color())
-            .add_modifier(Modifier::BOLD)
+        // Needed DXCC (band-fill, not ATNO).
+        needed_style(&app.theme)
     } else if is_rare_dx_from_tier(station) {
         Style::default()
             .fg(app.theme.error_color())
@@ -520,11 +517,7 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
     format!(
         "{}{}{}{}{}",
         need_marker(atno, needed, station.is_notable),
-        if station.band_needed && !atno {
-            "▲"
-        } else {
-            ""
-        },
+        band_marker(station.band_needed, atno),
         if station.pinned {
             "◆"
         } else if station.watchlisted {
@@ -535,23 +528,6 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
         if is_engaged { "● " } else { "" },
         station.call_sign
     )
-}
-
-/// Build the callsign-prefix marker string for the DX Hunter:
-/// `!` for ATNO, `+` for a needed (non-ATNO) DXCC, then `★` for notable.
-/// ATNO and needed are mutually exclusive (ATNO wins). Returns `""` for a
-/// plain station.
-fn need_marker(atno: bool, needed: bool, notable: bool) -> String {
-    let mut s = String::new();
-    if atno {
-        s.push('!');
-    } else if needed {
-        s.push('+');
-    }
-    if notable {
-        s.push('★');
-    }
-    s
 }
 
 fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
