@@ -559,6 +559,17 @@ jobs:
           cargo bench -p pancetta-core --bench dxcc_lookup -- --warm-up-time 1 --measurement-time 2 --noplot
           bash scripts/ci/check-criterion-budget.sh target/criterion/dxcc_entity_for_callsign 2000
 
+      # PAN-320: the FIR anti-alias decimation of one 15 s window (720k in,
+      # 180k out) must stay under 5 ms on the CI host. Same pattern as the
+      # DXCC budget above; the rm drops cache-restored estimates.
+      - name: Decimation CPU budget (PAN-320)
+        env:
+          CARGO_PROFILE_BENCH_DEBUG: line-tables-only
+        run: |
+          rm -rf target/criterion/decimation_48k_12k
+          cargo bench -p pancetta-dsp --bench decimation -- --warm-up-time 1 --measurement-time 2 --noplot
+          bash scripts/ci/check-criterion-budget.sh target/criterion/decimation_48k_12k 5000000
+
   # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
   # (development on Mac, production on Windows MiniPC), so a Linux-only
   # CI lane silently lets platform regressions land. Check-only plus scoped microphone identity tests

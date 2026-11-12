@@ -195,3 +195,23 @@ See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
 - Plan 1 of 3 (foundations): `docs/superpowers/plans/2026-05-18-research-harness-1-foundations.md` — complete
 - Plan 2 of 3 (eval pipeline + corpus): `docs/superpowers/plans/2026-05-20-research-harness-2-eval-pipeline.md` — complete
 - Plan 3 of 3 (curation + leaderboard + lifecycle): `docs/superpowers/plans/2026-05-20-research-harness-3-iteration-loop.md` — complete
+
+## decimation-ab (PAN-320)
+
+Replays identical recorded 48 kHz captures through the naive subsampler and
+the unity-gain 31-tap FIR, reporting merged decode counts and SNR
+distributions for both arms:
+
+```bash
+cargo run --release -p pancetta-research --bin decimation-ab \
+    -- --manifest /data/pan320/captures.json --output /tmp/pan320-result.json
+```
+
+The manifest is a v1 JSON listing one capture per condition (quiet, busy,
+tx_desense): path (relative to the manifest), sha256, condition and
+lead_seconds (0.5 or 1.0). Captures are 48 kHz PCM16 WAVs of exactly
+720000 frames (15 s); channel 0 alone feeds both arms, matching the live
+DSP. Exit 0 writes the report atomically; exit 2 reports an unreadable
+manifest or invalid input on stderr and never creates or replaces the
+output. The shipped default flips to the FIR only on a strictly larger
+total merged decode count (see `docs/measurements/PAN-320-decimation.md`).

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "status": "pending_station_captures",
+  "synthetic": false,
+  "decision": {
+    "selected_default": "subsample",
+    "subsample_total": null,
+    "fir31_total": null,
+    "decode_delta": null,
+    "reason": "No station raw48 corpus has been supplied yet: PAN-320 waits on the external acquisition step (Tony, sophon station; see PAN-393) of one quiet-band, one busy-band and one TX-desense 48 kHz PCM16 capture (exactly 720000 frames each) plus a v1 manifest with SHA-256 hashes. Until those files arrive and this A/B runs on them, no synthetic measurement may select the shipped default."
+  },
+  "manifest": null,
+  "decoder_settings": {
+    "note": "not run: no station captures"
+  },
+  "filter_coefficients": [
+    -0.0013576431709721325,
+    -0.0032458820859117632,
+    -0.0035296927240743587,
+    2.658995510550173e-18,
+    0.007127681729446994,
+    0.013643579627842682,
+    0.012795742439943443,
+    -5.799763198340437e-18,
+    -0.021755986812968243,
+    -0.03998091255046788,
+    -0.03707984386424679,
+    8.620655479621187e-18,
+    0.07009168544769938,
+    0.15453244849189973,
+    0.2236189106844956,
+    0.25027982557462647,
+    0.2236189106844956,
+    0.15453244849189973,
+    0.07009168544769938,
+    8.620655479621187e-18,
+    -0.03707984386424679,
+    -0.03998091255046788,
+    -0.021755986812968243,
+    -5.799763198340437e-18,
+    0.012795742439943443,
+    0.013643579627842682,
+    0.007127681729446994,
+    2.658995510550173e-18,
+    -0.0035296927240743587,
+    -0.0032458820859117632,
+    -0.0013576431709721325
+  ],
+  "decimation": {
+    "fir31": "31-tap Kaiser low-pass, unity DC gain, cutoff 6 kHz midpoint",
+    "fir31_group_delay_input_samples": 15,
+    "input_rate_hz": 48000,
+    "output_rate_hz": 12000,
+    "subsample": "counter starts 0, retains indices 3, 7, 11, ..."
+  },
+  "captures": [],
+  "per_condition": {}
+}

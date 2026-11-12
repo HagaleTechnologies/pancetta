@@ -26,6 +26,7 @@ url = ""
 [audio]
 bit_depth = "float32"
 buffer_size = 512
+decimation_antialias_filter = false
 input_channels = 2
 input_device = "default"
 output_channels = 2

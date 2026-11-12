@@ -32,6 +32,13 @@ pub struct AudioConfig {
     /// Number of output channels
     pub output_channels: u8,
 
+    /// Enable the unity-gain FIR anti-alias filter for 48 kHz to 12 kHz
+    /// receive decimation. Set false to use the original subsampler.
+    /// Restart required. Other supported input rates retain their existing
+    /// path. The shipped default is false until station recordings show a
+    /// strictly larger merged decode count with the filter.
+    pub decimation_antialias_filter: bool,
+
     /// Audio format bit depth
     pub bit_depth: BitDepth,
 
@@ -498,6 +505,7 @@ impl Default for AudioConfig {
             buffer_size: 512,
             input_channels: 2,
             output_channels: 2,
+            decimation_antialias_filter: false,
             bit_depth: BitDepth::Float32,
             processing: AudioProcessingConfig::default(),
             noise_reduction: NoiseReductionConfig::default(),
@@ -755,6 +763,10 @@ impl ConfigSection for AudioConfig {
             self.output_channels = other.output_channels;
         }
 
+        // PAN-320: explicit assignment either way — `false` in the overlay
+        // is a real operator choice (revert to subsampling), not "unset".
+        self.decimation_antialias_filter = other.decimation_antialias_filter;
+
         self.bit_depth = other.bit_depth;
 
         // Merge complex structures
@@ -814,6 +826,44 @@ mod tests {
         assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.buffer_size, 512);
         assert!(config.validate_section().is_ok());
+    }
+
+    /// PAN-320: the `[audio] decimation_antialias_filter` flag parses both
+    /// literals, defaults to the evidence-selected value (false until
+    /// station recordings show the FIR strictly ahead), and `merge_with`
+    /// carries both `true` and `false` — an overlay `false` is a real
+    /// operator choice, not "unset".
+    #[test]
+    fn decimation_flag_parse_default_and_merge() {
+        assert!(!AudioConfig::default().decimation_antialias_filter);
+
+        let parse =
+            |text: &str| toml::from_str::<AudioConfig>(text).expect("[audio] snippet must parse");
+
+        let enabled = parse("decimation_antialias_filter = true");
+        assert!(enabled.decimation_antialias_filter);
+
+        let disabled = parse("decimation_antialias_filter = false");
+        assert!(!disabled.decimation_antialias_filter);
+
+        // Omitted key: the container-level serde default supplies the
+        // evidence-selected default.
+        let omitted = parse("sample_rate = 48000");
+        assert!(!omitted.decimation_antialias_filter);
+
+        // merge_with carries both values explicitly.
+        let mut base = AudioConfig::default();
+        base.decimation_antialias_filter = true;
+        let mut overlay = AudioConfig::default();
+        overlay.decimation_antialias_filter = false;
+        base.merge_with(overlay);
+        assert!(!base.decimation_antialias_filter, "false overlay must win");
+
+        let mut base = AudioConfig::default();
+        let mut overlay = AudioConfig::default();
+        overlay.decimation_antialias_filter = true;
+        base.merge_with(overlay);
+        assert!(base.decimation_antialias_filter, "true overlay must win");
     }
 
     #[test]

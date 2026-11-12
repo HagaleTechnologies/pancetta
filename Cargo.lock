@@ -3205,6 +3205,7 @@ version = "0.9.6"
 dependencies = [
  "async-trait",
  "biquad",
+ "criterion",
  "crossbeam-channel",
  "num-complex",
  "num-traits",
@@ -3345,6 +3346,7 @@ dependencies = [
  "hound",
  "libc",
  "num-complex",
+ "pancetta-dsp",
  "pancetta-ft8",
  "pancetta-qso",
  "rand 0.10.3",
