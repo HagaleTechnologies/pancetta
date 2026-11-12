@@ -34,6 +34,7 @@ impl LocalLog {
     }
 
     pub(crate) fn record_confirmation_on_band(&mut self, entity: &'static str, band: &str) {
+        let entity = canonical_entity(entity);
         self.confirmed_on_band
             .entry(band.trim().to_uppercase())
             .or_default()
@@ -41,10 +42,11 @@ impl LocalLog {
     }
 
     pub(crate) fn is_confirmed(&self, entity: &str) -> bool {
-        self.confirmed.contains(entity)
+        self.confirmed.contains(canonical_entity(entity))
     }
 
     pub(crate) fn is_confirmed_on_band(&self, entity: &str, band: &str) -> bool {
+        let entity = canonical_entity(entity);
         self.confirmed_on_band
             .get(band)
             .is_some_and(|set| set.contains(entity))

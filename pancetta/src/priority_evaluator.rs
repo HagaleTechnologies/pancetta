@@ -663,18 +663,6 @@ impl CachedStationLookup {
     /// `(needed, atno)` for the local TUI under the configured policy.
     /// Never exposes the scorer's guess as a known verdict.
     pub fn needed_atno_shown(&self, callsign: &str) -> (bool, bool) {
-<<<<<<< HEAD
-        match self.dxcc_need_verdict(callsign) {
-            (NeedStatus::Needed, NeedSource::Cqdx) => (true, self.cqdx_is_atno(callsign)),
-            (NeedStatus::Needed, NeedSource::LocalLogbook) => (
-                true,
-                self.local_is_atno(
-                    resolved_identity(callsign)
-                        .as_deref()
-                        .and_then(pancetta_core::dxcc::entity_for_callsign),
-                ),
-            ),
-=======
         let Some(call) = resolved_identity(callsign) else {
             return (false, false);
         };
@@ -683,8 +671,7 @@ impl CachedStationLookup {
             (NeedStatus::Needed, NeedSource::Cqdx) => {
                 (true, self.needed_atno.read().matches(&call, entity))
             }
-            (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, true),
->>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1
+            (NeedStatus::Needed, NeedSource::LocalLogbook) => (true, self.local_is_atno(entity)),
             _ => (false, false),
         }
     }
@@ -692,15 +679,10 @@ impl CachedStationLookup {
     /// `upper` is already resolved; `entity` is its offline entity, passed in
     /// so a per-frame caller resolves nothing (PAN-284).
     fn verdict_for(&self, upper: &str, entity: Option<&'static str>) -> (NeedStatus, NeedSource) {
-<<<<<<< HEAD
-        let cqdx = self.needed_dxcc_status(upper);
+        let cqdx = self.needed_status_for(upper, entity);
         if cqdx != NeedStatus::Unknown
             && !(self.confirmation_policy() && self.local_log_available() && entity.is_some())
         {
-=======
-        let cqdx = self.needed_status_for(upper, entity);
-        if cqdx != NeedStatus::Unknown {
->>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1
             return (cqdx, NeedSource::Cqdx);
         }
         let Some(entity) = entity else {
@@ -1037,26 +1019,14 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_atno(&self, callsign: &str) -> bool {
-<<<<<<< HEAD
         // Confirmation need cannot turn a worked entity into ATNO.
-        match self.dxcc_need_verdict(callsign) {
-            (_, NeedSource::LocalLogbook) => self.local_is_atno(
-                resolved_identity(callsign)
-                    .as_deref()
-                    .and_then(pancetta_core::dxcc::entity_for_callsign),
-            ),
-            _ => self.cqdx_is_atno(callsign),
-=======
-        // PAN-347: the local logbook's ATNO is its needed verdict (never
-        // logged on any band or mode); otherwise cqdx's ATNO list.
         let Some(call) = resolved_identity(callsign) else {
             return false;
         };
         let entity = pancetta_core::dxcc::entity_for_callsign(&call);
         match self.verdict_for(&call, entity) {
-            (status, NeedSource::LocalLogbook) => status == NeedStatus::Needed,
+            (_, NeedSource::LocalLogbook) => self.local_is_atno(entity),
             _ => self.needed_atno.read().matches(&call, entity),
->>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1
         }
     }
 
@@ -2830,6 +2800,21 @@ mod pan348 {
     use super::*;
     use pancetta_config::NeededMeans;
     use pancetta_qso::priority::{PriorityScorer, PriorityTier, PriorityWeights};
+
+    #[tokio::test]
+    async fn confirmation_policy_shares_subdivision_identity() {
+        let (_tmp, l) = seeded_lookup(&adif(&[("TA1ABC", "FT8", 14.074, "")]), "K5ARH").await;
+        l.set_needed_means(NeededMeans::Unconfirmed);
+        assert_eq!(l.needed_atno_shown("TA2ABC"), (true, false));
+        assert!(!l.is_atno("TA2ABC"));
+        l.record_logged_contact("TA2ABC", "20M", "FT8", true, Utc::now());
+        for call in ["TA1ABC", "TA2ABC"] {
+            assert_eq!(l.needed_atno_shown(call), (false, false));
+            assert!(!l.is_needed_dxcc(call));
+            assert!(!l.is_dxcc_needed_on_band(call, 14_074_000.0));
+            assert!(l.is_dxcc_needed_on_band(call, 7_074_000.0));
+        }
+    }
 
     #[tokio::test]
     async fn unconfirmed_need_is_entity_and_band_scoped() {

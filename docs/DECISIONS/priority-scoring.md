@@ -369,8 +369,6 @@ the implementing session); H6 confirmation import, with a
 worked-unconfirmed entity should raise rank; reloading the local log after
 `pancetta import` without a restart.
 
-<<<<<<< HEAD
-
 ## Confirmation-based need (PAN-348)
 
 `[autonomous] needed_means` defaults to `unworked`, preserving cqdx-first
@@ -386,7 +384,7 @@ file command changes only the durable ADIF file under its shared lock and leaves
 a rebuild request. Restart rebuilds the index before seeding the cache. A running
 station does not pick up imported confirmations. No new remote fields or cqdx
 API changes are involved.
-=======
+
 ## PAN-346: Shared DXCC identity
 
 Needed and ATNO lists use ADIF entity IDs from the offline core registry.
@@ -405,4 +403,3 @@ identities. This joins Turkey and Italy subdivisions without renaming their
 display labels. Home and rarity keys use the same identity. The per-frame
 need lookup uses its carried entity, never resolves the callsign, and the
 remote display answer remains cqdx-only.
->>>>>>> 1943f93f11ff8d2a9882ae4e1c08bbd14c4743a1
