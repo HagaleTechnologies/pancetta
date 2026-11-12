@@ -32,7 +32,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback are implemented, unreleased; live notification-service and on-air qualification are pending.
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback are implemented, unreleased; live notification-service and on-air qualification are pending. Space-to-call QSY on network spots (PAN-287) is implemented, unreleased: it QSYs to the spot's FT8/FT4 dial and calls at the derived offset (the rig mode follows `rig.data_mode` when set, PAN-276), and cqdx spots do not reach DX Hunter yet; on-air qualification is pending.
 
 ## Building and Testing
 
@@ -101,8 +101,11 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 - TUI keys (PAN-327): every bound key in every dialog and the main view resolves through `keymap::resolve` into exactly one `Action`; a new key is a chord on its documented `KEYBINDINGS` row (or `MODAL_BINDINGS` for dialog-internal keys) plus an `Action` variant and a `match action` arm in `handle_key_event`, Main-scope chords for `Action::starts_tx()` refuse Ctrl/Alt, Shift+Q resolves in Global scope before any dialog chord or text-entry rule, and any change to what a key does must re-bless `pancetta-tui/tests/fixtures/key_effects.golden` (`PANCETTA_BLESS_KEY_EFFECTS=1`).
 
+- Spot-call QSY (PAN-287): Space on a DX Hunter network spot changes the dial only through `coordinator::spot_call`, never while the rig is keyed (the `rig_is_keyed` recheck and the `SetFrequency` enqueue run under `ptt_sync_gate`, which every key-down passes before its PTT-on enqueue; the autonomous operator is never locked under that gate), never across a QSO the admission snapshot shows as answered, and never without a Hamlib route. A call parked for PTT-off is dropped after 30 s, on any operator frequency change or operating-mode switch, by a newer spot call, or when TX policy no longer allows initiation.
+
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
 
+- The startup index rebuild builds `qso.db.new`, checkpoints the old index, keeps it as `qso.db.pre-rebuild[.N]` when it holds contacts ADIF lacks or cannot be read, then renames over. Staleness compares contacts, never mtimes. Legacy migration copies `qso.db` to `qso.db.pre-migration` first, refuses unreadable rows, and keeps the ADIF writer closed on refusal (PAN-282).
 - TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.
 
 ## Where Things Live

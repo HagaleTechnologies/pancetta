@@ -353,6 +353,7 @@ fn cq_dx_station() -> crate::app::DxStation {
         last_seen_network: None,
         audio_offset_hz: Some(750),
         slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+        spot_rf_hz: None,
         watchlisted: false,
         pinned: false,
     }

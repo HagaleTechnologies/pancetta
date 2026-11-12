@@ -571,6 +571,35 @@ pub fn compute_manual_tx_offset(
     (tx_off, partner_freq)
 }
 
+/// PAN-287: TX audio offset for a network-spot call whose DX offset is
+/// unknown (`StartQso { dx_offset_unknown: true }`). `allocated_hz` is the
+/// frequency allocator's pick, de-conflicted from the active QSOs exactly
+/// like [`compute_manual_tx_offset`]. `partner_freq` is a placeholder equal
+/// to our own TX offset: the existing two-sighting drift confirmation then
+/// relatches `partner_freq` to wherever the DX answers, and our TX stays put.
+pub fn compute_spot_call_tx_offset(
+    allocated_hz: f64,
+    active_offsets: &[f64],
+) -> (f64, Option<f64>) {
+    let tx_off = pancetta_qso::deconflict_offset(
+        allocated_hz,
+        active_offsets,
+        pancetta_qso::MIN_TX_SEPARATION_HZ,
+        pancetta_qso::TX_OFFSET_MIN_HZ,
+        pancetta_qso::TX_OFFSET_MAX_HZ,
+    );
+    (tx_off, Some(tx_off))
+}
+
+/// PAN-287: a band change empties the cross-parity call queue. A call parked
+/// on the old band must never promote and transmit on the new one. Returns
+/// the dropped callsigns in queue order, so each can be reported.
+fn drain_parked_calls_on_band_change(
+    queue: &mut std::collections::VecDeque<PendingManualCall>,
+) -> Vec<String> {
+    queue.drain(..).map(|p| p.callsign).collect()
+}
+
 /// Pure: summarize what a decoded frame tells us its sender is doing (#41).
 /// `our_call` lets us say "→ us" when the frame is directed at us. Returns
 /// `None` for frames with no useful "who are they working" signal.
@@ -4018,7 +4047,7 @@ impl super::ApplicationCoordinator {
                 // for the worked-station seed below (PAN-127). Because the
                 // rebuild runs inside this call before the logger opens
                 // `qso.db`, the logger never holds a pooled connection on a
-                // file the rebuild deleted (#453). Nothing can complete a QSO
+                // file the rebuild replaced (#453). Nothing can complete a QSO
                 // before this point: the decode/command loops below have not
                 // started yet.
                 qso_lookup.reset_display_history();
@@ -4062,11 +4091,15 @@ impl super::ApplicationCoordinator {
                 let history_db = if replay_mode {
                     replay_history_db(&adif_path).await
                 } else {
-                    live_seed_db.map(Arc::new).ok_or_else(|| {
-                        pancetta_qso::async_database::AsyncDatabaseError::InvalidQuery {
-                            message: "Prepared QSO index unavailable".into(),
-                        }
-                    })
+                    match live_seed_db {
+                        LocalIndex::Ready(db) => Ok(Arc::new(db)),
+                        LocalIndex::Unavailable { reason }
+                        | LocalIndex::MigrationRefused { reason } => Err(
+                            pancetta_qso::async_database::AsyncDatabaseError::IndexUnavailable {
+                                reason,
+                            },
+                        ),
+                    }
                 };
                 // PAN-268: the contest worker scores replay from the prepared
                 // in-memory seed, never the real station index. Selected before
@@ -5278,7 +5311,11 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             remote_origin,
                                             remote_client_key_id,
+                                            dx_offset_unknown,
                                         } => {
+                                            // PAN-287: a network-spot call carries no parity,
+                                            // so the parity gate always admits it (never queued).
+                                            debug_assert!(!dx_offset_unknown || dx_parity.is_none());
                                             // PAN-78: capacity/parity checks and the open run
                                             // under the admission lock.
                                             let _admission = qso_admission.lock().await;
@@ -5476,9 +5513,17 @@ impl super::ApplicationCoordinator {
                                                 tx_freq_mode.load(Ordering::Relaxed),
                                             ) == pancetta_core::TxFreqMode::Hold;
                                             let active = qso_manager.active_tx_offsets().await;
-                                            let (tx_off, partner) = compute_manual_tx_offset(
-                                                dx_freq, hold_mode, held, &active,
-                                            );
+                                            // PAN-287: a network-spot call with no known DX
+                                            // offset opens at the allocator's TX offset with a
+                                            // placeholder partner_freq; every other call is
+                                            // unchanged.
+                                            let (tx_off, partner) = if dx_offset_unknown {
+                                                compute_spot_call_tx_offset(dx_freq, &active)
+                                            } else {
+                                                compute_manual_tx_offset(
+                                                    dx_freq, hold_mode, held, &active,
+                                                )
+                                            };
                                             if tx_off != dx_freq {
                                                 info!(
                                                     target: "qso",
@@ -6391,6 +6436,34 @@ impl super::ApplicationCoordinator {
                                                         "Band change — {} active QSO(s) ended",
                                                         n
                                                     ),
+                                                )
+                                                .await;
+                                            }
+                                            // PAN-287: a call parked in the cross-parity queue on
+                                            // the old band must not promote and transmit on the
+                                            // new band. Drop and report each one.
+                                            let dropped = {
+                                                let mut queue = pending_manual_calls.lock().await;
+                                                drain_parked_calls_on_band_change(&mut queue)
+                                            };
+                                            for call in dropped {
+                                                warn!(
+                                                    target: "qso",
+                                                    "Band change: dropping queued call to {}", call
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!("Queued call to {call} dropped — band changed"),
+                                                )
+                                                .await;
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!("Dropped queued call to {call} — band changed"),
+                                                    None,
+                                                    Some(&call),
                                                 )
                                                 .await;
                                             }
@@ -7362,7 +7435,10 @@ fn snapshot_item_from_progress(
 
 #[cfg(test)]
 mod pending_manual_tests {
-    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall, QueueStamp};
+    use super::{
+        compute_manual_tx_offset, compute_spot_call_tx_offset, drain_parked_calls_on_band_change,
+        partition_pending_calls, PendingManualCall, QueueStamp,
+    };
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
 
@@ -7403,6 +7479,40 @@ mod pending_manual_tests {
         let (tx_off, partner) = compute_manual_tx_offset(180.0, false, 0, &[]);
         assert_eq!(tx_off, pancetta_qso::TX_OFFSET_MIN_HZ);
         assert_eq!(partner, Some(180.0));
+    }
+
+    // PAN-287: a network-spot call with no DX offset keeps the allocator's
+    // pick and listens there (placeholder partner_freq = our TX).
+    #[test]
+    fn spot_call_offset_keeps_allocator_pick_and_sets_placeholder_partner() {
+        assert_eq!(
+            compute_spot_call_tx_offset(1000.0, &[]),
+            (1000.0, Some(1000.0))
+        );
+    }
+
+    #[test]
+    fn spot_call_offset_is_deconflicted_from_active_qsos() {
+        let (tx, partner) = compute_spot_call_tx_offset(1000.0, &[1020.0]);
+        assert!((tx - 1020.0).abs() >= pancetta_qso::MIN_TX_SEPARATION_HZ);
+        assert_eq!(partner, Some(tx));
+    }
+
+    // PAN-287: a band change drops every parked cross-parity call, in queue
+    // order, and leaves the queue empty.
+    #[test]
+    fn band_change_drains_parked_calls_in_queue_order() {
+        let mut q: VecDeque<_> = [
+            caller_call("K1AAA", SlotParity::Even, pancetta_core::ResponseStep::Grid),
+            caller_call("K2BBB", SlotParity::Odd, pancetta_core::ResponseStep::Grid),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            drain_parked_calls_on_band_change(&mut q),
+            vec!["K1AAA".to_string(), "K2BBB".to_string()]
+        );
+        assert!(q.is_empty());
     }
 
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
@@ -11282,7 +11392,7 @@ async fn start_local_qso_log_writers(
 ) -> (
     Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
-    Option<pancetta_qso::async_database::QsoDatabase>,
+    LocalIndex,
 ) {
     if replay {
         info!(
@@ -11291,7 +11401,13 @@ async fn start_local_qso_log_writers(
             adif_path.display(),
             db_path.display(),
         );
-        return (None, None, None);
+        return (
+            None,
+            None,
+            LocalIndex::Unavailable {
+                reason: "--replay: the local index is not opened".into(),
+            },
+        );
     }
 
     // Subscribe before the index work below: a QSO that completes while a
@@ -11308,26 +11424,32 @@ async fn start_local_qso_log_writers(
     // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
     // log but proceed with DB-only — every operator should at least get
     // duplicate detection from the DB.
-    let adif_writer = match pancetta_qso::AdifLogWriter::open(adif_path).await {
-        Ok(mut w) => {
-            info!("ADIF log open at {}", adif_path.display());
-            w.set_station_power_watts(station_power_watts);
-            let w = std::sync::Arc::new(w);
-            adif_subscribers.track(start_adif_subscriber(
-                w.clone(),
-                adif_events,
-                adif_subscribers,
-            ));
-            Some(w)
-        }
-        Err(e) => {
-            warn!(
-                "ADIF writer init failed at {}: {} — continuing; QSOs this \
+    let adif_writer = if matches!(&seed_db, LocalIndex::MigrationRefused { .. }) {
+        warn!("ADIF log not opened: the legacy index was not migrated; QSOs this session are logged to {} only", db_path.display());
+        drop(adif_events);
+        None
+    } else {
+        match pancetta_qso::AdifLogWriter::open(adif_path).await {
+            Ok(mut w) => {
+                info!("ADIF log open at {}", adif_path.display());
+                w.set_station_power_watts(station_power_watts);
+                let w = std::sync::Arc::new(w);
+                adif_subscribers.track(start_adif_subscriber(
+                    w.clone(),
+                    adif_events,
+                    adif_subscribers,
+                ));
+                Some(w)
+            }
+            Err(e) => {
+                warn!(
+                    "ADIF writer init failed at {}: {} — continuing; QSOs this \
                  session will be DB-only",
-                adif_path.display(),
-                e,
-            );
-            None
+                    adif_path.display(),
+                    e,
+                );
+                None
+            }
         }
     };
 
@@ -11372,156 +11494,158 @@ async fn start_local_qso_log_writers(
     (adif_writer, async_logger, seed_db)
 }
 
-/// Bring the rebuildable SQLite index in line with the ADIF source of truth
-/// BEFORE either local log writer opens a file (PAN-127), and return it for
-/// the worked-station seed (`None` when it cannot be opened).
-///
-/// Three-case startup decision (non-replay only):
-///   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
-///      so contacts are not lost; future runs use ADIF as source of truth.
-///   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
-///      index so duplicate detection sees every prior contact.
-///   3. Open as-is: normal startup; index is current.
-///
-/// The order matters: `AdifLogWriter::open` creates an empty `qsos.adi` and
-/// `QsoLogger::new` an empty `qso.db`. When the writers opened first, the new
-/// empty ADIF made a legacy-only `qso.db` look stale, so the rebuild wiped
-/// every legacy contact, and a freshly created `qso.db` made a missing index
-/// look current, so it was never rebuilt.
-///
-/// Every path here is a write against the *real* `~/.pancetta/qsos.adi` /
-/// `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
-/// NOT EXISTS`, a write-mode connection even on an already-current DB) — not
-/// anything derived from `--replay`'s capture-dir argument, so it only runs
-/// from the live branch of [`start_local_qso_log_writers`] (PAN-41).
+/// The history seed and whether a refused migration must hold back ADIF creation.
+pub(crate) enum LocalIndex {
+    Ready(pancetta_qso::async_database::QsoDatabase),
+    Unavailable { reason: String },
+    MigrationRefused { reason: String },
+}
+impl LocalIndex {
+    #[cfg(test)]
+    fn expect(self, message: &str) -> pancetta_qso::async_database::QsoDatabase {
+        match self {
+            Self::Ready(db) => db,
+            _ => panic!("{message}"),
+        }
+    }
+    #[cfg(test)]
+    fn is_none(&self) -> bool {
+        !matches!(self, Self::Ready(_))
+    }
+}
+
+/// Reconcile contacts before either writer opens a file. An unchanged ADIF
+/// needs no rebuild regardless of timestamps. A migration refusal must never
+/// create a header-only ADIF that would erase legacy contacts on the next start.
 async fn prepare_local_qso_index(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
-) -> Option<pancetta_qso::async_database::QsoDatabase> {
-    use pancetta_qso::async_database::QsoDatabase;
-
-    // Case 1: migration — ADIF missing but legacy DB exists.
-    let adif_exists = match tokio::fs::try_exists(adif_path).await {
-        Ok(exists) => exists,
-        Err(error) => {
-            warn!(%error, "QSO history unavailable: cannot inspect ADIF");
-            return None;
-        }
+) -> LocalIndex {
+    use pancetta_qso::async_database::{AdifSnapshot, PreviousIndex, QsoDatabase};
+    let unavailable = |reason: String| LocalIndex::Unavailable { reason };
+    let adif_exists = match adif_path.try_exists() {
+        Ok(v) => v,
+        Err(e) => return unavailable(format!("cannot inspect ADIF: {e}")),
     };
-    let db_exists = match tokio::fs::try_exists(db_path).await {
-        Ok(exists) => exists,
-        Err(error) => {
-            warn!(%error, "QSO history unavailable: cannot inspect index");
-            return None;
-        }
+    let db_exists = match db_path.try_exists() {
+        Ok(v) => v,
+        Err(e) => return unavailable(format!("cannot inspect index: {e}")),
     };
-
-    if !adif_exists && db_exists {
-        info!(
-            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
-            db_path.display(),
-            adif_path.display(),
-        );
-        match QsoDatabase::open(&db_path).await {
-            Ok(db) => {
-                if let Err(e) = db.export_to_adif(&adif_path).await {
-                    warn!("QSO history unavailable: DB→ADIF migration failed: {}", e,);
-                    return None;
-                } else {
-                    info!("DB→ADIF migration succeeded");
-                }
+    let migrated = if !adif_exists && db_exists {
+        match QsoDatabase::migrate_legacy_to_adif(db_path, adif_path).await {
+            Ok((db, m)) => {
+                info!("DB→ADIF migration succeeded: exported {} QSOs to {}; legacy index copied to {}", m.exported, adif_path.display(),m.backup.display());
+                debug!(
+                    backup_existed = m.backup_existed,
+                    "Legacy migration backup retained"
+                );
+                Some(db)
             }
             Err(e) => {
-                warn!("QSO history unavailable: could not open legacy DB: {}", e);
-                return None;
-            }
-        }
-    }
-
-    // Case 2: replay — index missing or older than ADIF, or marked by a
-    // `pancetta import` that stopped before it finished indexing (PAN-127).
-    let marker = QsoDatabase::rebuild_marker(db_path);
-    let marked = match tokio::fs::try_exists(&marker).await {
-        Ok(exists) => exists,
-        Err(error) => {
-            warn!(%error, "QSO history unavailable: cannot inspect rebuild marker");
-            return None;
-        }
-    };
-    let db_metadata = match tokio::fs::metadata(db_path).await {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            warn!(%error, "QSO history unavailable: cannot stat index");
-            return None;
-        }
-    };
-    let adif_metadata = match tokio::fs::metadata(adif_path).await {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            warn!(%error, "QSO history unavailable: cannot stat ADIF");
-            return None;
-        }
-    };
-    let needs_replay = match (db_metadata, adif_metadata) {
-        (None, Some(_)) => {
-            info!(
-                "Index missing at {} — replaying from ADIF",
-                db_path.display()
-            );
-            true
-        }
-        (Some(_), Some(_)) if marked => {
-            info!(
-                "Index at {} is missing contacts an interrupted import added to {} — replaying",
-                db_path.display(),
-                adif_path.display(),
-            );
-            true
-        }
-        (Some(db_meta), Some(adif_meta)) => {
-            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
-                (Some(d), Some(a)) if a > d => {
-                    info!(
-                        "Index at {} is older than ADIF at {} — replaying",
+                return LocalIndex::MigrationRefused {
+                    reason: format!(
+                        "{e}. QSOs this session are logged to {} only, not {}.",
                         db_path.display(),
-                        adif_path.display(),
-                    );
-                    true
+                        adif_path.display()
+                    ),
                 }
-                (Some(_), Some(_)) => false,
-                _ => true, // Unknown modification time cannot prove the index current.
-            }
-        }
-        // No ADIF and no DB: fresh install; coordinator creates both later.
-        _ => false,
-    };
-
-    if needs_replay {
-        let replayed = QsoDatabase::replay_from_adif(&db_path, &adif_path).await;
-        // The marker stays until a replay succeeds, so a failed one (bad
-        // record, transient disk error) is retried at the next start instead
-        // of a stale or partial index being trusted from then on. Retrying
-        // loses nothing: `qsos.adi` holds every QSO the station logged.
-        if marked && replayed.is_ok() {
-            let _ = tokio::fs::remove_file(&marker).await;
-        }
-        match replayed {
-            Ok(db) => Some(db),
-            Err(e) => {
-                warn!("QSO history unavailable: ADIF replay failed: {}", e,);
-                // Writers remain fail-soft and may create/update the index below.
-                // Keep this failure visible on the next restart despite that new mtime.
-                if let Err(error) = tokio::fs::write(&marker, b"").await {
-                    warn!(%error, "Could not retain failed-history rebuild marker");
-                }
-                None
             }
         }
     } else {
-        // Case 3: open as-is.
-        QsoDatabase::open(&db_path).await.ok()
+        None
+    };
+    if !adif_exists && !db_exists {
+        return match QsoDatabase::open(db_path).await {
+            Ok(db) => LocalIndex::Ready(db),
+            Err(e) => unavailable(e.to_string()),
+        };
+    }
+    let marker = QsoDatabase::rebuild_marker(db_path);
+    let marked = match marker.try_exists() {
+        Ok(v) => v,
+        Err(e) => return unavailable(format!("cannot inspect rebuild marker: {e}")),
+    };
+    let snapshot = match AdifSnapshot::load(adif_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tokio::fs::write(&marker, b"").await;
+            return unavailable(format!(
+                "cannot read {} to check the index: {e}",
+                adif_path.display()
+            ));
+        }
+    };
+    let mut previous = PreviousIndex::Replace;
+    let mut missing_from_adif = None;
+    if db_exists {
+        let opened = match migrated {
+            Some(db) => Ok(db),
+            None => QsoDatabase::open_for_reconciliation(db_path).await,
+        };
+        match opened {
+            Ok(db) => {
+                match db.drift_from(&snapshot).await {
+                    Ok(drift) if drift.is_current() && !marked => return LocalIndex::Ready(db),
+                    Ok(drift) => {
+                        if drift.missing_from_adif > 0 {
+                            previous = PreviousIndex::KeepCopy;
+                            missing_from_adif = Some(drift.missing_from_adif);
+                        }
+                        if marked {
+                            info!("Index at {} is missing contacts an interrupted import added to {} — replaying",db_path.display(),adif_path.display());
+                        } else {
+                            info!("Index at {} differs from ADIF at {}: {} contacts missing from the index, {} not in the ADIF; rebuilding",db_path.display(),adif_path.display(),drift.missing_from_index,drift.missing_from_adif);
+                        }
+                    }
+                    Err(e) => {
+                        previous = PreviousIndex::KeepCopy;
+                        info!(
+                            "Index at {} cannot be read ({e}); rebuilding from ADIF",
+                            db_path.display()
+                        );
+                    }
+                }
+                db.close().await;
+            }
+            Err(e) => {
+                previous = PreviousIndex::KeepCopy;
+                info!(
+                    "Index at {} cannot be read ({e}); rebuilding from ADIF",
+                    db_path.display()
+                );
+            }
+        }
+    } else {
+        info!(
+            "Index missing at {} — replaying from ADIF",
+            db_path.display()
+        );
+    }
+    match QsoDatabase::rebuild_from(db_path, snapshot, previous).await {
+        Ok(rebuilt) => {
+            if let Some(kept) = rebuilt.kept {
+                if let Some(count) = missing_from_adif {
+                    warn!(
+                        "Kept the previous index as {}: it held {} contacts that {} does not",
+                        kept.display(),
+                        count,
+                        adif_path.display()
+                    );
+                } else {
+                    warn!("Kept the unreadable index as {}", kept.display());
+                }
+            }
+            let _ = tokio::fs::remove_file(&marker).await;
+            info!(
+                "QSO index ready: {} records ({} skipped)",
+                rebuilt.inserted, rebuilt.skipped
+            );
+            LocalIndex::Ready(rebuilt.db)
+        }
+        Err(e) => {
+            let _ = tokio::fs::write(&marker, b"").await;
+            unavailable(format!("ADIF replay failed: {e}"))
+        }
     }
 }
 
@@ -12623,7 +12747,9 @@ mod caller_dedup_tests {
 
 #[cfg(test)]
 mod replay_local_log_tests {
-    use super::{start_local_qso_log_writers, AdifSubscribers};
+    use super::{
+        prepare_local_qso_index, start_local_qso_log_writers, AdifSubscribers, LocalIndex,
+    };
     use std::time::Duration;
 
     /// Minimal manager config: a real callsign (the placeholder guard in
@@ -12717,6 +12843,186 @@ mod replay_local_log_tests {
         <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <MODE:3>FT8 \
         <FREQ:9>14.074000 <BAND:3>20M <EOR>\n";
 
+    #[tokio::test]
+    async fn live_start_does_not_rebuild_after_a_kill_with_rows_in_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let killed = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let path = dir.path().join("qso.db");
+        let manager = manager();
+        let subscribers = AdifSubscribers::new();
+        let (_writer, logger, seed) =
+            start_local_qso_log_writers(false, &adif, &path, 100, false, &manager, &subscribers)
+                .await;
+        let db = seed.expect("seed");
+        complete_one_qso(&manager).await;
+        assert_eq!(wait_for_adif_record(&adif).await, 1);
+        for _ in 0..100 {
+            if db.count_qsos().await.unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(db.count_qsos().await.unwrap(), 1);
+        let ids = qso_ids(&db).await;
+        for name in ["qsos.adi", "qso.db", "qso.db-wal", "qso.db-shm"] {
+            let source = dir.path().join(name);
+            if source.exists() {
+                let target = killed.path().join(name);
+                std::fs::copy(&source, &target).unwrap();
+                set_mtime(
+                    &target,
+                    std::fs::metadata(source).unwrap().modified().unwrap(),
+                );
+            }
+        }
+        let recovered = prepare_local_qso_index(
+            &killed.path().join("qsos.adi"),
+            &killed.path().join("qso.db"),
+        )
+        .await
+        .expect("recovered history");
+        assert_eq!(qso_ids(&recovered).await, ids);
+        recovered.close().await;
+        subscribers.stop(Duration::from_secs(2)).await;
+        drop(logger);
+        db.close().await;
+    }
+
+    async fn qso_ids(db: &pancetta_qso::async_database::QsoDatabase) -> Vec<String> {
+        let mut ids: Vec<_> = db
+            .search_qsos(&Default::default(), &Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|q| q.metadata.qso_id.to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+    fn set_mtime(path: &std::path::Path, at: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn live_start_rebuilds_an_index_whose_log_grew_at_the_same_mtime() {
+        grown_log(false).await;
+    }
+    #[tokio::test]
+    async fn live_start_rebuilds_an_index_newer_than_a_grown_log() {
+        grown_log(true).await;
+    }
+    async fn grown_log(newer: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let path = dir.path().join("qso.db");
+        index_with_two_rows(&path).await;
+        std::fs::write(&adif, format!("{TWO_RECORDS}<CALL:5>W2XYZ <QSO_DATE:8>20240102 <TIME_ON:6>120000 <FREQ:9>14.074000 <MODE:3>FT8 <EOR>")).unwrap();
+        let now = std::time::SystemTime::now();
+        set_mtime(&adif, now - Duration::from_secs(120));
+        set_mtime(
+            &path,
+            now - Duration::from_secs(if newer { 60 } else { 120 }),
+        );
+        let db = prepare_local_qso_index(&adif, &path)
+            .await
+            .expect("rebuilt");
+        assert_eq!(db.count_qsos().await.unwrap(), 3);
+        db.close().await;
+    }
+    #[tokio::test]
+    async fn live_start_keeps_a_copy_of_an_index_holding_contacts_the_log_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let path = dir.path().join("qso.db");
+        index_with_two_rows(&path).await;
+        std::fs::write(&adif, TWO_RECORDS.split_once("<CALL:5>K1ABC").unwrap().0).unwrap();
+        let db = prepare_local_qso_index(&adif, &path)
+            .await
+            .expect("rebuilt");
+        assert_eq!(db.count_qsos().await.unwrap(), 1);
+        db.close().await;
+        let old =
+            pancetta_qso::async_database::QsoDatabase::open(dir.path().join("qso.db.pre-rebuild"))
+                .await
+                .unwrap();
+        assert_eq!(old.count_qsos().await.unwrap(), 2);
+        old.close().await;
+    }
+    #[tokio::test]
+    async fn live_start_rebuilds_an_unreadable_index_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let path = dir.path().join("qso.db");
+        std::fs::write(&path, b"this is not a database").unwrap();
+        std::fs::write(dir.path().join("qso.db-wal"), [42; 64]).unwrap();
+        std::fs::write(&adif, TWO_RECORDS).unwrap();
+        let db = prepare_local_qso_index(&adif, &path)
+            .await
+            .expect("rebuilt");
+        assert_eq!(db.count_qsos().await.unwrap(), 2);
+        db.close().await;
+        assert_eq!(
+            std::fs::read(dir.path().join("qso.db.pre-rebuild-wal")).unwrap(),
+            [42; 64]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("qso.db.pre-rebuild")).unwrap(),
+            b"this is not a database"
+        );
+    }
+    #[tokio::test]
+    async fn live_start_refuses_a_legacy_migration_with_an_unreadable_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let adif = dir.path().join("qsos.adi");
+        let path = dir.path().join("qso.db");
+        index_with_two_rows(&path).await;
+        use sqlx::Connection;
+        let mut conn = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(&path),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE qsos SET progress_data = '{not json' WHERE id=1")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        for _ in 0..2 {
+            let subscribers = AdifSubscribers::new();
+            let (writer, logger, outcome) = start_local_qso_log_writers(
+                false,
+                &adif,
+                &path,
+                100,
+                false,
+                &manager(),
+                &subscribers,
+            )
+            .await;
+            assert!(writer.is_none());
+            match outcome {
+                LocalIndex::MigrationRefused { reason } => assert!(
+                    reason.contains("row 1") && reason.contains("qso.db.pre-migration"),
+                    "{reason}"
+                ),
+                _ => panic!("migration must refuse"),
+            }
+            assert!(!adif.exists());
+            subscribers.stop(Duration::from_secs(2)).await;
+            drop(logger);
+            let db = pancetta_qso::async_database::QsoDatabase::open(&path)
+                .await
+                .unwrap();
+            assert_eq!(db.count_qsos().await.unwrap(), 2);
+            db.close().await;
+        }
+    }
+
     /// Build a 2-row `qso.db` at `db_path` from an ADIF kept somewhere else,
     /// so the directory under test holds the index alone.
     async fn index_with_two_rows(db_path: &std::path::Path) {
@@ -12739,6 +13045,11 @@ mod replay_local_log_tests {
         let adif_path = dir.path().join("qsos.adi");
         let db_path = dir.path().join("qso.db");
         index_with_two_rows(&db_path).await;
+        let original = pancetta_qso::async_database::QsoDatabase::open(&db_path)
+            .await
+            .unwrap();
+        let ids = qso_ids(&original).await;
+        original.close().await;
         assert!(!adif_path.exists(), "precondition: no ADIF log yet");
         let manager = manager();
         let adif_subscribers = AdifSubscribers::new();
@@ -12760,6 +13071,8 @@ mod replay_local_log_tests {
             2,
             "the legacy contacts must survive startup"
         );
+        assert!(dir.path().join("qso.db.pre-migration").exists());
+        assert_eq!(qso_ids(&seed_db).await, ids);
         let adif = std::fs::read_to_string(&adif_path).expect("qsos.adi was written");
         let parsed = pancetta_qso::AdifProcessor::new()
             .parse_string(&adif)
@@ -12804,13 +13117,7 @@ mod replay_local_log_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let adif_path = dir.path().join("qsos.adi");
         let db_path = dir.path().join("qso.db");
-        // The ADIF holds one contact; the (newer) index holds two, so a
-        // rebuild would be visible as a count of 1.
-        let one_record = TWO_RECORDS
-            .split_once("<CALL:5>K1ABC")
-            .map(|(head, _)| head)
-            .expect("fixture has two records");
-        std::fs::write(&adif_path, one_record).expect("write qsos.adi");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
         let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::OpenOptions::new()
             .write(true)
@@ -12818,6 +13125,13 @@ mod replay_local_log_tests {
             .and_then(|f| f.set_modified(an_hour_ago))
             .expect("backdate qsos.adi");
         index_with_two_rows(&db_path).await;
+        set_mtime(&db_path, an_hour_ago);
+        set_mtime(&adif_path, std::time::SystemTime::now());
+        let original = pancetta_qso::async_database::QsoDatabase::open(&db_path)
+            .await
+            .unwrap();
+        let ids = qso_ids(&original).await;
+        original.close().await;
         let manager = manager();
         let adif_subscribers = AdifSubscribers::new();
 
@@ -12838,6 +13152,7 @@ mod replay_local_log_tests {
             2,
             "a current index must not be rebuilt"
         );
+        assert_eq!(qso_ids(&seed_db).await, ids);
         adif_subscribers.stop(Duration::from_secs(2)).await;
     }
 
@@ -13643,7 +13958,7 @@ mod replay_history_seed_tests {
             let db = QsoDatabase::open(&db_path).await.unwrap();
             db.insert_qso(&sample_progress("W9STALE")).await.unwrap();
         }
-        // ADIF strictly newer than the index -> the rebuild path.
+        // ADIF contacts differ from the index -> the rebuild path.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         tokio::fs::write(
             pancetta_dir.join("qsos.adi"),
@@ -15231,6 +15546,7 @@ mod respond_to_caller_admission_tests {
                 dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             }),
             Instant::now(),
         );
@@ -16543,6 +16859,7 @@ mod respond_to_caller_admission_tests {
                     dx_parity: Some(SlotParity::Even),
                     remote_origin: false,
                     remote_client_key_id: None,
+                    dx_offset_unknown: false,
                 }),
                 Instant::now(),
             ))
@@ -17233,6 +17550,7 @@ mod manual_capacity_admission_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -17624,6 +17942,7 @@ mod manual_capacity_admission_tests {
             dx_parity: Some(SlotParity::Even),
             remote_origin: true,
             remote_client_key_id: Some("peer".to_string()),
+            dx_offset_unknown: false,
         }
     }
 
@@ -17792,6 +18111,7 @@ mod remote_controller_change_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -17870,6 +18190,7 @@ mod remote_controller_change_tests {
             dx_parity: Some(dx),
             remote_origin: true,
             remote_client_key_id: Some(client.to_string()),
+            dx_offset_unknown: false,
         })
         .await;
     }
@@ -18987,7 +19308,7 @@ mod pan260 {
             &adif_subscribers,
         )
         .await;
-        let db = Arc::new(db.unwrap());
+        let db = Arc::new(db.expect("ready history"));
         let lookup = crate::priority_evaluator::CachedStationLookup::new();
         initialize_qso_history(&mut first, &lookup, db.clone())
             .await
@@ -19380,7 +19701,7 @@ mod pan50_live_contest {
             &adif_subscribers,
         )
         .await;
-        let db = db.unwrap();
+        let db = db.expect("ready history");
         let id = manager
             .start_cq_manual(14_074_000.0, None, false, None)
             .await

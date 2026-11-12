@@ -44,6 +44,7 @@ mod replay;
 mod restart_budget;
 mod session_state;
 mod shutdown;
+mod spot_call;
 pub mod station_agent;
 mod swr_guard;
 mod tier;
@@ -1592,6 +1593,14 @@ pub struct ApplicationCoordinator {
     /// round 2 found. Guards a unit value; only the mutual exclusion matters.
     /// See `docs/superpowers/specs/
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
+    ///
+    /// PAN-287: the TUI relay's spot-call QSY also holds it for its final
+    /// `spot_call::rig_is_keyed` recheck and the `SetFrequency` enqueue, and
+    /// the TUI's manual key-down (`tui_relay::manual_key_down`) holds it across
+    /// its last pre-PTT gates and the PTT-on enqueue, so a spot QSY can never
+    /// land while PTT is keyed. Rule: never lock the
+    /// autonomous operator while holding this gate — the Autonomous task holds
+    /// the operator lock while its offset drain takes this gate.
     pub(crate) ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
 
     /// PAN-145: synchronous relocation evidence for post-gate TX revalidation.
@@ -1887,6 +1896,19 @@ pub struct ApplicationCoordinator {
     /// one -- `send` would see `receiver_count() == 0` and discard the value
     /// instead of storing it, leaving every later subscriber seeded `None`.
     pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
+
+    /// PAN-287: the Autonomous task's `AutonomousOperator`, published by
+    /// `start_autonomous_component` on every (re)start, so the TUI relay's
+    /// spot call can ask the frequency allocator for a TX offset and clear its
+    /// old-band data after a commanded QSY. `None` until the Autonomous
+    /// component starts (or when it is config-disabled). `send_replace`
+    /// (never plain `send`) is load-bearing for the same zero-receiver reason
+    /// as `qso_manager_watch` above: this channel is constructed with
+    /// `watch::channel(None).0`, dropping the initial `Receiver`, so `send`
+    /// would discard the value instead of storing it.
+    pub(crate) autonomous_operator_watch: tokio::sync::watch::Sender<
+        Option<Arc<tokio::sync::Mutex<pancetta_qso::AutonomousOperator>>>,
+    >,
 
     /// PAN-42: `true` once the QSO component's task has finished its startup
     /// worked-history seed and is about to drain `ComponentId::Qso` (or has
@@ -2594,6 +2616,7 @@ impl ApplicationCoordinator {
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
             qso_manager_watch: tokio::sync::watch::channel(None).0,
+            autonomous_operator_watch: tokio::sync::watch::channel(None).0,
             qso_consumer_ready: tokio::sync::watch::channel(false).0,
         };
 

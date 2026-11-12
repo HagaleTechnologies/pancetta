@@ -79,6 +79,16 @@ its session. Grid-less reports and acknowledgments use that grid when rescoring;
 worked-grid and failure history are still read afresh. Otherwise a report could
 erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.
 
+Space on a network spot (PAN-287): a DX Hunter row from the DX cluster or
+cqdx.io that was never heard locally is called through
+`TuiCommand::CallNetworkSpot`, not `CallStation`. The TUI resolves the spot's
+standard FT8/FT4 dial and audio offset from `DxStation.spot_rf_hz` (never
+`frequency`, whose unit differs by source), and the coordinator QSYs first,
+waiting for PTT-off. Gotcha: the TUI switches its band only when the
+coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
+the band alone. See
+[the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
+
 Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
 PTT and view labels are separate from Debug and persistence strings. Rarity
 cells use words in a nine-cell column. Band Activity uses integer kilometres
