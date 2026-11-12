@@ -277,7 +277,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta doctor [--json]` | Station prerequisites and fixes. Exit 0: ON-AIR READY; 1: DECODE-ONLY; 2: NOT CONFIGURED; 3: NOT READY. JSON includes all checks. |
 | `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
 | `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
-| `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
+| `pancetta test-rig` | Test a running rigctld; exits 1 on failure. `--ptt` keys CAT/RTS for 1 s after the band-plan check (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
 | `pancetta import-confirmations <file.adi>` | Merge your LoTW report into existing contacts, then restart to apply confirmations. No login or download. |
@@ -399,8 +399,10 @@ Honest gaps, so you can judge whether it fits your station:
   the binary builds and decodes correctly on an ARM64 cloud runner, not on a
   Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
-  Other hamlib-supported rigs should work; nobody has proven it. The
-  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status.
+  `rig.model` accepts any name from the bundled Hamlib catalog or a numeric
+  Hamlib model ID, but no other rig has been proven on air. The
+  [supported-rig list](docs/SUPPORTED_RIGS.md) shows each rig's test status
+  and which models are accepted.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI
   and unsupported.
 

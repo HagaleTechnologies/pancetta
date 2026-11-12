@@ -581,11 +581,32 @@ fn hamlib_install_hint() -> &'static str {
     }
 }
 
+/// Pure model-resolution half of the rigctld check (PAN-340): no process
+/// spawn, no network, no global PATH read. `None` means the configured
+/// model resolves; `Some(outcome)` is the failure to report, using the
+/// same resolver message and numeric-ID guidance config validation shows
+/// instead of directing operators only to the small supported-rigs page.
+pub(crate) fn rig_model_outcome(model: &str) -> Option<CheckOutcome> {
+    match pancetta_hamlib::resolve_model(model) {
+        Ok(_) => None,
+        Err(err) => Some(CheckOutcome {
+            status: CheckStatus::Fail,
+            detail: err.to_string(),
+            fix: Some(
+                "run `rigctl -l` to find your model, then set rig.model to its name or \
+                 numeric ID (for example \"IC-7300\" or \"1045\"); see docs/SUPPORTED_RIGS.md"
+                    .to_string(),
+            ),
+        }),
+    }
+}
+
 pub(crate) fn check_rigctld() -> DoctorCheck {
     DoctorCheck {
         name: "rig / rigctld",
         role: CheckRole::Transmit,
         run: Box::new(|ctx| {
+<<<<<<< HEAD
             rigctld_outcome(ctx, || {
                 std::process::Command::new("rigctld")
                     .arg("--version")
@@ -657,6 +678,66 @@ fn rigctld_outcome(ctx: &DoctorCtx, on_path: impl FnOnce() -> bool) -> CheckOutc
         status: CheckStatus::Pass,
         detail,
         fix: None,
+=======
+            let Some(cfg) = &ctx.config else {
+                return not_configured();
+            };
+            if !cfg.rig.interface.enabled {
+                return CheckOutcome {
+                    status: CheckStatus::Pass,
+                    detail: "rig disabled — decode-only (mock rig, no PTT)".to_string(),
+                    fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
+                };
+            }
+            // Model must resolve or the coordinator can't spawn rigctld
+            // (hamlib.rs warns and gives up). Pure half of this check,
+            // factored out so it stays testable without spawning anything.
+            if let Some(outcome) = rig_model_outcome(&cfg.rig.model) {
+                return outcome;
+            }
+            // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
+            let on_path = std::process::Command::new("rigctld")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if !on_path {
+                return CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: "rig enabled but `rigctld` is not on PATH".to_string(),
+                    fix: Some(hamlib_install_hint().to_string()),
+                };
+            }
+            // Same host/port conventions as the coordinator (hamlib.rs:150-155).
+            let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port: u16 = std::env::var("RIGCTLD_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4532);
+            use std::net::ToSocketAddrs;
+            let reachable = format!("{host}:{port}")
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+                .map(|a| {
+                    std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok()
+                })
+                .unwrap_or(false);
+            let detail = if reachable {
+                format!("rigctld on PATH; already listening on {host}:{port}")
+            } else {
+                format!(
+                    "rigctld on PATH; nothing on {host}:{port} yet (pancetta spawns it at startup)"
+                )
+            };
+            CheckOutcome {
+                status: CheckStatus::Pass,
+                detail,
+                fix: None,
+            }
+        }),
+>>>>>>> 23fc8f42dfeee5be511bb6cc5c61bb061349d13a
     }
 }
 
@@ -1075,6 +1156,58 @@ mod tests {
         assert_eq!(
             o.fix.as_deref(),
             Some("check network; FT8 needs the clock within ~1 s of UTC")
+        );
+    }
+
+    /// PAN-340: the doctor's model check resolves through the shared offline
+    /// resolver — numeric IDs and catalog names pass, errors reuse the
+    /// resolver's wording with numeric-ID guidance — without spawning
+    /// rigctld or touching global PATH.
+    #[test]
+    fn model_diagnostic_uses_shared_resolver() {
+        // Numeric and catalog names (including non-curated ones) resolve.
+        for model in [
+            "1045",
+            "IC-7300",
+            "KX3",
+            "Barrett 950",
+            "  ft-dx10  ",
+            "123456",
+        ] {
+            assert!(
+                rig_model_outcome(model).is_none(),
+                "{model:?} must resolve for doctor"
+            );
+        }
+        // Unknown name: the resolver body, with matches and the hint.
+        let outcome = rig_model_outcome("FT-9999").expect("FT-9999 must fail");
+        assert_eq!(outcome.status, CheckStatus::Fail);
+        assert!(
+            outcome.detail.starts_with(
+                "Unknown rig.model 'FT-9999'. Closest matches: FT-990 (1016), \
+                 FT-991 (1035), FT-890 (1015)."
+            ),
+            "{}",
+            outcome.detail
+        );
+        let fix = outcome.fix.expect("unknown model needs a fix");
+        assert!(fix.contains("rigctl -l"), "{fix}");
+        assert!(fix.contains("numeric ID"), "{fix}");
+        // Malformed numeric value: the numeric-id error body.
+        let outcome = rig_model_outcome("0").expect("'0' must fail");
+        assert!(
+            outcome.detail.starts_with("Invalid rig.model '0'."),
+            "{}",
+            outcome.detail
+        );
+        // Ambiguity names every backend.
+        let outcome = rig_model_outcome("SW/FM radio").expect("ambiguity must fail");
+        assert!(
+            outcome
+                .detail
+                .starts_with("Ambiguous rig.model 'SW/FM radio'"),
+            "{}",
+            outcome.detail
         );
     }
 }
