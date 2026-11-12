@@ -105,27 +105,58 @@ impl CqdxCache {
 }
 
 /// Derive ham radio band name from frequency in Hz.
+///
+/// PAN-330: core band membership plus the core lowercase name — the old
+/// integer-MHz buckets (e.g. all of 5–6 MHz → `60m`) are gone, so
+/// 5,410,000 Hz now classifies as no band instead of `60m`, and 2m/70cm
+/// resolve where core supports them.
 pub fn frequency_to_band(freq_hz: u64) -> Option<String> {
-    match freq_hz / 1_000_000 {
-        1..=2 => Some("160m".to_string()),
-        3..=4 => Some("80m".to_string()),
-        5..=6 => Some("60m".to_string()),
-        7..=8 => Some("40m".to_string()),
-        10..=11 => Some("30m".to_string()),
-        14..=15 => Some("20m".to_string()),
-        18..=19 => Some("17m".to_string()),
-        21..=22 => Some("15m".to_string()),
-        24..=25 => Some("12m".to_string()),
-        28..=30 => Some("10m".to_string()),
-        50..=54 => Some("6m".to_string()),
-        _ => None,
-    }
+    pancetta_core::Band::from_frequency(freq_hz).map(|b| b.name().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::*;
+
+    /// PAN-330 AC3: cqdx frequency classification is core band membership
+    /// with the core lowercase label — including the old broad-MHz-bucket
+    /// corrections at the 60 m edge.
+    #[test]
+    fn band_vocabulary_table() {
+        for (hz, expected) in [
+            (1_800_000u64, Some("160m")),
+            (2_000_000, Some("160m")),
+            (3_500_000, Some("80m")),
+            (5_330_000, Some("60m")),
+            (5_357_500, Some("60m")),
+            (5_405_000, Some("60m")),
+            (7_074_000, Some("40m")),
+            (14_074_000, Some("20m")),
+            (50_313_000, Some("6m")),
+            (54_000_000, Some("6m")),
+            (144_174_000, Some("2m")),
+            (432_100_000, Some("70cm")),
+        ] {
+            assert_eq!(frequency_to_band(hz).as_deref(), expected, "at {hz} Hz");
+        }
+        // The old integer-MHz buckets are gone: adjacent MHz inside an old
+        // bucket and the 60 m spillover are no band, and edge ±1 Hz holds.
+        for hz in [
+            5_410_000u64, // old bucket said 60m; core says none
+            5_329_999,
+            5_405_001,
+            6_000_000,
+            8_000_000,
+            11_000_000,
+            15_000_000,
+            30_000_000,
+            54_000_001,
+            0,
+        ] {
+            assert_eq!(frequency_to_band(hz), None, "expected no band at {hz} Hz");
+        }
+    }
 
     fn sample_entities() -> Vec<DxccEntity> {
         vec![

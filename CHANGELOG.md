@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
+- PAN-330: `pancetta-core` now owns the shared radio vocabulary. Prefix-portable decodes such as `EA8/K5ARH DL1ABC -10` are marked directed at us by both the TUI and the remote gateway, every frequency classifier uses the core inclusive band edges (5,357,500 Hz is `60m`; at 5,410,000 Hz cqdx and recording classification now return no band; ADIF writes `60M` at 5,405,000 Hz instead of its old `5MHZ` fallback while keeping uppercase labels at the serialization boundary), Maidenhead validity is one core validator (`ZZ99` is rejected wherever semantics matter), committed-exchange payloads and the CQ-modifier and callsign-token policies have single core implementations, and hamlib/config band keys use the core names.
 
 ### Added
 

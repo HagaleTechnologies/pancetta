@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Shared radio-domain vocabulary: band names for rig preset validation (PAN-330)
+pancetta-core = { path = "../pancetta-core" }
 # Configuration and serialization
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"

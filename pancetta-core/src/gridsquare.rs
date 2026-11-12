@@ -699,4 +699,45 @@ mod tests {
         let grid_east = coordinates_to_grid(0.0, 179.0, GridPrecision::Square).unwrap();
         assert!(grid_east.starts_with("RJ"));
     }
+
+    /// PAN-330 AC6: `validate_grid` is the one semantic Maidenhead
+    /// authority. Case is normalized; even lengths 2–10 are supported with
+    /// pair ranges enforced (field A–R, square digits, subsquare A–X,
+    /// extended digits, sub-extended A–X). Shape-only checks that accept
+    /// `ZZ99` live elsewhere (`callsign::is_grid_shape`,
+    /// QSO false-positive detection) on purpose.
+    #[test]
+    fn locator_policy_table() {
+        for ok in [
+            "FN42",
+            "fn42",
+            "Fn42",
+            "FN42ab",
+            "FN42AB",
+            "FN42AB12",
+            "FN42AB12CD",
+            "FN",
+            "RR73",
+        ] {
+            assert!(validate_grid(ok).is_ok(), "expected valid: {ok:?}");
+        }
+        for bad in [
+            "ZZ99",    // field letters outside A–R (the ticket's case)
+            "FN42YY",  // subsquare letters outside A–X
+            "FN42X",   // odd length
+            "FN4212",  // letters where digits belong
+            "1234",    // digits where field letters belong
+            "FN4",     // odd length
+            "",        // empty
+            "   ",     // whitespace
+            "FN42€",   // non-ASCII
+            "FN42AB1", // odd length
+        ] {
+            assert!(validate_grid(bad).is_err(), "expected invalid: {bad:?}");
+        }
+        // `RR73` is a *geographically* valid locator (field RR, square 73):
+        // semantic validation accepts it, and FT8 exchange callers reserve it
+        // explicitly as the acknowledgement token instead (PAN-330 AC6).
+        assert!(validate_grid("RR73").is_ok());
+    }
 }

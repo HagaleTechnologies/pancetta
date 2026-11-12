@@ -543,23 +543,16 @@ impl super::ApplicationCoordinator {
                                 decoded_msg.message.grid_square.as_deref(), dial_mhz);
                             // "Calling me" detection: the parser sets
                             // to_callsign = our call when someone replies
-                            // to our CQ ("K5ARH F5ABC -10"). Match against
-                            // the bare callsign — strip any /R or /P suffix
-                            // on either side so "K5ARH/M" and "K5ARH" both
-                            // count.
-                            let is_directed_at_us = match decoded_msg.message.to_callsign.as_deref() {
-                                Some(to) => {
-                                    let to_base = to.split('/').next().unwrap_or(to);
-                                    let our_base = our_callsign_for_relay
-                                        .split('/')
-                                        .next()
-                                        .unwrap_or(&our_callsign_for_relay);
-                                    !to_base.is_empty()
-                                        && !our_base.is_empty()
-                                        && to_base.eq_ignore_ascii_case(our_base)
-                                }
-                                None => false,
-                            };
+                            // to our CQ ("K5ARH F5ABC -10"). PAN-330: the
+                            // shared core predicate also recognizes
+                            // prefix/suffix-portable destinations
+                            // ("EA8/K5ARH DL1ABC -10" is directed at
+                            // K5ARH) and resolved hash renders.
+                            let is_directed_at_us =
+                                decode_directed_at_us_flag(
+                                    decoded_msg.message.to_callsign.as_deref(),
+                                    &our_callsign_for_relay,
+                                );
 
                             // Compute distance and bearing if both grids are available
                             let (distance, bearing) = match (&grid_square, &station_coords) {
@@ -4425,6 +4418,14 @@ fn spawn_config_file_write_worker() -> (
 const RF_NO_DECODE_STATUS_CODE: u32 = 0xC200_0001;
 const SILENT_INPUT_STATUS_CODE: u32 = 0xC200_0002;
 
+/// "Directed at us" flag for one relayed decode — the relay's single use of
+/// the shared core predicate (`pancetta_core::callsign::decode_directed_at_us`,
+/// PAN-330). See that function for the recognized forms; absent, empty,
+/// whitespace-only and unresolved-hash (`<...>`) destinations never match.
+fn decode_directed_at_us_flag(to: Option<&str>, our_callsign: &str) -> bool {
+    pancetta_core::callsign::decode_directed_at_us(to, our_callsign)
+}
+
 fn relayed_status(
     component: String,
     status: String,
@@ -4923,6 +4924,30 @@ mod pan351_tests {
 
 #[cfg(test)]
 mod tui_relay_tests {
+    /// PAN-330 AC1: the TUI relay's directed flag recognizes prefix/suffix
+    /// portable calls, mixed case and resolved hash renders, and rejects
+    /// absent, empty, whitespace-only, unresolved-hash and wrong-call
+    /// destinations — exercised through the relay's own flag helper, not
+    /// just the core matcher.
+    #[test]
+    fn directed_decode_table() {
+        let f = |to: Option<&str>| super::decode_directed_at_us_flag(to, "K5ARH");
+        // The ticket's headline: `EA8/K5ARH DL1ABC -10` is directed at us.
+        assert!(f(Some("EA8/K5ARH")));
+        assert!(f(Some("K5ARH/P")));
+        assert!(f(Some("K5ARH/M")));
+        assert!(f(Some("k5arh")));
+        assert!(f(Some("<K5ARH>"))); // resolved hash render
+        assert!(f(Some("K5ARH"))); // plain reply to our CQ
+                                   // Not directed at us.
+        assert!(!f(Some("EA8/K5ARG")));
+        assert!(!f(Some("DL1ABC")));
+        assert!(!f(Some("<...>"))); // unresolved hash placeholder
+        assert!(!f(None));
+        assert!(!f(Some("")));
+        assert!(!f(Some("   ")));
+    }
+
     #[test]
     fn cluster_spot_relay_preserves_metadata() {
         // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,
