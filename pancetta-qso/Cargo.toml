@@ -75,3 +75,6 @@ required-features = ["sim-hifi"]
 name = "decode_rate_sweep"
 path = "examples/decode_rate_sweep.rs"
 required-features = ["sim-hifi"]
+
+[lints]
+workspace = true

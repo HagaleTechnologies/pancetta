@@ -53,3 +53,6 @@ cli = ["clap"]
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["full"] }
+
+[lints]
+workspace = true

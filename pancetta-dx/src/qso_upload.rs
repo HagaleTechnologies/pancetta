@@ -45,7 +45,7 @@
 //!   [`QsoUploadOutcome`] (a bounded timeout kills a hung invocation).
 //!
 //! **Failure classes (PAN-57).** The ClubLog, QRZ Logbook and eQSL clients
-//! return [`DxError::Upload`] for a refusal, carrying an
+//! return a [`DxError`] containing [`DxErrorInner::Upload`] for a refusal, carrying an
 //! [`UploadFailureClass`]: `Transient` (5xx, 408/425/429, and — via
 //! [`DxError::upload_failure_class`] — timeouts, connection errors and
 //! unrecognised responses), `LoginRejected` (401/403, QRZ `RESULT=AUTH`, an
@@ -54,11 +54,7 @@
 //! to decide between retrying, holding the record and warning the operator.
 //! The error text is unchanged, so log lines read as before.
 
-// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
-// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
-#![allow(clippy::result_large_err)]
-
-use crate::{body, DxError, Result};
+use crate::{body, DxError, DxErrorInner, Result};
 use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -94,7 +90,7 @@ pub fn upload_failure_class_for_status(status: u16) -> UploadFailureClass {
 /// The error for a non-2xx upload response: today's message text, plus the
 /// status class.
 fn http_failure(service: &str, status: reqwest::StatusCode, body: &str) -> DxError {
-    DxError::Upload {
+    DxError::from(DxErrorInner::Upload {
         class: upload_failure_class_for_status(status.as_u16()),
         message: format!(
             "{} upload failed: HTTP {} — {}",
@@ -102,7 +98,7 @@ fn http_failure(service: &str, status: reqwest::StatusCode, body: &str) -> DxErr
             status,
             body.trim()
         ),
-    }
+    })
 }
 
 fn build_client() -> Client {
@@ -179,7 +175,7 @@ impl ClubLogClient {
     ///
     /// HTTP 200 is treated as success (ClubLog returns 200 even for the
     /// "QSO Duplicate" case, which is harmless). Any non-success status is
-    /// mapped to a classified [`DxError::Upload`] carrying the status code and
+    /// mapped to a classified [`DxErrorInner::Upload`] carrying the status code and
     /// response body. **No credential value is included in the error.**
     pub async fn upload_adif(&self, adif_record: &str) -> Result<()> {
         let params = [
@@ -332,22 +328,22 @@ pub fn parse_qrz_response(body: &str) -> Result<QrzInsertOutcome> {
         // A plain duplicate without OPTION=REPLACE comes back as FAIL with a
         // REASON mentioning "duplicate"; treat that as non-fatal.
         "FAIL" if reason_is_dupe => Ok(QrzInsertOutcome::Duplicate { reason }),
-        "FAIL" => Err(DxError::Upload {
+        "FAIL" => Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::RecordRejected,
             message: format!(
                 "QRZ Logbook insert failed: {}",
                 reason.unwrap_or_else(|| "unknown reason".to_string())
             ),
-        }),
-        "AUTH" => Err(DxError::Upload {
+        })),
+        "AUTH" => Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::LoginRejected,
             message: "QRZ Logbook insert rejected: invalid or insufficient API key (RESULT=AUTH)"
                 .to_string(),
-        }),
-        _ => Err(DxError::Parse(format!(
+        })),
+        _ => Err(DxError::from(DxErrorInner::Parse(format!(
             "Unrecognised QRZ Logbook response: {}",
             body.trim()
-        ))),
+        )))),
     }
 }
 
@@ -509,10 +505,10 @@ pub fn parse_eqsl_response(body: &str) -> Result<QsoUploadOutcome> {
     if (lower.contains("bad") || lower.contains("error") || lower.contains("invalid"))
         && (lower.contains("user") || lower.contains("password") || lower.contains("login"))
     {
-        return Err(DxError::Upload {
+        return Err(DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::LoginRejected,
             message: format!("eQSL upload rejected (authentication): {}", body.trim()),
-        });
+        }));
     }
 
     // Success: "Result: 1 out of 1 ... Added" (or any "added" acknowledgement).
@@ -520,10 +516,10 @@ pub fn parse_eqsl_response(body: &str) -> Result<QsoUploadOutcome> {
         return Ok(QsoUploadOutcome::Logged);
     }
 
-    Err(DxError::Parse(format!(
+    Err(DxError::from(DxErrorInner::Parse(format!(
         "Unrecognised eQSL response: {}",
         body.trim()
-    )))
+    ))))
 }
 
 /// Render one ADIF field (`<TAG:len>value`) — used to build the eQSL header.
@@ -639,8 +635,8 @@ impl LotwClient {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            let mut f = opts.open(&path).map_err(DxError::Io)?;
-            f.write_all(file_body.as_bytes()).map_err(DxError::Io)?;
+            let mut f = opts.open(&path).map_err(DxError::from)?;
+            f.write_all(file_body.as_bytes()).map_err(DxError::from)?;
         }
 
         let path_str = path.to_string_lossy().to_string();
@@ -667,10 +663,10 @@ impl LotwClient {
                     target: "qso.upload",
                     "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
                 );
-                return Err(DxError::ExternalService(format!(
+                return Err(DxError::from(DxErrorInner::ExternalService(format!(
                     "LoTW: tqsl invocation failed ({}): {}",
                     self.tqsl_path, e
-                )));
+                ))));
             }
         };
 
@@ -698,10 +694,10 @@ impl LotwClient {
                         target: "qso.upload",
                         "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
                     );
-                    return Err(DxError::ExternalService(format!(
+                    return Err(DxError::from(DxErrorInner::ExternalService(format!(
                         "LoTW: tqsl invocation failed ({}): {}",
                         self.tqsl_path, e
-                    )));
+                    ))));
                 }
             },
             Ok(Err(e)) => {
@@ -710,10 +706,10 @@ impl LotwClient {
                     target: "qso.upload",
                     "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
                 );
-                return Err(DxError::ExternalService(format!(
+                return Err(DxError::from(DxErrorInner::ExternalService(format!(
                     "LoTW: tqsl invocation failed ({}): {}",
                     self.tqsl_path, e
-                )));
+                ))));
             }
             Err(_elapsed) => {
                 let _ = child.kill().await;
@@ -724,10 +720,10 @@ impl LotwClient {
                     "LoTW: tqsl ({}) timed out after {}s — killed",
                     self.tqsl_path, UPLOAD_TIMEOUT_SECS
                 );
-                return Err(DxError::ExternalService(format!(
+                return Err(DxError::from(DxErrorInner::ExternalService(format!(
                     "LoTW: tqsl ({}) timed out after {}s",
                     self.tqsl_path, UPLOAD_TIMEOUT_SECS
-                )));
+                ))));
             }
         };
 
@@ -747,11 +743,11 @@ impl LotwClient {
                 Ok(QsoUploadOutcome::Logged)
             }
         } else {
-            Err(DxError::ExternalService(format!(
+            Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "LoTW: tqsl exited with {} — {}",
                 output.status,
                 stderr.trim()
-            )))
+            ))))
         }
     }
 }
@@ -830,7 +826,7 @@ mod tests {
     #[test]
     fn parse_qrz_unknown_is_error() {
         let err = parse_qrz_response("FOO=BAR").unwrap_err();
-        assert!(matches!(err, DxError::Parse(_)));
+        assert!(matches!(err.kind(), DxErrorInner::Parse(_)));
     }
 
     #[test]
@@ -920,8 +916,8 @@ mod tests {
     fn parse_eqsl_bad_login_is_error() {
         let err = parse_eqsl_response("Error: Bad username/password").unwrap_err();
         assert!(matches!(
-            err,
-            DxError::Upload {
+            err.kind(),
+            DxErrorInner::Upload {
                 class: UploadFailureClass::LoginRejected,
                 ..
             }
@@ -931,7 +927,7 @@ mod tests {
     #[test]
     fn parse_eqsl_unknown_is_error() {
         let err = parse_eqsl_response("<html>something unexpected</html>").unwrap_err();
-        assert!(matches!(err, DxError::Parse(_)));
+        assert!(matches!(err.kind(), DxErrorInner::Parse(_)));
     }
 
     #[test]
@@ -1018,7 +1014,7 @@ mod tests {
     async fn clublog_error_body_is_bounded() {
         let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
         let err = clublog_at(addr).upload_adif(RECORD).await.unwrap_err();
-        let DxError::Upload { message: msg, .. } = err else {
+        let DxErrorInner::Upload { message: msg, .. } = err.kind() else {
             panic!("expected ExternalService, got {err:?}");
         };
         assert!(msg.starts_with("ClubLog upload failed: HTTP 500"), "{msg}");
@@ -1032,7 +1028,7 @@ mod tests {
         let (addr, h) = serve_chunked(STATUS_200, b"RESULT=OK&LOGID=1", 64 * MIB);
         let err = qrz_logbook_at(addr).upload_adif(RECORD).await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == UPLOAD_MAX_BODY_BYTES),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == UPLOAD_MAX_BODY_BYTES),
             "got {err:?}"
         );
         let s = served(h).await;
@@ -1043,7 +1039,7 @@ mod tests {
     async fn qrz_logbook_error_body_is_bounded() {
         let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
         let err = qrz_logbook_at(addr).upload_adif(RECORD).await.unwrap_err();
-        let DxError::Upload { message: msg, .. } = err else {
+        let DxErrorInner::Upload { message: msg, .. } = err.kind() else {
             panic!("expected ExternalService, got {err:?}");
         };
         assert!(
@@ -1073,7 +1069,7 @@ mod tests {
         let (addr, h) = serve_chunked(STATUS_200, b"Result: 1 out of 1 records added", 64 * MIB);
         let err = eqsl_at(addr).upload_adif(RECORD).await.unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == UPLOAD_MAX_BODY_BYTES),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == UPLOAD_MAX_BODY_BYTES),
             "got {err:?}"
         );
         let s = served(h).await;
@@ -1084,7 +1080,7 @@ mod tests {
     async fn eqsl_error_body_is_bounded() {
         let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
         let err = eqsl_at(addr).upload_adif(RECORD).await.unwrap_err();
-        let DxError::Upload { message: msg, .. } = err else {
+        let DxErrorInner::Upload { message: msg, .. } = err.kind() else {
             panic!("expected ExternalService, got {err:?}");
         };
         assert!(msg.starts_with("eQSL upload failed: HTTP 500"), "{msg}");
@@ -1183,7 +1179,7 @@ mod tests {
             err.upload_failure_class(),
             UploadFailureClass::LoginRejected
         );
-        assert!(matches!(err, DxError::Upload { .. }));
+        assert!(matches!(err.kind(), DxErrorInner::Upload { .. }));
     }
 
     #[test]
@@ -1207,10 +1203,10 @@ mod tests {
     #[test]
     fn unrecognised_responses_are_transient() {
         let qrz = parse_qrz_response("FOO=BAR").unwrap_err();
-        assert!(matches!(qrz, DxError::Parse(_)));
+        assert!(matches!(qrz.kind(), DxErrorInner::Parse(_)));
         assert_eq!(qrz.upload_failure_class(), UploadFailureClass::Transient);
         let eqsl = parse_eqsl_response("<html>maintenance</html>").unwrap_err();
-        assert!(matches!(eqsl, DxError::Parse(_)));
+        assert!(matches!(eqsl.kind(), DxErrorInner::Parse(_)));
         assert_eq!(eqsl.upload_failure_class(), UploadFailureClass::Transient);
     }
 
@@ -1221,7 +1217,7 @@ mod tests {
             l.local_addr().unwrap()
         };
         let err = clublog_at(dead).upload_adif(RECORD).await.unwrap_err();
-        assert!(matches!(err, DxError::Network(_)), "{err:?}");
+        assert!(matches!(err.kind(), DxErrorInner::Network(_)), "{err:?}");
         assert_eq!(err.upload_failure_class(), UploadFailureClass::Transient);
     }
 
@@ -1266,15 +1262,15 @@ mod tests {
 
     #[test]
     fn upload_failure_text_drops_the_variant_prefix() {
-        let err = DxError::Upload {
+        let err = DxError::from(DxErrorInner::Upload {
             class: UploadFailureClass::RecordRejected,
             message: "ClubLog upload failed: HTTP 400 Bad Request — nope".to_string(),
-        };
+        });
         assert_eq!(
             err.upload_failure_text(),
             "ClubLog upload failed: HTTP 400 Bad Request — nope"
         );
-        let parse = DxError::Parse("x".to_string());
+        let parse = DxError::from(DxErrorInner::Parse("x".to_string()));
         assert_eq!(parse.upload_failure_text(), parse.to_string());
     }
 }

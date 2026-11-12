@@ -126,3 +126,6 @@ ft2 = ["pancetta-ft8/ft2"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
+
+[lints]
+workspace = true

@@ -36,3 +36,6 @@ rand = "0.10"
 [[example]]
 name = "ft8_pipeline_demo"
 required-features = []
+
+[lints]
+workspace = true
