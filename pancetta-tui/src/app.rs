@@ -537,6 +537,10 @@ pub struct DxStation {
     /// `CallStation` command so the QSO layer can reply on the opposite
     /// parity.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// PAN-287: the spot's radio frequency in Hz (dial + audio offset), from the
+    /// DX cluster or cqdx. `None` for rows only ever decoded locally. The Space
+    /// spot-call path reads this — never `frequency`, whose unit differs by source.
+    pub spot_rf_hz: Option<u64>,
     /// DX watchlist (#197): true while this callsign is currently
     /// remembered as a heard-but-not-pounced-on PerBandDxccNew+/Atno CQ.
     /// Bulk-resynced each autonomous tick via `apply_dx_watchlist` — never
@@ -1353,6 +1357,11 @@ impl ActivePanel {
 /// - [`SpaceAction::Call`] when nothing directed-at-us is on record for the
 ///   callsign (a pure CQer, or a DX-cluster spot we've never heard call us).
 ///   This is the historical Space behavior — answer their CQ with our grid.
+/// - [`SpaceAction::CallSpot`] (PAN-287) when the focused row is a DX Hunter
+///   network spot (cluster/cqdx, never heard locally): the coordinator QSYs
+///   the rig to the spot's standard dial first, then calls at its offset.
+/// - [`SpaceAction::Refused`] (PAN-287) when that spot cannot be called in
+///   the active mode; the message is the status line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpaceAction {
     /// Answer a CQ / start a fresh contact at the grid step. Carries the
@@ -1372,6 +1381,20 @@ pub enum SpaceAction {
         step: pancetta_core::ResponseStep,
         snr: Option<f32>,
     },
+    /// PAN-287: call a network spot (cluster/cqdx row never heard locally) at its
+    /// standard dial; the coordinator QSYs first when the dial differs.
+    CallSpot {
+        callsign: String,
+        /// Band name from the operator's band list (status lines).
+        band: String,
+        /// Standard FT8/FT4 dial for the spot, in Hz.
+        dial_hz: u64,
+        /// `spot RF − dial` when it lies in 200-2900 Hz; `None` = the
+        /// frequency allocator picks.
+        audio_offset_hz: Option<u64>,
+    },
+    /// PAN-287: Space did nothing; `message` is the status line explaining why.
+    Refused { message: String },
 }
 
 /// A per-band snapshot stashed on band switch and restored when the operator
@@ -2520,6 +2543,7 @@ impl App {
                             last_seen_network: None,
                             audio_offset_hz: Some(audio_offset_hz),
                             slot_parity: message.slot_parity,
+                            spot_rf_hz: None,
                             watchlisted: false,
                             pinned: false,
                         },
@@ -2984,48 +3008,14 @@ impl App {
         let band = &self.config.bands.bands[self.current_band_index];
         let band_name = band.name.clone();
         // Mode-aware dial resolution (closes the manual-band-change gap
-        // documented for FT4 mode). FT8 → the TUI's own band table
-        // (unchanged). FT4 → `Band::dial_for(true)`, the same call the
-        // autonomous ChangeBand handler already uses; falls back to the FT8
-        // frequency (with a status note) on a band with no standard FT4
-        // sub-band. FT2 → no standard dial-frequency table exists yet (FT2
-        // remains blocked on the operator resolving two incompatible spec
-        // candidates); falls back to FT8 with a status note.
-        let core_band =
-            pancetta_core::Band::from_frequency((band.ft8_frequency * 1_000_000.0) as u64);
-        let (dial, operating_frequency, fallback_note) = match self.station_info.mode.as_str() {
-            "FT4" => match core_band.and_then(|b| b.dial_for(true)) {
-                Some(hz) => (hz, hz as f64 / 1_000_000.0, None),
-                None => {
-                    let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
-                    (
-                        ft8_dial,
-                        ft8_dial as f64 / 1_000_000.0,
-                        Some(format!(
-                            "{} has no standard FT4 frequency — using FT8 dial",
-                            band_name
-                        )),
-                    )
-                }
-            },
-            "FT2" => {
-                let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
-                (
-                    ft8_dial,
-                    ft8_dial as f64 / 1_000_000.0,
-                    Some("FT2 dial frequencies not yet defined — using FT8 dial".to_string()),
-                )
-            }
-            // FT8 (default): assign the band's own frequency directly — no
-            // u64-Hz round-trip — so this arm stays byte-identical to the
-            // pre-Task-11 code (`operating_frequency = band.ft8_frequency`)
-            // for any config, including a non-round-MHz custom band value.
-            _ => (
-                (band.ft8_frequency * 1_000_000.0) as u64,
-                band.ft8_frequency,
-                None,
-            ),
-        };
+        // documented for FT4 mode). One function, shared with the Space
+        // spot-call path (PAN-287), so band keys and spot QSYs land on
+        // identical dials; its doc comment explains the FT4/FT2 fallbacks.
+        let crate::spot_call::StandardDial {
+            dial_hz: dial,
+            operating_mhz: operating_frequency,
+            fallback_note,
+        } = crate::spot_call::standard_dial(band, &self.station_info.mode);
         self.station_info.operating_frequency = operating_frequency;
         let base_status = match fallback_note {
             Some(note) => format!(
@@ -3455,6 +3445,9 @@ impl App {
             last_seen_network: None,
             audio_offset_hz: None,
             slot_parity: None,
+            // PAN-287: the cluster spot's RF (its one production caller,
+            // `tui_runner`'s DxSpot arm, passes Hz). Space reads this.
+            spot_rf_hz: (freq.is_finite() && freq > 0.0).then(|| freq.round() as u64),
             watchlisted: false,
             pinned: false,
         };
@@ -3980,16 +3973,17 @@ impl App {
                 // Walk the SAME ordering the renderer draws (needed-first,
                 // priority desc, then snr/freq/call tiebreaks) so the
                 // highlighted row is exactly the Space call-target.
-                let displayed = self.displayed_dx_stations();
-                let station = displayed.get(self.dx_hunter_scroll)?;
+                let station = self.selected_dx_hunter_row()?;
                 if station.call_sign.is_empty() {
                     return None;
                 }
                 // Local decodes carry the audio offset where we actually
-                // heard the station — reply there. Network-only DX-cluster
-                // spots have no passband info, so fall back to the FT8
-                // calling convention (1500 Hz); tuning is then the
-                // operator's job. Slot parity is `Some` only for local
+                // heard the station — reply there. Space on a network spot
+                // (no local offset, a known `spot_rf_hz`) never reaches this
+                // value: `resolve_space_action` returns `CallSpot` first, and
+                // the coordinator QSYs and derives the offset (PAN-287). The
+                // 1500 Hz fallback remains only for a row with neither field
+                // (test fixtures). Slot parity is `Some` only for local
                 // decodes (network spots can't tell us the slot).
                 let audio_hz = station.audio_offset_hz.unwrap_or(1500);
                 Some((station.call_sign.clone(), audio_hz, station.slot_parity))
@@ -4008,6 +4002,49 @@ impl App {
                 Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             _ => None,
+        }
+    }
+
+    /// The DX Hunter row under the cursor, walking the SAME ordering the
+    /// renderer draws (needed-first, priority desc, then snr/freq/call
+    /// tiebreaks). Shared by `get_selected_station` and the Space spot-call
+    /// branch of `resolve_space_action`.
+    pub fn selected_dx_hunter_row(&self) -> Option<&DxStation> {
+        self.displayed_dx_stations()
+            .get(self.dx_hunter_scroll)
+            .copied()
+    }
+
+    /// PAN-287: the coordinator commanded a spot-call QSY to `dial_hz`
+    /// (`TuiMessage::SpotQsy`). Follow it: when the dial lies on a different
+    /// band of the operator's band list, switch the TUI's band exactly like a
+    /// band key (stash and clear the live lists, restore a fresh cache);
+    /// otherwise only the operating frequency moves.
+    pub fn apply_spot_qsy(&mut self, dial_hz: u64) {
+        let mhz = dial_hz as f64 / 1_000_000.0;
+        let target = self
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.frequency_range.0 <= mhz && mhz <= b.frequency_range.1);
+        match target {
+            Some(idx) if idx != self.current_band_index => {
+                let old_band = self
+                    .config
+                    .bands
+                    .bands
+                    .get(self.current_band_index)
+                    .map(|b| b.name.clone());
+                self.current_band_index = idx;
+                self.apply_band_selection(old_band);
+                // The band's standard dial and the commanded dial agree for
+                // the active mode; keep the commanded value authoritative.
+                self.station_info.operating_frequency = mhz;
+            }
+            _ => {
+                self.station_info.operating_frequency = mhz;
+            }
         }
     }
 
@@ -4044,9 +4081,15 @@ impl App {
     ///   [`classify_caller_reply`] logic the Callers panel uses and return
     ///   [`SpaceAction::Reply`] at that smart-default step (their `RR73` → we
     ///   send `73`, their grid → we send our report, etc.).
-    /// - Otherwise (a pure CQer, or a DX-cluster spot we've never heard call
-    ///   us) return [`SpaceAction::Call`] — the historical Space behavior of
-    ///   answering their CQ at the grid step.
+    /// - PAN-287: if the focused row is the DX Hunter cursor row and it is a
+    ///   network spot (no local `audio_offset_hz`, a known `spot_rf_hz`),
+    ///   return [`SpaceAction::CallSpot`] with the spot's standard dial and
+    ///   derived offset from [`crate::spot_call::resolve_spot_call`], or
+    ///   [`SpaceAction::Refused`] with the refusal's status line. The
+    ///   coordinator QSYs the rig there before calling.
+    /// - Otherwise (a pure CQer, or a station heard locally) return
+    ///   [`SpaceAction::Call`] — the historical Space behavior of answering
+    ///   their CQ at the grid step on the current dial.
     /// - **Fix round 2 (operator-confirmed 2026-07-03):** if neither of the
     ///   above applies (no directed-at-us reply pending) AND the focused
     ///   callsign already has a live QSO ([`Self::is_engaged`]), Space must
@@ -4095,6 +4138,36 @@ impl App {
         // operator-facing message.
         if self.is_engaged(&callsign) {
             return None;
+        }
+
+        // PAN-287: a DX Hunter network spot (never heard locally) is called at
+        // its own standard dial and offset, not at 1500 Hz on whatever dial
+        // the rig happens to be on.
+        if self.active_panel == ActivePanel::DxHunter {
+            if let Some(row) = self
+                .selected_dx_hunter_row()
+                .filter(|r| pancetta_core::callsign::callsigns_match(&r.call_sign, &callsign))
+            {
+                if let (None, Some(rf)) = (row.audio_offset_hz, row.spot_rf_hz) {
+                    return Some(
+                        match crate::spot_call::resolve_spot_call(
+                            rf,
+                            &self.station_info.mode,
+                            &self.config.bands.bands,
+                        ) {
+                            Ok(t) => SpaceAction::CallSpot {
+                                callsign,
+                                band: t.band_name,
+                                dial_hz: t.dial_hz,
+                                audio_offset_hz: t.audio_offset_hz,
+                            },
+                            Err(r) => SpaceAction::Refused {
+                                message: r.status_line(&callsign),
+                            },
+                        },
+                    );
+                }
+            }
         }
 
         let (frequency, dx_parity) = self
@@ -4690,6 +4763,7 @@ impl App {
                     // Network spots carry no passband / slot information.
                     audio_offset_hz: None,
                     slot_parity: None,
+                    spot_rf_hz: Some(spot.frequency_hz),
                     watchlisted: false,
                     pinned: false,
                 });
@@ -4706,6 +4780,8 @@ impl App {
             entry.confidence = Some(spot.confidence);
             entry.best_snr_network = spot.best_snr;
             entry.last_seen_network = Some(spot.last_seen);
+            // PAN-287: keep the spot RF current (the DX can move).
+            entry.spot_rf_hz = Some(spot.frequency_hz);
             // cqdx is authoritative for needs; keep them current each tick.
             entry.needed = spot.needed;
             entry.atno = spot.atno;
@@ -7762,6 +7838,7 @@ mod tests {
                 last_seen_network: None,
                 audio_offset_hz: None,
                 slot_parity: None,
+                spot_rf_hz: None,
                 watchlisted: false,
                 pinned: false,
             },
@@ -7928,6 +8005,7 @@ mod tests {
             last_seen_network: None,
             audio_offset_hz: Some(1200),
             slot_parity: None,
+            spot_rf_hz: None,
             watchlisted: false,
             pinned: false,
         }
@@ -8107,18 +8185,258 @@ mod tests {
         assert_eq!(freq, 871, "local audio offset must be preserved, not 1500");
     }
 
+    /// A row with neither a local audio offset nor a spot RF (only test
+    /// fixtures build one) keeps the legacy 1500 Hz fallback inside
+    /// `get_selected_station`. Real network spots never reach it from Space:
+    /// they carry `spot_rf_hz` and resolve to `SpaceAction::CallSpot` (PAN-287).
     #[tokio::test]
-    async fn get_selected_station_network_spot_defaults_to_1500() {
+    async fn get_selected_station_row_without_rf_or_offset_defaults_to_1500() {
         let mut app = fixture_app().await;
         app.active_panel = ActivePanel::DxHunter;
         let mut net = dx_fixture("NETONLY", 100, 10, 14.074, false);
         net.source = SpotSource::Network;
-        net.audio_offset_hz = None; // network spots carry no passband info
+        net.audio_offset_hz = None;
+        net.spot_rf_hz = None;
         app.dx_stations.insert("NETONLY".into(), net);
 
         app.dx_hunter_scroll = 0;
         let (_, freq, _) = app.get_selected_station().unwrap();
-        assert_eq!(freq, 1500, "network-only spot falls back to 1500 Hz");
+        assert_eq!(
+            freq, 1500,
+            "row with no RF and no offset falls back to 1500 Hz"
+        );
+    }
+
+    /// PAN-287: Space on a network spot resolves the spot's standard dial and
+    /// derived audio offset instead of 1500 Hz on the current dial.
+    #[tokio::test]
+    async fn space_on_network_spot_resolves_dial_and_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut net = dx_fixture("NETONLY", 100, 10, 14.075, false);
+        net.source = SpotSource::Network;
+        net.audio_offset_hz = None; // network spots carry no passband info
+        net.spot_rf_hz = Some(14_075_210);
+        app.dx_stations.insert("NETONLY".into(), net);
+        app.dx_hunter_scroll = 0;
+
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "NETONLY".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: Some(1210),
+            })
+        );
+    }
+
+    /// PAN-287 scenario 1: rig on 40 m, a 20 m cluster spot (through the
+    /// production `add_dx_spot` path) targets the 20 m dial at its offset.
+    #[tokio::test]
+    async fn space_on_cluster_spot_with_rig_on_40m_targets_20m() {
+        let mut app = fixture_app().await;
+        app.update_frequency(7_074_000);
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_075_210.0,
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "ZL1ABC".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: Some(1210),
+            })
+        );
+    }
+
+    /// PAN-287 scenario 2: a dial-only cluster spot has no offset, so the
+    /// coordinator's frequency allocator picks it.
+    #[tokio::test]
+    async fn space_on_dial_only_spot_has_no_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_074_000.0,
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "ZL1ABC".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: None,
+            })
+        );
+    }
+
+    /// PAN-287: a CW cluster spot is refused with a status line; nothing to
+    /// call.
+    #[tokio::test]
+    async fn space_on_cw_cluster_spot_is_refused() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_025_000.0,
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::Refused {
+                message: "Can't call ZL1ABC — spot 14.0250 MHz is not on the 20M FT8 sub-band"
+                    .to_string(),
+            })
+        );
+    }
+
+    /// PAN-287: a row we heard locally keeps today's behaviour exactly — the
+    /// call goes out at the heard offset on the current dial.
+    #[tokio::test]
+    async fn space_on_locally_heard_row_still_calls_at_heard_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut row = dx_fixture("VK9XX", 100, 10, 14.074, false);
+        row.audio_offset_hz = Some(750);
+        row.spot_rf_hz = Some(14_075_210);
+        app.dx_stations.insert("VK9XX".into(), row);
+        app.dx_hunter_scroll = 0;
+        match app.resolve_space_action() {
+            Some(SpaceAction::Call {
+                callsign,
+                frequency,
+                ..
+            }) => {
+                assert_eq!(callsign, "VK9XX");
+                assert_eq!(frequency, 750);
+            }
+            other => panic!("expected Call at the heard offset, got {other:?}"),
+        }
+    }
+
+    /// PAN-287: the coordinator's SpotQsy moves the TUI to the spot's band
+    /// exactly like a band key (live lists stashed and cleared).
+    #[tokio::test]
+    async fn apply_spot_qsy_switches_band_and_clears_lists() {
+        let mut app = fixture_app().await;
+        let forty = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "40M")
+            .unwrap();
+        app.current_band_index = forty;
+        app.station_info.operating_frequency = 7.074;
+        app.dx_stations
+            .insert("OLDBAND".into(), dx_fixture("OLDBAND", 10, 0, 7.074, false));
+
+        app.apply_spot_qsy(14_074_000);
+
+        assert_eq!(
+            app.config.bands.bands[app.current_band_index].name, "20M",
+            "band follows the commanded dial"
+        );
+        assert_eq!(app.station_info.operating_frequency, 14.074);
+        assert!(
+            !app.dx_stations.contains_key("OLDBAND"),
+            "old band's DX list is stashed, not shown on the new band"
+        );
+    }
+
+    /// PAN-287: a QSY inside the current band only moves the dial; the lists
+    /// stay.
+    #[tokio::test]
+    async fn apply_spot_qsy_same_band_only_updates_dial() {
+        let mut app = fixture_app().await;
+        let twenty = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "20M")
+            .unwrap();
+        app.current_band_index = twenty;
+        app.station_info.operating_frequency = 14.074;
+        app.dx_stations
+            .insert("KEEP".into(), dx_fixture("KEEP", 10, 0, 14.074, false));
+
+        app.apply_spot_qsy(14_080_000);
+
+        assert_eq!(app.current_band_index, twenty);
+        assert_eq!(app.station_info.operating_frequency, 14.08);
+        assert!(app.dx_stations.contains_key("KEEP"));
+    }
+
+    /// PAN-287: a cluster spot records its RF (Hz) for the Space path.
+    #[tokio::test]
+    async fn add_dx_spot_records_spot_rf_hz() {
+        let mut app = fixture_app().await;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_075_210.0,
+            "FT8".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_210));
+    }
+
+    /// PAN-287: a cqdx spot records its RF on insert and keeps it current on
+    /// every update.
+    #[tokio::test]
+    async fn merge_spot_groups_records_spot_rf_hz() {
+        let mut app = fixture_app().await;
+        let mut spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "ZL1ABC".into(),
+            band: "20m".into(),
+            mode: "FT8".into(),
+            frequency_hz: 14_075_210,
+            grid: None,
+            rarity_tier: "common".into(),
+            reporter_count: 1,
+            best_snr: Some(-7),
+            confidence: 0.9,
+            first_seen: Utc::now().timestamp(),
+            last_seen: Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "New Zealand".into(),
+            needed: false,
+            atno: false,
+        };
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_210));
+        spot.frequency_hz = 14_075_400;
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_400));
     }
 
     /// Real on-air regression (2026-07-25): OM5NU decoded consistently at

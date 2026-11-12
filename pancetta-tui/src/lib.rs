@@ -42,6 +42,7 @@ pub mod dx_reason;
 pub mod keymap;
 mod presentation;
 pub mod readiness;
+pub mod spot_call;
 pub mod tui_runner;
 pub mod ui;
 pub mod upload_status;

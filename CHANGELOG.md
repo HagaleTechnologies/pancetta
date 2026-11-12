@@ -42,7 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-260: Preserve autonomous duplicate protection across restarts and audio-offset changes. Load dated worked history for every band so band switches show and rank prior contacts correctly. Refuse automatic calls when required history is unavailable.
 - Hound mode now follows the WSJT-X Fox/Hound convention (PAN-259). The Hound calls at 1000-2700 Hz, sends its R-report at the Fox's own offset when the Fox reports it, and logs on the Fox's RR73 without sending 73. The `[hound]` defaults are now `call` 1000-2700 Hz and `response` 300-900 Hz; configs that set the old inverted values explicitly must update them (see `docs/CONFIG.md`).
 - `pancetta-ft8` decodes DXpedition (type 0.1) frames in the WSJT-X layout: two Hound calls, the Fox's 10-bit call hash and a 5-bit report. `K1ABC RR73; W9XYZ <KH1/KH7Z> -08` now yields RR73 to K1ABC and -08 to W9XYZ from the Fox; an unknown or collided Fox hash yields no QSO action. The new `Ft8Encoder::encode_dxpedition_contacts` replaces `encode_dxpedition`, which is deprecated and now returns an error (PAN-259).
+- PAN-287: A manual call parked for the other TX window on the old band is now dropped on a band change, with `Queued call to <call> dropped — band changed`. Before, it could promote and transmit on the new band.
 - Remote clients can no longer retune the rig while it transmits, or move a local or autonomous QSO; the client receives an error saying why (PAN-252).
+
+### Changed
+
+- PAN-287: Space on a DX Hunter cluster or cqdx spot (a row never heard locally) now QSYs the rig to the spot's standard FT8/FT4 dial and calls at the spot's audio offset (`spot RF − dial`). A spot with no usable offset (outside 200-2900 Hz, such as a dial-only `14074.0` spot) calls at the frequency allocator's offset. While a frame is airing, the QSY and the call wait for PTT-off, for at most 30 s. Space refuses, with a status line, a spot off the active mode's sub-band, FT2 mode, a band not in your band list, a QSY across a QSO whose partner has answered, and a QSY with no rig control. With `rig.data_mode` set, the rig's data mode is reapplied after the QSY (PAN-276); otherwise the mode is left as is. Any dial change pancetta commands (band keys, Shift+F, spot QSY) now clears the allocator's old-band spectral data, so TX Placement is empty until the new dial's first snapshot.
 
 
 ### Removed

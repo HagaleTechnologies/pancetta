@@ -831,6 +831,7 @@ pub(in crate::ui) mod tests {
                 last_seen_network: None,
                 audio_offset_hz: Some(1200),
                 slot_parity: None,
+                spot_rf_hz: None,
                 watchlisted: false,
                 pinned: false,
             },
