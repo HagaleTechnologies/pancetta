@@ -697,6 +697,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the only safe correlation key for upload state
+    /// (PAN-344); repeated callsigns stay independent.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed").
@@ -1485,6 +1488,14 @@ pub struct App {
     /// Scroll cursor into `recent_qsos` while the overlay is open. Same
     /// semantics as `diagnostics_scroll`.
     pub recent_qsos_scroll: usize,
+    /// PAN-344: latest per-QSO upload statuses, merged by UUID and revision
+    /// from the relay's full bounded snapshots (2 s health tick). Bounded to
+    /// 100 entries; rows look their UUID up here.
+    pub qso_uploads: Vec<crate::upload_status::QsoUploadStatus>,
+    /// PAN-344: the typed completion toast, owned by a QSO UUID. Rendered
+    /// through the status-text slot (after compose precedence) so periodic
+    /// component status updates cannot erase it.
+    pub completion_toast: Option<crate::upload_status::CompletionToast>,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
     /// from the diagnostic-event stream that already flows — no new bus
     /// message — by matching the exact completion text the coordinator
@@ -1888,6 +1899,8 @@ impl App {
             why_scroll: 0,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
+            qso_uploads: Vec::new(),
+            completion_toast: None,
             session_completed: 0,
             session_failed: 0,
             session_tx_drops: 0,
@@ -3547,6 +3560,21 @@ impl App {
     /// behavior (Task 3: the Recent-QSOs panel).
     pub fn push_recent_qso_outcome(&mut self, outcome: RecentQsoOutcome) {
         const MAX_RECENT_QSOS: usize = 50;
+        // PAN-344: only a COMPLETED terminal outcome owns the toast; a
+        // failed QSO never gets a "logged" wording.
+        if matches!(outcome.outcome, QsoOutcome::Completed) {
+            let status = self
+                .qso_uploads
+                .iter()
+                .find(|s| s.uuid == outcome.qso_uuid)
+                .cloned();
+            self.completion_toast = Some(crate::upload_status::CompletionToast::start(
+                &outcome.qso_uuid,
+                &outcome.callsign,
+                status.as_ref(),
+                chrono::Utc::now(),
+            ));
+        }
         let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
         self.recent_qsos.push_back(outcome);
         while self.recent_qsos.len() > MAX_RECENT_QSOS {
@@ -3555,6 +3583,61 @@ impl App {
         if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
             self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
+    }
+
+    /// PAN-344: merge one relayed upload-status snapshot batch. Full
+    /// snapshots arrive repeatedly, so correctness never relies on an
+    /// individual best-effort transition: each entry merges by UUID and only
+    /// a monotonic revision (>= current) replaces known state, and a missing
+    /// entry never erases a known row result. Entries arriving before their
+    /// row are retained here (bounded) so the row can match later.
+    pub fn apply_qso_upload_statuses(
+        &mut self,
+        statuses: Vec<crate::upload_status::QsoUploadStatus>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        const MAX_UPLOAD_STATUSES: usize = 100;
+        for status in statuses {
+            match self.qso_uploads.iter_mut().find(|e| e.uuid == status.uuid) {
+                Some(entry) => {
+                    if status.revision >= entry.revision {
+                        *entry = status.clone();
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    self.qso_uploads.push(status.clone());
+                    while self.qso_uploads.len() > MAX_UPLOAD_STATUSES {
+                        // Preserve status for every visible row, even when late
+                        // results for older registrations arrive afterwards.
+                        let evict = self
+                            .qso_uploads
+                            .iter()
+                            .position(|s| !self.recent_qsos.iter().any(|q| q.qso_uuid == s.uuid))
+                            .unwrap_or(0);
+                        self.qso_uploads.remove(evict);
+                    }
+                }
+            }
+            if let Some(toast) = self.completion_toast.as_mut() {
+                toast.apply_status(&status, now);
+            }
+        }
+    }
+
+    /// The retained upload status for a QSO UUID, if any (PAN-344).
+    pub fn upload_status_for(&self, uuid: &str) -> Option<&crate::upload_status::QsoUploadStatus> {
+        self.qso_uploads.iter().find(|s| s.uuid == uuid)
+    }
+
+    /// The visible completion-toast text, or `None` when no toast is active
+    /// or it has expired (PAN-344).
+    pub fn active_toast_text(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        self.completion_toast
+            .as_ref()
+            .and_then(|t| t.text_at(now))
+            .map(str::to_string)
     }
 
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
@@ -6785,12 +6868,139 @@ mod tests {
     fn fixture_recent_qso(callsign: &str) -> RecentQsoOutcome {
         RecentQsoOutcome {
             callsign: callsign.to_string(),
+            qso_uuid: format!("uuid-{callsign}"),
             outcome: QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
             ts: Utc::now(),
             brief_timeline: vec!["QSO with X logged".to_string()],
         }
+    }
+
+    /// PAN-344 AC3: UUID correlation keeps repeated callsigns independent;
+    /// snapshots arriving in any order converge, and stale (lower-revision)
+    /// snapshots cannot regress accepted results.
+    #[tokio::test]
+    async fn pan344_upload_updates_are_order_independent() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut a = fixture_recent_qso("K1ABC");
+        a.qso_uuid = "u-a".into();
+        let mut b = fixture_recent_qso("K1ABC");
+        b.qso_uuid = "u-b".into();
+        app.push_recent_qso_outcome(a);
+        app.push_recent_qso_outcome(b);
+
+        let now = Utc::now();
+        let accepted = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 2,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::new(
+                    crate::upload_status::UploadState::Accepted,
+                    "accepted",
+                ),
+            )],
+        };
+        let pending = crate::upload_status::QsoUploadStatus {
+            uuid: "u-b".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("retrying"),
+            )],
+        };
+
+        // An early snapshot converges with the normal outcome-first path.
+        let mut early = App::new(Config::default(), None).await.unwrap();
+        early.apply_qso_upload_statuses(vec![accepted.clone()], now);
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-a".into();
+        early.push_recent_qso_outcome(row);
+        assert_eq!(
+            early.active_toast_text(now).as_deref(),
+            Some("K1ABC uploaded")
+        );
+
+        // Reverse arrival order converges to the same display.
+        app.apply_qso_upload_statuses(vec![accepted.clone(), pending.clone()], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            app.upload_status_for("u-b")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Pending)
+        );
+
+        // An older snapshot for u-a cannot regress the accepted result.
+        let stale = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("queued"),
+            )],
+        };
+        app.apply_qso_upload_statuses(vec![stale], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+
+        // A missing snapshot entry never erases a known row result.
+        app.apply_qso_upload_statuses(Vec::new(), now);
+        assert!(app.upload_status_for("u-a").is_some());
+    }
+
+    /// PAN-344 AC6: the App-side upload cache is bounded and does not evict
+    /// the rows' own lookups (row ring stays capped at 50 independently).
+    #[tokio::test]
+    async fn pan344_upload_history_bounds() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let now = Utc::now();
+        for i in 0..120 {
+            let s = crate::upload_status::QsoUploadStatus {
+                uuid: format!("u-{i}"),
+                callsign: format!("N{i}TEST"),
+                revision: 0,
+                targets: vec![(
+                    crate::upload_status::UploadTarget::Qrz,
+                    crate::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            };
+            app.apply_qso_upload_statuses(vec![s], now);
+        }
+        assert!(app.qso_uploads.len() <= 100, "cache bounded at 100");
+        assert!(app.upload_status_for("u-0").is_none(), "oldest evicted");
+        assert!(app.upload_status_for("u-119").is_some(), "newest retained");
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-20".into();
+        app.push_recent_qso_outcome(row);
+        for i in 120..240 {
+            app.apply_qso_upload_statuses(
+                vec![crate::upload_status::QsoUploadStatus {
+                    uuid: format!("u-{i}"),
+                    callsign: "K1ABC".into(),
+                    revision: 0,
+                    targets: vec![],
+                }],
+                now,
+            );
+        }
+        assert!(
+            app.upload_status_for("u-20").is_some(),
+            "visible row survives late unrelated statuses"
+        );
     }
 
     /// docs/observability-diagnostics-plan.md Layer 2 (Recent-QSOs panel):

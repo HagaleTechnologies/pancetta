@@ -459,6 +459,22 @@ and say nothing about any one station. The strip chip and the Why text carry
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
 
+## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
+
+Each Recent-QSOs row shows one glyph cell per enabled upload target in
+fixed order Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW
+(✓ accepted, ~ pending, × rejected, ! failed, ? unknown), with per-target
+state and reason on the selected-contact Station card. The card follows the
+overlay cursor's QSO UUID, never the live focused station, so an older
+contact's results are never attributed to a same-callsign live station.
+The completion toast is typed App state ("{call} logged · uploads queued"
+until every explicitly accepted target yields "{call} uploaded"); compose
+input outranks it and ordinary status text returns on expiry. Acceptance is
+only ever an explicit service result — an empty captured target set renders
+"uploads off", a missing result renders "?", and colour supplements glyphs.
+History is session-only: the coordinator retains the last 100 completion
+registrations and the TUI mirrors them; a restart invents no accepted
+history.
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
 
 `pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.

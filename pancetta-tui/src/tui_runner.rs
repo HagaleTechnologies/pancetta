@@ -180,6 +180,11 @@ pub enum TuiMessage {
     /// appended to `App`'s own bounded ring (`App::recent_qsos`), separate
     /// from `diagnostic_events`.
     RecentQsoOutcome(crate::app::RecentQsoOutcome),
+    /// PAN-344: full bounded snapshot of per-QSO upload statuses, relayed on
+    /// the coordinator's existing 2 s health tick. Sent repeatedly so
+    /// correctness never relies on an individual best-effort transition;
+    /// merged by UUID and revision in `App::apply_qso_upload_statuses`.
+    QsoUploadStatuses(Vec<crate::upload_status::QsoUploadStatus>),
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate {
         rows: Vec<Vec<f32>>,
@@ -1121,6 +1126,9 @@ impl TuiRunner {
             }
             TuiMessage::RecentQsoOutcome(outcome) => {
                 app.push_recent_qso_outcome(outcome);
+            }
+            TuiMessage::QsoUploadStatuses(statuses) => {
+                app.apply_qso_upload_statuses(statuses, chrono::Utc::now());
             }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
@@ -5581,6 +5589,7 @@ mod key_tests {
 
         r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -5595,6 +5604,7 @@ mod key_tests {
         for i in 0..60 {
             r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
                 callsign: format!("N{i}TEST"),
+                qso_uuid: format!("u-{i}"),
                 outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
                 last_state: "Failed".to_string(),
                 freq_hz: 1500,
@@ -5612,6 +5622,166 @@ mod key_tests {
             recent.recent_qsos.len()
         );
         assert!(!recent.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
+    }
+
+    /// PAN-344 AC8: upload snapshots feed the toast without touching the
+    /// session counters or the readiness strip, and ordinary status updates
+    /// cannot erase the toast (only compose input outranks it).
+    #[tokio::test]
+    async fn pan344_upload_updates_preserve_counters_and_readiness() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
+            qso_id: Some("u-1".into()),
+            callsign: Some("K1ABC".to_string()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.read().await.session_completed, 1);
+
+        r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: "u-1".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["QSO with K1ABC logged".to_string()],
+        }))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(
+                a.active_toast_text(chrono::Utc::now()).as_deref(),
+                Some("K1ABC logged \u{b7} uploads queued")
+            );
+        }
+
+        // An ordinary status update must not erase the typed toast.
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "dsp".into(),
+            status: "decoding".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read()
+                .await
+                .active_toast_text(chrono::Utc::now())
+                .as_deref(),
+            Some("K1ABC logged \u{b7} uploads queued")
+        );
+
+        // A readiness snapshot stays untouched by upload updates.
+        let readiness_before = app.read().await.station_readiness.clone();
+
+        let accepted = crate::upload_status::QsoUploadStatus {
+            uuid: "u-1".to_string(),
+            callsign: "K1ABC".to_string(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::new(
+                    crate::upload_status::UploadState::Accepted,
+                    "accepted",
+                ),
+            )],
+        };
+        r.handle_message(TuiMessage::QsoUploadStatuses(vec![accepted]))
+            .await
+            .unwrap();
+
+        let a = app.read().await;
+        assert_eq!(
+            a.active_toast_text(chrono::Utc::now()).as_deref(),
+            Some("K1ABC uploaded"),
+            "all-accepted transitions the toast in place"
+        );
+        assert_eq!(
+            a.session_completed, 1,
+            "upload updates never count as completions"
+        );
+        assert_eq!(
+            a.station_readiness, readiness_before,
+            "upload updates never remove readiness warnings"
+        );
+    }
+
+    /// PAN-344 AC7: scrolling the Recent-QSOs selection moves only the
+    /// overlay cursor — the live station focus is untouched, and closing
+    /// the overlay leaves it alone too.
+    #[tokio::test]
+    async fn pan344_recent_selection_leaves_live_focus_unchanged() {
+        use crate::app::DecodedMessageView;
+        use pancetta_core::slot::SlotParity;
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.decoded_messages.push_back(DecodedMessageView {
+                timestamp: chrono::Utc::now(),
+                frequency: 14.074,
+                mode: "FT8".to_string(),
+                snr: -3,
+                delta_time: 0.0,
+                delta_freq: 1500.0,
+                call_sign: Some("JA1ABC".to_string()),
+                grid_square: Some("FN42".to_string()),
+                message: "CQ JA1ABC FN42".to_string(),
+                distance: Some(1234.0),
+                bearing: None,
+                slot_parity: Some(SlotParity::Even),
+                is_directed_at_us: false,
+                worked_before: false,
+                needed: false,
+                atno: false,
+                band_needed: false,
+                priority_score: None,
+                priority_factors: None,
+                is_own_tx: false,
+            });
+            for i in 0..2 {
+                a.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+                    callsign: format!("N{i}TEST"),
+                    qso_uuid: format!("u-{i}"),
+                    outcome: crate::app::QsoOutcome::Completed,
+                    last_state: "Completed".to_string(),
+                    freq_hz: 14075000,
+                    ts: chrono::Utc::now(),
+                    brief_timeline: vec!["Completed".to_string()],
+                });
+            }
+            a.show_recent_qsos = true;
+            a.recent_qsos_scroll = 1;
+        }
+        let focus_before = app.read().await.focused_callsign().clone();
+
+        r.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(a.recent_qsos_scroll, 0, "selection cursor moved up");
+            assert_eq!(a.focused_callsign(), focus_before, "live focus unchanged");
+        }
+
+        r.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+        {
+            let a = app.read().await;
+            assert_eq!(a.recent_qsos_scroll, 1);
+            assert_eq!(a.focused_callsign(), focus_before, "live focus unchanged");
+        }
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the

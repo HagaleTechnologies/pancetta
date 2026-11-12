@@ -411,6 +411,7 @@ fn rich_fixture(app: &mut App) {
     for callsign in ["W1AW", "G8KHF"] {
         app.recent_qsos.push_back(crate::app::RecentQsoOutcome {
             callsign: callsign.into(),
+            qso_uuid: format!("u-{callsign}"),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".into(),
             freq_hz: 14_074_000,
