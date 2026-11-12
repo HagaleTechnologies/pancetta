@@ -119,6 +119,8 @@ wiremock = "0.6"
 
 [features]
 default = []
+# Internal real-worker integration support.
+test-harness = []
 # Experimental FT2 digital mode (forwards to pancetta-ft8/ft2). Off by default;
 # when off, a configured FT2 mode falls back to FT8 timing in the coordinator.
 ft2 = ["pancetta-ft8/ft2"]
@@ -126,6 +128,14 @@ ft2 = ["pancetta-ft8/ft2"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
+
+[[test]]
+name = "coord_sim"
+required-features = ["test-harness"]
+
+[[test]]
+name = "tx_ptt_integration"
+required-features = ["test-harness"]
 
 [lints]
 workspace = true
