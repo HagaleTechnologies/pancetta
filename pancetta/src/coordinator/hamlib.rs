@@ -7,6 +7,58 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+const RIGCTLD_STDERR_MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Drain continuously, retaining only a bounded prefix even without newlines.
+/// The file logger uses a nonblocking writer; no queue backpressure is added here.
+fn drain_child_stderr_to_warn(mut stderr: impl std::io::Read + Send + 'static) {
+    fn emit(bytes: &[u8], overflow: usize) {
+        let bytes = if overflow == 0 {
+            bytes.strip_suffix(b"\r").unwrap_or(bytes)
+        } else {
+            bytes
+        };
+        if bytes.is_empty() && overflow == 0 {
+            return;
+        }
+        let line = String::from_utf8_lossy(bytes);
+        if overflow == 0 {
+            warn!(target: "rigctld", "{line}");
+        } else {
+            warn!(target: "rigctld", "{line} [+{overflow} bytes]");
+        }
+    }
+
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::with_capacity(RIGCTLD_STDERR_MAX_LINE_BYTES);
+    let mut overflow = 0usize;
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => {
+                emit(&line, overflow);
+                return;
+            }
+            Ok(count) => {
+                for &byte in &chunk[..count] {
+                    if byte == b'\n' {
+                        emit(&line, overflow);
+                        line.clear();
+                        overflow = 0;
+                    } else if line.len() < RIGCTLD_STDERR_MAX_LINE_BYTES {
+                        line.push(byte);
+                    } else {
+                        overflow = overflow.saturating_add(1);
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(target: "rigctld", "stderr read failed: {error}");
+                return;
+            }
+        }
+    }
+}
+
 // Serialize tests that replace the process-wide external-rigctld address.
 #[cfg(test)]
 static RIGCTLD_TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1953,11 +2005,15 @@ impl super::ApplicationCoordinator {
                         &rigctld_host,
                     ])
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                 {
-                    Ok(child) => {
+                    Ok(mut child) => {
                         info!("rigctld spawned (PID {})", child.id());
+                        if let Some(stderr) = child.stderr.take() {
+                            // Detached reader ends at EOF when the managed child exits.
+                            tokio::task::spawn_blocking(move || drain_child_stderr_to_warn(stderr));
+                        }
                         self.rigctld_process = Some(child);
                         // Give rigctld time to bind the port and open the serial device
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -10772,5 +10828,165 @@ mod pan272_ptt_off_watchdog_tests {
 
         s.rig.set_ptt(Vfo::Current, PttState::Off).await.unwrap();
         c.shutdown_signal.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod rigctld_stderr_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let writer = self.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(true)
+                .with_writer(move || writer.clone())
+                .finish()
+        }
+    }
+
+    fn capture(script: &str) -> String {
+        let output = LogBuffer::default();
+        let _subscriber = tracing::subscriber::set_default(output.subscriber());
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drain_child_stderr_to_warn(child.stderr.take().unwrap());
+        assert!(child.wait().unwrap().success());
+        output.text()
+    }
+
+    #[test]
+    fn stderr_lines_are_logged_at_warn_with_rigctld_prefix() {
+        let logs = capture("printf 'first\\r\\n\\nsecond\\n' >&2");
+        assert_eq!(logs, " WARN rigctld: first\n WARN rigctld: second\n");
+    }
+
+    #[test]
+    fn oversized_lines_are_truncated_and_draining_continues() {
+        let logs = capture("head -c 65536 /dev/zero | tr '\\000' x >&2; printf '\\nnext\\n' >&2");
+        let retained = "x".repeat(RIGCTLD_STDERR_MAX_LINE_BYTES);
+        assert_eq!(
+            logs,
+            format!(" WARN rigctld: {retained} [+57344 bytes]\n WARN rigctld: next\n")
+        );
+    }
+
+    #[test]
+    fn unterminated_final_line_and_invalid_utf8_are_logged() {
+        let logs = capture("printf '\\377\\376\\ntail without newline' >&2");
+        assert_eq!(
+            logs,
+            " WARN rigctld: \u{fffd}\u{fffd}\n WARN rigctld: tail without newline\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_spawn_pipes_rigctld_stderr_into_the_log() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "PAN332_MANAGED_STDERR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "coordinator::hamlib::rigctld_stderr_tests::managed_spawn_pipes_rigctld_stderr_into_the_log", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let output = LogBuffer::default();
+        tracing::subscriber::set_global_default(output.subscriber()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("rigctld");
+        let pid_file = dir.path().join("pid");
+        std::fs::write(&shim, "#!/bin/sh\necho $$ > \"$PAN332_PID_FILE\"\necho 'stdout is discarded'\necho 'open of /dev/ttyUSB0 failed' >&2\nexec sleep 120\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("PAN332_PID_FILE", &pid_file);
+        std::env::remove_var("PANCETTA_MOCK_RIG");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::env::set_var(
+            "RIGCTLD_PORT",
+            listener.local_addr().unwrap().port().to_string(),
+        );
+        std::env::set_var("RIGCTLD_HOST", "127.0.0.1");
+        drop(listener);
+        let mut config = pancetta_config::Config::default();
+        config.rig.interface.enabled = true;
+        config.rig.model = "IC-7300".into();
+        config.rig.interface.port = "/dev/ttyUSB0".into();
+        let mut coordinator = super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Vec::new(),
+            dir.path().join("config.toml"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        coordinator.start_hamlib_component().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output
+                .text()
+                .contains("WARN rigctld: open of /dev/ttyUSB0 failed")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!output.text().contains("stdout is discarded"));
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(coordinator);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // SAFETY: signal 0 only probes whether this shim PID still exists.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
