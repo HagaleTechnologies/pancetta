@@ -977,6 +977,7 @@ pub struct ApplicationCoordinator {
     message_bus: MessageBus,
 
     /// Named component task handles for health monitoring
+    tui_failure: Arc<std::sync::Mutex<Option<String>>>,
     named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
 
     decode_handles: Option<pipeline::DecodePipelineHandles>,
@@ -2427,6 +2428,7 @@ impl ApplicationCoordinator {
             id,
             config,
             message_bus,
+            tui_failure: Arc::new(std::sync::Mutex::new(None)),
             named_task_handles: Vec::new(),
             decode_handles: None,
             restart_budget: RestartBudget::new(),

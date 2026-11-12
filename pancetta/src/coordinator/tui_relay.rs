@@ -3569,12 +3569,14 @@ impl super::ApplicationCoordinator {
 
         // Wrap the JoinHandle and ensure shutdown is triggered when TUI exits
         let tui_shutdown = self.shutdown_signal.clone();
+        let tui_failure = self.tui_failure.clone();
         let tui_wrapper = tokio::spawn(async move {
             let result = match tui_handle.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("TUI task panicked: {}", e)),
             };
+            record_tui_failure(&tui_failure, &result);
             // Always trigger shutdown when TUI exits (user quit, crash, etc.)
             tui_shutdown.store(true, Ordering::Release);
             result
@@ -7693,5 +7695,18 @@ mod tui_relay_tests {
             3,
         )));
         assert!(take_pending_gain_save(&slow, 21_074_000, 3));
+    }
+}
+
+// Store before publishing shutdown, independently of who collects the task handle.
+pub(super) fn record_tui_failure(
+    failure: &std::sync::Mutex<Option<String>>,
+    result: &anyhow::Result<()>,
+) {
+    if let Err(error) = result {
+        failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| format!("{error:#}"));
     }
 }
