@@ -1022,11 +1022,11 @@ dependency is mandatory. The hamlib-off build had been broken since at least
 GitHub #270 (20 errors then, 77 by PAN-331) because no CI lane built it, and
 the default and release builds already included hamlib. Repairing it would
 have kept a second build of the TX-safety code (the PAN-115 hard mute takes a
-`pancetta_hamlib::Vfo`) that nothing ships. CI's `workspace-check` job now
-runs `cargo check -p pancetta --no-default-features`, so the station crate
-stays compiled without its default features. Since PAN-334 removed `metrics`
-the crate has no default features, so that build equals the default one until
-a default feature gains cfg sites. The opt-in `ft2` cfg arms are still built
+`pancetta_hamlib::Vfo`) that nothing ships. PAN-321 removed CI's separate station
+`--no-default-features` check because PAN-334 removed `metrics` and the
+crate's default feature list is empty. The examples build covers the same
+configuration today. If station defaults gain features, restore separate
+no-default coverage. The opt-in `ft2` cfg arms are still built
 by no CI lane. Replay mode still starts no Hamlib, so the "no Hamlib route"
 paths remain.
 
@@ -1045,7 +1045,7 @@ feature: a cfg-gated module forces a cfg at every caller, which is how
 `#[cfg_attr(feature = "serde", ...)]` like every other derive in the crate,
 and `transmit` enables `serde`.
 
-CI's `ft8-tests` job runs `cargo test -p pancetta-ft8` with default features
+CI's consolidated `workspace-check` job runs `cargo test -p pancetta-ft8` with default features
 (the standalone build) and checks `--no-default-features`; the `transmit`
 configuration of every pancetta-ft8 test still runs in `workspace-check`'s
 `--features transmit` test step. The default-features test build had been
@@ -1058,8 +1058,8 @@ Not done here: 16 `pancetta-ft8/tests/` files keep their `transmit` cfg
 gates (whole-file or per-test) although the encoder and modulator they use
 are no longer gated. Removing them touches 16 more files, which would take
 this pull request past the 40-file limit. Those tests still run in
-`workspace-check`'s `--features transmit` step, but the default-features
-`ft8-tests` run skips them. The gate removals are in commit `ceff2c0` on the
+`workspace-check`'s `--features transmit` step, but the standalone default-features
+test invocation skips them. The gate removals are in commit `ceff2c0` on the
 PAN-331 branch.
 
 ## Every listed CLI flag does something (PAN-334, 2026-11-09)
