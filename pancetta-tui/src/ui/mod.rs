@@ -3693,6 +3693,7 @@ mod view_render_tests {
             last_seen_network: None,
             audio_offset_hz: None,
             slot_parity: None,
+            spot_rf_hz: None,
             watchlisted: false,
             pinned: false,
         }
