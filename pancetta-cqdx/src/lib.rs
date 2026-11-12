@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-cqdx
 //!
 //! cqdx.io HTTP client and in-memory cache — entities, spots, and rarity scores.

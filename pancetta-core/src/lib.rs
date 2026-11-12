@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-core
 //!
 //! Shared types, errors, and utilities used by every other crate in the workspace.
