@@ -1,0 +1,1400 @@
+{
+  "source": "https://adif.org/315/ADIF_315_annotated.htm#DXCC_Entity_Code_Enumeration",
+  "parent_reference": "https://www.arrl.org/country-lists-prefixes",
+  "entities": {
+    "1A": {
+      "name": "Sov Mil Order of Malta",
+      "id": 246
+    },
+    "1S": {
+      "name": "Spratly Islands",
+      "id": 247
+    },
+    "3A": {
+      "name": "Monaco",
+      "id": 260
+    },
+    "3B6": {
+      "name": "Agalega & St. Brandon",
+      "id": 4
+    },
+    "3B8": {
+      "name": "Mauritius",
+      "id": 165
+    },
+    "3B9": {
+      "name": "Rodriguez Island",
+      "id": 207
+    },
+    "3C": {
+      "name": "Equatorial Guinea",
+      "id": 49
+    },
+    "3C0": {
+      "name": "Annobon Island",
+      "id": 195
+    },
+    "3D2": {
+      "name": "Fiji",
+      "id": 176
+    },
+    "3D2/C": {
+      "name": "Conway Reef",
+      "id": 489
+    },
+    "3D2/R": {
+      "name": "Rotuma Island",
+      "id": 460
+    },
+    "3DA": {
+      "name": "Kingdom of Eswatini",
+      "id": 468
+    },
+    "3V": {
+      "name": "Tunisia",
+      "id": 474
+    },
+    "3W": {
+      "name": "Vietnam",
+      "id": 293
+    },
+    "3X": {
+      "name": "Guinea",
+      "id": 107
+    },
+    "3Y/B": {
+      "name": "Bouvet",
+      "id": 24
+    },
+    "3Y/P": {
+      "name": "Peter 1 Island",
+      "id": 199
+    },
+    "4J": {
+      "name": "Azerbaijan",
+      "id": 18
+    },
+    "4L": {
+      "name": "Georgia",
+      "id": 75
+    },
+    "4O": {
+      "name": "Montenegro",
+      "id": 514
+    },
+    "4S": {
+      "name": "Sri Lanka",
+      "id": 315
+    },
+    "4U1I": {
+      "name": "ITU HQ",
+      "id": 117
+    },
+    "4U1U": {
+      "name": "United Nations HQ",
+      "id": 289
+    },
+    "4U1V": {
+      "name": "Vienna Intl Ctr",
+      "id": 206,
+      "canonical": "Austria"
+    },
+    "4W": {
+      "name": "Timor - Leste",
+      "id": 511
+    },
+    "4X": {
+      "name": "Israel",
+      "id": 336
+    },
+    "5A": {
+      "name": "Libya",
+      "id": 436
+    },
+    "5B": {
+      "name": "Cyprus",
+      "id": 215
+    },
+    "5H": {
+      "name": "Tanzania",
+      "id": 470
+    },
+    "5N": {
+      "name": "Nigeria",
+      "id": 450
+    },
+    "5R": {
+      "name": "Madagascar",
+      "id": 438
+    },
+    "5T": {
+      "name": "Mauritania",
+      "id": 444
+    },
+    "5U": {
+      "name": "Niger",
+      "id": 187
+    },
+    "5V": {
+      "name": "Togo",
+      "id": 483
+    },
+    "5W": {
+      "name": "Samoa",
+      "id": 190
+    },
+    "5X": {
+      "name": "Uganda",
+      "id": 286
+    },
+    "5Z": {
+      "name": "Kenya",
+      "id": 430
+    },
+    "6W": {
+      "name": "Senegal",
+      "id": 456
+    },
+    "6Y": {
+      "name": "Jamaica",
+      "id": 82
+    },
+    "7O": {
+      "name": "Yemen",
+      "id": 492
+    },
+    "7P": {
+      "name": "Lesotho",
+      "id": 432
+    },
+    "7Q": {
+      "name": "Malawi",
+      "id": 440
+    },
+    "7X": {
+      "name": "Algeria",
+      "id": 400
+    },
+    "8P": {
+      "name": "Barbados",
+      "id": 62
+    },
+    "8Q": {
+      "name": "Maldives",
+      "id": 159
+    },
+    "8R": {
+      "name": "Guyana",
+      "id": 129
+    },
+    "9A": {
+      "name": "Croatia",
+      "id": 497
+    },
+    "9G": {
+      "name": "Ghana",
+      "id": 424
+    },
+    "9H": {
+      "name": "Malta",
+      "id": 257
+    },
+    "9J": {
+      "name": "Zambia",
+      "id": 482
+    },
+    "9K": {
+      "name": "Kuwait",
+      "id": 348
+    },
+    "9L": {
+      "name": "Sierra Leone",
+      "id": 458
+    },
+    "9M2": {
+      "name": "West Malaysia",
+      "id": 299
+    },
+    "9M6": {
+      "name": "East Malaysia",
+      "id": 46
+    },
+    "9N": {
+      "name": "Nepal",
+      "id": 369
+    },
+    "9Q": {
+      "name": "Dem. Rep. of the Congo",
+      "id": 414
+    },
+    "9U": {
+      "name": "Burundi",
+      "id": 404
+    },
+    "9V": {
+      "name": "Singapore",
+      "id": 381
+    },
+    "9X": {
+      "name": "Rwanda",
+      "id": 454
+    },
+    "9Y": {
+      "name": "Trinidad & Tobago",
+      "id": 90
+    },
+    "A2": {
+      "name": "Botswana",
+      "id": 402
+    },
+    "A3": {
+      "name": "Tonga",
+      "id": 160
+    },
+    "A4": {
+      "name": "Oman",
+      "id": 370
+    },
+    "A5": {
+      "name": "Bhutan",
+      "id": 306
+    },
+    "A6": {
+      "name": "United Arab Emirates",
+      "id": 391
+    },
+    "A7": {
+      "name": "Qatar",
+      "id": 376
+    },
+    "A9": {
+      "name": "Bahrain",
+      "id": 304
+    },
+    "AP": {
+      "name": "Pakistan",
+      "id": 372
+    },
+    "BS7": {
+      "name": "Scarborough Reef",
+      "id": 506
+    },
+    "BV": {
+      "name": "Taiwan",
+      "id": 386
+    },
+    "BV9P": {
+      "name": "Pratas Island",
+      "id": 505
+    },
+    "BY": {
+      "name": "China",
+      "id": 318
+    },
+    "C2": {
+      "name": "Nauru",
+      "id": 157
+    },
+    "C3": {
+      "name": "Andorra",
+      "id": 203
+    },
+    "C5": {
+      "name": "The Gambia",
+      "id": 422
+    },
+    "C6": {
+      "name": "Bahamas",
+      "id": 60
+    },
+    "C9": {
+      "name": "Mozambique",
+      "id": 181
+    },
+    "CE": {
+      "name": "Chile",
+      "id": 112
+    },
+    "CE0X": {
+      "name": "San Felix & San Ambrosio",
+      "id": 217
+    },
+    "CE0Y": {
+      "name": "Easter Island",
+      "id": 47
+    },
+    "CE0Z": {
+      "name": "Juan Fernandez Islands",
+      "id": 125
+    },
+    "CE9": {
+      "name": "Antarctica",
+      "id": 13
+    },
+    "CM": {
+      "name": "Cuba",
+      "id": 70
+    },
+    "CN": {
+      "name": "Morocco",
+      "id": 446
+    },
+    "CP": {
+      "name": "Bolivia",
+      "id": 104
+    },
+    "CT": {
+      "name": "Portugal",
+      "id": 272
+    },
+    "CT3": {
+      "name": "Madeira Islands",
+      "id": 256
+    },
+    "CU": {
+      "name": "Azores",
+      "id": 149
+    },
+    "CX": {
+      "name": "Uruguay",
+      "id": 144
+    },
+    "CY0": {
+      "name": "Sable Island",
+      "id": 211
+    },
+    "CY9": {
+      "name": "St. Paul Island",
+      "id": 252
+    },
+    "D2": {
+      "name": "Angola",
+      "id": 401
+    },
+    "D4": {
+      "name": "Cape Verde",
+      "id": 409,
+      "aliases": [
+        "Cabo Verde"
+      ]
+    },
+    "D6": {
+      "name": "Comoros",
+      "id": 411
+    },
+    "DL": {
+      "name": "Fed. Rep. of Germany",
+      "id": 230
+    },
+    "DU": {
+      "name": "Philippines",
+      "id": 375
+    },
+    "E3": {
+      "name": "Eritrea",
+      "id": 51
+    },
+    "E4": {
+      "name": "Palestine",
+      "id": 510
+    },
+    "E5/N": {
+      "name": "North Cook Islands",
+      "id": 191
+    },
+    "E5/S": {
+      "name": "South Cook Islands",
+      "id": 234
+    },
+    "E6": {
+      "name": "Niue",
+      "id": 188
+    },
+    "E7": {
+      "name": "Bosnia-Herzegovina",
+      "id": 501
+    },
+    "EA": {
+      "name": "Spain",
+      "id": 281
+    },
+    "EA6": {
+      "name": "Balearic Islands",
+      "id": 21
+    },
+    "EA8": {
+      "name": "Canary Islands",
+      "id": 29
+    },
+    "EA9": {
+      "name": "Ceuta & Melilla",
+      "id": 32
+    },
+    "EI": {
+      "name": "Ireland",
+      "id": 245
+    },
+    "EK": {
+      "name": "Armenia",
+      "id": 14
+    },
+    "EL": {
+      "name": "Liberia",
+      "id": 434
+    },
+    "EP": {
+      "name": "Iran",
+      "id": 330
+    },
+    "ER": {
+      "name": "Moldova",
+      "id": 179
+    },
+    "ES": {
+      "name": "Estonia",
+      "id": 52
+    },
+    "ET": {
+      "name": "Ethiopia",
+      "id": 53
+    },
+    "EU": {
+      "name": "Belarus",
+      "id": 27
+    },
+    "EX": {
+      "name": "Kyrgyzstan",
+      "id": 135
+    },
+    "EY": {
+      "name": "Tajikistan",
+      "id": 262
+    },
+    "EZ": {
+      "name": "Turkmenistan",
+      "id": 280
+    },
+    "F": {
+      "name": "France",
+      "id": 227
+    },
+    "FG": {
+      "name": "Guadeloupe",
+      "id": 79
+    },
+    "FH": {
+      "name": "Mayotte",
+      "id": 169
+    },
+    "FJ": {
+      "name": "St. Barthelemy",
+      "id": 516
+    },
+    "FK": {
+      "name": "New Caledonia",
+      "id": 162
+    },
+    "FK/C": {
+      "name": "Chesterfield Islands",
+      "id": 512
+    },
+    "FM": {
+      "name": "Martinique",
+      "id": 84
+    },
+    "FO": {
+      "name": "French Polynesia",
+      "id": 175
+    },
+    "FO/A": {
+      "name": "Austral Islands",
+      "id": 508
+    },
+    "FO/C": {
+      "name": "Clipperton Island",
+      "id": 36
+    },
+    "FO/M": {
+      "name": "Marquesas Islands",
+      "id": 509
+    },
+    "FP": {
+      "name": "St. Pierre & Miquelon",
+      "id": 277
+    },
+    "FR": {
+      "name": "Reunion Island",
+      "id": 453
+    },
+    "FS": {
+      "name": "St. Martin",
+      "id": 213
+    },
+    "FT/G": {
+      "name": "Glorioso Islands",
+      "id": 99
+    },
+    "FT/J": {
+      "name": "Juan de Nova, Europa",
+      "id": 124
+    },
+    "FT/T": {
+      "name": "Tromelin Island",
+      "id": 276
+    },
+    "FT/W": {
+      "name": "Crozet Island",
+      "id": 41
+    },
+    "FT/X": {
+      "name": "Kerguelen Islands",
+      "id": 131
+    },
+    "FT/Z": {
+      "name": "Amsterdam & St. Paul Is.",
+      "id": 10
+    },
+    "FW": {
+      "name": "Wallis & Futuna Islands",
+      "id": 298
+    },
+    "FY": {
+      "name": "French Guiana",
+      "id": 63
+    },
+    "G": {
+      "name": "England",
+      "id": 223
+    },
+    "GD": {
+      "name": "Isle of Man",
+      "id": 114
+    },
+    "GI": {
+      "name": "Northern Ireland",
+      "id": 265
+    },
+    "GJ": {
+      "name": "Jersey",
+      "id": 122
+    },
+    "GM": {
+      "name": "Scotland",
+      "id": 279
+    },
+    "GM/S": {
+      "name": "Shetland Islands",
+      "id": 279,
+      "canonical": "Scotland"
+    },
+    "GU": {
+      "name": "Guernsey",
+      "id": 106
+    },
+    "GW": {
+      "name": "Wales",
+      "id": 294
+    },
+    "H4": {
+      "name": "Solomon Islands",
+      "id": 185
+    },
+    "H40": {
+      "name": "Temotu Province",
+      "id": 507
+    },
+    "HA": {
+      "name": "Hungary",
+      "id": 239
+    },
+    "HB": {
+      "name": "Switzerland",
+      "id": 287
+    },
+    "HB0": {
+      "name": "Liechtenstein",
+      "id": 251
+    },
+    "HC": {
+      "name": "Ecuador",
+      "id": 120
+    },
+    "HC8": {
+      "name": "Galapagos Islands",
+      "id": 71
+    },
+    "HH": {
+      "name": "Haiti",
+      "id": 78
+    },
+    "HI": {
+      "name": "Dominican Republic",
+      "id": 72
+    },
+    "HK": {
+      "name": "Colombia",
+      "id": 116
+    },
+    "HK0/A": {
+      "name": "San Andres & Providencia",
+      "id": 216
+    },
+    "HK0/M": {
+      "name": "Malpelo Island",
+      "id": 161
+    },
+    "HL": {
+      "name": "Republic of Korea",
+      "id": 137
+    },
+    "HP": {
+      "name": "Panama",
+      "id": 88
+    },
+    "HR": {
+      "name": "Honduras",
+      "id": 80
+    },
+    "HS": {
+      "name": "Thailand",
+      "id": 387
+    },
+    "HV": {
+      "name": "Vatican City",
+      "id": 295
+    },
+    "HZ": {
+      "name": "Saudi Arabia",
+      "id": 378
+    },
+    "I": {
+      "name": "Italy",
+      "id": 248
+    },
+    "IG9": {
+      "name": "African Italy",
+      "id": 248,
+      "canonical": "Italy"
+    },
+    "IS": {
+      "name": "Sardinia",
+      "id": 225
+    },
+    "IT9": {
+      "name": "Sicily",
+      "id": 248,
+      "canonical": "Italy"
+    },
+    "J2": {
+      "name": "Djibouti",
+      "id": 382
+    },
+    "J3": {
+      "name": "Grenada",
+      "id": 77
+    },
+    "J5": {
+      "name": "Guinea-Bissau",
+      "id": 109
+    },
+    "J6": {
+      "name": "St. Lucia",
+      "id": 97
+    },
+    "J7": {
+      "name": "Dominica",
+      "id": 95
+    },
+    "J8": {
+      "name": "St. Vincent",
+      "id": 98
+    },
+    "JA": {
+      "name": "Japan",
+      "id": 339
+    },
+    "JD/M": {
+      "name": "Minami Torishima",
+      "id": 177
+    },
+    "JD/O": {
+      "name": "Ogasawara",
+      "id": 192
+    },
+    "JT": {
+      "name": "Mongolia",
+      "id": 363
+    },
+    "JW": {
+      "name": "Svalbard",
+      "id": 259
+    },
+    "JW/B": {
+      "name": "Bear Island",
+      "id": 259,
+      "canonical": "Svalbard"
+    },
+    "JX": {
+      "name": "Jan Mayen",
+      "id": 118
+    },
+    "JY": {
+      "name": "Jordan",
+      "id": 342
+    },
+    "K": {
+      "name": "United States",
+      "id": 291
+    },
+    "KG4": {
+      "name": "Guantanamo Bay",
+      "id": 105
+    },
+    "KH0": {
+      "name": "Mariana Islands",
+      "id": 166
+    },
+    "KH1": {
+      "name": "Baker & Howland Islands",
+      "id": 20
+    },
+    "KH2": {
+      "name": "Guam",
+      "id": 103
+    },
+    "KH3": {
+      "name": "Johnston Island",
+      "id": 123
+    },
+    "KH4": {
+      "name": "Midway Island",
+      "id": 174
+    },
+    "KH5": {
+      "name": "Palmyra & Jarvis Islands",
+      "id": 197
+    },
+    "KH6": {
+      "name": "Hawaii",
+      "id": 110
+    },
+    "KH7K": {
+      "name": "Kure Island",
+      "id": 138
+    },
+    "KH8": {
+      "name": "American Samoa",
+      "id": 9
+    },
+    "KH8/S": {
+      "name": "Swains Island",
+      "id": 515
+    },
+    "KH9": {
+      "name": "Wake Island",
+      "id": 297
+    },
+    "KL": {
+      "name": "Alaska",
+      "id": 6
+    },
+    "KP1": {
+      "name": "Navassa Island",
+      "id": 182
+    },
+    "KP2": {
+      "name": "US Virgin Islands",
+      "id": 285
+    },
+    "KP4": {
+      "name": "Puerto Rico",
+      "id": 202
+    },
+    "KP5": {
+      "name": "Desecheo Island",
+      "id": 43
+    },
+    "LA": {
+      "name": "Norway",
+      "id": 266
+    },
+    "LU": {
+      "name": "Argentina",
+      "id": 100
+    },
+    "LX": {
+      "name": "Luxembourg",
+      "id": 254
+    },
+    "LY": {
+      "name": "Lithuania",
+      "id": 146
+    },
+    "LZ": {
+      "name": "Bulgaria",
+      "id": 212
+    },
+    "OA": {
+      "name": "Peru",
+      "id": 136
+    },
+    "OD": {
+      "name": "Lebanon",
+      "id": 354
+    },
+    "OE": {
+      "name": "Austria",
+      "id": 206
+    },
+    "OH": {
+      "name": "Finland",
+      "id": 224
+    },
+    "OH0": {
+      "name": "Aland Islands",
+      "id": 5
+    },
+    "OJ0": {
+      "name": "Market Reef",
+      "id": 167
+    },
+    "OK": {
+      "name": "Czech Republic",
+      "id": 503
+    },
+    "OM": {
+      "name": "Slovak Republic",
+      "id": 504
+    },
+    "ON": {
+      "name": "Belgium",
+      "id": 209
+    },
+    "OX": {
+      "name": "Greenland",
+      "id": 237
+    },
+    "OY": {
+      "name": "Faroe Islands",
+      "id": 222
+    },
+    "OZ": {
+      "name": "Denmark",
+      "id": 221
+    },
+    "P2": {
+      "name": "Papua New Guinea",
+      "id": 163
+    },
+    "P4": {
+      "name": "Aruba",
+      "id": 91
+    },
+    "P5": {
+      "name": "DPR of Korea",
+      "id": 344
+    },
+    "PA": {
+      "name": "Netherlands",
+      "id": 263
+    },
+    "PJ2": {
+      "name": "Curacao",
+      "id": 517
+    },
+    "PJ4": {
+      "name": "Bonaire",
+      "id": 520
+    },
+    "PJ5": {
+      "name": "Saba & St. Eustatius",
+      "id": 519
+    },
+    "PJ7": {
+      "name": "Sint Maarten",
+      "id": 518
+    },
+    "PY": {
+      "name": "Brazil",
+      "id": 108
+    },
+    "PY0F": {
+      "name": "Fernando de Noronha",
+      "id": 56
+    },
+    "PY0S": {
+      "name": "St. Peter & St. Paul",
+      "id": 253
+    },
+    "PY0T": {
+      "name": "Trindade & Martim Vaz",
+      "id": 273
+    },
+    "PZ": {
+      "name": "Suriname",
+      "id": 140
+    },
+    "R1FJ": {
+      "name": "Franz Josef Land",
+      "id": 61
+    },
+    "S0": {
+      "name": "Western Sahara",
+      "id": 302
+    },
+    "S2": {
+      "name": "Bangladesh",
+      "id": 305
+    },
+    "S5": {
+      "name": "Slovenia",
+      "id": 499
+    },
+    "S7": {
+      "name": "Seychelles",
+      "id": 379
+    },
+    "S9": {
+      "name": "Sao Tome & Principe",
+      "id": 219
+    },
+    "SM": {
+      "name": "Sweden",
+      "id": 284
+    },
+    "SP": {
+      "name": "Poland",
+      "id": 269
+    },
+    "ST": {
+      "name": "Sudan",
+      "id": 466
+    },
+    "SU": {
+      "name": "Egypt",
+      "id": 478
+    },
+    "SV": {
+      "name": "Greece",
+      "id": 236
+    },
+    "SV/A": {
+      "name": "Mount Athos",
+      "id": 180
+    },
+    "SV5": {
+      "name": "Dodecanese",
+      "id": 45
+    },
+    "SV9": {
+      "name": "Crete",
+      "id": 40
+    },
+    "T2": {
+      "name": "Tuvalu",
+      "id": 282
+    },
+    "T30": {
+      "name": "Western Kiribati",
+      "id": 301
+    },
+    "T31": {
+      "name": "Central Kiribati",
+      "id": 31
+    },
+    "T32": {
+      "name": "Eastern Kiribati",
+      "id": 48
+    },
+    "T33": {
+      "name": "Banaba Island",
+      "id": 490
+    },
+    "T5": {
+      "name": "Somalia",
+      "id": 232
+    },
+    "T7": {
+      "name": "San Marino",
+      "id": 278
+    },
+    "T8": {
+      "name": "Palau",
+      "id": 22
+    },
+    "TA": {
+      "name": "Asiatic Turkey",
+      "id": 390
+    },
+    "TA1": {
+      "name": "European Turkey",
+      "id": 390,
+      "canonical": "Asiatic Turkey"
+    },
+    "TF": {
+      "name": "Iceland",
+      "id": 242
+    },
+    "TG": {
+      "name": "Guatemala",
+      "id": 76
+    },
+    "TI": {
+      "name": "Costa Rica",
+      "id": 308
+    },
+    "TI9": {
+      "name": "Cocos Island",
+      "id": 37
+    },
+    "TJ": {
+      "name": "Cameroon",
+      "id": 406
+    },
+    "TK": {
+      "name": "Corsica",
+      "id": 214
+    },
+    "TL": {
+      "name": "Central African Republic",
+      "id": 408
+    },
+    "TN": {
+      "name": "Republic of the Congo",
+      "id": 412
+    },
+    "TR": {
+      "name": "Gabon",
+      "id": 420
+    },
+    "TT": {
+      "name": "Chad",
+      "id": 410
+    },
+    "TU": {
+      "name": "Cote d'Ivoire",
+      "id": 428
+    },
+    "TY": {
+      "name": "Benin",
+      "id": 416
+    },
+    "TZ": {
+      "name": "Mali",
+      "id": 442
+    },
+    "UA": {
+      "name": "European Russia",
+      "id": 54
+    },
+    "UA2": {
+      "name": "Kaliningrad",
+      "id": 126
+    },
+    "UA9": {
+      "name": "Asiatic Russia",
+      "id": 15
+    },
+    "UK": {
+      "name": "Uzbekistan",
+      "id": 292
+    },
+    "UN": {
+      "name": "Kazakhstan",
+      "id": 130
+    },
+    "UR": {
+      "name": "Ukraine",
+      "id": 288
+    },
+    "V2": {
+      "name": "Antigua & Barbuda",
+      "id": 94
+    },
+    "V3": {
+      "name": "Belize",
+      "id": 66
+    },
+    "V4": {
+      "name": "St. Kitts & Nevis",
+      "id": 249
+    },
+    "V5": {
+      "name": "Namibia",
+      "id": 464
+    },
+    "V6": {
+      "name": "Micronesia",
+      "id": 173
+    },
+    "V7": {
+      "name": "Marshall Islands",
+      "id": 168
+    },
+    "V8": {
+      "name": "Brunei Darussalam",
+      "id": 345
+    },
+    "VE": {
+      "name": "Canada",
+      "id": 1
+    },
+    "VK": {
+      "name": "Australia",
+      "id": 150
+    },
+    "VK0H": {
+      "name": "Heard Island",
+      "id": 111
+    },
+    "VK0M": {
+      "name": "Macquarie Island",
+      "id": 153
+    },
+    "VK9C": {
+      "name": "Cocos (Keeling) Islands",
+      "id": 38
+    },
+    "VK9L": {
+      "name": "Lord Howe Island",
+      "id": 147
+    },
+    "VK9M": {
+      "name": "Mellish Reef",
+      "id": 171
+    },
+    "VK9N": {
+      "name": "Norfolk Island",
+      "id": 189
+    },
+    "VK9W": {
+      "name": "Willis Island",
+      "id": 303
+    },
+    "VK9X": {
+      "name": "Christmas Island",
+      "id": 35
+    },
+    "VP2E": {
+      "name": "Anguilla",
+      "id": 12
+    },
+    "VP2M": {
+      "name": "Montserrat",
+      "id": 96
+    },
+    "VP2V": {
+      "name": "British Virgin Islands",
+      "id": 65
+    },
+    "VP5": {
+      "name": "Turks & Caicos Islands",
+      "id": 89
+    },
+    "VP6": {
+      "name": "Pitcairn Island",
+      "id": 172
+    },
+    "VP6/D": {
+      "name": "Ducie Island",
+      "id": 513
+    },
+    "VP8": {
+      "name": "Falkland Islands",
+      "id": 141
+    },
+    "VP8/G": {
+      "name": "South Georgia Island",
+      "id": 235
+    },
+    "VP8/H": {
+      "name": "South Shetland Islands",
+      "id": 241
+    },
+    "VP8/O": {
+      "name": "South Orkney Islands",
+      "id": 238
+    },
+    "VP8/S": {
+      "name": "South Sandwich Islands",
+      "id": 240
+    },
+    "VP9": {
+      "name": "Bermuda",
+      "id": 64
+    },
+    "VQ9": {
+      "name": "Chagos Islands",
+      "id": 33
+    },
+    "VR": {
+      "name": "Hong Kong",
+      "id": 321
+    },
+    "VU": {
+      "name": "India",
+      "id": 324
+    },
+    "VU4": {
+      "name": "Andaman & Nicobar Is.",
+      "id": 11
+    },
+    "VU7": {
+      "name": "Lakshadweep Islands",
+      "id": 142
+    },
+    "XE": {
+      "name": "Mexico",
+      "id": 50
+    },
+    "XF4": {
+      "name": "Revillagigedo",
+      "id": 204
+    },
+    "XT": {
+      "name": "Burkina Faso",
+      "id": 480
+    },
+    "XU": {
+      "name": "Cambodia",
+      "id": 312
+    },
+    "XW": {
+      "name": "Laos",
+      "id": 143
+    },
+    "XX9": {
+      "name": "Macao",
+      "id": 152
+    },
+    "XZ": {
+      "name": "Myanmar",
+      "id": 309
+    },
+    "YA": {
+      "name": "Afghanistan",
+      "id": 3
+    },
+    "YB": {
+      "name": "Indonesia",
+      "id": 327
+    },
+    "YI": {
+      "name": "Iraq",
+      "id": 333
+    },
+    "YJ": {
+      "name": "Vanuatu",
+      "id": 158
+    },
+    "YK": {
+      "name": "Syria",
+      "id": 384
+    },
+    "YL": {
+      "name": "Latvia",
+      "id": 145
+    },
+    "YN": {
+      "name": "Nicaragua",
+      "id": 86
+    },
+    "YO": {
+      "name": "Romania",
+      "id": 275
+    },
+    "YS": {
+      "name": "El Salvador",
+      "id": 74
+    },
+    "YU": {
+      "name": "Serbia",
+      "id": 296
+    },
+    "YV": {
+      "name": "Venezuela",
+      "id": 148
+    },
+    "YV0": {
+      "name": "Aves Island",
+      "id": 17
+    },
+    "Z2": {
+      "name": "Zimbabwe",
+      "id": 452
+    },
+    "Z3": {
+      "name": "North Macedonia",
+      "id": 502
+    },
+    "Z6": {
+      "name": "Republic of Kosovo",
+      "id": 522
+    },
+    "Z8": {
+      "name": "Republic of South Sudan",
+      "id": 521
+    },
+    "ZA": {
+      "name": "Albania",
+      "id": 7
+    },
+    "ZB": {
+      "name": "Gibraltar",
+      "id": 233
+    },
+    "ZC4": {
+      "name": "UK Base Areas on Cyprus",
+      "id": 283
+    },
+    "ZD7": {
+      "name": "St. Helena",
+      "id": 250
+    },
+    "ZD8": {
+      "name": "Ascension Island",
+      "id": 205
+    },
+    "ZD9": {
+      "name": "Tristan da Cunha & Gough",
+      "id": 274
+    },
+    "ZF": {
+      "name": "Cayman Islands",
+      "id": 69
+    },
+    "ZK3": {
+      "name": "Tokelau Islands",
+      "id": 270
+    },
+    "ZL": {
+      "name": "New Zealand",
+      "id": 170
+    },
+    "ZL7": {
+      "name": "Chatham Islands",
+      "id": 34
+    },
+    "ZL8": {
+      "name": "Kermadec Islands",
+      "id": 133
+    },
+    "ZL9": {
+      "name": "N.Z. Subantarctic Is.",
+      "id": 16
+    },
+    "ZP": {
+      "name": "Paraguay",
+      "id": 132
+    },
+    "ZS": {
+      "name": "South Africa",
+      "id": 462
+    },
+    "ZS8": {
+      "name": "Pr. Edward & Marion Is.",
+      "id": 201
+    }
+  },
+  "subdivision_reference": "https://adif.org/315/ADIF_315_annotated.htm#Region_Enumeration"
+}

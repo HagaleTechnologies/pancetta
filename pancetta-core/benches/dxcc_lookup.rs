@@ -6,6 +6,9 @@ use std::hint::black_box;
 
 const CALLS: &[&str] = &[
     "W1AW",
+    "3Y0J",
+    "KG4OJT",
+    "W1AW/KG4",
     "K5ARH",
     "G8KHF",
     "JA1XYZ",

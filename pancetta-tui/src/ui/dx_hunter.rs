@@ -1232,6 +1232,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn entity_identity_correction_renders_existing_markers() {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        for (needed, atno, expected) in [
+            (true, true, "!7K1ABC"),
+            (true, false, "+7K1ABC"),
+            (false, false, "7K1ABC"),
+        ] {
+            let mut japan = make_test_station("7K1ABC");
+            japan.needed = needed;
+            japan.atno = atno;
+            assert_eq!(format_call_display(&japan, atno, needed, false), expected);
+            app.dx_stations.insert(japan.call_sign.clone(), japan);
+            let rendered = text(&render_buffer(&app, 120, 8));
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(rendered.contains("Japan"), "{rendered}");
+            if !needed {
+                assert!(!rendered.contains("!7K1ABC") && !rendered.contains("+7K1ABC"));
+            }
+        }
+        let kg4 = make_test_station("KG4OJT");
+        assert_eq!(entity_cell_text(&kg4, None), "United States");
+        app.dx_stations.insert(kg4.call_sign.clone(), kg4);
+        let rendered = text(&render_buffer(&app, 120, 8));
+        assert!(rendered.contains("United States"), "{rendered}");
+        assert!(!rendered.contains("Guantanamo"), "{rendered}");
+    }
+
     #[test]
     fn need_marker_priority_and_stacking() {
         // Plain station — no marker.

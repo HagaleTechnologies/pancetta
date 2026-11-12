@@ -47,3 +47,10 @@ nothing. Do not reset it in `reset_display_history`.
 The home entity comes from `[station] callsign`, not `dxcc_entity`. KH6, KL7
 and KP4 are separate entities from the US. The old letter-prefix exclusion
 set is gone; do not reintroduce prefix matching for home.
+
+## Subdivisions share DXCC identity (PAN-346)
+
+All local entity keys use core's canonical parent name, including worked,
+confirmed, band, mode, rarity and home comparisons. A TA1 QSO therefore
+prevents a false TA2 ATNO. Unknown entity names stay intact. Loaded cqdx
+answers still take precedence over these local sets.
