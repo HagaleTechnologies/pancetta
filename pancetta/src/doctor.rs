@@ -606,7 +606,6 @@ pub(crate) fn check_rigctld() -> DoctorCheck {
         name: "rig / rigctld",
         role: CheckRole::Transmit,
         run: Box::new(|ctx| {
-<<<<<<< HEAD
             rigctld_outcome(ctx, || {
                 std::process::Command::new("rigctld")
                     .arg("--version")
@@ -630,23 +629,10 @@ fn rigctld_outcome(ctx: &DoctorCtx, on_path: impl FnOnce() -> bool) -> CheckOutc
             fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
         };
     }
-    // Model must map to a hamlib ID or the coordinator can't spawn rigctld
-    // (hamlib.rs:252-258 warns and gives up).
-    if pancetta_lib::coordinator::ApplicationCoordinator::hamlib_model_id(&cfg.rig.model).is_none()
-    {
-        return CheckOutcome {
-            status: CheckStatus::Fail,
-            detail: format!(
-                "unknown rig model '{}' — pancetta cannot spawn rigctld for it",
-                cfg.rig.model
-            ),
-            fix: Some(
-                "run `pancetta setup` and set a model listed in docs/SUPPORTED_RIGS.md \
-                         (e.g. IC-7300, FTdx10), or run an external rigctld and set \
-                         RIGCTLD_HOST/RIGCTLD_PORT"
-                    .to_string(),
-            ),
-        };
+    // Model must resolve or the coordinator can't spawn rigctld.
+    // Use the shared resolver so names and numeric IDs match config validation.
+    if let Some(outcome) = rig_model_outcome(&cfg.rig.model) {
+        return outcome;
     }
     // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
     if !on_path() {
@@ -678,66 +664,6 @@ fn rigctld_outcome(ctx: &DoctorCtx, on_path: impl FnOnce() -> bool) -> CheckOutc
         status: CheckStatus::Pass,
         detail,
         fix: None,
-=======
-            let Some(cfg) = &ctx.config else {
-                return not_configured();
-            };
-            if !cfg.rig.interface.enabled {
-                return CheckOutcome {
-                    status: CheckStatus::Pass,
-                    detail: "rig disabled — decode-only (mock rig, no PTT)".to_string(),
-                    fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
-                };
-            }
-            // Model must resolve or the coordinator can't spawn rigctld
-            // (hamlib.rs warns and gives up). Pure half of this check,
-            // factored out so it stays testable without spawning anything.
-            if let Some(outcome) = rig_model_outcome(&cfg.rig.model) {
-                return outcome;
-            }
-            // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
-            let on_path = std::process::Command::new("rigctld")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok();
-            if !on_path {
-                return CheckOutcome {
-                    status: CheckStatus::Fail,
-                    detail: "rig enabled but `rigctld` is not on PATH".to_string(),
-                    fix: Some(hamlib_install_hint().to_string()),
-                };
-            }
-            // Same host/port conventions as the coordinator (hamlib.rs:150-155).
-            let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let port: u16 = std::env::var("RIGCTLD_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(4532);
-            use std::net::ToSocketAddrs;
-            let reachable = format!("{host}:{port}")
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| it.next())
-                .map(|a| {
-                    std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok()
-                })
-                .unwrap_or(false);
-            let detail = if reachable {
-                format!("rigctld on PATH; already listening on {host}:{port}")
-            } else {
-                format!(
-                    "rigctld on PATH; nothing on {host}:{port} yet (pancetta spawns it at startup)"
-                )
-            };
-            CheckOutcome {
-                status: CheckStatus::Pass,
-                detail,
-                fix: None,
-            }
-        }),
->>>>>>> 23fc8f42dfeee5be511bb6cc5c61bb061349d13a
     }
 }
 
