@@ -2287,6 +2287,26 @@ impl App {
             crate::ui::station_card::focused_qrz_info(self).is_some(),
         )?;
 
+        // Compute from the pre-click focus and geometry, before changing panels.
+        let dx_start = crate::ui::view_rects(
+            self.active_view,
+            self.zoomed,
+            self.active_panel,
+            content_area,
+            crate::ui::station_card::focused_qrz_info(self).is_some(),
+        )
+        .into_iter()
+        .find(|(p, _)| *p == ActivePanel::DxHunter)
+        .map(|(_, area)| {
+            crate::ui::dx_hunter::viewport(
+                area,
+                self.dx_hunter_scroll,
+                self.active_panel == ActivePanel::DxHunter,
+                self.displayed_dx_stations().len(),
+            )
+            .start
+        })
+        .unwrap_or(0);
         if panel != ActivePanel::TxPlacement {
             self.active_panel = panel;
             let row = row as usize;
@@ -2301,7 +2321,7 @@ impl App {
                 ActivePanel::DxHunter => {
                     let len = self.displayed_dx_stations().len();
                     if len > 0 {
-                        self.dx_hunter_scroll = row.min(len - 1);
+                        self.dx_hunter_scroll = (dx_start + row).min(len - 1);
                         self.repin_dx_hunter();
                     }
                 }
@@ -2428,6 +2448,7 @@ impl App {
 
     pub async fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
         self.terminal_size = (width, height);
+        self.clamp_dx_hunter_selection();
         debug!("Terminal resized to {}x{}", width, height);
         Ok(())
     }
@@ -2921,7 +2942,11 @@ impl App {
     }
 
     fn cleanup_old_data(&mut self) {
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
+        self.cleanup_old_data_at(Utc::now());
+    }
+
+    fn cleanup_old_data_at(&mut self, now: chrono::DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::hours(24);
 
         // Remove old messages
         while let Some(front) = self.decoded_messages.front() {
@@ -2936,27 +2961,14 @@ impl App {
         self.dx_stations
             .retain(|_, station| station.last_seen > cutoff);
 
-        // Keep the state map in lockstep with the station window: an entry
-        // survives only while its station is still listed (PAN-85). Note that
-        // `dx_states` is keyed by `station_state_key` (uppercase, hash-render
-        // resolved) while `dx_stations` is keyed by the callsign exactly as it
-        // was received, so the membership test must put each station key
-        // through the same normalization — a plain `contains_key` would drop
-        // every state for a station spotted lower-case or hash-rendered.
-        //
-        // This bounds `dx_states` exactly as much as `cleanup_old_data` bounds
-        // `dx_stations` — no more: the function currently has no production
-        // caller, so neither map is pruned on a live station today.
-        let Self {
-            dx_states,
-            dx_stations,
-            ..
-        } = self;
-        dx_states.retain(|call, _| {
-            dx_stations
-                .keys()
-                .any(|k| station_state_key(k).is_some_and(|key| key == *call))
-        });
+        let live_keys: HashSet<String> = self
+            .dx_stations
+            .keys()
+            .filter_map(|call| station_state_key(call))
+            .collect();
+        self.dx_states.retain(|call, _| live_keys.contains(call));
+        self.clamp_dx_hunter_selection();
+        self.clamp_callers_selection();
     }
 
     /// Record a station's US state/territory (PAN-85), validating first. An
@@ -4009,6 +4021,7 @@ impl App {
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
     pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
+        self.cleanup_old_data();
         // 15 rows per 15s FT8 cycle (1 row/sec) × 30 cycles = ~7.5 minutes of history
         const MAX_WATERFALL_ROWS: usize = 450;
         self.waterfall_data.extend(rows);
@@ -6710,6 +6723,97 @@ mod tests {
         assert_eq!(app.station_state_for("W5ABC"), Some("AR"));
         assert_eq!(app.station_state_for("w5abc"), Some("AR"));
         assert_eq!(app.station_state_for("W1XYZ"), None);
+    }
+
+    #[tokio::test]
+    async fn pan319_cleanup_boundary_and_selection() {
+        let mut app = fixture_app().await;
+        let now = Utc::now();
+        for (call, age) in [
+            ("W5ABC", chrono::Duration::hours(24)),
+            (
+                "W6ABC",
+                chrono::Duration::hours(24) - chrono::Duration::nanoseconds(1),
+            ),
+            ("W7ABC", chrono::Duration::zero()),
+        ] {
+            app.add_decoded_message(fixture_view(call, -10))
+                .await
+                .unwrap();
+            app.dx_stations.get_mut(call).unwrap().last_seen = now - age;
+            app.set_station_state(call, "AR");
+        }
+        app.dx_hunter_scroll = 40;
+        app.cleanup_old_data_at(now);
+        assert!(!app.dx_stations.contains_key("W5ABC"));
+        assert!(app.dx_stations.contains_key("W6ABC"));
+        assert_eq!(app.station_state_for("W5ABC"), None);
+        assert_eq!(app.station_state_for("W6ABC"), Some("AR"));
+        assert_eq!(app.dx_hunter_scroll, 0);
+        assert_eq!(app.dx_hunter_pinned_call.as_deref(), Some("W7ABC"));
+    }
+
+    #[tokio::test]
+    async fn pan319_resized_dx_click_targets_visible_station() {
+        let mut app = fixture_app().await;
+        app.active_view = crate::view::ActiveView::Hunt;
+        app.active_panel = ActivePanel::DxHunter;
+        for i in 0..60 {
+            app.add_decoded_message(fixture_view(&format!("W{i}ABC"), -10))
+                .await
+                .unwrap();
+        }
+        app.dx_hunter_scroll = 40;
+        app.clamp_dx_hunter_selection();
+        app.handle_resize(132, 24).await.unwrap();
+        let focused = app.get_selected_station().unwrap().0;
+        app.qrz_stations.insert(
+            focused,
+            QrzStationInfo {
+                name: Some("Test Operator".into()),
+                qth: None,
+                country: None,
+                state: None,
+                grid: None,
+            },
+        );
+        for (zoomed, height, contest) in [(false, 24, false), (true, 24, false), (false, 48, true)]
+        {
+            app.handle_resize(132, height).await.unwrap();
+            app.contest_score =
+                contest.then(|| pancetta_qso::contest::ledger::ContestScoreUpdate {
+                    generation: 1,
+                    instance_id: "test".into(),
+                    rules_id: "test".into(),
+                    display_name: "Test".into(),
+                    outside_period: false,
+                    state: pancetta_qso::contest::ledger::ContestScoreState::Loading,
+                });
+            app.zoomed = zoomed;
+            let content = crate::contest_score::content(
+                crate::ui::content_area(Rect::new(0, 0, 132, height)),
+                app.contest_score.as_ref(),
+            );
+            let rect = crate::ui::view_rects(
+                app.active_view,
+                app.zoomed,
+                app.active_panel,
+                content,
+                crate::ui::station_card::focused_qrz_info(&app).is_some(),
+            )
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::DxHunter)
+            .unwrap()
+            .1;
+            let start = crate::ui::dx_hunter::viewport(rect, app.dx_hunter_scroll, true, 60).start;
+            let expected = app.displayed_dx_stations()[start].call_sign.clone();
+            app.handle_left_click(rect.x + 2, rect.y + 2);
+            assert_eq!(app.get_selected_station().unwrap().0, expected);
+            assert_eq!(
+                app.dx_hunter_pinned_call.as_deref(),
+                Some(expected.as_str())
+            );
+        }
     }
 
     #[tokio::test]
