@@ -19769,6 +19769,7 @@ mod dxpedition_receive_integration_tests {
         hz: f64,
     ) -> Vec<pancetta_ft8::DecodedMessage> {
         let mut symbols = [0; 79];
+        // SAFETY: payload has 10 live bytes and the exclusive output has 79 bytes; C retains neither pointer.
         unsafe {
             pancetta_ft8::ft8_lib_ffi::ft8_encode(payload.as_ptr(), symbols.as_mut_ptr());
         }
