@@ -4,9 +4,12 @@
 
 # Supported rigs
 
-Pancetta controls a rig through Hamlib's `rigctld`. It starts `rigctld` itself for the rigs below.
-Set `rig.model` in `~/.pancetta/pancetta.toml` to a name from the `rig.model` column.
-Case, hyphens and spaces are ignored.
+Pancetta controls a rig through Hamlib's `rigctld`.
+Set `rig.model` in `~/.pancetta/pancetta.toml` to a model name from the bundled Hamlib 4.5.5 catalog or a numeric Hamlib model ID, for example "IC-7300" or "1045".
+Case, hyphens and spaces are ignored when matching names. Ambiguous names require a numeric ID.
+Run `rigctl -l` to see the models your installed Hamlib supports. A numeric ID also permits models newer than the bundled catalog.
+For an all-digit model name, include the manufacturer, for example "Barrett 950".
+The table below records selected rigs and their hardware test status. It is not the full list of accepted models.
 
 The Yaesu FTdx10 is the only rig with a recorded hardware test.
 Every other rig is mapped to its Hamlib model, but nobody has recorded using it with Pancetta.
@@ -51,7 +54,7 @@ No remote session on a real rig is recorded. Remote operation is integration-tes
 ## Rigs not in this list
 
 If a `rigctld` is already listening on `RIGCTLD_HOST`:`RIGCTLD_PORT` (default `127.0.0.1:4532`), Pancetta connects to it and does not start its own.
-To use another rig Hamlib supports, start `rigctld -m <model> -r <port>` yourself before Pancetta.
-`pancetta doctor` still reports a `rig.model` that is not in this list as unknown.
+A nonempty `rig.model` name outside the bundled catalog now fails validation, even for external-daemon users; use the model's numeric ID instead (`rigctl -l` lists it).
+Empty and `Generic` keep their existing placeholder behavior.
 
 SWR readings, attenuator steps and preamp steps differ between rigs. Pancetta reads them from `rigctld` when it connects, so this page does not list them.

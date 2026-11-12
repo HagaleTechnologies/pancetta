@@ -12572,6 +12572,7 @@ mod qrz_enrichment_tests {
 
     fn lookup(grid: Option<&str>, name: Option<&str>) -> QrzLookup {
         QrzLookup {
+            qth: None,
             call: Some("JA1ABC".to_string()),
             name: name.map(str::to_string),
             grid: grid.map(str::to_string),

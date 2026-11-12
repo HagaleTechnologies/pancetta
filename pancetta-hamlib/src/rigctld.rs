@@ -562,7 +562,12 @@ impl RigctldClient {
         let mut last_error = None;
 
         for attempt in 0..self.config.retry_count {
-            match self.send_command(command).await {
+            // PTT is only successful after an explicit daemon acknowledgement.
+            // Keep the existing retry/reconnect policy for the production caller.
+            match self
+                .send_command_inner(command, matches!(command, "T 0" | "T 1"))
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     warn!("Command failed (attempt {}): {}", attempt + 1, e);

@@ -110,6 +110,7 @@ macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
 
+<<<<<<< HEAD
 Service readiness gotcha (PAN-335): spawning an audio thread or decoder task
 does not mean initialization succeeded. Owner readiness must follow successful
 stream start or decoder construction and clear on owner exit. READY also waits
@@ -117,3 +118,24 @@ for full startup and the rig loop. The watchdog sends only after completed
 coordinator health passes, so a second heartbeat task would hide the failure
 it is supposed to detect. Receive-only systemd host qualification is still
 pending. See [the service liveness decision](../../docs/DECISIONS/config-and-platform.md#service-liveness-and-field-diagnostics-pan-335-2026-11-12).
+=======
+Rig-model gotcha (PAN-340): **`rig.model` resolves through one offline
+catalog, and that catalog is not the qualification table.** Acceptance comes
+from the vendored Hamlib 4.5.5 `rigctl -l` snapshot
+(`pancetta-hamlib/data/rigctl-4.5.5.txt` → generated
+`model_catalog_generated.rs` → `model_catalog.rs::resolve_model`); hardware
+test status lives only in `SUPPORTED_RIGS` (`models.rs`), whose IDs are
+compile-time lookups by `RIG_MODEL_*` macro. `pancetta-config` depends on
+`pancetta-hamlib` (default features off) for the pure resolver — config
+validation never builds a client. Numeric IDs win over names: bare `"950"`
+is model ID 950, `"Barrett 950"` is 32002. Validation rejects unknown,
+malformed (`"1045 -t 4532"`), zero, signed and overflowed numerics, and
+ambiguous names (`SW/FM radio`), each with the shared resolver message;
+empty and `Generic` stay placeholders. Snapshot-refresh gotcha: after
+re-capturing the data file you must rerun
+`python3 pancetta-hamlib/scripts/generate_model_catalog.py` (the
+`catalog_generation_is_current` test fails otherwise) and regenerate
+`docs/SUPPORTED_RIGS.md`; upstream reuses one macro for two rows
+(RIG_MODEL_FT450 → 1027 and 1046), so curated tables must pin macros only
+the catalog carries once.
+>>>>>>> 495015e1d1bcb74a618a6b0a90d3a7f06fecad72
