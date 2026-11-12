@@ -240,8 +240,11 @@ pub enum MessageType {
     /// DX cluster messages
     DxMessage(DxMessage),
 
-    /// Status update message
-    StatusUpdate(String),
+    /// Transient operator feedback with explicit producer severity.
+    StatusUpdate {
+        text: String,
+        level: pancetta_core::DiagnosticLevel,
+    },
 
     /// Request to transmit an FT8 message.
     ///
