@@ -546,32 +546,6 @@ fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged
     )
 }
 
-<<<<<<< HEAD
-/// Build the callsign-prefix marker string for the DX Hunter:
-/// `!` for ATNO, `+` for a needed (non-ATNO) DXCC, then `★` for notable.
-/// ATNO and needed are mutually exclusive (ATNO wins). Returns `""` for a
-/// plain station.
-fn need_marker(atno: bool, needed: bool, notable: bool) -> String {
-    let mut s = String::new();
-    if atno {
-        s.push('!');
-    } else if needed {
-        s.push('+');
-    }
-    if notable {
-        s.push('★');
-    }
-    s
-=======
-fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
-    match snr {
-        snr if snr >= 0 => theme.success_color(),
-        snr if snr >= -10 => theme.warning_color(),
-        _ => theme.error_color(),
-    }
->>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
-}
-
 /// Check if a station is rare DX using cqdx.io rarity tier (preferred)
 /// or fallback hardcoded prefix list.
 fn is_rare_dx_from_tier(station: &DxStation) -> bool {
