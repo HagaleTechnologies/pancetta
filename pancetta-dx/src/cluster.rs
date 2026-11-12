@@ -3,7 +3,7 @@
 //! This module provides connectivity to DX cluster networks for real-time
 //! DX spot monitoring and posting.
 
-use crate::{Band, DxError, DxSpot, Mode, Result};
+use crate::{Band, DxError, DxErrorInner, DxSpot, Mode, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -373,8 +373,12 @@ impl DxClusterClient {
             TcpStream::connect(&addr),
         )
         .await
-        .map_err(|_| DxError::ExternalService("Connection timeout".to_string()))?
-        .map_err(|e| DxError::ExternalService(e.to_string()))?;
+        .map_err(|_| {
+            DxError::from(DxErrorInner::ExternalService(
+                "Connection timeout".to_string(),
+            ))
+        })?
+        .map_err(|e| DxError::from(DxErrorInner::ExternalService(e.to_string())))?;
 
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -522,8 +526,12 @@ impl DxClusterClient {
     /// Connect via WebSocket
     async fn connect_websocket(&mut self, ws_url: &str) -> Result<()> {
         // Validate URL first
-        let _url = Url::parse(ws_url)
-            .map_err(|e| DxError::Configuration(format!("Invalid WebSocket URL: {}", e)))?;
+        let _url = Url::parse(ws_url).map_err(|e| {
+            DxError::from(DxErrorInner::Configuration(format!(
+                "Invalid WebSocket URL: {}",
+                e
+            )))
+        })?;
 
         // One cluster line per message, so the line limit is the message limit.
         let ws_config = WebSocketConfig::default()
@@ -531,7 +539,12 @@ impl DxClusterClient {
             .max_frame_size(Some(MAX_CLUSTER_LINE_BYTES));
         let (ws_stream, _response) = connect_async_with_config(ws_url, Some(ws_config), false)
             .await
-            .map_err(|e| DxError::ExternalService(format!("WebSocket connection failed: {}", e)))?;
+            .map_err(|e| {
+                DxError::from(DxErrorInner::ExternalService(format!(
+                    "WebSocket connection failed: {}",
+                    e
+                )))
+            })?;
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -604,7 +617,9 @@ impl DxClusterClient {
     pub async fn login(&self) -> Result<()> {
         if let Some(sender) = &self.command_sender {
             sender.try_send(self.config.callsign.clone()).map_err(|_| {
-                DxError::ExternalService("Failed to send login command".to_string())
+                DxError::from(DxErrorInner::ExternalService(
+                    "Failed to send login command".to_string(),
+                ))
             })?;
         }
         Ok(())
@@ -613,14 +628,16 @@ impl DxClusterClient {
     /// Send command to cluster
     pub async fn send_command(&self, command: &str) -> Result<()> {
         if let Some(sender) = &self.command_sender {
-            sender
-                .try_send(command.to_string())
-                .map_err(|_| DxError::ExternalService("Failed to send command".to_string()))?;
+            sender.try_send(command.to_string()).map_err(|_| {
+                DxError::from(DxErrorInner::ExternalService(
+                    "Failed to send command".to_string(),
+                ))
+            })?;
             Ok(())
         } else {
-            Err(DxError::ExternalService(
+            Err(DxError::from(DxErrorInner::ExternalService(
                 "Not connected to cluster".to_string(),
-            ))
+            )))
         }
     }
 
@@ -957,7 +974,9 @@ impl DxClusterClient {
     ) -> Result<DxSpot> {
         // A malformed frequency must not masquerade as valid metadata.
         if !cluster_spot.frequency_khz.is_finite() || cluster_spot.frequency_khz <= 0.0 {
-            return Err(DxError::Configuration("Invalid spot frequency".to_string()));
+            return Err(DxError::from(DxErrorInner::Configuration(
+                "Invalid spot frequency".to_string(),
+            )));
         }
 
         // Convert frequency to Hz, rounded: `2048.14 * 1000.0` is
@@ -969,7 +988,9 @@ impl DxClusterClient {
         let mode = Self::extract_mode_from_comment(&cluster_spot.comment);
 
         if let Some(reason) = filter.rejection(frequency, band, mode) {
-            return Err(DxError::Configuration(reason.to_string()));
+            return Err(DxError::from(DxErrorInner::Configuration(
+                reason.to_string(),
+            )));
         }
 
         // Check for duplicates (accepted spots only)
@@ -983,9 +1004,9 @@ impl DxClusterClient {
             if let Some(last_time) = recent.get(&spot_key) {
                 let elapsed = now.signed_duration_since(*last_time);
                 if elapsed.num_seconds() < filter.duplicate_timeout as i64 {
-                    return Err(DxError::Configuration(
+                    return Err(DxError::from(DxErrorInner::Configuration(
                         "Duplicate spot filtered".to_string(),
-                    ));
+                    )));
                 }
             }
             recent.insert(spot_key, cluster_spot.time);

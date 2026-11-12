@@ -537,71 +537,6 @@ impl super::ApplicationCoordinator {
                         Ok(relayed) => {
                             let decoded_msg = &relayed.message;
                             let call_sign = decoded_msg.message.from_callsign.clone();
-                            let dial_mhz = decode_view_dial_mhz(&relayed);
-                            let grid_square = display_grid(
-                                &mut last_grids, call_sign.as_deref(),
-                                decoded_msg.message.grid_square.as_deref(), dial_mhz);
-                            // "Calling me" detection: the parser sets
-                            // to_callsign = our call when someone replies
-                            // to our CQ ("K5ARH F5ABC -10"). Match against
-                            // the bare callsign — strip any /R or /P suffix
-                            // on either side so "K5ARH/M" and "K5ARH" both
-                            // count.
-                            let is_directed_at_us = match decoded_msg.message.to_callsign.as_deref() {
-                                Some(to) => {
-                                    let to_base = to.split('/').next().unwrap_or(to);
-                                    let our_base = our_callsign_for_relay
-                                        .split('/')
-                                        .next()
-                                        .unwrap_or(&our_callsign_for_relay);
-                                    !to_base.is_empty()
-                                        && !our_base.is_empty()
-                                        && to_base.eq_ignore_ascii_case(our_base)
-                                }
-                                None => false,
-                            };
-
-                            // Compute distance and bearing if both grids are available
-                            let (distance, bearing) = match (&grid_square, &station_coords) {
-                                (Some(remote_grid), Some((home_lat, home_lon))) => {
-                                    match pancetta_core::gridsquare::grid_to_coordinates(remote_grid)
-                                    {
-                                        Ok((remote_lat, remote_lon)) => {
-                                            let geod = geographiclib_rs::Geodesic::wgs84();
-                                            let (dist_m, azi1, _azi2, _arc) = geod.inverse(
-                                                *home_lat, *home_lon, remote_lat, remote_lon,
-                                            );
-                                            let bearing_deg =
-                                                if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
-                                            (Some(dist_m / 1000.0), Some(bearing_deg))
-                                        }
-                                        Err(_) => (None, None),
-                                    }
-                                }
-                                _ => (None, None),
-                            };
-
-                            // Worked-before: same semantics as the scorer's
-                            // duplicate penalty — band-scoped (current
-                            // operating frequency), uppercase-exact match on
-                            // the full callsign. We deliberately do NOT strip
-                            // /P-style suffixes: record_worked stores the
-                            // callsign exactly as logged, and adding
-                            // stripping on the TUI side only would make the
-                            // TUI flag stations the scorer still treats as
-                            // new (divergence).
-                            let worked_before = worked_before_for(
-                                &relay_station_lookup,
-                                call_sign.as_deref(),
-                                dial_mhz * 1_000_000.0,
-                            );
-                            let (needed, atno) =
-                                needed_atno_for(&relay_station_lookup, call_sign.as_deref());
-                            let band_needed = dxcc_needed_on_band_for(
-                                &relay_station_lookup,
-                                call_sign.as_deref(),
-                                dial_mhz * 1_000_000.0,
-                            );
 
                             // PAN-85: forward a known US state whenever it is
                             // new or has changed since the last one sent.
@@ -620,50 +555,24 @@ impl super::ApplicationCoordinator {
                                 }
                             }
 
-                            // Compute the #164 tiered priority score via the
-                            // real PriorityScorer's classification (ATNO >
-                            // per-band-DXCC-new > special-station >
-                            // per-band-grid-new > everything else, encoded
-                            // to a single sortable u32 — see
-                            // TieredScore::as_display_u32). Every identified
-                            // frame updates DX Hunter, using the retained
-                            // grid and fresh signal/worked/failure inputs.
-                            let (priority_score, priority_factors) = display_rank(
-                                &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
-                                decoded_msg.snr_db, dial_mhz);
-                            if let Some(call) = call_sign.as_deref() {
-                                last_rank_inputs.insert(rank_inputs_key(call), RankInputs {
-                                    grid: grid_square.clone(),
-                                    snr_db: decoded_msg.snr_db,
-                                    dial_mhz,
-                                });
-                            }
-
-                            let tui_decoded = pancetta_tui::DecodedMessageView {
-                                timestamp: chrono::Utc::now(),
-                                frequency: dial_mhz,
-                                mode: super::mode_str(pancetta_config::OperatingMode::from_u8(
-                                    relay_active_protocol_mode.load(Ordering::Relaxed),
-                                ))
-                                .to_string(),
-                                snr: decoded_msg.snr_db as i32,
-                                delta_time: decoded_msg.time_offset as f32,
-                                delta_freq: decoded_msg.frequency_offset as f32,
-                                call_sign,
-                                grid_square,
-                                message: decoded_msg.text.clone(),
-                                distance,
-                                bearing,
-                                slot_parity: decoded_msg.slot_parity,
-                                is_directed_at_us,
-                                worked_before,
-                                needed,
-                                atno,
-                                band_needed,
-                                priority_score,
-                                priority_factors,
-                                is_own_tx: false,
-                            };
+                            // Everything else this decode produces — grid
+                            // retention, the directed-at-us flag, enrichment,
+                            // ranking and the view itself — is
+                            // `decoded_view_for_relay`, so tests drive the
+                            // exact production conversion (PAN-330 AC1).
+                            let tui_decoded = decoded_view_for_relay(
+                                &relayed,
+                                &mut RelayDecodeCtx {
+                                    last_grids: &mut last_grids,
+                                    last_rank_inputs: &mut last_rank_inputs,
+                                    station_coords,
+                                    lookup: &relay_station_lookup,
+                                    scorer: &relay_scorer,
+                                    our_callsign: &our_callsign_for_relay,
+                                    protocol_mode: relay_active_protocol_mode
+                                        .load(Ordering::Relaxed),
+                                },
+                            );
 
                             match tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DecodedMessage(tui_decoded),
@@ -4097,6 +4006,115 @@ fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
     }
 }
 
+/// State and services the per-decode view conversion shares with the relay
+/// thread: the grid/rank caches it owns across decodes, the station
+/// coordinates for distance/bearing, the worked-before/needed lookup, the
+/// display scorer, our callsign (directed detection) and the live protocol
+/// mode stamp. Extracted from the relay loop so tests drive the exact
+/// production conversion — the relay thread itself has no test harness
+/// (see the note at its spawn, and `TxPolicyCmdCtx` for the same pattern).
+struct RelayDecodeCtx<'a> {
+    last_grids: &'a mut RelayCache<(String, String), String>,
+    last_rank_inputs: &'a mut RelayCache<String, RankInputs>,
+    station_coords: Option<(f64, f64)>,
+    lookup: &'a crate::priority_evaluator::CachedStationLookup,
+    scorer: &'a pancetta_qso::PriorityScorer,
+    our_callsign: &'a str,
+    protocol_mode: u8,
+}
+
+/// Convert one decoded FT8 frame into the `DecodedMessageView` the relay
+/// forwards to the TUI: retained display grid, directed-at-us flag,
+/// distance/bearing, worked-before/needed/ATNO/band-needed enrichment,
+/// tiered display rank and the rank-input memory update (PAN-330 AC1 —
+/// the "relay output" the directed flag is proven against).
+fn decoded_view_for_relay(
+    relayed: &super::pipeline::RelayedDecode,
+    ctx: &mut RelayDecodeCtx<'_>,
+) -> pancetta_tui::DecodedMessageView {
+    let decoded_msg = &relayed.message;
+    let call_sign = decoded_msg.message.from_callsign.clone();
+    let dial_mhz = decode_view_dial_mhz(relayed);
+    let grid_square = display_grid(
+        ctx.last_grids,
+        call_sign.as_deref(),
+        decoded_msg.message.grid_square.as_deref(),
+        dial_mhz,
+    );
+    let is_directed_at_us =
+        decode_directed_at_us_flag(decoded_msg.message.to_callsign.as_deref(), ctx.our_callsign);
+
+    // Compute distance and bearing if both grids are available
+    let (distance, bearing) = match (&grid_square, ctx.station_coords) {
+        (Some(remote_grid), Some((home_lat, home_lon))) => {
+            match pancetta_core::gridsquare::grid_to_coordinates(remote_grid) {
+                Ok((remote_lat, remote_lon)) => {
+                    let geod = geographiclib_rs::Geodesic::wgs84();
+                    let (dist_m, azi1, _azi2, _arc) =
+                        geod.inverse(home_lat, home_lon, remote_lat, remote_lon);
+                    let bearing_deg = if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
+                    (Some(dist_m / 1000.0), Some(bearing_deg))
+                }
+                Err(_) => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+
+    // Worked-before: same semantics as the scorer's duplicate penalty —
+    // band-scoped (current operating frequency), uppercase-exact match on
+    // the full callsign. We deliberately do NOT strip /P-style suffixes:
+    // record_worked stores the callsign exactly as logged, and adding
+    // stripping on the TUI side only would make the TUI flag stations the
+    // scorer still treats as new (divergence).
+    let worked_before = worked_before_for(ctx.lookup, call_sign.as_deref(), dial_mhz * 1_000_000.0);
+    let (needed, atno) = needed_atno_for(ctx.lookup, call_sign.as_deref());
+    let band_needed =
+        dxcc_needed_on_band_for(ctx.lookup, call_sign.as_deref(), dial_mhz * 1_000_000.0);
+
+    let (priority_score, priority_factors) = display_rank(
+        ctx.scorer,
+        call_sign.as_deref(),
+        grid_square.as_deref(),
+        decoded_msg.snr_db,
+        dial_mhz,
+    );
+    if let Some(call) = call_sign.as_deref() {
+        ctx.last_rank_inputs.insert(
+            rank_inputs_key(call),
+            RankInputs {
+                grid: grid_square.clone(),
+                snr_db: decoded_msg.snr_db,
+                dial_mhz,
+            },
+        );
+    }
+
+    pancetta_tui::DecodedMessageView {
+        timestamp: chrono::Utc::now(),
+        frequency: dial_mhz,
+        mode: super::mode_str(pancetta_config::OperatingMode::from_u8(ctx.protocol_mode))
+            .to_string(),
+        snr: decoded_msg.snr_db as i32,
+        delta_time: decoded_msg.time_offset as f32,
+        delta_freq: decoded_msg.frequency_offset as f32,
+        call_sign,
+        grid_square,
+        message: decoded_msg.text.clone(),
+        distance,
+        bearing,
+        slot_parity: decoded_msg.slot_parity,
+        is_directed_at_us,
+        worked_before,
+        needed,
+        atno,
+        band_needed,
+        priority_score,
+        priority_factors,
+        is_own_tx: false,
+    }
+}
+
 /// Worked-before check for TUI enrichment (Batch 95).
 ///
 /// Delegates to `CachedStationLookup::is_duplicate` — the exact method
@@ -4435,6 +4453,14 @@ fn spawn_config_file_write_worker() -> (
 // Transient-only health identities, distinct from service error codes.
 const RF_NO_DECODE_STATUS_CODE: u32 = 0xC200_0001;
 const SILENT_INPUT_STATUS_CODE: u32 = 0xC200_0002;
+
+/// "Directed at us" flag for one relayed decode — the relay's single use of
+/// the shared core predicate (`pancetta_core::callsign::decode_directed_at_us`,
+/// PAN-330). See that function for the recognized forms; absent, empty,
+/// whitespace-only and unresolved-hash (`<...>`) destinations never match.
+fn decode_directed_at_us_flag(to: Option<&str>, our_callsign: &str) -> bool {
+    pancetta_core::callsign::decode_directed_at_us(to, our_callsign)
+}
 
 fn relayed_status(
     component: String,
@@ -4934,6 +4960,73 @@ mod pan351_tests {
 
 #[cfg(test)]
 mod tui_relay_tests {
+    /// PAN-330 AC1: the TUI relay's directed flag recognizes prefix/suffix
+    /// portable calls, mixed case and resolved hash renders, and rejects
+    /// absent, empty, whitespace-only, unresolved-hash and wrong-call
+    /// destinations — exercised through the relay's own output conversion
+    /// (`decoded_view_for_relay`, the exact production path the relay
+    /// thread runs), not just the core matcher.
+    #[test]
+    fn directed_decode_table() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let view = |to: Option<&str>| {
+            let ft8 = pancetta_ft8::Ft8Message {
+                from_callsign: Some("DL1ABC".into()),
+                to_callsign: to.map(str::to_string),
+                ..Default::default()
+            };
+            let mut message = pancetta_ft8::DecodedMessage::new(ft8, -10.0, 0.0, 1000.0, 0.0);
+            message.text = match to {
+                Some(t) => format!("{t} DL1ABC -10"),
+                None => "DL1ABC -10".into(),
+            };
+            let relayed = crate::coordinator::pipeline::RelayedDecode {
+                message,
+                dial_hz: 14_074_000,
+            };
+            let mut last_grids = super::RelayCache::default();
+            let mut last_rank_inputs = super::RelayCache::default();
+            super::decoded_view_for_relay(
+                &relayed,
+                &mut super::RelayDecodeCtx {
+                    last_grids: &mut last_grids,
+                    last_rank_inputs: &mut last_rank_inputs,
+                    station_coords: None,
+                    lookup: &lookup,
+                    scorer: &scorer,
+                    our_callsign: "K5ARH",
+                    protocol_mode: 0,
+                },
+            )
+        };
+        // The ticket's headline: `EA8/K5ARH DL1ABC -10` is directed at us.
+        assert!(view(Some("EA8/K5ARH")).is_directed_at_us);
+        assert!(view(Some("K5ARH/P")).is_directed_at_us);
+        assert!(view(Some("K5ARH/M")).is_directed_at_us);
+        assert!(view(Some("k5arh")).is_directed_at_us);
+        assert!(view(Some("<K5ARH>")).is_directed_at_us); // resolved hash render
+        assert!(view(Some("K5ARH")).is_directed_at_us); // plain reply to our CQ
+                                                        // Not directed at us.
+        assert!(!view(Some("EA8/K5ARG")).is_directed_at_us);
+        assert!(!view(Some("DL1ABC")).is_directed_at_us);
+        assert!(!view(Some("<...>")).is_directed_at_us); // unresolved hash placeholder
+        assert!(!view(None).is_directed_at_us);
+        assert!(!view(Some("")).is_directed_at_us);
+        assert!(!view(Some("   ")).is_directed_at_us);
+        // The conversion is the relay's own output: the frame's fields reach
+        // the view unchanged alongside the flag.
+        let v = view(Some("EA8/K5ARH"));
+        assert_eq!(v.call_sign.as_deref(), Some("DL1ABC"));
+        assert_eq!(v.message, "EA8/K5ARH DL1ABC -10");
+        assert_eq!(v.frequency, 14.074);
+        assert_eq!(v.snr, -10);
+        assert!(!v.worked_before);
+    }
+
     #[test]
     fn cluster_spot_relay_preserves_metadata() {
         // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,

@@ -3140,44 +3140,19 @@ pub fn is_cq_message(text: &str) -> bool {
 /// Returns `true` if `tok` looks like a report / RR73 / RRR / 73 payload —
 /// the trailing token of a standard FT8 exchange (vs. a grid in a reply).
 ///
-/// `pub` so callers that need the same "is this the payload of a committed
-/// exchange" test (e.g. the TUI Callers panel's busy detector mirrors this
-/// logic) have a single canonical definition.
-pub fn is_exchange_payload(tok: &str) -> bool {
-    let u = tok.to_uppercase();
-    if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
-        return true;
-    }
-    // Signal reports: "-12", "+05", "R-12", "R+05".
-    let body = u.strip_prefix('R').unwrap_or(&u);
-    if let Some(rest) = body.strip_prefix(['-', '+']) {
-        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
-    }
-    false
-}
+/// Moved to `pancetta_core::ft8_tokens` (PAN-330) so pancetta-qso and
+/// pancetta-tui share one definition; re-exported here so every existing
+/// caller and test keeps compiling unchanged.
+pub use pancetta_core::ft8_tokens::is_exchange_payload;
 
-/// `true` if `tok` has exact Maidenhead locator shape: 2 letters + 2 digits
-/// (a 4-character field+square), optionally followed by a 2-letter
-/// subsquare suffix (6 characters total). Any other length, or wrong
-/// character class in any position, is rejected — a 5-character or
-/// wrong-shaped 6-character token (e.g. "FN42X", "FN4212") is not a grid.
+/// `true` if `tok` is a semantically valid Maidenhead locator of the
+/// lengths an FT8 exchange can carry (4 or 6 characters). Case is
+/// normalized by the core validator. Shape-only recognition (which
+/// deliberately accepts `ZZ99` so false-positive detection can identify and
+/// reject it) stays separate in `pancetta_core::callsign::is_grid_shape`
+/// (PAN-330).
 fn looks_like_grid(tok: &str) -> bool {
-    let chars: Vec<char> = tok.chars().collect();
-    let field_square_ok = |c: &[char]| {
-        c[0].is_ascii_alphabetic()
-            && c[1].is_ascii_alphabetic()
-            && c[2].is_ascii_digit()
-            && c[3].is_ascii_digit()
-    };
-    match chars.len() {
-        4 => field_square_ok(&chars),
-        6 => {
-            field_square_ok(&chars)
-                && chars[4].is_ascii_alphabetic()
-                && chars[5].is_ascii_alphabetic()
-        }
-        _ => false,
-    }
+    matches!(tok.len(), 4 | 6) && pancetta_core::gridsquare::validate_grid(tok).is_ok()
 }
 
 /// Inspect a decoded message and, if it is a **third-party exchange** —
@@ -3191,9 +3166,8 @@ fn looks_like_grid(tok: &str) -> bool {
 /// not parse as a 3-token `<to> <from> <payload>` exchange.
 ///
 /// `pub` so the TUI Callers panel's "BUSY" detector can share this exact
-/// definition (it re-implements an equivalent locally because `pancetta-tui`
-/// does not depend on `pancetta-qso`; keeping this canonical and tested
-/// guards both copies against drift).
+/// definition (both sides classify the payload through
+/// `pancetta_core::ft8_tokens::is_exchange_payload`, PAN-330).
 pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
     if is_cq_message(text) {
         return Vec::new();
@@ -3210,7 +3184,12 @@ pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<Str
         return Vec::new();
     }
     // If either party is us, this is our own QSO traffic, not a third party.
-    if to.eq_ignore_ascii_case(our_callsign) || from.eq_ignore_ascii_case(our_callsign) {
+    // PAN-330: party identity is the core compound-aware matcher, so our own
+    // portable-form traffic ("EA8/K5ARH DL1ABC -10" while we are K5ARH) is
+    // our exchange, not a third party's.
+    if pancetta_core::callsign::callsigns_match(to, our_callsign)
+        || pancetta_core::callsign::callsigns_match(from, our_callsign)
+    {
         return Vec::new();
     }
     // Both tokens must look like callsigns (contain a digit) to avoid
@@ -7912,6 +7891,53 @@ mod dx_busy_tests {
         // If WE are a party, it is our own QSO, not a third party.
         assert!(third_party_exchange_callsigns("K5ARH JA1ABC -12", "K5ARH").is_empty());
         assert!(third_party_exchange_callsigns("JA1ABC K5ARH R-12", "K5ARH").is_empty());
+    }
+
+    /// PAN-330 AC5: the QSO busy detector classifies committed payloads
+    /// through the shared core function (`is_exchange_payload` is a
+    /// re-export of `pancetta_core::ft8_tokens::is_exchange_payload`).
+    #[test]
+    fn committed_exchange_payload_table() {
+        // Committed payloads mark both participants busy.
+        for payload in ["-12", "+05", "R-12", "R+05", "RR73", "RRR", "73", "rr73"] {
+            let text = format!("JA1ABC W1XYZ {payload}");
+            assert_eq!(
+                third_party_exchange_callsigns(&text, "K5ARH").len(),
+                2,
+                "expected busy exchange for {payload:?}"
+            );
+        }
+        // Grids / unsigned numbers / junk payloads are not committed.
+        for payload in ["FN42", "ZZ99", "12", "-", "+", "R", "RR7", "-12x", ""] {
+            let text = if payload.is_empty() {
+                "JA1ABC W1XYZ".to_string()
+            } else {
+                format!("JA1ABC W1XYZ {payload}")
+            };
+            assert!(
+                third_party_exchange_callsigns(&text, "K5ARH").is_empty(),
+                "expected not-committed for {payload:?}"
+            );
+        }
+    }
+
+    /// PAN-330 AC6: autonomous grid extraction uses core semantic
+    /// validation with a 4/6-length adapter — `ZZ99` (shape-valid, field
+    /// letters outside A–R) is no longer extracted as a grid.
+    #[test]
+    fn cq_grid_extraction_uses_core_locator_semantics() {
+        let grid = |text: &str| extract_grid_from_cq(text);
+        assert_eq!(grid("CQ DL1ABC FN42").as_deref(), Some("FN42"));
+        assert_eq!(grid("CQ DL1ABC fn42").as_deref(), Some("FN42"));
+        assert_eq!(grid("CQ DL1ABC FN42ab").as_deref(), Some("FN42AB"));
+        assert_eq!(grid("CQ DL1ABC FN42AB12cd").as_deref(), None); // > 6 chars
+        assert_eq!(grid("CQ DL1ABC ZZ99").as_deref(), None);
+        assert_eq!(grid("CQ DL1ABC FN42YY").as_deref(), None);
+        assert_eq!(grid("CQ DL1ABC FN42X").as_deref(), None);
+        assert_eq!(grid("CQ DL1ABC FN4212").as_deref(), None);
+        assert_eq!(grid("CQ DL1ABC RR73").as_deref(), Some("RR73")); // geographically valid; autonomous has no close-token collision here
+        assert_eq!(grid("CQ DL1ABC -12").as_deref(), None);
+        assert_eq!(grid("CQ DL1ABC").as_deref(), None);
     }
 
     #[test]

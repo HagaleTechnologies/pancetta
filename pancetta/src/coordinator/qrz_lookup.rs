@@ -145,9 +145,15 @@ pub(super) async fn handle_lookup_callsign(ctx: &QrzLookupCtx, callsign: String)
                     .insert(callsign.clone(), Some(lookup.clone()));
                 result(&tx, callsign, Some(lookup));
             }
-            Ok(Err(pancetta_dx::DxError::ExternalService(ref e)))
-                if e.to_ascii_lowercase().contains("not found")
-                    || e.contains("returned no callsign data") =>
+            // DxError is a private-box wrapper (PAN-328); match the borrowed
+            // inner kind the same way qrz_xml's session-expiry path does.
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    pancetta_dx::DxErrorInner::ExternalService(msg)
+                        if msg.to_ascii_lowercase().contains("not found")
+                            || msg.contains("returned no callsign data")
+                ) =>
             {
                 cache.lock().await.insert(callsign.clone(), None);
                 result(&tx, callsign, None);

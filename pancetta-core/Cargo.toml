@@ -24,3 +24,6 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[bench]]
 name = "dxcc_lookup"
 harness = false
+
+[lints]
+workspace = true
