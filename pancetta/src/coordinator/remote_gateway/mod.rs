@@ -315,6 +315,14 @@ async fn handle_bus_msg(
                         ServerEvent::Mode { mode } => {
                             s.mode = mode.clone();
                         }
+                        // PAN-341: fold the policy so a localhost client that
+                        // connects AFTER the change still gets the current
+                        // value in its Welcome snapshot — without this fold
+                        // only the live event would reach already-connected
+                        // clients.
+                        ServerEvent::TxPolicy { policy } => {
+                            s.tx_policy = *policy;
+                        }
                         _ => {}
                     }
                 }
@@ -326,6 +334,32 @@ async fn handle_bus_msg(
 
     // `send` errors only when there are no active subscribers — that is fine.
     let _ = evt_tx.send(event);
+}
+
+/// PAN-341 test seam: run ONE already-delivered bus message through the
+/// display-feed pump body ([`handle_bus_msg`]) so sibling test modules
+/// (station agent, TUI relay) can prove producer → pump → peer delivery
+/// through the real translation and snapshot fold without a live
+/// coordinator. Production uses the spawned pump task, never this.
+#[cfg(test)]
+pub(crate) async fn pump_bus_message_for_tests(
+    msg: &MessageType,
+    evt_tx: &broadcast::Sender<ServerEvent>,
+    snapshot: &RwLock<StateSnapshot>,
+) {
+    let op_freq = AtomicU64::new(14_074_000);
+    let lookup = crate::priority_evaluator::CachedStationLookup::new();
+    let spectrum_seq = AtomicU64::new(0);
+    handle_bus_msg(
+        msg,
+        &op_freq,
+        &lookup,
+        "K5ARH",
+        evt_tx,
+        snapshot,
+        &spectrum_seq,
+    )
+    .await;
 }
 
 impl super::ApplicationCoordinator {
@@ -660,6 +694,21 @@ mod server_tests {
         allowed_origins: &[&str],
         hello_timeout: Duration,
     ) -> (SocketAddr, broadcast::Sender<ServerEvent>) {
+        spawn_gateway_shared(
+            Arc::new(RwLock::new(snapshot)),
+            allowed_origins,
+            hello_timeout,
+        )
+        .await
+    }
+
+    /// [`spawn_gateway`] over an already-shared snapshot, so a test can keep
+    /// pumping bus messages into the same state a later Welcome reads.
+    async fn spawn_gateway_shared(
+        snapshot: Arc<RwLock<StateSnapshot>>,
+        allowed_origins: &[&str],
+        hello_timeout: Duration,
+    ) -> (SocketAddr, broadcast::Sender<ServerEvent>) {
         let (evt_tx, _) = broadcast::channel(16);
         let mut auth = auth::GatewayAuth::new(
             TEST_TOKEN,
@@ -671,7 +720,7 @@ mod server_tests {
         auth.hello_timeout = hello_timeout;
         let state = GatewayState {
             evt_tx: evt_tx.clone(),
-            snapshot: Arc::new(RwLock::new(snapshot)),
+            snapshot,
             server_version: "v0.9.9-test".into(),
             auth,
         };
@@ -880,6 +929,59 @@ mod server_tests {
                 assert_eq!(welcome.snapshot.tx_policy, TxPolicy::RespondOnly);
                 assert_eq!(welcome.server_version, "v0.9.9-test");
                 assert_eq!(welcome.protocol_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tx_policy_updates_event_and_welcome_snapshot() {
+        // PAN-341: a policy transition processed by the pump must BOTH
+        // broadcast the `txPolicy` event AND fold into the snapshot — here
+        // with no subscriber connected at all — so the NEXT authenticated
+        // localhost client's Welcome carries the updated value instead of
+        // the value seeded at pump start.
+        let (evt_tx, mut rx) = broadcast::channel::<ServerEvent>(16);
+        let snapshot = Arc::new(RwLock::new(empty_snapshot()));
+        assert_eq!(snapshot.read().await.tx_policy, TxPolicy::Full);
+
+        // The pump's own test pattern: feed the bus message directly. No
+        // consumer is subscribed (rx alone, kept for the event assertion).
+        handle_bus_msg(
+            &MessageType::TxPolicyStatus {
+                policy: TxPolicy::RespondOnly,
+            },
+            &AtomicU64::new(14_074_000),
+            &crate::priority_evaluator::CachedStationLookup::new(),
+            "K5ARH",
+            &evt_tx,
+            &snapshot,
+            &AtomicU64::new(0),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            ServerEvent::TxPolicy { policy } => assert_eq!(policy, TxPolicy::RespondOnly),
+            other => panic!("expected TxPolicy, got {other:?}"),
+        }
+        assert_eq!(
+            snapshot.read().await.tx_policy,
+            TxPolicy::RespondOnly,
+            "the fold must update the snapshot even with no subscribers"
+        );
+
+        // A client that connects only now sees the folded value in Welcome.
+        let snapshot_for_server = snapshot.clone();
+        let (addr, _) =
+            spawn_gateway_shared(snapshot_for_server, &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        ws.send(ClientMessage::Text(hello_text(Some(TEST_TOKEN)).into()))
+            .await
+            .unwrap();
+        let message = next_message(&mut ws).await.unwrap().unwrap();
+        match serde_json::from_str::<ServerFrame>(message.to_text().unwrap()).unwrap() {
+            ServerFrame::Welcome { welcome } => {
+                assert_eq!(welcome.snapshot.tx_policy, TxPolicy::RespondOnly);
             }
             other => panic!("expected Welcome, got {other:?}"),
         }

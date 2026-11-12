@@ -2503,6 +2503,7 @@ impl super::ApplicationCoordinator {
                                             swr_guard.note_capability(cap),
                                             &message_bus,
                                             &swr_halt,
+                                            &display_feed_enabled_poll,
                                         )
                                         .await;
                                     }
@@ -2517,6 +2518,7 @@ impl super::ApplicationCoordinator {
                                         keyed,
                                         &message_bus,
                                         &swr_halt,
+                                        &display_feed_enabled_poll,
                                     )
                                     .await;
                                     // PAN-206: every successful frequency poll also
