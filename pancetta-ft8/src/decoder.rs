@@ -2526,8 +2526,9 @@ fn select_top_k_per_bin(
         return Vec::new();
     }
 
-    let mut by_bin: std::collections::HashMap<usize, Vec<CostasCandidate>> =
-        std::collections::HashMap::new();
+    // Canonical bin traversal makes cross-bin score ties repeatable.
+    let mut by_bin: std::collections::BTreeMap<usize, Vec<CostasCandidate>> =
+        std::collections::BTreeMap::new();
     for c in candidates {
         by_bin.entry(c.freq_bin).or_default().push(c);
     }
@@ -6810,6 +6811,27 @@ impl Ft8Decoder {
         partner_freq_hz: Option<f64>,
         defer_nms: bool,
     ) -> Ft8Result<Vec<CostasCandidate>> {
+        self.costas_sync_search_impl(
+            spectrogram,
+            min_score,
+            freq_bin_scope,
+            partner_freq_hz,
+            defer_nms,
+            rayon::current_num_threads() > 1,
+        )
+    }
+
+    // Production uses the original traversal on a one-worker pool. Tests can
+    // force chunks even there, independently of that fallback.
+    fn costas_sync_search_impl(
+        &self,
+        spectrogram: &Spectrogram,
+        min_score: f64,
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
+        defer_nms: bool,
+        parallel: bool,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
 
@@ -6832,6 +6854,11 @@ impl Ft8Decoder {
             ),
             None => (MIN_FREQ_BIN, max_freq_bin),
         };
+
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let context = self.costas_context();
 
         // hb-242: when enabled, also compute the partial-Costas
         // (`sync_bc`) metric and use `max(full, partial)`. The partial
@@ -6871,7 +6898,7 @@ impl Ft8Decoder {
         // both for the main score and for parabolic-refinement
         // neighbour scores so the refined-score scale stays consistent.
         let scored = |t0: usize, f0: usize, freq_sub: usize| -> f64 {
-            self.costas_score_full_or_partial(spectrogram, t0, f0, freq_sub)
+            context.costas_score_full_or_partial(spectrogram, t0, f0, freq_sub)
         };
 
         // hb-230: pre-resolve the near-partner relaxed-threshold context.
@@ -6898,78 +6925,195 @@ impl Ft8Decoder {
             _ => None,
         };
 
-        for freq_sub in 0..spectrogram.freq_osr {
-            for t0 in 0..=max_time_step {
-                for f0 in lo..hi {
-                    let score = scored(t0, f0, freq_sub);
+        if parallel {
+            // Indexed collect preserves (sub, time, frequency-chunk) traversal
+            // order. No floating-point reduction crosses worker boundaries.
+            const CHUNK_BINS: usize = 32;
+            let chunks = bin_count.div_ceil(CHUNK_BINS);
+            let times = max_time_step + 1;
+            let results: Vec<_> = (0..spectrogram.freq_osr * times * chunks)
+                .into_par_iter()
+                .map(|work| {
+                    let freq_sub = work / (times * chunks);
+                    let t0 = (work / chunks) % times;
+                    let chunk_lo = lo + (work % chunks) * CHUNK_BINS;
+                    let chunk_hi = (chunk_lo + CHUNK_BINS).min(hi);
+                    let mut candidates = Vec::new();
+                    let mut tight = if two_baseline_enabled {
+                        vec![(0.0, 0); chunk_hi - chunk_lo]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut wide = if two_baseline_enabled {
+                        vec![(0.0, 0); chunk_hi - chunk_lo]
+                    } else {
+                        Vec::new()
+                    };
+                    for f0 in chunk_lo..chunk_hi {
+                        let score = scored(t0, f0, freq_sub);
 
-                    if two_baseline_enabled {
-                        let bin_idx = f0 - lo;
-                        // Wide pathway: any t0 contributes.
-                        if score > wide_peaks[freq_sub][bin_idx].0 {
-                            wide_peaks[freq_sub][bin_idx] = (score, t0);
+                        if two_baseline_enabled {
+                            let bin_idx = f0 - chunk_lo;
+                            // Wide pathway: any t0 contributes.
+                            if score > wide[bin_idx].0 {
+                                wide[bin_idx] = (score, t0);
+                            }
+                            // Tight pathway: only t0 ≤ tight_steps from the
+                            // nominal slot start. With `time_padding = 0`
+                            // and the t0 sweep starting at 0, "tight"
+                            // means low t0 values.
+                            if t0 <= tight_steps && score > tight[bin_idx].0 {
+                                tight[bin_idx] = (score, t0);
+                            }
                         }
-                        // Tight pathway: only t0 ≤ tight_steps from the
-                        // nominal slot start. With `time_padding = 0`
-                        // and the t0 sweep starting at 0, "tight"
-                        // means low t0 values.
-                        if t0 <= tight_steps && score > tight_peaks[freq_sub][bin_idx].0 {
-                            tight_peaks[freq_sub][bin_idx] = (score, t0);
-                        }
-                    }
 
-                    // hb-230: per-candidate threshold. Outside the
-                    // near-partner window (or with the feature off) this
-                    // is exactly `min_score` — the historical gate.
-                    // Inside the window it relaxes to
-                    // `max(0, min_score + score_delta)`.
-                    let candidate_threshold =
-                        if let Some((partner, radius, relaxed)) = relaxed_window {
-                            let sub_off = freq_sub as f64 * (tone_spacing_hz / FREQ_OSR as f64);
-                            let cand_freq = f0 as f64 * tone_spacing_hz + sub_off;
-                            if (cand_freq - partner).abs() <= radius {
-                                relaxed
+                        // hb-230: per-candidate threshold. Outside the
+                        // near-partner window (or with the feature off) this
+                        // is exactly `min_score` — the historical gate.
+                        // Inside the window it relaxes to
+                        // `max(0, min_score + score_delta)`.
+                        let candidate_threshold =
+                            if let Some((partner, radius, relaxed)) = relaxed_window {
+                                let sub_off = freq_sub as f64 * (tone_spacing_hz / FREQ_OSR as f64);
+                                let cand_freq = f0 as f64 * tone_spacing_hz + sub_off;
+                                if (cand_freq - partner).abs() <= radius {
+                                    relaxed
+                                } else {
+                                    min_score
+                                }
                             } else {
                                 min_score
+                            };
+                        if score > candidate_threshold {
+                            // hb-044: optional parabolic refinement of the
+                            // time-bin peak. Costs 2 extra score evaluations
+                            // per kept candidate. Both hb-044 (sort by
+                            // refined score) and hb-068 batch-8 variant (d,
+                            // sort by integer-bin score; only use fractional
+                            // offset in symbol extraction) were tested batch
+                            // 7-8 and BOTH regressed hard-200. Default off;
+                            // kept for research only.
+                            //
+                            // hb-068 batch-14 variants (when interpolation is
+                            // on AND a knob is set):
+                            // - (a) score gate: skip refinement entirely if
+                            //   `score ≤ sync_time_interp_score_gate`.
+                            // - (b) delta scale: multiply parabolic delta by
+                            //   `sync_time_interp_delta_scale` (and recompute
+                            //   refined score consistently).
+                            // - (c) reject large delta: if `|delta| >
+                            //   sync_time_interp_max_delta_abs`, fall back to
+                            //   integer-bin (delta=0, original score).
+                            let (refined_score, time_refinement) = context.refine_costas_score(
+                                spectrogram,
+                                t0,
+                                f0,
+                                freq_sub,
+                                max_time_step,
+                                score,
+                            );
+                            candidates.push(CostasCandidate {
+                                time_step: t0,
+                                freq_bin: f0,
+                                freq_sub,
+                                sync_score: refined_score,
+                                time_refinement,
+                            });
+                        }
+                    }
+                    (candidates, tight, wide)
+                })
+                .collect();
+            for (work, (local, tight, wide)) in results.into_iter().enumerate() {
+                candidates.extend(local);
+                if two_baseline_enabled {
+                    let sub = work / (times * chunks);
+                    let offset = (work % chunks) * CHUNK_BINS;
+                    for (i, (tight, wide)) in tight.into_iter().zip(wide).enumerate() {
+                        // Strict > and ordered merge keep the earliest t0 on ties.
+                        if tight.0 > tight_peaks[sub][offset + i].0 {
+                            tight_peaks[sub][offset + i] = tight;
+                        }
+                        if wide.0 > wide_peaks[sub][offset + i].0 {
+                            wide_peaks[sub][offset + i] = wide;
+                        }
+                    }
+                }
+            }
+        } else {
+            for freq_sub in 0..spectrogram.freq_osr {
+                for t0 in 0..=max_time_step {
+                    for f0 in lo..hi {
+                        let score = scored(t0, f0, freq_sub);
+
+                        if two_baseline_enabled {
+                            let bin_idx = f0 - lo;
+                            // Wide pathway: any t0 contributes.
+                            if score > wide_peaks[freq_sub][bin_idx].0 {
+                                wide_peaks[freq_sub][bin_idx] = (score, t0);
                             }
-                        } else {
-                            min_score
-                        };
-                    if score > candidate_threshold {
-                        // hb-044: optional parabolic refinement of the
-                        // time-bin peak. Costs 2 extra score evaluations
-                        // per kept candidate. Both hb-044 (sort by
-                        // refined score) and hb-068 batch-8 variant (d,
-                        // sort by integer-bin score; only use fractional
-                        // offset in symbol extraction) were tested batch
-                        // 7-8 and BOTH regressed hard-200. Default off;
-                        // kept for research only.
-                        //
-                        // hb-068 batch-14 variants (when interpolation is
-                        // on AND a knob is set):
-                        // - (a) score gate: skip refinement entirely if
-                        //   `score ≤ sync_time_interp_score_gate`.
-                        // - (b) delta scale: multiply parabolic delta by
-                        //   `sync_time_interp_delta_scale` (and recompute
-                        //   refined score consistently).
-                        // - (c) reject large delta: if `|delta| >
-                        //   sync_time_interp_max_delta_abs`, fall back to
-                        //   integer-bin (delta=0, original score).
-                        let (refined_score, time_refinement) = self.refine_costas_score(
-                            spectrogram,
-                            t0,
-                            f0,
-                            freq_sub,
-                            max_time_step,
-                            score,
-                        );
-                        candidates.push(CostasCandidate {
-                            time_step: t0,
-                            freq_bin: f0,
-                            freq_sub,
-                            sync_score: refined_score,
-                            time_refinement,
-                        });
+                            // Tight pathway: only t0 ≤ tight_steps from the
+                            // nominal slot start. With `time_padding = 0`
+                            // and the t0 sweep starting at 0, "tight"
+                            // means low t0 values.
+                            if t0 <= tight_steps && score > tight_peaks[freq_sub][bin_idx].0 {
+                                tight_peaks[freq_sub][bin_idx] = (score, t0);
+                            }
+                        }
+
+                        // hb-230: per-candidate threshold. Outside the
+                        // near-partner window (or with the feature off) this
+                        // is exactly `min_score` — the historical gate.
+                        // Inside the window it relaxes to
+                        // `max(0, min_score + score_delta)`.
+                        let candidate_threshold =
+                            if let Some((partner, radius, relaxed)) = relaxed_window {
+                                let sub_off = freq_sub as f64 * (tone_spacing_hz / FREQ_OSR as f64);
+                                let cand_freq = f0 as f64 * tone_spacing_hz + sub_off;
+                                if (cand_freq - partner).abs() <= radius {
+                                    relaxed
+                                } else {
+                                    min_score
+                                }
+                            } else {
+                                min_score
+                            };
+                        if score > candidate_threshold {
+                            // hb-044: optional parabolic refinement of the
+                            // time-bin peak. Costs 2 extra score evaluations
+                            // per kept candidate. Both hb-044 (sort by
+                            // refined score) and hb-068 batch-8 variant (d,
+                            // sort by integer-bin score; only use fractional
+                            // offset in symbol extraction) were tested batch
+                            // 7-8 and BOTH regressed hard-200. Default off;
+                            // kept for research only.
+                            //
+                            // hb-068 batch-14 variants (when interpolation is
+                            // on AND a knob is set):
+                            // - (a) score gate: skip refinement entirely if
+                            //   `score ≤ sync_time_interp_score_gate`.
+                            // - (b) delta scale: multiply parabolic delta by
+                            //   `sync_time_interp_delta_scale` (and recompute
+                            //   refined score consistently).
+                            // - (c) reject large delta: if `|delta| >
+                            //   sync_time_interp_max_delta_abs`, fall back to
+                            //   integer-bin (delta=0, original score).
+                            let (refined_score, time_refinement) = self.refine_costas_score(
+                                spectrogram,
+                                t0,
+                                f0,
+                                freq_sub,
+                                max_time_step,
+                                score,
+                            );
+                            candidates.push(CostasCandidate {
+                                time_step: t0,
+                                freq_bin: f0,
+                                freq_sub,
+                                sync_score: refined_score,
+                                time_refinement,
+                            });
+                        }
                     }
                 }
             }
@@ -7103,235 +7247,49 @@ impl Ft8Decoder {
     #[inline]
     fn costas_score_full_or_partial(
         &self,
-        spectrogram: &Spectrogram,
+        spec: &Spectrogram,
         t0: usize,
         f0: usize,
-        freq_sub: usize,
+        sub: usize,
     ) -> f64 {
-        let full = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
-        if self.config.costas_partial_metric_enabled {
-            let partial = self.compute_costas_score_partial_bc(spectrogram, t0, f0, freq_sub);
-            full.max(partial)
-        } else {
-            full
-        }
+        self.costas_context()
+            .costas_score_full_or_partial(spec, t0, f0, sub)
     }
 
-    /// Apply the `sync_time_interpolation` parabolic peak refinement to an
-    /// already-computed `score`, returning `(sync_score, time_refinement)`.
-    ///
-    /// Extracted verbatim from the native sweep so the PAN-7 seed union can
-    /// re-score seeds on exactly the same scale. That matters more than it
-    /// looks: `sync_time_interpolation` defaults **true**, so every native
-    /// `sync_score` is the refined value. A seed re-scored with a bare
-    /// `compute_costas_score` would sit on a systematically lower scale,
-    /// biasing it out of the shared truncate, the LDPC score buckets and the AP
-    /// gate — defeating the comparability the union exists to achieve.
     fn refine_costas_score(
-        &self,
-        spectrogram: &Spectrogram,
-        t0: usize,
-        f0: usize,
-        freq_sub: usize,
-        max_time_step: usize,
-        score: f64,
-    ) -> (f64, f64) {
-        if self.config.sync_time_interpolation
-            && t0 > 0
-            && t0 < max_time_step
-            && score > self.config.sync_time_interp_score_gate
-        {
-            // hb-245: parabolic peak interpolation (sub-sample DT
-            // refinement). Neighbour scores go through the same
-            // full/partial rule as the centre so the refined-score scale
-            // stays consistent. The math is the textbook Smith parabola
-            // through three equally-spaced points, already proven correct
-            // by `parabolic_peak_refinement` and its unit tests.
-            let y_left = self.costas_score_full_or_partial(spectrogram, t0 - 1, f0, freq_sub);
-            let y_right = self.costas_score_full_or_partial(spectrogram, t0 + 1, f0, freq_sub);
-            let (mut r_score, mut r_delta) = parabolic_peak_refinement(y_left, score, y_right);
-            // (b) delta scale: rescale the offset and recompute the score
-            // from the parabola so the score reflects the position used.
-            let scale = self.config.sync_time_interp_delta_scale;
-            if (scale - 1.0).abs() > f64::EPSILON && r_delta.abs() > 0.0 {
-                let a = (y_left + y_right - 2.0 * score) * 0.5;
-                let b = (y_right - y_left) * 0.5;
-                r_delta *= scale;
-                r_score = score + b * r_delta + a * r_delta * r_delta;
-            }
-            // (c) reject large delta: post-clamp/scale, if magnitude
-            // exceeds threshold, fall back to integer-bin position +
-            // original score.
-            if let Some(max_abs) = self.config.sync_time_interp_max_delta_abs {
-                if r_delta.abs() > max_abs {
-                    r_score = score;
-                    r_delta = 0.0;
-                }
-            }
-            (r_score, r_delta)
-        } else {
-            (score, 0.0)
-        }
-    }
-
-    fn compute_costas_score(
         &self,
         spec: &Spectrogram,
         t0: usize,
         f0: usize,
-        freq_sub: usize,
-    ) -> f64 {
-        // Full-Costas metric: all three sync groups (block A + B + C).
-        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |_| true)
+        sub: usize,
+        max_time: usize,
+        score: f64,
+    ) -> (f64, f64) {
+        self.costas_context()
+            .refine_costas_score(spec, t0, f0, sub, max_time, score)
     }
 
-    /// Partial-Costas metric (`sync_bc`). Computes the sync score
-    /// using ONLY the second and third Costas blocks (symbols 36–42 and
-    /// 72–78), skipping block A. This is the slot-edge rescue metric:
-    /// when the leading edge of the audio is missing or corrupted and
-    /// block A contains noise/garbage, the full metric collapses while
-    /// the partial metric remains meaningful. Inspired by wsjtr's
-    /// `sync_bc` and WSJT-X mainline `sync8.f90`, this is intended to be
-    /// combined with the full metric via `max(full, partial)` at the
-    /// candidate-emission site — never as a replacement for the full
-    /// metric on healthy signals.
+    fn compute_costas_score(&self, spec: &Spectrogram, t0: usize, f0: usize, sub: usize) -> f64 {
+        self.costas_context()
+            .compute_costas_score(spec, t0, f0, sub)
+    }
+
     fn compute_costas_score_partial_bc(
         &self,
         spec: &Spectrogram,
         t0: usize,
         f0: usize,
-        freq_sub: usize,
+        sub: usize,
     ) -> f64 {
-        // Partial: skip group 0 (block A); only blocks B (m=1) and C (m=2).
-        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |m| m != 0)
+        self.costas_context()
+            .compute_costas_score_partial_bc(spec, t0, f0, sub)
     }
 
-    /// Inner Costas-score kernel parameterised by which sync groups to
-    /// include. `keep_group(m)` is consulted once per group; pass
-    /// `|_| true` for the full ABC metric or `|m| m != 0` for the
-    /// partial BC metric.
-    ///
-    /// Because the score is an *average* (sum of per-comparison
-    /// differences divided by the comparison count, not a sum), the
-    /// full and partial metrics live on the same scale — `max(full,
-    /// partial)` is a meaningful selection rule without any
-    /// per-pathway threshold adjustment.
-    fn compute_costas_score_groups<F: Fn(usize) -> bool>(
-        &self,
-        spec: &Spectrogram,
-        t0: usize,
-        f0: usize,
-        freq_sub: usize,
-        keep_group: F,
-    ) -> f64 {
-        let pp = &self.protocol_params;
-
-        // With TIME_OSR>1, the outer t0 loop already iterates at sub-symbol
-        // resolution, so we only need to check 2 half-symbol offsets within
-        // each t0 position (as in the original TIME_OSR=1 code).
-        let steps_per_symbol = TIME_OSR;
-        let mut best_score = 0.0f64;
-
-        // Batch 92: with TIME_OSR >= 2 the outer t0 sweep already visits
-        // half-symbol offsets — the kernel at (t0, half=1) reads exactly
-        // the same cells as (t0+1, half=0) — so the half loop creates a
-        // two-step score plateau (`score(t0) = max(g(t0), g(t0+1))`)
-        // whose tie-break emits candidates one sync step early. When
-        // `costas_half_loop_disabled` is set, evaluate half=0 only.
-        // Guard: at TIME_OSR < 2 the half loop is NOT redundant (the t0
-        // grid is whole-symbol), so the flag is ignored there.
-        let half_count = if self.config.costas_half_loop_disabled && TIME_OSR >= 2 {
-            1
-        } else {
-            2
-        };
-
-        for half in 0..half_count {
-            let mut score = 0.0f64;
-            let mut num_average = 0usize;
-
-            for (m, &group_start) in pp.costas_positions.iter().enumerate() {
-                if !keep_group(m) {
-                    continue;
-                }
-                for k in 0..pp.costas_length {
-                    let symbol_idx = group_start + k;
-                    let time_idx = t0 + symbol_idx * steps_per_symbol + half;
-
-                    if time_idx >= spec.num_steps {
-                        continue;
-                    }
-
-                    let sm = pp.costas_arrays[m][k] as usize; // expected tone bin
-                    let freq_idx = f0 + sm;
-
-                    if freq_idx >= spec.num_bins {
-                        continue;
-                    }
-
-                    // Perf (Pass 2 / A3): hoist the `[time_idx][freq_sub]` row out
-                    // of this hot Costas-score loop. signal_mag and both frequency
-                    // neighbors index the same (time, freq_sub) plane, so resolving
-                    // the two outer `Vec` indirections once and reusing the row
-                    // slice is bit-identical — same order of reads — and removes
-                    // two pointer-chases per access in the innermost loop.
-                    //
-                    // perf F4: the row is `SpecScalar` (f32) storage; upcast to
-                    // f64 immediately at each read so the score accumulation
-                    // keeps its historical f64 arithmetic — only the storage
-                    // (and the half-size cache footprint that goes with it)
-                    // changed, not the scoring precision.
-                    let row = spec.row(time_idx, freq_sub);
-                    let signal_mag = row[freq_idx] as f64;
-
-                    // Check frequency neighbor below
-                    if sm > 0 && f0 + sm - 1 < spec.num_bins {
-                        let neighbor = row[f0 + sm - 1] as f64;
-                        score += signal_mag - neighbor;
-                        num_average += 1;
-                    }
-
-                    // Check frequency neighbor above
-                    if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
-                        let neighbor = row[f0 + sm + 1] as f64;
-                        score += signal_mag - neighbor;
-                        num_average += 1;
-                    }
-
-                    // Check time neighbor behind (previous symbol in this sync group)
-                    if k > 0 && time_idx >= steps_per_symbol {
-                        let prev_time = time_idx - steps_per_symbol;
-                        if prev_time < spec.num_steps {
-                            let neighbor = spec.at(prev_time, freq_sub, freq_idx) as f64;
-                            score += signal_mag - neighbor;
-                            num_average += 1;
-                        }
-                    }
-
-                    // Check time neighbor ahead (next symbol in this sync group)
-                    if k + 1 < pp.costas_length {
-                        let next_time = time_idx + steps_per_symbol;
-                        if next_time < spec.num_steps {
-                            let neighbor = spec.at(next_time, freq_sub, freq_idx) as f64;
-                            score += signal_mag - neighbor;
-                            num_average += 1;
-                        }
-                    }
-                }
-            }
-
-            let half_score = if num_average > 0 {
-                score / num_average as f64
-            } else {
-                0.0
-            };
-
-            if half_score > best_score {
-                best_score = half_score;
-            }
+    fn costas_context(&self) -> CostasScoringContext<'_> {
+        CostasScoringContext {
+            config: &self.config,
+            protocol_params: &self.protocol_params,
         }
-
-        best_score
     }
 
     /// Whether the pass-0 ft8_lib seed-union block should run for this
@@ -30194,5 +30152,541 @@ mod pan160_queue_tests {
         );
         assert!(!ap_timing_sender_matches(&m, "W1AW"));
         assert!(ap_timing_sender_matches(&m, "K2XYZ"));
+    }
+}
+
+#[cfg(test)]
+mod pan317_tests {
+    use super::*;
+    use crate::WINDOW_SAMPLES;
+    use rayon::ThreadPoolBuilder;
+
+    fn recording(path: &str) -> Spectrogram {
+        let mut reader =
+            hound::WavReader::open(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+                .unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, SAMPLE_RATE);
+        let mut audio: Vec<f64> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f64 / 32768.0)
+            .collect();
+        audio.resize(WINDOW_SAMPLES, 0.0);
+        Ft8Decoder::new(Ft8Config::default())
+            .unwrap()
+            .compute_spectrogram(&audio)
+            .unwrap()
+    }
+
+    fn bits(candidates: &[CostasCandidate]) -> Vec<(usize, usize, usize, u64, u64)> {
+        candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.time_step,
+                    c.freq_bin,
+                    c.freq_sub,
+                    c.sync_score.to_bits(),
+                    c.time_refinement.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    fn search(
+        dec: &Ft8Decoder,
+        spec: &Spectrogram,
+        parallel: bool,
+        scope: Option<&RangeInclusive<usize>>,
+        defer: bool,
+    ) -> Vec<CostasCandidate> {
+        dec.costas_sync_search_impl(
+            spec,
+            dec.config.min_sync_score,
+            scope,
+            Some(1000.0),
+            defer,
+            parallel,
+        )
+        .unwrap()
+    }
+
+    fn compare(
+        spec: &Spectrogram,
+        config: Ft8Config,
+        scope: Option<RangeInclusive<usize>>,
+        defer: bool,
+    ) {
+        let oracle = search(
+            &Ft8Decoder::new(config.clone()).unwrap(),
+            spec,
+            false,
+            scope.as_ref(),
+            defer,
+        );
+        for workers in [1, 2, 4] {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let dec = Ft8Decoder::new(config.clone()).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        bits(&oracle),
+                        bits(&search(&dec, spec, true, scope.as_ref(), defer)),
+                        "workers={workers}, scope={scope:?}"
+                    );
+                }
+                assert_eq!(
+                    bits(&oracle),
+                    bits(
+                        &dec.costas_sync_search_with_threshold_and_partner(
+                            spec,
+                            dec.config.min_sync_score,
+                            scope.as_ref(),
+                            Some(1000.0),
+                            defer
+                        )
+                        .unwrap()
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn pan317_recorded_candidates_match_serial() {
+        for fixture in [
+            "tests/fixtures/wav/generated/ft8_cq.wav",
+            "tests/fixtures/wav/wsjt/210703_133430.wav",
+            "tests/fixtures/wav/jtdx/190227_155815.wav",
+            "vendor/ft8_lib/test/wav/20m_busy/test_01.wav",
+        ] {
+            let spec = recording(fixture);
+            for variant in 0..10 {
+                let mut cfg = Ft8Config::default();
+                cfg.nms_enabled = true;
+                match variant {
+                    1 => cfg.costas_two_baseline_enabled = true,
+                    2 => cfg.costas_partial_metric_enabled = true,
+                    3 => cfg.per_bin_candidate_selection = true,
+                    4 => {
+                        cfg.costas_two_baseline_enabled = true;
+                        cfg.costas_partial_metric_enabled = true;
+                        cfg.per_bin_candidate_selection = true;
+                    }
+                    5 => cfg.sync_time_interpolation = false,
+                    6 => cfg.sync_time_interp_delta_scale = 0.5,
+                    7 => cfg.sync_time_interp_max_delta_abs = Some(0.1),
+                    8 => cfg.sync_time_interp_score_gate = 5.0,
+                    9 => {
+                        cfg.relaxed_sync_near_partner_hz_radius = Some(100.0);
+                        cfg.relaxed_sync_near_partner_score_delta = -1.0;
+                    }
+                    _ => {}
+                }
+                for half in [false, true] {
+                    cfg.costas_half_loop_disabled = half;
+                    for defer in [false, true] {
+                        compare(
+                            &spec,
+                            cfg.clone(),
+                            if variant == 9 { Some(120..=190) } else { None },
+                            defer,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn flat_spec() -> Spectrogram {
+        Spectrogram {
+            power: vec![1.0; 180 * 2 * 80],
+            complex: None,
+            num_steps: 180,
+            num_bins: 80,
+            freq_osr: 2,
+            time_padding: 0,
+        }
+    }
+
+    #[test]
+    fn pan317_ties_and_scopes_match_serial() {
+        let spec = flat_spec();
+        let cfg = Ft8Config {
+            min_sync_score: -1.0,
+            max_sync_candidates: 10000,
+            sync_time_interpolation: false,
+            ..Ft8Config::default()
+        };
+        for scope in [None, Some(30..=65), Some(34..=34), Some(100..=110)] {
+            compare(&spec, cfg.clone(), scope, false);
+        }
+        let dec = Ft8Decoder::new(cfg.clone()).unwrap();
+        let ties = search(&dec, &spec, true, Some(&(30..=65)), false);
+        let expected: Vec<_> = (0..2)
+            .flat_map(|sub| (0..=21).flat_map(move |t| (30..=65).map(move |f| (t, f, sub))))
+            .collect();
+        assert_eq!(
+            ties.iter()
+                .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        // Constant per-time spectral slopes yield positive, exactly tied peaks.
+        // Auxiliary baseline emission must choose t0=0 even across work IDs.
+        let mut slope = flat_spec();
+        for t in 0..slope.num_steps {
+            for sub in 0..2 {
+                for f in 0..80 {
+                    let idx = slope.idx(t, sub, f);
+                    slope.power[idx] = -((f * f) as f32);
+                }
+            }
+        }
+        let peak_cfg = Ft8Config {
+            min_sync_score: f64::MAX,
+            costas_two_baseline_enabled: true,
+            costas_two_baseline_norm_threshold: 0.0,
+            ..cfg
+        };
+        compare(&slope, peak_cfg.clone(), Some(1..=65), false);
+        let peaks = search(
+            &Ft8Decoder::new(peak_cfg).unwrap(),
+            &slope,
+            true,
+            Some(&(1..=65)),
+            false,
+        );
+        assert!(!peaks.is_empty());
+        assert!(peaks.iter().all(|c| c.time_step == 0));
+    }
+
+    #[test]
+    fn pan317_per_bin_order_is_repeatable() {
+        let spec = flat_spec();
+        let cfg = Ft8Config {
+            min_sync_score: -1.0,
+            max_sync_candidates: 10000,
+            sync_time_interpolation: false,
+            per_bin_candidate_selection: true,
+            ..Ft8Config::default()
+        };
+        compare(&spec, cfg.clone(), Some(30..=65), false);
+        let dec = Ft8Decoder::new(cfg).unwrap();
+        let result = search(&dec, &spec, true, Some(&(30..=65)), false);
+        assert!(result.windows(2).all(|w| w[0].freq_bin <= w[1].freq_bin));
+        assert_eq!(result[0].time_step, 0);
+        assert_eq!(result[0].freq_sub, 0);
+        for group in result.chunks_exact(PER_BIN_CANDIDATE_TOP_K) {
+            assert_eq!(group.len(), 2);
+            assert_eq!(group[0].time_step, 0);
+            assert_eq!(group[1].time_step, 1);
+            assert!(group.iter().all(|c| c.freq_sub == 0));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires release build and at least four available CPUs"]
+    fn pan317_four_worker_speedup() {
+        assert!(!cfg!(debug_assertions), "run in release mode");
+        let spec = recording("tests/fixtures/wav/jtdx/190227_155815.wav");
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            let dec = Ft8Decoder::new(Ft8Config::default()).unwrap();
+            for _ in 0..5 {
+                std::hint::black_box(search(&dec, &spec, false, None, false));
+                std::hint::black_box(search(&dec, &spec, true, None, false));
+            }
+            let mut serial = Vec::new();
+            let mut parallel = Vec::new();
+            for i in 0..21 {
+                let mut outputs = Vec::new();
+                for par in if i % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let start = std::time::Instant::now();
+                    let result = std::hint::black_box(search(&dec, &spec, par, None, false));
+                    let elapsed = start.elapsed();
+                    if par {
+                        parallel.push(elapsed);
+                    } else {
+                        serial.push(elapsed);
+                    }
+                    outputs.push(result);
+                }
+                assert_eq!(bits(&outputs[0]), bits(&outputs[1]));
+            }
+            serial.sort();
+            parallel.sort();
+            let ratio = serial[10].as_secs_f64() / parallel[10].as_secs_f64();
+            println!(
+                "PAN-317: serial median {:?}; parallel median {:?}; speedup {ratio:.3}x; 21 pairs",
+                serial[10], parallel[10]
+            );
+            // Check affinity and quota independently; exposed logical cores alone do not qualify.
+            let affinity = std::thread::available_parallelism().unwrap().get();
+            let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")
+                .ok()
+                .and_then(|s| {
+                    let mut fields = s.split_whitespace();
+                    let q = fields.next()?.parse::<f64>().ok()?;
+                    let period = fields.next()?.parse::<f64>().ok()?;
+                    Some(q / period)
+                });
+            println!("available_parallelism={affinity}, cgroup quota={quota:?}");
+            assert!(
+                affinity >= 4 && quota.is_none_or(|q| q >= 4.0),
+                "unqualified host: requires four available CPUs"
+            );
+            assert!(ratio >= 2.0, "four-worker sweep speedup {ratio:.3}x < 2x");
+        });
+    }
+}
+
+/// Immutable inputs for the Costas kernels. Never capture Ft8Decoder in Rayon work.
+struct CostasScoringContext<'a> {
+    config: &'a Ft8Config,
+    protocol_params: &'a ProtocolParams,
+}
+
+impl CostasScoringContext<'_> {
+    #[inline]
+    fn costas_score_full_or_partial(
+        &self,
+        spectrogram: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
+        let full = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
+        if self.config.costas_partial_metric_enabled {
+            let partial = self.compute_costas_score_partial_bc(spectrogram, t0, f0, freq_sub);
+            full.max(partial)
+        } else {
+            full
+        }
+    }
+
+    /// Apply the `sync_time_interpolation` parabolic peak refinement to an
+    /// already-computed `score`, returning `(sync_score, time_refinement)`.
+    ///
+    /// Extracted verbatim from the native sweep so the PAN-7 seed union can
+    /// re-score seeds on exactly the same scale. That matters more than it
+    /// looks: `sync_time_interpolation` defaults **true**, so every native
+    /// `sync_score` is the refined value. A seed re-scored with a bare
+    /// `compute_costas_score` would sit on a systematically lower scale,
+    /// biasing it out of the shared truncate, the LDPC score buckets and the AP
+    /// gate — defeating the comparability the union exists to achieve.
+    fn refine_costas_score(
+        &self,
+        spectrogram: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+        max_time_step: usize,
+        score: f64,
+    ) -> (f64, f64) {
+        if self.config.sync_time_interpolation
+            && t0 > 0
+            && t0 < max_time_step
+            && score > self.config.sync_time_interp_score_gate
+        {
+            // hb-245: parabolic peak interpolation (sub-sample DT
+            // refinement). Neighbour scores go through the same
+            // full/partial rule as the centre so the refined-score scale
+            // stays consistent. The math is the textbook Smith parabola
+            // through three equally-spaced points, already proven correct
+            // by `parabolic_peak_refinement` and its unit tests.
+            let y_left = self.costas_score_full_or_partial(spectrogram, t0 - 1, f0, freq_sub);
+            let y_right = self.costas_score_full_or_partial(spectrogram, t0 + 1, f0, freq_sub);
+            let (mut r_score, mut r_delta) = parabolic_peak_refinement(y_left, score, y_right);
+            // (b) delta scale: rescale the offset and recompute the score
+            // from the parabola so the score reflects the position used.
+            let scale = self.config.sync_time_interp_delta_scale;
+            if (scale - 1.0).abs() > f64::EPSILON && r_delta.abs() > 0.0 {
+                let a = (y_left + y_right - 2.0 * score) * 0.5;
+                let b = (y_right - y_left) * 0.5;
+                r_delta *= scale;
+                r_score = score + b * r_delta + a * r_delta * r_delta;
+            }
+            // (c) reject large delta: post-clamp/scale, if magnitude
+            // exceeds threshold, fall back to integer-bin position +
+            // original score.
+            if let Some(max_abs) = self.config.sync_time_interp_max_delta_abs {
+                if r_delta.abs() > max_abs {
+                    r_score = score;
+                    r_delta = 0.0;
+                }
+            }
+            (r_score, r_delta)
+        } else {
+            (score, 0.0)
+        }
+    }
+
+    fn compute_costas_score(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
+        // Full-Costas metric: all three sync groups (block A + B + C).
+        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |_| true)
+    }
+
+    /// Partial-Costas metric (`sync_bc`). Computes the sync score
+    /// using ONLY the second and third Costas blocks (symbols 36–42 and
+    /// 72–78), skipping block A. This is the slot-edge rescue metric:
+    /// when the leading edge of the audio is missing or corrupted and
+    /// block A contains noise/garbage, the full metric collapses while
+    /// the partial metric remains meaningful. Inspired by wsjtr's
+    /// `sync_bc` and WSJT-X mainline `sync8.f90`, this is intended to be
+    /// combined with the full metric via `max(full, partial)` at the
+    /// candidate-emission site — never as a replacement for the full
+    /// metric on healthy signals.
+    fn compute_costas_score_partial_bc(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
+        // Partial: skip group 0 (block A); only blocks B (m=1) and C (m=2).
+        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |m| m != 0)
+    }
+
+    /// Inner Costas-score kernel parameterised by which sync groups to
+    /// include. `keep_group(m)` is consulted once per group; pass
+    /// `|_| true` for the full ABC metric or `|m| m != 0` for the
+    /// partial BC metric.
+    ///
+    /// Because the score is an *average* (sum of per-comparison
+    /// differences divided by the comparison count, not a sum), the
+    /// full and partial metrics live on the same scale — `max(full,
+    /// partial)` is a meaningful selection rule without any
+    /// per-pathway threshold adjustment.
+    fn compute_costas_score_groups<F: Fn(usize) -> bool>(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+        keep_group: F,
+    ) -> f64 {
+        let pp = &self.protocol_params;
+
+        // With TIME_OSR>1, the outer t0 loop already iterates at sub-symbol
+        // resolution, so we only need to check 2 half-symbol offsets within
+        // each t0 position (as in the original TIME_OSR=1 code).
+        let steps_per_symbol = TIME_OSR;
+        let mut best_score = 0.0f64;
+
+        // Batch 92: with TIME_OSR >= 2 the outer t0 sweep already visits
+        // half-symbol offsets — the kernel at (t0, half=1) reads exactly
+        // the same cells as (t0+1, half=0) — so the half loop creates a
+        // two-step score plateau (`score(t0) = max(g(t0), g(t0+1))`)
+        // whose tie-break emits candidates one sync step early. When
+        // `costas_half_loop_disabled` is set, evaluate half=0 only.
+        // Guard: at TIME_OSR < 2 the half loop is NOT redundant (the t0
+        // grid is whole-symbol), so the flag is ignored there.
+        let half_count = if self.config.costas_half_loop_disabled && TIME_OSR >= 2 {
+            1
+        } else {
+            2
+        };
+
+        for half in 0..half_count {
+            let mut score = 0.0f64;
+            let mut num_average = 0usize;
+
+            for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+                if !keep_group(m) {
+                    continue;
+                }
+                for k in 0..pp.costas_length {
+                    let symbol_idx = group_start + k;
+                    let time_idx = t0 + symbol_idx * steps_per_symbol + half;
+
+                    if time_idx >= spec.num_steps {
+                        continue;
+                    }
+
+                    let sm = pp.costas_arrays[m][k] as usize; // expected tone bin
+                    let freq_idx = f0 + sm;
+
+                    if freq_idx >= spec.num_bins {
+                        continue;
+                    }
+
+                    // Perf (Pass 2 / A3): hoist the `[time_idx][freq_sub]` row out
+                    // of this hot Costas-score loop. signal_mag and both frequency
+                    // neighbors index the same (time, freq_sub) plane, so resolving
+                    // the two outer `Vec` indirections once and reusing the row
+                    // slice is bit-identical — same order of reads — and removes
+                    // two pointer-chases per access in the innermost loop.
+                    //
+                    // perf F4: the row is `SpecScalar` (f32) storage; upcast to
+                    // f64 immediately at each read so the score accumulation
+                    // keeps its historical f64 arithmetic — only the storage
+                    // (and the half-size cache footprint that goes with it)
+                    // changed, not the scoring precision.
+                    let row = spec.row(time_idx, freq_sub);
+                    let signal_mag = row[freq_idx] as f64;
+
+                    // Check frequency neighbor below
+                    if sm > 0 && f0 + sm - 1 < spec.num_bins {
+                        let neighbor = row[f0 + sm - 1] as f64;
+                        score += signal_mag - neighbor;
+                        num_average += 1;
+                    }
+
+                    // Check frequency neighbor above
+                    if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
+                        let neighbor = row[f0 + sm + 1] as f64;
+                        score += signal_mag - neighbor;
+                        num_average += 1;
+                    }
+
+                    // Check time neighbor behind (previous symbol in this sync group)
+                    if k > 0 && time_idx >= steps_per_symbol {
+                        let prev_time = time_idx - steps_per_symbol;
+                        if prev_time < spec.num_steps {
+                            let neighbor = spec.at(prev_time, freq_sub, freq_idx) as f64;
+                            score += signal_mag - neighbor;
+                            num_average += 1;
+                        }
+                    }
+
+                    // Check time neighbor ahead (next symbol in this sync group)
+                    if k + 1 < pp.costas_length {
+                        let next_time = time_idx + steps_per_symbol;
+                        if next_time < spec.num_steps {
+                            let neighbor = spec.at(next_time, freq_sub, freq_idx) as f64;
+                            score += signal_mag - neighbor;
+                            num_average += 1;
+                        }
+                    }
+                }
+            }
+
+            let half_score = if num_average > 0 {
+                score / num_average as f64
+            } else {
+                0.0
+            };
+
+            if half_score > best_score {
+                best_score = half_score;
+            }
+        }
+
+        best_score
     }
 }
