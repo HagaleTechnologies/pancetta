@@ -14,7 +14,7 @@
 A deep pass over pancetta's autonomous QSO handling: (A) state-machine correctness for
 happy-path and edge-case QSOs, and (B) the TX-timing "jank" the operator observes
 (redundant re-transmits, full-cycle start delays, multi-TX slow-start). **Analysis only
-— nothing implemented.** Read alongside `docs/qso-engine-bugs.md` (two already-triaged
+— nothing implemented.** Read alongside `docs/archive/qso-engine-bugs.md` (two already-triaged
 bugs this analysis generalizes).
 
 ## Executive summary
@@ -98,7 +98,7 @@ disagree.
   (`RespondingToCq` + `CqResponse`, `their_report: None`) after we sent a plain
   `SignalReport`. But the rearm unconditionally re-emits `ReportAck` (R-NN), so a QSO
   that advanced via stuck-at-grid keep-calls a rung *ahead* of what it last sent. **This
-  is the same defect family as `docs/qso-engine-bugs.md` BUG 2** (rearm's
+  is the same defect family as `docs/archive/qso-engine-bugs.md` BUG 2** (rearm's
   `SendingReport => ReportAck` arm ignores `their_report`). One fix closes both: gate
   the rearm on `their_report` (`None` ⇒ re-emit `SignalReport`; `Some` ⇒ `ReportAck`).
 - **GAP-5 (low — defensive) — no explicit self-echo reject.** Nothing filters
@@ -230,7 +230,7 @@ Two mechanisms cause most of the jank:
 2. **Boundary-anchor / pre-sleep `now` for the collection window** (Symptoms B + C) —
    `tx.rs` scheduling; also the cleanest fix for the multi-TX slow-start.
 3. **GAP-1 early-close arm** for `RespondingToCq` — small, closes a stall.
-4. **BUG 1 CQ parity latch** (`docs/qso-engine-bugs.md`) — independent but same
+4. **BUG 1 CQ parity latch** (`docs/archive/qso-engine-bugs.md`) — independent but same
    subsystem; fold in.
 5. **GAP-5 self-echo reject** + **GAP-4 dead `SendingConfirmation`** — low-cost hardening
    / cleanup.

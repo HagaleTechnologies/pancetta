@@ -24,7 +24,7 @@ in `pancetta.toml` (see docs/CONFIG.md) — no code changes required.
 
 ## Priority Scoring Engine
 
-Each decoded CQ is scored against a weighted set of criteria: needed DXCC entity (35%), needed grid square (20%), POTA/SOTA activation (15%), rarity score (10%), signal strength (5%), plus a +0.15 bonus for an all-time new one (ATNO), with duplicate and recent-failure penalties applied on top. A separate 6-tier ranking drives the DX Hunter panel. The weights are fully configurable via `PriorityWeights`, making it straightforward to tune for DX chasing, grid hunting, or contest operating. Scoring is stateless and synchronous — all external state (worked stations, recent failures, DXCC/grid needed sets) is injected via the `WorkedStationLookup` trait, keeping the engine pure and unit-testable. Score breakdowns are emitted per candidate for logging and diagnostics.
+DX Hunter ranks six tiers, highest first: ATNO, per-band DXCC new, special station, per-band grid new, standard, suspect. Its within-tier score excludes bonuses already represented by tiers. Autonomous admission still uses the configurable weighted score and `min_dx_score`. With `pounce_min_tier` configured, autonomous candidates sort by tier, then weighted score; otherwise they sort by weighted score.
 
 ## Multi-Stream TX
 
@@ -40,7 +40,7 @@ FT8 TX honors WSJT-X-style slot parity and supports late-start audio playback up
 
 ## Hardware Integration
 
-Hamlib CAT control is integrated via a TCP client to `rigctld`. The config defaults are a Generic rig at 9600 baud; the maintainer's station runs a Yaesu FTdx10 (Hamlib model 1042) over USB at 38400 baud. Pancetta sets the frequency and split and keys PTT; it never sets the rig mode. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
+Hamlib CAT control is integrated via a TCP client to `rigctld`. The config defaults are a Generic rig at 9600 baud; the maintainer's station runs a Yaesu FTdx10 (Hamlib model 1042) over USB at 38400 baud. Pancetta controls frequency, split and PTT. Optional `[rig] data_mode` sets the CAT mode on connection and after commanded retunes. Omit it for manual mode control. This option is hardware-unverified. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
 
 ## Terminal Interface
 
