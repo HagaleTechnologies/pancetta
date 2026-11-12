@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- PAN-328: `pancetta-dx::DxError` now stores a private `Box<DxErrorInner>`. Construct variants with `DxErrorInner::Variant(...).into()` and inspect them through `error.kind()`. Display text, source conversions and upload classification remain unchanged.
+
 - `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`) and turns on the `serde` feature, so a `transmit` build also gets the crate's serde derives. `decode_cycle` output is unchanged (PAN-331).
 
 ### Fixed
