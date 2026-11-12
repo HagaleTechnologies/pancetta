@@ -1485,10 +1485,8 @@ impl Ft8Message {
     }
 
     fn text_looks_like_callsign(s: &str) -> bool {
-        s.len() >= 3
-            && s.len() <= 10
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
-            && s.chars().any(|c| c.is_ascii_digit())
+        // Text parsing retains its 10-byte limit; core owns token shape.
+        s.len() <= 10 && pancetta_core::callsign::is_callsign_token(s)
     }
 
     fn text_looks_like_grid(s: &str) -> bool {
@@ -2784,6 +2782,60 @@ mod tests {
                 !Ft8Message::is_valid_cq_modifier(bad),
                 "expected rejected: {bad:?}"
             );
+        }
+    }
+
+    /// AC7: text calls use core token policy with the local 10-byte limit.
+    #[test]
+    fn text_callsign_token_table() {
+        for token in ["K5ARH", "k5arh", "EA8/K5ARH", "K5ARH/P", "AB1CDEFGHI"] {
+            assert!(Ft8Message::text_looks_like_callsign(token), "{token:?}");
+        }
+        for token in [
+            "DX",
+            "dx",
+            "QRP",
+            "POTA",
+            "ABCD",
+            "12",
+            "123",
+            "1234",
+            "",
+            "FN42",
+            "fn42",
+            "/K1ABC",
+            "K1ABC/",
+            "K1//ABC",
+            "K1ÄBC",
+            "K1-ABC",
+            "AB1CDEFGHIJ",
+        ] {
+            assert!(!Ft8Message::text_looks_like_callsign(token), "{token:?}");
+        }
+    }
+
+    #[test]
+    fn text_cq_token_extraction_table() {
+        for modifier in [
+            None,
+            Some("DX"),
+            Some("dx"),
+            Some("QRP"),
+            Some("POTA"),
+            Some("12"),
+            Some("123"),
+        ] {
+            for call in ["K5ARH", "k5arh", "EA8/K5ARH", "K5ARH/P"] {
+                let text = match modifier {
+                    Some(token) => format!("CQ {token} {call} FN42"),
+                    None => format!("CQ {call} FN42"),
+                };
+                let message = Ft8Message::from_text(&text);
+                assert_eq!(message.special_operation.as_deref(), modifier, "{text}");
+                assert_eq!(message.from_callsign.as_deref(), Some(call), "{text}");
+                assert_eq!(message.grid_square.as_deref(), Some("FN42"), "{text}");
+                assert_eq!(message.standard_type, Some(StandardMessageType::Cq));
+            }
         }
     }
 
