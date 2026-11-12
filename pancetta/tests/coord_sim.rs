@@ -1052,8 +1052,12 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
     // "something was emitted" — the old `!pending.is_empty()` check was
     // satisfiable by a keep-calling repeat of the opening `CqResponse`
     // and never proved the confirmed relatch actually advanced the QSO.
+    // The R-report number is OUR observed SNR of the DX (the fixture's
+    // inject_decode supplies -12.0), not the -11 the DX reported of us in
+    // its message text — see MessageExchange::generate_response
+    // (exchange.rs), which computes the reply report from the decode SNR.
     assert!(
-        pending.iter().any(|p| p.text == "K6L K5ARH R-11"),
+        pending.iter().any(|p| p.text == "K6L K5ARH R-12"),
         "confirmed relatch must emit our R-report (ReportAck), got {:?}",
         pending.iter().map(|p| p.text.clone()).collect::<Vec<_>>()
     );
