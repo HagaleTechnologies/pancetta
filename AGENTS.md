@@ -32,11 +32,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
-<<<<<<< HEAD
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need are implemented, unreleased; live notification-service and on-air qualification are pending.
-=======
-Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback are implemented, unreleased; live notification-service and on-air qualification are pending. Space-to-call QSY on network spots (PAN-287) is implemented, unreleased: it QSYs to the spot's FT8/FT4 dial and calls at the derived offset (the rig mode follows `rig.data_mode` when set, PAN-276), and cqdx spots do not reach DX Hunter yet; on-air qualification is pending.
->>>>>>> a0735e17c4275c704eb114467f866afae914bac8
+Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, and the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need are implemented, unreleased; live notification-service and on-air qualification are pending. Space-to-call QSY on network spots (PAN-287) is implemented, unreleased: it QSYs to the spot's FT8/FT4 dial and calls at the derived offset (the rig mode follows `rig.data_mode` when set, PAN-276), and cqdx spots do not reach DX Hunter yet; on-air qualification is pending.
 
 ## Building and Testing
 
