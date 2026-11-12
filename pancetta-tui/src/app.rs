@@ -1464,6 +1464,15 @@ pub enum RigConnDisplay {
     PollingFailed,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct QrzStationInfo {
+    pub name: Option<String>,
+    pub qth: Option<String>,
+    pub grid: Option<String>,
+    pub country: Option<String>,
+    pub state: Option<String>,
+}
+
 pub struct App {
     pub config: Config,
     pub should_quit: bool,
@@ -1471,6 +1480,7 @@ pub struct App {
 
     // UI State
     pub terminal_size: (u16, u16),
+    pub qrz_stations: HashMap<String, QrzStationInfo>,
     pub status_message: String,
     pub theme: Theme,
     /// Retained diagnostic-event history (docs/observability-diagnostics-
@@ -1906,6 +1916,7 @@ impl App {
             should_quit: false,
             active_panel: ActivePanel::BandActivity,
             terminal_size: (80, 24),
+            qrz_stations: HashMap::new(),
             status_message: "Pancetta TUI Ready".to_string(),
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),

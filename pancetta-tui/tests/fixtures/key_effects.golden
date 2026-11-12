@@ -21,6 +21,7 @@ empty/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: fals
 empty/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 empty/band | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+empty/band | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 empty/band | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 empty/band | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 empty/band | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
@@ -79,6 +80,7 @@ empty/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false
 empty/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 empty/qso | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+empty/qso | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 empty/qso | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 empty/qso | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 empty/qso | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
@@ -137,6 +139,7 @@ empty/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: f
 empty/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 empty/callers | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+empty/callers | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 empty/callers | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 empty/callers | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 empty/callers | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
@@ -195,6 +198,7 @@ empty/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false 
 empty/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 empty/dx | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "No DX station selected for Hound"
+empty/dx | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 empty/dx | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 empty/dx | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 empty/dx | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
@@ -253,6 +257,7 @@ empty/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics:
 empty/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 empty/placement | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+empty/placement | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 empty/placement | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 empty/placement | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 empty/placement | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
@@ -309,6 +314,7 @@ rich/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false
 rich/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/band | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/band | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/band | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/band | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/band | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -368,6 +374,7 @@ rich/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false 
 rich/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/qso | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/qso | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"W1AW\" }"]
 rich/qso | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/qso | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/qso | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -427,6 +434,7 @@ rich/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: fa
 rich/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/callers | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/callers | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/callers | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/callers | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/callers | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -486,6 +494,7 @@ rich/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -
 rich/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/dx | Char('H') | none,shift | cmds=["EngageHound { callsign: \"VK9XX\", fox_freq: 750, dx_parity: Some(Even), fox_grid: Some(\"QH30\") }"]; status_message: "Pancetta TUI Ready" -> "Hound: engaging VK9XX as Fox..."
+rich/dx | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"VK9XX\" }"]
 rich/dx | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/dx | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/dx | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -545,6 +554,7 @@ rich/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: 
 rich/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/placement | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/placement | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
 rich/placement | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/placement | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/placement | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -603,6 +613,7 @@ rich/band/zoomed | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics
 rich/band/zoomed | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/band/zoomed | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/band/zoomed | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/band/zoomed | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/band/zoomed | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/band/zoomed | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
@@ -663,6 +674,7 @@ rich/band/stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostic
 rich/band/stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/band/stopped | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/band/stopped | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/band/stopped | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/band/stopped | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/band/stopped | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; tx_policy: Full -> Disabled
@@ -723,6 +735,7 @@ rich/band/zoomed+stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_dia
 rich/band/zoomed+stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed+stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/band/zoomed+stopped | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/band/zoomed+stopped | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/band/zoomed+stopped | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/band/zoomed+stopped | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/band/zoomed+stopped | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; tx_policy: Full -> Disabled
@@ -783,6 +796,7 @@ rich/band/tx-disabled | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagno
 rich/band/tx-disabled | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/tx-disabled | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
 rich/band/tx-disabled | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/band/tx-disabled | Char('L') | none,shift | cmds=["LookupCallsign { callsign: \"G8KHF\" }"]
 rich/band/tx-disabled | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
 rich/band/tx-disabled | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
 rich/band/tx-disabled | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true
@@ -1618,7 +1632,7 @@ rich/help | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 rich/help | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/help | Esc | none,shift,ctrl,alt,ctrl+shift | help_visible: true -> false
 rich/help | Down | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 1
-rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 49
+rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 51
 rich/help | PageDown | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 17
 rich/compose | Char(' ') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST "; tx_input_buffer: "CQ TEST" -> "CQ TEST "; tx_input_cursor: 7 -> 8
 rich/compose | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST!"; tx_input_buffer: "CQ TEST" -> "CQ TEST!"; tx_input_cursor: 7 -> 8

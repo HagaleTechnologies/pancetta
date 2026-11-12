@@ -158,7 +158,16 @@ pub enum TuiMessage {
     /// pushed on change. Drives the readiness strip's verdict and items.
     StationReadiness(crate::readiness::StationReadiness),
     ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
-    /// Status update
+    /// Session lookup result for the requested callsign, independent of current focus.
+    QrzLookupUpdate {
+        callsign: String,
+        name: Option<String>,
+        qth: Option<String>,
+        grid: Option<String>,
+        country: Option<String>,
+        state: Option<String>,
+    },
+    /// Component-authored status text.
     StatusUpdate {
         component: String,
         status: String,
@@ -587,6 +596,8 @@ pub enum TuiCommand {
     /// new initiations (CQ, hunting) while keeping in-progress QSOs and
     /// answering callers; Disabled is a hard RX-only mute.
     CycleTxPolicy,
+    /// Operator requested a read-only QRZ lookup of the focused station.
+    LookupCallsign { callsign: String },
     /// Operator pressed Shift+M: cycle the station-wide operating mode
     /// FT8 → FT4 → FT2 → FT8. Unlike `CycleTxPolicy` this can be REFUSED
     /// (a QSO is active) — the coordinator relay does not optimistically
@@ -933,6 +944,25 @@ impl TuiRunner {
                 if app.resolve_alerts(code) > 0 {
                     app.status_message = format!("{component} recovered — alert cleared");
                 }
+            }
+            TuiMessage::QrzLookupUpdate {
+                callsign,
+                name,
+                qth,
+                grid,
+                country,
+                state,
+            } => {
+                app.qrz_stations.insert(
+                    callsign.trim().to_uppercase(),
+                    crate::app::QrzStationInfo {
+                        name,
+                        qth,
+                        grid,
+                        country,
+                        state,
+                    },
+                );
             }
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
@@ -2184,6 +2214,15 @@ impl TuiRunner {
                 // The coordinator resolves the target (active QSO vs.
                 // CQ-hunting) since App doesn't track that state locally.
                 self.message_tx.send(TuiCommand::NudgeTxOffset)?;
+            }
+
+            Action::LookupSelectedStation => {
+                if let Some(callsign) = app.focused_callsign() {
+                    self.message_tx
+                        .send(TuiCommand::LookupCallsign { callsign })?;
+                } else {
+                    app.status_message = "no station focused — Tab to a list, ↑/↓ to pick".into();
+                }
             }
 
             // === Autonomous controls ===
@@ -5399,6 +5438,42 @@ mod key_tests {
         );
     }
 
+    #[tokio::test]
+    async fn key_shift_l_emits_lookup_callsign() {
+        let (mut runner, commands, app) = make_runner().await;
+        focus_cluster_spot(&app, "DL1ABC", 14_074_000.0).await;
+        runner.handle_key_event(key('L')).await.unwrap();
+        assert!(
+            matches!(commands.try_recv(), Ok(TuiCommand::LookupCallsign {callsign}) if callsign == "DL1ABC")
+        );
+        runner
+            .handle_message(TuiMessage::QrzLookupUpdate {
+                callsign: "dl1abc".into(),
+                name: Some("Hans".into()),
+                qth: Some("Amberg".into()),
+                grid: Some("JO62jk".into()),
+                country: Some("Germany".into()),
+                state: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.qrz_stations["DL1ABC"].qth.as_deref(),
+            Some("Amberg")
+        );
+    }
+
+    #[tokio::test]
+    async fn key_shift_l_without_focus_explains_selection() {
+        let (mut runner, commands, app) = make_runner().await;
+        runner.handle_key_event(key('L')).await.unwrap();
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            app.read().await.status_message,
+            "no station focused — Tab to a list, ↑/↓ to pick"
+        );
+    }
+
     /// Shift+M emits CycleOperatingMode with NO optimistic local flip — a
     /// mode switch can be refused (QSO active) and flip-then-rollback would
     /// flicker the title bar, so the TUI waits for the coordinator's
@@ -6683,15 +6758,16 @@ mod key_tests {
 
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 60));
+        // Leave enough rows for all bindings and headings, including Shift+L.
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 64));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
             crate::keymap::KEYBINDINGS.len() + crate::keymap::Category::ALL.len(),
             "nothing wraps at full width; one heading per group"
         );
-        let buf = render_help(160, 60, 0);
-        let inner = help_inner(160, 60);
+        let buf = render_help(160, 64, 0);
+        let inner = help_inner(160, 64);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -6703,7 +6779,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 60, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 64, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]

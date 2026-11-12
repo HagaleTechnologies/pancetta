@@ -105,3 +105,11 @@ symbols. Check positive content in a direct panel as well as scanning full
 views, since a hidden column or clipped overlay can hide a broken label.
 `pan353_rendered_text` covers labels, action messages, distance placement and
 marker widths. Its scanner is for controlled fixtures, not arbitrary radio text.
+
+Interactive QRZ lookup uses Shift+L on the shared focused callsign. The
+coordinator owns credentials, a separate QRZ client and a session cache keyed
+by trimmed uppercase callsign. Hits and not-found results are cached; transient
+errors and timeouts can be retried. The lookup runs in a spawned task with a
+two-second deadline and a single-flight guard. The station card reads only the
+entry for its current focus, so a late reply cannot identify a different station.
+The credential hint names the actual section, [network.qrz_xml].

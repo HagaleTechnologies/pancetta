@@ -34,6 +34,7 @@ pub use hamlib::apply_receive_gain_preset;
 mod health;
 mod pipeline;
 mod psk_reporter;
+mod qrz_lookup;
 mod qso;
 mod qso_filter;
 mod qso_upload_status;
