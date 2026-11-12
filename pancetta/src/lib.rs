@@ -1,3 +1,6 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Crate-level warn overrides command-line -D, so Clippy must also deny here.
+#![cfg_attr(clippy, deny(clippy::undocumented_unsafe_blocks))]
 //! # pancetta
 //!
 //! Main binary crate: coordinator, message bus, pipeline, and priority evaluator.

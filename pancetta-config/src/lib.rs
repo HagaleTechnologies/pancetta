@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-config
 //!
 //! TOML-based configuration with hot-reload — used by all crates at startup.

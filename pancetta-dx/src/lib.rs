@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # pancetta-dx
 //!
 //! Network integrations for amateur radio data sources that don't fit

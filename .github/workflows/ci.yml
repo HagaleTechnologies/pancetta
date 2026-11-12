@@ -383,7 +383,7 @@ jobs:
         # pancetta-research is a local-only iteration harness (CLAUDE.md): never
         # built in CI. Excluded explicitly so its research internals never gate
         # or ship through the public CI lane.
-        run: cargo clippy --workspace --exclude pancetta-research --features transmit
+        run: cargo clippy --workspace --exclude pancetta-research --all-targets --features transmit -- -D clippy::undocumented_unsafe_blocks
 
   fmt:
     name: Format
