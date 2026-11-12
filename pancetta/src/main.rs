@@ -161,7 +161,11 @@ enum Commands {
     Setup,
     /// Check station health: config, clock, audio, decoder, rig — with a
     /// printed fix for every failure. Run this before your first session.
-    Doctor,
+    Doctor {
+        /// Emit one JSON report instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
     /// Export logged QSOs to ADIF
@@ -420,7 +424,7 @@ fn live_capture(cli: &Cli, stub_audio: bool) -> bool {
 
 fn opens_microphone(cli: &Cli, stub_audio: bool) -> bool {
     match cli.command.as_ref() {
-        Some(Commands::Doctor) => true,
+        Some(Commands::Doctor { .. }) => true,
         None | Some(Commands::Run) => live_capture(cli, stub_audio),
         _ => false,
     }
@@ -610,7 +614,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Info => info_command().await,
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
         Commands::Setup => setup_command().await,
-        Commands::Doctor => doctor_command(cli).await,
+        Commands::Doctor { json } => doctor_command(cli, json).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
         Commands::ImportConfirmations(args) => import_confirmations_command(args).await,
@@ -3008,38 +3012,23 @@ async fn setup_command() -> Result<()> {
     Ok(())
 }
 
-async fn doctor_command(cli: &Cli) -> Result<()> {
+async fn doctor_command(cli: &Cli, json: bool) -> Result<()> {
+    use std::io::Write;
     let ctx = doctor::build_ctx(cli.config.clone());
-    let checks = doctor::build_checks();
-    println!();
-    println!(
-        "pancetta doctor — {} checks (config: {})",
-        checks.len(),
-        ctx.config_path.display()
-    );
-    println!();
-    let mut results = Vec::with_capacity(checks.len());
-    for check in &checks {
-        let outcome = (check.run)(&ctx);
-        println!(
-            "[{}] {:<20} {}",
-            doctor::status_label(outcome.status),
-            check.name,
-            outcome.detail
-        );
-        if outcome.status != doctor::CheckStatus::Pass {
-            if let Some(fix) = &outcome.fix {
-                println!("       fix: {fix}");
-            }
+    let report = doctor::DoctorReport::collect(&ctx);
+    {
+        let mut stdout = std::io::stdout().lock();
+        if json {
+            serde_json::to_writer(&mut stdout, &report)?;
+            writeln!(stdout)?;
+        } else {
+            write!(stdout, "{}", report.text())?;
         }
-        results.push((check.hard, outcome.status));
+        stdout.flush()?;
     }
-    println!();
-    if doctor::doctor_exit_code(&results) != 0 {
-        println!("Result: NOT READY — fix the FAIL lines above, then re-run `pancetta doctor`.");
-        std::process::exit(1);
+    if report.exit_code != 0 {
+        std::process::exit(report.exit_code);
     }
-    println!("Result: ready. Start `pancetta` — you should see decodes within ~30 s.");
     Ok(())
 }
 
@@ -3384,11 +3373,15 @@ fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_block
     let console_text = (headless && !json).then(|| {
         tracing_subscriber::fmt::layer()
             .with_target(false)
-            .with_writer(if cli.gain_sweep_seconds.is_some() {
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
-            } else {
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
-            })
+            .with_writer(
+                if cli.gain_sweep_seconds.is_some()
+                    || matches!(cli.command, Some(Commands::Doctor { json: true }))
+                {
+                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+                } else {
+                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+                },
+            )
             .with_thread_ids(true)
             .with_file(source_location)
             .with_line_number(source_location)
@@ -4484,6 +4477,7 @@ mod microphone_command_tests {
             vec!["run"],
             vec!["--headless", "--test-tx", "N0CALL N0CALL 73"],
             vec!["doctor"],
+            vec!["doctor", "--json"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
             assert!(opens_microphone(&cli, false));
