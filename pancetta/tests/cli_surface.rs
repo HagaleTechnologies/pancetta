@@ -378,3 +378,21 @@ fn the_cli_source_has_no_not_yet_implemented_stub() {
     let main_rs = include_str!("../src/main.rs");
     assert!(!main_rs.contains("not yet implemented"));
 }
+
+#[test]
+fn confirmation_help_and_receiving_service_refusal() {
+    Scratch::new()
+        .command()
+        .args(["import-confirmations", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<FILE>"));
+    Scratch::new()
+        .command()
+        .args(["import-confirmations", "report.adi", "--wav", "x.wav"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--wav applies only to the receiving service",
+        ));
+}

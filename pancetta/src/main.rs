@@ -180,6 +180,8 @@ enum Commands {
     // "30 minutes" is `pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES`;
     // `import_duplicate_window_is_thirty_minutes` keeps the two in step.
     Import(ImportArgs),
+    /// Merge a LoTW confirmation report into existing contacts; restart to apply
+    ImportConfirmations(ImportConfirmationsArgs),
     /// Pair this station's agent with cqdx (remote-rig-control device enrollment)
     Pair(PairArgs),
     /// Show this station's agent identity and fingerprint words, for TOFU
@@ -241,6 +243,12 @@ struct ExportArgs {
     /// Filter by callsign substring (case-insensitive)
     #[arg(long)]
     callsign: Option<String>,
+}
+
+#[derive(Clone, Args)]
+struct ImportConfirmationsArgs {
+    /// Your LoTW ADIF confirmation report
+    file: PathBuf,
 }
 
 #[derive(Clone, Args)]
@@ -420,6 +428,10 @@ fn opens_microphone(cli: &Cli, stub_audio: bool) -> bool {
 
 #[tokio::main]
 async fn async_main(cli: Cli) -> Result<()> {
+    // Local maintenance needs neither station startup nor logging/config discovery.
+    if let Some(Commands::ImportConfirmations(args)) = &cli.command {
+        return import_confirmations_command(args.clone()).await;
+    }
     // Initialize logging first
     let _log_guard = init_logging(&cli, cli.headless)?;
 
@@ -601,6 +613,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
+        Commands::ImportConfirmations(args) => import_confirmations_command(args).await,
         Commands::Import(args) => match args.undo.clone() {
             Some(receipt) => undo_import_command(receipt).await,
             None => import_command(args).await,
@@ -820,6 +833,74 @@ impl LogbookPaths {
             imports: dir.join("imports"),
         }
     }
+}
+
+/// Merge confirmations while holding the same lock as the live ADIF writer.
+async fn import_confirmations_command(args: ImportConfirmationsArgs) -> Result<()> {
+    use pancetta_qso::adif_confirmations::plan_confirmations;
+    use pancetta_qso::adif_log_writer::replace_logbook_bytes;
+    use pancetta_qso::async_database::QsoDatabase;
+    let report = std::fs::read(&args.file)
+        .map_err(|_| anyhow::anyhow!("Cannot read confirmation report {}.", args.file.display()))?;
+    let paths = LogbookPaths::new();
+    if !paths.adif.exists() {
+        anyhow::bail!(
+            "Logbook not found at {}; import your contacts first.",
+            paths.adif.display()
+        );
+    }
+    let lock = LogbookLock::open(&paths.adif)
+        .with_context(|| format!("Cannot lock {}; nothing was changed.", paths.adif.display()))?;
+    let _turn = lock
+        .lock_within(std::time::Duration::from_secs(60), || {
+            eprintln!("Waiting for the logbook lock...");
+        })
+        .await
+        .context("Cannot lock the logbook; nothing was changed.")?
+        .ok_or_else(|| anyhow::anyhow!("Logbook is busy; nothing was changed."))?;
+    let before = std::fs::read(&paths.adif)
+        .context("Cannot safely read the logbook; nothing was changed.")?;
+    let plan = plan_confirmations(&before, &report).map_err(anyhow::Error::msg)?;
+    let backup = if plan.updated_qsos > 0 {
+        let backup = create_backup(&paths.adif)?;
+        let verified = std::fs::read(&backup).with_context(|| {
+            format!(
+                "Cannot verify backup {}; nothing was changed.",
+                backup.display()
+            )
+        })?;
+        if verified != before {
+            anyhow::bail!(
+                "Backup {} differs from the logbook; nothing was changed.",
+                backup.display()
+            );
+        }
+        let marker = QsoDatabase::rebuild_marker(&paths.db);
+        mark_index_incomplete(&marker, "LoTW confirmation import")
+            .with_context(|| format!("Cannot write {}; nothing was changed.", marker.display()))?;
+        replace_logbook_bytes(&paths.adif, &before, &plan.patched).map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot write {}: {e}. Recovery copy: {}. Rebuild marker retained.",
+                paths.adif.display(),
+                backup.display()
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    for (record, reason) in &plan.diagnostics {
+        eprintln!("Record {record}: {reason}; skipped.");
+    }
+    println!("LoTW confirmations: {} records, {} updated QSO, {} unchanged, {} unmatched, {} ambiguous, {} invalid.",
+        plan.records, plan.updated_qsos, plan.unchanged, plan.unmatched, plan.ambiguous, plan.invalid);
+    if let Some(backup) = backup {
+        println!("Backup: {}", backup.display());
+        println!("Restart Pancetta to rebuild the logbook index and apply confirmations.");
+    } else {
+        println!("No logbook changes.");
+    }
+    Ok(())
 }
 
 async fn export_command(args: ExportArgs) -> Result<()> {

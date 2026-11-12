@@ -556,6 +556,29 @@ exemption.
 > calling CQ after `cq_after_idle_cycles` idle cycles. Startup now warns
 > about unknown top-level sections, so a stale config will tell you.
 
+### Local confirmation policy
+
+`[autonomous] needed_means = "unworked"` is the default. It keeps cqdx-first
+needed status and the local never-worked fallback. Set `needed_means =
+"unconfirmed"` to evaluate need from local confirmations after the logbook has
+loaded. It applies even with autonomous disabled and requires a restart.
+Unsupported values are errors.
+
+A positive `QSL_RCVD` or `LOTW_QSL_RCVD` of Y or V confirms an entity.
+Global need means no confirmation on any band; band need means no confirmation
+on that band, across modes. ATNO remains never worked. eQSL alone does not count.
+Before the first successful local seed, cqdx and unknown behavior are unchanged.
+
+Use `pancetta import-confirmations lotw-report.adi` for your own LoTW report.
+It requires a unique call/band/effective-mode match within 30 UTC minutes and a
+positive confirmation with a valid date. It adds no contacts. Conflicting pairs
+and ambiguous matches are skipped with diagnostics. It writes a verified backup
+and restart rebuild marker before changing the logbook in place. Restart to apply
+the changes; no running index or cache is refreshed. For interrupted writes, stop
+the station, restore the printed backup to `qsos.adi` and keep the marker for the
+next start. Ordinary import undo refuses a block altered by this merge. See
+README's LoTW confirmations section for field rules and recovery details.
+
 ### `[autonomous.priorities]` — what to prioritize
 
 Each decoded CQ is scored against these weights (each validated to

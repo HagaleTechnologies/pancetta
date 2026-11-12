@@ -161,7 +161,7 @@ no non-GPL implementation parses them and strict 21-field parsers work against
 | SNR | i32 | dB |
 | DeltaTime | f64 | seconds |
 | DeltaFrequency | u32 | Hz (audio offset) |
-| Mode | utf8 | **single-character mode glyph**, not the mode name: `"~"` = FT8 (byte-verified from a captured packet). Other glyphs ⚑ (FT4 `"+"` unconfirmed from non-GPL sources — capture one before emitting FT4) |
+| Mode | utf8 | **single-character mode glyph**, not the mode name: `"~"` = FT8 (byte-verified from a captured packet). FT4 `"+"` follows the published [WSJT-X user guide](https://wsjtx.github.io/wsjtx/guide-full.html) decoded-lines table; the FT4 test vector is constructed, not captured |
 | Message | utf8 | decoded text, e.g. `"CQ K1ABC FN42"` |
 | LowConfidence | bool | |
 | OffAir | bool | true when decoding a .wav, not live RX |
@@ -377,6 +377,30 @@ Verified from GridTracker's BSD-3 source and its official docs:
 5. Whether 2.7.0+ actually appends highlight/score-count fields to Status (resolved by
    "ignore trailing bytes, emit classic 21 fields").
 6. WSJT-X ignoring inbound messages with mismatched Id (inferred).
-7. Full Decode mode-glyph table (only `"~"` = FT8 byte-verified; capture an FT4 packet
-   on-air before emitting FT4 decodes).
+7. FT2 Decode glyph remains unverified and is not emitted. FT4 uses the published `"+"` glyph; live GridTracker/JTAlert qualification remains pending.
 8. Precise upstream Status trigger list; JTAlert's Heartbeat-version checking.
+
+## PAN-349 outgoing Status sampling
+
+Every Status send samples the current manager through its restart watch channel.
+The earliest active named QSO in the current mode supplies every contact field,
+with canonical QSO ID as the tie-breaker. Anonymous CQ and terminal contacts are
+excluded. No selection clears DX call, report, grid and TX text, and sets RX DF
+to zero. QSO-only changes reach the existing one-second sampling path.
+
+Report is our signed report, never the remote report. The live exchange state's
+latched report supplies it while metadata has not yet been finalized. RX DF is
+the rounded partner audio offset, falling back to the QSO's audio offset.
+Invalid offsets become zero. TX DF remains the station's held transmit offset.
+TX message is the selected contact's latest bus-accepted intent, including between
+slots. It does not assert that a frame aired. Missing or poisoned intent state
+produces empty text.
+
+TRPeriod is integer seconds: 15 for FT8 and 7 for FT4, including idle Status.
+The FT4 value floors 7.5 seconds for this wire field only; scheduler timing stays
+7.5 seconds. Ordinary special-operation mode remains NONE (0); FastMode stays
+false. FT2 keeps the unavailable-period sentinel and emits no Decode.
+
+Tests use independently constructed full-packet FT4 Decode and populated Status
+vectors, plus the unchanged captured FT8 vector and local UDP sockets. Neither
+on-air FT4 capture nor live companion-app interoperability is claimed.
