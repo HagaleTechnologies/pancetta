@@ -200,6 +200,25 @@ Tests: `bar_fit::tests`, `ui::view_render_tests::title_bar_*` / `*_headings_are_
 `tui_runner::key_tests::help_overlay_*`.
 
 
+## Slot and parity clock in the title bar (PAN-352, 2026-11-11)
+
+The shared title row starts with `[E ▮▮▯▯▯▯ 06s │ TX:O]`. It shows current
+slot parity, six rounded progress cells, whole elapsed seconds and resolved
+station TX parity. Unknown TX parity is `-`. FT8 uses 15 s, FT4 7.5 s and
+FT2 3.2 s slots. Slot and UTC clocks use the same instant on each frame.
+
+The slot chip has admit rank 1, just below pinned callsign and TX policy.
+If it cannot fit, every droppable chip is hidden, including the application
+name. Pinned state and UTC can outlive it under extreme width pressure.
+The title row also appears on the too-small screen, with contest scores
+starting on row 1. The panel minimum stays 80×20.
+
+The decode chip retains the preset only. Elapsed milliseconds and budget
+exhaustion remain in Shift+S station health. At 80 columns with live TX and
+the presence-pause prompt both active, the pause prompt can drop to keep
+the clock. It returns when TX clears, or fits from 85 columns with a
+six-character callsign. This follows the clock's last-item-dropped rule.
+
 ## Readiness strip — durable blockers vs acknowledgeable warnings vs transient status (PAN-89, 2026-10-12)
 
 `pancetta-tui/src/readiness.rs` (model), `pancetta-tui/src/ui/readiness_strip.rs` (render),

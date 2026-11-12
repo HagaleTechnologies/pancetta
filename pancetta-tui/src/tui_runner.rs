@@ -269,9 +269,8 @@ pub enum TuiMessage {
     /// Authoritative decode-effort echo (decoder-speed-overhaul Task 15).
     /// Sent by the coordinator relay both once at startup (so the chip is
     /// correct from frame 1) and after every `CycleDecodeEffort` (operator
-    /// `e`). Drives the "DECODE: <PRESET> <ms>ms" title-bar chip; the
-    /// elapsed/exhausted half of that chip comes from `PipelineHealth`
-    /// separately.
+    /// `e`). Drives the "DECODE: <PRESET>" title-bar chip; the
+    /// elapsed time and budget exhaustion appear in Shift+S station health.
     DecodeEffortUpdate {
         /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
         /// "AUTO").
