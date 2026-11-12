@@ -59,7 +59,7 @@ pub struct QrzLookup {
     pub call: Option<String>,
     /// Operator name — typically last name, or full name (`<name>` / `<fname>`).
     pub name: Option<String>,
-    /// Town or city (<qth>).
+    /// Town or city (<addr2>).
     pub qth: Option<String>,
     /// Maidenhead grid locator (`<grid>`).
     pub grid: Option<String>,
@@ -281,7 +281,7 @@ fn parse_callsign(xml: &str) -> Result<QrzLookup> {
     Ok(QrzLookup {
         call: text("call")?,
         name,
-        qth: text("qth")?,
+        qth: text("addr2")?,
         grid: text("grid")?,
         country: text("country")?,
         dxcc: text("dxcc")?,
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(l.name.as_deref(), Some("LLOYD"));
         assert_eq!(l.qth, None);
         assert_eq!(
-            parse_callsign("<Callsign><qth>Amberg</qth></Callsign>")
+            parse_callsign("<Callsign><addr2>Amberg</addr2></Callsign>")
                 .unwrap()
                 .qth
                 .as_deref(),

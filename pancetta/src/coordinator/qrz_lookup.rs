@@ -225,7 +225,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_lookup_returns_fields_and_caches_normalized_call() {
-        let (url, count, server) = speaking_qrz_server("<QRZDatabase><Callsign><call>DL1ABC</call><name>Hans</name><qth>Amberg</qth><grid>JO62jk</grid><country>Germany</country><state>BY</state></Callsign></QRZDatabase>").await;
+        let (url, count, server) = speaking_qrz_server("<QRZDatabase><Callsign><call>DL1ABC</call><name>Hans</name><addr2>Amberg</addr2><grid>JO62jk</grid><country>Germany</country><state>BY</state></Callsign></QRZDatabase>").await;
         let (ctx, rx) = context(true, Some(url));
         handle_lookup_callsign(&ctx, " dl1abc ".into()).await;
         assert!(

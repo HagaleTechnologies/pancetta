@@ -2260,6 +2260,7 @@ impl App {
             self.contest_score.as_ref(),
             x,
             y,
+            crate::ui::station_card::focused_qrz_info(self).is_some(),
         )?;
 
         if panel != ActivePanel::TxPlacement {
@@ -2336,6 +2337,7 @@ impl App {
             self.zoomed,
             self.active_panel,
             content_area,
+            crate::ui::station_card::focused_qrz_info(self).is_some(),
         )
         .into_iter()
         .find(|(p, _)| *p == ActivePanel::TxPlacement)
@@ -6640,7 +6642,7 @@ mod tests {
             ActiveView::Monitor,
         ] {
             let rendered: Vec<ActivePanel> =
-                crate::ui::view_rects(view, false, ActivePanel::BandActivity, area)
+                crate::ui::view_rects(view, false, ActivePanel::BandActivity, area, false)
                     .into_iter()
                     .map(|(p, _)| p)
                     .collect();
@@ -10690,11 +10692,17 @@ mod tests {
     fn operate_panel_rect(app: &App, panel: ActivePanel) -> ratatui::layout::Rect {
         let content_area =
             crate::ui::content_area(Rect::new(0, 0, app.terminal_size.0, app.terminal_size.1));
-        crate::ui::view_rects(app.active_view, app.zoomed, app.active_panel, content_area)
-            .into_iter()
-            .find(|(p, _)| *p == panel)
-            .map(|(_, r)| r)
-            .unwrap_or_else(|| panic!("{:?} not present in this view", panel))
+        crate::ui::view_rects(
+            app.active_view,
+            app.zoomed,
+            app.active_panel,
+            content_area,
+            crate::ui::station_card::focused_qrz_info(app).is_some(),
+        )
+        .into_iter()
+        .find(|(p, _)| *p == panel)
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| panic!("{:?} not present in this view", panel))
     }
 
     #[tokio::test]
