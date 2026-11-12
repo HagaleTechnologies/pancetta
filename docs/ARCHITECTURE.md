@@ -61,8 +61,9 @@ Audio In (USB codec, 48kHz stereo)
 pancetta-audio  (AudioManager, cpal + ringbuf)
   | raw f32 samples via crossbeam channel
   v
-pancetta-dsp  (DspPipeline)
-  | decimate 4:1 -> 12kHz mono, bandpass filter, 15-sec window extraction
+pancetta/src/coordinator/dsp.rs
+  | downmix capture frames to mono; integer subsampling to 12 kHz
+  | FT8 slot-aligned 12.64-second base capture windows, with configured lead-in
   v
 pancetta-ft8  (Ft8Decoder)
   | LDPC decode, OSD, AP injection -> Vec<DecodedMessage>
@@ -82,6 +83,13 @@ pancetta-audio  -> Audio Out (USB codec)
 pancetta-hamlib -> PTT control via rigctld (Yaesu FTdx10)
 ```
 
+This diagram is FT8-specific. The receive stage is the coordinator-owned
+`pancetta/src/coordinator/dsp.rs`: it downmixes capture frames to mono and
+subsamples every Nth sample to 12 kHz (4:1 at the default 48 kHz input; FT8
+sits well below the 6 kHz Nyquist, so the earlier FIR bandpass was removed).
+It does **not** use the reusable `pancetta-dsp::DspPipeline` or its bandpass
+filter; `pancetta-dsp` remains a separate FFT/filtering/resampling library.
+
 Each FT8 slot is 15 seconds. The pipeline must decode and decide within the slot boundary.
 Multi-stream TX is supported: N simultaneous FT8 signals can be encoded into a single slot
 at different audio frequencies.
@@ -92,15 +100,55 @@ at different audio frequencies.
 
 The coordinator lives in `pancetta/src/coordinator/` and is decomposed into submodules:
 
-| File             | Role                                                         |
-|------------------|--------------------------------------------------------------|
-| `mod.rs`         | `ApplicationCoordinator` struct, startup sequencing          |
-| `pipeline.rs`    | audio/DSP/FT8 pipeline setup, crossbeam channel wiring       |
-| `hamlib.rs`      | rigctld process management and TCP connection                 |
-| `health.rs`      | health checks and performance stats                          |
-| `shutdown.rs`    | graceful shutdown, task join                                 |
-| `wav_playback.rs`| WAV file playback mode for offline testing                   |
-| `util.rs`        | shared utilities (linear resampler, etc.)                    |
+<!-- coordinator-modules:start -->
+| File | Role |
+|---|---|
+| `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
+| `audio.rs` | Audio component startup. |
+| `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
+| `autonomous.rs` | Autonomous operator component. |
+| `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
+| `config_reload.rs` | Applying saved config edits: live security fields, restart list. |
+| `contest.rs` | Durable contest scoring refresh. |
+| `desense.rs` | Window-based evidence for TX-induced receive desense. |
+| `dsp.rs` | Receive audio downmix, subsampling, decode windows and waterfall. |
+| `dx_cluster.rs` | DX cluster component. |
+| `effort.rs` | Decode-effort preset to wall-time budget mapping. |
+| `ft8.rs` | FT8 decoder component startup. |
+| `gain_sweep.rs` | Receive-gain experiment measurements and inference (PAN-244). |
+| `gain_sweep_runtime.rs` | Coordinator runtime driving the receive-gain experiment. |
+| `hamlib.rs` | rigctld TCP client: poll loop, watchdog, SWR metering, gain transactions. |
+| `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
+| `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
+| `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
+| `psk_reporter.rs` | PSKReporter component. |
+| `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
+| `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
+| `qso_filter.rs` | QSO partner band-collapse filtering (hb-229). |
+| `qso_upload_status.rs` | Registry of per-QSO upload results for the TUI (PAN-344). |
+| `raw_capture.rs` | Timed raw 48 kHz capture, one WAV per FT8 slot (PAN-393). |
+| `readiness.rs` | Coordinator side of the TUI readiness strip (PAN-89). |
+| `receive_overload.rs` | Receive-window overload policy and bounded ATT transactions. |
+| `remote_gateway/` | Local read-only WebSocket gateway (Panino). |
+| `replay.rs` | Replay mode: listing recorded WAVs and feeding decode windows. |
+| `restart_budget.rs` | Reconnect/restart backoff and restart budgets. |
+| `session_state.rs` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |
+| `shutdown.rs` | Graceful shutdown, task join and direct rigctld PTT-off budgets. |
+| `spot_call.rs` | Space on a network spot: QSY to its dial and call (PAN-287). |
+| `station_agent/` | Station agent component (remote operation, Noise transport). |
+| `swr_guard.rs` | SWR protection trip logic (PAN-251). |
+| `tier.rs` | Hardware-tier auto-classification at startup. |
+| `tui_relay.rs` | TUI relay and command forwarding. |
+| `tx.rs` | TX worker scheduling, playback and PTT gates. |
+| `tx/` | TX worker scheduling, playback and PTT gates. |
+| `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
+| `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
+| `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
+| `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
+| `util.rs` | Linear resampling for WAV playback. |
+| `wav_playback.rs` | WAV file playback for offline testing. |
+| `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |
+<!-- coordinator-modules:end -->
 
 **Communication model**: crossbeam channels carry point-to-point data (audio samples,
 decoded messages, waterfall frames). A `MessageBus` handles broadcast control events
@@ -110,9 +158,9 @@ The core channel topology established in `pipeline.rs`:
 
 ```
 audio_to_dsp_tx  ->  audio_to_dsp_rx   (Vec<f32>, bounded 100)
-dsp_to_ft8_tx    ->  dsp_to_ft8_rx     (Vec<f32>, bounded 2)
-ft8_to_tui_tx    ->  ft8_to_tui_rx     (DecodedMessage, unbounded)
-waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, unbounded)
+dsp_to_ft8_tx    ->  dsp_to_ft8_rx     (DecodeWindow, bounded 2)
+ft8_to_tui_tx    ->  ft8_to_tui_rx     (RelayedDecode, bounded 500)
+waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, bounded 100)
 ```
 
 **`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs}`) speaks
@@ -137,17 +185,12 @@ byte-identical whether or not `[network.wsjtx_udp]` is enabled.
 
 ### `WorkedStationLookup` (pancetta-qso)
 
-Trait interface used by `PriorityScorer` for synchronous station queries: duplicate
-detection, rarity lookup, and needed DXCC/grid checks. Decouples scoring logic from
-the coordinator's data sources.
-
-```
-pancetta_qso::priority::WorkedStationLookup
-  - is_duplicate(callsign, band) -> bool
-  - get_rarity(callsign) -> f64
-  - is_needed_dxcc(entity) -> bool
-  - is_needed_grid(grid) -> bool
-```
+Trait interface used by `PriorityScorer` for synchronous station queries —
+duplicate detection, recent-failure backoff, rarity and needed
+DXCC/grid/ATNO checks (including per-band variants). It decouples scoring
+logic from the coordinator's data sources. The real method set lives in the
+source: `pancetta-qso/src/priority.rs`; the coordinator-side implementation
+is `CachedStationLookup` (see below).
 
 ### `PriorityScorer` (pancetta-qso)
 
@@ -158,13 +201,17 @@ Configured via `pancetta-config`.
 
 ### `AutonomousOperator` (pancetta-qso)
 
-Decision engine operating in one of three modes:
-- **Hunt**: pounce on rare stations identified by `PriorityScorer`
-- **CQ**: call CQ and answer inbound callers by priority
-- **Hybrid**: hunt when rare targets are present, CQ otherwise
-
-Manages per-QSO state machines (CALLING -> EXCHANGING -> CONFIRMING -> COMPLETE).
-Hands off completed exchanges to the QSO log.
+`AutonomousOperator` answers scored CQs above `[autonomous].min_dx_score`
+(default 0.3) and falls back to calling CQ after
+`[autonomous].cq_after_idle_cycles` idle cycles (default 10). Hunt, CQ and
+Hybrid are **not** configurable operator modes — there is no `mode` key (see
+CONFIG.md's note on the keys that never existed). The runtime operating
+states (`Hunting`, `CallingCq`, `InQso`, `ListeningForCollisions`, `Paused`)
+are defined in `pancetta-qso/src/autonomous.rs` and are separate from the
+TX-frequency Auto/Hold setting. Per-QSO progress is tracked by the
+`QsoState` machine defined in `pancetta-qso/src/states.rs` (linked instead
+of restated here). Completed exchanges are handed to the coordinator's QSO
+persistence (below).
 
 ### `SmartFrequencyAllocator` (pancetta-qso)
 
@@ -208,13 +255,14 @@ the lock while it appends other loggers' records, verbatim, as one block
 (`write_import_block`), and records a receipt in `~/.pancetta/imports/` so
 `pancetta import --undo` can remove exactly that block, in place, under the same lock.
 
-### `AsyncQsoLogger` (pancetta)
+### Coordinator QSO persistence (pancetta)
 
-Coordinator-level QSO persistence layer. On each completed QSO it writes to both the
-ADIF file (via `AdifLogWriter`) and to the sqlx-backed SQLite index
-(`~/.pancetta/qso.db`). The index is rebuilt from the ADIF on startup when missing or
-stale; it is safe to delete. The legacy sync rusqlite path is gone; pancetta-qso is
-async-only via sqlx.
+The coordinator's QSO persistence lives in
+`pancetta/src/coordinator/qso.rs`. On each completed QSO it writes to both
+the ADIF file (via `AdifLogWriter`) and to the sqlx-backed SQLite index
+(`~/.pancetta/qso.db`). The index is rebuilt from the ADIF on startup when
+missing or stale; it is safe to delete. The legacy sync rusqlite path is
+gone; pancetta-qso is async-only via sqlx.
 
 **Migration**: on the first startup after upgrade, if `qso.db` exists but `qsos.adi`
 does not, the coordinator auto-exports all rows from the old database into a fresh ADIF

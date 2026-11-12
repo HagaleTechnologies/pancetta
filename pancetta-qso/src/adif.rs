@@ -286,24 +286,24 @@ const QSL_RCVD_FIELD: &str = "QSL_RCVD";
 /// every call — and it's called per duplicate-check / per QSO-scan, i.e.
 /// thousands of times per slot on a busy band. The classification uses no
 /// instance state, so it now lives here and the `&self` method delegates.
+///
+/// PAN-330: this is an explicit *format adapter* over the one core band
+/// vocabulary — membership comes from `Band::from_frequency`'s inclusive Hz
+/// boundaries (compared as f64, so a fractional Hz just outside an edge
+/// cannot slip inside), and the core lowercase name is uppercased for the
+/// ADIF serialization boundary. Finite positive frequencies outside every
+/// standard band keep the legacy rounded-MHz fallback; nonfinite or
+/// non-positive inputs never map to a real band.
 pub fn freq_hz_to_band(frequency_hz: f64) -> String {
-    let freq_mhz = frequency_hz / 1_000_000.0;
-    match freq_mhz {
-        f if (1.8..=2.0).contains(&f) => "160M".to_string(),
-        f if (3.5..=4.0).contains(&f) => "80M".to_string(),
-        f if (5.3..=5.4).contains(&f) => "60M".to_string(),
-        f if (7.0..=7.3).contains(&f) => "40M".to_string(),
-        f if (10.1..=10.15).contains(&f) => "30M".to_string(),
-        f if (14.0..=14.35).contains(&f) => "20M".to_string(),
-        f if (18.068..=18.168).contains(&f) => "17M".to_string(),
-        f if (21.0..=21.45).contains(&f) => "15M".to_string(),
-        f if (24.89..=24.99).contains(&f) => "12M".to_string(),
-        f if (28.0..=29.7).contains(&f) => "10M".to_string(),
-        f if (50.0..=54.0).contains(&f) => "6M".to_string(),
-        f if (144.0..=148.0).contains(&f) => "2M".to_string(),
-        f if (420.0..=450.0).contains(&f) => "70CM".to_string(),
-        _ => format!("{:.0}MHZ", freq_mhz),
+    if frequency_hz.is_finite() && frequency_hz > 0.0 {
+        for band in pancetta_core::Band::all() {
+            let (low, high) = band.frequency_range();
+            if frequency_hz >= low as f64 && frequency_hz <= high as f64 {
+                return band.name().to_uppercase();
+            }
+        }
     }
+    format!("{:.0}MHZ", frequency_hz / 1_000_000.0)
 }
 
 /// Attribution appended to every logged QSO's COMMENT field, crediting the
@@ -1601,6 +1601,53 @@ impl fmt::Display for AdifField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC3: ADIF band classification is the core membership table
+    /// (inclusive Hz edges, compared as f64) formatted uppercase. Every
+    /// standard band's endpoints and their adjacent Hz, plus the ticket's
+    /// 60 m frequencies, fractional Hz, and the documented fallbacks.
+    #[test]
+    fn band_vocabulary_table() {
+        // (ADIF label, low Hz, high Hz) — derived from the core table, with
+        // the ADIF-format expectation written out explicitly.
+        let edges: [(&str, f64, f64); 13] = [
+            ("160M", 1_800_000.0, 2_000_000.0),
+            ("80M", 3_500_000.0, 4_000_000.0),
+            ("60M", 5_330_000.0, 5_405_000.0),
+            ("40M", 7_000_000.0, 7_300_000.0),
+            ("30M", 10_100_000.0, 10_150_000.0),
+            ("20M", 14_000_000.0, 14_350_000.0),
+            ("17M", 18_068_000.0, 18_168_000.0),
+            ("15M", 21_000_000.0, 21_450_000.0),
+            ("12M", 24_890_000.0, 24_990_000.0),
+            ("10M", 28_000_000.0, 29_700_000.0),
+            ("6M", 50_000_000.0, 54_000_000.0),
+            ("2M", 144_000_000.0, 148_000_000.0),
+            ("70CM", 420_000_000.0, 450_000_000.0),
+        ];
+        for (label, low, high) in edges {
+            assert_eq!(freq_hz_to_band(low), label, "low edge of {label}");
+            assert_eq!(freq_hz_to_band(high), label, "high edge of {label}");
+            // Adjacent Hz outside each edge falls back — never a real band.
+            assert_ne!(freq_hz_to_band(low - 1.0), label, "below low of {label}");
+            assert_ne!(freq_hz_to_band(high + 1.0), label, "above high of {label}");
+        }
+        // The ticket's headline: 5,357,500 Hz is 60M, and 5,405,000 Hz now
+        // writes 60M instead of the old 5MHZ fallback.
+        assert_eq!(freq_hz_to_band(5_357_500.0), "60M");
+        assert_eq!(freq_hz_to_band(5_405_000.0), "60M");
+        assert_eq!(freq_hz_to_band(5_405_001.0), "5MHZ");
+        // Fractional Hz outside an edge cannot slip inside via truncation.
+        assert_eq!(freq_hz_to_band(5_405_000.5), "5MHZ");
+        assert_eq!(freq_hz_to_band(5_329_999.5), "5MHZ");
+        assert_eq!(freq_hz_to_band(5_330_000.5), "60M");
+        // Fallbacks: zero, negative, gaps and nonfinite inputs.
+        assert_eq!(freq_hz_to_band(0.0), "0MHZ");
+        assert_eq!(freq_hz_to_band(-14_074_000.0), "-14MHZ");
+        assert_eq!(freq_hz_to_band(5_000_000.0), "5MHZ");
+        assert_eq!(freq_hz_to_band(f64::NAN), "NaNMHZ");
+        assert_eq!(freq_hz_to_band(f64::INFINITY), "infMHZ");
+    }
 
     #[test]
     fn test_parse_simple_adif() {

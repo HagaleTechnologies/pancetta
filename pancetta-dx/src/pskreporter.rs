@@ -3,11 +3,7 @@
 //! This module provides integration with PSKReporter for real-time
 //! digital mode activity monitoring and spot collection.
 
-// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
-// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
-#![allow(clippy::result_large_err)]
-
-use crate::{Band, DxError, DxSpot, Mode, Result};
+use crate::{Band, DxError, DxErrorInner, DxSpot, Mode, Result};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -213,21 +209,25 @@ impl PskReporterClient {
         let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
-            return Err(DxError::ExternalService(format!(
+            return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "PSKReporter API error: HTTP {}",
                 response.status()
-            )));
+            ))));
         }
 
         let bytes = crate::body::bytes_within(response, PSKREPORTER_MAX_BODY_BYTES).await?;
-        let psk_response: PskReporterResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| DxError::Parse(format!("Failed to parse PSKReporter response: {}", e)))?;
+        let psk_response: PskReporterResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            DxError::from(DxErrorInner::Parse(format!(
+                "Failed to parse PSKReporter response: {}",
+                e
+            )))
+        })?;
 
         if psk_response.status != "OK" {
-            return Err(DxError::ExternalService(format!(
+            return Err(DxError::from(DxErrorInner::ExternalService(format!(
                 "PSKReporter API error: {}",
                 psk_response.error.unwrap_or("Unknown error".to_string())
-            )));
+            ))));
         }
 
         let reports = psk_response.reception_reports.unwrap_or_default();
@@ -429,8 +429,12 @@ impl PskReporterClient {
 
     /// Build query URL from parameters
     fn build_query_url(&self, params: &QueryParams) -> Result<Url> {
-        let mut url = Url::parse(&self.config.base_url)
-            .map_err(|e| DxError::Configuration(format!("Invalid base URL: {}", e)))?;
+        let mut url = Url::parse(&self.config.base_url).map_err(|e| {
+            DxError::from(DxErrorInner::Configuration(format!(
+                "Invalid base URL: {}",
+                e
+            )))
+        })?;
 
         let start_timestamp = params.start_time.timestamp();
         let end_timestamp = params.end_time.timestamp();
@@ -486,7 +490,7 @@ impl PskReporterClient {
         let mode = self.parse_mode(&psk_spot.mode);
 
         let time = DateTime::from_timestamp(psk_spot.flow_start_seconds, 0)
-            .ok_or_else(|| DxError::Parse("Invalid timestamp".to_string()))?;
+            .ok_or_else(|| DxError::from(DxErrorInner::Parse("Invalid timestamp".to_string())))?;
 
         Ok(DxSpot {
             callsign: psk_spot.transmitter_call,
@@ -695,10 +699,10 @@ fn padded(len: usize) -> usize {
 /// wrapping (PAN-285).
 fn patch_len(buf: &mut [u8], at: usize, len: usize) -> Result<()> {
     let len = u16::try_from(len).map_err(|_| {
-        DxError::Io(std::io::Error::new(
+        DxError::from(DxErrorInner::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("PSKReporter length {len} does not fit in 16 bits"),
-        ))
+        )))
     })?;
     buf[at..at + 2].copy_from_slice(&len.to_be_bytes());
     Ok(())
@@ -961,9 +965,9 @@ impl PskReporterUploader {
         }
 
         if self.config.reporter_callsign.is_empty() {
-            return Err(DxError::Configuration(
+            return Err(DxError::from(DxErrorInner::Configuration(
                 "Reporter callsign must be set for PSKReporter upload".to_string(),
-            ));
+            )));
         }
 
         let addr = format!("{}:{}", self.config.server, self.config.port);
@@ -971,7 +975,7 @@ impl PskReporterUploader {
         // public PSKReporter server (a 127.0.0.1 source can't reach the internet).
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(DxError::Io)?;
+            .map_err(DxError::from)?;
 
         // [sec I-14] Restrict the socket to its single peer. `connect` on a UDP
         // socket sets the default destination AND makes the kernel drop any
@@ -979,7 +983,7 @@ impl PskReporterUploader {
         // ephemeral-port exposure of the all-interfaces bind. This path is
         // send-only (we `send` then drop the socket; we never `recv`), so the
         // connect is purely a hardening measure with no behavioral cost.
-        socket.connect(&addr).await.map_err(DxError::Io)?;
+        socket.connect(&addr).await.map_err(DxError::from)?;
 
         self.flush_to(&socket).await
     }
@@ -998,7 +1002,7 @@ impl PskReporterUploader {
                         reports, datagrams
                     );
                 }
-                return Err(DxError::Io(e));
+                return Err(DxError::from(DxErrorInner::Io(e)));
             }
             debug!(
                 "PSKReporter datagram seq={}: {} reports, {} bytes",
@@ -1861,7 +1865,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, DxError::ResponseTooLarge { limit } if limit == PSKREPORTER_MAX_BODY_BYTES),
+            matches!(err.kind(), DxErrorInner::ResponseTooLarge { limit } if *limit == PSKREPORTER_MAX_BODY_BYTES),
             "got {err:?}"
         );
         crate::test_support::served(h).await;

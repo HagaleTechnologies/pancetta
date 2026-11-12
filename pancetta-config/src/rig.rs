@@ -1147,14 +1147,14 @@ impl ConfigSection for RigConfig {
         }
 
         if let Some(presets) = &self.receive_gain_presets {
-            // Keep canonical band Display names at this config boundary; the
-            // config crate is independent of the runtime/core types.
-            const BANDS: &[&str] = &[
-                "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m",
-                "70cm",
-            ];
+            // PAN-330: preset band keys are the one core standard-band
+            // vocabulary (`Band::name()`); `custom` stays excluded because it
+            // is not a standard band key.
             for (band, preset) in presets {
-                if !BANDS.contains(&band.as_str()) {
+                if pancetta_core::Band::all()
+                    .iter()
+                    .all(|b| b.name() != band.as_str())
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "rig.receive_gain_presets".into(),
                         value: band.clone(),
@@ -1386,6 +1386,33 @@ impl RigParametersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC4: receive-gain preset keys are exactly the core standard
+    /// band names, with `custom` still excluded.
+    #[test]
+    fn preset_band_keys_match_core() {
+        // Every core standard name is an accepted preset key.
+        for band in pancetta_core::Band::all() {
+            let name = band.name();
+            let cfg: RigConfig = toml::from_str(&format!(
+                "[receive_gain_presets.\"{name}\"]\npreamp_db = 0\nattenuator_db = 0\n"
+            ))
+            .unwrap();
+            assert!(cfg.validate_section().is_ok(), "expected valid key: {name}");
+        }
+        // `custom` and junk keys are rejected with the existing error field.
+        for bad in ["custom", "60M", "5MHZ", "", "160m ", "wavelength"] {
+            let cfg: RigConfig = toml::from_str(&format!(
+                "[receive_gain_presets.\"{bad}\"]\npreamp_db = 0\nattenuator_db = 0\n"
+            ))
+            .unwrap_or_else(|e| panic!("toml parse failed for {bad:?}: {e}"));
+            let err = cfg.validate_section().unwrap_err();
+            assert!(
+                err.to_string().contains("rig.receive_gain_presets"),
+                "expected preset-band rejection for {bad:?}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn data_mode_defaults_and_documented_example() {

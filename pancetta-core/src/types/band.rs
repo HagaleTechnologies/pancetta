@@ -87,6 +87,30 @@ impl IaruRegion {
 }
 
 impl Band {
+    /// Canonical lowercase standard-band name (`"160m"`, `"60m"`, `"70cm"`,
+    /// …), shared by every crate as *the* band vocabulary (PAN-330).
+    /// `Band::Custom` is `"custom"`; its formatted range stays with
+    /// [`fmt::Display`]. These names are exactly what serde, `FromStr` and
+    /// `fmt::Display` use for standard bands — one table, not three.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Band::Band160m => "160m",
+            Band::Band80m => "80m",
+            Band::Band60m => "60m",
+            Band::Band40m => "40m",
+            Band::Band30m => "30m",
+            Band::Band20m => "20m",
+            Band::Band17m => "17m",
+            Band::Band15m => "15m",
+            Band::Band12m => "12m",
+            Band::Band10m => "10m",
+            Band::Band6m => "6m",
+            Band::Band2m => "2m",
+            Band::Band70cm => "70cm",
+            Band::Custom(_, _) => "custom",
+        }
+    }
+
     /// Get frequency range in Hz (low, high)
     pub fn frequency_range(&self) -> (u64, u64) {
         match self {
@@ -109,29 +133,10 @@ impl Band {
 
     /// Get band from frequency in Hz
     pub fn from_frequency(freq: u64) -> Option<Band> {
-        let bands = [
-            Band::Band160m,
-            Band::Band80m,
-            Band::Band60m,
-            Band::Band40m,
-            Band::Band30m,
-            Band::Band20m,
-            Band::Band17m,
-            Band::Band15m,
-            Band::Band12m,
-            Band::Band10m,
-            Band::Band6m,
-            Band::Band2m,
-            Band::Band70cm,
-        ];
-
-        for band in bands {
-            let (low, high) = band.frequency_range();
-            if freq >= low && freq <= high {
-                return Some(band);
-            }
-        }
-        None
+        Band::all()
+            .iter()
+            .copied()
+            .find(|band| band.contains_frequency(freq))
     }
 
     /// Region-aware frequency range. Falls back to `frequency_range()` (today's
@@ -299,20 +304,8 @@ impl Band {
 impl fmt::Display for Band {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Band::Band160m => write!(f, "160m"),
-            Band::Band80m => write!(f, "80m"),
-            Band::Band60m => write!(f, "60m"),
-            Band::Band40m => write!(f, "40m"),
-            Band::Band30m => write!(f, "30m"),
-            Band::Band20m => write!(f, "20m"),
-            Band::Band17m => write!(f, "17m"),
-            Band::Band15m => write!(f, "15m"),
-            Band::Band12m => write!(f, "12m"),
-            Band::Band10m => write!(f, "10m"),
-            Band::Band6m => write!(f, "6m"),
-            Band::Band2m => write!(f, "2m"),
-            Band::Band70cm => write!(f, "70cm"),
             Band::Custom(low, high) => write!(f, "{}-{} MHz", low / 1_000_000, high / 1_000_000),
+            _ => write!(f, "{}", self.name()),
         }
     }
 }
@@ -321,22 +314,11 @@ impl FromStr for Band {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "160m" => Ok(Band::Band160m),
-            "80m" => Ok(Band::Band80m),
-            "60m" => Ok(Band::Band60m),
-            "40m" => Ok(Band::Band40m),
-            "30m" => Ok(Band::Band30m),
-            "20m" => Ok(Band::Band20m),
-            "17m" => Ok(Band::Band17m),
-            "15m" => Ok(Band::Band15m),
-            "12m" => Ok(Band::Band12m),
-            "10m" => Ok(Band::Band10m),
-            "6m" => Ok(Band::Band6m),
-            "2m" => Ok(Band::Band2m),
-            "70cm" => Ok(Band::Band70cm),
-            _ => Err(format!("Unknown band: {}", s)),
-        }
+        Band::all()
+            .iter()
+            .copied()
+            .find(|b| b.name() == s)
+            .ok_or_else(|| format!("Unknown band: {}", s))
     }
 }
 
@@ -468,5 +450,103 @@ mod tests {
 
         let decoded: Band = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, band);
+    }
+
+    /// PAN-330 AC3: every standard band's Hz boundaries are inclusive, the
+    /// adjacent Hz outside each edge is not a member, and zero / allocation
+    /// gaps classify as no band. Explicit canonical expectations, not values
+    /// derived from the function under test.
+    #[test]
+    fn canonical_band_edges() {
+        // (band, low Hz, high Hz) — the authoritative global table.
+        let edges: [(Band, u64, u64); 13] = [
+            (Band::Band160m, 1_800_000, 2_000_000),
+            (Band::Band80m, 3_500_000, 4_000_000),
+            (Band::Band60m, 5_330_000, 5_405_000),
+            (Band::Band40m, 7_000_000, 7_300_000),
+            (Band::Band30m, 10_100_000, 10_150_000),
+            (Band::Band20m, 14_000_000, 14_350_000),
+            (Band::Band17m, 18_068_000, 18_168_000),
+            (Band::Band15m, 21_000_000, 21_450_000),
+            (Band::Band12m, 24_890_000, 24_990_000),
+            (Band::Band10m, 28_000_000, 29_700_000),
+            (Band::Band6m, 50_000_000, 54_000_000),
+            (Band::Band2m, 144_000_000, 148_000_000),
+            (Band::Band70cm, 420_000_000, 450_000_000),
+        ];
+        for (band, low, high) in edges {
+            assert_eq!(
+                band.frequency_range(),
+                (low, high),
+                "{} range drifted",
+                band.name()
+            );
+            // Inclusive endpoints.
+            assert_eq!(
+                Band::from_frequency(low),
+                Some(band),
+                "{} low edge",
+                band.name()
+            );
+            assert_eq!(
+                Band::from_frequency(high),
+                Some(band),
+                "{} high edge",
+                band.name()
+            );
+            // Adjacent Hz just outside each edge.
+            assert_eq!(
+                Band::from_frequency(low - 1),
+                None,
+                "below {} low",
+                band.name()
+            );
+            assert_eq!(
+                Band::from_frequency(high + 1),
+                None,
+                "above {} high",
+                band.name()
+            );
+        }
+        // The ticket's headline frequencies.
+        assert_eq!(Band::from_frequency(5_357_500), Some(Band::Band60m));
+        // Zero and allocation gaps are not any band.
+        for gap in [
+            0,
+            1,
+            5_000_000,
+            5_329_999,
+            5_405_001,
+            6_000_000,
+            30_000_000,
+            1_000_000_000,
+        ] {
+            assert_eq!(Band::from_frequency(gap), None, "gap {gap} classified");
+        }
+    }
+
+    /// PAN-330 AC4: Display, FromStr, serde and `name()` agree on one
+    /// standard-band vocabulary.
+    #[test]
+    fn standard_band_names_agree() {
+        use std::str::FromStr;
+        for band in Band::all() {
+            let name = band.name();
+            // Canonical application label is lowercase.
+            assert_eq!(name, name.to_lowercase(), "{} not lowercase", name);
+            assert_eq!(band.to_string(), name);
+            assert_eq!(Band::from_str(name).unwrap(), *band);
+            let json = serde_json::to_string(band).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            let round: Band = serde_json::from_str(&json).unwrap();
+            assert_eq!(round, *band);
+        }
+        // Unknown names are rejected; `custom` is not a standard key.
+        assert!(Band::from_str("60M").is_err());
+        assert!(Band::from_str("custom").is_err());
+        assert!(Band::from_str("").is_err());
+        // Custom keeps its formatted range display and `custom` name.
+        assert_eq!(Band::Custom(5_000_000, 5_100_000).to_string(), "5-5 MHz");
+        assert_eq!(Band::Custom(5_000_000, 5_100_000).name(), "custom");
     }
 }
