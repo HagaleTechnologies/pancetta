@@ -51,7 +51,8 @@ indicators.
 See [the PAN-86 decision](../../docs/DECISIONS/tui.md#needed-grids-and-states-in-dx-hunter-pan-86-2026-10-18)
 for history availability, state accumulation, and session-only QRZ enrichment.
 
-PAN-94 adds a Station-card reason, a Why column at panel width 89, and a `w`
+PAN-94 adds a Station-card reason, a Why column at panel width 97 (since
+PAN-345's Band column), and a `w`
 breakdown overlay. Reasons use the inputs stored with the latest score, and
 portable callsign suffixes are explicitly guesses. See
 [the PAN-94 decision](../../docs/DECISIONS/tui.md#dx-hunter-explains-its-ranking-pan-94-2026-10-18)
@@ -63,6 +64,15 @@ outside the home and logged prefixes. Display and wire surfaces must use
 `display_needed_atno` or `needed_dxcc_status`, which never claim needed while
 the list is unknown. See
 [the PAN-93 decision](../../docs/DECISIONS/priority-scoring.md#needed-is-a-claim-with-availability-pan-93-2026-10-22).
+
+Gotcha (PAN-345): `DxStation::frequency` has no single unit. Local decodes and
+cqdx rows store MHz, DX-cluster rows store Hz. Never infer a band from its
+magnitude: read `DxStation::band`, which each source derives from its own unit
+(cluster Hz, cqdx `frequency_hz`, decode MHz times 1,000,000) through
+`pancetta_core::Band::from_frequency`. DX Hunter's `Band` column (five cells,
+right after `Call` in width priority) renders it, `---` when unknown. Cluster
+spots are filtered by `[network.dx_cluster.filtering]` in
+`pancetta-dx/src/cluster.rs` before they reach the bus.
 
 The local relay remembers the last decoded grid per exact callsign and band for
 its session. Grid-less reports and acknowledgments use that grid when rescoring;
@@ -79,10 +89,17 @@ coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
 
+<<<<<<< HEAD
 Replay sessions show `TX: REPLAY` in neutral gray from the first title-bar draw,
 regardless of TX policy. The session flag is supplied by the coordinator and is
 not saved in TUI config. See
 [the TX-policy banner decision](../../docs/DECISIONS/tui.md#tri-state-global-tx-policy).
+=======
+Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
+only marks a grid when both rows have the same canonical square. A later rover
+locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full
+and middle width tiers start at 77/64.
+>>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
 
 Display vocabulary lives in `pancetta-tui/src/presentation.rs`. Rig, reply-step,
 PTT and view labels are separate from Debug and persistence strings. Rarity

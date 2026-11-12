@@ -328,6 +328,10 @@ impl super::ApplicationCoordinator {
         // PAN-114: clock-skew warning published by the clock-skew monitor
         // (`clock_monitor.rs`), read on the same 2s health tick.
         let clock_skew_relay = self.clock_skew.clone();
+        // PAN-344: per-QSO upload-status registry, snapshotted (cloned) on
+        // the same 2s tick and relayed as full bounded snapshots so a lost
+        // best-effort transition heals on the next tick.
+        let qso_upload_statuses_relay = self.qso_upload_statuses.clone();
         // PAN-89: readiness-strip inputs, snapshotted on the same 2s tick.
         let readiness_sources = super::readiness::ReadinessSources::from_coordinator(self);
         // Clone our callsign before the tui-relay thread consumes the original
@@ -777,6 +781,8 @@ impl super::ApplicationCoordinator {
                         MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                             callsign,
                             frequency,
+                            mode,
+                            band,
                             spotter,
                             ..
                         }) => {
@@ -811,17 +817,19 @@ impl super::ApplicationCoordinator {
                                     );
                                 }
                             }
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                            let _ = tui_msg_tx_relay.send(cluster_spot_tui_message(
+                                ClusterSpotRelay {
                                     callsign,
                                     frequency,
+                                    mode,
+                                    band,
                                     spotter,
                                     worked_before,
                                     needed,
                                     atno,
                                     band_needed,
                                 },
-                            );
+                            ));
                         }
                         MessageType::StatusUpdate(text) => {
                             // Free-form status emitted by other components (e.g. QSO
@@ -997,6 +1005,16 @@ impl super::ApplicationCoordinator {
 
                 // Send pipeline health to TUI every 2 seconds
                 if last_health_send.elapsed() >= std::time::Duration::from_secs(2) {
+                    // PAN-344: relay the full bounded per-QSO upload-status
+                    // snapshot on the same tick. Sent repeatedly; the App
+                    // merges by UUID and revision.
+                    let uploads = qso_upload_statuses_relay
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot();
+                    let _ = tui_msg_tx_relay.send(
+                        pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(uploads),
+                    );
                     let health = pancetta_tui::app::PipelineHealth {
                         audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
                         dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
@@ -3599,6 +3617,7 @@ fn map_recent_qso_outcome(
 ) -> pancetta_tui::app::RecentQsoOutcome {
     pancetta_tui::app::RecentQsoOutcome {
         callsign: outcome.callsign.clone(),
+        qso_uuid: outcome.qso_uuid.clone(),
         outcome: match &outcome.outcome {
             crate::message_bus::QsoOutcome::Completed => pancetta_tui::app::QsoOutcome::Completed,
             crate::message_bus::QsoOutcome::Failed(reason) => {
@@ -3900,6 +3919,36 @@ enum NudgeOutcome {
     /// unrelated future CQ-hunting cycle while implying something was armed
     /// for this QSO. The status line explains why, mirroring `HeldNoOp`.
     NoEligibleTarget,
+}
+
+/// A cluster spot's fields plus the relay's station lookups, for
+/// [`cluster_spot_tui_message`].
+struct ClusterSpotRelay {
+    callsign: String,
+    frequency: u64,
+    mode: Option<pancetta_core::Mode>,
+    band: Option<pancetta_core::Band>,
+    spotter: String,
+    worked_before: bool,
+    needed: bool,
+    atno: bool,
+    band_needed: bool,
+}
+
+/// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
+/// pass through unchanged (PAN-345).
+fn cluster_spot_tui_message(spot: ClusterSpotRelay) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::DxSpot {
+        callsign: spot.callsign,
+        frequency: spot.frequency,
+        mode: spot.mode,
+        band: spot.band,
+        spotter: spot.spotter,
+        worked_before: spot.worked_before,
+        needed: spot.needed,
+        atno: spot.atno,
+        band_needed: spot.band_needed,
+    }
 }
 
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
@@ -4681,6 +4730,56 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn cluster_spot_relay_preserves_metadata() {
+        // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,
+        // including CW and unknown values.
+        for (mode, band) in [
+            (
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (None, None),
+        ] {
+            let msg = super::cluster_spot_tui_message(super::ClusterSpotRelay {
+                callsign: "JA1XYZ".to_string(),
+                frequency: 14_074_000,
+                mode,
+                band,
+                spotter: "W1ABC".to_string(),
+                worked_before: true,
+                needed: true,
+                atno: false,
+                band_needed: true,
+            });
+            match msg {
+                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                    callsign,
+                    frequency,
+                    mode: got_mode,
+                    band: got_band,
+                    spotter,
+                    worked_before,
+                    needed,
+                    atno,
+                    band_needed,
+                } => {
+                    assert_eq!(callsign, "JA1XYZ");
+                    assert_eq!(frequency, 14_074_000);
+                    assert_eq!(got_mode, mode);
+                    assert_eq!(got_band, band);
+                    assert_eq!(spotter, "W1ABC");
+                    assert!(worked_before && needed && !atno && band_needed);
+                }
+                other => panic!("expected DxSpot, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn needed_atno_for_reports_unknown_as_not_needed() {
         // PAN-93: no cqdx list loaded → not shown as needed, even though the
@@ -6922,6 +7021,7 @@ mod tui_relay_tests {
         let ts = chrono::Utc::now();
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "JA1ABC".to_string(),
+            qso_uuid: "u-ja1abc".to_string(),
             outcome: crate::message_bus::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -6948,6 +7048,7 @@ mod tui_relay_tests {
     fn map_recent_qso_outcome_carries_failure_reason() {
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "W2XYZ".to_string(),
+            qso_uuid: "u-w2xyz".to_string(),
             outcome: crate::message_bus::QsoOutcome::Failed(
                 pancetta_qso::QsoFailureReason::Timeout,
             ),
@@ -6961,6 +7062,70 @@ mod tui_relay_tests {
             mapped.outcome,
             pancetta_tui::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)
         ));
+    }
+
+    /// PAN-344 AC3: UUID correlation survives the relay — repeated
+    /// callsigns map to distinct UUIDs, and the registry snapshot the relay
+    /// forwards keeps each contact's identity and per-target states intact.
+    #[test]
+    fn pan344_upload_snapshot_mapping_preserves_identity() {
+        let mk = |uuid: &str| crate::message_bus::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: uuid.to_string(),
+            outcome: crate::message_bus::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        };
+        let a = map_recent_qso_outcome(&mk("u-1"));
+        let b = map_recent_qso_outcome(&mk("u-2"));
+        assert_eq!(a.callsign, b.callsign);
+        assert_ne!(a.qso_uuid, b.qso_uuid, "same callsign, distinct QSOs");
+        assert_eq!(a.qso_uuid, "u-1");
+        assert_eq!(b.qso_uuid, "u-2");
+
+        // The registry snapshot flows through the typed message unchanged:
+        // two same-callsign contacts keep independent per-target states.
+        let registry = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(
+                "u-1",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::new(
+                        pancetta_tui::upload_status::UploadState::Accepted,
+                        "",
+                    ),
+                )],
+            );
+            reg.register(
+                "u-2",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            );
+        }
+        let snapshot = registry.lock().unwrap().snapshot();
+        let msg = pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(snapshot);
+        let pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(statuses) = msg else {
+            panic!("typed snapshot message");
+        };
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].uuid, "u-1");
+        assert_eq!(statuses[0].callsign, "K1ABC");
+        assert_eq!(
+            statuses[0].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            statuses[1].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Pending)
+        );
     }
 
     fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {

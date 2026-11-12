@@ -596,6 +596,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the correlation key for per-QSO upload state
+    /// (PAN-344). Internal only; never added to any external message.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed"). NOT the full
@@ -1040,7 +1043,14 @@ pub enum DxMessage {
     /// New DX spot
     Spot {
         callsign: String,
+        /// Spot frequency in Hz.
         frequency: u64,
+        /// Mode parsed from the spot comment; `None` when unknown, never
+        /// assumed FT8 (PAN-345).
+        mode: Option<pancetta_core::Mode>,
+        /// Band derived from `frequency` by the shared
+        /// `pancetta_core::Band::from_frequency` table; `None` outside it.
+        band: Option<pancetta_core::Band>,
         spotter: String,
         comment: String,
     },
