@@ -596,6 +596,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the correlation key for per-QSO upload state
+    /// (PAN-344). Internal only; never added to any external message.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed"). NOT the full
@@ -800,6 +803,12 @@ pub enum QsoMessage {
         /// permission to THIS specific client, not just "some client is
         /// armed" — see `QsoMetadata::remote_client_key_id`.
         remote_client_key_id: Option<String>,
+        /// PAN-287: `true` when `frequency` is the TX offset the allocator chose for a
+        /// network-spot call whose DX offset is unknown — not where we heard the DX.
+        /// The QSO opens with `partner_freq = Some(tx_off)`, so the existing
+        /// two-sighting drift confirmation relatches where we hear the DX without
+        /// moving our TX. `false` for every other StartQso (byte-identical).
+        dx_offset_unknown: bool,
     },
     /// Respond to a station **calling us**, opening the exchange at an
     /// operator-chosen [`pancetta_core::ResponseStep`] rather than always
@@ -1034,7 +1043,14 @@ pub enum DxMessage {
     /// New DX spot
     Spot {
         callsign: String,
+        /// Spot frequency in Hz.
         frequency: u64,
+        /// Mode parsed from the spot comment; `None` when unknown, never
+        /// assumed FT8 (PAN-345).
+        mode: Option<pancetta_core::Mode>,
+        /// Band derived from `frequency` by the shared
+        /// `pancetta_core::Band::from_frequency` table; `None` outside it.
+        band: Option<pancetta_core::Band>,
         spotter: String,
         comment: String,
     },

@@ -328,6 +328,7 @@ fn cq_dx_station() -> crate::app::DxStation {
         call_sign: "VK9XX".to_string(),
         grid_square: Some("QH30".to_string()),
         frequency: 14.074,
+        band: None,
         mode: "FT8".to_string(),
         last_seen: chrono::Utc::now(),
         snr: -10,
@@ -352,6 +353,7 @@ fn cq_dx_station() -> crate::app::DxStation {
         last_seen_network: None,
         audio_offset_hz: Some(750),
         slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+        spot_rf_hz: None,
         watchlisted: false,
         pinned: false,
     }
@@ -410,6 +412,7 @@ fn rich_fixture(app: &mut App) {
     for callsign in ["W1AW", "G8KHF"] {
         app.recent_qsos.push_back(crate::app::RecentQsoOutcome {
             callsign: callsign.into(),
+            qso_uuid: format!("u-{callsign}"),
             outcome: crate::app::QsoOutcome::Completed,
             last_state: "Completed".into(),
             freq_hz: 14_074_000,

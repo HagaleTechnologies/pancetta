@@ -200,6 +200,25 @@ Tests: `bar_fit::tests`, `ui::view_render_tests::title_bar_*` / `*_headings_are_
 `tui_runner::key_tests::help_overlay_*`.
 
 
+## Slot and parity clock in the title bar (PAN-352, 2026-11-11)
+
+The shared title row starts with `[E ▮▮▯▯▯▯ 06s │ TX:O]`. It shows current
+slot parity, six rounded progress cells, whole elapsed seconds and resolved
+station TX parity. Unknown TX parity is `-`. FT8 uses 15 s, FT4 7.5 s and
+FT2 3.2 s slots. Slot and UTC clocks use the same instant on each frame.
+
+The slot chip has admit rank 1, just below pinned callsign and TX policy.
+If it cannot fit, every droppable chip is hidden, including the application
+name. Pinned state and UTC can outlive it under extreme width pressure.
+The title row also appears on the too-small screen, with contest scores
+starting on row 1. The panel minimum stays 80×20.
+
+The decode chip retains the preset only. Elapsed milliseconds and budget
+exhaustion remain in Shift+S station health. At 80 columns with live TX and
+the presence-pause prompt both active, the pause prompt can drop to keep
+the clock. It returns when TX clears, or fits from 85 columns with a
+six-character callsign. This follows the clock's last-item-dropped rule.
+
 ## Readiness strip — durable blockers vs acknowledgeable warnings vs transient status (PAN-89, 2026-10-12)
 
 `pancetta-tui/src/readiness.rs` (model), `pancetta-tui/src/ui/readiness_strip.rs` (render),
@@ -458,3 +477,58 @@ and say nothing about any one station. The strip chip and the Why text carry
 - **Key-effect golden.** `pancetta-tui/tests/fixtures/key_effects.golden` records what every key does (status line, commands sent, App fields changed) in five modifier sets across 36 scenarios: the main view on every panel, zoomed, stopped and TX-disabled, every dialog on a rich fixture, and six empty-dialog cases. The rich fixture includes audio devices, diagnostic events and recent QSOs. It was blessed from the pre-refactor handler at `7053b62` (the harness, `tui_runner/key_effects.rs`, uses only APIs that exist there, so it can be dropped onto that commit to re-check), and the new handler reproduces it byte for byte. Any change to what a key does fails `key_effects_match_golden` until it is re-blessed on purpose with `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`. The variable is separate from `PANCETTA_REGEN_DOCS`, so regenerating docs never re-blesses key behaviour.
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
+
+## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
+
+Each Recent-QSOs row shows one glyph cell per enabled upload target in
+fixed order Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW
+(✓ accepted, ~ pending, × rejected, ! failed, ? unknown), with per-target
+state and reason on the selected-contact Station card. The card follows the
+overlay cursor's QSO UUID, never the live focused station, so an older
+contact's results are never attributed to a same-callsign live station.
+The completion toast is typed App state ("{call} logged · uploads queued"
+until every explicitly accepted target yields "{call} uploaded"); compose
+input outranks it and ordinary status text returns on expiry. Acceptance is
+only ever an explicit service result — an empty captured target set renders
+"uploads off", a missing result renders "?", and colour supplements glyphs.
+History is session-only: the coordinator retains the last 100 completion
+registrations and the TUI mirrors them; a restart invents no accepted
+history.
+## Space on a network spot QSYs the rig (PAN-287, 2026-11)
+
+`pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.
+
+- **Offset derivation.** No source supplies an explicit audio offset, so `offset = spot RF − standard dial`. It is used when it lies in `ACTIVE_QSO_TX_OFFSET_MIN_HZ..=ACTIVE_QSO_TX_OFFSET_MAX_HZ` (200-2900 Hz); otherwise the spot has no offset and the allocator picks one. The ticket's 14.0746 MHz example derives 600 Hz, not 1210 Hz; tests pin both 14,074,600 → 600 Hz and 14,075,210 → 1210 Hz.
+- **One standard dial.** `spot_call::standard_dial(band, mode)` is shared by `apply_band_selection` and the spot resolver: FT8 uses the band table's `ft8_frequency`, FT4 uses `pancetta_core::Band::dial_for(true)`. Band keys and spot QSY land on identical dials. FT2 has no standard dial and is refused.
+- **Window check, not the mode label.** The spot RF must lie in `[dial, dial + 3000 Hz]` for the active mode on the band whose range contains it. A spot in the other FT mode's window is refused and points at Shift+M; anything else (CW, SSB) is refused as off the sub-band. The cluster's `"FT8"` label is never trusted.
+- **Which rows.** Only DX Hunter rows with no local audio offset and a known `spot_rf_hz` take the new path. Locally heard rows, Callers and Band Activity behave as before, and `CallStation` is untouched.
+- **TUI resolves, coordinator admits.** The TUI sends `TuiCommand::CallNetworkSpot { callsign, band, dial_hz, audio_offset_hz }`. The relay checks own call, TX policy, rig route, exchange in progress and keyed state, then QSYs and calls. The TUI switches its band only when the coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves it alone.
+- **Exchange blocks a QSY.** A dial-changing spot call is refused while any QSO is in `WaitingForReport`, `SendingReport`, `WaitingForConfirmation`, `SendingConfirmation` or `Contest(ExchangingInfo)`. Our own CQs and unanswered calls are ended by the band change, as a band key ends them. A spot on the current dial is never blocked. The exchange check is a snapshot of the QSO manager taken before `ptt_sync_gate`, not serialized with the QSO task: a partner reply the QSO task applies between that read and the dial store is still torn down. It cannot be reread under the gate, because `apply_tx_offset_switch` takes the manager's `qsos` lock before `ptt_sync_gate`; closing it fully needs the QSO task to arbitrate the QSY.
+- **No rig control, no QSY.** Without a Hamlib route the call is refused and names the dial to tune to; calling on the current dial would transmit on the wrong band.
+- **Allocator after the QSY.** The relay reads the autonomous operator through `autonomous_operator_watch` (published with `send_replace` on every start and restart) and calls `allocate_smart_frequency_avoiding` after the QSY. Any commanded dial change clears the operator's band-scoped state (`invalidate_band_scoped_state`).
+- **Two-sighting reliance.** `StartQso { dx_offset_unknown: true }` opens at the allocator's offset with `partner_freq = Some(tx)`. The existing two-sighting drift confirmation relatches `partner_freq` to wherever the DX answers, and our TX stays put. A stale derived offset costs one extra reply cycle; one off-frequency frame never advances the QSO. The relevance gate is unchanged.
+- **Deferral.** While keyed (`ptt_active`, or `gain_tx_gate` bits other than bit 0), the call is parked, latest wins. It is dropped after 30 s, on any operator frequency change or operating-mode switch (its dial was resolved for the old mode), by a newer spot call, or at execution when TX policy no longer allows initiation, an exchange has started, or the rig route is gone. The final keyed recheck and the `SetFrequency` enqueue run under `ptt_sync_gate`, which the TUI's manual key-down (`tui_relay::manual_key_down`) also holds across its last pre-PTT gates and its PTT-on enqueue; the autonomous operator is never locked under that gate.
+- **Parked cross-parity calls.** A band change now drains `pending_manual_calls` and reports each one, so a call queued on the old band never promotes on the new band.
+- **A13 (rig data mode).** No `SetMode` is sent from `qsy_send`. Since PAN-276, with `[rig] data_mode` set, the rigctld backend reapplies the configured mode after every commanded frequency change, spot QSY included; unset, the mode is left to the operator.
+
+Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
+
+## Band Activity need markers (PAN-350, 2026-11-11)
+
+Band Activity consumes the same prepared entity verdict as DX Hunter, falling
+back to stored decode flags when no verdict exists. Both use shared need glyph
+and style helpers: ATNO `!` suppresses needed `+` and band-new `▲`; otherwise
+`+` precedes `▲`. Band Activity puts these before its directed or engaged
+prefix. ATNO is bold magenta and underlined, ahead of worked-before; ordinary
+needed is bold error colour, behind worked-before. Own TX, directed and global
+focus styles win first; engaged adds green underline and selection retains
+black text on accent. Own TX and missing calls have no need markers.
+
+A new-grid `+` appears only when the prepared verdict is true and the decode's
+canonical grid matches the current DX row's canonical grid. Historical decodes
+retain their grid and band-needed flag. Unknown, invalid, absent or mismatched
+grid history adds no marker and triggers no lookup during rendering.
+
+Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
+borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
+below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.

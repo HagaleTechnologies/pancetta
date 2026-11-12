@@ -571,6 +571,35 @@ pub fn compute_manual_tx_offset(
     (tx_off, partner_freq)
 }
 
+/// PAN-287: TX audio offset for a network-spot call whose DX offset is
+/// unknown (`StartQso { dx_offset_unknown: true }`). `allocated_hz` is the
+/// frequency allocator's pick, de-conflicted from the active QSOs exactly
+/// like [`compute_manual_tx_offset`]. `partner_freq` is a placeholder equal
+/// to our own TX offset: the existing two-sighting drift confirmation then
+/// relatches `partner_freq` to wherever the DX answers, and our TX stays put.
+pub fn compute_spot_call_tx_offset(
+    allocated_hz: f64,
+    active_offsets: &[f64],
+) -> (f64, Option<f64>) {
+    let tx_off = pancetta_qso::deconflict_offset(
+        allocated_hz,
+        active_offsets,
+        pancetta_qso::MIN_TX_SEPARATION_HZ,
+        pancetta_qso::TX_OFFSET_MIN_HZ,
+        pancetta_qso::TX_OFFSET_MAX_HZ,
+    );
+    (tx_off, Some(tx_off))
+}
+
+/// PAN-287: a band change empties the cross-parity call queue. A call parked
+/// on the old band must never promote and transmit on the new one. Returns
+/// the dropped callsigns in queue order, so each can be reported.
+fn drain_parked_calls_on_band_change(
+    queue: &mut std::collections::VecDeque<PendingManualCall>,
+) -> Vec<String> {
+    queue.drain(..).map(|p| p.callsign).collect()
+}
+
 /// Pure: summarize what a decoded frame tells us its sender is doing (#41).
 /// `our_call` lets us say "→ us" when the frame is directed at us. Returns
 /// `None` for frames with no useful "who are they working" signal.
@@ -3091,6 +3120,7 @@ fn recent_qso_outcome(
 
     crate::message_bus::RecentQsoOutcome {
         callsign: their_call.to_string(),
+        qso_uuid: metadata.qso_id.to_string(),
         outcome,
         last_state,
         freq_hz: metadata.frequency as u32,
@@ -3694,6 +3724,7 @@ impl super::ApplicationCoordinator {
                 self.upload_health.clone(),
                 Some(self.message_bus.clone()),
                 self.shutdown_signal.clone(),
+                Some(self.qso_upload_statuses.clone()),
             );
             self.upload_outbox = Some(handle);
             self.upload_outbox_task = Some(task);
@@ -3991,6 +4022,9 @@ impl super::ApplicationCoordinator {
             // is still seeding history -- and never waits forever either.
             let consumer_ready =
                 super::replay::QsoConsumerReadyGuard::new(self.qso_consumer_ready.clone());
+            // PAN-344: the per-QSO upload-status registry the upload
+            // subscriber registers completions into.
+            let qso_upload_statuses_for_subscriber = self.qso_upload_statuses.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
@@ -4054,6 +4088,7 @@ impl super::ApplicationCoordinator {
                         shutdown.clone(),
                         qso_lookup.clone(),
                         qrz_xml_base_url.clone(),
+                        qso_upload_statuses_for_subscriber.clone(),
                     );
                 }
 
@@ -4628,6 +4663,16 @@ impl super::ApplicationCoordinator {
                             Ok(pancetta_qso::QsoEvent::QsoCompleted {
                                 qso_id, metadata, ..
                             }) => {
+                                if !upload_enabled {
+                                    qso_upload_statuses_for_subscriber
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .register(
+                                            &qso_id.to_string(),
+                                            metadata.their_callsign.as_deref().unwrap_or("?"),
+                                            vec![],
+                                        );
+                                }
                                 if let Some(callsign) = &metadata.their_callsign {
                                     let _ = snapshot_bus
                                         .send_message_durable(ComponentMessage::new(
@@ -4711,7 +4756,8 @@ impl super::ApplicationCoordinator {
                                         rst(metadata.reports.sent),
                                         rst(metadata.reports.received),
                                     );
-                                    emit_status(&snapshot_bus, completed_text.clone()).await;
+                                    // The typed completion toast owns the visual slot.
+                                    // Keep the diagnostic below for counters and history.
                                     // observability-diagnostics-plan.md Layer 2:
                                     // also retain this outcome in the diagnostic
                                     // history (the status line above is overwritten
@@ -5282,7 +5328,11 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             remote_origin,
                                             remote_client_key_id,
+                                            dx_offset_unknown,
                                         } => {
+                                            // PAN-287: a network-spot call carries no parity,
+                                            // so the parity gate always admits it (never queued).
+                                            debug_assert!(!dx_offset_unknown || dx_parity.is_none());
                                             // PAN-78: capacity/parity checks and the open run
                                             // under the admission lock.
                                             let _admission = qso_admission.lock().await;
@@ -5480,9 +5530,17 @@ impl super::ApplicationCoordinator {
                                                 tx_freq_mode.load(Ordering::Relaxed),
                                             ) == pancetta_core::TxFreqMode::Hold;
                                             let active = qso_manager.active_tx_offsets().await;
-                                            let (tx_off, partner) = compute_manual_tx_offset(
-                                                dx_freq, hold_mode, held, &active,
-                                            );
+                                            // PAN-287: a network-spot call with no known DX
+                                            // offset opens at the allocator's TX offset with a
+                                            // placeholder partner_freq; every other call is
+                                            // unchanged.
+                                            let (tx_off, partner) = if dx_offset_unknown {
+                                                compute_spot_call_tx_offset(dx_freq, &active)
+                                            } else {
+                                                compute_manual_tx_offset(
+                                                    dx_freq, hold_mode, held, &active,
+                                                )
+                                            };
                                             if tx_off != dx_freq {
                                                 info!(
                                                     target: "qso",
@@ -6395,6 +6453,34 @@ impl super::ApplicationCoordinator {
                                                         "Band change — {} active QSO(s) ended",
                                                         n
                                                     ),
+                                                )
+                                                .await;
+                                            }
+                                            // PAN-287: a call parked in the cross-parity queue on
+                                            // the old band must not promote and transmit on the
+                                            // new band. Drop and report each one.
+                                            let dropped = {
+                                                let mut queue = pending_manual_calls.lock().await;
+                                                drain_parked_calls_on_band_change(&mut queue)
+                                            };
+                                            for call in dropped {
+                                                warn!(
+                                                    target: "qso",
+                                                    "Band change: dropping queued call to {}", call
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!("Queued call to {call} dropped — band changed"),
+                                                )
+                                                .await;
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!("Dropped queued call to {call} — band changed"),
+                                                    None,
+                                                    Some(&call),
                                                 )
                                                 .await;
                                             }
@@ -7366,7 +7452,10 @@ fn snapshot_item_from_progress(
 
 #[cfg(test)]
 mod pending_manual_tests {
-    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall, QueueStamp};
+    use super::{
+        compute_manual_tx_offset, compute_spot_call_tx_offset, drain_parked_calls_on_band_change,
+        partition_pending_calls, PendingManualCall, QueueStamp,
+    };
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
 
@@ -7407,6 +7496,40 @@ mod pending_manual_tests {
         let (tx_off, partner) = compute_manual_tx_offset(180.0, false, 0, &[]);
         assert_eq!(tx_off, pancetta_qso::TX_OFFSET_MIN_HZ);
         assert_eq!(partner, Some(180.0));
+    }
+
+    // PAN-287: a network-spot call with no DX offset keeps the allocator's
+    // pick and listens there (placeholder partner_freq = our TX).
+    #[test]
+    fn spot_call_offset_keeps_allocator_pick_and_sets_placeholder_partner() {
+        assert_eq!(
+            compute_spot_call_tx_offset(1000.0, &[]),
+            (1000.0, Some(1000.0))
+        );
+    }
+
+    #[test]
+    fn spot_call_offset_is_deconflicted_from_active_qsos() {
+        let (tx, partner) = compute_spot_call_tx_offset(1000.0, &[1020.0]);
+        assert!((tx - 1020.0).abs() >= pancetta_qso::MIN_TX_SEPARATION_HZ);
+        assert_eq!(partner, Some(tx));
+    }
+
+    // PAN-287: a band change drops every parked cross-parity call, in queue
+    // order, and leaves the queue empty.
+    #[test]
+    fn band_change_drains_parked_calls_in_queue_order() {
+        let mut q: VecDeque<_> = [
+            caller_call("K1AAA", SlotParity::Even, pancetta_core::ResponseStep::Grid),
+            caller_call("K2BBB", SlotParity::Odd, pancetta_core::ResponseStep::Grid),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            drain_parked_calls_on_band_change(&mut q),
+            vec!["K1AAA".to_string(), "K2BBB".to_string()]
+        );
+        assert!(q.is_empty());
     }
 
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
@@ -11025,6 +11148,55 @@ async fn upload_subscriber_finish(outbox: Option<&super::upload_outbox::UploadOu
 // QRZ XML test endpoint — bundling them into a struct would just move the
 // same fields without improving clarity.
 #[allow(clippy::too_many_arguments)]
+/// PAN-344: the enabled upload targets captured for one completion — the
+/// outbox's runtime-enabled destinations plus LoTW when its client is on,
+/// each starting Pending ("queued" means upload work has been scheduled,
+/// not accepted). Later config changes never rewrite a contact's captured
+/// set; an empty set means "uploads disabled".
+fn completion_upload_targets(
+    destinations: &[pancetta_dx::upload_outbox::UploadDestination],
+    lotw_enabled: bool,
+) -> Vec<(
+    pancetta_tui::upload_status::UploadTarget,
+    pancetta_tui::upload_status::TargetUploadStatus,
+)> {
+    use pancetta_tui::upload_status::{sort_targets, TargetUploadStatus, UploadTarget};
+    let mut targets: Vec<_> = destinations
+        .iter()
+        .map(|d| {
+            (
+                super::qso_upload_status::upload_target_for_destination(*d),
+                TargetUploadStatus::pending("queued"),
+            )
+        })
+        .collect();
+    if lotw_enabled {
+        targets.push((UploadTarget::Lotw, TargetUploadStatus::pending("queued")));
+    }
+    sort_targets(&mut targets);
+    targets
+}
+
+/// PAN-344: map one LoTW one-shot result to its registry state and reason.
+/// Logged and Duplicate mean Accepted; an error means Failed — no retry
+/// behaviour is added, matching the existing best-effort single attempt.
+fn lotw_result_state<E: std::fmt::Display>(
+    result: &Result<pancetta_dx::QsoUploadOutcome, E>,
+) -> (pancetta_tui::upload_status::UploadState, String) {
+    use pancetta_tui::upload_status::UploadState;
+    match result {
+        Ok(pancetta_dx::QsoUploadOutcome::Logged) => (UploadState::Accepted, String::new()),
+        Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => (
+            UploadState::Accepted,
+            "duplicate \u{2014} already logged".to_string(),
+        ),
+        Err(_) => (
+            UploadState::Failed,
+            "tqsl failed · check local upload diagnostics".into(),
+        ),
+    }
+}
+
 fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
     lotw_cfg: pancetta_config::network::LotwUploadConfig,
@@ -11034,6 +11206,7 @@ fn start_qso_upload_subscriber(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
     qrz_xml_base_url: Option<String>,
+    upload_statuses: super::qso_upload_status::SharedUploadStatusRegistry,
 ) {
     use std::sync::Arc;
 
@@ -11128,6 +11301,28 @@ fn start_qso_upload_subscriber(
             };
             match event {
                 Ok(pancetta_qso::QsoEvent::QsoCompleted { mut metadata, .. }) => {
+                    // PAN-344: register the COMPLETE enabled target set at
+                    // completion processing, BEFORE QRZ enrichment or ADIF
+                    // rendering, so later config changes never rewrite this
+                    // contact's denominator and local preparation failures
+                    // have targets to mark. All captured targets start
+                    // Pending ("queued" = scheduled, not accepted).
+                    {
+                        let their_for_registry = metadata
+                            .their_callsign
+                            .clone()
+                            .unwrap_or_else(|| "?".to_string());
+                        let destinations: &[pancetta_dx::upload_outbox::UploadDestination] =
+                            outbox.as_ref().map(|o| o.destinations()).unwrap_or(&[]);
+                        let targets =
+                            completion_upload_targets(destinations, lotw_client.is_some());
+                        // Registered even when EMPTY: a confirmed empty
+                        // target set is "uploads disabled", never unknown.
+                        upload_statuses
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .register(&metadata.qso_id.to_string(), &their_for_registry, targets);
+                    }
                     // Best-effort QRZ XML enrichment: fill a MISSING their-grid
                     // (and name/dxcc in notes for logging) before rendering the
                     // ADIF record. No-op when the client is disabled or the grid
@@ -11169,6 +11364,17 @@ fn start_qso_upload_subscriber(
                                 "Skipping upload for QSO {}: ADIF render failed: {}",
                                 metadata.qso_id, e
                             );
+                            // PAN-344: a local preparation failure marks every
+                            // intended target Failed — the contact keeps its
+                            // denominator and cannot become all-accepted.
+                            upload_statuses
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .record_all(
+                                    &metadata.qso_id.to_string(),
+                                    pancetta_tui::upload_status::UploadState::Failed,
+                                    "upload skipped: ADIF render failed",
+                                );
                             continue;
                         }
                     };
@@ -11189,16 +11395,31 @@ fn start_qso_upload_subscriber(
                     // the contra-callsign is unknown. Frequency is the
                     // dial+offset RF value already stamped on the metadata.
                     if let Some(outbox) = &outbox {
-                        let cqdx_payload = if outbox
+                        let cqdx_enabled = outbox
                             .destinations()
-                            .contains(&pancetta_dx::upload_outbox::UploadDestination::Cqdx)
-                        {
-                            cqdx_record_from_metadata(&metadata)
-                                .and_then(|qso| serde_json::to_string(&qso).ok())
+                            .contains(&pancetta_dx::upload_outbox::UploadDestination::Cqdx);
+                        let cqdx_payload = if cqdx_enabled {
+                            let payload = cqdx_record_from_metadata(&metadata)
+                                .and_then(|qso| serde_json::to_string(&qso).ok());
+                            // PAN-344: an enabled cqdx.io target with no
+                            // constructible payload is a local failure for
+                            // that target, never an acceptance.
+                            if payload.is_none() {
+                                upload_statuses
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .record(
+                                        &metadata.qso_id.to_string(),
+                                        pancetta_tui::upload_status::UploadTarget::Cqdx,
+                                        pancetta_tui::upload_status::UploadState::Failed,
+                                        "cqdx record unavailable",
+                                    );
+                            }
+                            payload
                         } else {
                             None
                         };
-                        outbox
+                        let queued = outbox
                             .enqueue(super::upload_outbox::outbox_batch(
                                 metadata.qso_id,
                                 &their,
@@ -11207,6 +11428,23 @@ fn start_qso_upload_subscriber(
                                 outbox.destinations(),
                             ))
                             .await;
+                        // PAN-344: a closed worker channel is a local refusal
+                        // for every targeted destination — never silence.
+                        if !queued {
+                            let mut registry = upload_statuses
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for destination in outbox.destinations() {
+                                registry.record(
+                                    &metadata.qso_id.to_string(),
+                                    super::qso_upload_status::upload_target_for_destination(
+                                        *destination,
+                                    ),
+                                    pancetta_tui::upload_status::UploadState::Failed,
+                                    "upload queue is closed",
+                                );
+                            }
+                        }
                     }
 
                     // LoTW signs + uploads the same rendered ADIF record by
@@ -11215,8 +11453,13 @@ fn start_qso_upload_subscriber(
                     if let Some(client) = lotw_client.clone() {
                         let record = record.clone();
                         let their = their.clone();
+                        let upload_statuses = upload_statuses.clone();
+                        let lotw_uuid = metadata.qso_id.to_string();
                         tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
+                            // PAN-344: the LoTW one-shot result feeds the
+                            // registry through the tested mapping helper.
+                            let result = client.upload_adif(&record).await;
+                            match &result {
                                 Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
                                     target: "qso.upload",
                                     "LoTW: signed + uploaded QSO with {}", their
@@ -11231,6 +11474,16 @@ fn start_qso_upload_subscriber(
                                     "LoTW: upload failed for {}: {}", their, e
                                 ),
                             }
+                            let (state, reason) = lotw_result_state(&result);
+                            upload_statuses
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .record(
+                                    &lotw_uuid,
+                                    pancetta_tui::upload_status::UploadTarget::Lotw,
+                                    state,
+                                    &reason,
+                                );
                         });
                     }
                 }
@@ -12045,6 +12298,93 @@ mod cqdx_upload_tests {
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn pan344_subscriber_missing_payload_and_closed_worker() {
+        use super::super::upload_outbox::{
+            self, Delivery, OutboxTiming, OutboxTransport, UploadHealth,
+        };
+        use pancetta_dx::upload_outbox::{RetrySchedule, UploadDestination};
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+        struct Transport;
+        impl OutboxTransport for Transport {
+            fn destinations(&self) -> Vec<UploadDestination> {
+                vec![UploadDestination::QrzLogbook, UploadDestination::Cqdx]
+            }
+            async fn deliver(&self, _: UploadDestination, _: String) -> Delivery {
+                Delivery::Accepted { duplicate: false }
+            }
+        }
+        for closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let statuses = super::super::qso_upload_status::UploadStatusRegistry::shared();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let (handle, task) = upload_outbox::start_upload_outbox(
+                dir.path().join("queue.json"),
+                Arc::new(Transport),
+                RetrySchedule::new(3, 5, 20, 2.0, 0.0, std::time::Duration::from_millis(100)),
+                OutboxTiming::PRODUCTION,
+                Arc::new(Mutex::new(UploadHealth::default())),
+                None,
+                shutdown.clone(),
+                Some(statuses.clone()),
+            );
+            if closed {
+                task.abort();
+                while !handle.worker_stopped() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let (tx, rx) = tokio::sync::broadcast::channel(4);
+            super::start_qso_upload_subscriber(
+                Some(handle),
+                Default::default(),
+                Default::default(),
+                100,
+                rx,
+                shutdown,
+                Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+                None,
+                statuses.clone(),
+            );
+            let metadata = metadata_with_call(if closed { Some("K1ABC") } else { None });
+            let uuid = metadata.qso_id;
+            tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+                qso_id: uuid,
+                metadata,
+                state_history: vec![],
+                messages: vec![],
+            })
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let ready = statuses
+                        .lock()
+                        .unwrap()
+                        .snapshot()
+                        .first()
+                        .is_some_and(|s| {
+                            s.state(UploadTarget::Cqdx) == Some(UploadState::Failed)
+                                && s.state(UploadTarget::Qrz)
+                                    == Some(if closed {
+                                        UploadState::Failed
+                                    } else {
+                                        UploadState::Accepted
+                                    })
+                        });
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("subscriber reports actual payload and queue outcomes");
+            drop(tx);
+            task.abort();
         }
     }
 
@@ -13703,6 +14043,7 @@ mod replay_history_seed_tests {
             )),
             None,
             shutdown.clone(),
+            None,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while transport.0.lock().unwrap().is_empty() {
@@ -15440,6 +15781,7 @@ mod respond_to_caller_admission_tests {
                 dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             }),
             Instant::now(),
         );
@@ -16752,6 +17094,7 @@ mod respond_to_caller_admission_tests {
                     dx_parity: Some(SlotParity::Even),
                     remote_origin: false,
                     remote_client_key_id: None,
+                    dx_offset_unknown: false,
                 }),
                 Instant::now(),
             ))
@@ -17442,6 +17785,7 @@ mod manual_capacity_admission_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -17833,6 +18177,7 @@ mod manual_capacity_admission_tests {
             dx_parity: Some(SlotParity::Even),
             remote_origin: true,
             remote_client_key_id: Some("peer".to_string()),
+            dx_offset_unknown: false,
         }
     }
 
@@ -18001,6 +18346,7 @@ mod remote_controller_change_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -18079,6 +18425,7 @@ mod remote_controller_change_tests {
             dx_parity: Some(dx),
             remote_origin: true,
             remote_client_key_id: Some(client.to_string()),
+            dx_offset_unknown: false,
         })
         .await;
     }
@@ -19724,5 +20071,115 @@ mod completed_tx_purge_tests {
         assert!(live(&g, &key));
         assert!(g.purge_if_current(&key, third));
         assert!(!live(&g, &key), "the re-completion's own purge removes it");
+    }
+
+    /// PAN-344 AC5: the enabled-target matrix captured at completion.
+    /// Every enabled outbox destination plus an enabled LoTW client is
+    /// captured, in canonical display order, all Pending; an empty captured
+    /// set is "uploads disabled"; a preparation failure marks the whole
+    /// captured set Failed so an enabled target can never disappear from
+    /// the all-accepted calculation.
+    #[test]
+    fn pan344_completion_upload_target_matrix() {
+        use super::completion_upload_targets;
+        use pancetta_dx::upload_outbox::UploadDestination::*;
+        use pancetta_tui::upload_status::{verdict, UploadState, UploadTarget, UploadVerdict};
+
+        let all = completion_upload_targets(&[ClubLog, QrzLogbook, Eqsl, Cqdx], true);
+        assert_eq!(
+            all.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![
+                UploadTarget::Qrz,
+                UploadTarget::ClubLog,
+                UploadTarget::Eqsl,
+                UploadTarget::Cqdx,
+                UploadTarget::Lotw
+            ],
+            "canonical display order"
+        );
+        assert!(all
+            .iter()
+            .all(|(_, s)| s.state == UploadState::Pending && s.reason == "queued"));
+
+        let subset = completion_upload_targets(&[QrzLogbook], false);
+        assert_eq!(
+            subset.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![UploadTarget::Qrz]
+        );
+
+        // Empty captured set: disabled, never vacuously all-accepted.
+        let none = completion_upload_targets(&[], false);
+        let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
+        registry.lock().unwrap().register("u-none", "K1ABC", none);
+        let snap = registry.lock().unwrap().snapshot();
+        assert_eq!(verdict(&snap[0]), UploadVerdict::Disabled);
+
+        // ADIF render failure marks every intended target Failed.
+        let uuid = "u-matrix";
+        registry.lock().unwrap().register(
+            uuid,
+            "K1ABC",
+            completion_upload_targets(&[ClubLog, QrzLogbook], true),
+        );
+        registry.lock().unwrap().record_all(
+            uuid,
+            UploadState::Failed,
+            "upload skipped: ADIF render failed",
+        );
+        let snap = registry.lock().unwrap().snapshot();
+        let entry = snap.iter().find(|s| s.uuid == uuid).unwrap();
+        assert_eq!(entry.targets.len(), 3, "no enabled target disappears");
+        assert!(entry
+            .targets
+            .iter()
+            .all(|(_, s)| s.state == UploadState::Failed));
+        assert_eq!(verdict(entry), UploadVerdict::NeedsAttention);
+    }
+
+    /// PAN-344 AC5: LoTW's own result is included — Logged and Duplicate
+    /// mean Accepted, an error means Failed, and a registered Lotw target
+    /// transitions accordingly (it stays pending until its own result).
+    #[test]
+    fn pan344_lotw_result_is_included() {
+        use super::{completion_upload_targets, lotw_result_state};
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+
+        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
+            pancetta_dx::QsoUploadOutcome::Logged,
+        ));
+        assert_eq!(state, UploadState::Accepted);
+        assert!(reason.is_empty());
+
+        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
+            pancetta_dx::QsoUploadOutcome::Duplicate,
+        ));
+        assert_eq!(state, UploadState::Accepted);
+        assert!(reason.contains("duplicate"));
+
+        let (state, reason) = lotw_result_state(&Err("tqsl not found".to_string()));
+        assert_eq!(state, UploadState::Failed);
+        assert!(reason.contains("tqsl failed"), "{reason}");
+
+        let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
+        registry
+            .lock()
+            .unwrap()
+            .register("u-lotw", "K1ABC", completion_upload_targets(&[], true));
+        {
+            let snap = registry.lock().unwrap().snapshot();
+            let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
+            assert_eq!(
+                entry.state(UploadTarget::Lotw),
+                Some(UploadState::Pending),
+                "LoTW stays pending until its own result"
+            );
+        }
+        registry
+            .lock()
+            .unwrap()
+            .record("u-lotw", UploadTarget::Lotw, state, &reason);
+        let snap = registry.lock().unwrap().snapshot();
+        let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
+        assert_eq!(entry.state(UploadTarget::Lotw), Some(UploadState::Failed));
     }
 }

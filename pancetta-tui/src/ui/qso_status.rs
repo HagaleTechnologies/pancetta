@@ -1192,6 +1192,7 @@ mod tests {
             call_sign: call.to_string(),
             grid_square: None,
             frequency: 14_074_000.0,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -10,
@@ -1216,6 +1217,7 @@ mod tests {
             last_seen_network: None,
             audio_offset_hz: None,
             slot_parity: None,
+            spot_rf_hz: None,
             watchlisted: false,
             pinned: false,
         }

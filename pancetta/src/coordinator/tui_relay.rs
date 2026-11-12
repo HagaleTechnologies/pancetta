@@ -328,6 +328,10 @@ impl super::ApplicationCoordinator {
         // PAN-114: clock-skew warning published by the clock-skew monitor
         // (`clock_monitor.rs`), read on the same 2s health tick.
         let clock_skew_relay = self.clock_skew.clone();
+        // PAN-344: per-QSO upload-status registry, snapshotted (cloned) on
+        // the same 2s tick and relayed as full bounded snapshots so a lost
+        // best-effort transition heals on the next tick.
+        let qso_upload_statuses_relay = self.qso_upload_statuses.clone();
         // PAN-89: readiness-strip inputs, snapshotted on the same 2s tick.
         let readiness_sources = super::readiness::ReadinessSources::from_coordinator(self);
         // Clone our callsign before the tui-relay thread consumes the original
@@ -777,6 +781,8 @@ impl super::ApplicationCoordinator {
                         MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                             callsign,
                             frequency,
+                            mode,
+                            band,
                             spotter,
                             ..
                         }) => {
@@ -811,17 +817,19 @@ impl super::ApplicationCoordinator {
                                     );
                                 }
                             }
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                            let _ = tui_msg_tx_relay.send(cluster_spot_tui_message(
+                                ClusterSpotRelay {
                                     callsign,
                                     frequency,
+                                    mode,
+                                    band,
                                     spotter,
                                     worked_before,
                                     needed,
                                     atno,
                                     band_needed,
                                 },
-                            );
+                            ));
                         }
                         MessageType::StatusUpdate(text) => {
                             // Free-form status emitted by other components (e.g. QSO
@@ -997,6 +1005,16 @@ impl super::ApplicationCoordinator {
 
                 // Send pipeline health to TUI every 2 seconds
                 if last_health_send.elapsed() >= std::time::Duration::from_secs(2) {
+                    // PAN-344: relay the full bounded per-QSO upload-status
+                    // snapshot on the same tick. Sent repeatedly; the App
+                    // merges by UUID and revision.
+                    let uploads = qso_upload_statuses_relay
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot();
+                    let _ = tui_msg_tx_relay.send(
+                        pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(uploads),
+                    );
                     let health = pancetta_tui::app::PipelineHealth {
                         audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
                         dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
@@ -1295,6 +1313,30 @@ impl super::ApplicationCoordinator {
         // immediately (the structured panel update follows on the next
         // autonomous slot tick, ≤15s later).
         let cmd_tui_msg_tx = tui_msg_tx.clone();
+        // PAN-287: Space on a DX Hunter network spot (`CallNetworkSpot`) and
+        // the operator's `SetFrequency` share one QSY helper and one lock, so
+        // a band key cannot interleave between a spot QSY and its call. See
+        // `coordinator/spot_call.rs`.
+        let spot_ctx = super::spot_call::SpotCallCtx {
+            qsy: super::spot_call::QsyCtx {
+                bus: cmd_message_bus.clone(),
+                operating_freq_hz: cmd_operating_freq_hz.clone(),
+                last_freq_command: cmd_last_freq_command.clone(),
+                split_tx_hz: cmd_split_tx_hz.clone(),
+                tui_msg_tx: cmd_tui_msg_tx.clone(),
+                operator_watch: self.autonomous_operator_watch.subscribe(),
+            },
+            ptt_active: self.ptt_active.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            our_callsign: cmd_our_callsign.clone(),
+            qso_manager_watch: cmd_qso_manager_watch.clone(),
+            active_tx_offsets: cmd_active_tx_offsets.clone(),
+            ptt_sync_gate: cmd_ptt_sync_gate.clone(),
+            spot_qsy_lock: Arc::new(tokio::sync::Mutex::new(())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            parked_call: Arc::new(std::sync::Mutex::new(None)),
+            wait_cap: super::spot_call::SPOT_QSY_WAIT_CAP,
+        };
         // Shared config — the SelectDevice handler persists the operator's
         // chosen output device into it (and into `cmd_config_path`).
         let cmd_config = self.config.clone();
@@ -1635,12 +1677,32 @@ impl super::ApplicationCoordinator {
                                     // TUI-initiated call is LOCAL (byte-identical to prior).
                                     remote_origin: false,
                                     remote_client_key_id: None,
+                                    dx_offset_unknown: false,
                                 }),
                                 Instant::now(),
                             );
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::CallNetworkSpot {
+                            callsign,
+                            band,
+                            dial_hz,
+                            audio_offset_hz,
+                        } => {
+                            // PAN-287: admit, QSY when needed (after PTT-off), then call.
+                            info!(
+                                "TUI CallNetworkSpot: {} {} Hz offset {:?}",
+                                callsign, dial_hz, audio_offset_hz
+                            );
+                            let call = super::spot_call::SpotCall {
+                                callsign,
+                                band,
+                                dial_hz,
+                                audio_offset_hz,
+                            };
+                            super::spot_call::handle_spot_call(&spot_ctx, call).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::EngageHound {
                             callsign,
@@ -1817,71 +1879,19 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::SetFrequency { vfo, frequency } => {
                             info!("TUI SetFrequency: VFO {} -> {} Hz", vfo, frequency);
-                            // C9 — band change mid-QSO: tear down active QSOs so no
-                            // stale keep-call keeps TXing on the new band. Capture the
-                            // *old* dial frequency BEFORE we overwrite the atomic, then
-                            // decide whether this dial move is a genuine band change.
-                            let old_freq_hz = cmd_operating_freq_hz.load(Ordering::Relaxed);
-                            cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
-                            // Stamp the C9 dedup anchor: pancetta commanded this
-                            // freq, so the hamlib poll loop suppresses its own
-                            // teardown (here and during the rig settle window).
-                            if let Ok(mut anchor) = cmd_last_freq_command.lock() {
-                                *anchor = Some((frequency, Instant::now()));
-                            }
-                            if super::is_band_change(old_freq_hz, frequency) {
-                                info!(
-                                    target: "operator.override",
-                                    "Band change {} Hz -> {} Hz — tearing down active QSOs",
-                                    old_freq_hz, frequency
-                                );
-                                let teardown = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(
-                                        crate::message_bus::QsoMessage::BandChanged {
-                                            previous_hz: old_freq_hz,
-                                            new_hz: frequency,
-                                        },
-                                    ),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(teardown).await {
-                                    warn!("Band change: failed to send teardown: {}", e);
-                                }
-                                // A band change invalidates any split TX freq.
-                                if cmd_split_tx_hz.load(Ordering::Relaxed) != 0 {
-                                    let store = super::forward_split_change(
-                                        &cmd_message_bus,
-                                        ComponentId::Tui,
-                                        &cmd_split_tx_hz,
-                                        false,
-                                        0,
-                                    )
-                                    .await;
-                                    // Push authoritative split state to the TUI chip.
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::SplitUpdate {
-                                            tx_hz: store,
-                                        },
-                                    );
-                                }
-                            }
-                            // Forward to hamlib if available
-                            let msg = ComponentMessage::new(
+                            // C9 band-change teardown, split clear and the rig
+                            // command live in `spot_call::qsy_send` (PAN-287); a
+                            // commanded dial change also clears the allocator's
+                            // old-band data and cancels a parked spot call.
+                            let _spot_lock = spot_ctx.spot_qsy_lock.lock().await;
+                            super::spot_call::note_operator_frequency_change(&spot_ctx);
+                            super::spot_call::qsy_to(
+                                &spot_ctx.qsy,
                                 ComponentId::Tui,
-                                ComponentId::Hamlib,
-                                MessageType::RigControl(
-                                    crate::message_bus::RigControlMessage::SetFrequency {
-                                        vfo,
-                                        frequency,
-                                    },
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                debug!("Failed to forward SetFrequency to hamlib: {}", e);
-                            }
+                                vfo,
+                                frequency,
+                            )
+                            .await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::SetSplit {
                             enabled,
@@ -2091,17 +2101,24 @@ impl super::ApplicationCoordinator {
                                 cmd_active_protocol_mode.load(Ordering::Relaxed),
                             );
                             let next = current.cycle();
-                            match super::try_switch_operating_mode(
-                                next,
-                                &cmd_active_tx_qsos,
-                                &cmd_decode_window,
-                                &cmd_active_protocol_mode,
-                                &cmd_active_slot_ns,
-                                &cmd_active_decode_phase_ns,
-                                &cmd_current_decode_effort,
-                                &cmd_resolved_hardware_tier,
-                            ) {
-                                Ok(()) => {
+                            // PAN-287: a parked spot call's dial was resolved
+                            // for the old mode; a successful switch cancels it.
+                            let switched =
+                                super::spot_call::switch_mode_cancelling_parked(&spot_ctx, || {
+                                    super::try_switch_operating_mode(
+                                        next,
+                                        &cmd_active_tx_qsos,
+                                        &cmd_decode_window,
+                                        &cmd_active_protocol_mode,
+                                        &cmd_active_slot_ns,
+                                        &cmd_active_decode_phase_ns,
+                                        &cmd_current_decode_effort,
+                                        &cmd_resolved_hardware_tier,
+                                    )
+                                })
+                                .await;
+                            match switched {
+                                Ok(cancelled_spot_call) => {
                                     let mode_str = super::mode_str(next).to_string();
                                     warn!(
                                         target: "operator.override",
@@ -2161,6 +2178,12 @@ impl super::ApplicationCoordinator {
                                                     the FT2 label"
                                                     .to_string(),
                                             },
+                                        );
+                                    }
+                                    // Last, so no status line above overwrites it.
+                                    if let Some(call) = cancelled_spot_call {
+                                        super::spot_call::report_mode_change_cancel(
+                                            &spot_ctx, &call,
                                         );
                                     }
                                 }
@@ -2705,7 +2728,7 @@ impl super::ApplicationCoordinator {
                             // operator hit Shift+Q / cycled to Disabled.
                             // PTT-OFF (state=false) is ALWAYS allowed: it can
                             // only ever stop TX, never start it.
-                            if new_state {
+                            let outcome = if new_state {
                                 // PAN-19 round-12 review (Codex P1): route
                                 // through `ptt_on_refusal`, which itself
                                 // routes through the SAME shared gate the
@@ -2719,63 +2742,67 @@ impl super::ApplicationCoordinator {
                                 // only consumed once it became ready,
                                 // unexpectedly keying the radio well after
                                 // the operator's actual keypress.
-                                if let Some(status) = ptt_on_refusal(
-                                    &cmd_tx_policy,
-                                    &cmd_tx_restart_inhibit,
-                                    &cmd_hamlib_command_loop_ready,
-                                    &cmd_hamlib_pending_frequency,
-                                    &cmd_hamlib_pending_split,
-                                    &cmd_hamlib_command_in_flight,
-                                    &cmd_rig_conn_state,
-                                    &cmd_audio_output_alive,
-                                    &cmd_message_bus.receive_gain,
-                                    &cmd_message_bus.data_mode,
-                                ) {
-                                    warn!(
-                                        target: "tx.policy",
-                                        "Refusing PTT key-up: {status}"
-                                    );
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "TX".to_string(),
-                                            status,
-                                        },
-                                    );
-                                    continue;
-                                }
+                                //
                                 // PAN-118: frequency-aware sibling of the gate
                                 // above — a manual PTT key-up is a raw carrier on
                                 // the effective TX dial, so refuse it while that
                                 // dial sits outside the configured amateur band
                                 // plan. Same status channel as every other PTT
                                 // refusal; PTT-off remains always allowed below.
-                                if let Some(status) = ptt_band_plan_refusal(
-                                    &cmd_operating_freq_hz,
-                                    &cmd_split_tx_hz,
-                                    &cmd_band_plan,
-                                ) {
-                                    warn!(
-                                        target: "tx.policy",
-                                        "Refusing PTT key-up: {status}"
-                                    );
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "TX".to_string(),
-                                            status,
-                                        },
-                                    );
-                                    continue;
+                                //
+                                // PAN-287: both gates and the enqueue run under
+                                // `ptt_sync_gate` (see `manual_key_down`), so a
+                                // parked spot-call QSY cannot retune between
+                                // its keyed recheck and its `SetFrequency`.
+                                match manual_key_down(&cmd_message_bus, &cmd_ptt_sync_gate, || {
+                                    ptt_on_refusal(
+                                        &cmd_tx_policy,
+                                        &cmd_tx_restart_inhibit,
+                                        &cmd_hamlib_command_loop_ready,
+                                        &cmd_hamlib_pending_frequency,
+                                        &cmd_hamlib_pending_split,
+                                        &cmd_hamlib_command_in_flight,
+                                        &cmd_rig_conn_state,
+                                        &cmd_audio_output_alive,
+                                        &cmd_message_bus.receive_gain,
+                                        &cmd_message_bus.data_mode,
+                                    )
+                                    .or_else(|| {
+                                        ptt_band_plan_refusal(
+                                            &cmd_operating_freq_hz,
+                                            &cmd_split_tx_hz,
+                                            &cmd_band_plan,
+                                        )
+                                    })
+                                })
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(status) => {
+                                        warn!(
+                                            target: "tx.policy",
+                                            "Refusing PTT key-up: {status}"
+                                        );
+                                        let _ = cmd_tui_msg_tx.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "TX".to_string(),
+                                                status,
+                                            },
+                                        );
+                                        continue;
+                                    }
                                 }
-                            }
+                            } else {
+                                super::tx::send_ptt_command(
+                                    &cmd_message_bus,
+                                    ComponentId::Tui,
+                                    false,
+                                    || true,
+                                )
+                            };
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
-                            if super::tx::send_ptt_command(
-                                &cmd_message_bus,
-                                ComponentId::Tui,
-                                new_state,
-                                || true,
-                            ) != crate::message_bus::SendIfOutcome::Enqueued
-                            {
+                            if outcome != crate::message_bus::SendIfOutcome::Enqueued {
                                 warn!("Failed to toggle PTT: message dropped");
                             }
                         }
@@ -3589,6 +3616,7 @@ fn map_recent_qso_outcome(
 ) -> pancetta_tui::app::RecentQsoOutcome {
     pancetta_tui::app::RecentQsoOutcome {
         callsign: outcome.callsign.clone(),
+        qso_uuid: outcome.qso_uuid.clone(),
         outcome: match &outcome.outcome {
             crate::message_bus::QsoOutcome::Completed => pancetta_tui::app::QsoOutcome::Completed,
             crate::message_bus::QsoOutcome::Failed(reason) => {
@@ -3892,6 +3920,36 @@ enum NudgeOutcome {
     NoEligibleTarget,
 }
 
+/// A cluster spot's fields plus the relay's station lookups, for
+/// [`cluster_spot_tui_message`].
+struct ClusterSpotRelay {
+    callsign: String,
+    frequency: u64,
+    mode: Option<pancetta_core::Mode>,
+    band: Option<pancetta_core::Band>,
+    spotter: String,
+    worked_before: bool,
+    needed: bool,
+    atno: bool,
+    band_needed: bool,
+}
+
+/// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
+/// pass through unchanged (PAN-345).
+fn cluster_spot_tui_message(spot: ClusterSpotRelay) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::DxSpot {
+        callsign: spot.callsign,
+        frequency: spot.frequency,
+        mode: spot.mode,
+        band: spot.band,
+        spotter: spot.spotter,
+        worked_before: spot.worked_before,
+        needed: spot.needed,
+        atno: spot.atno,
+        band_needed: spot.band_needed,
+    }
+}
+
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
 ///
 /// PAN-67: this MUST come from the frequency the decode's own audio window
@@ -4090,6 +4148,31 @@ fn ptt_band_plan_refusal(
             None
         }
     })
+}
+
+/// PAN-287 (Codex P1, PR #613): the TUI's manual key-down (Shift+T). Holds
+/// `ptt_sync_gate` across `refusal` (the last pre-PTT gates) and the PTT-on
+/// enqueue, so a spot-call QSY, whose final `spot_call::rig_is_keyed`
+/// recheck and `SetFrequency` enqueue run under the same gate, cannot
+/// interleave: Hamlib receives either this PTT-on first (the QSY sees the
+/// rig keyed and keeps waiting) or the retune first. The gate is taken
+/// before `refusal` runs, so nothing suspends between the last gate and the
+/// enqueue (PAN-202). `Err` carries `refusal`'s status line.
+async fn manual_key_down(
+    bus: &crate::message_bus::MessageBus,
+    ptt_sync_gate: &tokio::sync::Mutex<()>,
+    refusal: impl FnOnce() -> Option<String>,
+) -> Result<crate::message_bus::SendIfOutcome, String> {
+    let _ptt_sync = ptt_sync_gate.lock().await;
+    if let Some(status) = refusal() {
+        return Err(status);
+    }
+    Ok(super::tx::send_ptt_command(
+        bus,
+        ComponentId::Tui,
+        true,
+        || true,
+    ))
 }
 
 /// Upsert a bookmark into a list by name (PAN-61: save-as, overwrite if the
@@ -4646,6 +4729,56 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn cluster_spot_relay_preserves_metadata() {
+        // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,
+        // including CW and unknown values.
+        for (mode, band) in [
+            (
+                Some(pancetta_core::Mode::FT8),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (
+                Some(pancetta_core::Mode::CW),
+                Some(pancetta_core::Band::Band20m),
+            ),
+            (None, None),
+        ] {
+            let msg = super::cluster_spot_tui_message(super::ClusterSpotRelay {
+                callsign: "JA1XYZ".to_string(),
+                frequency: 14_074_000,
+                mode,
+                band,
+                spotter: "W1ABC".to_string(),
+                worked_before: true,
+                needed: true,
+                atno: false,
+                band_needed: true,
+            });
+            match msg {
+                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                    callsign,
+                    frequency,
+                    mode: got_mode,
+                    band: got_band,
+                    spotter,
+                    worked_before,
+                    needed,
+                    atno,
+                    band_needed,
+                } => {
+                    assert_eq!(callsign, "JA1XYZ");
+                    assert_eq!(frequency, 14_074_000);
+                    assert_eq!(got_mode, mode);
+                    assert_eq!(got_band, band);
+                    assert_eq!(spotter, "W1ABC");
+                    assert!(worked_before && needed && !atno && band_needed);
+                }
+                other => panic!("expected DxSpot, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn needed_atno_for_reports_unknown_as_not_needed() {
         // PAN-93: no cqdx list loaded → not shown as needed, even though the
@@ -6692,6 +6825,85 @@ mod tui_relay_tests {
         );
     }
 
+    /// PAN-287 (Codex P1, PR #613): a manual key-down waits while the
+    /// spot-call QSY holds `ptt_sync_gate`, so the QSY's `SetFrequency`
+    /// reaches Hamlib before the PTT-on and a keyed rig is never retuned.
+    #[tokio::test]
+    async fn manual_key_down_waits_for_ptt_sync_gate() {
+        use crate::message_bus::{MessageBus, RigControlMessage, SendIfOutcome};
+        let bus = MessageBus::new(16).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let task = {
+            let (bus, gate) = (bus.clone(), gate.clone());
+            tokio::spawn(async move { manual_key_down(&bus, &gate, || None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "no PTT-on may be enqueued while ptt_sync_gate is held"
+        );
+        // Stand-in for the spot QSY's enqueue under the gate.
+        bus.send_message(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000,
+            }),
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+        drop(held);
+        assert_eq!(task.await.unwrap(), Ok(SendIfOutcome::Enqueued));
+        assert!(matches!(
+            hamlib_rx.try_recv().unwrap().message_type,
+            MessageType::RigControl(RigControlMessage::SetFrequency { .. })
+        ));
+        assert!(matches!(
+            hamlib_rx.try_recv().unwrap().message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        ));
+    }
+
+    /// PAN-287 / PAN-202: the manual key-down's refusal runs after the
+    /// `ptt_sync_gate` wait, never before it, so a gate another task flips
+    /// while the key-down waits (an SWR trip's `tx_halt`, a supervisor
+    /// restart inhibit) still refuses it.
+    #[tokio::test]
+    async fn manual_key_down_evaluates_its_refusal_after_the_gate_wait() {
+        use crate::message_bus::MessageBus;
+        let bus = MessageBus::new(16).unwrap();
+        let (_, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let refuse = Arc::new(AtomicBool::new(false));
+        let held = gate.clone().lock_owned().await;
+        let task = {
+            let (bus, gate, refuse) = (bus.clone(), gate.clone(), refuse.clone());
+            tokio::spawn(async move {
+                manual_key_down(&bus, &gate, || {
+                    refuse
+                        .load(Ordering::Acquire)
+                        .then(|| "Can't key PTT — TX policy is Disabled".to_string())
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        refuse.store(true, Ordering::Release);
+        drop(held);
+        assert_eq!(
+            task.await.unwrap(),
+            Err("Can't key PTT — TX policy is Disabled".to_string())
+        );
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a refused key-down enqueues nothing"
+        );
+    }
+
     /// Batch 94: the relay's snapshot→banner mapping must carry every
     /// QSO-detail field through field-for-field — a dropped field here
     /// silently renders as "---" in the panel.
@@ -6808,6 +7020,7 @@ mod tui_relay_tests {
         let ts = chrono::Utc::now();
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "JA1ABC".to_string(),
+            qso_uuid: "u-ja1abc".to_string(),
             outcome: crate::message_bus::QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
@@ -6834,6 +7047,7 @@ mod tui_relay_tests {
     fn map_recent_qso_outcome_carries_failure_reason() {
         let outcome = crate::message_bus::RecentQsoOutcome {
             callsign: "W2XYZ".to_string(),
+            qso_uuid: "u-w2xyz".to_string(),
             outcome: crate::message_bus::QsoOutcome::Failed(
                 pancetta_qso::QsoFailureReason::Timeout,
             ),
@@ -6847,6 +7061,70 @@ mod tui_relay_tests {
             mapped.outcome,
             pancetta_tui::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)
         ));
+    }
+
+    /// PAN-344 AC3: UUID correlation survives the relay — repeated
+    /// callsigns map to distinct UUIDs, and the registry snapshot the relay
+    /// forwards keeps each contact's identity and per-target states intact.
+    #[test]
+    fn pan344_upload_snapshot_mapping_preserves_identity() {
+        let mk = |uuid: &str| crate::message_bus::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            qso_uuid: uuid.to_string(),
+            outcome: crate::message_bus::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 14_075_000,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Completed".to_string()],
+        };
+        let a = map_recent_qso_outcome(&mk("u-1"));
+        let b = map_recent_qso_outcome(&mk("u-2"));
+        assert_eq!(a.callsign, b.callsign);
+        assert_ne!(a.qso_uuid, b.qso_uuid, "same callsign, distinct QSOs");
+        assert_eq!(a.qso_uuid, "u-1");
+        assert_eq!(b.qso_uuid, "u-2");
+
+        // The registry snapshot flows through the typed message unchanged:
+        // two same-callsign contacts keep independent per-target states.
+        let registry = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(
+                "u-1",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::new(
+                        pancetta_tui::upload_status::UploadState::Accepted,
+                        "",
+                    ),
+                )],
+            );
+            reg.register(
+                "u-2",
+                "K1ABC",
+                vec![(
+                    pancetta_tui::upload_status::UploadTarget::Qrz,
+                    pancetta_tui::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            );
+        }
+        let snapshot = registry.lock().unwrap().snapshot();
+        let msg = pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(snapshot);
+        let pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(statuses) = msg else {
+            panic!("typed snapshot message");
+        };
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].uuid, "u-1");
+        assert_eq!(statuses[0].callsign, "K1ABC");
+        assert_eq!(
+            statuses[0].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            statuses[1].state(pancetta_tui::upload_status::UploadTarget::Qrz),
+            Some(pancetta_tui::upload_status::UploadState::Pending)
+        );
     }
 
     fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {

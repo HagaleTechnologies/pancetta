@@ -79,3 +79,12 @@ absent). The contest worker never receives or reopens the real
 `~/.pancetta/qso.db` during replay, and simulated completions are never
 persisted, so they never change the replayed score. A failed seed preparation
 reports the score unavailable instead of falling back to disk.
+
+## Per-QSO upload state gotcha (PAN-344)
+
+The outbox deletes an accepted entry and publishes only aggregate health,
+so neither a missing queue row nor a health count proves a contact was
+accepted. Correlate by QSO UUID, never callsign, and treat an explicit
+service response (duplicate included) as the only acceptance; absence is
+unknown, an empty captured target set is disabled, and config changes after
+completion never rewrite a contact's captured denominator.

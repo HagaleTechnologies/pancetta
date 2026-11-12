@@ -4305,6 +4305,41 @@ impl QsoManager {
             .collect()
     }
 
+    /// PAN-287: every active QSO, plus the partners of every QSO whose
+    /// completion queued a closing frame that has not aired or been settled
+    /// yet (PAN-280). Such a QSO is `Completed`, so it is not in the active
+    /// list, but its 73 is still TX-live. Both come from one `qsos` read
+    /// guard: holds, commits and reverts all run under the write guard, so a
+    /// QSO moving between the two sets is never missed by both. A record
+    /// whose QSO no longer holds the state it created is skipped, matching
+    /// commit and revert.
+    pub async fn active_qsos_and_pending_completion_partners(
+        &self,
+    ) -> (Vec<(QsoId, QsoProgress)>, Vec<String>) {
+        // Lock order matches `hold_completion`: `qsos`, then the pending map.
+        let qsos = self.qsos.read().await;
+        let active = qsos
+            .iter()
+            .filter(|(_, progress)| progress.state.is_active())
+            .map(|(id, progress)| (*id, progress.clone()))
+            .collect();
+        let pending = self
+            .pending_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let partners = pending
+            .iter()
+            .filter_map(|(id, record)| {
+                let progress = qsos.get(id)?;
+                if progress.state != record.completed_state {
+                    return None;
+                }
+                progress.metadata.their_callsign.clone()
+            })
+            .collect();
+        (active, partners)
+    }
+
     /// Selected Fox identities for the next decode window, under one short read.
     pub async fn active_hound_foxes(&self) -> Vec<String> {
         self.qsos
@@ -17161,6 +17196,133 @@ mod sender_verification_tests {
         }
     }
 
+    // PAN-287: a network-spot call opens at an offset derived from the spot's
+    // RF (or the allocator's pick), which can be stale. These pin the existing
+    // two-sighting recovery (C-1 / PAN-15) that spot calls now rely on, so a
+    // later tolerance change cannot silently break them.
+
+    /// Tx=Rx spot call at a stale offset: the DX answers at 1210 Hz. The first
+    /// sighting (planted 30 s earlier) is only a candidate; the second confirms
+    /// the drift, relatches TX to 1210 Hz, and the QSO advances.
+    #[tokio::test]
+    async fn spot_call_at_a_stale_offset_recovers_on_the_second_reply() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("ZL1ABC".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "ZL1ABC".into(),
+            report: -11,
+        };
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report,
+                1210.0,
+                Utc::now() - chrono::Duration::seconds(30),
+            )
+            .await;
+        manager
+            .process_message(report, "K5ARH ZL1ABC -11".into(), 1210.0, Some(-11.0))
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            !matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "the confirmed second reply must advance the QSO, got {:?}",
+            progress.state
+        );
+        assert_eq!(progress.metadata.frequency, 1210.0);
+    }
+
+    /// TX-offset-only spot call (allocator pick 1000 Hz, placeholder
+    /// `partner_freq = Some(1000)`): two DX replies at 1210 Hz relatch only
+    /// `partner_freq`; our TX stays at 1000 Hz and the QSO advances.
+    #[tokio::test]
+    async fn tx_offset_only_call_relatches_partner_and_keeps_tx() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "ZL1ABC".into(),
+                1000.0,
+                None,
+                CallInitiation::Manual,
+                Some(1000.0),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "ZL1ABC".into(),
+            report: -11,
+        };
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report,
+                1210.0,
+                Utc::now() - chrono::Duration::seconds(30),
+            )
+            .await;
+        manager
+            .process_message(report, "K5ARH ZL1ABC -11".into(), 1210.0, Some(-11.0))
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.partner_freq, Some(1210.0));
+        assert_eq!(progress.metadata.frequency, 1000.0);
+        assert!(
+            !matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "the confirmed reply must advance the QSO, got {:?}",
+            progress.state
+        );
+    }
+
+    /// One off-frequency frame (a spoof, or a stray decode) never advances a
+    /// TX-offset-only spot call, and never moves where we listen.
+    #[tokio::test]
+    async fn tx_offset_only_call_ignores_one_off_frequency_frame() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "ZL1ABC".into(),
+                1000.0,
+                None,
+                CallInitiation::Manual,
+                Some(1000.0),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "ZL1ABC".into(),
+                    report: -11,
+                },
+                "K5ARH ZL1ABC -11".into(),
+                2400.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a single off-frequency frame must not advance, got {:?}",
+            progress.state
+        );
+        assert_eq!(progress.metadata.partner_freq, Some(1000.0));
+        assert_eq!(progress.metadata.frequency, 1000.0);
+    }
+
     /// A split-TX relatch must announce itself on the event bus.
     ///
     /// The coordinator refreshes its scoped/AP decoder hint
@@ -29197,6 +29359,32 @@ mod pending_completion_tests {
         assert_eq!(completions(&events), 0);
         assert_eq!(air(&manager, id, again).await, CompletionAired::Committed);
         assert_eq!(completions(&drain(&mut rx)), 1);
+    }
+
+    async fn pending_partners(manager: &QsoManager) -> Vec<String> {
+        manager
+            .active_qsos_and_pending_completion_partners()
+            .await
+            .1
+    }
+
+    /// PAN-287: a completion waiting on its closing frame names its partner
+    /// until that frame airs.
+    #[tokio::test]
+    async fn pending_completion_partners_lists_unaired_close_until_it_airs() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        assert!(pending_partners(&manager).await.is_empty());
+        let (id, opened) = reply(&manager, ResponseStep::SeventyThree, None).await;
+        let attempt = opened.attempt_id().expect("the open queued a 73");
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+        let (active, partners) = manager.active_qsos_and_pending_completion_partners().await;
+        assert!(active.is_empty(), "the Completed QSO is not active");
+        assert_eq!(partners, vec![DX]);
+        assert_eq!(air(&manager, id, attempt).await, CompletionAired::Committed);
+        assert!(pending_partners(&manager).await.is_empty());
     }
 
     /// Guard: a completion that queues no closing frame (we sent RR73, the

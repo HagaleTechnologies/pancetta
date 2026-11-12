@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-345: DX-cluster spots now honour `[network.dx_cluster.filtering]`. `bands` and `modes` allowlists, inclusive Hz limits and `duplicate_window_minutes` (`0` turns it off) apply locally before a spot reaches DX Hunter, and a filtered spot no longer suppresses the next accepted one. With the cluster enabled, an invalid band or mode name, or inverted limits, is now a startup error instead of being ignored. Spots keep their parsed mode (CW stays CW, unknown is `Unknown`, never FT8), and DX Hunter gains a `Band` column for every row. `dxcc_filters` is still not applied. Live-cluster qualification is pending.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
 
 ### Changed
@@ -17,8 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.
 
+=======
+- PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.
+>>>>>>> 669a5dba34505f45c16bfb8883d8ef2bc404675a
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
 - Touching an unchanged ADIF no longer rebuilds the index; changed contacts are detected even with equal file times.
 - Legacy QSO migration keeps a backup and refuses unreadable rows instead of writing a partial logbook.
@@ -44,7 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-260: Preserve autonomous duplicate protection across restarts and audio-offset changes. Load dated worked history for every band so band switches show and rank prior contacts correctly. Refuse automatic calls when required history is unavailable.
 - Hound mode now follows the WSJT-X Fox/Hound convention (PAN-259). The Hound calls at 1000-2700 Hz, sends its R-report at the Fox's own offset when the Fox reports it, and logs on the Fox's RR73 without sending 73. The `[hound]` defaults are now `call` 1000-2700 Hz and `response` 300-900 Hz; configs that set the old inverted values explicitly must update them (see `docs/CONFIG.md`).
 - `pancetta-ft8` decodes DXpedition (type 0.1) frames in the WSJT-X layout: two Hound calls, the Fox's 10-bit call hash and a 5-bit report. `K1ABC RR73; W9XYZ <KH1/KH7Z> -08` now yields RR73 to K1ABC and -08 to W9XYZ from the Fox; an unknown or collided Fox hash yields no QSO action. The new `Ft8Encoder::encode_dxpedition_contacts` replaces `encode_dxpedition`, which is deprecated and now returns an error (PAN-259).
+- PAN-287: A manual call parked for the other TX window on the old band is now dropped on a band change, with `Queued call to <call> dropped — band changed`. Before, it could promote and transmit on the new band.
 - Remote clients can no longer retune the rig while it transmits, or move a local or autonomous QSO; the client receives an error saying why (PAN-252).
+
+### Changed
+
+- PAN-287: Space on a DX Hunter cluster or cqdx spot (a row never heard locally) now QSYs the rig to the spot's standard FT8/FT4 dial and calls at the spot's audio offset (`spot RF − dial`). A spot with no usable offset (outside 200-2900 Hz, such as a dial-only `14074.0` spot) calls at the frequency allocator's offset. While a frame is airing, the QSY and the call wait for PTT-off, for at most 30 s. Space refuses, with a status line, a spot off the active mode's sub-band, FT2 mode, a band not in your band list, a QSY across a QSO whose partner has answered, and a QSY with no rig control. With `rig.data_mode` set, the rig's data mode is reapplied after the QSY (PAN-276); otherwise the mode is left as is. Any dial change pancetta commands (band keys, Shift+F, spot QSY) now clears the allocator's old-band spectral data, so TX Placement is empty until the new dial's first snapshot.
 
 
 ### Removed
@@ -58,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains available.
 
 ### Added
+
+- Show slot progress, current parity and station TX parity in the title bar, including the narrow-terminal resize screen (PAN-352).
 
 - PAN-393: `[audio.recording] raw_capture_minutes` records one raw 48 kHz WAV per FT8 slot for that many minutes after start, into `raw48/` inside the recording directory, so decimation changes can be tested on real captures. It is off by default (0) and needs `auto_record = true` and a 48 kHz capture device. Files are named with the UTC slot time and band, `_tx` marks a slot our transmission overlapped, and `raw48/` stops at its own 2 GB cap while decode-window recording continues.
 - PAN-380: `pancetta-ft8/README.md` lists the crate's stable API (the cycle API manta calls and the window API from dispensa Q-0085) and its compatibility policy. `pancetta-ft8/tests/stable_api_guard.rs` fails to compile, naming the item, when a change breaks one of those signatures, fields or trait bounds. The README's configuration example and parameter table no longer use the nonexistent `time_range` field.

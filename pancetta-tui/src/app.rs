@@ -480,7 +480,16 @@ pub enum RankOrigin {
 pub struct DxStation {
     pub call_sign: String,
     pub grid_square: Option<String>,
+    /// Source-dependent unit: MHz for local decodes and cqdx spots, Hz for
+    /// DX-cluster spots. Read [`DxStation::band`] for the band instead of
+    /// guessing it from this value's magnitude (PAN-345).
     pub frequency: f64,
+    /// Band of `frequency`, derived at each source boundary from that
+    /// source's own unit through `pancetta_core::Band::from_frequency`:
+    /// cluster Hz, cqdx `frequency_hz`, local decode MHz × 1,000,000. `None`
+    /// when the frequency is outside every band. Refreshed whenever
+    /// `frequency` changes (PAN-345).
+    pub band: Option<pancetta_core::Band>,
     pub mode: String,
     pub last_seen: DateTime<Utc>,
     pub snr: i32,
@@ -537,6 +546,10 @@ pub struct DxStation {
     /// `CallStation` command so the QSO layer can reply on the opposite
     /// parity.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// PAN-287: the spot's radio frequency in Hz (dial + audio offset), from the
+    /// DX cluster or cqdx. `None` for rows only ever decoded locally. The Space
+    /// spot-call path reads this — never `frequency`, whose unit differs by source.
+    pub spot_rf_hz: Option<u64>,
     /// DX watchlist (#197): true while this callsign is currently
     /// remembered as a heard-but-not-pounced-on PerBandDxccNew+/Atno CQ.
     /// Bulk-resynced each autonomous tick via `apply_dx_watchlist` — never
@@ -594,6 +607,17 @@ impl DxStation {
             at,
         )
     }
+}
+
+/// Band of a local decode's dial frequency, which the decoded view carries
+/// in MHz, through the shared Hz band table (PAN-345). A nonfinite or
+/// out-of-band value has no band.
+fn band_from_mhz(mhz: f64) -> Option<pancetta_core::Band> {
+    let hz = (mhz * 1_000_000.0).round();
+    if !hz.is_finite() || hz <= 0.0 {
+        return None;
+    }
+    pancetta_core::Band::from_frequency(hz as u64)
 }
 
 /// Exact station identity for worked status: a resolved hash render matches
@@ -693,6 +717,9 @@ pub enum QsoOutcome {
 pub struct RecentQsoOutcome {
     /// The DX station's callsign.
     pub callsign: String,
+    /// The QSO's UUID — the only safe correlation key for upload state
+    /// (PAN-344); repeated callsigns stay independent.
+    pub qso_uuid: String,
     /// How the QSO ended.
     pub outcome: QsoOutcome,
     /// Short terminal-state label ("Completed" / "Failed").
@@ -1350,6 +1377,11 @@ impl ActivePanel {
 /// - [`SpaceAction::Call`] when nothing directed-at-us is on record for the
 ///   callsign (a pure CQer, or a DX-cluster spot we've never heard call us).
 ///   This is the historical Space behavior — answer their CQ with our grid.
+/// - [`SpaceAction::CallSpot`] (PAN-287) when the focused row is a DX Hunter
+///   network spot (cluster/cqdx, never heard locally): the coordinator QSYs
+///   the rig to the spot's standard dial first, then calls at its offset.
+/// - [`SpaceAction::Refused`] (PAN-287) when that spot cannot be called in
+///   the active mode; the message is the status line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpaceAction {
     /// Answer a CQ / start a fresh contact at the grid step. Carries the
@@ -1369,6 +1401,20 @@ pub enum SpaceAction {
         step: pancetta_core::ResponseStep,
         snr: Option<f32>,
     },
+    /// PAN-287: call a network spot (cluster/cqdx row never heard locally) at its
+    /// standard dial; the coordinator QSYs first when the dial differs.
+    CallSpot {
+        callsign: String,
+        /// Band name from the operator's band list (status lines).
+        band: String,
+        /// Standard FT8/FT4 dial for the spot, in Hz.
+        dial_hz: u64,
+        /// `spot RF − dial` when it lies in 200-2900 Hz; `None` = the
+        /// frequency allocator picks.
+        audio_offset_hz: Option<u64>,
+    },
+    /// PAN-287: Space did nothing; `message` is the status line explaining why.
+    Refused { message: String },
 }
 
 /// A per-band snapshot stashed on band switch and restored when the operator
@@ -1462,6 +1508,14 @@ pub struct App {
     /// Scroll cursor into `recent_qsos` while the overlay is open. Same
     /// semantics as `diagnostics_scroll`.
     pub recent_qsos_scroll: usize,
+    /// PAN-344: latest per-QSO upload statuses, merged by UUID and revision
+    /// from the relay's full bounded snapshots (2 s health tick). Bounded to
+    /// 100 entries; rows look their UUID up here.
+    pub qso_uploads: Vec<crate::upload_status::QsoUploadStatus>,
+    /// PAN-344: the typed completion toast, owned by a QSO UUID. Rendered
+    /// through the status-text slot (after compose precedence) so periodic
+    /// component status updates cannot erase it.
+    pub completion_toast: Option<crate::upload_status::CompletionToast>,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
     /// from the diagnostic-event stream that already flows — no new bus
     /// message — by matching the exact completion text the coordinator
@@ -1679,9 +1733,8 @@ pub struct App {
     /// pick the right budget. Loaded from `~/.pancetta/tui_state.json` at
     /// startup and persisted alongside `active_view` on every change; the
     /// coordinator's startup echo corrects a stale persisted guess within
-    /// the first health tick regardless. Drives the "DECODE: <PRESET>
-    /// <ms>ms" title-bar chip (the elapsed-ms/exhausted half comes from
-    /// `pipeline_health` separately).
+    /// the first health tick regardless. Drives the "DECODE: <PRESET>"
+    /// title-bar chip. Decode timing and budget exhaustion appear in Shift+S health.
     pub decode_effort: String,
     /// The message currently being transmitted (NOW-SENDING), if any.
     /// Updated from the coordinator's `TxQueueUpdate`.
@@ -1865,6 +1918,8 @@ impl App {
             why_scroll: 0,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
+            qso_uploads: Vec::new(),
+            completion_toast: None,
             session_completed: 0,
             session_failed: 0,
             session_tx_drops: 0,
@@ -2449,6 +2504,7 @@ impl App {
                 Some(entry) => {
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
+                    entry.band = band_from_mhz(message.frequency);
                     entry.mode = message.mode.clone();
                     entry.last_seen = message.timestamp;
                     entry.snr = message.snr;
@@ -2478,6 +2534,7 @@ impl App {
                             call_sign: call_sign.clone(),
                             grid_square,
                             frequency: message.frequency,
+                            band: band_from_mhz(message.frequency),
                             mode: message.mode.clone(),
                             last_seen: message.timestamp,
                             snr: message.snr,
@@ -2507,6 +2564,7 @@ impl App {
                             last_seen_network: None,
                             audio_offset_hz: Some(audio_offset_hz),
                             slot_parity: message.slot_parity,
+                            spot_rf_hz: None,
                             watchlisted: false,
                             pinned: false,
                         },
@@ -2971,48 +3029,14 @@ impl App {
         let band = &self.config.bands.bands[self.current_band_index];
         let band_name = band.name.clone();
         // Mode-aware dial resolution (closes the manual-band-change gap
-        // documented for FT4 mode). FT8 → the TUI's own band table
-        // (unchanged). FT4 → `Band::dial_for(true)`, the same call the
-        // autonomous ChangeBand handler already uses; falls back to the FT8
-        // frequency (with a status note) on a band with no standard FT4
-        // sub-band. FT2 → no standard dial-frequency table exists yet (FT2
-        // remains blocked on the operator resolving two incompatible spec
-        // candidates); falls back to FT8 with a status note.
-        let core_band =
-            pancetta_core::Band::from_frequency((band.ft8_frequency * 1_000_000.0) as u64);
-        let (dial, operating_frequency, fallback_note) = match self.station_info.mode.as_str() {
-            "FT4" => match core_band.and_then(|b| b.dial_for(true)) {
-                Some(hz) => (hz, hz as f64 / 1_000_000.0, None),
-                None => {
-                    let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
-                    (
-                        ft8_dial,
-                        ft8_dial as f64 / 1_000_000.0,
-                        Some(format!(
-                            "{} has no standard FT4 frequency — using FT8 dial",
-                            band_name
-                        )),
-                    )
-                }
-            },
-            "FT2" => {
-                let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
-                (
-                    ft8_dial,
-                    ft8_dial as f64 / 1_000_000.0,
-                    Some("FT2 dial frequencies not yet defined — using FT8 dial".to_string()),
-                )
-            }
-            // FT8 (default): assign the band's own frequency directly — no
-            // u64-Hz round-trip — so this arm stays byte-identical to the
-            // pre-Task-11 code (`operating_frequency = band.ft8_frequency`)
-            // for any config, including a non-round-MHz custom band value.
-            _ => (
-                (band.ft8_frequency * 1_000_000.0) as u64,
-                band.ft8_frequency,
-                None,
-            ),
-        };
+        // documented for FT4 mode). One function, shared with the Space
+        // spot-call path (PAN-287), so band keys and spot QSYs land on
+        // identical dials; its doc comment explains the FT4/FT2 fallbacks.
+        let crate::spot_call::StandardDial {
+            dial_hz: dial,
+            operating_mhz: operating_frequency,
+            fallback_note,
+        } = crate::spot_call::standard_dial(band, &self.station_info.mode);
         self.station_info.operating_frequency = operating_frequency;
         let base_status = match fallback_note {
             Some(note) => format!(
@@ -3393,11 +3417,14 @@ impl App {
         pancetta_core::callsign::callsigns_match(call, ours)
     }
 
+    /// Insert a DX-cluster spot row. `freq` is the cluster's Hz value and
+    /// `band` the band the coordinator derived from it (PAN-345).
     #[allow(clippy::too_many_arguments)]
     pub fn add_dx_spot(
         &mut self,
         callsign: String,
         freq: f64,
+        band: Option<pancetta_core::Band>,
         mode: String,
         snr: i32,
         worked_before: bool,
@@ -3414,6 +3441,7 @@ impl App {
             call_sign: callsign.clone(),
             grid_square: None,
             frequency: freq,
+            band,
             mode,
             last_seen: Utc::now(),
             snr,
@@ -3442,6 +3470,9 @@ impl App {
             last_seen_network: None,
             audio_offset_hz: None,
             slot_parity: None,
+            // PAN-287: the cluster spot's RF (its one production caller,
+            // `tui_runner`'s DxSpot arm, passes Hz). Space reads this.
+            spot_rf_hz: (freq.is_finite() && freq > 0.0).then(|| freq.round() as u64),
             watchlisted: false,
             pinned: false,
         };
@@ -3554,6 +3585,21 @@ impl App {
     /// behavior (Task 3: the Recent-QSOs panel).
     pub fn push_recent_qso_outcome(&mut self, outcome: RecentQsoOutcome) {
         const MAX_RECENT_QSOS: usize = 50;
+        // PAN-344: only a COMPLETED terminal outcome owns the toast; a
+        // failed QSO never gets a "logged" wording.
+        if matches!(outcome.outcome, QsoOutcome::Completed) {
+            let status = self
+                .qso_uploads
+                .iter()
+                .find(|s| s.uuid == outcome.qso_uuid)
+                .cloned();
+            self.completion_toast = Some(crate::upload_status::CompletionToast::start(
+                &outcome.qso_uuid,
+                &outcome.callsign,
+                status.as_ref(),
+                chrono::Utc::now(),
+            ));
+        }
         let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
         self.recent_qsos.push_back(outcome);
         while self.recent_qsos.len() > MAX_RECENT_QSOS {
@@ -3562,6 +3608,61 @@ impl App {
         if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
             self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
+    }
+
+    /// PAN-344: merge one relayed upload-status snapshot batch. Full
+    /// snapshots arrive repeatedly, so correctness never relies on an
+    /// individual best-effort transition: each entry merges by UUID and only
+    /// a monotonic revision (>= current) replaces known state, and a missing
+    /// entry never erases a known row result. Entries arriving before their
+    /// row are retained here (bounded) so the row can match later.
+    pub fn apply_qso_upload_statuses(
+        &mut self,
+        statuses: Vec<crate::upload_status::QsoUploadStatus>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        const MAX_UPLOAD_STATUSES: usize = 100;
+        for status in statuses {
+            match self.qso_uploads.iter_mut().find(|e| e.uuid == status.uuid) {
+                Some(entry) => {
+                    if status.revision >= entry.revision {
+                        *entry = status.clone();
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    self.qso_uploads.push(status.clone());
+                    while self.qso_uploads.len() > MAX_UPLOAD_STATUSES {
+                        // Preserve status for every visible row, even when late
+                        // results for older registrations arrive afterwards.
+                        let evict = self
+                            .qso_uploads
+                            .iter()
+                            .position(|s| !self.recent_qsos.iter().any(|q| q.qso_uuid == s.uuid))
+                            .unwrap_or(0);
+                        self.qso_uploads.remove(evict);
+                    }
+                }
+            }
+            if let Some(toast) = self.completion_toast.as_mut() {
+                toast.apply_status(&status, now);
+            }
+        }
+    }
+
+    /// The retained upload status for a QSO UUID, if any (PAN-344).
+    pub fn upload_status_for(&self, uuid: &str) -> Option<&crate::upload_status::QsoUploadStatus> {
+        self.qso_uploads.iter().find(|s| s.uuid == uuid)
+    }
+
+    /// The visible completion-toast text, or `None` when no toast is active
+    /// or it has expired (PAN-344).
+    pub fn active_toast_text(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        self.completion_toast
+            .as_ref()
+            .and_then(|t| t.text_at(now))
+            .map(str::to_string)
     }
 
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
@@ -3897,16 +3998,17 @@ impl App {
                 // Walk the SAME ordering the renderer draws (needed-first,
                 // priority desc, then snr/freq/call tiebreaks) so the
                 // highlighted row is exactly the Space call-target.
-                let displayed = self.displayed_dx_stations();
-                let station = displayed.get(self.dx_hunter_scroll)?;
+                let station = self.selected_dx_hunter_row()?;
                 if station.call_sign.is_empty() {
                     return None;
                 }
                 // Local decodes carry the audio offset where we actually
-                // heard the station — reply there. Network-only DX-cluster
-                // spots have no passband info, so fall back to the FT8
-                // calling convention (1500 Hz); tuning is then the
-                // operator's job. Slot parity is `Some` only for local
+                // heard the station — reply there. Space on a network spot
+                // (no local offset, a known `spot_rf_hz`) never reaches this
+                // value: `resolve_space_action` returns `CallSpot` first, and
+                // the coordinator QSYs and derives the offset (PAN-287). The
+                // 1500 Hz fallback remains only for a row with neither field
+                // (test fixtures). Slot parity is `Some` only for local
                 // decodes (network spots can't tell us the slot).
                 let audio_hz = station.audio_offset_hz.unwrap_or(1500);
                 Some((station.call_sign.clone(), audio_hz, station.slot_parity))
@@ -3925,6 +4027,49 @@ impl App {
                 Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             _ => None,
+        }
+    }
+
+    /// The DX Hunter row under the cursor, walking the SAME ordering the
+    /// renderer draws (needed-first, priority desc, then snr/freq/call
+    /// tiebreaks). Shared by `get_selected_station` and the Space spot-call
+    /// branch of `resolve_space_action`.
+    pub fn selected_dx_hunter_row(&self) -> Option<&DxStation> {
+        self.displayed_dx_stations()
+            .get(self.dx_hunter_scroll)
+            .copied()
+    }
+
+    /// PAN-287: the coordinator commanded a spot-call QSY to `dial_hz`
+    /// (`TuiMessage::SpotQsy`). Follow it: when the dial lies on a different
+    /// band of the operator's band list, switch the TUI's band exactly like a
+    /// band key (stash and clear the live lists, restore a fresh cache);
+    /// otherwise only the operating frequency moves.
+    pub fn apply_spot_qsy(&mut self, dial_hz: u64) {
+        let mhz = dial_hz as f64 / 1_000_000.0;
+        let target = self
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.frequency_range.0 <= mhz && mhz <= b.frequency_range.1);
+        match target {
+            Some(idx) if idx != self.current_band_index => {
+                let old_band = self
+                    .config
+                    .bands
+                    .bands
+                    .get(self.current_band_index)
+                    .map(|b| b.name.clone());
+                self.current_band_index = idx;
+                self.apply_band_selection(old_band);
+                // The band's standard dial and the commanded dial agree for
+                // the active mode; keep the commanded value authoritative.
+                self.station_info.operating_frequency = mhz;
+            }
+            _ => {
+                self.station_info.operating_frequency = mhz;
+            }
         }
     }
 
@@ -3961,9 +4106,15 @@ impl App {
     ///   [`classify_caller_reply`] logic the Callers panel uses and return
     ///   [`SpaceAction::Reply`] at that smart-default step (their `RR73` → we
     ///   send `73`, their grid → we send our report, etc.).
-    /// - Otherwise (a pure CQer, or a DX-cluster spot we've never heard call
-    ///   us) return [`SpaceAction::Call`] — the historical Space behavior of
-    ///   answering their CQ at the grid step.
+    /// - PAN-287: if the focused row is the DX Hunter cursor row and it is a
+    ///   network spot (no local `audio_offset_hz`, a known `spot_rf_hz`),
+    ///   return [`SpaceAction::CallSpot`] with the spot's standard dial and
+    ///   derived offset from [`crate::spot_call::resolve_spot_call`], or
+    ///   [`SpaceAction::Refused`] with the refusal's status line. The
+    ///   coordinator QSYs the rig there before calling.
+    /// - Otherwise (a pure CQer, or a station heard locally) return
+    ///   [`SpaceAction::Call`] — the historical Space behavior of answering
+    ///   their CQ at the grid step on the current dial.
     /// - **Fix round 2 (operator-confirmed 2026-07-03):** if neither of the
     ///   above applies (no directed-at-us reply pending) AND the focused
     ///   callsign already has a live QSO ([`Self::is_engaged`]), Space must
@@ -4012,6 +4163,36 @@ impl App {
         // operator-facing message.
         if self.is_engaged(&callsign) {
             return None;
+        }
+
+        // PAN-287: a DX Hunter network spot (never heard locally) is called at
+        // its own standard dial and offset, not at 1500 Hz on whatever dial
+        // the rig happens to be on.
+        if self.active_panel == ActivePanel::DxHunter {
+            if let Some(row) = self
+                .selected_dx_hunter_row()
+                .filter(|r| pancetta_core::callsign::callsigns_match(&r.call_sign, &callsign))
+            {
+                if let (None, Some(rf)) = (row.audio_offset_hz, row.spot_rf_hz) {
+                    return Some(
+                        match crate::spot_call::resolve_spot_call(
+                            rf,
+                            &self.station_info.mode,
+                            &self.config.bands.bands,
+                        ) {
+                            Ok(t) => SpaceAction::CallSpot {
+                                callsign,
+                                band: t.band_name,
+                                dial_hz: t.dial_hz,
+                                audio_offset_hz: t.audio_offset_hz,
+                            },
+                            Err(r) => SpaceAction::Refused {
+                                message: r.status_line(&callsign),
+                            },
+                        },
+                    );
+                }
+            }
         }
 
         let (frequency, dx_parity) = self
@@ -4576,6 +4757,7 @@ impl App {
                     call_sign: spot.dx_call.clone(),
                     grid_square: spot.grid.clone(),
                     frequency: spot.frequency_hz as f64 / 1_000_000.0,
+                    band: pancetta_core::Band::from_frequency(spot.frequency_hz),
                     mode: spot.mode.clone(),
                     last_seen: chrono::Utc::now(),
                     snr: spot.best_snr.unwrap_or(0),
@@ -4607,6 +4789,7 @@ impl App {
                     // Network spots carry no passband / slot information.
                     audio_offset_hz: None,
                     slot_parity: None,
+                    spot_rf_hz: Some(spot.frequency_hz),
                     watchlisted: false,
                     pinned: false,
                 });
@@ -4623,6 +4806,8 @@ impl App {
             entry.confidence = Some(spot.confidence);
             entry.best_snr_network = spot.best_snr;
             entry.last_seen_network = Some(spot.last_seen);
+            // PAN-287: keep the spot RF current (the DX can move).
+            entry.spot_rf_hz = Some(spot.frequency_hz);
             // cqdx is authoritative for needs; keep them current each tick.
             entry.needed = spot.needed;
             entry.atno = spot.atno;
@@ -5122,6 +5307,60 @@ fn band_plan_candidate_ranges(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dx_row_band_is_source_unit_correct() {
+        use pancetta_core::Band;
+        // PAN-345: each source derives band from its own unit — cluster Hz,
+        // cqdx `frequency_hz`, local decode MHz — never from the magnitude.
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_dx_spot(
+            "JA1CL".into(),
+            14_074_000.0,
+            Some(Band::Band20m),
+            "CW".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.merge_spot_groups(&[reason_spot("VK3NET", false)]);
+        let mut local = fixture_view("K1LOC", -7);
+        local.frequency = 14.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        for call in ["JA1CL", "VK3NET", "K1LOC"] {
+            assert_eq!(app.dx_stations[call].band, Some(Band::Band20m), "{call}");
+        }
+        assert_eq!(app.dx_stations["JA1CL"].frequency, 14_074_000.0);
+        assert_eq!(app.dx_stations["VK3NET"].frequency, 14.074);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 14.074);
+
+        // An existing row's band follows its frequency when the frequency
+        // changes ...
+        local.frequency = 7.074;
+        app.add_decoded_message(local.clone()).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+        // ... and a metadata-only cqdx merge keeps the retained frequency's
+        // band.
+        app.merge_spot_groups(&[reason_spot("K1LOC", false)]);
+        assert_eq!(app.dx_stations["K1LOC"].frequency, 7.074);
+        assert_eq!(app.dx_stations["K1LOC"].band, Some(Band::Band40m));
+
+        // Outside every band (or unknown), no band.
+        local.frequency = 1.0;
+        app.add_decoded_message(local).await.unwrap();
+        assert_eq!(app.dx_stations["K1LOC"].band, None);
+        let mut off_band = reason_spot("ZL1OFF", false);
+        off_band.frequency_hz = 1_000_000;
+        app.merge_spot_groups(&[off_band]);
+        assert_eq!(app.dx_stations["ZL1OFF"].band, None);
+        assert_eq!(super::band_from_mhz(f64::NAN), None);
+        assert_eq!(super::band_from_mhz(-14.074), None);
+        // The shared table's inclusive edges, through the MHz conversion.
+        assert_eq!(super::band_from_mhz(14.0), Some(Band::Band20m));
+        assert_eq!(super::band_from_mhz(14.35), Some(Band::Band20m));
+    }
+
     fn reason_spot(call: &str, needed: bool) -> crate::tui_runner::CqdxSpotInfo {
         crate::tui_runner::CqdxSpotInfo {
             dx_call: call.into(),
@@ -5503,6 +5742,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -5988,6 +6228,7 @@ mod tests {
         app.add_dx_spot(
             "JA1XYZ".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6031,6 +6272,7 @@ mod tests {
         app.add_dx_spot(
             "<W5ABC>".into(),
             14.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6099,6 +6341,7 @@ mod tests {
         app.add_dx_spot(
             "W5ABC".into(),
             7.074,
+            None,
             "FT8".into(),
             -10,
             false,
@@ -6709,12 +6952,139 @@ mod tests {
     fn fixture_recent_qso(callsign: &str) -> RecentQsoOutcome {
         RecentQsoOutcome {
             callsign: callsign.to_string(),
+            qso_uuid: format!("uuid-{callsign}"),
             outcome: QsoOutcome::Completed,
             last_state: "Completed".to_string(),
             freq_hz: 1500,
             ts: Utc::now(),
             brief_timeline: vec!["QSO with X logged".to_string()],
         }
+    }
+
+    /// PAN-344 AC3: UUID correlation keeps repeated callsigns independent;
+    /// snapshots arriving in any order converge, and stale (lower-revision)
+    /// snapshots cannot regress accepted results.
+    #[tokio::test]
+    async fn pan344_upload_updates_are_order_independent() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut a = fixture_recent_qso("K1ABC");
+        a.qso_uuid = "u-a".into();
+        let mut b = fixture_recent_qso("K1ABC");
+        b.qso_uuid = "u-b".into();
+        app.push_recent_qso_outcome(a);
+        app.push_recent_qso_outcome(b);
+
+        let now = Utc::now();
+        let accepted = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 2,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::new(
+                    crate::upload_status::UploadState::Accepted,
+                    "accepted",
+                ),
+            )],
+        };
+        let pending = crate::upload_status::QsoUploadStatus {
+            uuid: "u-b".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("retrying"),
+            )],
+        };
+
+        // An early snapshot converges with the normal outcome-first path.
+        let mut early = App::new(Config::default(), None).await.unwrap();
+        early.apply_qso_upload_statuses(vec![accepted.clone()], now);
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-a".into();
+        early.push_recent_qso_outcome(row);
+        assert_eq!(
+            early.active_toast_text(now).as_deref(),
+            Some("K1ABC uploaded")
+        );
+
+        // Reverse arrival order converges to the same display.
+        app.apply_qso_upload_statuses(vec![accepted.clone(), pending.clone()], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+        assert_eq!(
+            app.upload_status_for("u-b")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Pending)
+        );
+
+        // An older snapshot for u-a cannot regress the accepted result.
+        let stale = crate::upload_status::QsoUploadStatus {
+            uuid: "u-a".into(),
+            callsign: "K1ABC".into(),
+            revision: 1,
+            targets: vec![(
+                crate::upload_status::UploadTarget::Qrz,
+                crate::upload_status::TargetUploadStatus::pending("queued"),
+            )],
+        };
+        app.apply_qso_upload_statuses(vec![stale], now);
+        assert_eq!(
+            app.upload_status_for("u-a")
+                .unwrap()
+                .state(crate::upload_status::UploadTarget::Qrz),
+            Some(crate::upload_status::UploadState::Accepted)
+        );
+
+        // A missing snapshot entry never erases a known row result.
+        app.apply_qso_upload_statuses(Vec::new(), now);
+        assert!(app.upload_status_for("u-a").is_some());
+    }
+
+    /// PAN-344 AC6: the App-side upload cache is bounded and does not evict
+    /// the rows' own lookups (row ring stays capped at 50 independently).
+    #[tokio::test]
+    async fn pan344_upload_history_bounds() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let now = Utc::now();
+        for i in 0..120 {
+            let s = crate::upload_status::QsoUploadStatus {
+                uuid: format!("u-{i}"),
+                callsign: format!("N{i}TEST"),
+                revision: 0,
+                targets: vec![(
+                    crate::upload_status::UploadTarget::Qrz,
+                    crate::upload_status::TargetUploadStatus::pending("queued"),
+                )],
+            };
+            app.apply_qso_upload_statuses(vec![s], now);
+        }
+        assert!(app.qso_uploads.len() <= 100, "cache bounded at 100");
+        assert!(app.upload_status_for("u-0").is_none(), "oldest evicted");
+        assert!(app.upload_status_for("u-119").is_some(), "newest retained");
+        let mut row = fixture_recent_qso("K1ABC");
+        row.qso_uuid = "u-20".into();
+        app.push_recent_qso_outcome(row);
+        for i in 120..240 {
+            app.apply_qso_upload_statuses(
+                vec![crate::upload_status::QsoUploadStatus {
+                    uuid: format!("u-{i}"),
+                    callsign: "K1ABC".into(),
+                    revision: 0,
+                    targets: vec![],
+                }],
+                now,
+            );
+        }
+        assert!(
+            app.upload_status_for("u-20").is_some(),
+            "visible row survives late unrelated statuses"
+        );
     }
 
     /// docs/observability-diagnostics-plan.md Layer 2 (Recent-QSOs panel):
@@ -7403,6 +7773,7 @@ mod tests {
         app.add_dx_spot(
             "K5ARH".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7413,6 +7784,7 @@ mod tests {
         app.add_dx_spot(
             "k5arh".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -10,
             false,
@@ -7429,6 +7801,7 @@ mod tests {
         app.add_dx_spot(
             "JA1ABC".to_string(),
             14.074,
+            None,
             "FT8".to_string(),
             -5,
             false,
@@ -7528,6 +7901,7 @@ mod tests {
                 call_sign: "K5ARH".to_string(),
                 grid_square: None,
                 frequency: 14.074,
+                band: None,
                 mode: "FT8".to_string(),
                 last_seen: chrono::Utc::now(),
                 snr: -10,
@@ -7552,6 +7926,7 @@ mod tests {
                 last_seen_network: None,
                 audio_offset_hz: None,
                 slot_parity: None,
+                spot_rf_hz: None,
                 watchlisted: false,
                 pinned: false,
             },
@@ -7694,6 +8069,7 @@ mod tests {
             call_sign: call.to_string(),
             grid_square: None,
             frequency: freq,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: Utc::now(),
             snr,
@@ -7718,6 +8094,7 @@ mod tests {
             last_seen_network: None,
             audio_offset_hz: Some(1200),
             slot_parity: None,
+            spot_rf_hz: None,
             watchlisted: false,
             pinned: false,
         }
@@ -7897,18 +8274,262 @@ mod tests {
         assert_eq!(freq, 871, "local audio offset must be preserved, not 1500");
     }
 
+    /// A row with neither a local audio offset nor a spot RF (only test
+    /// fixtures build one) keeps the legacy 1500 Hz fallback inside
+    /// `get_selected_station`. Real network spots never reach it from Space:
+    /// they carry `spot_rf_hz` and resolve to `SpaceAction::CallSpot` (PAN-287).
     #[tokio::test]
-    async fn get_selected_station_network_spot_defaults_to_1500() {
+    async fn get_selected_station_row_without_rf_or_offset_defaults_to_1500() {
         let mut app = fixture_app().await;
         app.active_panel = ActivePanel::DxHunter;
         let mut net = dx_fixture("NETONLY", 100, 10, 14.074, false);
         net.source = SpotSource::Network;
-        net.audio_offset_hz = None; // network spots carry no passband info
+        net.audio_offset_hz = None;
+        net.spot_rf_hz = None;
         app.dx_stations.insert("NETONLY".into(), net);
 
         app.dx_hunter_scroll = 0;
         let (_, freq, _) = app.get_selected_station().unwrap();
-        assert_eq!(freq, 1500, "network-only spot falls back to 1500 Hz");
+        assert_eq!(
+            freq, 1500,
+            "row with no RF and no offset falls back to 1500 Hz"
+        );
+    }
+
+    /// PAN-287: Space on a network spot resolves the spot's standard dial and
+    /// derived audio offset instead of 1500 Hz on the current dial.
+    #[tokio::test]
+    async fn space_on_network_spot_resolves_dial_and_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut net = dx_fixture("NETONLY", 100, 10, 14.075, false);
+        net.source = SpotSource::Network;
+        net.audio_offset_hz = None; // network spots carry no passband info
+        net.spot_rf_hz = Some(14_075_210);
+        app.dx_stations.insert("NETONLY".into(), net);
+        app.dx_hunter_scroll = 0;
+
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "NETONLY".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: Some(1210),
+            })
+        );
+    }
+
+    /// PAN-287 scenario 1: rig on 40 m, a 20 m cluster spot (through the
+    /// production `add_dx_spot` path) targets the 20 m dial at its offset.
+    #[tokio::test]
+    async fn space_on_cluster_spot_with_rig_on_40m_targets_20m() {
+        let mut app = fixture_app().await;
+        app.update_frequency(7_074_000);
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "ZL1ABC".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: Some(1210),
+            })
+        );
+    }
+
+    /// PAN-287 scenario 2: a dial-only cluster spot has no offset, so the
+    /// coordinator's frequency allocator picks it.
+    #[tokio::test]
+    async fn space_on_dial_only_spot_has_no_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_074_000.0,
+            Some(pancetta_core::Band::Band20m),
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::CallSpot {
+                callsign: "ZL1ABC".to_string(),
+                band: "20M".to_string(),
+                dial_hz: 14_074_000,
+                audio_offset_hz: None,
+            })
+        );
+    }
+
+    /// PAN-287: a CW cluster spot is refused with a status line; nothing to
+    /// call.
+    #[tokio::test]
+    async fn space_on_cw_cluster_spot_is_refused() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_025_000.0,
+            Some(pancetta_core::Band::Band20m),
+            "FT8".into(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        app.dx_hunter_scroll = 0;
+        assert_eq!(
+            app.resolve_space_action(),
+            Some(SpaceAction::Refused {
+                message: "Can't call ZL1ABC — spot 14.0250 MHz is not on the 20M FT8 sub-band"
+                    .to_string(),
+            })
+        );
+    }
+
+    /// PAN-287: a row we heard locally keeps today's behaviour exactly — the
+    /// call goes out at the heard offset on the current dial.
+    #[tokio::test]
+    async fn space_on_locally_heard_row_still_calls_at_heard_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut row = dx_fixture("VK9XX", 100, 10, 14.074, false);
+        row.audio_offset_hz = Some(750);
+        row.spot_rf_hz = Some(14_075_210);
+        app.dx_stations.insert("VK9XX".into(), row);
+        app.dx_hunter_scroll = 0;
+        match app.resolve_space_action() {
+            Some(SpaceAction::Call {
+                callsign,
+                frequency,
+                ..
+            }) => {
+                assert_eq!(callsign, "VK9XX");
+                assert_eq!(frequency, 750);
+            }
+            other => panic!("expected Call at the heard offset, got {other:?}"),
+        }
+    }
+
+    /// PAN-287: the coordinator's SpotQsy moves the TUI to the spot's band
+    /// exactly like a band key (live lists stashed and cleared).
+    #[tokio::test]
+    async fn apply_spot_qsy_switches_band_and_clears_lists() {
+        let mut app = fixture_app().await;
+        let forty = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "40M")
+            .unwrap();
+        app.current_band_index = forty;
+        app.station_info.operating_frequency = 7.074;
+        app.dx_stations
+            .insert("OLDBAND".into(), dx_fixture("OLDBAND", 10, 0, 7.074, false));
+
+        app.apply_spot_qsy(14_074_000);
+
+        assert_eq!(
+            app.config.bands.bands[app.current_band_index].name, "20M",
+            "band follows the commanded dial"
+        );
+        assert_eq!(app.station_info.operating_frequency, 14.074);
+        assert!(
+            !app.dx_stations.contains_key("OLDBAND"),
+            "old band's DX list is stashed, not shown on the new band"
+        );
+    }
+
+    /// PAN-287: a QSY inside the current band only moves the dial; the lists
+    /// stay.
+    #[tokio::test]
+    async fn apply_spot_qsy_same_band_only_updates_dial() {
+        let mut app = fixture_app().await;
+        let twenty = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "20M")
+            .unwrap();
+        app.current_band_index = twenty;
+        app.station_info.operating_frequency = 14.074;
+        app.dx_stations
+            .insert("KEEP".into(), dx_fixture("KEEP", 10, 0, 14.074, false));
+
+        app.apply_spot_qsy(14_080_000);
+
+        assert_eq!(app.current_band_index, twenty);
+        assert_eq!(app.station_info.operating_frequency, 14.08);
+        assert!(app.dx_stations.contains_key("KEEP"));
+    }
+
+    /// PAN-287: a cluster spot records its RF (Hz) for the Space path.
+    #[tokio::test]
+    async fn add_dx_spot_records_spot_rf_hz() {
+        let mut app = fixture_app().await;
+        app.add_dx_spot(
+            "ZL1ABC".into(),
+            14_075_210.0,
+            Some(pancetta_core::Band::Band20m),
+            "FT8".into(),
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_210));
+    }
+
+    /// PAN-287: a cqdx spot records its RF on insert and keeps it current on
+    /// every update.
+    #[tokio::test]
+    async fn merge_spot_groups_records_spot_rf_hz() {
+        let mut app = fixture_app().await;
+        let mut spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "ZL1ABC".into(),
+            band: "20m".into(),
+            mode: "FT8".into(),
+            frequency_hz: 14_075_210,
+            grid: None,
+            rarity_tier: "common".into(),
+            reporter_count: 1,
+            best_snr: Some(-7),
+            confidence: 0.9,
+            first_seen: Utc::now().timestamp(),
+            last_seen: Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "New Zealand".into(),
+            needed: false,
+            atno: false,
+        };
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_210));
+        spot.frequency_hz = 14_075_400;
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        assert_eq!(app.dx_stations["ZL1ABC"].spot_rf_hz, Some(14_075_400));
     }
 
     /// Real on-air regression (2026-07-25): OM5NU decoded consistently at
