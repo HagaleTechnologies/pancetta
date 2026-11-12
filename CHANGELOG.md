@@ -8,11 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
-<<<<<<< HEAD
-- Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
-=======
 - PAN-330: `pancetta-core` now owns the shared radio vocabulary. Prefix-portable decodes such as `EA8/K5ARH DL1ABC -10` are marked directed at us by both the TUI and the remote gateway, every frequency classifier uses the core inclusive band edges (5,357,500 Hz is `60m`; at 5,410,000 Hz cqdx and recording classification now return no band; ADIF writes `60M` at 5,405,000 Hz instead of its old `5MHZ` fallback while keeping uppercase labels at the serialization boundary), Maidenhead validity is one core validator (`ZZ99` is rejected wherever semantics matter), committed-exchange payloads and the CQ-modifier and callsign-token policies have single core implementations, and hamlib/config band keys use the core names.
->>>>>>> 6a0b73ba9e081e96ab37e47cacdff5166d69fb4d
+- Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
 - PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
 
 ### Added
