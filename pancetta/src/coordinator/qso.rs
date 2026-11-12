@@ -7490,7 +7490,6 @@ mod pending_manual_tests {
         assert_eq!(partner, Some(180.0));
     }
 
-<<<<<<< HEAD
     #[test]
     fn held_operator_endpoints_survive_manual_placement() {
         for held in [200, 2800] {
@@ -7526,7 +7525,8 @@ mod pending_manual_tests {
                 (expected, Some(dx))
             );
         }
-=======
+    }
+
     // PAN-287: a network-spot call with no DX offset keeps the allocator's
     // pick and listens there (placeholder partner_freq = our TX).
     #[test]
@@ -7559,7 +7559,6 @@ mod pending_manual_tests {
             vec!["K1AAA".to_string(), "K2BBB".to_string()]
         );
         assert!(q.is_empty());
->>>>>>> a0735e17c4275c704eb114467f866afae914bac8
     }
 
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is

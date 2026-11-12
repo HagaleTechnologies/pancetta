@@ -459,7 +459,6 @@ and say nothing about any one station. The strip chip and the Why text carry
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
 
-<<<<<<< HEAD
 
 ## Honest QSO values and operator offsets (PAN-354)
 
@@ -488,7 +487,7 @@ The multi-QSO table is unchanged.
 The unused public SignalMeter, Modal and SpectrumDisplay widgets remain for a
 separate compatibility review. They are not an alternate production SNR scale.
 Physical tmux and Windows Terminal glyph checks still need operator qualification.
-=======
+
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
 
 `pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.
@@ -507,4 +506,3 @@ Physical tmux and Windows Terminal glyph checks still need operator qualificatio
 - **A13 (rig data mode).** No `SetMode` is sent from `qsy_send`. Since PAN-276, with `[rig] data_mode` set, the rigctld backend reapplies the configured mode after every commanded frequency change, spot QSY included; unset, the mode is left to the operator.
 
 Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
->>>>>>> a0735e17c4275c704eb114467f866afae914bac8
