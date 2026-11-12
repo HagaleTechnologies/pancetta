@@ -187,10 +187,12 @@ pub(crate) struct QsyCtx {
 }
 
 impl QsyCtx {
-    fn status(&self, text: String) {
+    fn status(&self, text: String, level: pancetta_core::DiagnosticLevel) {
         let _ = self.tui_msg_tx.send(TuiMessage::StatusUpdate {
             component: "TX".to_string(),
             status: text,
+
+            level,
         });
     }
 }
@@ -289,7 +291,10 @@ pub(crate) async fn invalidate_allocator_band_state(ctx: &QsyCtx) {
 /// invalidates through the hop itself and also relays split to the gateway.
 pub(crate) async fn qsy_to(ctx: &QsyCtx, source: ComponentId, vfo: u8, frequency: u64) -> u64 {
     let Some(old) = qsy_send(ctx, source, vfo, frequency).await else {
-        ctx.status("Can't QSY — rig command was not delivered, try again".to_string());
+        ctx.status(
+            "Can't QSY — rig command was not delivered, try again".to_string(),
+            pancetta_core::DiagnosticLevel::Warn,
+        );
         return ctx.operating_freq_hz.load(Ordering::Relaxed);
     };
     if old != frequency {
@@ -425,7 +430,7 @@ pub(crate) async fn handle_spot_call(ctx: &SpotCallCtx, call: SpotCall) {
     match ctx.admit(&call, ctx.keyed()).await {
         SpotAdmission::Refuse(line) => {
             info!(target: "tx.policy", "Spot call refused: {}", line);
-            ctx.qsy.status(line);
+            ctx.qsy.status(line, pancetta_core::DiagnosticLevel::Warn);
         }
         SpotAdmission::Defer => park(ctx, call).await,
         SpotAdmission::Proceed { .. } => {
@@ -445,12 +450,15 @@ async fn park(ctx: &SpotCallCtx, call: SpotCall) {
         (gen, ctx.qsy.operating_freq_hz.load(Ordering::Relaxed))
     };
     info!(target: "operator.override", "Spot call to {} parked until PTT-off", call.callsign);
-    ctx.qsy.status(format!(
-        "Queued: QSY to {} {:.3} MHz after this frame, then call {}",
-        call.band,
-        call.dial_hz as f64 / 1e6,
-        call.callsign
-    ));
+    ctx.qsy.status(
+        format!(
+            "Queued: QSY to {} {:.3} MHz after this frame, then call {}",
+            call.band,
+            call.dial_hz as f64 / 1e6,
+            call.callsign
+        ),
+        pancetta_core::DiagnosticLevel::Info,
+    );
     tokio::spawn(wait_then_execute(ctx.clone(), call, gen, dial_at_park));
 }
 
@@ -477,10 +485,13 @@ async fn execute_spot_call(
                 "Parked spot call to {} cancelled: dial moved {} -> {} Hz while parked",
                 call.callsign, dial_at_park, now
             );
-            ctx.qsy.status(format!(
-                "Queued call to {} cancelled — frequency changed",
-                call.callsign
-            ));
+            ctx.qsy.status(
+                format!(
+                    "Queued call to {} cancelled — frequency changed",
+                    call.callsign
+                ),
+                pancetta_core::DiagnosticLevel::Warn,
+            );
             return ExecOutcome::Done;
         }
     }
@@ -492,7 +503,7 @@ async fn execute_spot_call(
                 ctx.take_parked();
             }
             info!(target: "tx.policy", "Spot call refused: {}", line);
-            ctx.qsy.status(line);
+            ctx.qsy.status(line, pancetta_core::DiagnosticLevel::Warn);
             return ExecOutcome::Done;
         }
         SpotAdmission::Proceed { qsy } => qsy,
@@ -518,10 +529,13 @@ async fn execute_spot_call(
                 if expected_gen.is_some() {
                     ctx.take_parked();
                 }
-                ctx.qsy.status(format!(
-                    "Can't call {} — rig command was not delivered, try again",
-                    call.callsign
-                ));
+                ctx.qsy.status(
+                    format!(
+                        "Can't call {} — rig command was not delivered, try again",
+                        call.callsign
+                    ),
+                    pancetta_core::DiagnosticLevel::Warn,
+                );
                 return ExecOutcome::Done;
             }
         }
@@ -534,12 +548,15 @@ async fn execute_spot_call(
             target: "operator.override",
             "Spot QSY to {} Hz for {}", call.dial_hz, call.callsign
         );
-        ctx.qsy.status(format!(
-            "QSY {} {:.3} MHz — calling {}",
-            call.band,
-            call.dial_hz as f64 / 1e6,
-            call.callsign
-        ));
+        ctx.qsy.status(
+            format!(
+                "QSY {} {:.3} MHz — calling {}",
+                call.band,
+                call.dial_hz as f64 / 1e6,
+                call.callsign
+            ),
+            pancetta_core::DiagnosticLevel::Info,
+        );
     }
     if expected_gen.is_some() {
         ctx.take_parked();
@@ -551,7 +568,10 @@ async fn execute_spot_call(
                 Some(hz) => (hz.round() as u64, true),
                 None => {
                     // The QSY stands: the operator asked to go there.
-                    ctx.qsy.status(allocator_not_ready(&call.callsign));
+                    ctx.qsy.status(
+                        allocator_not_ready(&call.callsign),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    );
                     return ExecOutcome::Done;
                 }
             }
@@ -604,11 +624,14 @@ async fn wait_then_execute(ctx: SpotCallCtx, call: SpotCall, gen: u64, dial_at_p
                     "Dropping parked spot call to {}: still keyed after {:?}",
                     call.callsign, ctx.wait_cap
                 );
-                ctx.qsy.status(format!(
-                    "Dropped queued call to {} — still transmitting after {} s",
-                    call.callsign,
-                    SPOT_QSY_WAIT_CAP.as_secs()
-                ));
+                ctx.qsy.status(
+                    format!(
+                        "Dropped queued call to {} — still transmitting after {} s",
+                        call.callsign,
+                        SPOT_QSY_WAIT_CAP.as_secs()
+                    ),
+                    pancetta_core::DiagnosticLevel::Warn,
+                );
             }
             return;
         }
@@ -620,9 +643,10 @@ async fn wait_then_execute(ctx: SpotCallCtx, call: SpotCall, gen: u64, dial_at_p
 pub(crate) fn note_operator_frequency_change(ctx: &SpotCallCtx) {
     ctx.generation.fetch_add(1, Ordering::SeqCst);
     if let Some(call) = ctx.take_parked() {
-        ctx.qsy.status(format!(
-            "Queued call to {call} cancelled — frequency changed"
-        ));
+        ctx.qsy.status(
+            format!("Queued call to {call} cancelled — frequency changed"),
+            pancetta_core::DiagnosticLevel::Warn,
+        );
     }
 }
 
@@ -652,9 +676,10 @@ pub(crate) async fn switch_mode_cancelling_parked<E>(
 
 /// Status line for a parked spot call a mode switch cancelled.
 pub(crate) fn report_mode_change_cancel(ctx: &SpotCallCtx, call: &str) {
-    ctx.qsy.status(format!(
-        "Queued call to {call} cancelled — operating mode changed"
-    ));
+    ctx.qsy.status(
+        format!("Queued call to {call} cancelled — operating mode changed"),
+        pancetta_core::DiagnosticLevel::Warn,
+    );
 }
 
 #[cfg(test)]

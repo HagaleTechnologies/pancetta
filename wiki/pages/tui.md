@@ -89,10 +89,14 @@ coordinator reports `TuiMessage::SpotQsy`, so a refused or parked call leaves
 the band alone. See
 [the PAN-287 decision](../../docs/DECISIONS/tui.md#space-on-a-network-spot-qsys-the-rig-pan-287-2026-11).
 
+<<<<<<< HEAD
 Replay sessions show `TX: REPLAY` in neutral gray from the first title-bar draw,
 regardless of TX policy. The session flag is supplied by the coordinator and is
 not saved in TUI config. See
 [the TX-policy banner decision](../../docs/DECISIONS/tui.md#tri-state-global-tx-policy).
+=======
+PAN-351: transient statuses expire independently of readiness alerts. Pass an explicit severity through the bus and use Relay for service feedback. Local feedback may temporarily cover a held error. Do not restore decode echoes or use transient expiry to clear readiness.
+>>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
 
 Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
 only marks a grid when both rows have the same canonical square. A later rover

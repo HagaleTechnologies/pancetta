@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
+
 ### Added
 
 - PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.

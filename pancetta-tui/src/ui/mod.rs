@@ -1259,9 +1259,14 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                         .fg(app.theme.accent_color())
                         .add_modifier(Modifier::BOLD),
                 ),
+                // PAN-351: leveled transient status colors by severity.
                 None => Span::styled(
-                    app.status_message.clone(),
-                    Style::default().fg(app.theme.accent_color()),
+                    app.status_message(),
+                    Style::default().fg(match app.selected_status().map(|(_, level)| level) {
+                        Some(pancetta_core::DiagnosticLevel::Warn) => app.theme.warning_color(),
+                        Some(pancetta_core::DiagnosticLevel::Error) => app.theme.error_color(),
+                        _ => app.theme.accent_color(),
+                    }),
                 ),
             },
         },
@@ -2387,7 +2392,10 @@ mod view_render_tests {
                     qso_id: None,
                     deferred: false,
                 });
-                app.status_message = "Reply step: RR73".into();
+                app.set_local_status(
+                    "Reply step: RR73".into(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
             }
             for view in ALL_VIEWS {
                 app.active_view = view;
@@ -3614,7 +3622,10 @@ mod view_render_tests {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
-        app.status_message = "Pancetta TUI Ready".to_string();
+        app.set_local_status(
+            "Pancetta TUI Ready".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+        );
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
             qso_uuid: "u-1".to_string(),
@@ -4559,6 +4570,80 @@ mod view_render_tests {
 mod hit_test_tests {
     use super::*;
     use crate::view::ActiveView;
+
+    #[tokio::test]
+    async fn pan351_status_render_states() {
+        use pancetta_core::DiagnosticLevel::{Error, Info, Warn};
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::time::{Duration, Instant};
+        for (width, height) in [(80, 24), (132, 40)] {
+            for view in [
+                ActiveView::Operate,
+                ActiveView::Hunt,
+                ActiveView::Run,
+                ActiveView::Monitor,
+            ] {
+                let mut app = App::new(crate::Config::default(), None).await.unwrap();
+                app.active_view = view;
+                for zoomed in [false, true] {
+                    app.zoomed = zoomed;
+                    app.compose_mode = false;
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    for (level, color) in [
+                        (Info, app.theme.accent_color()),
+                        (Warn, app.theme.warning_color()),
+                        (Error, app.theme.error_color()),
+                    ] {
+                        app.clear_status_for_test();
+                        app.status_test_push("TOKEN", level, Instant::now());
+                        terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let row = (0..height).find(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, *y)].symbol())
+                                .collect::<String>()
+                                .contains("TOKEN")
+                        });
+                        if row.is_none() {
+                            assert_eq!(width, 80, "status text must fit at 132 columns");
+                            continue;
+                        }
+                        let row = row.unwrap();
+                        let text = (0..width)
+                            .map(|x| buffer[(x, row)].symbol())
+                            .collect::<String>();
+                        let x = text.find("TOKEN").unwrap() as u16;
+                        assert_eq!(buffer[(x, row)].fg, color);
+                    }
+                    app.add_coded_error_message("held".into(), Some(351));
+                    app.set_local_status("ECHO".into(), Info);
+                    assert_eq!(app.status_message(), "ECHO");
+                    app.status_test_prune(Instant::now() + Duration::from_secs(5));
+                    assert_eq!(app.status_message(), "Error: held");
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let before = terminal.backend().buffer().clone();
+                    app.status_test_prune(Instant::now() + Duration::from_secs(30));
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let after = terminal.backend().buffer();
+                    // Readiness occupies the second row and remains byte-identical.
+                    for x in 0..width {
+                        assert_eq!(before[(x, 1)], after[(x, 1)]);
+                    }
+                    assert!(app.status_message().is_empty());
+                    app.enter_compose_mode();
+                    app.tx_input_buffer = "CQ TEST".into();
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    if width == 132 {
+                        assert!((0..height).any(|y| (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            .contains("CQ TEST")));
+                    }
+                }
+            }
+        }
+    }
 
     fn rects_overlap(a: Rect, b: Rect) -> bool {
         a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
