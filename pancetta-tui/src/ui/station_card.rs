@@ -807,6 +807,7 @@ pub(in crate::ui) mod tests {
                 call_sign: "JA1ABC".to_string(),
                 grid_square: None,
                 frequency: 14.074,
+                band: None,
                 mode: "FT8".to_string(),
                 last_seen: chrono::Utc::now(),
                 snr: 3,

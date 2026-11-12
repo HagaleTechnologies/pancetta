@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-345: DX-cluster spots now honour `[network.dx_cluster.filtering]`. `bands` and `modes` allowlists, inclusive Hz limits and `duplicate_window_minutes` (`0` turns it off) apply locally before a spot reaches DX Hunter, and a filtered spot no longer suppresses the next accepted one. With the cluster enabled, an invalid band or mode name, or inverted limits, is now a startup error instead of being ignored. Spots keep their parsed mode (CW stays CW, unknown is `Unknown`, never FT8), and DX Hunter gains a `Band` column for every row. `dxcc_filters` is still not applied. Live-cluster qualification is pending.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
 
 ### Changed

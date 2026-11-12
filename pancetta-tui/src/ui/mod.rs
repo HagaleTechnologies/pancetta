@@ -4157,6 +4157,7 @@ mod view_render_tests {
             call_sign: call.to_string(),
             grid_square: Some("RE78".to_string()),
             frequency: 14.074,
+            band: None,
             mode: "FT8".to_string(),
             last_seen: chrono::Utc::now(),
             snr: -12,
@@ -4298,7 +4299,9 @@ mod view_render_tests {
                 for t in &tokens {
                     assert!(full_names.contains(&t.as_str()), "{w}x{h} {view:?}: {t}");
                 }
-                for must in ["Call", "Entity", "SNR"] {
+                // PAN-345: Band joins right after Call, so the narrowest
+                // supported panel shows Call, Band and Entity.
+                for must in ["Call", "Band", "Entity"] {
                     assert!(tokens.iter().any(|t| t == must), "{w}x{h} {view:?}");
                 }
                 assert!(
