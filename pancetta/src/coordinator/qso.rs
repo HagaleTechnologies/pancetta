@@ -11688,7 +11688,8 @@ async fn start_local_qso_log_writers(
 }
 
 /// The history seed and whether a refused migration must hold back ADIF creation.
-pub(crate) enum LocalIndex {
+#[doc(hidden)]
+pub enum LocalIndex {
     Ready(pancetta_qso::async_database::QsoDatabase),
     Unavailable { reason: String },
     MigrationRefused { reason: String },
@@ -11710,7 +11711,8 @@ impl LocalIndex {
 /// Reconcile contacts before either writer opens a file. An unchanged ADIF
 /// needs no rebuild regardless of timestamps. A migration refusal must never
 /// create a header-only ADIF that would erase legacy contacts on the next start.
-async fn prepare_local_qso_index(
+#[doc(hidden)]
+pub async fn prepare_local_qso_index(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
 ) -> LocalIndex {

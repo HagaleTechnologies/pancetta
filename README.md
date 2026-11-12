@@ -277,6 +277,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
+| `pancetta import-confirmations <file.adi>` | Merge your LoTW report into existing contacts, then restart to apply confirmations. No login or download. |
 | `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
 | `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |
 | `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |
@@ -284,6 +285,36 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
 | `pancetta --headless --log-format json` | The same, with one JSON object per log line on stderr and in the log file (for journald, jq or a log shipper). |
 | `pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain.json` | Measure per-band receive gain and save an advisory report. [Limits and timing](docs/receive-gain-sweep.md). |
+
+### LoTW confirmations
+
+Run `pancetta import-confirmations lotw-report.adi` with your own LoTW report
+for this logbook. It updates existing contacts only. Matching requires the same
+call including portable suffix, known band, effective mode and UTC start time
+within 30 minutes, inclusive. Multiple matching contacts are skipped rather than
+guessed. FT4 and FT8 are distinct modes.
+
+The report must carry a positive `LOTW_QSL_RCVD` with `LOTW_QSLRDATE`, or
+LoTW's `QSL_RCVD` with `QSLRDATE`. Values Y and V count, ignoring case and
+surrounding spaces. Dates must be valid `YYYYMMDD`. Incomplete or conflicting
+pairs are skipped. The command stores LoTW tags, retains V and the earliest
+valid date, and preserves unrelated fields. A paper-QSL file is not a LoTW report.
+
+The command waits up to 60 seconds for the shared logbook lock. A changed log
+gets a verified `.bak` or `.bak.N` recovery copy and a rebuild marker before an
+in-place rewrite. An interrupted rewrite may need recovery from that backup.
+Stop the station before restoring it to `~/.pancetta/qsos.adi`, retain the rebuild
+marker, then restart. A repeat import with no changes creates no backup or marker.
+The SQLite index and running caches are left alone. Restart Pancetta to rebuild
+the index and apply confirmations. Ordinary `import --undo` refuses an imported
+block if a later confirmation merge changed its bytes.
+
+To keep worked but unconfirmed entities needed, set `[autonomous] needed_means =
+"unconfirmed"` and restart. The default `"unworked"` retains cqdx-first behavior.
+The confirmation policy uses the loaded local log for global and per-band need,
+across modes, even when autonomous operation is disabled. ATNO still means never
+worked. Confirmations on another band do not clear band need. Duplicate admission
+rules still apply. Remote clients retain cqdx-only verdicts.
 
 ## Capability status
 
@@ -311,7 +342,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | Tier-based pouncing, decode alerts and editable watchlist | Implemented, *Unreleased* | Optional tier admission; bell, ntfy and webhook alerts; persistent pins edited with Shift+W. No live notification-service or on-air qualification | [configuration](docs/CONFIG.md#dx-tiers-alerts-and-watchlist) |
-| Needed, ATNO, band-slot, mode and confirmed status from the local logbook | Integration-tested, *Unreleased* | Answers when cqdx.io has not; confirmations come from QSL_RCVD and LOTW_QSL_RCVD already in qsos.adi; the remote client still shows cqdx-only needed | [local logbook needs](pancetta/tests/local_logbook_needs.rs) |
+| Needed, ATNO, band-slot, mode and confirmed status from the local logbook | Integration-tested, *Unreleased* | Answers when cqdx.io has not; confirmations come from QSL_RCVD and LOTW_QSL_RCVD in qsos.adi, including LoTW report imports; opt-in `needed_means = "unconfirmed"` uses local confirmations even with cqdx loaded; the remote client still shows cqdx-only needed | [local logbook needs](pancetta/tests/local_logbook_needs.rs) |
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
 | FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
