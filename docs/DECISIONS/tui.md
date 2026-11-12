@@ -459,7 +459,6 @@ and say nothing about any one station. The strip chip and the Why text carry
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
 
-<<<<<<< HEAD
 ## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
 
 Each Recent-QSOs row shows one glyph cell per enabled upload target in
@@ -476,7 +475,6 @@ only ever an explicit service result — an empty captured target set renders
 History is session-only: the coordinator retains the last 100 completion
 registrations and the TUI mirrors them; a restart invents no accepted
 history.
-=======
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
 
 `pancetta-tui/src/spot_call.rs`, `pancetta/src/coordinator/spot_call.rs`, `pancetta/src/coordinator/tui_relay.rs`, `pancetta/src/coordinator/qso.rs`: before this, Space on a DX Hunter cluster row called the station at a fixed 1500 Hz on whatever dial the rig was on. The call carried no dial, so a 20M spot pressed while on 40M keyed FT8 on the wrong band.
@@ -495,4 +493,3 @@ history.
 - **A13 (rig data mode).** No `SetMode` is sent from `qsy_send`. Since PAN-276, with `[rig] data_mode` set, the rigctld backend reapplies the configured mode after every commanded frequency change, spot QSY included; unset, the mode is left to the operator.
 
 Follow-up candidates are in `docs/DECISIONS/2026-07-development-phases-and-gaps.md` (PAN-287 entries).
->>>>>>> a0735e17c4275c704eb114467f866afae914bac8
