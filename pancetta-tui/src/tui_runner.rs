@@ -156,6 +156,12 @@ pub enum TuiMessage {
         component: String,
         status: String,
     },
+    /// PAN-287: the coordinator commanded a spot-call QSY to `dial_hz`. The
+    /// TUI applies its band state now (`App::apply_spot_qsy`), not at the
+    /// keypress, so a refused or parked spot call leaves the band alone.
+    SpotQsy {
+        dial_hz: u64,
+    },
     /// A retained, operator-facing diagnostic event (docs/observability-
     /// diagnostics-plan.md Layer 1) — relayed from
     /// `MessageType::DiagnosticEvent`. Appended to `App`'s bounded event
@@ -458,6 +464,21 @@ pub enum TuiCommand {
         callsign: String,
         frequency: u64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
+    /// PAN-287: call a DX Hunter network spot (cluster/cqdx row never heard
+    /// locally). The TUI resolved the spot's standard dial for the active
+    /// mode and its audio offset (`spot RF − dial`, `None` when outside
+    /// 200-2900 Hz). The coordinator admits it, QSYs the rig first when the
+    /// dial differs (waiting for PTT-off), then opens the call — at
+    /// `audio_offset_hz`, or at the frequency allocator's pick when `None`.
+    CallNetworkSpot {
+        callsign: String,
+        /// Band name from the operator's band list (status lines only).
+        band: String,
+        /// Standard FT8/FT4 dial for the spot, in Hz.
+        dial_hz: u64,
+        /// The spot's audio offset on that dial; `None` = allocator's choice.
+        audio_offset_hz: Option<u64>,
     },
     /// Reply to a station calling US (from the Callers panel), opening the
     /// exchange at the operator-chosen sequence step (smart default +
@@ -900,6 +921,10 @@ impl TuiRunner {
             }
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
+            }
+            // PAN-287: the coordinator commanded a spot-call QSY; follow it.
+            TuiMessage::SpotQsy { dial_hz } => {
+                app.apply_spot_qsy(dial_hz);
             }
             TuiMessage::WaterfallUpdate { rows } => {
                 app.push_waterfall_rows(rows);
@@ -2338,6 +2363,37 @@ impl TuiRunner {
                         dx_parity,
                     })?;
                     app.status_message = format!("Calling {}...", callsign);
+                }
+                // PAN-287: a DX Hunter network spot — the coordinator QSYs
+                // to its dial (after PTT-off when keyed), then calls.
+                Some(crate::app::SpaceAction::CallSpot {
+                    callsign,
+                    band,
+                    dial_hz,
+                    audio_offset_hz,
+                }) => {
+                    let offset = match audio_offset_hz {
+                        Some(o) => format!("{o} Hz"),
+                        None => "auto offset".to_string(),
+                    };
+                    app.status_message = format!(
+                        "Calling {} — {} {:.3} MHz @ {}...",
+                        callsign,
+                        band,
+                        dial_hz as f64 / 1_000_000.0,
+                        offset
+                    );
+                    self.message_tx.send(TuiCommand::CallNetworkSpot {
+                        callsign,
+                        band,
+                        dial_hz,
+                        audio_offset_hz,
+                    })?;
+                }
+                // PAN-287: the spot can't be called in the active mode;
+                // nothing is sent.
+                Some(crate::app::SpaceAction::Refused { message }) => {
+                    app.status_message = message;
                 }
                 None => {
                     app.status_message = match app.focused_callsign() {
@@ -4090,6 +4146,7 @@ mod key_tests {
             last_seen_network: None,
             audio_offset_hz: Some(750),
             slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+            spot_rf_hz: None,
             watchlisted: false,
             pinned: false,
         }
@@ -6689,6 +6746,7 @@ mod key_tests {
                     last_seen_network: None,
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    spot_rf_hz: None,
                     watchlisted: false,
                     pinned: false,
                 },
@@ -7431,6 +7489,7 @@ mod key_tests {
                     last_seen_network: None,
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    spot_rf_hz: None,
                     watchlisted: false,
                     pinned: false,
                 },
@@ -7453,6 +7512,114 @@ mod key_tests {
             }
             other => panic!("Expected CallStation, got {:?}", other),
         }
+    }
+
+    /// PAN-287: put one DX-cluster spot (production `add_dx_spot` path) on
+    /// the DX Hunter and focus it.
+    async fn focus_cluster_spot(app: &Arc<RwLock<App>>, call: &str, rf_hz: f64) {
+        let mut a = app.write().await;
+        a.active_panel = crate::app::ActivePanel::DxHunter;
+        a.add_dx_spot(
+            call.to_string(),
+            rf_hz,
+            "FT8".to_string(),
+            0,
+            false,
+            true,
+            false,
+            false,
+        );
+        a.dx_hunter_scroll = 0;
+        a.clamp_dx_hunter_selection();
+        assert_eq!(a.focused_callsign().as_deref(), Some(call));
+    }
+
+    /// PAN-287 scenario 1: Space on a network spot sends `CallNetworkSpot`
+    /// with the spot's dial and derived offset, not `CallStation` at 1500 Hz.
+    #[tokio::test]
+    async fn space_on_network_spot_sends_call_network_spot() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_cluster_spot(&app, "ZL1ABC", 14_075_210.0).await;
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallNetworkSpot {
+                callsign,
+                band,
+                dial_hz,
+                audio_offset_hz,
+            }) => {
+                assert_eq!(callsign, "ZL1ABC");
+                assert_eq!(band, "20M");
+                assert_eq!(dial_hz, 14_074_000);
+                assert_eq!(audio_offset_hz, Some(1210));
+            }
+            other => panic!("Expected CallNetworkSpot, got {:?}", other),
+        }
+        assert_eq!(
+            app.read().await.status_message,
+            "Calling ZL1ABC — 20M 14.074 MHz @ 1210 Hz..."
+        );
+    }
+
+    /// PAN-287 scenario 2: a dial-only spot says the allocator picks.
+    #[tokio::test]
+    async fn space_on_dial_only_spot_status_says_auto_offset() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_cluster_spot(&app, "ZL1ABC", 14_074_000.0).await;
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallNetworkSpot {
+                audio_offset_hz, ..
+            }) => assert_eq!(audio_offset_hz, None),
+            other => panic!("Expected CallNetworkSpot, got {:?}", other),
+        }
+        assert_eq!(
+            app.read().await.status_message,
+            "Calling ZL1ABC — 20M 14.074 MHz @ auto offset..."
+        );
+    }
+
+    /// PAN-287: a spot that can't be called in the active mode sends nothing
+    /// and explains why.
+    #[tokio::test]
+    async fn space_on_refused_spot_sends_nothing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_cluster_spot(&app, "ZL1ABC", 14_025_000.0).await;
+        r.handle_key_event(key(' ')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a refused spot sends no command"
+        );
+        assert_eq!(
+            app.read().await.status_message,
+            "Can't call ZL1ABC — spot 14.0250 MHz is not on the 20M FT8 sub-band"
+        );
+    }
+
+    /// PAN-287: the coordinator's `SpotQsy` moves the TUI's band.
+    #[tokio::test]
+    async fn spot_qsy_message_applies_band() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            let forty = a
+                .config
+                .bands
+                .bands
+                .iter()
+                .position(|b| b.name == "40M")
+                .unwrap();
+            a.current_band_index = forty;
+            a.station_info.operating_frequency = 7.074;
+        }
+        r.handle_message(TuiMessage::SpotQsy {
+            dial_hz: 14_074_000,
+        })
+        .await
+        .unwrap();
+        let a = app.read().await;
+        assert_eq!(a.config.bands.bands[a.current_band_index].name, "20M");
+        assert_eq!(a.station_info.operating_frequency, 14.074);
     }
 
     /// Task 3's actual behavior change: `resolve_space_action` used to key

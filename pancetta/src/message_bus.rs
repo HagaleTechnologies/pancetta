@@ -800,6 +800,12 @@ pub enum QsoMessage {
         /// permission to THIS specific client, not just "some client is
         /// armed" — see `QsoMetadata::remote_client_key_id`.
         remote_client_key_id: Option<String>,
+        /// PAN-287: `true` when `frequency` is the TX offset the allocator chose for a
+        /// network-spot call whose DX offset is unknown — not where we heard the DX.
+        /// The QSO opens with `partner_freq = Some(tx_off)`, so the existing
+        /// two-sighting drift confirmation relatches where we hear the DX without
+        /// moving our TX. `false` for every other StartQso (byte-identical).
+        dx_offset_unknown: bool,
     },
     /// Respond to a station **calling us**, opening the exchange at an
     /// operator-chosen [`pancetta_core::ResponseStep`] rather than always

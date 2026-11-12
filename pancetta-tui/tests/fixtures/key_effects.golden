@@ -1618,7 +1618,7 @@ rich/help | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 rich/help | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/help | Esc | none,shift,ctrl,alt,ctrl+shift | help_visible: true -> false
 rich/help | Down | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 1
-rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 47
+rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 49
 rich/help | PageDown | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 17
 rich/compose | Char(' ') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST "; tx_input_buffer: "CQ TEST" -> "CQ TEST "; tx_input_cursor: 7 -> 8
 rich/compose | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST!"; tx_input_buffer: "CQ TEST" -> "CQ TEST!"; tx_input_cursor: 7 -> 8

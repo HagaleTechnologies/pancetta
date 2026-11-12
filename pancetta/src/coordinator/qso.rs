@@ -580,6 +580,35 @@ pub fn compute_manual_tx_offset(
     (tx_off, partner_freq)
 }
 
+/// PAN-287: TX audio offset for a network-spot call whose DX offset is
+/// unknown (`StartQso { dx_offset_unknown: true }`). `allocated_hz` is the
+/// frequency allocator's pick, de-conflicted from the active QSOs exactly
+/// like [`compute_manual_tx_offset`]. `partner_freq` is a placeholder equal
+/// to our own TX offset: the existing two-sighting drift confirmation then
+/// relatches `partner_freq` to wherever the DX answers, and our TX stays put.
+pub fn compute_spot_call_tx_offset(
+    allocated_hz: f64,
+    active_offsets: &[f64],
+) -> (f64, Option<f64>) {
+    let tx_off = pancetta_qso::deconflict_offset(
+        allocated_hz,
+        active_offsets,
+        pancetta_qso::MIN_TX_SEPARATION_HZ,
+        pancetta_qso::TX_OFFSET_MIN_HZ,
+        pancetta_qso::TX_OFFSET_MAX_HZ,
+    );
+    (tx_off, Some(tx_off))
+}
+
+/// PAN-287: a band change empties the cross-parity call queue. A call parked
+/// on the old band must never promote and transmit on the new one. Returns
+/// the dropped callsigns in queue order, so each can be reported.
+fn drain_parked_calls_on_band_change(
+    queue: &mut std::collections::VecDeque<PendingManualCall>,
+) -> Vec<String> {
+    queue.drain(..).map(|p| p.callsign).collect()
+}
+
 /// Pure: summarize what a decoded frame tells us its sender is doing (#41).
 /// `our_call` lets us say "→ us" when the frame is directed at us. Returns
 /// `None` for frames with no useful "who are they working" signal.
@@ -5291,7 +5320,11 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             remote_origin,
                                             remote_client_key_id,
+                                            dx_offset_unknown,
                                         } => {
+                                            // PAN-287: a network-spot call carries no parity,
+                                            // so the parity gate always admits it (never queued).
+                                            debug_assert!(!dx_offset_unknown || dx_parity.is_none());
                                             // PAN-78: capacity/parity checks and the open run
                                             // under the admission lock.
                                             let _admission = qso_admission.lock().await;
@@ -5489,9 +5522,17 @@ impl super::ApplicationCoordinator {
                                                 tx_freq_mode.load(Ordering::Relaxed),
                                             ) == pancetta_core::TxFreqMode::Hold;
                                             let active = qso_manager.active_tx_offsets().await;
-                                            let (tx_off, partner) = compute_manual_tx_offset(
-                                                dx_freq, hold_mode, held, &active,
-                                            );
+                                            // PAN-287: a network-spot call with no known DX
+                                            // offset opens at the allocator's TX offset with a
+                                            // placeholder partner_freq; every other call is
+                                            // unchanged.
+                                            let (tx_off, partner) = if dx_offset_unknown {
+                                                compute_spot_call_tx_offset(dx_freq, &active)
+                                            } else {
+                                                compute_manual_tx_offset(
+                                                    dx_freq, hold_mode, held, &active,
+                                                )
+                                            };
                                             if tx_off != dx_freq {
                                                 info!(
                                                     target: "qso",
@@ -6404,6 +6445,34 @@ impl super::ApplicationCoordinator {
                                                         "Band change — {} active QSO(s) ended",
                                                         n
                                                     ),
+                                                )
+                                                .await;
+                                            }
+                                            // PAN-287: a call parked in the cross-parity queue on
+                                            // the old band must not promote and transmit on the
+                                            // new band. Drop and report each one.
+                                            let dropped = {
+                                                let mut queue = pending_manual_calls.lock().await;
+                                                drain_parked_calls_on_band_change(&mut queue)
+                                            };
+                                            for call in dropped {
+                                                warn!(
+                                                    target: "qso",
+                                                    "Band change: dropping queued call to {}", call
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!("Queued call to {call} dropped — band changed"),
+                                                )
+                                                .await;
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!("Dropped queued call to {call} — band changed"),
+                                                    None,
+                                                    Some(&call),
                                                 )
                                                 .await;
                                             }
@@ -7375,7 +7444,10 @@ fn snapshot_item_from_progress(
 
 #[cfg(test)]
 mod pending_manual_tests {
-    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall, QueueStamp};
+    use super::{
+        compute_manual_tx_offset, compute_spot_call_tx_offset, drain_parked_calls_on_band_change,
+        partition_pending_calls, PendingManualCall, QueueStamp,
+    };
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
 
@@ -7418,6 +7490,7 @@ mod pending_manual_tests {
         assert_eq!(partner, Some(180.0));
     }
 
+<<<<<<< HEAD
     #[test]
     fn held_operator_endpoints_survive_manual_placement() {
         for held in [200, 2800] {
@@ -7453,6 +7526,40 @@ mod pending_manual_tests {
                 (expected, Some(dx))
             );
         }
+=======
+    // PAN-287: a network-spot call with no DX offset keeps the allocator's
+    // pick and listens there (placeholder partner_freq = our TX).
+    #[test]
+    fn spot_call_offset_keeps_allocator_pick_and_sets_placeholder_partner() {
+        assert_eq!(
+            compute_spot_call_tx_offset(1000.0, &[]),
+            (1000.0, Some(1000.0))
+        );
+    }
+
+    #[test]
+    fn spot_call_offset_is_deconflicted_from_active_qsos() {
+        let (tx, partner) = compute_spot_call_tx_offset(1000.0, &[1020.0]);
+        assert!((tx - 1020.0).abs() >= pancetta_qso::MIN_TX_SEPARATION_HZ);
+        assert_eq!(partner, Some(tx));
+    }
+
+    // PAN-287: a band change drops every parked cross-parity call, in queue
+    // order, and leaves the queue empty.
+    #[test]
+    fn band_change_drains_parked_calls_in_queue_order() {
+        let mut q: VecDeque<_> = [
+            caller_call("K1AAA", SlotParity::Even, pancetta_core::ResponseStep::Grid),
+            caller_call("K2BBB", SlotParity::Odd, pancetta_core::ResponseStep::Grid),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            drain_parked_calls_on_band_change(&mut q),
+            vec!["K1AAA".to_string(), "K2BBB".to_string()]
+        );
+        assert!(q.is_empty());
+>>>>>>> a0735e17c4275c704eb114467f866afae914bac8
     }
 
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
@@ -15486,6 +15593,7 @@ mod respond_to_caller_admission_tests {
                 dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             }),
             Instant::now(),
         );
@@ -16798,6 +16906,7 @@ mod respond_to_caller_admission_tests {
                     dx_parity: Some(SlotParity::Even),
                     remote_origin: false,
                     remote_client_key_id: None,
+                    dx_offset_unknown: false,
                 }),
                 Instant::now(),
             ))
@@ -17488,6 +17597,7 @@ mod manual_capacity_admission_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -17879,6 +17989,7 @@ mod manual_capacity_admission_tests {
             dx_parity: Some(SlotParity::Even),
             remote_origin: true,
             remote_client_key_id: Some("peer".to_string()),
+            dx_offset_unknown: false,
         }
     }
 
@@ -18047,6 +18158,7 @@ mod remote_controller_change_tests {
                 dx_parity: Some(SlotParity::Even),
                 remote_origin: false,
                 remote_client_key_id: None,
+                dx_offset_unknown: false,
             })
             .await;
         }
@@ -18125,6 +18237,7 @@ mod remote_controller_change_tests {
             dx_parity: Some(dx),
             remote_origin: true,
             remote_client_key_id: Some(client.to_string()),
+            dx_offset_unknown: false,
         })
         .await;
     }

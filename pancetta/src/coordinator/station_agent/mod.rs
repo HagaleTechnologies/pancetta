@@ -876,9 +876,7 @@ async fn remote_qsy_refusal(ctx: &ArmContext, bus: &MessageBus) -> Option<&'stat
     // `tx::send_ptt_command`, which sets bit 1 of `gain_tx_gate` once a key-down
     // is enqueued; Hamlib clears it on an acknowledged bus PTT-off. Bits 2+
     // count key-downs mid-enqueue. Bit 0 is the receive-gain transition.
-    if ctx.station_activity.ptt_active.load(Ordering::Acquire)
-        || bus.gain_tx_gate.load(Ordering::Acquire) & !1 != 0
-    {
+    if crate::coordinator::spot_call::rig_is_keyed(&ctx.station_activity.ptt_active, bus) {
         return Some("the rig is transmitting");
     }
     // Drop watch::Ref before awaiting the manager, allowing restart publication.
@@ -1707,6 +1705,7 @@ fn tx_kind_to_qso_message(kind: TxKind, peer: &str) -> crate::message_bus::QsoMe
             dx_parity: parse_dx_parity(dx_parity.as_deref()),
             remote_origin: true,
             remote_client_key_id: Some(peer.to_string()),
+            dx_offset_unknown: false,
         },
         TxKind::AnswerCaller {
             callsign,
