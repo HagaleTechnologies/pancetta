@@ -9,17 +9,19 @@ use pancetta_lib::clock_skew::{
     clock_fix_hint, sntp_clock_offset, CLOCK_SKEW_FAIL_S, CLOCK_SKEW_WARN_S, NTP_SERVER,
     NTP_SERVER_HOST, SNTP_TIMEOUT,
 };
+use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Outcome status of one doctor check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum CheckStatus {
     /// Ready.
     Pass,
     /// Not OK, but not fatal to a decode-only station (or unverifiable here).
     Warn,
-    /// Broken. If the check is `hard`, doctor exits non-zero.
+    /// A failed prerequisite or advisory probe.
     Fail,
 }
 
@@ -31,10 +33,10 @@ pub struct CheckOutcome {
 }
 
 /// One doctor check, kept as data so later phases add checks as one-liners
-/// in [`build_checks`]. `hard` checks gate the exit code; soft checks print.
+/// in [`build_checks`]. Each role determines how failure affects readiness.
 pub struct DoctorCheck {
     pub name: &'static str,
-    pub hard: bool,
+    pub role: CheckRole,
     pub run: Box<dyn Fn(&DoctorCtx) -> CheckOutcome>,
 }
 
@@ -100,15 +102,137 @@ pub fn status_label(s: CheckStatus) -> &'static str {
     }
 }
 
-/// Non-zero iff any HARD check FAILed. Warns and soft fails never gate.
-pub fn doctor_exit_code(results: &[(bool, CheckStatus)]) -> i32 {
-    if results
-        .iter()
-        .any(|(hard, s)| *hard && *s == CheckStatus::Fail)
-    {
-        1
-    } else {
-        0
+/// Readiness responsibility, independent of human diagnostic wording.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckRole {
+    Receive,
+    Transmit,
+    Advisory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Verdict {
+    #[serde(rename = "NOT CONFIGURED")]
+    NotConfigured,
+    #[serde(rename = "DECODE-ONLY")]
+    DecodeOnly,
+    #[serde(rename = "ON-AIR READY")]
+    OnAirReady,
+    #[serde(rename = "NOT READY")]
+    NotReady,
+}
+
+impl Verdict {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::OnAirReady => 0,
+            Self::DecodeOnly => 1,
+            Self::NotConfigured => 2,
+            Self::NotReady => 3,
+        }
+    }
+
+    fn result_line(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "Result: NOT CONFIGURED. Run `pancetta setup`, then re-run `pancetta doctor`.",
+            Self::DecodeOnly => "Result: DECODE-ONLY. Receive checks passed; fix the transmit prerequisites above to go on-air.",
+            Self::OnAirReady => "Result: ON-AIR READY. Doctor prerequisites passed; PTT and transmit audio are not tested.",
+            Self::NotReady => "Result: NOT READY. Fix the failed receive or configuration checks above, then re-run `pancetta doctor`.",
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CheckResult {
+    name: &'static str,
+    status: CheckStatus,
+    detail: String,
+    fix: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DoctorReport {
+    pub verdict: Verdict,
+    pub exit_code: i32,
+    config_path: String,
+    checks: Vec<CheckResult>,
+}
+
+impl DoctorReport {
+    // Both live probes and controlled fixtures use this aggregation path.
+    fn from_results(ctx: &DoctorCtx, results: Vec<(DoctorCheck, CheckOutcome)>) -> Self {
+        let verdict = if ctx.config.is_none() && ctx.config_error.is_none() {
+            Verdict::NotConfigured
+        } else if ctx.config_error.is_some()
+            || results.iter().any(|(check, outcome)| {
+                check.role == CheckRole::Receive && outcome.status == CheckStatus::Fail
+            })
+        {
+            Verdict::NotReady
+        } else if ctx
+            .config
+            .as_ref()
+            .is_some_and(|cfg| cfg.station.callsign == "N0CALL" || !cfg.rig.interface.enabled)
+            || results.iter().any(|(check, outcome)| {
+                check.role == CheckRole::Transmit && outcome.status != CheckStatus::Pass
+            })
+        {
+            Verdict::DecodeOnly
+        } else {
+            Verdict::OnAirReady
+        };
+        Self {
+            verdict,
+            exit_code: verdict.exit_code(),
+            config_path: ctx.config_path.display().to_string(),
+            checks: results
+                .into_iter()
+                .map(|(check, outcome)| CheckResult {
+                    name: check.name,
+                    status: outcome.status,
+                    detail: outcome.detail,
+                    fix: outcome.fix,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn collect(ctx: &DoctorCtx) -> Self {
+        let results = build_checks()
+            .into_iter()
+            .map(|check| {
+                let outcome = (check.run)(ctx);
+                (check, outcome)
+            })
+            .collect();
+        Self::from_results(ctx, results)
+    }
+
+    pub fn text(&self) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        writeln!(
+            text,
+            "\npancetta doctor — {} checks (config: {})\n",
+            self.checks.len(),
+            self.config_path
+        )
+        .unwrap();
+        for check in &self.checks {
+            writeln!(
+                text,
+                "[{}] {:<20} {}",
+                status_label(check.status),
+                check.name,
+                check.detail
+            )
+            .unwrap();
+            if let Some(fix) = check.fix.as_deref().filter(|fix| !fix.is_empty()) {
+                writeln!(text, "       fix: {fix}").unwrap();
+            }
+        }
+        writeln!(text, "\n{}", self.verdict.result_line()).unwrap();
+        text
     }
 }
 
@@ -123,7 +247,7 @@ fn not_configured() -> CheckOutcome {
 pub(crate) fn check_config() -> DoctorCheck {
     DoctorCheck {
         name: "config",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|ctx| {
             if !ctx.config_path.exists() {
                 return CheckOutcome {
@@ -170,7 +294,7 @@ pub(crate) fn check_config() -> DoctorCheck {
 
 /// Classify one SNTP result. PASS below FT8's ~0.3 s decode margin, WARN
 /// from the margin up to 1 s (PAN-114), FAIL from 1 s, WARN when the server
-/// cannot be reached. Only FAIL gates the exit code (`check_clock` is hard).
+/// cannot be reached. Only FAIL blocks receive readiness.
 fn clock_outcome(result: Result<f64, String>) -> CheckOutcome {
     match result {
         Ok(offset) if offset.abs() < CLOCK_SKEW_WARN_S => CheckOutcome {
@@ -200,7 +324,7 @@ fn clock_outcome(result: Result<f64, String>) -> CheckOutcome {
 pub(crate) fn check_clock() -> DoctorCheck {
     DoctorCheck {
         name: "system clock",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|_ctx| {
             clock_outcome(sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string()))
         }),
@@ -210,7 +334,7 @@ pub(crate) fn check_clock() -> DoctorCheck {
 pub(crate) fn check_audio_device() -> DoctorCheck {
     DoctorCheck {
         name: "audio input device",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|ctx| {
             let Some(cfg) = &ctx.config else {
                 return not_configured();
@@ -407,7 +531,7 @@ fn audio_level_outcome(
 pub(crate) fn check_audio_level() -> DoctorCheck {
     DoctorCheck {
         name: "audio level (2 s)",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|ctx| {
             let Some(cfg) = &ctx.config else {
                 return not_configured();
@@ -427,7 +551,7 @@ pub(crate) fn check_decoder() -> DoctorCheck {
     DoctorCheck {
         name: "ft8_lib decoder",
         // Soft by invariant: the stub build is degraded, never fatal.
-        hard: false,
+        role: CheckRole::Advisory,
         run: Box::new(|_ctx| {
             if pancetta_ft8::ft8lib_is_available() {
                 CheckOutcome {
@@ -460,86 +584,86 @@ fn hamlib_install_hint() -> &'static str {
 pub(crate) fn check_rigctld() -> DoctorCheck {
     DoctorCheck {
         name: "rig / rigctld",
-        hard: true,
+        role: CheckRole::Transmit,
         run: Box::new(|ctx| {
-            let Some(cfg) = &ctx.config else {
-                return not_configured();
-            };
-            if !cfg.rig.interface.enabled {
-                return CheckOutcome {
-                    status: CheckStatus::Pass,
-                    detail: "rig disabled — decode-only (mock rig, no PTT)".to_string(),
-                    fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
-                };
-            }
-            // Model must map to a hamlib ID or the coordinator can't spawn rigctld
-            // (hamlib.rs:252-258 warns and gives up).
-            if pancetta_lib::coordinator::ApplicationCoordinator::hamlib_model_id(&cfg.rig.model)
-                .is_none()
-            {
-                return CheckOutcome {
-                    status: CheckStatus::Fail,
-                    detail: format!(
-                        "unknown rig model '{}' — pancetta cannot spawn rigctld for it",
-                        cfg.rig.model
-                    ),
-                    fix: Some(
-                        "run `pancetta setup` and set a model listed in docs/SUPPORTED_RIGS.md \
+            rigctld_outcome(ctx, || {
+                std::process::Command::new("rigctld")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+            })
+        }),
+    }
+}
+
+fn rigctld_outcome(ctx: &DoctorCtx, on_path: impl FnOnce() -> bool) -> CheckOutcome {
+    let Some(cfg) = &ctx.config else {
+        return not_configured();
+    };
+    if !cfg.rig.interface.enabled {
+        return CheckOutcome {
+            status: CheckStatus::Warn,
+            detail: "rig disabled — decode-only (mock rig, no PTT)".to_string(),
+            fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
+        };
+    }
+    // Model must map to a hamlib ID or the coordinator can't spawn rigctld
+    // (hamlib.rs:252-258 warns and gives up).
+    if pancetta_lib::coordinator::ApplicationCoordinator::hamlib_model_id(&cfg.rig.model).is_none()
+    {
+        return CheckOutcome {
+            status: CheckStatus::Fail,
+            detail: format!(
+                "unknown rig model '{}' — pancetta cannot spawn rigctld for it",
+                cfg.rig.model
+            ),
+            fix: Some(
+                "run `pancetta setup` and set a model listed in docs/SUPPORTED_RIGS.md \
                          (e.g. IC-7300, FTdx10), or run an external rigctld and set \
                          RIGCTLD_HOST/RIGCTLD_PORT"
-                            .to_string(),
-                    ),
-                };
-            }
-            // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
-            let on_path = std::process::Command::new("rigctld")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok();
-            if !on_path {
-                return CheckOutcome {
-                    status: CheckStatus::Fail,
-                    detail: "rig enabled but `rigctld` is not on PATH".to_string(),
-                    fix: Some(hamlib_install_hint().to_string()),
-                };
-            }
-            // Same host/port conventions as the coordinator (hamlib.rs:150-155).
-            let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let port: u16 = std::env::var("RIGCTLD_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(4532);
-            use std::net::ToSocketAddrs;
-            let reachable = format!("{host}:{port}")
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| it.next())
-                .map(|a| {
-                    std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok()
-                })
-                .unwrap_or(false);
-            let detail = if reachable {
-                format!("rigctld on PATH; already listening on {host}:{port}")
-            } else {
-                format!(
-                    "rigctld on PATH; nothing on {host}:{port} yet (pancetta spawns it at startup)"
-                )
-            };
-            CheckOutcome {
-                status: CheckStatus::Pass,
-                detail,
-                fix: None,
-            }
-        }),
+                    .to_string(),
+            ),
+        };
+    }
+    // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
+    if !on_path() {
+        return CheckOutcome {
+            status: CheckStatus::Fail,
+            detail: "rig enabled but `rigctld` is not on PATH".to_string(),
+            fix: Some(hamlib_install_hint().to_string()),
+        };
+    }
+    // Same host/port conventions as the coordinator (hamlib.rs:150-155).
+    let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("RIGCTLD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4532);
+    use std::net::ToSocketAddrs;
+    let reachable = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .map(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok())
+        .unwrap_or(false);
+    let detail = if reachable {
+        format!("rigctld on PATH; already listening on {host}:{port}")
+    } else {
+        format!("rigctld on PATH; nothing on {host}:{port} yet (pancetta spawns it at startup)")
+    };
+    CheckOutcome {
+        status: CheckStatus::Pass,
+        detail,
+        fix: None,
     }
 }
 
 pub(crate) fn check_submodule() -> DoctorCheck {
     DoctorCheck {
         name: "ft8_lib submodule",
-        hard: false,
+        role: CheckRole::Advisory,
         run: Box::new(|_ctx| {
             // Only meaningful when run from a source-checkout root — probes
             // the same path pancetta-ft8/build.rs uses at compile time
@@ -574,6 +698,218 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn fixture_ctx() -> DoctorCtx {
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".into();
+        config.rig.interface.enabled = true;
+        DoctorCtx {
+            config_path: "station.toml".into(),
+            config: Some(config),
+            config_error: None,
+        }
+    }
+
+    fn fixture_report(ctx: &DoctorCtx, statuses: [CheckStatus; 7]) -> DoctorReport {
+        let checks = build_checks()
+            .into_iter()
+            .zip(statuses)
+            .map(|(check, status)| {
+                (
+                    check,
+                    CheckOutcome {
+                        status,
+                        detail: "fixture detail".into(),
+                        fix: Some("fixture fix".into()),
+                    },
+                )
+            })
+            .collect();
+        DoctorReport::from_results(ctx, checks)
+    }
+
+    fn fixture_report_with_audio(audio: CheckOutcome) -> DoctorReport {
+        let ctx = fixture_ctx();
+        let mut results: Vec<_> = build_checks()
+            .into_iter()
+            .map(|check| {
+                (
+                    check,
+                    CheckOutcome {
+                        status: CheckStatus::Pass,
+                        detail: "ok".into(),
+                        fix: None,
+                    },
+                )
+            })
+            .collect();
+        results[3].1 = audio;
+        DoctorReport::from_results(&ctx, results)
+    }
+
+    #[test]
+    fn verdict_precedence() {
+        use CheckStatus::*;
+        let ctx = fixture_ctx();
+        let cases = [
+            ([Pass; 7], Verdict::OnAirReady),
+            (
+                [Pass, Warn, Warn, Pass, Fail, Pass, Fail],
+                Verdict::OnAirReady,
+            ),
+            (
+                [Pass, Fail, Pass, Pass, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Fail, Pass, Pass, Pass, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Pass, Pass, Fail, Pass, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Pass, Pass, Pass, Fail, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Pass, Pass, Pass, Pass, Pass, Fail, Pass],
+                Verdict::DecodeOnly,
+            ),
+        ];
+        for (statuses, expected) in cases {
+            assert_eq!(fixture_report(&ctx, statuses).verdict, expected);
+        }
+        let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
+        assert_eq!(
+            fixture_report(&missing, [Fail; 7]).verdict,
+            Verdict::NotConfigured
+        );
+        let mut invalid = fixture_ctx();
+        invalid.config_error = Some("invalid".into());
+        assert_eq!(
+            fixture_report(&invalid, [Pass; 7]).verdict,
+            Verdict::NotReady
+        );
+    }
+
+    #[test]
+    fn decode_only_prerequisites() {
+        let mut ctx = fixture_ctx();
+        ctx.config.as_mut().unwrap().rig.interface.enabled = false;
+        assert_eq!(
+            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            Verdict::DecodeOnly
+        );
+        ctx.config.as_mut().unwrap().rig.interface.enabled = true;
+        ctx.config.as_mut().unwrap().station.callsign = "N0CALL".into();
+        assert_eq!(
+            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            Verdict::DecodeOnly
+        );
+    }
+
+    #[test]
+    fn rig_outcomes_keep_fixes() {
+        for (model, enabled, expected_fix) in [
+            (
+                "FTdx10",
+                false,
+                "to go on-air: `pancetta setup` and enable rig control",
+            ),
+            ("FTdx10", true, hamlib_install_hint()),
+            ("not-a-rig", true, "docs/SUPPORTED_RIGS.md"),
+        ] {
+            let mut ctx = fixture_ctx();
+            let cfg = ctx.config.as_mut().unwrap();
+            cfg.rig.model = model.into();
+            cfg.rig.interface.enabled = enabled;
+            let rig = rigctld_outcome(&ctx, || false);
+            assert!(rig.fix.as_ref().unwrap().contains(expected_fix));
+            assert_eq!(
+                rig.status,
+                if enabled {
+                    CheckStatus::Fail
+                } else {
+                    CheckStatus::Warn
+                }
+            );
+            let mut results: Vec<_> = build_checks()
+                .into_iter()
+                .map(|check| {
+                    (
+                        check,
+                        CheckOutcome {
+                            status: CheckStatus::Pass,
+                            detail: "ok".into(),
+                            fix: None,
+                        },
+                    )
+                })
+                .collect();
+            results[5].1 = rig;
+            let report = DoctorReport::from_results(&ctx, results);
+            assert_eq!(report.verdict, Verdict::DecodeOnly);
+            let json = serde_json::to_value(&report).unwrap();
+            assert!(json["checks"][5]["fix"]
+                .as_str()
+                .unwrap()
+                .contains(expected_fix));
+            assert!(report.text().contains(expected_fix));
+        }
+    }
+
+    #[test]
+    fn report_renderings_agree() {
+        use CheckStatus::*;
+        let ctx = fixture_ctx();
+        let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
+        let fixtures = [
+            (fixture_report(&missing, [Pass; 7]), "NOT CONFIGURED", 2,
+                "Result: NOT CONFIGURED. Run `pancetta setup`, then re-run `pancetta doctor`."),
+            (fixture_report(&ctx, [Pass, Pass, Pass, Pass, Pass, Fail, Pass]), "DECODE-ONLY", 1,
+                "Result: DECODE-ONLY. Receive checks passed; fix the transmit prerequisites above to go on-air."),
+            (fixture_report(&ctx, [Pass; 7]), "ON-AIR READY", 0,
+                "Result: ON-AIR READY. Doctor prerequisites passed; PTT and transmit audio are not tested."),
+            (fixture_report(&ctx, [Pass, Pass, Pass, Fail, Pass, Fail, Pass]), "NOT READY", 3,
+                "Result: NOT READY. Fix the failed receive or configuration checks above, then re-run `pancetta doctor`."),
+        ];
+        let names = [
+            "config",
+            "system clock",
+            "audio input device",
+            "audio level (2 s)",
+            "ft8_lib decoder",
+            "rig / rigctld",
+            "ft8_lib submodule",
+        ];
+        for (report, label, code, result_line) in fixtures {
+            let text = report.text();
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(report.exit_code, code);
+            assert_eq!(json["exit_code"], code);
+            assert_eq!(json["verdict"], label);
+            assert!(text.ends_with(&format!("{result_line}\n")));
+            for (index, name) in names.into_iter().enumerate() {
+                assert_eq!(json["checks"][index]["name"], name);
+                assert_eq!(json["checks"][index]["detail"], "fixture detail");
+                assert_eq!(json["checks"][index]["fix"], "fixture fix");
+                assert_eq!(
+                    json["checks"][index]["status"],
+                    status_label(report.checks[index].status)
+                );
+                assert!(text.contains(&format!(
+                    "[{}] {:<20} fixture detail\n       fix: fixture fix",
+                    status_label(report.checks[index].status),
+                    name
+                )));
+            }
+        }
+        let mut report = fixture_report(&ctx, [Pass; 7]);
+        report.checks[0].fix = None;
+        assert!(serde_json::to_value(&report).unwrap()["checks"][0]["fix"].is_null());
+    }
+
     #[test]
     fn silent_audio_names_missing_approval() {
         for state in [
@@ -586,15 +922,12 @@ mod tests {
                 outcome.detail,
                 "FLAT LINE: microphone access has not been approved on this Mac"
             );
-            let fix = outcome.fix.unwrap();
+            let fix = outcome.fix.as_ref().unwrap();
             assert!(fix.contains("System Settings > Privacy & Security > Microphone"));
             assert!(fix.contains("pancetta or the terminal app running it"));
             assert!(fix.contains("restart that app"));
             assert!(fix.contains("normally needed only once"));
-            assert_eq!(
-                doctor_exit_code(&[(check_audio_level().hard, outcome.status)]),
-                1
-            );
+            assert_eq!(fixture_report_with_audio(outcome).exit_code, 3);
         }
         let denied = audio_level_outcome(Ok((0.0, 0.0)), MicrophoneAuthorization::Denied);
         assert!(denied.fix.unwrap().starts_with("open System Settings"));
@@ -670,7 +1003,7 @@ mod tests {
         let ctx = build_ctx(Some(PathBuf::from("/nonexistent/dir/pancetta.toml")));
         let check = check_audio_level();
         assert_eq!(check.name, "audio level (2 s)");
-        assert!(check.hard);
+        assert!(check.role == CheckRole::Receive);
         let outcome = (check.run)(&ctx);
         assert_eq!(outcome.status, CheckStatus::Warn);
         assert_eq!(outcome.detail, "not configured — run the wizard");
@@ -678,15 +1011,6 @@ mod tests {
             outcome.fix.as_deref(),
             Some("run `pancetta` (first-run wizard) or `pancetta setup`")
         );
-    }
-
-    #[test]
-    fn exit_code_is_nonzero_only_for_hard_failures() {
-        use CheckStatus::*;
-        assert_eq!(doctor_exit_code(&[(true, Pass), (false, Fail)]), 0); // soft fail ok
-        assert_eq!(doctor_exit_code(&[(true, Warn), (false, Warn)]), 0); // warns ok
-        assert_eq!(doctor_exit_code(&[(true, Fail)]), 1); // hard fail
-        assert_eq!(doctor_exit_code(&[]), 0);
     }
 
     #[test]
@@ -707,7 +1031,7 @@ mod tests {
         let ctx = build_ctx(Some(path));
         let outcome = (check_config().run)(&ctx);
         assert_eq!(outcome.status, CheckStatus::Fail);
-        assert!(check_config().hard);
+        assert!(check_config().role == CheckRole::Receive);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -737,7 +1061,7 @@ mod tests {
         assert_eq!(o.detail, "offset -1.20 s — FT8 needs < ~1 s from UTC");
         assert_eq!(o.fix.as_deref(), Some(clock_fix_hint()));
         assert_eq!(clock_outcome(Ok(1.0)).status, CheckStatus::Fail);
-        assert!(check_clock().hard);
+        assert!(check_clock().role == CheckRole::Receive);
     }
 
     #[test]
