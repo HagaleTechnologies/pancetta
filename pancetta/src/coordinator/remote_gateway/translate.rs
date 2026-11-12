@@ -202,6 +202,9 @@ pub(crate) fn server_event_from_bus(msg: &MessageType) -> Option<ServerEvent> {
         MessageType::SplitStatus { tx_hz } => Some(ServerEvent::Split { tx_hz: *tx_hz }),
         MessageType::TxStatus { active } => Some(ServerEvent::TxStatus { active: *active }),
         MessageType::ModeStatus { mode } => Some(ServerEvent::Mode { mode: mode.clone() }),
+        // PAN-341: the bus policy echo (TUI banner + remote observation)
+        // becomes the existing wire `txPolicy` event — no new wire shape.
+        MessageType::TxPolicyStatus { policy } => Some(ServerEvent::TxPolicy { policy: *policy }),
         MessageType::TxPlacementUpdate { snapshot } => Some(placement_snapshot_to_event(snapshot)),
         MessageType::TxDenied { reason, .. } => Some(ServerEvent::Error {
             component: "tx".to_string(),
@@ -398,6 +401,22 @@ mod tests {
         match server_event_from_bus(&msg) {
             Some(ServerEvent::Mode { mode }) => assert_eq!(mode, "FT4"),
             other => panic!("expected Mode, got {:?}", other),
+        }
+    }
+
+    /// PAN-341: every `TxPolicyStatus` bus message maps to the existing wire
+    /// `txPolicy` event, policy carried unchanged (the wire values themselves
+    /// are pinned by pancetta-protocol's `event_roundtrips` /
+    /// `respond_only_policy_wire_value` / `tx_policy_wire_casing`).
+    #[test]
+    fn tx_policy_status_maps_to_tx_policy_event() {
+        use pancetta_core::TxPolicy;
+        for policy in [TxPolicy::Full, TxPolicy::RespondOnly, TxPolicy::Disabled] {
+            let msg = MessageType::TxPolicyStatus { policy };
+            match server_event_from_bus(&msg) {
+                Some(ServerEvent::TxPolicy { policy: p }) => assert_eq!(p, policy),
+                other => panic!("expected TxPolicy({policy:?}), got {other:?}"),
+            }
         }
     }
 
