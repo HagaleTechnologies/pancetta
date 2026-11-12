@@ -31,6 +31,70 @@ use crate::app::{App, DecodedMessageView, DevicePanel, DeviceSelectionState};
 use crate::config::Config;
 use crate::keymap::Action;
 
+// Set before the first mutation, so partial setup is owned too. The panic
+// hook uses this without locking the runner, including during unwinding.
+static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
+
+trait TerminalOps {
+    fn raw_off(&mut self) -> io::Result<()>;
+    fn leave(&mut self) -> io::Result<()>;
+    fn show(&mut self) -> io::Result<()>;
+}
+
+struct SystemTerminal;
+impl TerminalOps for SystemTerminal {
+    fn raw_off(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+    fn leave(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen)
+    }
+    fn show(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), crossterm::cursor::Show)
+    }
+}
+
+fn restore(owned: &AtomicBool, ops: &mut impl TerminalOps) -> io::Result<()> {
+    if !owned.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    // Evaluate every step before selecting the first error.
+    let raw = ops.raw_off();
+    let screen = ops.leave();
+    let cursor = ops.show();
+    raw.and(screen).and(cursor)
+}
+
+/// Restore only terminal state acquired by this process's TUI.
+/// Safe to call repeatedly, including from the process panic hook.
+pub fn restore_terminal() {
+    let _ = restore(&TERMINAL_OWNED, &mut SystemTerminal);
+}
+
+struct TerminalGuard<O: TerminalOps = SystemTerminal> {
+    ops: O,
+    owned: &'static AtomicBool,
+}
+impl TerminalGuard<SystemTerminal> {
+    fn acquire() -> Self {
+        TERMINAL_OWNED.store(true, Ordering::Release);
+        Self {
+            ops: SystemTerminal,
+            owned: &TERMINAL_OWNED,
+        }
+    }
+}
+impl<O: TerminalOps> TerminalGuard<O> {
+    fn cleanup(&mut self) -> io::Result<()> {
+        restore(self.owned, &mut self.ops)
+    }
+}
+impl<O: TerminalOps> Drop for TerminalGuard<O> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
 /// TUI runner that manages the terminal interface
 pub struct TuiRunner {
     /// Application state
@@ -44,6 +108,7 @@ pub struct TuiRunner {
     /// cleanup paths that touch `terminal` aren't exercised by the
     /// key-event unit tests, so `Option` is the smallest seam.
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+    terminal_guard: Option<TerminalGuard>,
     /// Message receiver from message bus
     message_rx: Receiver<TuiMessage>,
     /// Message sender to message bus
@@ -699,6 +764,7 @@ impl TuiRunner {
         shutdown: Arc<AtomicBool>,
         last_input_ms: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self> {
+        let terminal_guard = TerminalGuard::acquire();
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -718,6 +784,7 @@ impl TuiRunner {
             dx_need_lookup: None,
             config,
             terminal: Some(terminal),
+            terminal_guard: Some(terminal_guard),
             message_rx,
             message_tx,
             shutdown,
@@ -751,6 +818,7 @@ impl TuiRunner {
             dx_need_lookup: None,
             config,
             terminal: None,
+            terminal_guard: None,
             message_rx,
             message_tx,
             shutdown,
@@ -3418,13 +3486,9 @@ impl TuiRunner {
 
     /// Cleanup terminal on exit
     fn cleanup(&mut self) -> Result<()> {
-        let Some(terminal) = self.terminal.as_mut() else {
-            // Headless mode (unit tests) — nothing to clean up.
-            return Ok(());
-        };
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
+        if let Some(guard) = self.terminal_guard.as_mut() {
+            guard.cleanup()?;
+        }
 
         info!(
             "TUI metrics - Frames: {}, Messages: {}, Avg render: {:.2}ms, Dropped: {}",
@@ -9368,3 +9432,78 @@ mod pan_59_command_tests {
 
 #[cfg(test)]
 mod key_effects;
+
+#[cfg(test)]
+mod pan333_terminal_guard {
+    use super::*;
+    use std::sync::Mutex;
+    struct Fake {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+    impl TerminalOps for Fake {
+        fn raw_off(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("raw");
+            if self.fail {
+                Err(io::Error::other("cleanup failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn leave(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("leave");
+            Ok(())
+        }
+        fn show(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("show");
+            Ok(())
+        }
+    }
+    fn guard(fail: bool) -> (TerminalGuard<Fake>, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            TerminalGuard {
+                ops: Fake {
+                    calls: calls.clone(),
+                    fail,
+                },
+                owned: Box::leak(Box::new(AtomicBool::new(true))),
+            },
+            calls,
+        )
+    }
+    #[test]
+    fn setup_failure_preserves_cause_and_restores_every_step() {
+        let (guard, calls) = guard(true);
+        let result: Result<()> = (|| {
+            let _guard = guard;
+            anyhow::bail!("setup failure")
+        })();
+        assert_eq!(result.unwrap_err().to_string(), "setup failure");
+        assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
+    }
+    #[test]
+    fn run_error_restores_on_drop() {
+        let (guard, calls) = guard(false);
+        let result: Result<()> = (|| {
+            let _runner_guard = guard;
+            anyhow::bail!("run error")
+        })();
+        assert_eq!(result.unwrap_err().to_string(), "run error");
+        assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
+    }
+    #[test]
+    fn repeated_cleanup_and_drop_are_noops() {
+        let (mut guard, calls) = guard(false);
+        guard.cleanup().unwrap();
+        guard.cleanup().unwrap();
+        drop(guard);
+        assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
+    }
+    #[test]
+    fn cleanup_step_failure_does_not_skip_screen_or_cursor() {
+        let (mut guard, calls) = guard(true);
+        assert!(guard.cleanup().is_err());
+        assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
+    }
+}
