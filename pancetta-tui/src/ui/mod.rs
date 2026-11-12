@@ -1253,9 +1253,14 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                         .fg(app.theme.accent_color())
                         .add_modifier(Modifier::BOLD),
                 ),
+                // PAN-351: leveled transient status colors by severity.
                 None => Span::styled(
-                    app.status_message.clone(),
-                    Style::default().fg(app.theme.accent_color()),
+                    app.status_message(),
+                    Style::default().fg(match app.selected_status().map(|(_, level)| level) {
+                        Some(pancetta_core::DiagnosticLevel::Warn) => app.theme.warning_color(),
+                        Some(pancetta_core::DiagnosticLevel::Error) => app.theme.error_color(),
+                        _ => app.theme.accent_color(),
+                    }),
                 ),
             },
         },
@@ -1474,7 +1479,7 @@ pub fn render_watchlist_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Off
 
 /// Render the `o`-key TX-audio-offset modal.
 ///
-/// One integer Hz field in [300, 2700]; blank Enter = Auto; Esc = cancel.
+/// One integer Hz field in the allocator default range; blank Enter = Auto; Esc = cancel.
 /// Mirrors the `render_freq_modal` layout and sizing.
 pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
     if area.width < 10 || area.height < 4 {
@@ -1490,7 +1495,9 @@ pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Offset
     };
     f.render_widget(ratatui::widgets::Clear, modal_area);
     let body = format!(
-        " TX audio offset (Hz, 300–2700): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        " TX audio offset (Hz, {}–{}): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        crate::app::operator_tx_offset_range().0,
+        crate::app::operator_tx_offset_range().1,
         m.buffer,
     );
     let block = Block::default()
@@ -2379,7 +2386,10 @@ mod view_render_tests {
                     qso_id: None,
                     deferred: false,
                 });
-                app.status_message = "Reply step: RR73".into();
+                app.set_local_status(
+                    "Reply step: RR73".into(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
             }
             for view in ALL_VIEWS {
                 app.active_view = view;
@@ -3606,7 +3616,10 @@ mod view_render_tests {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
-        app.status_message = "Pancetta TUI Ready".to_string();
+        app.set_local_status(
+            "Pancetta TUI Ready".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+        );
         app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
             callsign: "K1ABC".to_string(),
             qso_uuid: "u-1".to_string(),
@@ -4213,6 +4226,101 @@ mod view_render_tests {
         }
     }
 
+    #[tokio::test]
+    async fn operator_offset_modal_uses_allocator_default_range() {
+        let range = pancetta_qso::frequency::FrequencyAllocatorConfig::default().range;
+        assert_eq!(crate::app::TX_OFFSET_MIN_HZ as f64, range.0);
+        assert_eq!(crate::app::TX_OFFSET_MAX_HZ as f64, range.1);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            render_offset_modal(
+                f,
+                f.area(),
+                &crate::app::OffsetModalState {
+                    visible: true,
+                    buffer: String::new(),
+                },
+            )
+        })
+        .unwrap();
+        assert!(buffer_contains(term.backend().buffer(), "200–2800"));
+    }
+
+    #[tokio::test]
+    async fn numeric_snr_cells_share_theme_scale_across_panels() {
+        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+            let mut app = default_app().await;
+            app.theme = theme;
+            app.active_panel = ActivePanel::QsoStatus;
+            for snr in [-15, -11, -10, -1, 0, 5, 10] {
+                let mut station = fixture_dx_station("JA1ABC");
+                station.snr = snr;
+                app.dx_stations.insert("JA1ABC".into(), station);
+                let mut message = fixture_caller(&app, "JA1ABC");
+                message.snr = snr;
+                message.is_directed_at_us = false;
+                app.decoded_messages.clear();
+                app.decoded_messages.push_back(message);
+                // The selected single-QSO detail uses the same measured report.
+                app.qso_statuses = vec![crate::app::QsoStatus {
+                    active: true,
+                    snr_tx: Some(snr),
+                    snr_rx: Some(snr),
+                    ..Default::default()
+                }];
+                let expected = get_snr_color(snr, &theme);
+                for panel in 0..3 {
+                    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+                    term.draw(|f| match panel {
+                        0 => dx_hunter::render_dx_hunter(f, f.area(), &app).unwrap(),
+                        1 => band_activity::render_band_activity(f, f.area(), &app).unwrap(),
+                        _ => qso_status::render_qso_status(f, f.area(), &app).unwrap(),
+                    })
+                    .unwrap();
+                    let buf = term.backend().buffer();
+                    let needle = if panel == 2 {
+                        format!("{snr:+} dB")
+                    } else {
+                        format!("{snr:+}")
+                    };
+                    let mut found = false;
+                    for y in 1..buf.area.height {
+                        let row = row_text(buf, y);
+                        if let Some(byte) = row.find(&needle) {
+                            let x = row[..byte].chars().count() as u16;
+                            assert_eq!(
+                                buf[(x, y)].fg,
+                                expected,
+                                "panel {panel}, SNR {snr}, theme {theme:?}"
+                            );
+                            found = true;
+                        }
+                    }
+                    assert!(found, "missing SNR {needle} in panel {panel}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qso_panels_render_through_production_draw_at_supported_sizes() {
+        let mut app = default_app().await;
+        app.active_view = crate::view::ActiveView::Operate;
+        for (w, h) in [(80, 24), (100, 30), (120, 40)] {
+            let idle = render_app(&app, w, h);
+            assert!(!buffer_contains(&idle, "-50 dB"));
+            app.qso_statuses = vec![crate::app::QsoStatus {
+                active: true,
+                call_sign: Some("JA1ABC".into()),
+                snr_tx: Some(-12),
+                ..Default::default()
+            }];
+            let active = render_app(&app, w, h);
+            assert!(buffer_contains(&active, "JA1ABC"));
+            app.qso_statuses.clear();
+        }
+    }
+
     const SUPPORTED_SIZES: [(u16, u16); 3] = [(80, 24), (100, 30), (132, 40)];
 
     #[tokio::test]
@@ -4416,6 +4524,80 @@ mod view_render_tests {
 mod hit_test_tests {
     use super::*;
     use crate::view::ActiveView;
+
+    #[tokio::test]
+    async fn pan351_status_render_states() {
+        use pancetta_core::DiagnosticLevel::{Error, Info, Warn};
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::time::{Duration, Instant};
+        for (width, height) in [(80, 24), (132, 40)] {
+            for view in [
+                ActiveView::Operate,
+                ActiveView::Hunt,
+                ActiveView::Run,
+                ActiveView::Monitor,
+            ] {
+                let mut app = App::new(crate::Config::default(), None).await.unwrap();
+                app.active_view = view;
+                for zoomed in [false, true] {
+                    app.zoomed = zoomed;
+                    app.compose_mode = false;
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    for (level, color) in [
+                        (Info, app.theme.accent_color()),
+                        (Warn, app.theme.warning_color()),
+                        (Error, app.theme.error_color()),
+                    ] {
+                        app.clear_status_for_test();
+                        app.status_test_push("TOKEN", level, Instant::now());
+                        terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let row = (0..height).find(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, *y)].symbol())
+                                .collect::<String>()
+                                .contains("TOKEN")
+                        });
+                        if row.is_none() {
+                            assert_eq!(width, 80, "status text must fit at 132 columns");
+                            continue;
+                        }
+                        let row = row.unwrap();
+                        let text = (0..width)
+                            .map(|x| buffer[(x, row)].symbol())
+                            .collect::<String>();
+                        let x = text.find("TOKEN").unwrap() as u16;
+                        assert_eq!(buffer[(x, row)].fg, color);
+                    }
+                    app.add_coded_error_message("held".into(), Some(351));
+                    app.set_local_status("ECHO".into(), Info);
+                    assert_eq!(app.status_message(), "ECHO");
+                    app.status_test_prune(Instant::now() + Duration::from_secs(5));
+                    assert_eq!(app.status_message(), "Error: held");
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let before = terminal.backend().buffer().clone();
+                    app.status_test_prune(Instant::now() + Duration::from_secs(30));
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let after = terminal.backend().buffer();
+                    // Readiness occupies the second row and remains byte-identical.
+                    for x in 0..width {
+                        assert_eq!(before[(x, 1)], after[(x, 1)]);
+                    }
+                    assert!(app.status_message().is_empty());
+                    app.enter_compose_mode();
+                    app.tx_input_buffer = "CQ TEST".into();
+                    terminal.draw(|f| draw(f, &app).unwrap()).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    if width == 132 {
+                        assert!((0..height).any(|y| (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            .contains("CQ TEST")));
+                    }
+                }
+            }
+        }
+    }
 
     fn rects_overlap(a: Rect, b: Rect) -> bool {
         a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height

@@ -220,6 +220,15 @@ fn default_qso_stall_switch_after() -> u32 {
     4
 }
 
+/// Local award-need policy. Changes apply after restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeededMeans {
+    #[default]
+    Unworked,
+    Unconfirmed,
+}
+
 /// Top-level autonomous operator configuration.
 ///
 /// Corresponds to the `[autonomous]` section in the TOML config file.
@@ -228,6 +237,8 @@ fn default_qso_stall_switch_after() -> u32 {
 pub struct AutonomousConfig {
     /// Enable autonomous mode.
     pub enabled: bool,
+    /// Local entity need: never worked, or lacking an accepted QSL.
+    pub needed_means: NeededMeans,
     /// Allow new direct-call replies without recent console activity.
     /// Applies independently of `enabled`; requires restart to change.
     pub unattended_policy: UnattendedPolicy,
@@ -284,6 +295,7 @@ impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            needed_means: NeededMeans::Unworked,
             unattended_policy: UnattendedPolicy::Off,
             slot_parity: SlotParitySetting::Auto,
             cq_after_idle_cycles: 10,
@@ -354,6 +366,7 @@ impl ConfigSection for AutonomousConfig {
 
     fn merge_with(&mut self, other: Self) {
         self.enabled = other.enabled;
+        self.needed_means = other.needed_means;
         self.unattended_policy = other.unattended_policy;
         self.slot_parity = other.slot_parity;
         self.cq_after_idle_cycles = other.cq_after_idle_cycles;
@@ -379,6 +392,34 @@ impl ConfigSection for AutonomousConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needed_means_defaults_roundtrips_and_merges() {
+        let mut config: AutonomousConfig = toml::from_str("").unwrap();
+        assert_eq!(config.needed_means, NeededMeans::Unworked);
+        for (value, expected) in [
+            ("unworked", NeededMeans::Unworked),
+            ("unconfirmed", NeededMeans::Unconfirmed),
+        ] {
+            let parsed: AutonomousConfig =
+                toml::from_str(&format!("needed_means = \"{value}\"")).unwrap();
+            assert_eq!(parsed.needed_means, expected);
+            let encoded = toml::to_string(&parsed).unwrap();
+            assert_eq!(
+                toml::from_str::<AutonomousConfig>(&encoded)
+                    .unwrap()
+                    .needed_means,
+                expected
+            );
+            config.merge_with(parsed);
+            assert_eq!(config.needed_means, expected);
+        }
+    }
+
+    #[test]
+    fn needed_means_rejects_unknown_value() {
+        assert!(toml::from_str::<AutonomousConfig>("needed_means = \"anything\"").is_err());
+    }
 
     #[test]
     fn pan120_omitted_unattended_policy_defaults_off() {

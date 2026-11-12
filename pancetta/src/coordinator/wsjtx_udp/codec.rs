@@ -527,6 +527,52 @@ mod golden {
             .collect()
     }
 
+    // Constructed from protocol-notes field order and the WSJT-X user guide
+    // decoded-lines table (+ = FT4). These are not captured packets.
+    #[test]
+    fn ft4_decode_encodes_byte_exact() {
+        let out = OutMsg::Decode {
+            new: true,
+            time_ms: 45_296_789,
+            snr: -10,
+            delta_time: 0.2,
+            delta_freq: 1302,
+            mode: "+".into(),
+            message: "CQ DL1ABC JO62".into(),
+            low_confidence: false,
+            off_air: false,
+        };
+        assert_eq!(out.encode("WSJT-X - pancetta"), hex("adbccbda00000002000000020000001157534a542d58202d2070616e63657474610102b32c95fffffff63fc999999999999a00000516000000012b0000000e435120444c31414243204a4f36320000"));
+    }
+
+    #[test]
+    fn active_qso_status_encodes_byte_exact() {
+        let out = OutMsg::Status {
+            dial_frequency: 14_074_000,
+            mode: "FT8".into(),
+            dx_call: "DL1ABC".into(),
+            report: "-10".into(),
+            tx_mode: "FT8".into(),
+            tx_enabled: true,
+            transmitting: false,
+            decoding: false,
+            rx_df: 1302,
+            tx_df: 1500,
+            de_call: "K5ARH".into(),
+            de_grid: "EM12".into(),
+            dx_grid: "JO62".into(),
+            tx_watchdog: false,
+            sub_mode: String::new(),
+            fast_mode: false,
+            special_operation_mode: 0,
+            frequency_tolerance: u32::MAX,
+            tr_period: 15,
+            configuration_name: "Default".into(),
+            tx_message: "DL1ABC K5ARH R-10".into(),
+        };
+        assert_eq!(out.encode("WSJT-X - pancetta"), hex("adbccbda00000002000000010000001157534a542d58202d2070616e63657474610000000000d6c0900000000346543800000006444c31414243000000032d31300000000346543801000000000516000005dc000000054b3541524800000004454d3132000000044a4f363200000000000000ffffffff0000000f0000000744656661756c7400000011444c31414243204b3541524820522d3130"));
+    }
+
     #[test]
     fn heartbeat_round_trips_byte_exact() {
         let bytes = hex(HEARTBEAT);

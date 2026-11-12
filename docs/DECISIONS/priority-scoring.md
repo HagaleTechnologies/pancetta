@@ -368,3 +368,38 @@ the implementing session); H6 confirmation import, with a
 `record_confirmation` hook if it runs live; whether a new mode or a
 worked-unconfirmed entity should raise rank; reloading the local log after
 `pancetta import` without a restart.
+
+## Confirmation-based need (PAN-348)
+
+`[autonomous] needed_means` defaults to `unworked`, preserving cqdx-first
+precedence. With `unconfirmed`, a successfully seeded local log takes precedence
+for local entity and band need. Global need checks confirmations on all bands;
+band need checks the evaluated band, across modes. ATNO always checks worked
+history. Home entities and unknown bands retain their existing exclusions.
+The cqdx-only remote display helper keeps its existing meaning.
+
+Seeds remain additive and availability never resets after a successful read.
+Live completion adds worked history without inventing a confirmation. The LoTW
+file command changes only the durable ADIF file under its shared lock and leaves
+a rebuild request. Restart rebuilds the index before seeding the cache. A running
+station does not pick up imported confirmations. No new remote fields or cqdx
+API changes are involved.
+
+## PAN-346: Shared DXCC identity
+
+Needed and ATNO lists use ADIF entity IDs from the offline core registry.
+Known IDs are authoritative even when an API prefix disagrees. Unknown or
+out-of-range IDs retain the uppercase-prefix fallback; an empty loaded list
+still means nothing needed, and refresh failures retain the last answer.
+
+The resolver checks full normalized exact calls, then KG4 length rules, then
+indexed prefixes and the US safety net. KG4 plus two ASCII letters is
+Guantanamo; other nonempty suffixes are USA unless a full exact rule wins.
+The shipped prefix table remains unchanged; separate pinned data supplies
+exact calls and explicit ADIF identities.
+
+Local worked, confirmed, band and mode history compare canonical parent
+identities. This joins Turkey and Italy subdivisions without renaming their
+display labels. Home and rarity keys use the same identity. The per-frame
+need lookup uses its carried entity, never resolves the callsign, and the
+remote display answer remains cqdx-only.

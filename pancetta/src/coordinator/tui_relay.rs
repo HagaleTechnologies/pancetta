@@ -215,6 +215,132 @@ fn display_rank(
     )
 }
 
+/// PAN-341: the context the TX-policy command handlers (`g` cycle, Shift+Q
+/// emergency stop) need. Extracted from the command-loop match arms into
+/// free functions so tests drive the exact production path (atomic stores,
+/// QSO sends, TUI echoes, gateway relay) without a terminal or a full
+/// coordinator — there is no command-loop test harness (see the note at the
+/// loop's spawn).
+pub(crate) struct TxPolicyCmdCtx {
+    /// Bus for the QSO `StopCq`/`CancelAllQsos` sends and the additive
+    /// `relay_to_gateway` policy relay.
+    pub(crate) bus: crate::message_bus::MessageBus,
+    /// `display_feed_enabled` gate read by `relay_to_gateway` (PAN-341).
+    pub(crate) display_feed_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Canonical policy atomic (`Coordinator.tx_policy`).
+    pub(crate) tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// `Coordinator.abort_current_tx` — set when a cycle lands on Disabled.
+    pub(crate) abort_current_tx: Arc<std::sync::atomic::AtomicBool>,
+    /// Shift+Q's shared halt (abort + autonomous-off + Disabled).
+    pub(crate) tx_halt: super::tx_halt::TxHaltHandles,
+    /// Manual-CQ bookkeeping flag, cleared on every halt-to-Disabled path.
+    pub(crate) cq_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Tune-tone deadline, cleared on every halt-to-Disabled path.
+    pub(crate) tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    /// Best-effort TUI echo channel (bounded; headless sends are dropped).
+    pub(crate) tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+/// `TuiCommand::CycleTxPolicy` (`g`): cycle Full → RespondOnly → Disabled →
+/// Full, aborting the in-flight transmission and stopping the manual CQ when
+/// the result is Disabled, then echo the new state to the TUI banner and —
+/// PAN-341 — relay it to already-connected remote-gateway clients (same
+/// additive dual-send pattern as ModeStatus, dispensa Q-0027).
+pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
+    let prev = pancetta_core::TxPolicy::from_u8(ctx.tx_policy.load(Ordering::Acquire));
+    let next = prev.cycle();
+    ctx.tx_policy.store(next.as_u8(), Ordering::Release);
+    warn!(
+        target: "tx.policy",
+        "Operator cycled global TX policy: {} -> {}",
+        prev.label(),
+        next.label()
+    );
+    // Cycling to Disabled must abort the CURRENT transmission, not just gate
+    // the next one. Set the same abort flag Shift+Q uses so the in-flight TX
+    // (up to 12.64s of FT8, or an active tune) stops within ~50ms via the
+    // worker's interruptible_sleep. Also cancel the manual CQ QSO so it stops
+    // keep-calling (clearing the bookkeeping flag alone no longer stops TX —
+    // the QSO owns it now).
+    if next == pancetta_core::TxPolicy::Disabled {
+        ctx.abort_current_tx.store(true, Ordering::Release);
+        ctx.cq_active.store(false, Ordering::Relaxed);
+        *ctx.tune_until.write().await = None;
+        let msg = ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
+            Instant::now(),
+        );
+        if let Err(e) = ctx.bus.send_message(msg).await {
+            warn!("Failed to cancel CQ QSO on TX disable: {}", e);
+        }
+    }
+    // PAN-341: publish the resulting policy to service peers — including the
+    // Disabled → Full recovery step after a halt. No-op when nobody needs the
+    // display feed.
+    super::remote_gateway::relay_to_gateway(
+        &ctx.bus,
+        &ctx.display_feed_enabled,
+        ComponentId::Tui,
+        MessageType::TxPolicyStatus { policy: next },
+    )
+    .await;
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy: next });
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+            component: "TX".to_string(),
+            status: format!("TX policy: {}", next.label()),
+            level: pancetta_core::DiagnosticLevel::Info,
+        });
+}
+
+/// `TuiCommand::OperatorEmergencyStop` (Shift+Q): halt every TX path the
+/// station can drive via the shared [`super::tx_halt::TxHaltHandles::halt`]
+/// (synchronous and bus-free — nothing may suspend between the halt decision
+/// and the policy store every PTT-on gate reads), clear local CQ/tune state,
+/// echo Disabled to the TUI banner, and — PAN-341 — announce the Disabled
+/// policy to remote peers BEFORE awaiting the durable QSO cancellation.
+pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
+    warn!(
+        target: "operator.override",
+        "Operator emergency stop (Shift+Q): aborting TX, disabling autonomous, stopping CQ + tune"
+    );
+    ctx.tx_halt.halt();
+    ctx.cq_active.store(false, Ordering::Relaxed);
+    *ctx.tune_until.write().await = None;
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
+            policy: pancetta_core::TxPolicy::Disabled,
+        });
+    // PAN-341: peers learn the halt before the (awaiting) durable QSO
+    // cancellation, after the safety gate is closed and local state cleared.
+    super::remote_gateway::relay_to_gateway(
+        &ctx.bus,
+        &ctx.display_feed_enabled,
+        ComponentId::Tui,
+        MessageType::TxPolicyStatus {
+            policy: pancetta_core::TxPolicy::Disabled,
+        },
+    )
+    .await;
+    // Clear the TX *source*, not just mute it: cancel every active QSO so
+    // manual keep-calling (and any duplicate QSO objects) stops re-emitting
+    // each slot. Without this, returning the policy to Full would resume the
+    // runaway. This is the real fix for "h + k didn't stop it; only restart
+    // did." Durable (PAN-251): a full QSO channel parks the cancel instead of
+    // dropping it.
+    if super::tx_halt::cancel_all_qsos(&ctx.bus, ComponentId::Tui).await
+        == crate::message_bus::DurableDelivery::Dropped
+    {
+        warn!("Emergency stop: failed to send CancelAllQsos");
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -403,7 +529,7 @@ impl super::ApplicationCoordinator {
                 if let Ok(mut pending) = relay_pending_gain_save.lock() {
                     if pending.is_some_and(|(_, since, _)| since.elapsed() >= Duration::from_secs(10)) {
                         pending.take();
-                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into()));
+                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
                     }
                 }
                 if !ft8_disconnected {
@@ -579,6 +705,7 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "Autonomous".to_string(),
                                     status: status.state.clone(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -742,7 +869,7 @@ impl super::ApplicationCoordinator {
                         ) => {
                             if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
                                 if relay_gain_frequency.load(Ordering::Acquire) != frequency {
-                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into()));
+                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
                                 } else if let Some(band) = pancetta_core::Band::from_frequency(frequency) {
                                     let _ = relay_gain_mutation_tx.send((band.to_string(), pancetta_config::rig::ReceiveGainPreset { preamp_db, attenuator_db: att_db }));
                                 }
@@ -752,7 +879,7 @@ impl super::ApplicationCoordinator {
                             crate::message_bus::RigControlMessage::ReceiveGainError { frequency, request_id, error },
                         ) => {
                             if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
-                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error)));
+                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error), pancetta_core::DiagnosticLevel::Warn));
                             }
                         }
                         MessageType::RigControl(
@@ -831,17 +958,14 @@ impl super::ApplicationCoordinator {
                                 },
                             ));
                         }
-                        MessageType::StatusUpdate(text) => {
+                        MessageType::StatusUpdate { text, level } => {
                             // Free-form status emitted by other components (e.g. QSO
                             // component reports respond_to_cq success/failure here so
                             // Space-to-call surfaces "Calling X — TX queued" or the
                             // actual rejection reason instead of just an optimistic
                             // "Calling X..." that hides silent failures.
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: format!("{}", bus_msg.source),
-                                    status: text,
-                                },
+                                relayed_status(format!("{}", bus_msg.source), text, level),
                             );
                         }
                         MessageType::Error {
@@ -1098,19 +1222,23 @@ impl super::ApplicationCoordinator {
                     match edges.rf_no_decode {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "dsp".to_string(),
+                                    code: RF_NO_DECODE_STATUS_CODE,
                                     status: "⚠ RF present but no decodes — check mode/clock?"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
                                 },
                             );
                         }
                         Some(false) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "dsp".to_string(),
+                                    code: RF_NO_DECODE_STATUS_CODE,
                                     status: "Decodes resumed — RF/no-decode warning cleared"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -1123,20 +1251,24 @@ impl super::ApplicationCoordinator {
                     match edges.silent_input {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "audio".to_string(),
+                                    code: SILENT_INPUT_STATUS_CODE,
                                     status: "⚠ INPUT SILENT (RMS≈0) — check Sound input device, \
                                              mic permission, and that nothing else grabbed the CODEC"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Warn,
                                 },
                             );
                         }
                         Some(false) => {
                             let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
                                     component: "audio".to_string(),
+                                    code: SILENT_INPUT_STATUS_CODE,
                                     status: "Audio input restored — silence warning cleared"
                                         .to_string(),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -1393,6 +1525,19 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        // PAN-341: shared context for the extracted TX-policy command
+        // handlers (`g` cycle, Shift+Q), so the match arms and the unit
+        // tests drive the exact same production path.
+        let cmd_tx_policy_ctx = TxPolicyCmdCtx {
+            bus: cmd_message_bus.clone(),
+            display_feed_enabled: cmd_display_feed_enabled.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            abort_current_tx: cmd_abort_current_tx.clone(),
+            tx_halt: cmd_tx_halt.clone(),
+            cq_active: cmd_cq_active.clone(),
+            tune_until: cmd_tune_until.clone(),
+            tui_msg_tx: cmd_tui_msg_tx.clone(),
+        };
         // Fox-mode flag (shared with the QSO component). The ToggleFoxMode
         // relay arm reads the current value and sends `SetFoxMode { on: !current }`
         // so a single keypress always flips the authoritative state, even if the
@@ -1518,6 +1663,8 @@ impl super::ApplicationCoordinator {
                 let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                     component: "Session".to_string(),
                     status: status.clone(),
+
+                    level: pancetta_core::DiagnosticLevel::Info,
                 });
             }
             if let Some(message) = &cmd_session_report.error {
@@ -1643,6 +1790,8 @@ impl super::ApplicationCoordinator {
                                             "Refusing to call our own station ({})",
                                             callsign
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1662,6 +1811,8 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1741,6 +1892,8 @@ impl super::ApplicationCoordinator {
                                             "Refusing Hound on our own station ({})",
                                             callsign
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1761,6 +1914,8 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1776,6 +1931,7 @@ impl super::ApplicationCoordinator {
                                     // the Fox, not where we call it, so the
                                     // status claims no call offset here.
                                     status: format!("Hound: engaging {} as Fox...", callsign),
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                             let msg = ComponentMessage::new(
@@ -1935,6 +2091,8 @@ impl super::ApplicationCoordinator {
                                             "Can't start CQ — TX policy is {} (press g for Full)",
                                             policy.label()
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                                 continue;
@@ -1991,108 +2149,29 @@ impl super::ApplicationCoordinator {
                         pancetta_tui::tui_runner::TuiCommand::OperatorEmergencyStop => {
                             // hb-161: Phase 5 emergency stop. Operator
                             // pressed Shift+Q. Halt every TX path the
-                            // station can drive:
-                            //   1. `tx_halt::halt()` (PAN-251, shared with
-                            //      the SWR trip), with no await before the
-                            //      policy store: abort the in-flight TX
-                            //      (PTT-off in ~50ms via the existing F8
-                            //      path), disable autonomous mode at
-                            //      runtime (the autonomous loop reads this
-                            //      flag every slot before submitting TX),
-                            //      and set the global policy to Disabled
-                            //      (RX-only).
-                            //   2. Stop the repeating-CQ loop.
-                            //   3. Cancel any active tune tone.
-                            //   4. Echo Disabled to the TUI banner.
-                            //   5. Cancel every active QSO.
-                            // Logged at WARN with target=operator.override
-                            // so it stands out in the journal. The
-                            // operator re-enables autonomous explicitly:
-                            // the TUI `a` key sends ToggleAutonomous,
-                            // which re-sets this same runtime gate
-                            // (Batch 93), and restores TX with the policy
-                            // cycle key (`g`). We don't auto-restore.
-                            warn!(
-                                target: "operator.override",
-                                "Operator emergency stop (Shift+Q): aborting TX, disabling \
-                                 autonomous, stopping CQ + tune"
-                            );
-                            cmd_tx_halt.halt();
-                            cmd_cq_active.store(false, Ordering::Relaxed);
-                            *cmd_tune_until.write().await = None;
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
-                                    policy: pancetta_core::TxPolicy::Disabled,
-                                },
-                            );
-                            // Clear the TX *source*, not just mute it: cancel
-                            // every active QSO so manual keep-calling (and any
-                            // duplicate QSO objects) stops re-emitting each slot.
-                            // Without this, returning the policy to Full would
-                            // resume the runaway. This is the real fix for
-                            // "h + k didn't stop it; only restart did."
-                            // Durable (PAN-251): a full QSO channel parks the
-                            // cancel instead of dropping it.
-                            if super::tx_halt::cancel_all_qsos(&cmd_message_bus, ComponentId::Tui)
-                                .await
-                                == crate::message_bus::DurableDelivery::Dropped
-                            {
-                                warn!("Emergency stop: failed to send CancelAllQsos");
-                            }
+                            // station can drive, then cancel every active
+                            // QSO; see `emergency_stop` for the full
+                            // rationale. Logged at WARN with
+                            // target=operator.override so it stands out in
+                            // the journal. The operator re-enables
+                            // autonomous explicitly: the TUI `a` key sends
+                            // ToggleAutonomous, which re-sets this same
+                            // runtime gate (Batch 93), and restores TX with
+                            // the policy cycle key (`g`). We don't
+                            // auto-restore.
+                            emergency_stop(&cmd_tx_policy_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {
                             // Operator pressed `g`: cycle the global TX policy
-                            // Full → RespondOnly → Disabled → Full. Update the
-                            // shared atomic and echo the new state to the TUI
-                            // banner (mirrors ToggleAutonomous's echo pattern).
-                            let prev = pancetta_core::TxPolicy::from_u8(
-                                cmd_tx_policy.load(Ordering::Acquire),
-                            );
-                            let next = prev.cycle();
-                            cmd_tx_policy.store(next.as_u8(), Ordering::Release);
-                            warn!(
-                                target: "tx.policy",
-                                "Operator cycled global TX policy: {} -> {}",
-                                prev.label(),
-                                next.label()
-                            );
-                            // Cycling to Disabled must abort the CURRENT
-                            // transmission, not just gate the next one. Set the
-                            // same abort flag Shift+Q uses so the in-flight TX
-                            // (up to 12.64s of FT8, or an active tune) stops
-                            // within ~50ms via the worker's interruptible_sleep.
-                            // Also cancel the manual CQ QSO so it stops
-                            // keep-calling (clearing the bookkeeping flag alone
-                            // no longer stops TX — the QSO owns it now).
-                            if next == pancetta_core::TxPolicy::Disabled {
-                                cmd_abort_current_tx.store(true, Ordering::Release);
-                                cmd_cq_active.store(false, Ordering::Relaxed);
-                                *cmd_tune_until.write().await = None;
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                    warn!("Failed to cancel CQ QSO on TX disable: {}", e);
-                                }
-                            }
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
-                                    policy: next,
-                                },
-                            );
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "TX".to_string(),
-                                    status: format!("TX policy: {}", next.label()),
-                                },
-                            );
+                            // Full → RespondOnly → Disabled → Full, echoing the
+                            // new state to the TUI banner and — PAN-341 — to
+                            // connected remote peers. See `cycle_tx_policy`.
+                            cycle_tx_policy(&cmd_tx_policy_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleOperatingMode => {
                             // Operator pressed Shift+M: cycle the station-wide
-                            // operating mode FT8 → FT4 → FT2 → FT8. Unlike
+                            // operating mode FT8 → FT4 → FT8 (also FT2 with
+                            // the `ft2` feature). Unlike
                             // CycleTxPolicy this can be REFUSED (a QSO is
                             // active) — no optimistic local flip; the TUI
                             // waits for either a ModeUpdate (success) or a
@@ -2100,7 +2179,7 @@ impl super::ApplicationCoordinator {
                             let current = pancetta_config::OperatingMode::from_u8(
                                 cmd_active_protocol_mode.load(Ordering::Relaxed),
                             );
-                            let next = current.cycle();
+                            let next = super::next_operating_mode(current);
                             // PAN-287: a parked spot call's dial was resolved
                             // for the old mode; a successful switch cancels it.
                             let switched =
@@ -2161,25 +2240,6 @@ impl super::ApplicationCoordinator {
                                             mode: mode_str,
                                         },
                                     );
-                                    // FT2 is feature-gated in pancetta-ft8 behind `ft2`
-                                    // (see `protocol_from_mode`). On a build without it,
-                                    // switching TO "FT2" silently runs FT8 protocol
-                                    // params/timing under the FT2 label — ADIF logs
-                                    // MODE:FT2 while actually on-air FT8. Warn the
-                                    // operator rather than switch silently; no-op on an
-                                    // `ft2`-enabled build.
-                                    #[cfg(not(feature = "ft2"))]
-                                    if next == pancetta_config::OperatingMode::Ft2 {
-                                        let _ = cmd_tui_msg_tx.send(
-                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                                component: "Mode".to_string(),
-                                                status: "FT2 protocol is not yet implemented \
-                                                    on this build — running FT8 timing under \
-                                                    the FT2 label"
-                                                    .to_string(),
-                                            },
-                                        );
-                                    }
                                     // Last, so no status line above overwrites it.
                                     if let Some(call) = cancelled_spot_call {
                                         super::spot_call::report_mode_change_cancel(
@@ -2195,6 +2255,8 @@ impl super::ApplicationCoordinator {
                                                 "can't switch mode: {} QSO(s) active",
                                                 n
                                             ),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2204,6 +2266,8 @@ impl super::ApplicationCoordinator {
                                             component: "Mode".to_string(),
                                             status: "can't switch mode: QSO state unavailable"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2212,6 +2276,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "Mode".to_string(),
                                             status: "mode switch busy, try again".to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2335,6 +2401,8 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "TX".to_string(),
                                     status: format!("TX freq: {}", next.label()),
+
+                                    level: pancetta_core::DiagnosticLevel::Info,
                                 },
                             );
                         }
@@ -2378,6 +2446,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
                                             status: format!("TX offset held @ {} Hz", hz),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2413,6 +2483,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
                                             status: "TX offset auto (Tx=Rx)".to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2518,6 +2590,8 @@ impl super::ApplicationCoordinator {
                                             component: "TX".to_string(),
                                             status: "Nudging active QSO to a new offset"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2534,6 +2608,8 @@ impl super::ApplicationCoordinator {
                                                 "CQ-offset nudge armed — takes effect only if the \
                                                       next autonomous cycle is CQ-hunting"
                                                     .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Info,
                                         },
                                     );
                                 }
@@ -2556,6 +2632,8 @@ impl super::ApplicationCoordinator {
                                             status: "TX offset is Hold — press `f` for Auto to \
                                                      enable nudging"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2576,6 +2654,8 @@ impl super::ApplicationCoordinator {
                                             status: "Nudge ignored — the active QSO's current \
                                                      state can't retransmit a frame"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 }
@@ -2643,6 +2723,8 @@ impl super::ApplicationCoordinator {
                                             status: "Can't tune — TX is DISABLED (press g \
                                                      to re-enable)"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                     continue;
@@ -2687,6 +2769,8 @@ impl super::ApplicationCoordinator {
                                         status: "Autonomous disabled in config — restart with \
                                                  autonomous.enabled=true"
                                             .to_string(),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -2714,6 +2798,8 @@ impl super::ApplicationCoordinator {
                                             "Autonomous TX disabled (runtime gate closed)"
                                                 .to_string()
                                         },
+
+                                        level: pancetta_core::DiagnosticLevel::Info,
                                     },
                                 );
                             }
@@ -2787,6 +2873,8 @@ impl super::ApplicationCoordinator {
                                             pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                                 component: "TX".to_string(),
                                                 status,
+
+                                                level: pancetta_core::DiagnosticLevel::Warn,
                                             },
                                         );
                                         continue;
@@ -2862,6 +2950,8 @@ impl super::ApplicationCoordinator {
                                         status: "Device choice applied live, but not persisted \
                                                  (config file isn't TOML)"
                                             .to_string(),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -2904,7 +2994,8 @@ impl super::ApplicationCoordinator {
                                                             "Failed to save device choice: {}",
                                                             e
                                                         ),
-                                                    },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                                 );
                                             }
                                             Err(_) => {
@@ -2942,6 +3033,7 @@ impl super::ApplicationCoordinator {
                                         force: true,
                                         respond: resp_tx,
                                     };
+                                    let mut status_level = pancetta_core::DiagnosticLevel::Warn;
                                     let status = if reopen_tx.send(req).is_err() {
                                         warn!(
                                             "Audio reopen channel closed; device not switched live"
@@ -2957,6 +3049,7 @@ impl super::ApplicationCoordinator {
                                             .await
                                         {
                                             Ok(Ok(Ok(()))) => {
+                                                status_level = pancetta_core::DiagnosticLevel::Info;
                                                 info!(
                                                     "Live audio device switch succeeded: {}",
                                                     picked
@@ -2990,6 +3083,8 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "audio".to_string(),
                                             status,
+
+                                            level: status_level,
                                         },
                                     );
                                 }
@@ -3002,7 +3097,8 @@ impl super::ApplicationCoordinator {
                                                 "Device {} saved — restart to apply (no live audio in this mode)",
                                                 picked
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Info,
+                                },
                                     );
                                 }
                             }
@@ -3041,6 +3137,8 @@ impl super::ApplicationCoordinator {
                                         status: format!(
                                             "Unknown rig model '{model}' — not applied"
                                         ),
+
+                                        level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
@@ -3087,6 +3185,8 @@ impl super::ApplicationCoordinator {
                                             status: "Rig applied live, but not persisted (config \
                                                      file isn't TOML)"
                                                 .to_string(),
+
+                                            level: pancetta_core::DiagnosticLevel::Warn,
                                         },
                                     );
                                 } else {
@@ -3172,6 +3272,8 @@ impl super::ApplicationCoordinator {
                                             // retries) plus margin, so a slow-
                                             // but-genuinely-in-progress reconnect
                                             // isn't misreported as timed out.
+                                            let mut status_level =
+                                                pancetta_core::DiagnosticLevel::Warn;
                                             let status = match tokio::time::timeout(
                                                 Duration::from_secs(20),
                                                 resp_rx,
@@ -3179,6 +3281,8 @@ impl super::ApplicationCoordinator {
                                             .await
                                             {
                                                 Ok(Ok(Ok(()))) => {
+                                                    status_level =
+                                                        pancetta_core::DiagnosticLevel::Info;
                                                     info!(
                                                         "Live rig reconnect succeeded: {}",
                                                         report_model
@@ -3213,7 +3317,8 @@ impl super::ApplicationCoordinator {
                                             pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                                 component: "rig".to_string(),
                                                 status,
-                                            },
+                                    level: status_level,
+                                },
                                         );
                                         });
                                     }
@@ -3228,7 +3333,8 @@ impl super::ApplicationCoordinator {
                                                 "Rig config saved ({}) — a rig switch is already in progress; try again shortly",
                                                 model
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                     );
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -3242,7 +3348,8 @@ impl super::ApplicationCoordinator {
                                                 "Rig config saved ({}) — live switch unavailable; restart to apply",
                                                 model
                                             ),
-                                        },
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                },
                                     );
                                     }
                                 }
@@ -3256,6 +3363,7 @@ impl super::ApplicationCoordinator {
                             {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Rig not connected — preset not saved".into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3263,6 +3371,7 @@ impl super::ApplicationCoordinator {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Could not read rig gain: unknown band — preset not saved"
                                         .into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3270,6 +3379,7 @@ impl super::ApplicationCoordinator {
                                 let _ = cmd_tui_msg_tx.send(gain_status(
                                     "Gain presets aren't supported for a non-TOML config file"
                                         .into(),
+                                    pancetta_core::DiagnosticLevel::Warn,
                                 ));
                                 continue;
                             }
@@ -3304,10 +3414,13 @@ impl super::ApplicationCoordinator {
                             );
                             if let Err(error) = cmd_message_bus.send_message(request).await {
                                 take_pending_gain_save(&pending_gain_save, frequency, request_id);
-                                let _ = cmd_tui_msg_tx.send(gain_status(format!(
-                                    "Could not read rig gain: {} — preset not saved",
-                                    error
-                                )));
+                                let _ = cmd_tui_msg_tx.send(gain_status(
+                                    format!(
+                                        "Could not read rig gain: {} — preset not saved",
+                                        error
+                                    ),
+                                    pancetta_core::DiagnosticLevel::Warn,
+                                ));
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::SaveRigBookmark {
@@ -4308,10 +4421,31 @@ fn spawn_config_file_write_worker() -> (
     (tx, handle)
 }
 
-fn gain_status(status: String) -> pancetta_tui::tui_runner::TuiMessage {
+// Transient-only health identities, distinct from service error codes.
+const RF_NO_DECODE_STATUS_CODE: u32 = 0xC200_0001;
+const SILENT_INPUT_STATUS_CODE: u32 = 0xC200_0002;
+
+fn relayed_status(
+    component: String,
+    status: String,
+    level: pancetta_core::DiagnosticLevel,
+) -> pancetta_tui::tui_runner::TuiMessage {
+    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+        component,
+        status,
+        level,
+    }
+}
+
+fn gain_status(
+    status: String,
+    level: pancetta_core::DiagnosticLevel,
+) -> pancetta_tui::tui_runner::TuiMessage {
     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
         component: "rig".into(),
         status,
+
+        level,
     }
 }
 
@@ -4353,12 +4487,14 @@ fn spawn_receive_gain_preset_mutation_worker(
             if !config_is_toml {
                 let _ = tui_tx.send(gain_status(
                     "Gain presets aren't supported for a non-TOML config file".into(),
+                    pancetta_core::DiagnosticLevel::Warn,
                 ));
                 continue;
             }
             if preset.preamp_db < 0 || preset.attenuator_db < 0 {
                 let _ = tui_tx.send(gain_status(
                     "Could not save gain preset: negative rig gain".into(),
+                    pancetta_core::DiagnosticLevel::Warn,
                 ));
                 continue;
             }
@@ -4415,23 +4551,29 @@ fn spawn_receive_gain_preset_mutation_worker(
                     Err(e) => Err(e.to_string()),
                 }
             };
-            let status = match result {
-                Err(error) => format!("Could not save gain preset: {}", error),
+            let (status, level) = match result {
+                Err(error) => (
+                    format!("Could not save gain preset: {}", error),
+                    pancetta_core::DiagnosticLevel::Warn,
+                ),
                 Ok(()) => {
                     if let Ok(written) = written_rx.await {
                         staged = written;
                     }
                     config.write().await.rig.receive_gain_presets = Some(staged);
-                    format!(
-                        "Saved {} receive-gain preset: preamp {} ({} dB), attenuator {} dB",
-                        band,
-                        super::hamlib::preamp_label(preset.preamp_db),
-                        preset.preamp_db,
-                        preset.attenuator_db
+                    (
+                        format!(
+                            "Saved {} receive-gain preset: preamp {} ({} dB), attenuator {} dB",
+                            band,
+                            super::hamlib::preamp_label(preset.preamp_db),
+                            preset.preamp_db,
+                            preset.attenuator_db
+                        ),
+                        pancetta_core::DiagnosticLevel::Info,
                     )
                 }
             };
-            let _ = tui_tx.send(gain_status(status));
+            let _ = tui_tx.send(gain_status(status, level));
         }
         Ok(())
     });
@@ -4505,6 +4647,8 @@ fn spawn_bookmark_mutation_worker(
                 let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                     component: "rig".to_string(),
                     status: "Bookmarks aren't supported for a non-TOML config file".to_string(),
+
+                    level: pancetta_core::DiagnosticLevel::Warn,
                 });
                 continue;
             }
@@ -4533,6 +4677,8 @@ fn spawn_bookmark_mutation_worker(
                             tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                 component: "rig".to_string(),
                                 status: format!("No bookmark named '{}'", name),
+
+                                level: pancetta_core::DiagnosticLevel::Warn,
                             });
                         continue;
                     }
@@ -4594,6 +4740,13 @@ fn spawn_bookmark_mutation_worker(
                 BookmarkMutation::Save(_) => "save",
                 BookmarkMutation::Delete(_) => "delete",
             };
+            let level = if persist_result.is_err()
+                || (matches!(mutation, BookmarkMutation::Save(_)) && staged.len() >= 20)
+            {
+                pancetta_core::DiagnosticLevel::Warn
+            } else {
+                pancetta_core::DiagnosticLevel::Info
+            };
             let status = if let Err(e) = persist_result {
                 warn!("Failed to persist rig bookmark {}: {}", verb, e);
                 format!("Failed to {} bookmark '{}': {}", verb, name, e)
@@ -4630,6 +4783,8 @@ fn spawn_bookmark_mutation_worker(
             let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                 component: "rig".to_string(),
                 status,
+
+                level,
             });
         }
         Ok(())
@@ -4725,6 +4880,45 @@ where
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
     }))
+}
+
+#[cfg(test)]
+mod pan351_tests {
+    use super::*;
+    #[test]
+    fn pan351_relay_preserves_status_level() {
+        for expected in [
+            pancetta_core::DiagnosticLevel::Info,
+            pancetta_core::DiagnosticLevel::Warn,
+            pancetta_core::DiagnosticLevel::Error,
+        ] {
+            let bus = MessageType::StatusUpdate {
+                text: "feedback".into(),
+                level: expected,
+            };
+            let MessageType::StatusUpdate { text, level } = bus else {
+                unreachable!()
+            };
+            let message = relayed_status("Qso".into(), text, level);
+            let pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component,
+                status,
+                level,
+            } = message
+            else {
+                panic!("wrong TUI variant")
+            };
+            assert_eq!(component, "Qso");
+            assert_eq!(status, "feedback");
+            assert_eq!(level, expected);
+        }
+        let pancetta_tui::tui_runner::TuiMessage::StatusUpdate { level, .. } =
+            gain_status("refusal".into(), pancetta_core::DiagnosticLevel::Warn)
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(level, pancetta_core::DiagnosticLevel::Warn);
+    }
 }
 
 #[cfg(test)]
@@ -6412,6 +6606,8 @@ mod tui_relay_tests {
             .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                 component: "test".to_string(),
                 status: "channel full".to_string(),
+
+                level: pancetta_core::DiagnosticLevel::Info,
             })
             .unwrap();
         let in_flight = Arc::new(AtomicBool::new(false));
@@ -7205,6 +7401,179 @@ mod tui_relay_tests {
         let was = gate.load(Ordering::Acquire);
         gate.store(!was, Ordering::Release);
         assert!(!gate.load(Ordering::Acquire));
+    }
+
+    // ---- PAN-341: TX-policy producers ------------------------------------
+
+    use super::TxPolicyCmdCtx;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    struct PolicyFixture {
+        ctx: TxPolicyCmdCtx,
+        tui: crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        gateway: crossbeam_channel::Receiver<ComponentMessage>,
+        qso: crossbeam_channel::Receiver<ComponentMessage>,
+        tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    /// The extracted handler context over a fresh bus, parameterized by the
+    /// display-feed gate (AC5: the same producer behavior must hold with the
+    /// feed enabled and disabled).
+    async fn policy_fixture(feed_enabled: bool) -> PolicyFixture {
+        let bus = MessageBus::new(32).unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (_, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        let (tui_tx, tui) = crossbeam_channel::bounded(1000);
+        let tx_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxPolicy::Full.as_u8(),
+        ));
+        let abort_current_tx = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cq_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
+            Arc::new(tokio::sync::RwLock::new(Some(tokio::time::Instant::now())));
+        let tx_halt = super::super::tx_halt::TxHaltHandles {
+            abort_current_tx: abort_current_tx.clone(),
+            autonomous_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            tx_policy: tx_policy.clone(),
+        };
+        let ctx = TxPolicyCmdCtx {
+            bus,
+            display_feed_enabled: Arc::new(std::sync::atomic::AtomicBool::new(feed_enabled)),
+            tx_policy: tx_policy.clone(),
+            abort_current_tx,
+            tx_halt,
+            cq_active,
+            tune_until,
+            tui_msg_tx: tui_tx,
+        };
+        PolicyFixture {
+            ctx,
+            tui,
+            gateway,
+            qso,
+            tx_policy,
+        }
+    }
+
+    fn drain<T>(rx: &crossbeam_channel::Receiver<T>) -> Vec<T> {
+        rx.try_iter().collect()
+    }
+
+    fn policy_of(f: &PolicyFixture) -> pancetta_core::TxPolicy {
+        pancetta_core::TxPolicy::from_u8(f.tx_policy.load(Ordering::Acquire))
+    }
+
+    fn gateway_policies(f: &PolicyFixture) -> Vec<pancetta_core::TxPolicy> {
+        drain(&f.gateway)
+            .into_iter()
+            .filter_map(|m| match m.message_type {
+                MessageType::TxPolicyStatus { policy } => Some(policy),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tui_policy_updates(f: &PolicyFixture) -> Vec<pancetta_core::TxPolicy> {
+        drain(&f.tui)
+            .into_iter()
+            .filter_map(|m| match m {
+                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy } => Some(policy),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC1 + AC5: every `g` cycle publishes the RESULTING policy — including
+    /// the Disabled → Full recovery — with local effects identical whether
+    /// the display feed is on or off, and a gateway message only when it is
+    /// on.
+    #[tokio::test]
+    async fn cycle_tx_policy_publishes_each_transition() {
+        for feed_enabled in [true, false] {
+            let f = policy_fixture(feed_enabled).await;
+            let expected = [
+                pancetta_core::TxPolicy::RespondOnly,
+                pancetta_core::TxPolicy::Disabled,
+                pancetta_core::TxPolicy::Full,
+            ];
+            for (step, want) in expected.iter().enumerate() {
+                super::cycle_tx_policy(&f.ctx).await;
+
+                assert_eq!(policy_of(&f), *want, "step {step} atomic");
+                // Local TUI echo survives both gate states (additive-only).
+                assert_eq!(tui_policy_updates(&f), vec![*want], "step {step} TUI echo");
+                // Gateway inbox: exactly one policy message per press when
+                // enabled, none ever when disabled.
+                if feed_enabled {
+                    assert_eq!(gateway_policies(&f), vec![*want], "step {step} relay");
+                } else {
+                    assert!(
+                        drain(&f.gateway).is_empty(),
+                        "step {step}: feed disabled must enqueue nothing"
+                    );
+                }
+                // The Disabled leg keeps its safety effects; the others
+                // leave abort/CQ/tune state untouched.
+                if *want == pancetta_core::TxPolicy::Disabled {
+                    assert!(
+                        f.ctx.abort_current_tx.load(Ordering::Acquire),
+                        "step {step} abort"
+                    );
+                    assert!(!f.ctx.cq_active.load(Ordering::Relaxed), "step {step} cq");
+                    assert!(f.ctx.tune_until.read().await.is_none(), "step {step} tune");
+                    assert!(
+                        drain(&f.qso).iter().any(|m| matches!(
+                            m.message_type,
+                            MessageType::QsoMessage(QsoMessage::StopCq)
+                        )),
+                        "step {step} StopCq"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC2 + AC5: Shift+Q publishes Disabled (before the durable QSO
+    /// cancellation) while keeping every halt effect, with and without the
+    /// display feed.
+    #[tokio::test]
+    async fn emergency_stop_relays_disabled() {
+        for feed_enabled in [true, false] {
+            let f = policy_fixture(feed_enabled).await;
+            super::emergency_stop(&f.ctx).await;
+
+            // Halt semantics preserved (tx_halt tests pin the sync store).
+            assert_eq!(policy_of(&f), pancetta_core::TxPolicy::Disabled);
+            assert!(f.ctx.tx_halt.abort_current_tx.load(Ordering::Acquire));
+            assert!(!f.ctx.tx_halt.autonomous_enabled.load(Ordering::Acquire));
+            assert!(!f.ctx.cq_active.load(Ordering::Relaxed));
+            assert!(f.ctx.tune_until.read().await.is_none());
+            assert_eq!(
+                tui_policy_updates(&f),
+                vec![pancetta_core::TxPolicy::Disabled]
+            );
+            let qso = drain(&f.qso);
+            assert!(
+                qso.iter().any(|m| matches!(
+                    m.message_type,
+                    MessageType::QsoMessage(QsoMessage::CancelAllQsos)
+                )),
+                "{qso:?}"
+            );
+            if feed_enabled {
+                assert_eq!(
+                    gateway_policies(&f),
+                    vec![pancetta_core::TxPolicy::Disabled]
+                );
+            } else {
+                assert!(drain(&f.gateway).is_empty());
+            }
+        }
     }
 
     /// Batch 95: the TUI's worked-before flag and the autonomous

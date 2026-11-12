@@ -12,6 +12,9 @@ pub enum Headline {
     AllTimeNew {
         source: NeedSource,
     },
+    UnconfirmedEntityOnBand {
+        band: String,
+    },
     NewEntityOnBand {
         band: String,
     },
@@ -44,6 +47,7 @@ impl Headline {
             }
             .into(),
             Self::NewEntityOnBand { band } => format!("new entity on {band}"),
+            Self::UnconfirmedEntityOnBand { band } => format!("unconfirmed entity on {band}"),
             Self::NeededEntity { known, local } => match (known, local) {
                 (Some(true), false) => "needed entity (cqdx list)",
                 (Some(false), false) => "maybe needed entity (cqdx list changed)",
@@ -84,9 +88,9 @@ impl Headline {
         Some(match self {
             Self::InvalidCallsign => PriorityTier::Suspect,
             Self::AllTimeNew { .. } => PriorityTier::Atno,
-            Self::NewEntityOnBand { .. } | Self::NeededEntity { .. } => {
-                PriorityTier::PerBandDxccNew
-            }
+            Self::NewEntityOnBand { .. }
+            | Self::UnconfirmedEntityOnBand { .. }
+            | Self::NeededEntity { .. } => PriorityTier::PerBandDxccNew,
             Self::Notable | Self::SpecialEvent => PriorityTier::SpecialStation,
             Self::NewGrid { .. } => PriorityTier::PerBandGridNew,
             Self::NoAwardNeed => PriorityTier::Standard,
@@ -209,7 +213,11 @@ pub fn reason_for(
                 source: f.need_source,
             },
             PriorityTier::PerBandDxccNew if f.dxcc_new_on_band => {
-                Headline::NewEntityOnBand { band: band.clone() }
+                if need.and_then(|n| n.unconfirmed_policy) == Some(true) {
+                    Headline::UnconfirmedEntityOnBand { band: band.clone() }
+                } else {
+                    Headline::NewEntityOnBand { band: band.clone() }
+                }
             }
             PriorityTier::PerBandDxccNew => Headline::NeededEntity {
                 known: need.and_then(|n| n.dxcc_needed),
@@ -463,9 +471,17 @@ pub fn detail_for(
         let inputs = [
             ("needed entity".into(), needed_value, needed_source.as_str()),
             (
-                format!("entity new on {band}"),
+                if need.and_then(|n| n.unconfirmed_policy) == Some(true) {
+                    "entity needed on band".into()
+                } else {
+                    format!("entity new on {band}")
+                },
                 yes_no(f.dxcc_new_on_band),
-                "your log",
+                if need.and_then(|n| n.unconfirmed_policy) == Some(true) {
+                    "local logbook"
+                } else {
+                    "your log"
+                },
             ),
             (
                 "all-time new entity".into(),
@@ -534,8 +550,18 @@ pub fn detail_for(
         // PAN-347: the entity's standing in the local logbook, display only.
         if let Some(standing) = need.and_then(|n| n.entity_standing) {
             lines.push(String::new());
-            lines.push("Local logbook (all bands, not scored)".into());
-            lines.push(format!("  {:<32}  {}", "entity", standing.label()));
+            if need.and_then(|n| n.unconfirmed_policy) == Some(true) {
+                lines.push("Needed policy: unconfirmed (local logbook)".into());
+                lines.push("Local logbook (all bands)".into());
+            } else {
+                lines.push("Local logbook (all bands, not scored)".into());
+            }
+            let label = if need.and_then(|n| n.unconfirmed_policy) == Some(true) {
+                "entity standing"
+            } else {
+                "entity"
+            };
+            lines.push(format!("  {label:<32}  {}", standing.label()));
             let mode = station.mode.trim().to_uppercase();
             if let Some(v) = need.and_then(|n| n.new_mode).filter(|_| !mode.is_empty()) {
                 lines.push(format!(
@@ -644,6 +670,14 @@ mod tests {
     }
     fn factors(s: &mut DxStation) -> &mut pancetta_qso::priority::PriorityFactors {
         s.local_rank.as_mut().unwrap().factors.as_mut().unwrap()
+    }
+
+    #[test]
+    fn confirmation_policy_uses_confirmation_wording() {
+        assert_eq!(
+            Headline::UnconfirmedEntityOnBand { band: "20M".into() }.text(),
+            "unconfirmed entity on 20M"
+        );
     }
 
     #[test]

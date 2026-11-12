@@ -583,7 +583,7 @@ mod tests {
             .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "needed": [{
-                    "entityId": 327,
+                    "entityId": 24,
                     "name": "Bouvet Island",
                     "prefix": "3Y/B",
                     "atno": true
@@ -595,7 +595,7 @@ mod tests {
         let client = test_client(&server.uri());
         let needed = client.fetch_needed(None).await.unwrap();
         assert_eq!(needed.len(), 1);
-        assert_eq!(needed[0].entity_id, 327);
+        assert_eq!(needed[0].entity_id, 24);
         assert!(needed[0].atno);
     }
 
@@ -608,7 +608,7 @@ mod tests {
             .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "needed": [
-                    { "entityId": 327, "name": "Bouvet Island", "prefix": "3Y/B", "atno": true },
+                    { "entityId": 24, "name": "Bouvet Island", "prefix": "3Y/B", "atno": true },
                     // Worked on another band, so a band-fill on 20m, not an ATNO.
                     { "entityId": 339, "name": "Japan", "prefix": "JA", "atno": false }
                 ]
@@ -630,7 +630,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/entities/needed"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "needed": [{ "entityId": 327, "name": "Bouvet Island", "prefix": "3Y/B" }]
+                "needed": [{ "entityId": 24, "name": "Bouvet Island", "prefix": "3Y/B" }]
             })))
             .mount(&server)
             .await;
@@ -711,7 +711,7 @@ mod tests {
                     "dxCall": "3Y0J",
                     "band": "20m",
                     "mode": "FT8",
-                    "dxDxcc": 327,
+                    "dxDxcc": 24,
                     "dxEntityName": "Bouvet Island",
                     "dxContinent": "AF",
                     "dxCqZone": 38,

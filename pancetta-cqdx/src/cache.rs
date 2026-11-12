@@ -9,8 +9,6 @@ use std::collections::{HashMap, HashSet};
 /// In-memory cache of cqdx.io data for the current session.
 #[derive(Debug, Clone)]
 pub struct CqdxCache {
-    /// All DXCC entities indexed by prefix (longest-prefix-first for matching).
-    prefixes: Vec<(String, u32)>,
     /// Entity details by ADIF number.
     entities: HashMap<u32, DxccEntity>,
     /// Entity IDs the user still needs. None = no data loaded (needed status
@@ -31,7 +29,6 @@ impl Default for CqdxCache {
 impl CqdxCache {
     pub fn new() -> Self {
         Self {
-            prefixes: Vec::new(),
             entities: HashMap::new(),
             needed_entity_ids: None,
             rarity_scores: HashMap::new(),
@@ -39,17 +36,9 @@ impl CqdxCache {
         }
     }
 
-    /// Load DXCC entity table. Sorts prefixes longest-first for matching.
+    /// Load entity metadata independently of offline callsign resolution.
     pub fn load_entities(&mut self, entities: Vec<DxccEntity>) {
-        self.entities.clear();
-        self.prefixes.clear();
-        for entity in &entities {
-            self.entities.insert(entity.adif_number, entity.clone());
-            self.prefixes
-                .push((entity.prefix.to_uppercase(), entity.adif_number));
-        }
-        // Sort longest prefix first so "3Y/B" matches before "3Y"
-        self.prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.entities = entities.into_iter().map(|e| (e.adif_number, e)).collect();
     }
 
     /// Load needed entity IDs. Calling this with an empty vec means nothing is needed.
@@ -70,15 +59,9 @@ impl CqdxCache {
         self.spot_groups = groups;
     }
 
-    /// Resolve a callsign to its DXCC entity ADIF number using longest-prefix matching.
+    /// Resolve through the shared offline DXCC identity rules.
     pub fn resolve_entity(&self, callsign: &str) -> Option<u32> {
-        let upper = callsign.to_uppercase();
-        for (prefix, id) in &self.prefixes {
-            if upper.starts_with(prefix.as_str()) {
-                return Some(*id);
-            }
-        }
-        None
+        pancetta_core::dxcc::entity_id_for_callsign(callsign).map(u32::from)
     }
 
     /// Get rarity score for a callsign. Returns 0.5 (default) if unknown.
@@ -169,7 +152,7 @@ mod tests {
                 is_deleted: false,
             },
             DxccEntity {
-                adif_number: 327,
+                adif_number: 24,
                 entity_name: "Bouvet Island".to_string(),
                 prefix: "3Y/B".to_string(),
                 continent: "AF".to_string(),
@@ -187,7 +170,7 @@ mod tests {
             dx_call: dx_call.to_string(),
             band: "20m".to_string(),
             mode: "FT8".to_string(),
-            dx_dxcc: 327,
+            dx_dxcc: 24,
             dx_entity_name: "Bouvet Island".to_string(),
             dx_continent: "AF".to_string(),
             dx_cq_zone: 38,
@@ -207,6 +190,27 @@ mod tests {
     }
 
     #[test]
+    fn cache_uses_core_entity_ids_without_entity_load() {
+        let mut cache = CqdxCache::new();
+        assert_eq!(cache.is_needed_dxcc("7K1ABC"), None);
+        cache.load_needed(vec![NeededEntity {
+            entity_id: 339,
+            name: "Japan".into(),
+            prefix: "JA".into(),
+            atno: true,
+        }]);
+        for call in ["JA1ABC", "7K1ABC", "JR1ABC", "JH1ABC", "8N1ABC", "JE1ABC"] {
+            assert_eq!(cache.resolve_entity(call), Some(339), "{call}");
+            assert_eq!(cache.is_needed_dxcc(call), Some(true), "{call}");
+        }
+        assert_eq!(cache.resolve_entity("3Y0J"), Some(24));
+        assert_eq!(cache.resolve_entity("KG4OJT"), Some(291));
+        assert_eq!(cache.resolve_entity("KG4AC"), Some(105));
+        cache.load_needed(vec![]);
+        assert_eq!(cache.is_needed_dxcc("7K1ABC"), Some(false));
+    }
+
+    #[test]
     fn test_resolve_entity_by_prefix() {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
@@ -218,14 +222,14 @@ mod tests {
     fn test_resolve_entity_longest_prefix_wins() {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
-        assert_eq!(cache.resolve_entity("3Y/B1234"), Some(327));
+        assert_eq!(cache.resolve_entity("3Y0J"), Some(24));
     }
 
     #[test]
     fn test_resolve_entity_unknown_returns_none() {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
-        assert_eq!(cache.resolve_entity("ZZ9ZZZ"), None);
+        assert_eq!(cache.resolve_entity("QQ9XYZ"), None);
     }
 
     #[test]
@@ -263,12 +267,12 @@ mod tests {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
         cache.load_needed(vec![NeededEntity {
-            entity_id: 327,
+            entity_id: 24,
             name: "Bouvet Island".to_string(),
             prefix: "3Y/B".to_string(),
             atno: true,
         }]);
-        assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(true)); // Bouvet is needed
+        assert_eq!(cache.is_needed_dxcc("3Y0J"), Some(true)); // Bouvet is needed
         assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false)); // US is NOT needed
     }
 
@@ -288,7 +292,7 @@ mod tests {
         cache.load_needed(vec![]);
         // PAN-93: a successful empty answer means nothing is needed.
         assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false));
-        assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(false));
+        assert_eq!(cache.is_needed_dxcc("3Y0J"), Some(false));
     }
 
     #[test]

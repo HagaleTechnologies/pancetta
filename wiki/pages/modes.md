@@ -33,7 +33,10 @@ periods, band dial tables, and offset regions are normative in the code and
   `_with_period` variants; `derive_dsp_timing` maps a `ProtocolParams` to
   window/decode-phase/overlap/slot values threaded into `dsp.rs` and the parity
   stamping in `ft8.rs`.
-- **Runtime switch** — `try_switch_operating_mode` is the single gate; it
+- **Runtime switch** — Shift+M cycles FT8 → FT4 → FT8 by default. Builds
+  with the experimental `ft2` feature cycle FT8 → FT4 → FT2 → FT8.
+  `next_operating_mode` selects only compiled-in modes;
+  `try_switch_operating_mode` is the single gate; it
   refuses while any QSO is active (synchronous lock, zero `.await` in the
   critical section) and only then mutates the shared protocol + timing atomics.
 - **Hound** — a manual `Tx≠Rx` procedure flagged by `QsoMetadata.hound`; mode
@@ -65,6 +68,18 @@ so a switch just before or just after that boundary receives the same recovery.
 resolves to today's exact FT8 constants (regression-guarded). Do not change a
 slot or parity default without preserving that. See [[tx-scheduling]] for how
 the active period feeds the scheduler.
+
+## Companion UDP sampling
+
+PAN-349 samples the live mode when draining decodes: FT8 uses `~`, FT4 uses
+`+`, and FT2 is suppressed. Capture-time mode provenance remains unavailable.
+Status samples the current QSO manager through its restart watch each time,
+so replacing the manager cannot retain a contact from the old instance.
+Selection is earliest active named contact of the current mode, then QSO ID.
+RX DF uses `partner_freq.unwrap_or(frequency)`, which is an audio offset;
+TX DF uses the station's held offset. They can differ. TX text comes only from
+an accepted intent for that selected contact, and does not prove transmission.
+FT4's integer Status period is 7 seconds; its scheduler still uses 7.5 seconds.
 
 ## Rig CAT mode is separate
 

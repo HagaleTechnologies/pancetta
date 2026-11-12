@@ -116,8 +116,13 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::Callers);
     let block = create_panel_block("Callers", is_active, app);
 
-    // PAN-88: narrow panels show fewer, whole columns. `table_area` below
-    // has the same width as `area`.
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.is_empty() {
+        return Ok(());
+    }
+
+    // Keep the outer-width column budget, including the border reservation.
     let columns = visible_columns(area.width);
     let header_cells = columns.iter().map(|c| {
         Cell::from(c.header()).style(
@@ -133,16 +138,13 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
 
     // Reserve one row at the bottom for the reply-hint line.
     let table_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: area.height.saturating_sub(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
     };
     let hint_area = Rect {
-        x: area.x + 1,
-        y: area.y + area.height.saturating_sub(1),
-        width: area.width.saturating_sub(2),
+        y: inner.y + inner.height - 1,
         height: 1,
+        ..inner
     };
 
     let mut rows: Vec<Row> = callers
@@ -164,7 +166,6 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block)
         .column_spacing(1)
         .style(Style::default().fg(app.theme.foreground_color()))
         .row_highlight_style(
@@ -287,13 +288,7 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColu
     } else {
         call_style
     };
-    let snr_style = Style::default().fg(if msg.snr >= 0 {
-        app.theme.success_color()
-    } else if msg.snr >= -10 {
-        app.theme.warning_color()
-    } else {
-        app.theme.error_color()
-    });
+    let snr_style = Style::default().fg(super::get_snr_color(msg.snr, &app.theme));
     let flags_style = if flags.contains(&"BUSY") {
         Style::default().fg(app.theme.warning_color())
     } else {
@@ -331,6 +326,146 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caller_fixture(call: &str) -> DecodedMessageView {
+        DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".into(),
+            snr: -15,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some(call.into()),
+            grid_square: None,
+            message: format!("N0CALL {call} -10"),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: true,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            priority_factors: None,
+            is_own_tx: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn callers_hint_is_inside_intact_border_at_small_sizes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for populated in [false, true] {
+            let mut app = App::new(crate::config::Config::default(), None)
+                .await
+                .unwrap();
+            app.active_panel = ActivePanel::Callers;
+            if populated {
+                for i in 0..8 {
+                    app.decoded_messages
+                        .push_back(caller_fixture(&format!("K{i}ABC")));
+                }
+            }
+            for scroll in [0, 5] {
+                app.callers_scroll = scroll;
+                for width in [32, 40, 80] {
+                    for height in [0, 1, 2, 3, 4, 6] {
+                        let area = Rect::new(2, 2, width, height);
+                        let mut terminal =
+                            Terminal::new(TestBackend::new(width + 4, height + 4)).unwrap();
+                        terminal
+                            .draw(|f| {
+                                for y in 0..height + 4 {
+                                    for x in 0..width + 4 {
+                                        f.buffer_mut()[(x, y)].set_symbol("~");
+                                    }
+                                }
+                                render_callers(f, area, &app).unwrap();
+                            })
+                            .unwrap();
+                        let buf = terminal.backend().buffer();
+                        for y in 0..height + 4 {
+                            for x in 0..width + 4 {
+                                if !area.contains((x, y).into()) {
+                                    assert_eq!(
+                                        buf[(x, y)].symbol(),
+                                        "~",
+                                        "{width}x{height} at {x},{y}"
+                                    );
+                                }
+                            }
+                        }
+                        if height >= 2 {
+                            for x in area.x + 1..area.right() - 1 {
+                                assert_eq!(
+                                    buf[(x, area.bottom() - 1)].symbol(),
+                                    "─",
+                                    "bottom border {width}x{height}"
+                                );
+                            }
+                        }
+                        if populated && height == 6 {
+                            let table_text: String = (area.y + 1..area.bottom() - 2)
+                                .flat_map(|y| (area.x + 1..area.right() - 1).map(move |x| (x, y)))
+                                .map(|pos| buf[pos].symbol())
+                                .collect();
+                            assert!(
+                                table_text.contains(if scroll == 0 { "K7ABC" } else { "K2ABC" }),
+                                "selected caller missing: {table_text}"
+                            );
+                            assert!(table_text.contains("▶"));
+                        }
+                        if height >= 3 {
+                            let hint: String = (area.x + 1..area.right() - 1)
+                                .map(|x| buf[(x, area.bottom() - 2)].symbol())
+                                .collect();
+                            assert!(
+                                hint.contains(if populated { "reply" } else { "(no callers)" }),
+                                "{width}x{height}: {hint}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn callers_snr_uses_shared_scale_in_both_themes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+            app.theme = theme;
+            for snr in [-15, -11, -10, -1, 0, 5, 10] {
+                let mut msg = caller_fixture("K1ABC");
+                msg.snr = snr;
+                msg.message = "N0CALL K1ABC".into();
+                app.decoded_messages.clear();
+                app.decoded_messages.push_back(msg);
+                let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+                terminal
+                    .draw(|f| render_callers(f, f.area(), &app).unwrap())
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let label = format!("{snr:+}");
+                let row: String = (0..80).map(|x| buf[(x, 2)].symbol()).collect();
+                let cells: Vec<char> = row.chars().collect();
+                let label_cells: Vec<char> = label.chars().collect();
+                let start = cells
+                    .windows(label_cells.len())
+                    .position(|w| w == label_cells)
+                    .unwrap_or_else(|| panic!("missing {label}: {row}"));
+                for x in start..start + label.len() {
+                    assert_eq!(
+                        buf[(x as u16, 2)].fg,
+                        super::super::get_snr_color(snr, &app.theme)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn visible_columns_compact_tier_at_operate_80() {

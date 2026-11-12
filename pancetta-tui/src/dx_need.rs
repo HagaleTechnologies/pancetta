@@ -9,8 +9,8 @@ pub struct DxNeedStatus {
     pub grid_needed: Option<bool>,
     pub state: Option<String>,
     pub state_needed: Option<bool>,
-    /// PAN-93 / PAN-347: needed-entity verdict, cqdx or local logbook
-    /// (`dxcc_source`); None while neither has answered.
+    /// Needed-entity verdict from cqdx or the local logbook according to
+    /// the configured policy; None while neither has answered.
     pub dxcc_needed: Option<bool>,
     /// PAN-93: the loaded cqdx list's scope and time, when cqdx answered.
     pub dxcc_list: Option<NeedListSource>,
@@ -23,6 +23,8 @@ pub struct DxNeedStatus {
     /// None without a locally decoded mode, the log, or an entity, and for
     /// the home entity.
     pub new_mode: Option<bool>,
+    /// Local confirmation policy is active after a successful logbook seed.
+    pub unconfirmed_policy: Option<bool>,
 }
 
 /// PAN-347: an entity's standing in the local logbook, all bands and modes.

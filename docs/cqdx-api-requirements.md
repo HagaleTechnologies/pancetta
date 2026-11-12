@@ -71,7 +71,7 @@ Returns DXCC entities the authenticated user still needs (not yet confirmed).
 ```json
 {
   "needed": [
-    { "entityId": 327, "name": "Bouvet Island", "prefix": "3Y/B" }
+    { "entityId": 24, "name": "Bouvet Island", "prefix": "3Y/B" }
   ]
 }
 ```
@@ -253,7 +253,7 @@ I'm operating right now" (a band-fill) from "needed everywhere" (ATNO).
 ```json
 {
   "needed": [
-    { "entityId": 327, "name": "Bouvet Island", "prefix": "3Y/B", "atno": true },
+    { "entityId": 24, "name": "Bouvet Island", "prefix": "3Y/B", "atno": true },
     { "entityId": 291, "name": "United States",  "prefix": "K",    "atno": false }
   ]
 }

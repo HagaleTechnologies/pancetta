@@ -7247,6 +7247,305 @@ mod tests {
         );
     }
 
+    /// PAN-341 test helper: run `action` (a real TX-policy producer), pump
+    /// every message it enqueued to `ComponentId::RemoteGateway` through the
+    /// display-feed body, fan the resulting events out via
+    /// [`drain_read_stream`], and return the peer's first NEW decrypted JSON
+    /// frame (panicking when the action produced none — the positive
+    /// direction; withholding is asserted by the callers below).
+    #[allow(clippy::too_many_arguments)]
+    async fn policy_frame_after_action<F: std::future::Future<Output = ()>>(
+        action: F,
+        gw_rx: &crossbeam_channel::Receiver<crate::message_bus::ComponentMessage>,
+        evt_tx: &tokio::sync::broadcast::Sender<pancetta_protocol::ServerEvent>,
+        snapshot: &tokio::sync::RwLock<pancetta_protocol::StateSnapshot>,
+        events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
+        sess: &mut MultiPeerSession<'_, MockWs>,
+        ctx: &ArmContext,
+        outbound: &Arc<Mutex<Vec<String>>>,
+        transports: &mut [snow::TransportState],
+    ) -> Value {
+        let before = outbound.lock().unwrap().len();
+        action.await;
+        while let Ok(m) = gw_rx.try_recv() {
+            super::super::remote_gateway::pump_bus_message_for_tests(
+                &m.message_type,
+                evt_tx,
+                snapshot,
+            )
+            .await;
+        }
+        drain_read_stream(events, sess, ctx, || NOW);
+        let out = outbound.lock().unwrap().clone();
+        let envs = envs_to(&out[before..], CLIENT_KEY_ID);
+        assert_eq!(envs.len(), 1, "exactly one txPolicy frame: {envs:?}");
+        client_decrypt_json(&mut transports[0], &envs[0])
+    }
+
+    /// PAN-341 Gherkin Scenario 1 (+ both halt sources, AC1/AC2): the REAL
+    /// production producers — the extracted `g`-cycle command handler, the
+    /// Shift+Q emergency stop and the SWR trip's `act` — feed the display
+    /// feed through `relay_to_gateway`; the display-feed pump translates;
+    /// `drain_read_stream` delivers each `txPolicy` frame, encrypted, to an
+    /// authorized status-only peer. Each action→decrypted-frame step is
+    /// bounded by one second on the REAL clock (no injected sleep).
+    #[tokio::test]
+    async fn tx_policy_changes_reach_status_peer_within_one_second() {
+        use crate::message_bus::{ComponentId, MessageBus};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let dev_a = client_device();
+        let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a]);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+        );
+
+        // The production wiring, minus the coordinator: a bus with every
+        // inbox the handlers write to, the display-feed gate ON, and the
+        // shared pump state (broadcast ring + snapshot).
+        let bus = MessageBus::new(64).unwrap();
+        let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (_tui_tx, tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (_ham_tx, ham_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_gw_tx, gw_rx) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        let display_feed_enabled = Arc::new(AtomicBool::new(true));
+        let (evt_tx, events) =
+            tokio::sync::broadcast::channel::<pancetta_protocol::ServerEvent>(1024);
+        let snapshot = Arc::new(tokio::sync::RwLock::new(pancetta_protocol::StateSnapshot {
+            frequency_hz: 14_074_000,
+            split_tx_hz: 0,
+            tx_policy: pancetta_core::TxPolicy::Full,
+            mode: "FT8".to_string(),
+            dx_hunter: vec![],
+            active_qsos: vec![],
+            pending_calls: vec![],
+            recent_decodes: vec![],
+        }));
+        let mut events = Some(events);
+
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let abort_current_tx = Arc::new(AtomicBool::new(false));
+        let policy_ctx = super::super::tui_relay::TxPolicyCmdCtx {
+            bus: bus.clone(),
+            display_feed_enabled: display_feed_enabled.clone(),
+            tx_policy: tx_policy.clone(),
+            abort_current_tx: abort_current_tx.clone(),
+            tx_halt: super::super::tx_halt::TxHaltHandles {
+                abort_current_tx,
+                autonomous_enabled: Arc::new(AtomicBool::new(true)),
+                tx_policy: tx_policy.clone(),
+            },
+            cq_active: Arc::new(AtomicBool::new(false)),
+            tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+            tui_msg_tx: crossbeam_channel::bounded(1000).0,
+        };
+        let swr_halt = super::super::tx_halt::TxHaltHandles {
+            abort_current_tx: Arc::new(AtomicBool::new(false)),
+            autonomous_enabled: Arc::new(AtomicBool::new(true)),
+            tx_policy: tx_policy.clone(),
+        };
+
+        // Three `g` presses from Full: respondOnly, disabled, full. Each
+        // action→decrypted-frame step is bounded by one second on the REAL
+        // clock, and asserts the frame CONTENT.
+        macro_rules! assert_policy_frame {
+            ($action:expr, $policy:literal, $why:literal) => {{
+                let v = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    policy_frame_after_action(
+                        $action,
+                        &gw_rx,
+                        &evt_tx,
+                        &snapshot,
+                        &mut events,
+                        &mut sess,
+                        &ctx,
+                        &outbound,
+                        &mut transports,
+                    ),
+                )
+                .await
+                .expect($why);
+                assert_eq!(v["frame"], "event");
+                assert_eq!(v["event"]["event"], "txPolicy");
+                assert_eq!(v["event"]["policy"], $policy);
+            }};
+        }
+
+        assert_policy_frame!(
+            super::super::tui_relay::cycle_tx_policy(&policy_ctx),
+            "respondOnly",
+            "g -> RespondOnly within one second"
+        );
+        assert_policy_frame!(
+            super::super::tui_relay::cycle_tx_policy(&policy_ctx),
+            "disabled",
+            "g -> Disabled within one second"
+        );
+        assert_policy_frame!(
+            super::super::tui_relay::cycle_tx_policy(&policy_ctx),
+            "full",
+            "g -> Full (halt recovery) within one second"
+        );
+
+        // Both halt sources announce Disabled: Shift+Q ...
+        assert_policy_frame!(
+            super::super::tui_relay::emergency_stop(&policy_ctx),
+            "disabled",
+            "Shift+Q -> Disabled within one second"
+        );
+
+        // ... and the SWR trip (a repeated Disabled is a state assignment).
+        assert_policy_frame!(
+            super::super::swr_guard::act(
+                super::super::swr_guard::SwrAction::Trip {
+                    swr: 4.2,
+                    max_swr: 3.0
+                },
+                &bus,
+                &swr_halt,
+                &display_feed_enabled,
+            ),
+            "disabled",
+            "SWR trip -> Disabled within one second"
+        );
+
+        // The halt effects themselves are preserved end to end.
+        assert_eq!(
+            pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire)),
+            pancetta_core::TxPolicy::Disabled
+        );
+        assert!(policy_ctx.tx_halt.abort_current_tx.load(Ordering::Acquire));
+        // The producers' non-gateway writes reached their real inboxes.
+        assert!(tui_rx.try_iter().any(|m| matches!(
+            m.message_type,
+            crate::message_bus::MessageType::TxPolicyStatus { .. }
+        )));
+        assert!(qso_rx.try_iter().any(|m| matches!(
+            m.message_type,
+            crate::message_bus::MessageType::QsoMessage(_)
+        )));
+        assert!(ham_rx.try_iter().any(|m| matches!(
+            m.message_type,
+            crate::message_bus::MessageType::RigControl(_)
+        )));
+    }
+
+    /// AC3: `txPolicy` rides the existing per-frame `status`-capability
+    /// gate. The same real `g`-cycle producer + pump + drain path delivers
+    /// one frame to a currently-authorized peer and NOTHING to a peer with
+    /// no verified hello, an expired capability, or a revoked jti.
+    #[tokio::test]
+    async fn tx_policy_respects_peer_authority() {
+        use crate::message_bus::{ComponentId, MessageBus};
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+
+        for (label, grants) in [
+            ("authorized", true),
+            ("no verified hello", false),
+            ("expired capability", false),
+            ("revoked jti", false),
+        ] {
+            let identity = AgentIdentity::generate();
+            let mut allow = HashSet::new();
+            allow.insert(CLIENT_KEY_ID.to_string());
+            let mut ctx = fresh_ctx(&identity.key_id(), allow);
+            let dev_a = client_device();
+            let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a]);
+            match label {
+                "expired capability" => ctx.peers.insert(
+                    CLIENT_KEY_ID.to_string(),
+                    PeerCtx::authorized_until(vec!["status".to_string()], NOW - 1),
+                ),
+                "revoked jti" => {
+                    ctx.revoked_jtis.insert("test-jti".to_string());
+                    ctx.peers.insert(
+                        CLIENT_KEY_ID.to_string(),
+                        PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+                    )
+                }
+                _ => ctx.peers.insert(
+                    CLIENT_KEY_ID.to_string(),
+                    if grants {
+                        PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000)
+                    } else {
+                        PeerCtx::unauthorized()
+                    },
+                ),
+            };
+
+            let bus = MessageBus::new(64).unwrap();
+            let _ = bus.create_channel(ComponentId::Qso).await.unwrap();
+            let _ = bus.create_channel(ComponentId::Tui).await.unwrap();
+            let _ = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+            let (_gw_tx, gw_rx) = bus
+                .create_channel(ComponentId::RemoteGateway)
+                .await
+                .unwrap();
+            let (evt_tx, events) =
+                tokio::sync::broadcast::channel::<pancetta_protocol::ServerEvent>(1024);
+            let snapshot = Arc::new(tokio::sync::RwLock::new(pancetta_protocol::StateSnapshot {
+                frequency_hz: 14_074_000,
+                split_tx_hz: 0,
+                tx_policy: pancetta_core::TxPolicy::Full,
+                mode: "FT8".to_string(),
+                dx_hunter: vec![],
+                active_qsos: vec![],
+                pending_calls: vec![],
+                recent_decodes: vec![],
+            }));
+            let mut events = Some(events);
+            let policy_ctx = super::super::tui_relay::TxPolicyCmdCtx {
+                bus: bus.clone(),
+                display_feed_enabled: Arc::new(AtomicBool::new(true)),
+                tx_policy: Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8())),
+                abort_current_tx: Arc::new(AtomicBool::new(false)),
+                tx_halt: super::super::tx_halt::TxHaltHandles {
+                    abort_current_tx: Arc::new(AtomicBool::new(false)),
+                    autonomous_enabled: Arc::new(AtomicBool::new(true)),
+                    tx_policy: Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8())),
+                },
+                cq_active: Arc::new(AtomicBool::new(false)),
+                tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+                tui_msg_tx: crossbeam_channel::bounded(1000).0,
+            };
+
+            let before = outbound.lock().unwrap().len();
+            super::super::tui_relay::cycle_tx_policy(&policy_ctx).await;
+            while let Ok(m) = gw_rx.try_recv() {
+                super::super::remote_gateway::pump_bus_message_for_tests(
+                    &m.message_type,
+                    &evt_tx,
+                    &snapshot,
+                )
+                .await;
+            }
+            drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
+            let out = outbound.lock().unwrap().clone();
+            let new = &out[before..];
+            if grants {
+                let envs = envs_to(new, CLIENT_KEY_ID);
+                assert_eq!(envs.len(), 1, "{label}: exactly one frame");
+                let v = client_decrypt_json(&mut transports[0], &envs[0]);
+                assert_eq!(v["event"]["event"], "txPolicy", "{label}");
+                assert_eq!(v["event"]["policy"], "respondOnly", "{label}");
+            } else {
+                assert!(
+                    envs_to(new, CLIENT_KEY_ID).is_empty(),
+                    "{label}: a peer without currently-valid authority must receive no frame"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deliver_sends_drops_frames_for_unauthorized_peers() {
         let identity = AgentIdentity::generate();

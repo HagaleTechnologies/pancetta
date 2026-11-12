@@ -183,9 +183,13 @@ jobs:
           mkdir "$NAME/docs"
           cp docs/UPGRADING.md docs/CONFIG.md "$NAME/docs/"
           if [ "${{ runner.os }}" = "Windows" ]; then
+            cp -r packaging/windows "$NAME/windows"
+            powershell -NoProfile -Command 'foreach ($f in "install","uninstall") { $p = "packaging/windows/$f-pancetta-service.ps1"; $errs = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$errs); if ($errs) { $errs | ForEach-Object { $_.Message }; exit 1 } }'
             7z a "${NAME}.zip" "$NAME"
             ARCHIVE="${NAME}.zip"
             7z l "$ARCHIVE" | tr '\\' '/' | grep -F "$NAME/docs/UPGRADING.md"
+            7z l "$ARCHIVE" | tr '\\' '/' | grep -F "$NAME/windows/install-pancetta-service.ps1"
+            7z l "$ARCHIVE" | tr '\\' '/' | grep -F "$NAME/windows/uninstall-pancetta-service.ps1"
           else
             tar czf "${NAME}.tar.gz" "$NAME"
             ARCHIVE="${NAME}.tar.gz"

@@ -330,7 +330,7 @@ async fn tx_placement_best_row_does_not_star_an_idle_owner() {
 }
 
 /// Plan Phase 4: the same keyed/idle distinction in the top-10 zoom table's
-/// `Live` column, which shipped with the `*` suffix and no test.
+/// `Assigned` column, which shipped with the `*` suffix and no test.
 #[tokio::test]
 async fn placement_zoom_live_column_stars_a_keyed_owner() {
     let mut app = new_app().await;
@@ -349,7 +349,7 @@ async fn placement_zoom_live_column_stars_a_keyed_owner() {
     let row = zoom_table_row(&buf, "1480").expect("occupied candidate row");
     assert!(
         row.contains("=JA1ABC*"),
-        "the Live column must star a keyed owner: {row}"
+        "the Assigned column must star a keyed owner: {row}"
     );
 }
 
@@ -363,7 +363,7 @@ async fn tx_placement_best_row_is_untagged_without_live_assignments() {
     assert!(!row.contains('='), "got {row}");
 }
 
-/// Plan Phase 4: the top-10 zoom table's `Live` column names the owner of an
+/// Plan Phase 4: the top-10 zoom table's `Assigned` column names the owner of an
 /// occupied candidate and renders the placeholder for a free one.
 #[tokio::test]
 async fn placement_zoom_table_has_a_live_column_naming_the_owner() {
@@ -374,7 +374,9 @@ async fn placement_zoom_table_has_a_live_column_naming_the_owner() {
     app.zoomed = true;
 
     let buf = render(&app, 120, 40);
-    assert!(contains(&buf, "Live"), "Live header column");
+    assert!(contains(&buf, "Assigned"), "Assigned header column");
+    assert!(!contains(&buf, "Quiet"));
+    assert!(!contains(&buf, "Live"));
     let occupied = zoom_table_row(&buf, "1480").expect("occupied candidate row");
     assert!(
         occupied.contains("=JA1ABC"),
@@ -388,6 +390,24 @@ async fn placement_zoom_table_has_a_live_column_naming_the_owner() {
     assert!(
         free.contains('-'),
         "free rows render the placeholder: {free}"
+    );
+    let header = row_containing(&buf, "Assigned").unwrap();
+    let assigned_column = header
+        .chars()
+        .collect::<Vec<_>>()
+        .windows("Assigned".len())
+        .position(|s| s.iter().collect::<String>() == "Assigned")
+        .unwrap();
+    assert_eq!(occupied.chars().nth(assigned_column), Some('='));
+    assert_eq!(free.chars().nth(assigned_column), Some('-'));
+    assert_eq!(
+        occupied
+            .chars()
+            .skip(assigned_column)
+            .take(16)
+            .collect::<String>()
+            .trim(),
+        "=JA1ABC"
     );
 }
 
@@ -500,7 +520,7 @@ async fn stream_marker_label_does_not_erase_the_next_stream_marker() {
 }
 
 /// Compound/portable calls (`VK9/G4ABC/P`) are exactly the stations this
-/// instrument exists to help work. A 10-wide `Live` column silently truncated
+/// instrument exists to help work. A 10-wide `Assigned` column silently truncated
 /// them to a DIFFERENT, still-plausible callsign, with ~60 columns unused.
 #[tokio::test]
 async fn placement_zoom_live_column_fits_a_compound_callsign() {
@@ -515,4 +535,21 @@ async fn placement_zoom_live_column_fits_a_compound_callsign() {
         row.contains("=VK9/G4ABC/P"),
         "compound callsign must not be truncated: {row}"
     );
+}
+
+#[tokio::test]
+async fn placement_zoom_loading_and_empty_snapshot_remain_honest() {
+    let mut app = new_app().await;
+    app.active_panel = ActivePanel::TxPlacement;
+    app.zoomed = true;
+    assert!(contains(
+        &render(&app, 120, 40),
+        "Waiting for TX-placement data"
+    ));
+    app.apply_placement(placement_view(&[]));
+    let buf = render(&app, 120, 40);
+    assert!(contains(&buf, "Assigned"));
+    assert!(!contains(&buf, "Quiet"));
+    assert!(!contains(&buf, "Live"));
+    assert!(contains(&buf, "no clear placement candidates yet"));
 }
