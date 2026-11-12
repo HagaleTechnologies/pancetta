@@ -1945,6 +1945,7 @@ mod tests {
     #[test]
     fn test_encode_dxpedition_contacts_matches_ft8lib_symbols() {
         let mut reference = [0u8; NUM_SYMBOLS];
+        // SAFETY: payload has 10 live bytes and the exclusive output has 79 bytes; C retains neither pointer.
         unsafe {
             crate::ft8_lib_ffi::ft8_encode(
                 DXPEDITION_REFERENCE_PAYLOAD.as_ptr(),

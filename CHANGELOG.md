@@ -8,7 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
+<<<<<<< HEAD
 - Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
+=======
+- PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
+>>>>>>> 69c84e618b719b0dc916bb16ade4ef149b4dd3c3
 
 ### Added
 
@@ -24,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
 - PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.
 - PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.

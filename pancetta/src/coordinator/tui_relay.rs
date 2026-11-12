@@ -1449,6 +1449,11 @@ impl super::ApplicationCoordinator {
         // the operator's `SetFrequency` share one QSY helper and one lock, so
         // a band key cannot interleave between a spot QSY and its call. See
         // `coordinator/spot_call.rs`.
+        let qrz_ctx = super::qrz_lookup::QrzLookupCtx::new(
+            self.config.clone(),
+            cmd_tui_msg_tx.clone(),
+            self.qrz_xml_base_url_override.clone(),
+        );
         let spot_ctx = super::spot_call::SpotCallCtx {
             qsy: super::spot_call::QsyCtx {
                 bus: cmd_message_bus.clone(),
@@ -1835,6 +1840,9 @@ impl super::ApplicationCoordinator {
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::LookupCallsign { callsign } => {
+                            super::qrz_lookup::handle_lookup_callsign(&qrz_ctx, callsign).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::CallNetworkSpot {
                             callsign,
@@ -3585,6 +3593,7 @@ impl super::ApplicationCoordinator {
         // Run the TUI on a blocking task (it takes over the terminal)
         let tui_config_lock = config.read().await;
         let tui_config = pancetta_tui::Config {
+            replay: self.replay_mode(),
             station: pancetta_tui::config::StationConfig {
                 call_sign: tui_config_lock.station.callsign.clone(),
                 grid_square: tui_config_lock.station.grid_square.clone(),

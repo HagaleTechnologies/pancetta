@@ -87,20 +87,43 @@ Both sections are described in
 
 ### `unsafe` Code
 
-Production code contains `unsafe` in three files:
+Production Rust unsafe blocks occur in these six files:
 
-- `pancetta-ft8/src/ft8_lib_ffi.rs` — FFI to the bundled `ft8_lib` C
-  decoder. The C struct layouts are pinned by compile-time size asserts, and
-  decoded text is read only within a bounded buffer.
-- `pancetta/src/runtime.rs` — the Linux `setpriority` call.
-- `pancetta-agent/src/arm.rs` — `clock_gettime`.
+- `pancetta-ft8/src/ft8_lib_ffi.rs`: bindings to the bundled C decoder,
+  compiled when `not(ft8lib_stub)`. C layouts have compile-time size asserts;
+  text reads are bounded. A private `MonitorGuard` uniquely owns each initialized
+  monitor and calls `monitor_free` on normal return, early return and Rust unwind.
+  It cannot recover from C allocation failure, abort or process termination.
+- `pancetta/src/runtime.rs`: Linux `setpriority`.
+- `pancetta-agent/src/arm.rs`: Linux, Android and Apple `clock_gettime` for the suspend-aware clock.
+- `pancetta/src/responsibility.rs`: macOS responsibility lookup and process relaunch.
+- `pancetta/src/mic_access.rs`: macOS Objective-C microphone authorization calls.
+- `pancetta/src/doctor.rs`: macOS Objective-C microphone authorization lookup.
 
-Only the `arm.rs` site carries a `SAFETY:` comment. The FFI module has no
-per-block justification comments; its safeguards are the layout asserts and
-the bounded-buffer text reader described above. The `runtime.rs` call has no
-justification comment either. `pancetta-protocol` forbids
-`unsafe_code` and `pancetta-qso` denies it. Independent review of the FFI
-boundary is welcome.
+The FT8 and main library and binary roots warn on
+`clippy::undocumented_unsafe_blocks` and deny it when compiled by Clippy.
+The Clippy-only deny prevents the crate warning from overriding CI's deny flag.
+CI checks all targets with
+`-D clippy::undocumented_unsafe_blocks`. Each unsafe block has a `SAFETY:`
+explanation. macOS-only sites also require native macOS checking; a Linux
+Clippy run does not compile them. Unsafe callback types and the explicit
+`unsafe extern "C"` declaration in the binding are declarations, not blocks.
+
+Test-only C encoder calls occur in `pancetta-ft8/src/encoder.rs`,
+`pancetta-ft8/tests/dxpedition_type01.rs` and
+`pancetta/src/coordinator/qso.rs`. Process-control tests also use unsafe
+in `pancetta/src/responsibility.rs` and `pancetta/tests/shutdown_signals.rs`.
+The FFI module also tests valid owned
+waterfall reads. The accuracy helper uses an atomic LCG without unsafe.
+`pancetta-research/src/tier_slots.rs` uses documented Unix `flock` calls;
+that local research harness is excluded from CI.
+
+`pancetta-tui`, `pancetta-config`, `pancetta-dx`, `pancetta-cqdx`,
+`pancetta-dsp`, `pancetta-hamlib` and `pancetta-core` forbid `unsafe_code`,
+as does `pancetta-protocol`. `pancetta-qso` denies it. These policies apply
+to those libraries, not the bundled C code or all transitive dependencies.
+Source inventory searches classify executable code separately from comments,
+strings, callback types and extern declarations.
 
 ## Coordinated Disclosure
 

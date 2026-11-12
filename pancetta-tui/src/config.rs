@@ -6,6 +6,9 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Runtime-only replay session state, supplied before the first TUI draw.
+    #[serde(skip)]
+    pub replay: bool,
     pub station: StationConfig,
     pub ui: UiConfig,
     pub audio: AudioConfig,
@@ -111,6 +114,7 @@ pub enum FrequencyFormat {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            replay: false,
             station: StationConfig {
                 call_sign: "N0CALL".to_string(),
                 grid_square: "FN20".to_string(),
@@ -408,6 +412,20 @@ mod tests {
 
         assert_eq!(config.station.call_sign, loaded_config.station.call_sign);
         assert_eq!(config.ui.theme as u8, loaded_config.ui.theme as u8);
+    }
+
+    #[test]
+    fn replay_is_runtime_only_and_defaults_to_false() {
+        assert!(!Config::default().replay);
+        let config = Config {
+            replay: true,
+            ..Config::default()
+        };
+        let temp_file = NamedTempFile::new().unwrap();
+        config.save(temp_file.path()).unwrap();
+        let saved = fs::read_to_string(temp_file.path()).unwrap();
+        assert!(!saved.contains("replay"));
+        assert!(!Config::load(temp_file.path()).unwrap().replay);
     }
 
     #[test]

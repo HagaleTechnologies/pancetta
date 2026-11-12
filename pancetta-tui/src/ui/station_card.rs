@@ -1,6 +1,7 @@
 //! The focused station's card has four content lines: callsign and status,
 //! ranking reason, grid/distance/last-heard message, and QSO or call action.
-//! Hunt view reserves all four lines; Operate clips to its available height.
+//! A cached QRZ identity adds a fifth line. Hunt reserves room for it;
+//! without QRZ it reserves four lines; Operate clips to its available height.
 //!
 //! **Documented spec divergence:** the original design (spec §4) sources
 //! "what they're doing right now" from the coordinator's `DxActivityMap`.
@@ -77,9 +78,16 @@ pub fn upload_detail_lines(
     }
 }
 
+/// Cached identity for the same focus used by the card and layout.
+pub(crate) fn focused_qrz_info(app: &App) -> Option<&crate::app::QrzStationInfo> {
+    let call = app.focused_callsign()?;
+    app.qrz_stations.get(&call.trim().to_uppercase())
+}
+
 /// Render four content lines: call/entity/status, ranking reason,
 /// grid/distance/last-message, and engagement or transmit window;
-/// one fallback line when nothing is focused.
+/// an optional QRZ identity line after the callsign, or one fallback line
+/// when nothing is focused.
 pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let block = create_panel_block("Station", false, app);
     let inner = block.inner(area);
@@ -103,7 +111,17 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let line3 = render_line3(app, &call, last_decode);
 
     let why = render_why_line(app, inner.width, chrono::Utc::now());
-    let paragraph = Paragraph::new(vec![line1, why, line2, line3]);
+    let mut lines = vec![line1];
+    if let Some(info) = focused_qrz_info(app) {
+        let parts: Vec<&str> = [&info.name, &info.qth, &info.grid, &info.country]
+            .into_iter()
+            .filter_map(|s| s.as_deref())
+            .filter(|s| !s.is_empty())
+            .collect();
+        lines.push(Line::from(format!("QRZ: {}", parts.join(" · "))));
+    }
+    lines.extend([why, line2, line3]);
+    let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, inner);
 
     Ok(())
@@ -507,6 +525,88 @@ pub(in crate::ui) mod tests {
         assert!(clipped.contains("QRZ Logbook: pending"), "{clipped}");
         assert!(clipped.ends_with('\u{2026}'), "{clipped}");
         assert!(clipped.chars().count() <= 40, "{clipped}");
+    }
+
+    #[tokio::test]
+    async fn qrz_line_is_second_and_only_for_focused_station() {
+        let mut app = ranked_app("DL1ABC", true, false).await;
+        assert!(!buffer_contains(&render_at(&app, 130, 7), "QRZ:"));
+        app.qrz_stations.insert(
+            "DL1ABC".into(),
+            crate::app::QrzStationInfo {
+                name: Some("Hans Müller".into()),
+                qth: Some("Amberg".into()),
+                grid: Some("JO62jk".into()),
+                country: Some("Germany".into()),
+                state: None,
+            },
+        );
+        let buf = render_at(&app, 130, 7);
+        assert!(row(&buf, 2).contains("QRZ: Hans Müller · Amberg · JO62jk · Germany"));
+        assert!(row(&buf, 3).contains("Why:"));
+        app.dx_stations.clear();
+        app.add_decoded_message(fixture_view("JA1ABC", -7))
+            .await
+            .unwrap();
+        assert!(!buffer_contains(&render_at(&app, 130, 7), "QRZ:"));
+        app.qrz_stations.insert(
+            "JA1ABC".into(),
+            crate::app::QrzStationInfo {
+                country: Some("Japan".into()),
+                ..Default::default()
+            },
+        );
+        let buf = render_at(&app, 130, 7);
+        assert!(buffer_contains(&buf, "QRZ: Japan"));
+        assert!(!buffer_contains(&buf, "Amberg"));
+    }
+
+    #[tokio::test]
+    async fn hunt_lookup_preserves_transmit_window() {
+        let mut app = ranked_app("DL1ABC", true, false).await;
+        app.qrz_stations.insert(
+            "DL1ABC".into(),
+            crate::app::QrzStationInfo {
+                name: Some("Hans".into()),
+                qth: Some("Amberg".into()),
+                ..Default::default()
+            },
+        );
+        let backend = TestBackend::new(130, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| super::super::layout_hunt(f, f.area(), &app).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(buffer_contains(buf, "QRZ: Hans · Amberg"));
+        assert!(buffer_contains(buf, "Why:"));
+        assert!(buffer_contains(buf, "CQ DL1ABC"));
+        assert!(buffer_contains(buf, "E-window · Space=call"));
+        app.active_qsos.push(fixture_banner("DL1ABC", "wait rpt"));
+        terminal
+            .draw(|f| super::super::layout_hunt(f, f.area(), &app).unwrap())
+            .unwrap();
+        assert!(buffer_contains(
+            terminal.backend().buffer(),
+            "in QSO: wait rpt"
+        ));
+
+        let area = Rect::new(0, 0, 130, 40);
+        let rects = super::super::compute_hunt_rects(area, true);
+        assert_eq!(rects.station_card.unwrap().height, 7);
+        assert_eq!(
+            super::super::hit_test(
+                crate::view::ActiveView::Hunt,
+                false,
+                app.active_panel,
+                area,
+                None,
+                rects.qso_status.x + 2,
+                rects.qso_status.y + 2,
+                true,
+            ),
+            Some((ActivePanel::QsoStatus, 0))
+        );
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ pub use hamlib::apply_receive_gain_preset;
 mod health;
 mod pipeline;
 mod psk_reporter;
+mod qrz_lookup;
 mod qso;
 #[doc(hidden)]
 pub use qso::{prepare_local_qso_index, LocalIndex};

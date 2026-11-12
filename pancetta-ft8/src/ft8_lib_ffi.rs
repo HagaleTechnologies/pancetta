@@ -183,7 +183,7 @@ pub struct ftx_message_offsets_t {
 
 // Real FFI symbols — only when the C library was actually compiled.
 #[cfg(not(ft8lib_stub))]
-extern "C" {
+unsafe extern "C" {
     // Encoding
     pub fn ft8_encode(payload: *const u8, tones: *mut u8);
     pub fn ftx_message_init(msg: *mut ftx_message_t);
@@ -223,6 +223,38 @@ extern "C" {
     pub fn monitor_free(me: *mut monitor_t);
 }
 
+// The C struct contains heap pointers but no pointers into its own storage.
+// Moving it preserves those allocations. Only this owner calls monitor_free.
+#[cfg(not(ft8lib_stub))]
+struct MonitorGuard(monitor_t);
+
+#[cfg(not(ft8lib_stub))]
+impl MonitorGuard {
+    fn new(cfg: &monitor_config_t) -> Self {
+        // SAFETY: all fields admit zero, including null raw pointers and protocol
+        // discriminant 0 (FT4). monitor_init fills the C-owned fields before use.
+        let mut mon: monitor_t = unsafe { std::mem::zeroed() };
+        // SAFETY: mon is writable, cfg is live for this synchronous call. Callers
+        // use 12 kHz, positive OSRs and an in-Nyquist band; C retains no cfg pointer.
+        unsafe { monitor_init(&mut mon, cfg) };
+        Self(mon)
+    }
+}
+
+#[cfg(not(ft8lib_stub))]
+impl Drop for MonitorGuard {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns a successfully initialized monitor. All C
+        // borrows have ended and this is its only free, including during unwind.
+        unsafe { monitor_free(&mut self.0) };
+        #[cfg(test)]
+        MONITOR_RELEASES.set(MONITOR_RELEASES.get() + 1);
+    }
+}
+
+#[cfg(all(test, not(ft8lib_stub)))]
+thread_local! { static MONITOR_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 // ============================================================================
 // Hash interface callbacks (no-op — we don't maintain a hash table)
 // ============================================================================
@@ -251,11 +283,15 @@ fn make_hash_interface() -> ftx_callsign_hash_interface_t {
 #[cfg(not(ft8lib_stub))]
 pub fn ft8lib_encode(message: &str) -> Option<[u8; 79]> {
     let c_msg = CString::new(message).ok()?;
+    // SAFETY: All fields are integers, floats or integer arrays, for which zero is valid.
     let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
+    // SAFETY: msg is an exclusive writable C-layout message; C retains no pointer.
     unsafe { ftx_message_init(&mut msg) };
 
     let mut hash_if = make_hash_interface();
 
+    // SAFETY: msg is writable, c_msg is NUL-terminated and live, and the live hash
+    // callbacks do not dereference or retain pointers.
     let rc = unsafe { ftx_message_encode(&mut msg, &mut hash_if, c_msg.as_ptr()) };
 
     if rc != ftx_message_rc_t::FTX_MESSAGE_RC_OK {
@@ -263,6 +299,8 @@ pub fn ft8lib_encode(message: &str) -> Option<[u8; 79]> {
     }
 
     let mut tones = [0u8; 79];
+    // SAFETY: The live payload has 10 bytes and the exclusive tones buffer has 79 bytes, as
+    // required by C; no pointers are retained.
     unsafe { ft8_encode(msg.payload.as_ptr(), tones.as_mut_ptr()) };
 
     Some(tones)
@@ -272,10 +310,14 @@ pub fn ft8lib_encode(message: &str) -> Option<[u8; 79]> {
 #[cfg(not(ft8lib_stub))]
 pub fn ft8lib_encode_payload(message: &str) -> Option<[u8; 10]> {
     let c_msg = CString::new(message).ok()?;
+    // SAFETY: All fields are integers, floats or integer arrays, for which zero is valid.
     let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
+    // SAFETY: msg is an exclusive writable C-layout message; C retains no pointer.
     unsafe { ftx_message_init(&mut msg) };
 
     let mut hash_if = make_hash_interface();
+    // SAFETY: msg is writable, c_msg is NUL-terminated and live, and the live hash
+    // callbacks do not dereference or retain pointers.
     let rc = unsafe { ftx_message_encode(&mut msg, &mut hash_if, c_msg.as_ptr()) };
 
     if rc != ftx_message_rc_t::FTX_MESSAGE_RC_OK {
@@ -295,8 +337,11 @@ pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
 
     let mut hash_if = make_hash_interface();
     let mut text_buf = [0u8; 35];
+    // SAFETY: All fields are integers, floats or integer arrays, for which zero is valid.
     let mut offsets: ftx_message_offsets_t = unsafe { std::mem::zeroed() };
 
+    // SAFETY: msg and no-op hash callbacks are live; text_buf has 35 writable bytes,
+    // offsets is a writable C-layout output, and C retains no pointers.
     let rc = unsafe {
         ftx_message_decode(
             &msg,
@@ -333,10 +378,16 @@ const FT8_ND: usize = 58;
 ///
 /// ft8_lib's default build stores magnitudes as `uint8_t` and recovers the
 /// dB value as `mag * 0.5 - 120.0` (see `WF_ELEM_MAG` in `ft8/decode.h`).
+///
+/// # Safety
+/// `mag` must point into a live initialized u8 allocation, with `idx` selecting
+/// an initialized cell in that allocation. Pointer arithmetic must stay within
+/// it, and no concurrent mutation or free may occur during this read.
 #[cfg(not(ft8lib_stub))]
 #[inline]
 unsafe fn wf_mag_db(mag: *const u8, idx: usize) -> f64 {
-    f64::from(*mag.add(idx)) * 0.5 - 120.0
+    // SAFETY: the caller guarantees an initialized in-allocation cell and no mutation.
+    f64::from(unsafe { *mag.add(idx) }) * 0.5 - 120.0
 }
 
 /// Estimate SNR (dB, referenced to a 2500 Hz noise bandwidth, WSJT-X
@@ -363,8 +414,13 @@ unsafe fn wf_mag_db(mag: *const u8, idx: usize) -> f64 {
 ///
 /// Returns `None` if the candidate's tone bins or symbol blocks fall
 /// outside the waterfall (so the caller can fall back rather than read OOB).
+///
+/// # Safety
+/// `wf` must describe a live monitor-owned waterfall with initialized blocks,
+/// unmodified C geometry, and a candidate returned by that waterfall's search.
+/// No concurrent writes or free are permitted during this call.
 #[cfg(not(ft8lib_stub))]
-fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> Option<f64> {
+unsafe fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> Option<f64> {
     if wf.mag.is_null() {
         return None;
     }
@@ -407,6 +463,9 @@ fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> 
         let mut peak = 0.0f64;
         let mut peak_idx = 0usize;
         for (t, slot) in lin.iter_mut().enumerate() {
+            // SAFETY: The live C monitor allocated max_blocks * block_stride bytes;
+            // processed blocks are initialized. C search bounds subcoordinates by
+            // OSRs, and the checks above bound block and tone indices.
             let db = unsafe { wf_mag_db(wf.mag, (sym_off as usize) + t) };
             let p = 10.0f64.powf(db / 10.0);
             *slot = p;
@@ -509,14 +568,16 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
         protocol,
     };
 
-    let mut mon: monitor_t = unsafe { std::mem::zeroed() };
-    unsafe { monitor_init(&mut mon, &cfg) };
+    let mut guard = MonitorGuard::new(&cfg);
+    let mon = &mut guard.0;
 
     // Feed audio in block_size chunks
     let block_size = mon.block_size as usize;
     let mut offset = 0;
     while offset + block_size <= samples.len() {
-        unsafe { monitor_process(&mut mon, samples[offset..].as_ptr()) };
+        // SAFETY: mon is exclusively owned by guard; the loop guarantees block_size
+        // live f32 samples, consumed synchronously without retaining the input.
+        unsafe { monitor_process(mon, samples[offset..].as_ptr()) };
         offset += block_size;
     }
 
@@ -534,6 +595,9 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
     ];
 
     let n_found =
+        // SAFETY: guard owns the processed waterfall; the exclusive heap has
+        // num_candidates writable entries. C bounds its writes and returned count by
+        // that capacity.
         unsafe { ftx_find_candidates(&mon.wf, num_candidates as i32, candidates.as_mut_ptr(), 0) };
 
     // Decode each candidate
@@ -544,15 +608,23 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
     // form mirrors the ft8_lib C API and keeps this hot FFI loop unambiguous.
     #[allow(clippy::needless_range_loop)]
     for i in 0..n_found as usize {
+        // SAFETY: All fields are integers, floats or integer arrays, for which zero is valid.
         let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
+        // SAFETY: status contains only floats and integers, all valid when zero.
         let mut status: ftx_decode_status_t = unsafe { std::mem::zeroed() };
 
         let ok =
+            // SAFETY: The waterfall is live under guard, candidate came from its
+            // search, and msg/status are exclusive C-layout output buffers; C
+            // retains no pointers.
             unsafe { ftx_decode_candidate(&mon.wf, &candidates[i], 25, &mut msg, &mut status) };
 
         if ok {
             let mut text_buf = [0u8; 35];
+            // SAFETY: All fields are integers, floats or integer arrays, for which zero is valid.
             let mut offsets: ftx_message_offsets_t = unsafe { std::mem::zeroed() };
+            // SAFETY: msg and no-op callbacks are live; the exclusive output buffers
+            // have the required 35-byte text capacity and C offsets layout.
             let rc = unsafe {
                 ftx_message_decode(
                     &msg,
@@ -615,7 +687,10 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
                 // Real SNR from the waterfall at the decoded position; fall
                 // back to the native estimator's -24 dB floor when the
                 // candidate position is out of the waterfall's range.
-                let snr_db = estimate_snr_from_waterfall(&mon.wf, cand).unwrap_or(-24.0) as f32;
+                // SAFETY: guard still owns the processed waterfall, unchanged since search;
+                // cand came from that search and no C mutation occurs during SNR reads.
+                let snr_db =
+                    unsafe { estimate_snr_from_waterfall(&mon.wf, cand) }.unwrap_or(-24.0) as f32;
 
                 // Deduplicate
                 if !messages.iter().any(
@@ -640,8 +715,6 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
             }
         }
     }
-
-    unsafe { monitor_free(&mut mon) };
 
     messages
 }
@@ -689,18 +762,15 @@ pub fn ft8lib_find_candidate_seeds(
         protocol,
     };
 
-    let mut mon: monitor_t = unsafe { std::mem::zeroed() };
-    unsafe { monitor_init(&mut mon, &cfg) };
+    let mut guard = MonitorGuard::new(&cfg);
+    let mon = &mut guard.0;
 
-    // `monitor_init` mallocs `window`, `last_frame`, `wf.mag` and the kiss_fft
-    // config (monitor.c:37-45,66,75,83), and this runs once per decode window in
-    // a long-lived process. Everything between here and `monitor_free` below is
-    // deliberately panic-free and infallible — no `?`, no fallible call — so the
-    // single exit path is the only exit path.
     let block_size = mon.block_size as usize;
     let mut offset = 0;
     while offset + block_size <= samples.len() {
-        unsafe { monitor_process(&mut mon, samples[offset..].as_ptr()) };
+        // SAFETY: mon is exclusively owned by guard; the loop guarantees block_size
+        // live f32 samples, consumed synchronously without retaining the input.
+        unsafe { monitor_process(mon, samples[offset..].as_ptr()) };
         offset += block_size;
     }
 
@@ -716,6 +786,9 @@ pub fn ft8lib_find_candidate_seeds(
     ];
 
     let n_found =
+        // SAFETY: guard owns the processed waterfall; the exclusive heap has
+        // num_candidates writable entries. C bounds its writes and returned count by
+        // that capacity.
         unsafe { ftx_find_candidates(&mon.wf, num_candidates as i32, heap.as_mut_ptr(), 0) };
     let n_found = (n_found.max(0) as usize).min(num_candidates);
 
@@ -742,8 +815,6 @@ pub fn ft8lib_find_candidate_seeds(
         block_size: mon.block_size,
         symbol_period: mon.symbol_period,
     };
-
-    unsafe { monitor_free(&mut mon) };
 
     set
 }
@@ -810,7 +881,99 @@ pub fn ft8lib_is_available() -> bool {
 
 #[cfg(all(test, not(ft8lib_stub)))]
 mod tests {
-    use super::cstr_from_fixed_buf;
+    use super::*;
+
+    fn config(protocol: ftx_protocol_t) -> monitor_config_t {
+        monitor_config_t {
+            f_min: 100.0,
+            f_max: 3000.0,
+            sample_rate: 12000,
+            time_osr: 2,
+            freq_osr: 2,
+            protocol,
+        }
+    }
+
+    fn protocols() -> [ftx_protocol_t; 2] {
+        [
+            ftx_protocol_t::FTX_PROTOCOL_FT8,
+            ftx_protocol_t::FTX_PROTOCOL_FT4,
+        ]
+    }
+
+    #[test]
+    fn monitor_guard_releases_on_return() {
+        for protocol in protocols() {
+            let before = MONITOR_RELEASES.get();
+            {
+                let _guard = MonitorGuard::new(&config(protocol));
+            }
+            assert_eq!(MONITOR_RELEASES.get(), before + 1);
+        }
+    }
+
+    #[test]
+    fn monitor_guard_releases_on_early_return() {
+        fn early(protocol: ftx_protocol_t) -> bool {
+            let _guard = MonitorGuard::new(&config(protocol));
+            if true {
+                return true;
+            }
+            false
+        }
+        for protocol in protocols() {
+            let before = MONITOR_RELEASES.get();
+            assert!(early(protocol));
+            assert_eq!(MONITOR_RELEASES.get(), before + 1);
+        }
+    }
+
+    #[test]
+    fn monitor_guard_releases_on_unwind() {
+        for protocol in protocols() {
+            let before = MONITOR_RELEASES.get();
+            let result = std::panic::catch_unwind(|| {
+                let _guard = MonitorGuard::new(&config(protocol));
+                panic!("exercise Rust unwind");
+            });
+            assert!(result.is_err());
+            assert_eq!(MONITOR_RELEASES.get(), before + 1);
+        }
+    }
+
+    #[test]
+    fn wrapper_paths_release_monitors() {
+        for protocol in protocols() {
+            let samples = vec![0.0; 12000 * 15];
+            let before = MONITOR_RELEASES.get();
+            let empty = ft8lib_find_candidate_seeds(&samples, protocol, 0);
+            assert!(empty.seeds.is_empty());
+            assert_eq!(MONITOR_RELEASES.get(), before);
+            assert!(ft8lib_decode_audio_protocol(&samples, protocol).is_empty());
+            assert_eq!(MONITOR_RELEASES.get(), before + 1);
+            let set = ft8lib_find_candidate_seeds(&samples, protocol, 10);
+            assert_eq!(MONITOR_RELEASES.get(), before + 2);
+            assert_eq!(set.time_osr, 2);
+            assert_eq!(set.freq_osr, 2);
+            assert_eq!(
+                set.block_size,
+                if protocol == ftx_protocol_t::FTX_PROTOCOL_FT8 {
+                    1920
+                } else {
+                    576
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn wf_mag_db_reads_owned_cells() {
+        let cells = [0u8, 240, 255];
+        for (idx, expected) in [-120.0, 0.0, 7.5].into_iter().enumerate() {
+            // SAFETY: idx is in this live initialized array, which is not mutated.
+            assert_eq!(unsafe { wf_mag_db(cells.as_ptr(), idx) }, expected);
+        }
+    }
 
     #[test]
     fn fixed_buf_with_in_bounds_nul_returns_prefix() {
