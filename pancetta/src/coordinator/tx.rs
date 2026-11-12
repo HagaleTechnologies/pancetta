@@ -9367,7 +9367,7 @@ impl super::ApplicationCoordinator {
 
     /// The injected clock is sampled under the arm lock during playback.
     /// Production supplies ArmTime::now; tests share the accepted arm's timeline.
-    async fn start_transmitter_component_with_clock(
+    pub(super) async fn start_transmitter_component_with_clock(
         &mut self,
         arm_clock: std::sync::Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
     ) -> Result<()> {

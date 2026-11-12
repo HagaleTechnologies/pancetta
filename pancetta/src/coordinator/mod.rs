@@ -5622,3 +5622,7 @@ pub(crate) mod audit_test_util {
 }
 
 mod contest;
+
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+pub mod testing;
