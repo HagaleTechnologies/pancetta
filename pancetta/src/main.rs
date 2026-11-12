@@ -3044,159 +3044,247 @@ async fn doctor_command(cli: &Cli) -> Result<()> {
 }
 
 async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
-    use std::time::Duration;
+    test_rig_inner(args, cli)
+        .await
+        .map_err(|e| anyhow::anyhow!("Rig test failed: {e:#}"))
+}
 
-    println!();
+async fn test_rig_inner(args: TestRigArgs, cli: &Cli) -> Result<()> {
+    use pancetta_config::rig::PttMethod;
+    use pancetta_hamlib::{PttState, RigControl, RigctldClient, RigctldConfig, Vfo};
+    use std::io::Write;
+
     println!("=== Pancetta Rig Test ===");
-    println!();
-
-    // Load config to get rig settings
     let config = load_configuration(cli).await?;
-
-    if !config.rig.interface.enabled {
-        println!("Rig control is disabled in configuration.");
-        println!("Run 'pancetta setup' to configure your rig, or set rig.interface.enabled = true");
-        return Ok(());
-    }
-
-    let port_name = &config.rig.interface.port;
-    let baud_rate = config.rig.interface.baud_rate;
-
+    anyhow::ensure!(
+        config.rig.interface.enabled,
+        "rig control is disabled; set rig.interface.enabled = true"
+    );
+    let endpoint = RigctldConfig {
+        host: std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        port: std::env::var("RIGCTLD_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(4532),
+        // A diagnostic must not replay an ambiguous key-down.
+        retry_count: 1,
+        ..Default::default()
+    };
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
     println!("Rig model:  {}", config.rig.model);
-    println!("Port:       {}", port_name);
-    println!("Baud rate:  {}", baud_rate);
+    println!("rigctld:    {address}");
     println!("PTT method: {:?}", config.rig.ptt.method);
-    println!();
-
-    // Step 1: Check serial port exists
-    print!("[1/4] Checking serial port... ");
-    match serialport::available_ports() {
-        Ok(ports) => {
-            let found = ports.iter().any(|p| p.port_name == *port_name);
-            if found {
-                println!("FOUND");
-            } else {
-                println!("NOT FOUND");
-                println!();
-                println!("  Available ports:");
-                if ports.is_empty() {
-                    println!("    (none detected)");
-                } else {
-                    for p in &ports {
-                        println!("    {}", p.port_name);
-                    }
-                }
-                println!();
-                println!(
-                    "  Check your USB cable and run 'pancetta setup' to select the right port."
-                );
-                return Ok(());
-            }
-        }
-        Err(e) => {
-            println!("ERROR ({})", e);
-            return Ok(());
-        }
+    let rig = RigctldClient::new(endpoint);
+    print!("[1/3] Connecting to rigctld... ");
+    std::io::stdout().flush()?;
+    if let Err(e) = rig.connect().await {
+        println!("FAILED");
+        anyhow::bail!("cannot connect to rigctld at {address}: {e:#}");
     }
-
-    // Step 2: Open serial port
-    print!("[2/4] Opening serial port... ");
-    let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_secs(2))
-        .open();
-
-    let mut port = match port {
-        Ok(p) => {
-            println!("OK");
-            p
-        }
+    println!("OK");
+    print!("[2/3] Reading frequency... ");
+    std::io::stdout().flush()?;
+    let frequency = match rig.get_frequency(Vfo::Current).await {
+        Ok(f) => f,
         Err(e) => {
             println!("FAILED");
-            println!();
-            match e.kind() {
-                serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => {
-                    println!(
-                        "  Permission denied. You may need to add your user to the 'dialout' group"
-                    );
-                    println!("  or check device permissions on {}.", port_name);
-                }
-                serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
-                    println!(
-                        "  Device not found. The rig may be powered off or USB cable disconnected."
-                    );
-                }
-                _ => {
-                    println!("  Error: {}", e);
-                }
-            }
-            return Ok(());
+            anyhow::bail!("cannot read frequency: {e:#}");
         }
     };
-
-    // Step 3: Try reading from port (check if rig is sending data)
-    print!("[3/4] Listening for rig data (2s)... ");
-    let mut buf = vec![0u8; 256];
-    match port.read(&mut buf) {
-        Ok(n) => {
-            println!("OK ({} bytes received)", n);
-            // Show first few bytes as hex for debugging
-            let hex: Vec<String> = buf[..n.min(16)]
-                .iter()
-                .map(|b| format!("{:02X}", b))
-                .collect();
-            println!("       Data: {}", hex.join(" "));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            println!("OK (no unsolicited data — normal for most rigs)");
-        }
-        Err(e) => {
-            println!("ERROR ({})", e);
-        }
-    }
-
-    // Step 4: PTT test (only if requested)
+    println!("OK ({frequency} Hz)");
     if args.ptt {
-        use pancetta_config::rig::PttMethod;
-
-        println!("[4/4] Testing PTT...");
+        anyhow::ensure!(
+            matches!(config.rig.ptt.method, PttMethod::Cat | PttMethod::Serial),
+            "PTT method {:?} cannot be tested by this command",
+            config.rig.ptt.method
+        );
+        println!("[3/3] Testing PTT...");
+        std::io::stdout().flush()?;
+        // Unlike the coordinator, this command has no polling cache.
+        let dial = rig
+            .get_frequency(Vfo::Current)
+            .await
+            .context("cannot read fresh frequency")?;
+        let (split, _) = rig
+            .get_split()
+            .await
+            .context("cannot determine split TX frequency")?;
+        let split_dial = if split {
+            let f = rig
+                .get_split_freq()
+                .await
+                .context("cannot determine split TX frequency")?;
+            anyhow::ensure!(
+                f != 0,
+                "cannot determine split TX frequency: unknown frequency"
+            );
+            f
+        } else {
+            0
+        };
+        let rf = test_rig_admit_ptt(dial, split_dial, &config.rig.frequency.band_plan)?;
+        println!("       Band-plan check: OK ({rf} Hz)");
+        // Register the handler before key-down so Ctrl+C during I/O also cleans up.
+        let interrupted = signal::ctrl_c();
+        tokio::pin!(interrupted);
+        // Poll once to install Tokio's process signal handler.
+        tokio::select! {
+            biased;
+            result = &mut interrupted => {
+                result.context("cannot install interrupt handler")?;
+                anyhow::bail!("PTT test interrupted");
+            }
+            _ = std::future::ready(()) => {}
+        }
         match config.rig.ptt.method {
-            PttMethod::None => {
-                println!(
-                    "       PTT method is 'none' — skipping. Configure PTT in 'pancetta setup'."
-                );
+            PttMethod::Cat => {
+                let on = rig.set_ptt(Vfo::Current, PttState::On).await;
+                let pulse = if on.is_ok() {
+                    // Closed output must never unwind past the unkey below.
+                    let _ = writeln!(std::io::stdout(), "       PTT ON for 1 second");
+                    std::io::stdout().flush().ok();
+                    test_rig_hold(&mut interrupted).await
+                } else {
+                    Ok(())
+                };
+                // The client command timeout bounds this cleanup, including after an
+                // ambiguous key-down failure or an interrupt.
+                let off = rig.set_ptt(Vfo::Current, PttState::Off).await;
+                test_rig_pulse_result("PTT", on, off, pulse)?;
+                println!("       PTT OFF");
             }
             PttMethod::Serial => {
-                println!("       Asserting RTS for 1 second...");
-                if let Err(e) = port.write_request_to_send(true) {
-                    println!("       RTS ON failed: {}", e);
-                } else {
-                    println!("       RTS ON — check your rig's TX indicator");
-                    std::thread::sleep(Duration::from_secs(1));
-                    let _ = port.write_request_to_send(false);
-                    println!("       RTS OFF");
-                }
+                let mut port =
+                    serialport::new(&config.rig.interface.port, config.rig.interface.baud_rate)
+                        .timeout(std::time::Duration::from_secs(2))
+                        .open()
+                        .context("cannot open Serial PTT port")?;
+                test_rig_rts_pulse(
+                    |on| port.write_request_to_send(on).map_err(Into::into),
+                    &mut interrupted,
+                )
+                .await?;
             }
-            PttMethod::Cat => {
-                println!(
-                    "       CAT PTT is keyed through rigctld, which this serial-port test does not use; PTT not keyed."
-                );
-                println!("       Serial port connectivity looks good though.");
-            }
-            PttMethod::Vox => {
-                println!("       VOX is audio-triggered — no serial test needed.");
-                println!("       VOX will activate when audio is sent to the rig.");
-            }
-            other => {
-                println!("       PTT method {:?} not supported in test mode.", other);
-            }
+            _ => unreachable!("PTT method checked above"),
         }
     } else {
-        println!("[4/4] PTT test: skipped (use --ptt to test)");
+        println!("[3/3] PTT test: skipped (use --ptt to test)");
     }
-
-    println!();
     println!("Rig test complete.");
     Ok(())
+}
+
+/// Gate shared by CAT and Serial; a diagnostic must never skip an unknown dial.
+fn test_rig_admit_ptt(
+    dial: u64,
+    split: u64,
+    plan: &pancetta_config::BandPlanConfig,
+) -> Result<u64> {
+    let rf = pancetta_qso::qso_manager::effective_tx_dial(dial, split);
+    anyhow::ensure!(rf != 0, "cannot determine TX frequency: unknown frequency");
+    if let Some(reason) = pancetta_lib::coordinator::tx_band_plan_mute_reason(rf as f64, 0.0, plan)
+    {
+        anyhow::bail!("{reason}");
+    }
+    Ok(rf)
+}
+
+async fn test_rig_hold(
+    interrupted: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        result = interrupted => {
+            result.context("cannot receive interrupt")?;
+            anyhow::bail!("PTT test interrupted");
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => Ok(()),
+    }
+}
+
+fn test_rig_pulse_result(
+    label: &str,
+    on: Result<()>,
+    off: Result<()>,
+    pulse: Result<()>,
+) -> Result<()> {
+    if let Err(off) = off {
+        let prior = on
+            .err()
+            .map(|e| format!("{label} ON failed: {e:#}; "))
+            .unwrap_or_default();
+        anyhow::bail!("{prior}{label} OFF failed; rig may still be keyed: {off:#}");
+    }
+    on.with_context(|| format!("{label} ON failed"))?;
+    pulse
+}
+
+async fn test_rig_rts_pulse(
+    mut set_rts: impl FnMut(bool) -> Result<()>,
+    interrupted: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<()> {
+    let on = set_rts(true);
+    let pulse = if on.is_ok() {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "       RTS ON for 1 second");
+        std::io::stdout().flush().ok();
+        test_rig_hold(interrupted).await
+    } else {
+        Ok(())
+    };
+    let off = set_rts(false);
+    test_rig_pulse_result("RTS", on, off, pulse)?;
+    println!("       RTS OFF");
+    Ok(())
+}
+
+#[cfg(test)]
+mod test_rig_tests {
+    use super::*;
+
+    #[test]
+    fn test_rig_unknown_and_cat_serial_admission() {
+        let plan = pancetta_config::BandPlanConfig::default();
+        // Both methods use this exact gate before opening/asserting PTT.
+        for _method in ["Cat", "Serial"] {
+            assert!(test_rig_admit_ptt(0, 0, &plan).is_err());
+            assert!(test_rig_admit_ptt(14_074_000, 30_000_000, &plan).is_err());
+            assert_eq!(
+                test_rig_admit_ptt(30_000_000, 14_074_000, &plan).unwrap(),
+                14_074_000
+            );
+        }
+        let bypass = pancetta_config::BandPlanConfig {
+            edge_warnings: false,
+            ..plan
+        };
+        assert!(test_rig_admit_ptt(0, 0, &bypass).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rig_serial_errors_attempt_cleanup() {
+        for (on_error, off_error) in [(true, false), (false, true), (true, true)] {
+            let mut calls = Vec::new();
+            let result = test_rig_rts_pulse(
+                |on| {
+                    calls.push(on);
+                    if (on && on_error) || (!on && off_error) {
+                        anyhow::bail!("fake serial error");
+                    }
+                    Ok(())
+                },
+                std::future::pending(),
+            )
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert_eq!(calls, [true, false]);
+            if on_error {
+                assert!(error.contains("RTS ON failed"));
+            }
+            if off_error {
+                assert!(error.contains("RTS OFF failed; rig may still be keyed"));
+            }
+        }
+    }
 }
 
 /// Install a process-wide panic hook so a panic ANYWHERE (including inside a

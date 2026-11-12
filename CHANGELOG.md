@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-340: `rig.model` now accepts any Hamlib model — a name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, `"Barrett 950"`), a manufacturer-qualified name, or a numeric Hamlib model ID (`"1045"`), so rigs newer than the bundled catalog still work by number. Case, hyphens and spaces are ignored when matching names; ambiguous names and all-digit model names require the manufacturer-qualified form or the numeric ID. Unknown, malformed or ambiguous values fail config validation with the closest matches and a `rigctl -l` numeric-ID hint, and `pancetta doctor` reports the same message. Selecting more models adds no hardware qualification: only the FTdx10 is radio-qualified. Empty and `Generic` keep their placeholder behavior, and external `rigctld` users with an unknown name must now use its numeric ID.
 - PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.
 - PAN-345: DX-cluster spots now honour `[network.dx_cluster.filtering]`. `bands` and `modes` allowlists, inclusive Hz limits and `duplicate_window_minutes` (`0` turns it off) apply locally before a spot reaches DX Hunter, and a filtered spot no longer suppresses the next accepted one. With the cluster enabled, an invalid band or mode name, or inverted limits, is now a startup error instead of being ignored. Spots keep their parsed mode (CW stays CW, unknown is `Unknown`, never FT8), and DX Hunter gains a `Band` column for every row. `dxcc_filters` is still not applied. Live-cluster qualification is pending.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
 - PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.
 - PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.

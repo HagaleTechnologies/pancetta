@@ -1118,6 +1118,20 @@ impl RigConfig {
 
 impl ConfigSection for RigConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        // PAN-340: resolve `rig.model` through the shared offline Hamlib
+        // catalog (names or numeric IDs). Empty and `Generic` stay legacy
+        // placeholders: they keep the shipped defaults and external-daemon
+        // placeholder configurations valid without guessing a backend, and
+        // an enabled managed station still needs a real model before it can
+        // spawn rigctld. Every other unknown, malformed or ambiguous value
+        // is a validation error whether CAT is enabled or not.
+        let model = self.model.trim();
+        if !model.is_empty() && !model.eq_ignore_ascii_case("Generic") {
+            if let Err(resolution) = pancetta_hamlib::resolve_model(model) {
+                return Err(ConfigError::Validation(resolution.to_string()));
+            }
+        }
+
         // Reject an unrecognized operating mode at config-load time.
         self.operating_mode()?;
         let data_mode = self.normalized_data_mode()?;
@@ -1655,6 +1669,122 @@ attenuator_db = 12
         assert_eq!(config.model, "Generic");
         assert!(!config.interface.enabled);
         assert!(config.validate_section().is_ok());
+    }
+
+    /// PAN-340 AC3: an unknown model is a validation error whose body is the
+    /// shared resolver message — closest matches plus numeric-ID guidance.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn unknown_model_has_suggestions_and_numeric_hint() {
+        let mut config = RigConfig::default();
+        config.model = "FT-9999".to_string();
+        let error = config.validate_section().unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "Validation error: Unknown rig.model 'FT-9999'. Closest matches: \
+                 FT-990 (1016), FT-991 (1035), FT-890 (1015)."
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "Run `rigctl -l` to find your model, then set rig.model to its numeric ID, \
+                 for example \"1045\"."
+            ),
+            "{error}"
+        );
+    }
+
+    /// PAN-340 AC4: accepted names and IDs, rejected malformed numerics, and
+    /// the empty/`Generic` placeholder behavior — with CAT on and off.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn model_validation_boundaries_and_placeholders() {
+        // Placeholders stay valid with and without CAT.
+        for model in ["", "   ", "Generic", "generic", " GENERIC "] {
+            for enabled in [false, true] {
+                let mut config = RigConfig::default();
+                config.model = model.to_string();
+                config.interface.enabled = enabled;
+                config
+                    .validate_section()
+                    .unwrap_or_else(|e| panic!("{model:?} (enabled={enabled}): {e}"));
+            }
+        }
+        // Valid catalog names, manufacturer-qualified names and numeric IDs.
+        for model in [
+            "IC-7300",
+            "ic 7300",
+            "KX3",
+            "FTdx10",
+            "Barrett 950",
+            "1045",
+            " 1045 ",
+            "0007",
+            "2147483647",               // in range, absent from the catalog
+            "Video4Linux2 SW/FM radio", // qualified disambiguation
+        ] {
+            let mut config = RigConfig::default();
+            config.model = model.to_string();
+            config.interface.enabled = true;
+            config
+                .validate_section()
+                .unwrap_or_else(|e| panic!("{model:?}: {e}"));
+        }
+        // Malformed numeric values are rejected with the numeric-id error.
+        for bad in [
+            "0",
+            "-1",
+            "+7",
+            "2147483648",
+            "9999999999",
+            "1045 -t 4532",
+            "1045;power 50",
+        ] {
+            let mut config = RigConfig::default();
+            config.model = bad.to_string();
+            let error = config.validate_section().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Invalid rig.model '{bad}'")),
+                "{bad:?}: {error}"
+            );
+            assert!(
+                error.contains("decimal integers from 1 to 2147483647"),
+                "{bad:?}: {error}"
+            );
+        }
+        // Unknown names fail whether CAT is enabled or disabled.
+        for enabled in [false, true] {
+            let mut config = RigConfig::default();
+            config.model = "FT-9999".to_string();
+            config.interface.enabled = enabled;
+            assert!(
+                config.validate_section().is_err(),
+                "FT-9999 must fail validation with CAT {enabled}"
+            );
+        }
+        // Ambiguity is an error naming every backend.
+        let mut config = RigConfig::default();
+        config.model = "SW/FM radio".to_string();
+        let error = config.validate_section().unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "Validation error: Ambiguous rig.model 'SW/FM radio': Video4Linux \
+                 SW/FM radio (26001), Video4Linux2 SW/FM radio (26002)."
+            ),
+            "{error}"
+        );
+        // Model validation is offline and pure: environment variables the
+        // rigctld spawn reads cannot change it.
+        std::env::set_var("RIGCTLD_HOST", "192.0.2.1");
+        std::env::set_var("RIGCTLD_PORT", "9999");
+        let mut config = RigConfig::default();
+        config.model = "IC-7300".to_string();
+        config.validate_section().expect("valid model stays valid");
+        config.model = "FT-9999".to_string();
+        assert!(config.validate_section().is_err());
+        std::env::remove_var("RIGCTLD_HOST");
+        std::env::remove_var("RIGCTLD_PORT");
     }
 
     #[test]
