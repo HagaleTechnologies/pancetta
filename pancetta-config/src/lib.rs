@@ -2013,6 +2013,7 @@ mod merge_guard {
         assert_carries_all::<autonomous::AutonomousConfig>(
             "AutonomousConfig",
             &[
+                ("needed_means", json!("unconfirmed")),
                 ("slot_parity", json!("even")),
                 ("unattended_policy", json!("respond_only")),
                 ("pounce_min_tier", json!("atno")),

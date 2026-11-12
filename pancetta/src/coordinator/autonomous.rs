@@ -2726,7 +2726,7 @@ impl super::ApplicationCoordinator {
                                 let status_msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
                                     ComponentId::Tui,
-                                    MessageType::StatusUpdate(text.clone()),
+                                    MessageType::StatusUpdate { text: text.clone(), level: pancetta_core::DiagnosticLevel::Info },
                                     Instant::now(),
                                 );
                                 let _ = message_bus.send_message(status_msg).await;

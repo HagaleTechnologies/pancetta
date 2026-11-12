@@ -240,8 +240,11 @@ pub enum MessageType {
     /// DX cluster messages
     DxMessage(DxMessage),
 
-    /// Status update message
-    StatusUpdate(String),
+    /// Transient operator feedback with explicit producer severity.
+    StatusUpdate {
+        text: String,
+        level: pancetta_core::DiagnosticLevel,
+    },
 
     /// Request to transmit an FT8 message.
     ///
@@ -344,9 +347,15 @@ pub enum MessageType {
         timestamp: chrono::DateTime<chrono::Utc>,
     },
 
-    /// TX-policy state echo for the TUI banner. Sent by the Hamlib poll
-    /// loop's SWR trip (PAN-251) when it sets the policy to Disabled. The
-    /// TUI relay mirrors it into the TX banner. Observation only.
+    /// TX-policy state echo. Sent by the Hamlib poll loop's SWR trip
+    /// (PAN-251) when it sets the policy to Disabled, by the TUI relay's
+    /// `g` policy cycle and by the Shift+Q emergency stop (PAN-341). The
+    /// TUI relay mirrors it into the TX banner; each producer also relays
+    /// it additively to `ComponentId::RemoteGateway`
+    /// (`remote_gateway::relay_to_gateway`), where the display-feed pump
+    /// translates it into the wire `txPolicy` event for connected service
+    /// peers and folds it into the localhost Welcome snapshot. Observation
+    /// only.
     TxPolicyStatus {
         /// Current global TX policy.
         policy: pancetta_core::TxPolicy,

@@ -903,7 +903,10 @@ impl super::ApplicationCoordinator {
         let error_msg = ComponentMessage::new(
             ComponentId::Coordinator,
             ComponentId::Tui,
-            MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+            MessageType::StatusUpdate {
+                text: format!("{}: {}", component_id, degradation),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            },
             Instant::now(),
         );
         let _ = self.message_bus.send_message(error_msg).await;
