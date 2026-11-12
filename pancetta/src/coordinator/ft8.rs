@@ -237,6 +237,26 @@ fn sync_reference_parser_seeds(native: &Ft8Decoder, reference: &mut Ft8Decoder) 
     }
 }
 
+/// Submit scoped results before starting the main passes. This runs on the
+/// blocking decoder thread, so it may drive the bus future directly.
+fn forward_scoped_decode(
+    rt: &tokio::runtime::Handle,
+    bus: &crate::message_bus::MessageBus,
+    message: ComponentMessage,
+) {
+    // send_message awaits only the route-table lock and tries the bounded
+    // queue once. It never waits for QSO processing or for queue capacity.
+    if let Err(e) = rt.block_on(bus.send_message(message)) {
+        debug!("Failed to forward scoped fast-path decode to QSO: {}", e);
+    }
+}
+
+/// Receipt-to-entry time includes scoped work and dispatch, even when the
+/// main passes overlap. Keep the receipt anchor rather than a pass-local clock.
+fn pre_native_us(received: Instant, native_entry: Instant) -> u64 {
+    native_entry.duration_since(received).as_micros() as u64
+}
+
 /// Compute the active protocol's slot parity for a decoded window.
 ///
 /// `received_utc` is the window's receipt timestamp (captured immediately on
@@ -1099,15 +1119,7 @@ impl super::ApplicationCoordinator {
                                     MessageType::DecodedMessage(decoded_msg),
                                     Instant::now(),
                                 );
-                                let bus = message_bus.clone();
-                                rt.spawn(async move {
-                                    if let Err(e) = bus.send_message(qso_msg).await {
-                                        debug!(
-                                            "Failed to forward scoped fast-path decode to QSO: {}",
-                                            e
-                                        );
-                                    }
-                                });
+                                forward_scoped_decode(&rt, &message_bus, qso_msg);
                             }
                         }
 
@@ -1283,10 +1295,8 @@ impl super::ApplicationCoordinator {
                         // truthful: it still includes any scoped fast-path
                         // work that ran first — subtracting that would
                         // conceal work rather than recover budget.
-                        let pre_native_us = outcome
-                            .native_started_at
-                            .duration_since(window_ready_at)
-                            .as_micros() as u64;
+                        let pre_native_us =
+                            pre_native_us(window_ready_at, outcome.native_started_at);
                         let pre_native_ms = (pre_native_us / 1_000) as u64;
                         let headroom_at_native =
                             headroom_ms(&decode_budget, outcome.native_started_at);
@@ -2507,6 +2517,119 @@ mod pan318_overlap_lifecycle_tests {
             Ft8Decoder::new(Ft8Config::default()).expect("native ctor"),
             Ft8Decoder::new(Ft8Config::default()).expect("reference ctor"),
         )
+    }
+
+    // A current-thread runtime does not poll detached sends while the
+    // blocking decode worker runs. This makes the old spawn race deterministic.
+    #[test]
+    fn parallel_scoped_delivery_precedes_merge() {
+        use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+        use pancetta_ft8::window_execution::run_overlapped_passes;
+        use std::{sync::Arc, time::Instant};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let bus = Arc::new(MessageBus::new(16).unwrap());
+        let (_, inbox) = rt.block_on(bus.create_channel(ComponentId::Qso)).unwrap();
+        let mut native = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let mut modulator = pancetta_ft8::Ft8Modulator::new_default().unwrap();
+        let symbols = encoder.encode_message("CQ K1DEF FN20", None).unwrap();
+        let mut window = modulator.modulate_symbols(&symbols, 500.0).unwrap();
+        window.resize(pancetta_ft8::WINDOW_SAMPLES, 0.0);
+        let budget = pancetta_ft8::DecodeBudget::until(
+            Instant::now() + std::time::Duration::from_millis(250),
+        );
+        let (scoped, _) = native
+            .decode_window_with_ap_scoped_partner_budgeted(
+                &window,
+                &pancetta_ft8::ApContext::default(),
+                Some(315..=325),
+                None,
+                budget,
+            )
+            .unwrap();
+        let decoded = scoped
+            .into_iter()
+            .find(|m| m.text == "CQ K1DEF FN20")
+            .expect("scoped pass must find the generated CQ");
+        super::forward_scoped_decode(
+            rt.handle(),
+            &bus,
+            ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::Qso,
+                MessageType::DecodedMessage(decoded),
+                Instant::now(),
+            ),
+        );
+        let outcome = run_overlapped_passes(
+            || {
+                assert!(
+                    inbox.try_recv().is_ok(),
+                    "QSO send must finish before main passes"
+                );
+                Vec::new()
+            },
+            Vec::new,
+        );
+        assert!(
+            !outcome.reference_panicked(),
+            "scoped delivery raced the main pair"
+        );
+        let _ = pancetta_ft8::merge::merge_ft8lib_first(
+            outcome.reference.unwrap(),
+            outcome.native.unwrap(),
+        );
+    }
+
+    #[test]
+    fn parallel_scoped_time_is_not_hidden() {
+        use pancetta_ft8::{window_execution::run_overlapped_passes, ApContext, DecodeBudget};
+        use std::time::{Duration, Instant};
+
+        let (mut native, _) = pair();
+        let window = vec![0.0; pancetta_ft8::WINDOW_SAMPLES];
+        // An already spent receipt budget must stay spent after scoped work.
+        let receipt = Instant::now() - Duration::from_millis(300);
+        let deadline = receipt + Duration::from_millis(250);
+        let budget = DecodeBudget::until(deadline);
+        let scoped_started = Instant::now();
+        native
+            .decode_window_with_ap_scoped_partner_budgeted(
+                &window,
+                &ApContext::default(),
+                Some(315..=325),
+                None,
+                budget,
+            )
+            .unwrap();
+        let scoped_finished = Instant::now();
+        let outcome = run_overlapped_passes(
+            || (),
+            || {
+                assert_eq!(budget.deadline(), Some(deadline));
+                assert!(!budget.has_time(), "main pass must not get a fresh budget");
+                native
+                    .decode_window_with_ap_scoped_partner_budgeted(
+                        &window,
+                        &ApContext::default(),
+                        None,
+                        None,
+                        budget,
+                    )
+                    .unwrap()
+            },
+        );
+        assert!(!outcome.native_panicked());
+        let elapsed = super::pre_native_us(receipt, outcome.native_started_at);
+        assert!(elapsed >= 300_000);
+        assert!(elapsed >= scoped_finished.duration_since(scoped_started).as_micros() as u64);
+        assert_eq!(
+            super::headroom_ms(&budget, outcome.native_started_at),
+            Some(0)
+        );
     }
 
     /// AC5 (`parallel_rebuild_is_atomic`): a rebuild whose construction
