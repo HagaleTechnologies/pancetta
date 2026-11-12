@@ -1759,22 +1759,14 @@ impl TuiRunner {
                             })?;
                         }
                         _ => {
-<<<<<<< HEAD
                             {
                                 let text = format!(
                                     "Invalid offset — enter {} to {} Hz (blank = Auto)",
-                                    crate::app::TX_OFFSET_MIN_HZ,
-                                    crate::app::TX_OFFSET_MAX_HZ
+                                    crate::app::operator_tx_offset_range().0,
+                                    crate::app::operator_tx_offset_range().1
                                 );
                                 app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
                             };
-=======
-                            app.status_message = format!(
-                                "Invalid offset — enter {} to {} Hz (blank = Auto)",
-                                crate::app::operator_tx_offset_range().0,
-                                crate::app::operator_tx_offset_range().1
-                            );
->>>>>>> 9f7689a1718be3b340fb350b1fc019beddaecd97
                         }
                     }
                 }
@@ -2010,33 +2002,24 @@ impl TuiRunner {
 
             // Operator offset steps use the same bounds as offset entry.
             Action::TxOffsetDown => {
-<<<<<<< HEAD
-                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
-                {
-                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
-            }
-            Action::TxOffsetUp => {
-                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
-                {
-                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
-                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
-                };
-=======
                 app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).clamp(
                     crate::app::operator_tx_offset_range().0 as f64,
                     crate::app::operator_tx_offset_range().1 as f64,
                 );
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                {
+                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
             Action::TxOffsetUp => {
                 app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).clamp(
                     crate::app::operator_tx_offset_range().0 as f64,
                     crate::app::operator_tx_offset_range().1 as f64,
                 );
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
->>>>>>> 9f7689a1718be3b340fb350b1fc019beddaecd97
+                {
+                    let text = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
+                };
             }
 
             // Band switching: = = band up (+ dropped; Shift not required),
@@ -2538,18 +2521,14 @@ impl TuiRunner {
             Action::OpenOffsetModal => {
                 app.offset_modal.visible = true;
                 app.offset_modal.buffer.clear();
-<<<<<<< HEAD
                 {
-                    let text = "TX offset: enter Hz (200–2900), blank=Auto, Enter, Esc".to_string();
+                    let text = format!(
+                        "TX offset: enter Hz ({}–{}), blank=Auto, Enter, Esc",
+                        crate::app::operator_tx_offset_range().0,
+                        crate::app::operator_tx_offset_range().1
+                    );
                     app.set_local_status(text, pancetta_core::DiagnosticLevel::Info);
                 };
-=======
-                app.status_message = format!(
-                    "TX offset: enter Hz ({}–{}), blank=Auto, Enter, Esc",
-                    crate::app::operator_tx_offset_range().0,
-                    crate::app::operator_tx_offset_range().1
-                );
->>>>>>> 9f7689a1718be3b340fb350b1fc019beddaecd97
             }
             Action::ToggleMonitoring => {
                 app.toggle_monitoring().await?;
@@ -7669,7 +7648,7 @@ mod key_tests {
         for input in ["200", "2800", "199", "2801", "abc", "18446744073709551616"] {
             let (mut r, cmd_rx, app) = make_runner().await;
             r.handle_key_event(key('o')).await.unwrap();
-            assert!(app.read().await.status_message.contains("200–2800"));
+            assert!(app.read().await.status_message().contains("200–2800"));
             app.write().await.offset_modal.buffer = input.to_string();
             r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .await
@@ -7677,14 +7656,14 @@ mod key_tests {
             let a = app.read().await;
             if let Ok(hz @ (200 | 2800)) = input.parse::<u64>() {
                 assert!(!a.offset_modal.visible);
-                assert_eq!(a.status_message, format!("TX offset held @ {hz} Hz"));
+                assert_eq!(a.status_message(), format!("TX offset held @ {hz} Hz"));
                 assert!(
                     matches!(cmd_rx.try_recv(), Ok(TuiCommand::SetTxOffset { offset_hz: Some(v) }) if v == hz)
                 );
             } else {
                 assert!(a.offset_modal.visible);
                 assert_eq!(
-                    a.status_message,
+                    a.status_message(),
                     "Invalid offset — enter 200 to 2800 Hz (blank = Auto)"
                 );
                 assert!(cmd_rx.try_recv().is_err());
@@ -7710,23 +7689,6 @@ mod key_tests {
             assert_eq!(app.read().await.tx_frequency_offset, expected);
             assert!(cmd_rx.try_recv().is_err());
         }
-<<<<<<< HEAD
-        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        let a = app.read().await;
-        assert!(
-            a.offset_modal.visible,
-            "200 Hz is below new minimum 300 — modal stays open"
-        );
-        assert!(
-            a.status_message().contains("Invalid"),
-            "status says invalid"
-        );
-        drop(a);
-        assert!(cmd_rx.try_recv().is_err(), "no command emitted");
-=======
->>>>>>> 9f7689a1718be3b340fb350b1fc019beddaecd97
     }
 
     /// Blank entry on Enter emits `SetTxOffset{None}` (→ Auto) and closes.

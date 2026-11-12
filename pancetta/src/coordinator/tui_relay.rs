@@ -294,6 +294,7 @@ pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
         .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
             component: "TX".to_string(),
             status: format!("TX policy: {}", next.label()),
+            level: pancetta_core::DiagnosticLevel::Info,
         });
 }
 
@@ -2162,62 +2163,10 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {
                             // Operator pressed `g`: cycle the global TX policy
-<<<<<<< HEAD
-                            // Full → RespondOnly → Disabled → Full. Update the
-                            // shared atomic and echo the new state to the TUI
-                            // banner (mirrors ToggleAutonomous's echo pattern).
-                            let prev = pancetta_core::TxPolicy::from_u8(
-                                cmd_tx_policy.load(Ordering::Acquire),
-                            );
-                            let next = prev.cycle();
-                            cmd_tx_policy.store(next.as_u8(), Ordering::Release);
-                            warn!(
-                                target: "tx.policy",
-                                "Operator cycled global TX policy: {} -> {}",
-                                prev.label(),
-                                next.label()
-                            );
-                            // Cycling to Disabled must abort the CURRENT
-                            // transmission, not just gate the next one. Set the
-                            // same abort flag Shift+Q uses so the in-flight TX
-                            // (up to 12.64s of FT8, or an active tune) stops
-                            // within ~50ms via the worker's interruptible_sleep.
-                            // Also cancel the manual CQ QSO so it stops
-                            // keep-calling (clearing the bookkeeping flag alone
-                            // no longer stops TX — the QSO owns it now).
-                            if next == pancetta_core::TxPolicy::Disabled {
-                                cmd_abort_current_tx.store(true, Ordering::Release);
-                                cmd_cq_active.store(false, Ordering::Relaxed);
-                                *cmd_tune_until.write().await = None;
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                    warn!("Failed to cancel CQ QSO on TX disable: {}", e);
-                                }
-                            }
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
-                                    policy: next,
-                                },
-                            );
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "TX".to_string(),
-                                    status: format!("TX policy: {}", next.label()),
-
-                                    level: pancetta_core::DiagnosticLevel::Info,
-                                },
-                            );
-=======
                             // Full → RespondOnly → Disabled → Full, echoing the
                             // new state to the TUI banner and — PAN-341 — to
                             // connected remote peers. See `cycle_tx_policy`.
                             cycle_tx_policy(&cmd_tx_policy_ctx).await;
->>>>>>> 9f7689a1718be3b340fb350b1fc019beddaecd97
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleOperatingMode => {
                             // Operator pressed Shift+M: cycle the station-wide
