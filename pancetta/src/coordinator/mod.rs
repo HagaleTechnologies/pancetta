@@ -5635,11 +5635,11 @@ pub(crate) mod audit_test_util {
 
 mod contest;
 
-<<<<<<< HEAD
 #[cfg(feature = "test-harness")]
 #[doc(hidden)]
+#[path = "tx/test_harness.rs"]
 pub mod testing;
-=======
+
 #[cfg(test)]
 mod active_qso_freq_tests {
     use super::ActiveQsoFreq;
@@ -5664,4 +5664,3 @@ mod active_qso_freq_tests {
         assert_eq!(hint.secondary, Some((1500.0, expires_at)));
     }
 }
->>>>>>> 6a0b73ba9e081e96ab37e47cacdff5166d69fb4d

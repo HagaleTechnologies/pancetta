@@ -128,7 +128,6 @@ ft2 = ["pancetta-ft8/ft2"]
 name = "pipeline_bench"
 harness = false
 
-<<<<<<< HEAD
 [[test]]
 name = "coord_sim"
 required-features = ["test-harness"]
@@ -136,7 +135,6 @@ required-features = ["test-harness"]
 [[test]]
 name = "tx_ptt_integration"
 required-features = ["test-harness"]
-=======
+
 [lints]
 workspace = true
->>>>>>> 6a0b73ba9e081e96ab37e47cacdff5166d69fb4d
