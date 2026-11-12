@@ -2967,6 +2967,7 @@ impl App {
             .filter_map(|call| station_state_key(call))
             .collect();
         self.dx_states.retain(|call, _| live_keys.contains(call));
+        self.clamp_band_activity_selection();
         self.clamp_dx_hunter_selection();
         self.clamp_callers_selection();
     }
@@ -6751,6 +6752,46 @@ mod tests {
         assert_eq!(app.station_state_for("W6ABC"), Some("AR"));
         assert_eq!(app.dx_hunter_scroll, 0);
         assert_eq!(app.dx_hunter_pinned_call.as_deref(), Some("W7ABC"));
+    }
+
+    #[tokio::test]
+    async fn pan319_cleanup_preserves_band_activity_call_target() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        let now = Utc::now();
+        let mut expired = fixture_view_directed("K1OLD", -10);
+        expired.timestamp = now - chrono::Duration::hours(25);
+        app.add_decoded_message(expired).await.unwrap();
+        app.add_decoded_message(fixture_view("K2AAA", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K3BBB", -6))
+            .await
+            .unwrap();
+        // Directed messages sort first: [K1OLD, K3BBB, K2AAA].
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now);
+
+        assert_eq!(app.decoded_messages.len(), 2);
+        assert_eq!(app.band_activity_scroll, 0);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        // When the selected call also expires, adopt the surviving row.
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        app.decoded_messages.front_mut().unwrap().timestamp = now - chrono::Duration::hours(25);
+        app.cleanup_old_data_at(now);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now + chrono::Duration::hours(25));
+        assert_eq!(app.band_activity_scroll, 0);
+        assert!(app.band_activity_pinned_call.is_none());
+        assert!(app.get_selected_station().is_none());
     }
 
     #[tokio::test]
