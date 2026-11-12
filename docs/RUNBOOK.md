@@ -42,7 +42,7 @@ is wrapped in `catch_unwind`, so one bad window is logged and skipped rather
 than fatal; the release build uses `panic = "unwind"` so this works), but the
 OS supervisor is the backstop that recovers from everything else.
 
-Ship-provided units (edit the binary path inside each):
+Ship-provided units and service scripts:
 
 - **Linux / MiniPC:** `packaging/systemd/pancetta.service` — `Restart=always`,
   `RestartSec=2`, crash-loop rate limit. Install as a `--user` service and
@@ -86,10 +86,17 @@ Ship-provided units (edit the binary path inside each):
   A per-user LaunchAgent resumes after user login following a reboot. The two
   supervisor log files are **not** rotated; the 14-file retention below applies
   only to the daily application logs (`pancetta.log.*`).
-- **Windows:** wrap `pancetta.exe --headless` with
-  [NSSM](https://nssm.cc/) (`nssm install Pancetta …`, set *Exit actions →
-  Restart*) or a Task Scheduler task with trigger *At startup* and
-  *Restart on failure*. The per-user profile keeps `~/.pancetta` private.
+- **Windows:** the release zip includes `windows/install-pancetta-service.ps1`
+  and `windows/uninstall-pancetta-service.ps1`. Supply
+  [NSSM 2.24](https://nssm.cc/download) in `windows\` or on PATH, extract to a
+  stable folder, and open PowerShell as administrator using your station account.
+  Run `.\windows\install-pancetta-service.ps1` and enter the account password
+  to start the headless, auto-starting `Pancetta` service. Supervisor logs are
+  under `%LOCALAPPDATA%\pancetta\logs`; application logs and data remain
+  under `%USERPROFILE%\.pancetta`. Run
+  `.\windows\uninstall-pancetta-service.ps1` to stop and remove the service
+  while preserving all data. See the zip's `windows/README.md` for upgrades
+  and the required first-run boot, audio and graceful-stop checks.
 
 Always run the supervised station with `--headless` (no TUI). Use the TUI
 interactively for setup, manual operation, and monitoring.
