@@ -556,6 +556,7 @@ impl super::ApplicationCoordinator {
                                                             // preserves this path's pre-existing
                                                             // boolean-only arm-gate behavior.
                                                             remote_client_key_id: None,
+                                                            dx_offset_unknown: false,
                                                         },
                                                     ),
                                                     Instant::now(),

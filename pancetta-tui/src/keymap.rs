@@ -980,7 +980,7 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
     ),
     kb(
         "Space",
-        "Call selected station",
+        "Call selected station (a DX Hunter cluster/cqdx spot QSYs the rig to its dial first; waits for PTT-off)",
         Category::QsoOperation,
         true,
         &[main_no_ctrl_alt(c(' '), Action::CallOrReplySelected)],
