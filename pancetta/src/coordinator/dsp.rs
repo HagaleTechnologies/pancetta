@@ -716,6 +716,7 @@ impl super::ApplicationCoordinator {
         // config read that produced `protocol`/`timing` above.
         let seed_mode_u8 = active_operating_mode.as_u8();
 
+        let initialized = self.service_notify.dsp.clone();
         let handle = tokio::task::spawn_blocking(move || {
             // FT8 timing: transmissions start at 0/15/30/45 second marks.
             // We need 12.64 seconds of audio at 12kHz = 151,680 samples per window.
@@ -833,6 +834,10 @@ impl super::ApplicationCoordinator {
                 next_window_time.format("%H:%M:%S")
             );
 
+            let _initialized =
+                super::service_notify::Initialized::after_start(initialized, || {
+                    Ok::<_, anyhow::Error>(())
+                })?;
             let mut last_audio_batch = std::time::Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {

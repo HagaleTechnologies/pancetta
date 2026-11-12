@@ -3021,17 +3021,7 @@ async fn doctor_command(cli: &Cli) -> Result<()> {
     let mut results = Vec::with_capacity(checks.len());
     for check in &checks {
         let outcome = (check.run)(&ctx);
-        println!(
-            "[{}] {:<20} {}",
-            doctor::status_label(outcome.status),
-            check.name,
-            outcome.detail
-        );
-        if outcome.status != doctor::CheckStatus::Pass {
-            if let Some(fix) = &outcome.fix {
-                println!("       fix: {fix}");
-            }
-        }
+        println!("{}", doctor::render_check(check.name, &outcome));
         results.push((check.hard, outcome.status));
     }
     println!();

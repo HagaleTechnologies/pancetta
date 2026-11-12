@@ -155,6 +155,7 @@ impl super::ApplicationCoordinator {
         let span = tracing::span!(tracing::Level::INFO, "coordinator_shutdown");
         let _enter = span.enter();
 
+        self.service_notify.stopping();
         info!("Starting graceful shutdown");
         self.is_running.store(false, Ordering::Release);
         self.shutdown_signal.store(true, Ordering::Release);

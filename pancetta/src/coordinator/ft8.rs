@@ -632,7 +632,12 @@ impl super::ApplicationCoordinator {
         let decode_last_budget_exhausted = self.decode_last_budget_exhausted.clone();
 
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
+        let initialized = self.service_notify.decoder.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            let _initialized =
+                super::service_notify::Initialized::after_start(initialized, || {
+                    Ok::<_, anyhow::Error>(())
+                })?;
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
