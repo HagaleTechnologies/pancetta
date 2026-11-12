@@ -215,6 +215,131 @@ fn display_rank(
     )
 }
 
+/// PAN-341: the context the TX-policy command handlers (`g` cycle, Shift+Q
+/// emergency stop) need. Extracted from the command-loop match arms into
+/// free functions so tests drive the exact production path (atomic stores,
+/// QSO sends, TUI echoes, gateway relay) without a terminal or a full
+/// coordinator — there is no command-loop test harness (see the note at the
+/// loop's spawn).
+pub(crate) struct TxPolicyCmdCtx {
+    /// Bus for the QSO `StopCq`/`CancelAllQsos` sends and the additive
+    /// `relay_to_gateway` policy relay.
+    pub(crate) bus: crate::message_bus::MessageBus,
+    /// `display_feed_enabled` gate read by `relay_to_gateway` (PAN-341).
+    pub(crate) display_feed_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Canonical policy atomic (`Coordinator.tx_policy`).
+    pub(crate) tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// `Coordinator.abort_current_tx` — set when a cycle lands on Disabled.
+    pub(crate) abort_current_tx: Arc<std::sync::atomic::AtomicBool>,
+    /// Shift+Q's shared halt (abort + autonomous-off + Disabled).
+    pub(crate) tx_halt: super::tx_halt::TxHaltHandles,
+    /// Manual-CQ bookkeeping flag, cleared on every halt-to-Disabled path.
+    pub(crate) cq_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Tune-tone deadline, cleared on every halt-to-Disabled path.
+    pub(crate) tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    /// Best-effort TUI echo channel (bounded; headless sends are dropped).
+    pub(crate) tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+}
+
+/// `TuiCommand::CycleTxPolicy` (`g`): cycle Full → RespondOnly → Disabled →
+/// Full, aborting the in-flight transmission and stopping the manual CQ when
+/// the result is Disabled, then echo the new state to the TUI banner and —
+/// PAN-341 — relay it to already-connected remote-gateway clients (same
+/// additive dual-send pattern as ModeStatus, dispensa Q-0027).
+pub(crate) async fn cycle_tx_policy(ctx: &TxPolicyCmdCtx) {
+    let prev = pancetta_core::TxPolicy::from_u8(ctx.tx_policy.load(Ordering::Acquire));
+    let next = prev.cycle();
+    ctx.tx_policy.store(next.as_u8(), Ordering::Release);
+    warn!(
+        target: "tx.policy",
+        "Operator cycled global TX policy: {} -> {}",
+        prev.label(),
+        next.label()
+    );
+    // Cycling to Disabled must abort the CURRENT transmission, not just gate
+    // the next one. Set the same abort flag Shift+Q uses so the in-flight TX
+    // (up to 12.64s of FT8, or an active tune) stops within ~50ms via the
+    // worker's interruptible_sleep. Also cancel the manual CQ QSO so it stops
+    // keep-calling (clearing the bookkeeping flag alone no longer stops TX —
+    // the QSO owns it now).
+    if next == pancetta_core::TxPolicy::Disabled {
+        ctx.abort_current_tx.store(true, Ordering::Release);
+        ctx.cq_active.store(false, Ordering::Relaxed);
+        *ctx.tune_until.write().await = None;
+        let msg = ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
+            Instant::now(),
+        );
+        if let Err(e) = ctx.bus.send_message(msg).await {
+            warn!("Failed to cancel CQ QSO on TX disable: {}", e);
+        }
+    }
+    // PAN-341: publish the resulting policy to service peers — including the
+    // Disabled → Full recovery step after a halt. No-op when nobody needs the
+    // display feed.
+    super::remote_gateway::relay_to_gateway(
+        &ctx.bus,
+        &ctx.display_feed_enabled,
+        ComponentId::Tui,
+        MessageType::TxPolicyStatus { policy: next },
+    )
+    .await;
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy: next });
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+            component: "TX".to_string(),
+            status: format!("TX policy: {}", next.label()),
+        });
+}
+
+/// `TuiCommand::OperatorEmergencyStop` (Shift+Q): halt every TX path the
+/// station can drive via the shared [`super::tx_halt::TxHaltHandles::halt`]
+/// (synchronous and bus-free — nothing may suspend between the halt decision
+/// and the policy store every PTT-on gate reads), clear local CQ/tune state,
+/// echo Disabled to the TUI banner, and — PAN-341 — announce the Disabled
+/// policy to remote peers BEFORE awaiting the durable QSO cancellation.
+pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
+    warn!(
+        target: "operator.override",
+        "Operator emergency stop (Shift+Q): aborting TX, disabling autonomous, stopping CQ + tune"
+    );
+    ctx.tx_halt.halt();
+    ctx.cq_active.store(false, Ordering::Relaxed);
+    *ctx.tune_until.write().await = None;
+    let _ = ctx
+        .tui_msg_tx
+        .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
+            policy: pancetta_core::TxPolicy::Disabled,
+        });
+    // PAN-341: peers learn the halt before the (awaiting) durable QSO
+    // cancellation, after the safety gate is closed and local state cleared.
+    super::remote_gateway::relay_to_gateway(
+        &ctx.bus,
+        &ctx.display_feed_enabled,
+        ComponentId::Tui,
+        MessageType::TxPolicyStatus {
+            policy: pancetta_core::TxPolicy::Disabled,
+        },
+    )
+    .await;
+    // Clear the TX *source*, not just mute it: cancel every active QSO so
+    // manual keep-calling (and any duplicate QSO objects) stops re-emitting
+    // each slot. Without this, returning the policy to Full would resume the
+    // runaway. This is the real fix for "h + k didn't stop it; only restart
+    // did." Durable (PAN-251): a full QSO channel parks the cancel instead of
+    // dropping it.
+    if super::tx_halt::cancel_all_qsos(&ctx.bus, ComponentId::Tui).await
+        == crate::message_bus::DurableDelivery::Dropped
+    {
+        warn!("Emergency stop: failed to send CancelAllQsos");
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -1389,6 +1514,19 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        // PAN-341: shared context for the extracted TX-policy command
+        // handlers (`g` cycle, Shift+Q), so the match arms and the unit
+        // tests drive the exact same production path.
+        let cmd_tx_policy_ctx = TxPolicyCmdCtx {
+            bus: cmd_message_bus.clone(),
+            display_feed_enabled: cmd_display_feed_enabled.clone(),
+            tx_policy: cmd_tx_policy.clone(),
+            abort_current_tx: cmd_abort_current_tx.clone(),
+            tx_halt: cmd_tx_halt.clone(),
+            cq_active: cmd_cq_active.clone(),
+            tune_until: cmd_tune_until.clone(),
+            tui_msg_tx: cmd_tui_msg_tx.clone(),
+        };
         // Fox-mode flag (shared with the QSO component). The ToggleFoxMode
         // relay arm reads the current value and sends `SetFoxMode { on: !current }`
         // so a single keypress always flips the authoritative state, even if the
@@ -1987,104 +2125,24 @@ impl super::ApplicationCoordinator {
                         pancetta_tui::tui_runner::TuiCommand::OperatorEmergencyStop => {
                             // hb-161: Phase 5 emergency stop. Operator
                             // pressed Shift+Q. Halt every TX path the
-                            // station can drive:
-                            //   1. `tx_halt::halt()` (PAN-251, shared with
-                            //      the SWR trip), with no await before the
-                            //      policy store: abort the in-flight TX
-                            //      (PTT-off in ~50ms via the existing F8
-                            //      path), disable autonomous mode at
-                            //      runtime (the autonomous loop reads this
-                            //      flag every slot before submitting TX),
-                            //      and set the global policy to Disabled
-                            //      (RX-only).
-                            //   2. Stop the repeating-CQ loop.
-                            //   3. Cancel any active tune tone.
-                            //   4. Echo Disabled to the TUI banner.
-                            //   5. Cancel every active QSO.
-                            // Logged at WARN with target=operator.override
-                            // so it stands out in the journal. The
-                            // operator re-enables autonomous explicitly:
-                            // the TUI `a` key sends ToggleAutonomous,
-                            // which re-sets this same runtime gate
-                            // (Batch 93), and restores TX with the policy
-                            // cycle key (`g`). We don't auto-restore.
-                            warn!(
-                                target: "operator.override",
-                                "Operator emergency stop (Shift+Q): aborting TX, disabling \
-                                 autonomous, stopping CQ + tune"
-                            );
-                            cmd_tx_halt.halt();
-                            cmd_cq_active.store(false, Ordering::Relaxed);
-                            *cmd_tune_until.write().await = None;
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
-                                    policy: pancetta_core::TxPolicy::Disabled,
-                                },
-                            );
-                            // Clear the TX *source*, not just mute it: cancel
-                            // every active QSO so manual keep-calling (and any
-                            // duplicate QSO objects) stops re-emitting each slot.
-                            // Without this, returning the policy to Full would
-                            // resume the runaway. This is the real fix for
-                            // "h + k didn't stop it; only restart did."
-                            // Durable (PAN-251): a full QSO channel parks the
-                            // cancel instead of dropping it.
-                            if super::tx_halt::cancel_all_qsos(&cmd_message_bus, ComponentId::Tui)
-                                .await
-                                == crate::message_bus::DurableDelivery::Dropped
-                            {
-                                warn!("Emergency stop: failed to send CancelAllQsos");
-                            }
+                            // station can drive, then cancel every active
+                            // QSO; see `emergency_stop` for the full
+                            // rationale. Logged at WARN with
+                            // target=operator.override so it stands out in
+                            // the journal. The operator re-enables
+                            // autonomous explicitly: the TUI `a` key sends
+                            // ToggleAutonomous, which re-sets this same
+                            // runtime gate (Batch 93), and restores TX with
+                            // the policy cycle key (`g`). We don't
+                            // auto-restore.
+                            emergency_stop(&cmd_tx_policy_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {
                             // Operator pressed `g`: cycle the global TX policy
-                            // Full → RespondOnly → Disabled → Full. Update the
-                            // shared atomic and echo the new state to the TUI
-                            // banner (mirrors ToggleAutonomous's echo pattern).
-                            let prev = pancetta_core::TxPolicy::from_u8(
-                                cmd_tx_policy.load(Ordering::Acquire),
-                            );
-                            let next = prev.cycle();
-                            cmd_tx_policy.store(next.as_u8(), Ordering::Release);
-                            warn!(
-                                target: "tx.policy",
-                                "Operator cycled global TX policy: {} -> {}",
-                                prev.label(),
-                                next.label()
-                            );
-                            // Cycling to Disabled must abort the CURRENT
-                            // transmission, not just gate the next one. Set the
-                            // same abort flag Shift+Q uses so the in-flight TX
-                            // (up to 12.64s of FT8, or an active tune) stops
-                            // within ~50ms via the worker's interruptible_sleep.
-                            // Also cancel the manual CQ QSO so it stops
-                            // keep-calling (clearing the bookkeeping flag alone
-                            // no longer stops TX — the QSO owns it now).
-                            if next == pancetta_core::TxPolicy::Disabled {
-                                cmd_abort_current_tx.store(true, Ordering::Release);
-                                cmd_cq_active.store(false, Ordering::Relaxed);
-                                *cmd_tune_until.write().await = None;
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                    warn!("Failed to cancel CQ QSO on TX disable: {}", e);
-                                }
-                            }
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
-                                    policy: next,
-                                },
-                            );
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "TX".to_string(),
-                                    status: format!("TX policy: {}", next.label()),
-                                },
-                            );
+                            // Full → RespondOnly → Disabled → Full, echoing the
+                            // new state to the TUI banner and — PAN-341 — to
+                            // connected remote peers. See `cycle_tx_policy`.
+                            cycle_tx_policy(&cmd_tx_policy_ctx).await;
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleOperatingMode => {
                             // Operator pressed Shift+M: cycle the station-wide
@@ -7121,6 +7179,179 @@ mod tui_relay_tests {
         let was = gate.load(Ordering::Acquire);
         gate.store(!was, Ordering::Release);
         assert!(!gate.load(Ordering::Acquire));
+    }
+
+    // ---- PAN-341: TX-policy producers ------------------------------------
+
+    use super::TxPolicyCmdCtx;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    struct PolicyFixture {
+        ctx: TxPolicyCmdCtx,
+        tui: crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        gateway: crossbeam_channel::Receiver<ComponentMessage>,
+        qso: crossbeam_channel::Receiver<ComponentMessage>,
+        tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    /// The extracted handler context over a fresh bus, parameterized by the
+    /// display-feed gate (AC5: the same producer behavior must hold with the
+    /// feed enabled and disabled).
+    async fn policy_fixture(feed_enabled: bool) -> PolicyFixture {
+        let bus = MessageBus::new(32).unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (_, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        let (tui_tx, tui) = crossbeam_channel::bounded(1000);
+        let tx_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxPolicy::Full.as_u8(),
+        ));
+        let abort_current_tx = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cq_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tune_until: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
+            Arc::new(tokio::sync::RwLock::new(Some(tokio::time::Instant::now())));
+        let tx_halt = super::super::tx_halt::TxHaltHandles {
+            abort_current_tx: abort_current_tx.clone(),
+            autonomous_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            tx_policy: tx_policy.clone(),
+        };
+        let ctx = TxPolicyCmdCtx {
+            bus,
+            display_feed_enabled: Arc::new(std::sync::atomic::AtomicBool::new(feed_enabled)),
+            tx_policy: tx_policy.clone(),
+            abort_current_tx,
+            tx_halt,
+            cq_active,
+            tune_until,
+            tui_msg_tx: tui_tx,
+        };
+        PolicyFixture {
+            ctx,
+            tui,
+            gateway,
+            qso,
+            tx_policy,
+        }
+    }
+
+    fn drain<T>(rx: &crossbeam_channel::Receiver<T>) -> Vec<T> {
+        rx.try_iter().collect()
+    }
+
+    fn policy_of(f: &PolicyFixture) -> pancetta_core::TxPolicy {
+        pancetta_core::TxPolicy::from_u8(f.tx_policy.load(Ordering::Acquire))
+    }
+
+    fn gateway_policies(f: &PolicyFixture) -> Vec<pancetta_core::TxPolicy> {
+        drain(&f.gateway)
+            .into_iter()
+            .filter_map(|m| match m.message_type {
+                MessageType::TxPolicyStatus { policy } => Some(policy),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tui_policy_updates(f: &PolicyFixture) -> Vec<pancetta_core::TxPolicy> {
+        drain(&f.tui)
+            .into_iter()
+            .filter_map(|m| match m {
+                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy } => Some(policy),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC1 + AC5: every `g` cycle publishes the RESULTING policy — including
+    /// the Disabled → Full recovery — with local effects identical whether
+    /// the display feed is on or off, and a gateway message only when it is
+    /// on.
+    #[tokio::test]
+    async fn cycle_tx_policy_publishes_each_transition() {
+        for feed_enabled in [true, false] {
+            let f = policy_fixture(feed_enabled).await;
+            let expected = [
+                pancetta_core::TxPolicy::RespondOnly,
+                pancetta_core::TxPolicy::Disabled,
+                pancetta_core::TxPolicy::Full,
+            ];
+            for (step, want) in expected.iter().enumerate() {
+                super::cycle_tx_policy(&f.ctx).await;
+
+                assert_eq!(policy_of(&f), *want, "step {step} atomic");
+                // Local TUI echo survives both gate states (additive-only).
+                assert_eq!(tui_policy_updates(&f), vec![*want], "step {step} TUI echo");
+                // Gateway inbox: exactly one policy message per press when
+                // enabled, none ever when disabled.
+                if feed_enabled {
+                    assert_eq!(gateway_policies(&f), vec![*want], "step {step} relay");
+                } else {
+                    assert!(
+                        drain(&f.gateway).is_empty(),
+                        "step {step}: feed disabled must enqueue nothing"
+                    );
+                }
+                // The Disabled leg keeps its safety effects; the others
+                // leave abort/CQ/tune state untouched.
+                if *want == pancetta_core::TxPolicy::Disabled {
+                    assert!(
+                        f.ctx.abort_current_tx.load(Ordering::Acquire),
+                        "step {step} abort"
+                    );
+                    assert!(!f.ctx.cq_active.load(Ordering::Relaxed), "step {step} cq");
+                    assert!(f.ctx.tune_until.read().await.is_none(), "step {step} tune");
+                    assert!(
+                        drain(&f.qso).iter().any(|m| matches!(
+                            m.message_type,
+                            MessageType::QsoMessage(QsoMessage::StopCq)
+                        )),
+                        "step {step} StopCq"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC2 + AC5: Shift+Q publishes Disabled (before the durable QSO
+    /// cancellation) while keeping every halt effect, with and without the
+    /// display feed.
+    #[tokio::test]
+    async fn emergency_stop_relays_disabled() {
+        for feed_enabled in [true, false] {
+            let f = policy_fixture(feed_enabled).await;
+            super::emergency_stop(&f.ctx).await;
+
+            // Halt semantics preserved (tx_halt tests pin the sync store).
+            assert_eq!(policy_of(&f), pancetta_core::TxPolicy::Disabled);
+            assert!(f.ctx.tx_halt.abort_current_tx.load(Ordering::Acquire));
+            assert!(!f.ctx.tx_halt.autonomous_enabled.load(Ordering::Acquire));
+            assert!(!f.ctx.cq_active.load(Ordering::Relaxed));
+            assert!(f.ctx.tune_until.read().await.is_none());
+            assert_eq!(
+                tui_policy_updates(&f),
+                vec![pancetta_core::TxPolicy::Disabled]
+            );
+            let qso = drain(&f.qso);
+            assert!(
+                qso.iter().any(|m| matches!(
+                    m.message_type,
+                    MessageType::QsoMessage(QsoMessage::CancelAllQsos)
+                )),
+                "{qso:?}"
+            );
+            if feed_enabled {
+                assert_eq!(
+                    gateway_policies(&f),
+                    vec![pancetta_core::TxPolicy::Disabled]
+                );
+            } else {
+                assert!(drain(&f.gateway).is_empty());
+            }
+        }
     }
 
     /// Batch 95: the TUI's worked-before flag and the autonomous
