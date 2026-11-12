@@ -91,6 +91,11 @@ the band alone. See
 
 PAN-351: transient statuses expire independently of readiness alerts. Pass an explicit severity through the bus and use Relay for service feedback. Local feedback may temporarily cover a held error. Do not restore decode echoes or use transient expiry to clear readiness.
 
+Replay sessions show `TX: REPLAY` in neutral gray from the first title-bar draw,
+regardless of TX policy. The session flag is supplied by the coordinator and is
+not saved in TUI config. See
+[the TX-policy banner decision](../../docs/DECISIONS/tui.md#tri-state-global-tx-policy).
+
 Gotcha (PAN-350): Band Activity reuses DX Hunter's prepared need verdict, but
 only marks a grid when both rows have the same canonical square. A later rover
 locator must not mark an older decode's grid. Call/Grid use 12/5 cells; the full

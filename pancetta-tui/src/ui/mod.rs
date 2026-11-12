@@ -773,14 +773,20 @@ fn title_bar_segments(
         title_rank::MODE,
     ));
 
-    // Bold, color-coded global TX-policy banner chip. Always visible (pinned)
-    // so the operator can tell at a glance which of the three states is
-    // active: GREEN "TX: FULL", YELLOW "TX: RESPOND-ONLY", RED
-    // "TX: DISABLED — RX ONLY". Reversed/bold for visual dominance.
-    let (policy_text, policy_bg) = match app.tx_policy {
-        pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
-        pancetta_core::TxPolicy::RespondOnly => (" TX: RESPOND-ONLY ".to_string(), Color::Yellow),
-        pancetta_core::TxPolicy::Disabled => (" TX: DISABLED — RX ONLY ".to_string(), Color::Red),
+    // Pinned TX banner: replay is a neutral session fact from the first draw.
+    // Live sessions retain the green/yellow/red policy states.
+    let (policy_text, policy_bg) = if app.config.replay {
+        (" TX: REPLAY ".to_string(), Color::Gray)
+    } else {
+        match app.tx_policy {
+            pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
+            pancetta_core::TxPolicy::RespondOnly => {
+                (" TX: RESPOND-ONLY ".to_string(), Color::Yellow)
+            }
+            pancetta_core::TxPolicy::Disabled => {
+                (" TX: DISABLED — RX ONLY ".to_string(), Color::Red)
+            }
+        }
     };
     segs.push(BarSegment::new(
         " ",
@@ -4040,6 +4046,46 @@ mod view_render_tests {
         crate::view::ActiveView::Run,
         crate::view::ActiveView::Monitor,
     ];
+
+    #[tokio::test]
+    async fn replay_title_bar_is_neutral_from_first_draw_for_every_policy() {
+        use crate::config::{Config, Theme};
+        use pancetta_core::TxPolicy;
+
+        for theme in [Theme::Dark, Theme::Light] {
+            for policy in [TxPolicy::Full, TxPolicy::RespondOnly, TxPolicy::Disabled] {
+                let mut config = Config {
+                    replay: true,
+                    ..Config::default()
+                };
+                config.ui.theme = theme;
+                let mut app = App::new(config, None).await.unwrap();
+                app.tx_policy = policy;
+                for view in ALL_VIEWS {
+                    app.active_view = view;
+                    for width in [80, 160] {
+                        let buf = render_app(&app, width, 24);
+                        let row = row_text(&buf, 0);
+                        let chip = " TX: REPLAY ";
+                        let start = row.find(chip).unwrap_or_else(|| {
+                            panic!("{theme:?} {policy:?} {view:?} {width}: [{row}]")
+                        });
+                        for text in ["TX: FULL", "TX: RESPOND-ONLY", "TX: DISABLED"] {
+                            assert!(!row.contains(text), "[{row}]");
+                        }
+                        assert!(ends_with_utc_clock(&row), "[{row}]");
+                        let start_col = row[..start].chars().count() as u16;
+                        for x in start_col..start_col + chip.len() as u16 {
+                            let cell = &buf[(x, 0)];
+                            assert_eq!(cell.fg, Color::Black);
+                            assert_eq!(cell.bg, Color::Gray);
+                            assert!(cell.modifier.contains(Modifier::BOLD));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Gherkin 1: the UTC clock stays visible in the header at the
     /// documented minimum terminal size, in all four main views.

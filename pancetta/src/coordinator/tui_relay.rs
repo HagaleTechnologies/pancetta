@@ -3593,6 +3593,7 @@ impl super::ApplicationCoordinator {
         // Run the TUI on a blocking task (it takes over the terminal)
         let tui_config_lock = config.read().await;
         let tui_config = pancetta_tui::Config {
+            replay: self.replay_mode(),
             station: pancetta_tui::config::StationConfig {
                 call_sign: tui_config_lock.station.callsign.clone(),
                 grid_square: tui_config_lock.station.grid_square.clone(),
