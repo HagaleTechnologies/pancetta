@@ -5635,6 +5635,11 @@ pub(crate) mod audit_test_util {
 
 mod contest;
 
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+#[path = "tx/test_harness.rs"]
+pub mod testing;
+
 #[cfg(test)]
 mod active_qso_freq_tests {
     use super::ActiveQsoFreq;

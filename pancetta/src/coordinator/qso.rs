@@ -20259,3 +20259,69 @@ mod completed_tx_purge_tests {
         assert_eq!(entry.state(UploadTarget::Lotw), Some(UploadState::Failed));
     }
 }
+
+/// Integration adapter over the same outcome handlers used by the QSO task.
+#[cfg(feature = "test-harness")]
+#[derive(Default)]
+pub(super) struct HarnessOutcomes {
+    completions: RecentManualCompletions,
+}
+
+#[cfg(feature = "test-harness")]
+impl HarnessOutcomes {
+    pub(super) async fn apply(
+        &self,
+        manager: &pancetta_qso::QsoManager,
+        outcome: &crate::message_bus::QsoMessage,
+    ) {
+        use crate::message_bus::QsoMessage;
+        match outcome {
+            QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced,
+                attempt_id,
+            } => {
+                handle_tx_frame_not_sent(
+                    manager,
+                    &self.completions,
+                    qso_id,
+                    message_text,
+                    replaced.as_ref(),
+                    *attempt_id,
+                )
+                .await
+            }
+            QsoMessage::TxFrameSent {
+                qso_id,
+                message_text,
+                aired,
+                aired_at,
+                attempt_id,
+            } => {
+                handle_tx_frame_sent(
+                    manager,
+                    &self.completions,
+                    qso_id,
+                    message_text,
+                    aired,
+                    *aired_at,
+                    *attempt_id,
+                )
+                .await
+            }
+            QsoMessage::TxFrameScheduled {
+                qso_id,
+                attempt_id,
+                target_slot,
+            } => {
+                if let Ok(id) = qso_id.parse() {
+                    manager
+                        .record_scheduled_tx_slot(id, *attempt_id, *target_slot)
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+}

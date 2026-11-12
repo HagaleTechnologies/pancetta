@@ -179,3 +179,13 @@ target slot (Step 6), set `station.ptt_lead_ms = 2000`. With the default 80 ms
 lead that window is an 80 ms race. Send the frame 4 to 10 s into a slot, so it
 targets the next slot and waits the full lead, and act on the first
 `SetPtt(true)`. `pancetta/src/coordinator/tx/abort_transcripts.rs` does this.
+
+## Real-worker integration tests
+
+CoordSim lives in `pancetta/tests/common/mod.rs` and drives the production TX
+worker through the disabled-by-default `test-harness` feature. Run
+`cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration`;
+the default workspace test command skips these targets. These tests use real
+UTC slot scheduling and FT8 playback durations. The injected arm clock controls
+authorization time only. See `pancetta/tests/common/README.md` for shutdown
+ownership and the supersede missing-unkey mutation check.
