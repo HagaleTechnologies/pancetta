@@ -4349,3 +4349,6 @@ mod microphone_command_tests {
         assert!(opens_microphone(&doctor, true));
     }
 }
+
+#[cfg(test)]
+mod docs_cli_drift;

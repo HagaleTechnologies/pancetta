@@ -15,7 +15,7 @@
 - **Tagging and publishing are OPERATOR-GATED** (Task 8). The workflow creates a *draft* release; only the operator publishes. No tag is pushed without explicit operator approval.
 - **No crates.io publishing.** `[workspace.package] publish = false` (root `Cargo.toml:42`) stays untouched; Task 5 fills metadata so it remains a choice, not a blocker.
 - Windows release target is `x86_64-pc-windows-gnu`, never MSVC (VLA incompatibility, `ci.yml:174-181`; the on-rig MiniPC builds with MinGW already).
-- K5ARH → N0CALL swaps only in test fixtures/plan files; docs describing real on-air sessions (`docs/qso-engine-bugs.md`, `docs/operations/*`, security reviews, `docs/fcc-part97-compliance.md`) are left alone.
+- K5ARH → N0CALL swaps only in test fixtures/plan files; docs describing real on-air sessions (`docs/archive/qso-engine-bugs.md`, `docs/operations/*`, security reviews, `docs/fcc-part97-compliance.md`) are left alone.
 - All commits run the standard local gate: `cargo fmt --all` + `cargo clippy --workspace --features transmit` clean before each commit. Repo commit-message conventions (`feat:`/`fix:`/`docs:`/`chore:`). Main moves only by PR merge.
 - Line numbers below are from current `origin/main`; if Phase 1's README edits have landed, locate anchors by heading, not line number.
 
