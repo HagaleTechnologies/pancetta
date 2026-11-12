@@ -3307,7 +3307,19 @@ mod test_rig_tests {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        pancetta_tui::tui_runner::restore_terminal();
+        // Restore only when this panic is on the process-exit path: the
+        // main thread's unwind is the only one that takes the process
+        // down, so the terminal must be back before the diagnostic is
+        // printed. Panics on every other thread are survived by design —
+        // the FT8 decode loop catches them (`catch_unwind` in
+        // `coordinator/ft8.rs`, a `spawn_blocking` thread) and the
+        // supervisor restarts panicked component tasks — while the TUI
+        // keeps running on its relay thread; restoring there would drop
+        // the alternate screen and raw mode mid-session with
+        // `TERMINAL_OWNED` left permanently false.
+        if std::thread::current().name() == Some("main") {
+            pancetta_tui::tui_runner::restore_terminal();
+        }
         let n = pancetta_lib::coordinator::record_panic();
         let location = info
             .location()
@@ -4561,6 +4573,20 @@ mod pan333_panic_tests {
         );
     }
 
+    /// Validate round 1 finding (`main.rs` panic hook): a panic on a
+    /// non-main thread is caught or supervised and the process keeps
+    /// running the TUI; the hook must not restore the terminal under it.
+    #[test]
+    fn pan333_worker_panic_keeps_terminal_for_running_tui() {
+        let output = isolated("worker");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn pan333_hook_child() {
         let Ok(mode) = std::env::var("PAN333_HOOK_CHILD") else {
@@ -4655,8 +4681,41 @@ mod pan333_panic_tests {
             default_hook(info);
         }));
         install_panic_hook();
-        assert!(std::panic::catch_unwind(|| panic!("simulated panic")).is_err());
-        assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+        if mode == "worker" {
+            // A non-main-thread panic that the process survives: the hook
+            // must count it but leave the terminal to the running TUI.
+            std::thread::Builder::new()
+                .name("pan333-worker".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("worker panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+            // Raw mode must still be active: the hook skipped restoration,
+            // so the TUI keeps its alternate screen and input handling.
+            let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+            assert_eq!(
+                term.c_lflag & libc::ICANON,
+                0,
+                "hook restored the terminal under the still-running TUI"
+            );
+        } else {
+            // The hook restores only on the process-exit path, so the panic
+            // must come from a thread named like the main thread; libtest
+            // runs this test on a thread named after the test itself.
+            std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("simulated panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+        }
         drop(runner);
         std::io::stdout().flush().unwrap();
         unsafe {
@@ -4669,8 +4728,16 @@ mod pan333_panic_tests {
         let (output, _master) = reader.join().unwrap();
         let output = String::from_utf8_lossy(&output).into_owned();
         let diagnostic = output.find("PAN333_DEFAULT_DIAGNOSTIC").unwrap();
-        assert!(output.find("\x1b[?1049l").unwrap() < diagnostic, "{output}");
-        assert!(output.find("\x1b[?25h").unwrap() < diagnostic, "{output}");
+        if mode == "worker" {
+            // The hook restored nothing during the panic: the alternate
+            // screen is left only by the runner's own teardown (drop),
+            // which still owns the terminal, so it comes after the
+            // diagnostic instead of before it.
+            assert!(diagnostic < output.find("\x1b[?1049l").unwrap(), "{output}");
+        } else {
+            assert!(output.find("\x1b[?1049l").unwrap() < diagnostic, "{output}");
+            assert!(output.find("\x1b[?25h").unwrap() < diagnostic, "{output}");
+        }
         let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
         assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
         assert_ne!(term.c_lflag & libc::ICANON, 0);

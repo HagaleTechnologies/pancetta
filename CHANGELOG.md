@@ -7,11 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
-- Restore the terminal after TUI startup failures and panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
-=======
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
->>>>>>> 23fc8f42dfeee5be511bb6cc5c61bb061349d13a
+- Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
 
 ### Added
 
