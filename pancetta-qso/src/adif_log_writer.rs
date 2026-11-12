@@ -30,7 +30,7 @@
 use crate::adif::{AdifError, AdifProcessor, AdifQso, AdifRecord};
 use crate::logbook_lock::{LogbookGuard, LogbookLock};
 use crate::QsoMetadata;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -433,12 +433,59 @@ pub fn remove_import_block(
     file.sync_all().map_err(io)
 }
 
+/// Replace a verified logbook in place, preserving existing append handles.
+/// The maintenance caller must hold the logbook lock and have synced a backup
+/// and rebuild marker. A partial I/O failure is recoverable from that backup;
+/// this operation does not promise crash atomicity.
+pub fn replace_logbook_bytes(
+    path: &Path,
+    expected: &[u8],
+    replacement: &[u8],
+) -> AdifLogResult<()> {
+    let io = |source| AdifLogError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    let mut current = Vec::new();
+    file.read_to_end(&mut current).map_err(io)?;
+    if current != expected {
+        return Err(AdifLogError::Format(
+            "logbook changed before replacement; nothing was written".into(),
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    file.write_all(replacement).map_err(io)?;
+    file.set_len(replacement.len() as u64).map_err(io)?;
+    file.sync_all().map_err(io)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::states::{GridSquares, QsoMetadata, SignalReports};
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    #[test]
+    fn replacement_checks_bytes_and_preserves_append_handle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        std::fs::write(&path, b"old log").unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        assert!(replace_logbook_bytes(&path, b"bad log", b"new").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old log");
+        replace_logbook_bytes(&path, b"old log", b"new longer log").unwrap();
+        live.write_all(b" appended").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new longer log appended");
+    }
 
     fn fixture_metadata() -> QsoMetadata {
         QsoMetadata {

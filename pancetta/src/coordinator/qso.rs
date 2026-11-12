@@ -969,6 +969,7 @@ async fn promote_pending_manual_calls(
                     emit_status(
                         message_bus,
                         format!("Now calling {} (was queued)", p.callsign),
+                        pancetta_core::DiagnosticLevel::Info,
                     )
                     .await;
                 }
@@ -1065,6 +1066,7 @@ async fn report_expired_calls(message_bus: &MessageBus, expired: Vec<String>) {
                 call,
                 QUEUED_CALL_TTL.as_secs() / 60
             ),
+            pancetta_core::DiagnosticLevel::Warn,
         )
         .await;
         crate::coordinator::tx::emit_diagnostic_full(
@@ -1087,11 +1089,18 @@ async fn report_expired_calls(message_bus: &MessageBus, expired: Vec<String>) {
 /// Used to surface QSO/TX state changes that the operator should see, even
 /// when nothing failed at the transport layer (e.g. duplicate suppression,
 /// QSO state-machine rejections).
-async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
+async fn emit_status(
+    message_bus: &MessageBus,
+    text: impl Into<String>,
+    level: pancetta_core::DiagnosticLevel,
+) {
     let msg = ComponentMessage::new(
         ComponentId::Qso,
         ComponentId::Tui,
-        MessageType::StatusUpdate(text.into()),
+        MessageType::StatusUpdate {
+            text: text.into(),
+            level,
+        },
         Instant::now(),
     );
     let _ = message_bus.send_message(msg).await;
@@ -1347,6 +1356,7 @@ async fn maybe_auto_resend_73(
                     "Re-sending 73 to {} ({}/{}) — they repeated RR73",
                     from_station, resend_n, AUTO_73_MAX_RESENDS
                 ),
+                pancetta_core::DiagnosticLevel::Info,
             )
             .await;
         }
@@ -2063,7 +2073,12 @@ async fn refuse_manual_open_at_capacity(
         },
     )
     .await;
-    emit_status(message_bus, manual_capacity_status(open, callsign, snap)).await;
+    emit_status(
+        message_bus,
+        manual_capacity_status(open, callsign, snap),
+        pancetta_core::DiagnosticLevel::Warn,
+    )
+    .await;
     if remote_origin {
         super::remote_gateway::relay_to_gateway(
             message_bus,
@@ -2381,6 +2396,7 @@ async fn maybe_answer_caller(
             emit_status(
                 message_bus,
                 format!("Answering {} (caller)", answer.their_call),
+                pancetta_core::DiagnosticLevel::Info,
             )
             .await;
         }
@@ -4309,7 +4325,12 @@ impl super::ApplicationCoordinator {
                                             let text = format!(
                                                 "73 to {call} was not sent; QSO not logged, still open"
                                             );
-                                            emit_status(&snapshot_bus, text.clone()).await;
+                                            emit_status(
+                                                &snapshot_bus,
+                                                text.clone(),
+                                                pancetta_core::DiagnosticLevel::Warn,
+                                            )
+                                            .await;
                                             let _ = snapshot_bus
                                                 .send_message(ComponentMessage::new(
                                                     ComponentId::Qso,
@@ -4539,7 +4560,12 @@ impl super::ApplicationCoordinator {
                                                 failure_reason_text(reason)
                                             )
                                         };
-                                        emit_status(&snapshot_bus, text).await;
+                                        emit_status(
+                                            &snapshot_bus,
+                                            text,
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -5515,8 +5541,7 @@ impl super::ApplicationCoordinator {
                                                         "Queued {} — waiting for current window \
                                                          to clear",
                                                         callsign
-                                                    ),
-                                                )
+                                                    ), pancetta_core::DiagnosticLevel::Info)
                                                 .await;
                                                 continue;
                                             }
@@ -5627,8 +5652,7 @@ impl super::ApplicationCoordinator {
                                                         format!(
                                                             "Calling {} — TX queued ({:.0} Hz)",
                                                             callsign, tx_off
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Info)
                                                     .await;
                                                 }
                                                 Err(e) => {
@@ -5638,8 +5662,7 @@ impl super::ApplicationCoordinator {
                                                     );
                                                     emit_status(
                                                         &message_bus,
-                                                        format!("Call {} failed: {}", callsign, e),
-                                                    )
+                                                        format!("Call {} failed: {}", callsign, e), pancetta_core::DiagnosticLevel::Warn)
                                                     .await;
                                                 }
                                             }
@@ -6007,8 +6030,7 @@ impl super::ApplicationCoordinator {
                                                         "Hound: queued {} — waiting for current \
                                                          window to clear",
                                                         callsign
-                                                    ),
-                                                )
+                                                    ), pancetta_core::DiagnosticLevel::Info)
                                                 .await;
                                                 continue;
                                             }
@@ -6067,8 +6089,7 @@ impl super::ApplicationCoordinator {
                                                             "Hound: calling Fox {} — TX \
                                                              queued ({} Hz RX)",
                                                             callsign, fox_freq
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Info)
                                                     .await;
                                                 }
                                                 Err(e) => {
@@ -6081,8 +6102,7 @@ impl super::ApplicationCoordinator {
                                                         format!(
                                                             "Hound: engage {} failed: {}",
                                                             callsign, e
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Warn)
                                                     .await;
                                                 }
                                             }
@@ -6237,8 +6257,7 @@ impl super::ApplicationCoordinator {
                                                         "Queued {} — waiting for current window \
                                                          to clear",
                                                         callsign
-                                                    ),
-                                                )
+                                                    ), pancetta_core::DiagnosticLevel::Info)
                                                 .await;
                                                 continue;
                                             }
@@ -6323,8 +6342,7 @@ impl super::ApplicationCoordinator {
                                                         format!(
                                                             "Replying to {} — TX queued ({:.0} Hz)",
                                                             callsign, tx_off
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Info)
                                                     .await;
                                                 }
                                                 Err(e) => {
@@ -6337,8 +6355,7 @@ impl super::ApplicationCoordinator {
                                                         format!(
                                                             "Reply to {} failed: {}",
                                                             callsign, e
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Warn)
                                                     .await;
                                                 }
                                             }
@@ -6461,8 +6478,7 @@ impl super::ApplicationCoordinator {
                                                     format!(
                                                         "Band change — {} active QSO(s) ended",
                                                         n
-                                                    ),
-                                                )
+                                                    ), pancetta_core::DiagnosticLevel::Warn)
                                                 .await;
                                             }
                                             // PAN-287: a call parked in the cross-parity queue on
@@ -6480,6 +6496,7 @@ impl super::ApplicationCoordinator {
                                                 emit_status(
                                                     &message_bus,
                                                     format!("Queued call to {call} dropped — band changed"),
+                                                    pancetta_core::DiagnosticLevel::Warn,
                                                 )
                                                 .await;
                                                 crate::coordinator::tx::emit_diagnostic_full(
@@ -6598,16 +6615,14 @@ impl super::ApplicationCoordinator {
                                                         format!(
                                                             "Calling CQ — TX queued ({} Hz)",
                                                             frequency
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Info)
                                                     .await;
                                                 }
                                                 Err(e) => {
                                                     warn!("Failed to start manual CQ: {}", e);
                                                     emit_status(
                                                         &message_bus,
-                                                        format!("Start CQ failed: {}", e),
-                                                    )
+                                                        format!("Start CQ failed: {}", e), pancetta_core::DiagnosticLevel::Warn)
                                                     .await;
                                                 }
                                             }
@@ -6675,8 +6690,7 @@ impl super::ApplicationCoordinator {
                                                             "Fox mode refused — TX policy is {} \
                                                              (press g for Full)",
                                                             policy.label()
-                                                        ),
-                                                    )
+                                                        ), pancetta_core::DiagnosticLevel::Warn)
                                                     .await;
                                                     // Echo the ACTUAL state (still false — refused)
                                                     // so the TUI can correct its optimistic flip.
@@ -6742,7 +6756,7 @@ impl super::ApplicationCoordinator {
                                                             finishing
                                                         )
                                                     };
-                                                    emit_status(&message_bus, status).await;
+                                                    emit_status(&message_bus, status, pancetta_core::DiagnosticLevel::Warn).await;
                                                 } else {
                                                     match qso_manager
                                                         .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
@@ -6767,8 +6781,7 @@ impl super::ApplicationCoordinator {
                                                                     "Fox mode ON — CQ + up to {} \
                                                                      streams",
                                                                     n
-                                                                ),
-                                                            )
+                                                                ), pancetta_core::DiagnosticLevel::Info)
                                                             .await;
                                                         }
                                                         Err(e) => {
@@ -6785,8 +6798,7 @@ impl super::ApplicationCoordinator {
                                                                     "Fox mode ON (CQ start failed: \
                                                                      {})",
                                                                     e
-                                                                ),
-                                                            )
+                                                                ), pancetta_core::DiagnosticLevel::Warn)
                                                             .await;
                                                         }
                                                     }
@@ -6867,8 +6879,7 @@ impl super::ApplicationCoordinator {
                                                 );
                                                 emit_status(
                                                     &message_bus,
-                                                    "Fox mode OFF".to_string(),
-                                                )
+                                                    "Fox mode OFF".to_string(), pancetta_core::DiagnosticLevel::Info)
                                                 .await;
                                                 // Echo actual state (disengaged = false) to TUI.
                                                 let _ = message_bus
@@ -10085,7 +10096,7 @@ mod auto_73_tests {
         assert_eq!(entry.resends, 0, "the resend commit must be rolled back");
         assert_eq!(entry.last_resend_at, None);
         while let Ok(msg) = tui.try_recv() {
-            if let crate::message_bus::MessageType::StatusUpdate(text) = &msg.message_type {
+            if let crate::message_bus::MessageType::StatusUpdate { text, .. } = &msg.message_type {
                 assert!(
                     !text.contains("Re-sending 73"),
                     "status claimed a resend: {text}"
@@ -11688,7 +11699,8 @@ async fn start_local_qso_log_writers(
 }
 
 /// The history seed and whether a refused migration must hold back ADIF creation.
-pub(crate) enum LocalIndex {
+#[doc(hidden)]
+pub enum LocalIndex {
     Ready(pancetta_qso::async_database::QsoDatabase),
     Unavailable { reason: String },
     MigrationRefused { reason: String },
@@ -11710,7 +11722,8 @@ impl LocalIndex {
 /// Reconcile contacts before either writer opens a file. An unchanged ADIF
 /// needs no rebuild regardless of timestamps. A migration refusal must never
 /// create a header-only ADIF that would erase legacy contacts on the next start.
-async fn prepare_local_qso_index(
+#[doc(hidden)]
+pub async fn prepare_local_qso_index(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
 ) -> LocalIndex {
@@ -15688,7 +15701,7 @@ mod respond_to_caller_admission_tests {
         messages.iter().any(|m| {
             matches!(
                 &m.message_type,
-                MessageType::StatusUpdate(text)
+                MessageType::StatusUpdate { text, .. }
                     if text.contains("Queued") && text.contains("<...>")
             )
         })
@@ -17150,7 +17163,7 @@ mod respond_to_caller_admission_tests {
         assert!(
             pan76_wait_for(
                 &tui_rx,
-                |m| matches!(m, MessageType::StatusUpdate(t) if t.contains("K4DDD"))
+                |m| matches!(m, MessageType::StatusUpdate { text: t, .. } if t.contains("K4DDD"))
             )
             .await,
             "the Qso component must handle the StartQso"
@@ -17248,7 +17261,7 @@ mod respond_to_caller_admission_tests {
         loop {
             while let Ok(msg) = tui_rx.try_recv() {
                 match msg.message_type {
-                    MessageType::StatusUpdate(text) => statuses.push(text),
+                    MessageType::StatusUpdate { text, .. } => statuses.push(text),
                     MessageType::FoxModeStatus { on: true } => return statuses,
                     _ => {}
                 }
@@ -17910,7 +17923,7 @@ mod manual_capacity_admission_tests {
 
     fn status(m: &ComponentMessage) -> Option<&str> {
         match &m.message_type {
-            MessageType::StatusUpdate(s) => Some(s.as_str()),
+            MessageType::StatusUpdate { text: s, .. } => Some(s.as_str()),
             _ => None,
         }
     }
@@ -18452,7 +18465,7 @@ mod remote_controller_change_tests {
 
     fn status(m: &ComponentMessage) -> Option<&str> {
         match &m.message_type {
-            MessageType::StatusUpdate(s) => Some(s.as_str()),
+            MessageType::StatusUpdate { text: s, .. } => Some(s.as_str()),
             _ => None,
         }
     }
@@ -18976,7 +18989,7 @@ mod pan120_tests {
                                     "refusal emitted manager events: {events:?}"
                                 );
                                 assert!(st.fox_admitted.read().unwrap().is_empty());
-                                assert!(!tui.try_iter().any(|m| matches!(m.message_type, MessageType::StatusUpdate(ref t) if t.starts_with("Answering "))));
+                                assert!(!tui.try_iter().any(|m| matches!(m.message_type, MessageType::StatusUpdate { text: ref t, .. } if t.starts_with("Answering "))));
                             } else {
                                 let outgoing = sends(&events);
                                 assert_eq!(outgoing.len(), 1, "{events:?}");
@@ -19378,7 +19391,7 @@ mod pan120_tests {
                 let messages = h.barrier().await;
                 assert!(drain(&mut rx).is_empty());
                 assert_eq!(h.manager.active_qso_count().await, 0);
-                assert!(!messages.iter().any(|m| matches!(&m.message_type, MessageType::StatusUpdate(t) if t.starts_with("Answering "))));
+                assert!(!messages.iter().any(|m| matches!(&m.message_type, MessageType::StatusUpdate { text: t, .. } if t.starts_with("Answering "))));
                 h.present();
                 // Refreshing presence cannot bypass the same-slot attempt dedup.
                 h.decode("K5ARH W1ABC FN31", 100, 14_074_000).await;

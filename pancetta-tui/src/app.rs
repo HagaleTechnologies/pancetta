@@ -1479,12 +1479,15 @@ pub struct App {
 
     // UI State
     pub terminal_size: (u16, u16),
+<<<<<<< HEAD
     pub qrz_stations: HashMap<String, QrzStationInfo>,
     pub status_message: String,
+=======
+    statuses: crate::status::StatusMessages,
+>>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
     pub theme: Theme,
     /// Retained diagnostic-event history (docs/observability-diagnostics-
-    /// plan.md Layer 1) — unlike `status_message` (a single, overwrite-
-    /// prone line), this is a bounded scrollback of WHY things happened:
+    /// plan.md Layer 1) — unlike the expiring transient status ring, this is a bounded scrollback of WHY things happened:
     /// QSO outcomes, drops, rejects. Toggled into view alongside the
     /// existing panels; see `ActivePanel`.
     pub diagnostic_events: VecDeque<DiagnosticEventRecord>,
@@ -1915,8 +1918,23 @@ impl App {
             should_quit: false,
             active_panel: ActivePanel::BandActivity,
             terminal_size: (80, 24),
+<<<<<<< HEAD
             qrz_stations: HashMap::new(),
             status_message: "Pancetta TUI Ready".to_string(),
+=======
+            statuses: {
+                let mut statuses = crate::status::StatusMessages::default();
+                statuses.push(
+                    "Pancetta TUI Ready".into(),
+                    pancetta_core::DiagnosticLevel::Info,
+                    crate::status::Origin::Local,
+                    None,
+                    None,
+                    std::time::Instant::now(),
+                );
+                statuses
+            },
+>>>>>>> 27fba49d41c56da94ef46c7f9220424a86fbcf10
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),
             recent_qsos: VecDeque::with_capacity(50),
@@ -2198,7 +2216,14 @@ impl App {
         // shrink).
         self.clamp_band_activity_selection();
         self.persist_tui_state();
-        self.status_message = crate::presentation::view_message(self.active_view).to_string();
+        self.statuses.push(
+            crate::presentation::view_message(self.active_view).to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
     }
 
     /// Apply the coordinator's authoritative `DecodeEffortUpdate` echo
@@ -2207,7 +2232,14 @@ impl App {
     /// the choice into its own `~/.pancetta/session_state.json` when the
     /// keystroke is handled, and this file stopped carrying a cosmetic copy.
     pub fn set_decode_effort(&mut self, effort: String, budget_ms: u64) {
-        self.status_message = format!("Decode effort: {} ({} ms budget)", effort, budget_ms);
+        self.statuses.push(
+            format!("Decode effort: {} ({} ms budget)", effort, budget_ms),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Relay,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         self.decode_effort = effort;
     }
 
@@ -2367,18 +2399,36 @@ impl App {
         let code = placement.openness.get(bin).copied().unwrap_or(0);
 
         if code == 0 {
-            self.status_message = format!("\u{26a0} {hz} Hz busy in both windows — not parking");
+            self.statuses.push(
+                format!("\u{26a0} {hz} Hz busy in both windows — not parking"),
+                pancetta_core::DiagnosticLevel::Warn,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
             return None;
         }
 
         self.tx_offset_hold_hz = Some(hz);
         self.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
         self.parked_since = Some(chrono::Utc::now());
-        self.status_message = match code {
-            1 => format!("Parked at {hz} Hz (O) \u{2014} Even window busy"),
-            2 => format!("Parked at {hz} Hz (E) \u{2014} Odd window busy"),
-            _ => format!("Parked at {hz} Hz (E+O)"),
-        };
+        self.statuses.push(
+            match code {
+                1 => format!("Parked at {hz} Hz (O) \u{2014} Even window busy"),
+                2 => format!("Parked at {hz} Hz (E) \u{2014} Odd window busy"),
+                _ => format!("Parked at {hz} Hz (E+O)"),
+            },
+            if code == 3 {
+                pancetta_core::DiagnosticLevel::Info
+            } else {
+                pancetta_core::DiagnosticLevel::Warn
+            },
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         Some(crate::tui_runner::TuiCommand::SetTxOffset {
             offset_hz: Some(hz),
         })
@@ -2404,19 +2454,33 @@ impl App {
         // This method just sets the monitoring flag so the UI knows to expect data.
         // Standalone TUI operation (without coordinator) is not yet supported.
         self.is_monitoring = true;
-        self.status_message = "Audio monitoring active (via coordinator)".to_string();
+        self.statuses.push(
+            "Audio monitoring active (via coordinator)".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         info!("Audio monitoring flag set — pipeline managed by coordinator");
         Ok(())
     }
 
     pub async fn toggle_monitoring(&mut self) -> Result<()> {
         self.is_monitoring = !self.is_monitoring;
-        self.status_message = if self.is_monitoring {
-            "Audio monitoring enabled"
-        } else {
-            "Audio monitoring disabled"
-        }
-        .to_string();
+        self.statuses.push(
+            if self.is_monitoring {
+                "Audio monitoring enabled"
+            } else {
+                "Audio monitoring disabled"
+            }
+            .to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
 
         info!(
             "Audio monitoring: {}",
@@ -2801,7 +2865,14 @@ impl App {
         self.decoded_messages.clear();
         self.band_activity_scroll = 0;
         self.clamp_band_activity_selection();
-        self.status_message = "Messages cleared".to_string();
+        self.statuses.push(
+            "Messages cleared".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         info!("Cleared all decoded messages");
     }
 
@@ -2844,7 +2915,14 @@ impl App {
             }
             _ => {
                 self.clear_armed_at = Some(std::time::Instant::now());
-                self.status_message = "press x again within 3s to clear decodes".to_string();
+                self.statuses.push(
+                    "press x again within 3s to clear decodes".to_string(),
+                    pancetta_core::DiagnosticLevel::Info,
+                    crate::status::Origin::Local,
+                    None,
+                    None,
+                    std::time::Instant::now(),
+                );
                 false
             }
         }
@@ -3072,23 +3150,37 @@ impl App {
                 self.decoded_messages = snap.decoded_messages;
                 self.dx_stations = snap.dx_stations;
                 let mins = (age_secs / 60).max(0);
-                self.status_message = if caller_count > 0 {
-                    format!(
-                        "{} — restored {} caller{} from {}m ago",
-                        base_status,
-                        caller_count,
-                        if caller_count == 1 { "" } else { "s" },
-                        mins
-                    )
-                } else {
-                    format!("{} — restored from {}m ago", base_status, mins)
-                };
+                self.statuses.push(
+                    if caller_count > 0 {
+                        format!(
+                            "{} — restored {} caller{} from {}m ago",
+                            base_status,
+                            caller_count,
+                            if caller_count == 1 { "" } else { "s" },
+                            mins
+                        )
+                    } else {
+                        format!("{} — restored from {}m ago", base_status, mins)
+                    },
+                    pancetta_core::DiagnosticLevel::Info,
+                    crate::status::Origin::Local,
+                    None,
+                    None,
+                    std::time::Instant::now(),
+                );
                 return dial;
             }
             // else: too old — already removed; fall through to a fresh start.
         }
 
-        self.status_message = base_status;
+        self.statuses.push(
+            base_status,
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         dial
     }
 
@@ -3493,6 +3585,68 @@ impl App {
         self.clamp_dx_hunter_selection();
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_test_push(
+        &mut self,
+        text: &str,
+        level: pancetta_core::DiagnosticLevel,
+        now: std::time::Instant,
+    ) {
+        self.statuses.push(
+            text.into(),
+            level,
+            crate::status::Origin::Relay,
+            None,
+            None,
+            now,
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn status_test_len(&self) -> usize {
+        self.statuses.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn status_test_prune(&mut self, now: std::time::Instant) {
+        self.statuses.prune(now);
+    }
+    /// Current active transient text; readiness is independent.
+    pub fn status_message(&self) -> String {
+        self.selected_status()
+            .map(|(text, _)| text.to_string())
+            .unwrap_or_default()
+    }
+    pub fn selected_status(&self) -> Option<(&str, pancetta_core::DiagnosticLevel)> {
+        self.statuses
+            .selected(std::time::Instant::now())
+            .map(|e| (e.text.as_str(), e.level))
+    }
+    pub fn set_local_status(&mut self, text: String, level: pancetta_core::DiagnosticLevel) {
+        self.statuses.push(
+            text,
+            level,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
+    }
+    pub fn set_relay_status(&mut self, text: String, level: pancetta_core::DiagnosticLevel) {
+        self.statuses.push(
+            text,
+            level,
+            crate::status::Origin::Relay,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn clear_status_for_test(&mut self) {
+        self.statuses.clear();
+    }
+    pub fn prune_status(&mut self) {
+        self.statuses.prune(std::time::Instant::now());
+    }
     pub fn add_error_message(&mut self, error: String) {
         self.add_coded_error_message(error, None);
     }
@@ -3500,7 +3654,6 @@ impl App {
     /// Like [`Self::add_error_message`], tagged with the `code` a later
     /// [`Self::resolve_alerts`] clears it by.
     pub fn add_coded_error_message(&mut self, error: String, code: Option<u32>) {
-        self.status_message = format!("Error: {}", error);
         // PAN-89: also a sticky alert on the readiness strip until `!`
         // acknowledges it. A repeat of an unacknowledged alert counts up
         // instead of stacking.
@@ -3510,9 +3663,25 @@ impl App {
             .find(|a| !a.acknowledged && a.text == error && a.code == code)
         {
             alert.count += 1;
+            self.statuses.push(
+                format!("Error: {}", error),
+                pancetta_core::DiagnosticLevel::Error,
+                crate::status::Origin::Relay,
+                code,
+                Some(alert.id),
+                std::time::Instant::now(),
+            );
             return;
         }
         self.next_alert_id += 1;
+        self.statuses.push(
+            format!("Error: {}", error),
+            pancetta_core::DiagnosticLevel::Error,
+            crate::status::Origin::Relay,
+            code,
+            Some(self.next_alert_id),
+            std::time::Instant::now(),
+        );
         self.alerts.push_back(crate::readiness::Alert {
             id: self.next_alert_id,
             text: error,
@@ -3527,11 +3696,12 @@ impl App {
     }
 
     /// The fault behind every alert tagged `code` recovered on its own: drop
-    /// those alerts, acknowledged or not. Returns how many were dropped.
+    /// those alerts and matching transients, acknowledged or not. Returns the
+    /// larger removal count, including recovery after readiness eviction.
     pub fn resolve_alerts(&mut self, code: u32) -> usize {
         let before = self.alerts.len();
         self.alerts.retain(|a| a.code != Some(code));
-        before - self.alerts.len()
+        (before - self.alerts.len()).max(self.statuses.resolve(code))
     }
 
     /// PAN-89 `!`: acknowledge every visible readiness Warning (alerts are
@@ -3547,6 +3717,7 @@ impl App {
                 crate::readiness::ReadinessKey::Alert(id) => {
                     if let Some(alert) = self.alerts.iter_mut().find(|a| a.id == id) {
                         alert.acknowledged = true;
+                        self.statuses.acknowledge(id);
                     }
                 }
                 key => {
@@ -3777,8 +3948,15 @@ impl App {
                         .first()
                         .map(|s| format!("{:.0}", s.offset_hz))
                         .unwrap_or_else(|| "\u{2014}".to_string());
-                    self.status_message = format!(
+                    self.statuses.push(
+                        format!(
                         "\u{26a0} parked {hz} now busy in {busy} \u{2014} \u{2460} {best} better"
+                    ),
+                        pancetta_core::DiagnosticLevel::Warn,
+                        crate::status::Origin::Relay,
+                        None,
+                        None,
+                        std::time::Instant::now(),
                     );
                 }
             }
@@ -3809,8 +3987,32 @@ impl App {
         }
     }
 
-    pub fn update_component_status(&mut self, component: String, status: String) {
-        self.status_message = format!("{}: {}", component, status);
+    pub fn update_component_status(
+        &mut self,
+        component: String,
+        status: String,
+        level: pancetta_core::DiagnosticLevel,
+    ) {
+        self.set_relay_status(format!("{}: {}", component, status), level);
+    }
+
+    /// Replace one transient condition, independently of readiness alerts.
+    pub fn update_coded_component_status(
+        &mut self,
+        component: String,
+        status: String,
+        level: pancetta_core::DiagnosticLevel,
+        code: u32,
+    ) {
+        self.statuses.resolve(code);
+        self.statuses.push(
+            format!("{}: {}", component, status),
+            level,
+            crate::status::Origin::Relay,
+            Some(code),
+            None,
+            std::time::Instant::now(),
+        );
     }
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
@@ -3869,9 +4071,23 @@ impl App {
         self.help_visible = !self.help_visible;
         if self.help_visible {
             self.help_scroll = 0;
-            self.status_message = "Help — press Escape or ? to close".to_string();
+            self.statuses.push(
+                "Help — press Escape or ? to close".to_string(),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         } else {
-            self.status_message = "Pancetta TUI Ready".to_string();
+            self.statuses.push(
+                "Pancetta TUI Ready".to_string(),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         }
     }
 
@@ -4087,9 +4303,23 @@ impl App {
 
     pub fn activate_selected(&mut self) {
         if let Some((callsign, _freq, _parity)) = self.get_selected_station() {
-            self.status_message = format!("Calling {}...", callsign);
+            self.statuses.push(
+                format!("Calling {}...", callsign),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         } else {
-            self.status_message = "No station selected".to_string();
+            self.statuses.push(
+                "No station selected".to_string(),
+                pancetta_core::DiagnosticLevel::Warn,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         }
     }
 
@@ -4541,7 +4771,14 @@ impl App {
         if self.tx_input_buffer.len() < 13 {
             self.tx_input_buffer.insert(self.tx_input_cursor, c);
             self.tx_input_cursor += 1;
-            self.status_message = format!("TX: {}", self.tx_input_buffer);
+            self.statuses.push(
+                format!("TX: {}", self.tx_input_buffer),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         }
     }
 
@@ -4549,7 +4786,14 @@ impl App {
         if self.tx_input_cursor > 0 {
             self.tx_input_cursor -= 1;
             self.tx_input_buffer.remove(self.tx_input_cursor);
-            self.status_message = format!("TX: {}", self.tx_input_buffer);
+            self.statuses.push(
+                format!("TX: {}", self.tx_input_buffer),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         }
     }
 
@@ -4557,14 +4801,28 @@ impl App {
     /// active, Char/Backspace edit the buffer and command letters are inert.
     pub fn enter_compose_mode(&mut self) {
         self.compose_mode = true;
-        self.status_message = "Compose TX message — type, Enter to send, Esc to cancel".to_string();
+        self.statuses.push(
+            "Compose TX message — type, Enter to send, Esc to cancel".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
     }
 
     /// Leave compose mode, discarding the in-progress buffer.
     pub fn cancel_compose_mode(&mut self) {
         self.compose_mode = false;
         self.clear_input();
-        self.status_message = "Compose cancelled".to_string();
+        self.statuses.push(
+            "Compose cancelled".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
     }
 
     /// A small compose prompt for the status / input line, e.g.
@@ -4706,11 +4964,18 @@ impl App {
     pub fn toggle_autonomous(&mut self) {
         if let Some(ref mut status) = self.autonomous_status {
             status.enabled = !status.enabled;
-            self.status_message = if status.enabled {
-                "Autonomous mode enabled".to_string()
-            } else {
-                "Autonomous mode disabled".to_string()
-            };
+            self.statuses.push(
+                if status.enabled {
+                    "Autonomous mode enabled".to_string()
+                } else {
+                    "Autonomous mode disabled".to_string()
+                },
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
             info!(
                 "Autonomous mode: {}",
                 if status.enabled {
@@ -4723,7 +4988,14 @@ impl App {
             // No live status yet (the autonomous loop pushes one per
             // 15s slot). The toggle command still goes to the
             // coordinator; the runtime gate flips regardless.
-            self.status_message = "Autonomous toggle sent (waiting for live status)".to_string();
+            self.statuses.push(
+                "Autonomous toggle sent (waiting for live status)".to_string(),
+                pancetta_core::DiagnosticLevel::Info,
+                crate::status::Origin::Local,
+                None,
+                None,
+                std::time::Instant::now(),
+            );
         }
     }
 
@@ -4735,11 +5007,18 @@ impl App {
     /// the authoritative state via the standard `StatusUpdate` path.
     pub fn toggle_fox_mode(&mut self) {
         self.fox_mode = !self.fox_mode;
-        self.status_message = if self.fox_mode {
-            "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)".to_string()
-        } else {
-            "Fox mode OFF".to_string()
-        };
+        self.statuses.push(
+            if self.fox_mode {
+                "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)".to_string()
+            } else {
+                "Fox mode OFF".to_string()
+            },
+            pancetta_core::DiagnosticLevel::Info,
+            crate::status::Origin::Local,
+            None,
+            None,
+            std::time::Instant::now(),
+        );
         info!(
             "Fox mode: {}",
             if self.fox_mode { "enabled" } else { "disabled" }
@@ -4854,10 +5133,24 @@ impl App {
                 // Toggle paused state via the state string.
                 if status.state == "Paused" {
                     status.state = "Hunting".to_string();
-                    self.status_message = "Autonomous resumed".to_string();
+                    self.statuses.push(
+                        "Autonomous resumed".to_string(),
+                        pancetta_core::DiagnosticLevel::Info,
+                        crate::status::Origin::Local,
+                        None,
+                        None,
+                        std::time::Instant::now(),
+                    );
                 } else {
                     status.state = "Paused".to_string();
-                    self.status_message = "Autonomous paused".to_string();
+                    self.statuses.push(
+                        "Autonomous paused".to_string(),
+                        pancetta_core::DiagnosticLevel::Info,
+                        crate::status::Origin::Local,
+                        None,
+                        None,
+                        std::time::Instant::now(),
+                    );
                 }
                 info!("Autonomous state: {}", status.state);
             }
@@ -6053,13 +6346,16 @@ mod tests {
     #[tokio::test]
     async fn decoded_message_does_not_overwrite_status_message() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        app.status_message = "Applying rig config…".to_string();
+        app.set_local_status(
+            "Applying rig config…".to_string(),
+            pancetta_core::DiagnosticLevel::Info,
+        );
         for i in 0..30 {
             app.add_decoded_message(fixture_view(&format!("K{i}ABC"), -10))
                 .await
                 .unwrap();
         }
-        assert_eq!(app.status_message, "Applying rig config…");
+        assert_eq!(app.status_message(), "Applying rig config…");
     }
 
     #[tokio::test]
@@ -6077,7 +6373,7 @@ mod tests {
             "Rig connect failed (connection refused)"
         );
         assert!(!app.alerts[0].acknowledged);
-        assert!(app.status_message.starts_with("Error: "));
+        assert!(app.status_message().starts_with("Error: "));
     }
 
     fn fixture_view_directed(call: &str, snr: i32) -> DecodedMessageView {
@@ -10006,9 +10302,9 @@ mod tests {
             "callers restored on return within TTL"
         );
         assert!(
-            app.status_message.contains("restored") && app.status_message.contains("2 caller"),
+            app.status_message().contains("restored") && app.status_message().contains("2 caller"),
             "restore should be visible in status: {:?}",
-            app.status_message
+            app.status_message()
         );
     }
 
@@ -10045,16 +10341,16 @@ mod tests {
             "the placeholder must still be excluded from the restored Callers panel"
         );
         assert!(
-            app.status_message.contains("restored") && app.status_message.contains("2 caller"),
+            app.status_message().contains("restored") && app.status_message().contains("2 caller"),
             "restored-count status must match the displayed rows (2), not the raw \
              directed-decode count (3, which would wrongly include the placeholder): {:?}",
-            app.status_message
+            app.status_message()
         );
         assert!(
-            !app.status_message.contains("3 caller"),
+            !app.status_message().contains("3 caller"),
             "restored-count status must never count the unresolved hash \
              placeholder as a caller: {:?}",
-            app.status_message
+            app.status_message()
         );
     }
 
@@ -10086,9 +10382,9 @@ mod tests {
             "stale snapshot must not restore"
         );
         assert!(
-            !app.status_message.contains("restored"),
+            !app.status_message().contains("restored"),
             "no restore status for stale snapshot: {:?}",
-            app.status_message
+            app.status_message()
         );
     }
 
@@ -10520,26 +10816,27 @@ mod tests {
         app.apply_placement(placement_view_with_bin_code(52, 3));
         assert_eq!(app.park_coverage_last, Some((1500, 3)));
         assert!(
-            !app.status_message.contains("now busy"),
+            !app.status_message().contains("now busy"),
             "no warning on the baseline-establishing snapshot, got: {}",
-            app.status_message
+            app.status_message()
         );
 
         // Coverage degrades 3 -> 1 (strict decrease): fires exactly once.
         app.apply_placement(placement_view_with_bin_code(52, 1));
         assert!(
-            app.status_message.contains("now busy"),
+            app.status_message().contains("now busy"),
             "expected a degradation warning, got: {}",
-            app.status_message
+            app.status_message()
         );
         assert_eq!(app.park_coverage_last, Some((1500, 1)));
 
         // Stash a sentinel, then apply an UNCHANGED (still code 1) snapshot.
         // Edge-triggered: must NOT re-fire / rewrite status_message.
-        app.status_message = "SENTINEL".to_string();
+        app.set_local_status("SENTINEL".to_string(), pancetta_core::DiagnosticLevel::Info);
         app.apply_placement(placement_view_with_bin_code(52, 1));
         assert_eq!(
-            app.status_message, "SENTINEL",
+            app.status_message(),
+            "SENTINEL",
             "warning must not repeat while still degraded (edge-triggered, not per-update)"
         );
         assert_eq!(app.park_coverage_last, Some((1500, 1)));
@@ -10555,10 +10852,11 @@ mod tests {
         assert_eq!(app.park_coverage_last, Some((1500, 1)));
 
         // Improves 1 -> 2: no warning.
-        app.status_message = "SENTINEL".to_string();
+        app.set_local_status("SENTINEL".to_string(), pancetta_core::DiagnosticLevel::Info);
         app.apply_placement(placement_view_with_bin_code(52, 2));
         assert_eq!(
-            app.status_message, "SENTINEL",
+            app.status_message(),
+            "SENTINEL",
             "an improvement must not trigger the degradation warning"
         );
         assert_eq!(app.park_coverage_last, Some((1500, 2)));
@@ -10610,10 +10908,11 @@ mod tests {
         // which wouldn't spuriously fire here since they're equal, so
         // additionally verify the baseline correctly rebases to B (not
         // left pointing at A) and no warning fires.
-        app.status_message = "SENTINEL".to_string();
+        app.set_local_status("SENTINEL".to_string(), pancetta_core::DiagnosticLevel::Info);
         app.apply_placement(placement_view_with_bin_code(10, 3));
         assert_eq!(
-            app.status_message, "SENTINEL",
+            app.status_message(),
+            "SENTINEL",
             "no real degradation at the newly-parked frequency -> no warning"
         );
         assert_eq!(
@@ -10627,9 +10926,9 @@ mod tests {
         // baseline (not just permanently suppressed).
         app.apply_placement(placement_view_with_bin_code(10, 1));
         assert!(
-            app.status_message.contains("now busy"),
+            app.status_message().contains("now busy"),
             "a genuine degradation at the (now-current) parked frequency must still warn, got: {}",
-            app.status_message
+            app.status_message()
         );
         assert_eq!(app.park_coverage_last, Some((450, 1)));
     }
@@ -10656,7 +10955,7 @@ mod tests {
         // code 1 the whole time (unrelated to A) — no real degradation
         // occurs at B between this and the next snapshot.
         app.tx_offset_hold_hz = Some(450);
-        app.status_message = "SENTINEL".to_string();
+        app.set_local_status("SENTINEL".to_string(), pancetta_core::DiagnosticLevel::Info);
         app.apply_placement(placement_view_with_bin_code(10, 1));
 
         // The fix: B's fresh code (1) must NOT be compared against A's
@@ -10664,7 +10963,8 @@ mod tests {
         // fire. Since park_coverage_last was tracking A's frequency, not
         // B's, this must be treated as a fresh baseline instead.
         assert_eq!(
-            app.status_message, "SENTINEL",
+            app.status_message(),
+            "SENTINEL",
             "must not compare B's code against A's stale baseline across a re-park"
         );
         assert_eq!(
@@ -10818,9 +11118,9 @@ mod tests {
                 assert_eq!(app.tx_freq_mode, pancetta_core::TxFreqMode::Hold);
                 assert!(app.parked_since.is_some());
                 assert!(
-                    app.status_message.contains(&format!("Parked at {hz} Hz")),
+                    app.status_message().contains(&format!("Parked at {hz} Hz")),
                     "status: {}",
-                    app.status_message
+                    app.status_message()
                 );
             }
             other => panic!("expected SetTxOffset(Some(_)), got {other:?}"),
@@ -10857,10 +11157,10 @@ mod tests {
             "no park should have been latched"
         );
         assert!(
-            app.status_message
+            app.status_message()
                 .contains("busy in both windows — not parking"),
             "status: {}",
-            app.status_message
+            app.status_message()
         );
     }
 
@@ -10891,9 +11191,9 @@ mod tests {
         ));
         assert!(app.tx_offset_hold_hz.is_some(), "code 1 still parks");
         assert!(
-            app.status_message.contains("Even window busy"),
+            app.status_message().contains("Even window busy"),
             "status: {}",
-            app.status_message
+            app.status_message()
         );
 
         // Code 2 = first (Even) window clear, second (Odd) window busy.
@@ -10906,9 +11206,9 @@ mod tests {
         ));
         assert!(app.tx_offset_hold_hz.is_some(), "code 2 still parks");
         assert!(
-            app.status_message.contains("Odd window busy"),
+            app.status_message().contains("Odd window busy"),
             "status: {}",
-            app.status_message
+            app.status_message()
         );
     }
 

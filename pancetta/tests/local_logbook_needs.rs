@@ -226,3 +226,175 @@ async fn confirmed_status_is_distinct_from_worked() {
     assert!(card.contains(" confirmed"), "{card}");
     assert!(!card.contains("worked-unconfirmed"), "{card}");
 }
+
+#[tokio::test]
+async fn unconfirmed_policy_renders_needed_then_confirmed() {
+    let text = adif(&[("DL1ABC".into(), "FT8", 14.074, "")]);
+    let (tmp, lookup) = offline_lookup(&text).await;
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    let row = row_of(&hunter, "DL1XYZ");
+    assert!(
+        row.contains("+▲DL1XYZ") && !row.contains("!DL1XYZ"),
+        "{row}"
+    );
+    assert!(row.contains("unconfirmed entity on 20M"), "{row}");
+    assert!(!row.contains("new entity"), "{row}");
+    let card = render(&mut app, View::Card, 130, 6);
+    assert!(card.contains(" needed"), "{card}");
+    let overlay = render(&mut app, View::Overlay, 140, 45);
+    assert!(
+        overlay.contains("Needed policy: unconfirmed (local logbook)"),
+        "{overlay}"
+    );
+    assert!(overlay.contains("Local logbook (all bands)"), "{overlay}");
+    assert!(
+        overlay.lines().any(|l| l.contains("entity needed on band")
+            && l.contains("yes")
+            && l.contains("local logbook")),
+        "{overlay}"
+    );
+    assert!(
+        overlay
+            .lines()
+            .any(|l| l.contains("all-time new entity") && l.contains("no")),
+        "{overlay}"
+    );
+
+    let home = tmp.path().join("home");
+    let logdir = home.join(".pancetta");
+    std::fs::create_dir_all(&logdir).unwrap();
+    let local_adif = logdir.join("qsos.adi");
+    std::fs::write(&local_adif, &text).unwrap();
+    let dbpath = logdir.join("qso.db");
+    let stale = QsoDatabase::replay_from_adif(&dbpath, &local_adif)
+        .await
+        .unwrap();
+    stale.close().await;
+    let report = tmp.path().join("lotw.adi");
+    std::fs::write(
+        &report,
+        adif(&[(
+            "DL1ABC".into(),
+            "FT8",
+            14.074,
+            "<LOTW_QSL_RCVD:1>Y <LOTW_QSLRDATE:8>20261111",
+        )]),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pancetta"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .arg("import-confirmations")
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rebuilt =
+        match pancetta_lib::coordinator::prepare_local_qso_index(&local_adif, &dbpath).await {
+            pancetta_lib::coordinator::LocalIndex::Ready(db) => db,
+            _ => panic!("confirmation import must rebuild a ready index"),
+        };
+    let lookup = CachedStationLookup::new();
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    lookup.seed_worked_history(&rebuilt).await.unwrap();
+    lookup.seed_display_history(&rebuilt).await;
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    let row = row_of(&hunter, "DL1XYZ");
+    assert!(
+        !row.contains("+▲DL1XYZ") && !row.contains("+DL1XYZ"),
+        "{row}"
+    );
+    assert!(row.contains("no award need"), "{row}");
+    let card = render(&mut app, View::Card, 130, 6);
+    assert!(card.contains(" confirmed"), "{card}");
+    let overlay = render(&mut app, View::Overlay, 140, 45);
+    assert!(
+        overlay
+            .lines()
+            .any(|l| l.contains("entity needed on band") && l.contains("no")),
+        "{overlay}"
+    );
+}
+
+#[tokio::test]
+async fn confirmation_on_other_band_keeps_band_need() {
+    let (_tmp, lookup) = offline_lookup(&adif(&[(
+        "DL1ABC".into(),
+        "FT4",
+        7.0475,
+        "<LOTW_QSL_RCVD:1>V",
+    )]))
+    .await;
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+    assert_eq!(lookup.needed_atno_shown("DL1XYZ"), (false, false));
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    let row = row_of(&hunter, "DL1XYZ");
+    assert!(row.contains("▲DL1XYZ"), "{row}");
+    assert!(row.contains("unconfirmed entity on 20M"), "{row}");
+    assert!(
+        !row.contains("all-time new") && !row.contains("new entity"),
+        "{row}"
+    );
+    let overlay = render(&mut app, View::Overlay, 140, 45);
+    assert!(
+        overlay
+            .lines()
+            .any(|l| l.contains("entity needed on band") && l.contains("yes")),
+        "{overlay}"
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_policy_preserves_unknown_and_empty_states() {
+    use pancetta_tui::readiness::{readiness_items, NeedListHealth, StationReadiness};
+    let lookup = CachedStationLookup::new();
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DL1XYZ", 0.0, "FT8").await;
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    assert!(
+        hunter.contains("maybe needed entity (cqdx list not loaded)"),
+        "{hunter}"
+    );
+    app.station_readiness = Some(StationReadiness {
+        cqdx_dxcc_needs: NeedListHealth::Unavailable {
+            error: "offline".into(),
+            retrying: true,
+        },
+        ..Default::default()
+    });
+    assert!(readiness_items(&app)
+        .iter()
+        .any(|i| i.label.contains("CQDX NEEDS UNKNOWN")));
+    let (_tmp, lookup) = offline_lookup(&adif(&[])).await;
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    assert!(hunter.contains("!DL1XYZ"), "{hunter}");
+    assert!(
+        hunter.contains("all-time new entity (local logbook)"),
+        "{hunter}"
+    );
+    app.station_readiness = Some(StationReadiness {
+        cqdx_dxcc_needs: NeedListHealth::LocalLogbook {
+            error: "offline".into(),
+            retrying: true,
+        },
+        ..Default::default()
+    });
+    assert!(readiness_items(&app)
+        .iter()
+        .any(|i| i.label.contains("NEEDS FROM LOCAL LOGBOOK")));
+}

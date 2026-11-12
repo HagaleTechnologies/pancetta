@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
+
 ### Added
 
+- PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.
 - PAN-345: DX-cluster spots now honour `[network.dx_cluster.filtering]`. `bands` and `modes` allowlists, inclusive Hz limits and `duplicate_window_minutes` (`0` turns it off) apply locally before a spot reaches DX Hunter, and a filtered spot no longer suppresses the next accepted one. With the cluster enabled, an invalid band or mode name, or inverted limits, is now a startup error instead of being ignored. Spots keep their parsed mode (CW stays CW, unknown is `Unknown`, never FT8), and DX Hunter gains a `Band` column for every row. `dxcc_filters` is still not applied. Live-cluster qualification is pending.
 - PAN-276: Optional `rig.data_mode` and `rig.data_passband_hz` apply an exact CAT mode at connection and after commanded frequency or split changes. TX waits for confirmation. Omit the settings for manual rig-mode control. Hardware qualification is pending.
 - PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
@@ -19,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
 - PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.
 - PAN-350: Band Activity now shows DX Hunter’s needed, ATNO and new-grid markers and need colours. Historical grids only use a new-grid verdict when it matches their locator. Wider Call and Grid columns keep markers visible.
 - PAN-282: Rebuilding the QSO index now swaps in a complete temporary database, preserving the old index if interrupted.
