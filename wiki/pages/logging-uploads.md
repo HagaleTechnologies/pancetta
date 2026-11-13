@@ -88,3 +88,16 @@ accepted. Correlate by QSO UUID, never callsign, and treat an explicit
 service response (duplicate included) as the only acceptance; absence is
 unknown, an empty captured target set is disabled, and config changes after
 completion never rewrite a contact's captured denominator.
+
+
+## Startup ADIF snapshots (PAN-304)
+
+After index reconciliation and before opening the ADIF writer or starting its
+subscriber, live startup snapshots changed logbook bytes. Replay and refused
+legacy migration skip this step. The shared logbook lock covers comparison,
+publication and pruning; a one-second timeout skips the snapshot with a warning.
+The default keeps seven snapshots beside the index in `backups/`.
+Only complete generated ADIF names count, separately from SQLite and import
+backups. Retention never rotates or replaces the source `qsos.adi`.
+A temporary owner-only file is synced before no-clobber hard-link publication;
+a failed write or publication never prunes old snapshots.

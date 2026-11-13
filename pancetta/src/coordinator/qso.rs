@@ -3615,7 +3615,7 @@ impl super::ApplicationCoordinator {
         )
         .to_string();
         // Layer 2 timeline persistence gate — see docs/CONFIG.md `[database]`.
-        let persist_qso_timeline = config.database.persist_qso_timeline;
+        let database_settings = config.database.clone();
         // Task 5 (gap 2/4, docs/ap-decoding-design.md §1): priority weights
         // for ranking ALL currently-active QSOs by `PriorityScorer::
         // evaluate_cq` for the AP context — read once here before `drop`,
@@ -4087,7 +4087,7 @@ impl super::ApplicationCoordinator {
                     &adif_path,
                     &db_path,
                     station_power_watts,
-                    persist_qso_timeline,
+                    &database_settings,
                     &qso_manager,
                     &adif_subscribers,
                 )
@@ -10252,7 +10252,7 @@ mod auto_73_tests {
             &adif_path,
             &dir.path().join("qso.db"),
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &mgr,
             &adif_subscribers,
         )
@@ -11596,7 +11596,7 @@ async fn start_local_qso_log_writers(
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
     station_power_watts: u32,
-    persist_qso_timeline: bool,
+    database_settings: &pancetta_config::DatabaseConfig,
     qso_manager: &pancetta_qso::QsoManager,
     adif_subscribers: &AdifSubscribers,
 ) -> (
@@ -11629,6 +11629,16 @@ async fn start_local_qso_log_writers(
     // made a legacy-only `qso.db` look stale (wiped by the rebuild) and a
     // missing index look current (never rebuilt) — PAN-127.
     let seed_db = prepare_local_qso_index(adif_path, db_path).await;
+
+    if !matches!(&seed_db, LocalIndex::MigrationRefused { .. }) {
+        if let Err(e) = super::adif_backup::startup(adif_path, database_settings).await {
+            warn!(
+                "Startup ADIF backup failed at {}: {}; continuing",
+                adif_path.display(),
+                e
+            );
+        }
+    }
 
     // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted and
     // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
@@ -11667,7 +11677,7 @@ async fn start_local_qso_log_writers(
     // and inserts into the rebuildable SQLite index.
     let mut logger_config = pancetta_qso::LoggerConfig {
         database_path: db_path.to_path_buf(),
-        persist_qso_timeline,
+        persist_qso_timeline: database_settings.persist_qso_timeline,
         ..Default::default()
     };
     // `~/.pancetta/backups`, never relative to the process cwd.
@@ -13052,6 +13062,161 @@ mod replay_local_log_tests {
     };
     use std::time::Duration;
 
+    fn adif_backup_copies(directory: &std::path::Path) -> Vec<Vec<u8>> {
+        if !directory.exists() {
+            return Vec::new();
+        }
+        let mut paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("qsos_adi_")
+            })
+            .collect();
+        paths.sort();
+        paths.iter().map(|p| std::fs::read(p).unwrap()).collect()
+    }
+
+    async fn adif_backup_start(
+        root: &std::path::Path,
+        replay: bool,
+        settings: &pancetta_config::DatabaseConfig,
+    ) -> bool {
+        // A private runtime per simulated station also stops the logger's
+        // detached tasks and closes their database pools between starts.
+        let root = root.to_owned();
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let subscribers = AdifSubscribers::new();
+                let (writer, logger, seed) = start_local_qso_log_writers(
+                    replay,
+                    &root.join("qsos.adi"),
+                    &root.join("qso.db"),
+                    100,
+                    &settings,
+                    &manager(),
+                    &subscribers,
+                )
+                .await;
+                if !replay {
+                    assert!(
+                        logger.is_some(),
+                        "backup failure must not prevent index logger initialization"
+                    );
+                }
+                let opened = writer.is_some();
+                subscribers.stop(Duration::from_secs(2)).await;
+                drop(writer);
+                drop(logger);
+                if let LocalIndex::Ready(db) = seed {
+                    db.close().await;
+                }
+                opened
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_startup_backs_up_changed_adif() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("qsos.adi");
+        let mut expected = Vec::new();
+        for bytes in [TWO_RECORDS.to_owned(), format!("{TWO_RECORDS}\n")] {
+            std::fs::write(&source, bytes.as_bytes()).unwrap();
+            assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+            expected.push(bytes.as_bytes().to_vec());
+            assert_eq!(adif_backup_copies(&dir.path().join("backups")), expected);
+            assert_eq!(std::fs::read(&source).unwrap(), bytes.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_startup_skips_unchanged_adif() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("qsos.adi"), TWO_RECORDS).unwrap();
+        for _ in 0..2 {
+            assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        }
+        assert_eq!(
+            adif_backup_copies(&dir.path().join("backups")),
+            vec![TWO_RECORDS.as_bytes()]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_startup_honors_adif_backup_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = pancetta_config::DatabaseConfig {
+            adif_backup_directory: "custom".into(),
+            adif_backup_retain_count: 1,
+            ..Default::default()
+        };
+        for bytes in [TWO_RECORDS.to_owned(), format!("{TWO_RECORDS}\n")] {
+            std::fs::write(dir.path().join("qsos.adi"), bytes.as_bytes()).unwrap();
+            assert!(adif_backup_start(dir.path(), false, &settings).await);
+            assert_eq!(
+                adif_backup_copies(&dir.path().join("custom")),
+                vec![bytes.as_bytes()]
+            );
+        }
+        assert!(!dir.path().join("backups").exists());
+        settings.adif_backup_enabled = false;
+        settings.adif_backup_directory = "disabled".into();
+        assert!(adif_backup_start(dir.path(), false, &settings).await);
+        assert!(!dir.path().join("disabled").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_adif_backup_skip_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("qsos.adi"), TWO_RECORDS).unwrap();
+        assert!(!adif_backup_start(dir.path(), true, &Default::default()).await);
+        assert!(!dir.path().join("backups").exists());
+        let missing = tempfile::tempdir().unwrap();
+        assert!(adif_backup_start(missing.path(), false, &Default::default()).await);
+        assert!(!missing.path().join("backups").exists());
+        // The migration-refusal test below verifies refusal with a corrupt legacy row.
+    }
+
+    #[tokio::test]
+    async fn startup_adif_backup_failure_is_nonfatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("qsos.adi");
+        std::fs::write(&source, TWO_RECORDS).unwrap();
+        assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        let before = adif_backup_copies(&dir.path().join("backups"));
+        std::fs::write(&source, format!("{TWO_RECORDS}\n")).unwrap();
+        let locked_source = source.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = pancetta_qso::logbook_lock::LogbookLock::open(&locked_source).unwrap();
+            let _held = lock.try_lock().unwrap().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        ready_rx.recv().unwrap();
+        assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        holder.join().unwrap();
+        assert_eq!(adif_backup_copies(&dir.path().join("backups")), before);
+        std::fs::write(dir.path().join("blocked"), b"file").unwrap();
+        let settings = pancetta_config::DatabaseConfig {
+            adif_backup_directory: "blocked".into(),
+            ..Default::default()
+        };
+        assert!(adif_backup_start(dir.path(), false, &settings).await);
+        assert_eq!(adif_backup_copies(&dir.path().join("backups")), before);
+    }
+
     /// Minimal manager config: a real callsign (the placeholder guard in
     /// `start_cq` rejects NOCALL/N0CALL) and a grid, everything else default.
     fn manager() -> pancetta_qso::QsoManager {
@@ -13151,9 +13316,16 @@ mod replay_local_log_tests {
         let path = dir.path().join("qso.db");
         let manager = manager();
         let subscribers = AdifSubscribers::new();
-        let (_writer, logger, seed) =
-            start_local_qso_log_writers(false, &adif, &path, 100, false, &manager, &subscribers)
-                .await;
+        let (_writer, logger, seed) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &path,
+            100,
+            &pancetta_config::DatabaseConfig::default(),
+            &manager,
+            &subscribers,
+        )
+        .await;
         let db = seed.expect("seed");
         complete_one_qso(&manager).await;
         assert_eq!(wait_for_adif_record(&adif).await, 1);
@@ -13299,7 +13471,7 @@ mod replay_local_log_tests {
                 &adif,
                 &path,
                 100,
-                false,
+                &pancetta_config::DatabaseConfig::default(),
                 &manager(),
                 &subscribers,
             )
@@ -13313,6 +13485,7 @@ mod replay_local_log_tests {
                 _ => panic!("migration must refuse"),
             }
             assert!(!adif.exists());
+            assert!(!adif.parent().unwrap().join("backups").exists());
             subscribers.stop(Duration::from_secs(2)).await;
             drop(logger);
             let db = pancetta_qso::async_database::QsoDatabase::open(&path)
@@ -13359,7 +13532,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13398,7 +13571,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13440,7 +13613,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13474,7 +13647,7 @@ mod replay_local_log_tests {
             &logged_adif,
             &before_cut.path().join("qso.db"),
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &first_session,
             &adif_subscribers,
         )
@@ -13513,7 +13686,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &restarted,
             &adif_subscribers,
         )
@@ -13566,7 +13739,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13604,7 +13777,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13638,7 +13811,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13683,7 +13856,7 @@ mod replay_local_log_tests {
             &dir.path().join("qsos.adi"),
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13715,7 +13888,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -19579,9 +19752,16 @@ mod pan260 {
         std::fs::write(&adif, [0xff, 0xfe]).unwrap();
         let m = manager();
         let adif_subscribers = AdifSubscribers::new();
-        let (_, _, seed) =
-            start_local_qso_log_writers(false, &adif, &index, 100, false, &m, &adif_subscribers)
-                .await;
+        let (_, _, seed) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &index,
+            100,
+            &pancetta_config::DatabaseConfig::default(),
+            &m,
+            &adif_subscribers,
+        )
+        .await;
         assert!(seed.is_none());
         assert!(pancetta_qso::async_database::QsoDatabase::rebuild_marker(&index).exists());
         assert!(
@@ -19613,7 +19793,7 @@ mod pan260 {
             &adif,
             &index,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &first,
             &adif_subscribers,
         )
@@ -20007,7 +20187,7 @@ mod pan50_live_contest {
             &adif,
             &index,
             100,
-            false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
