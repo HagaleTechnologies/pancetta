@@ -1013,6 +1013,17 @@ entry, `enabled = false` — apply to a running station when you save;
 every other change to this table needs a restart. See
 [Hot reload](#hot-reload).
 
+Station-agent `relay_url` requires `wss://` and `pairing_api_url` requires
+`https://`. Plain `ws://` and `http://` are allowed only for the exact
+hostname `localhost` or an IP whose `is_loopback()` is true, including
+`127.0.0.2` and `::1`. No DNS lookup grants this exception. Private LAN
+addresses, `0.0.0.0`, and names such as `localhost.attacker.com` do not qualify.
+Each plaintext loopback URL emits one unencrypted-link warning per validation.
+Supplied URLs must be absolute, have a host, and have no surrounding whitespace,
+even when the agent is disabled. Absent URLs remain valid when disabled.
+The `pair --pairing-api-url` override follows the same rule and is checked
+before identity creation or enrollment.
+
 #### The remote-access audit log (`audit_log_path`)
 
 `audit_log_path` defaults to `~/.pancetta/agent-audit.log`. Pancetta
