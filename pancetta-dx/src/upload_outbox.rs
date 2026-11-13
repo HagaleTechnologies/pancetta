@@ -41,11 +41,19 @@ pub enum UploadDestination {
     Eqsl,
     /// cqdx.io `POST /api/v1/qsos`.
     Cqdx,
+    /// LoTW signed upload via tqsl.
+    Lotw,
 }
 
 impl UploadDestination {
     /// Every destination, in display order.
-    pub const ALL: [Self; 4] = [Self::ClubLog, Self::QrzLogbook, Self::Eqsl, Self::Cqdx];
+    pub const ALL: [Self; 5] = [
+        Self::ClubLog,
+        Self::QrzLogbook,
+        Self::Eqsl,
+        Self::Cqdx,
+        Self::Lotw,
+    ];
 
     /// Operator-facing service name.
     pub fn label(self) -> &'static str {
@@ -54,6 +62,7 @@ impl UploadDestination {
             Self::QrzLogbook => "QRZ Logbook",
             Self::Eqsl => "eQSL",
             Self::Cqdx => "cqdx.io",
+            Self::Lotw => "LoTW",
         }
     }
 
@@ -64,6 +73,7 @@ impl UploadDestination {
             Self::QrzLogbook => "[network.qrz_logbook]",
             Self::Eqsl => "[network.eqsl]",
             Self::Cqdx => "[network.cqdx]",
+            Self::Lotw => "[network.lotw]",
         }
     }
 }
@@ -858,6 +868,31 @@ mod tests {
 
     fn path_in(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join(OUTBOX_FILE_NAME)
+    }
+
+    #[test]
+    fn pan300_lotw_round_trip_preserves_existing_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        let (mut store, _) = OutboxStore::open(path.clone());
+        let id = Uuid::new_v4();
+        let existing = &UploadDestination::ALL[..4];
+        store.add(
+            existing.iter().map(|&d| up(id, d, "K1ABC")).collect(),
+            Utc::now(),
+        );
+        OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
+        let (mut store, quarantine) = OutboxStore::open(path.clone());
+        assert!(quarantine.is_none());
+        assert_eq!(store.len(), 4);
+        store.add(vec![up(id, UploadDestination::Lotw, "K1ABC")], Utc::now());
+        store.add(vec![up(id, UploadDestination::Lotw, "K1ABC")], Utc::now());
+        assert_eq!(store.len(), 5);
+        OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
+        let (again, quarantine) = OutboxStore::open(path);
+        assert!(quarantine.is_none());
+        assert_eq!(again.entries(), store.entries());
+        assert_eq!(again.entries()[4].destination, UploadDestination::Lotw);
     }
 
     #[test]

@@ -43,9 +43,6 @@ pub struct UiConfig {
     /// Status bar configuration
     pub status_bar: StatusBarConfig,
 
-    /// Keyboard shortcuts
-    pub keyboard: KeyboardConfig,
-
     /// Logging and display preferences
     pub logging: LoggingDisplayConfig,
 
@@ -662,9 +659,6 @@ pub struct AccessibilityConfig {
     /// Visual indicators
     pub visual_indicators: VisualIndicatorConfig,
 
-    /// Sound feedback
-    pub sound_feedback: SoundFeedbackConfig,
-
     /// Motion sensitivity
     pub motion_sensitivity: MotionSensitivityConfig,
 }
@@ -721,26 +715,6 @@ pub struct VisualIndicatorConfig {
 
     /// Highlight active elements
     pub highlight_active: bool,
-}
-
-/// Sound feedback configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SoundFeedbackConfig {
-    /// Enable sound feedback
-    pub enabled: bool,
-
-    /// Button click sounds
-    pub button_clicks: bool,
-
-    /// Alert sounds
-    pub alerts: bool,
-
-    /// Status change sounds
-    pub status_changes: bool,
-
-    /// Sound volume (0.0 to 1.0)
-    pub volume: f32,
 }
 
 /// Motion sensitivity configuration
@@ -1067,79 +1041,6 @@ pub enum ItemAlignment {
     Right,
 }
 
-/// Keyboard shortcuts configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct KeyboardConfig {
-    /// Keyboard shortcuts map
-    pub shortcuts: HashMap<String, KeyboardShortcut>,
-
-    /// Enable global shortcuts
-    pub global_shortcuts: bool,
-
-    /// Shortcut conflict resolution
-    pub conflict_resolution: ConflictResolution,
-
-    /// Show shortcut hints
-    pub show_hints: bool,
-}
-
-/// Keyboard shortcut definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyboardShortcut {
-    /// Key combination
-    pub keys: String,
-
-    /// Action command
-    pub action: String,
-
-    /// Shortcut description
-    pub description: String,
-
-    /// Context where shortcut is active
-    pub context: ShortcutContext,
-
-    /// Shortcut enabled state
-    pub enabled: bool,
-}
-
-/// Shortcut context
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShortcutContext {
-    /// Global (always active)
-    Global,
-
-    /// Main window focus
-    MainWindow,
-
-    /// Specific panel focus
-    Panel(String),
-
-    /// Dialog windows
-    Dialog,
-
-    /// Input fields
-    Input,
-}
-
-/// Conflict resolution strategies
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConflictResolution {
-    /// First registered wins
-    FirstWins,
-
-    /// Last registered wins
-    LastWins,
-
-    /// Warn user about conflicts
-    WarnUser,
-
-    /// Disable conflicting shortcuts
-    DisableConflicting,
-}
-
 /// Logging display configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1460,7 +1361,6 @@ impl Default for UiConfig {
             animations: AnimationConfig::default(),
             toolbars: ToolbarConfig::default(),
             status_bar: StatusBarConfig::default(),
-            keyboard: KeyboardConfig::default(),
             logging: LoggingDisplayConfig::default(),
             spectrum: SpectrumDisplayConfig::default(),
             custom_widgets: HashMap::new(),
@@ -1767,18 +1667,6 @@ impl Default for VisualIndicatorConfig {
     }
 }
 
-impl Default for SoundFeedbackConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            button_clicks: false,
-            alerts: true,
-            status_changes: true,
-            volume: 0.5,
-        }
-    }
-}
-
 impl Default for AnimationConfig {
     fn default() -> Self {
         Self {
@@ -1885,42 +1773,6 @@ impl Default for StatusBarConfig {
             ],
             update_interval_ms: 500,
             show_progress: true,
-        }
-    }
-}
-
-impl Default for KeyboardConfig {
-    fn default() -> Self {
-        let mut shortcuts = HashMap::new();
-
-        // Add default shortcuts
-        shortcuts.insert(
-            "quit".to_string(),
-            KeyboardShortcut {
-                keys: "Ctrl+Q".to_string(),
-                action: "application.quit".to_string(),
-                description: "Quit application".to_string(),
-                context: ShortcutContext::Global,
-                enabled: true,
-            },
-        );
-
-        shortcuts.insert(
-            "connect".to_string(),
-            KeyboardShortcut {
-                keys: "Ctrl+Shift+C".to_string(),
-                action: "rig.connect".to_string(),
-                description: "Connect to rig".to_string(),
-                context: ShortcutContext::MainWindow,
-                enabled: true,
-            },
-        );
-
-        Self {
-            shortcuts,
-            global_shortcuts: false,
-            conflict_resolution: ConflictResolution::WarnUser,
-            show_hints: true,
         }
     }
 }
@@ -2098,7 +1950,6 @@ impl ConfigSection for UiConfig {
         self.animations = other.animations;
         self.toolbars = other.toolbars;
         self.status_bar = other.status_bar;
-        self.keyboard = other.keyboard;
         self.logging = other.logging;
         self.spectrum = other.spectrum;
 
@@ -2152,13 +2003,6 @@ mod tests {
         config.spectrum.fft_size = 2048; // Reset to valid
         config.spectrum.averaging = 1.5;
         assert!(config.validate_section().is_err());
-    }
-
-    #[test]
-    fn test_keyboard_shortcuts() {
-        let config = UiConfig::default();
-        assert!(config.keyboard.shortcuts.contains_key("quit"));
-        assert!(config.keyboard.shortcuts.contains_key("connect"));
     }
 
     #[test]

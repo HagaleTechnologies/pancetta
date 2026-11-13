@@ -3,6 +3,17 @@
 //! This module handles hierarchical configuration loading, hot-reload capability,
 //! file watching, and configuration merging from multiple sources.
 
+const REMOVED_SECTIONS: &[&str] = &[
+    "network.wspr",
+    "network.web_api",
+    "network.proxy",
+    "network.tls",
+    "network.rate_limiting",
+    "network.dx_cluster.alerts",
+    "ui.keyboard",
+    "ui.accessibility.sound_feedback",
+];
+
 use crate::{Config, ConfigError, ConfigResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -742,7 +753,7 @@ impl ConfigLoader {
     /// known even when absent). Nested: every key, at any depth, checked
     /// against `parsed` serialized to JSON — a key serde kept shows up there,
     /// a key serde dropped does not. Map-valued fields (e.g.
-    /// `ui.keyboard.shortcuts`) carry the user's own keys into `parsed`, so
+    /// `network.custom_services`) carry the user's own keys into `parsed`, so
     /// they are never reported. Non-fatal by design; a second-parse failure
     /// here is unreachable in practice (the typed parse already succeeded).
     ///
@@ -783,6 +794,9 @@ impl ConfigLoader {
                 None if table == "audio" && key == "agc" => self.push_load_warning(
                     "The [audio.agc] automatic-gain setting no longer exists and has no effect. Remove this section from your config.".to_string(),
                 ),
+                None if REMOVED_SECTIONS.contains(&format!("{table}.{key}").as_str()) => self.push_load_warning(format!(
+                    "The [{table}.{key}] section no longer exists and has no effect. Remove this section from your config."
+                )),
                 None => self.push_load_warning(format!(
                     "Unknown config key `{key}` in [{table}] — ignored (check spelling; see docs/CONFIG.md)"
                 )),
@@ -1929,6 +1943,129 @@ gainn         = 2.0
         assert!(warnings[0].contains("[network]"), "{warnings:?}");
     }
 
+    const LEGACY_SECTIONS: &[&str] = &[
+        "network.wspr",
+        "network.web_api",
+        "network.proxy",
+        "network.tls",
+        "network.rate_limiting",
+        "network.dx_cluster.alerts",
+        "ui.keyboard",
+        "ui.accessibility.sound_feedback",
+    ];
+
+    const LEGACY_CONFIG: &str = r#"
+[station]
+callsign = "W1AW"
+grid_square = "FN31"
+[network.wspr]
+enabled = true
+database_url = "https://example.com/wspr"
+[network.wspr.filtering]
+min_snr = -30
+[network.web_api]
+enabled = true
+port = 8080
+[network.web_api.authentication]
+required = true
+[network.proxy]
+enabled = true
+server = "localhost"
+port = 8080
+[network.tls]
+verify_certificates = true
+min_version = "tls12"
+[network.rate_limiting]
+enabled = true
+[network.rate_limiting.global]
+requests_per_minute = 60
+[network.dx_cluster.alerts]
+visual_alerts = true
+audio_alerts = false
+[network.dx_cluster.alerts.sounds]
+volume = 0.5
+[ui.keyboard]
+show_hints = true
+[ui.keyboard.shortcuts.custom]
+keys = "Ctrl+M"
+action = "app.custom"
+description = "Custom shortcut"
+context = "global"
+enabled = true
+[ui.accessibility.sound_feedback]
+enabled = true
+volume = 0.5
+"#;
+
+    fn assert_removed_warnings(loader: &ConfigLoader, config: &Config) {
+        config.validate().unwrap();
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), LEGACY_SECTIONS.len(), "{warnings:?}");
+        for section in LEGACY_SECTIONS {
+            let expected = format!("The [{section}] section no longer exists and has no effect. Remove this section from your config.");
+            assert_eq!(
+                warnings.iter().filter(|w| **w == expected).count(),
+                1,
+                "{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_sections_toml_loads_with_one_warning_each() {
+        let loader = ConfigLoader::new().unwrap();
+        let config = loader.parse_toml(LEGACY_CONFIG).unwrap();
+        assert_removed_warnings(&loader, &config);
+    }
+
+    #[test]
+    fn removed_sections_json_loads_with_one_warning_each() {
+        let raw: toml::Table = LEGACY_CONFIG.parse().unwrap();
+        let loader = ConfigLoader::new().unwrap();
+        let config = loader
+            .parse_json(&serde_json::to_string(&raw).unwrap())
+            .unwrap();
+        assert_removed_warnings(&loader, &config);
+    }
+
+    #[test]
+    fn removed_audio_agc_and_wspr_warn_independently() {
+        let loader = ConfigLoader::new().unwrap();
+        let config = loader.parse_toml("[station]\ncallsign = \"W1AW\"\ngrid_square = \"FN31\"\n[audio.agc]\nenabled = true\n[network.wspr]\nenabled = true\n").unwrap();
+        config.validate().unwrap();
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w == REMOVED_AGC_WARNING));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("[network.wspr] section no longer exists")));
+    }
+
+    #[test]
+    fn absent_removed_sections_have_no_warning() {
+        for json in [false, true] {
+            let loader = ConfigLoader::new().unwrap();
+            if json {
+                loader.parse_json("{}").unwrap();
+            } else {
+                loader.parse_toml("").unwrap();
+            }
+            assert!(loader.load_warnings().is_empty());
+        }
+    }
+
+    #[test]
+    fn serialized_config_has_no_removed_sections() {
+        for text in [
+            Config::defaults_toml(),
+            toml::to_string(&Config::default()).unwrap(),
+        ] {
+            for section in LEGACY_SECTIONS {
+                assert!(!text.contains(&format!("[{section}]")), "{section}");
+            }
+        }
+    }
+
     const REMOVED_AGC_WARNING: &str = "The [audio.agc] automatic-gain setting no longer exists and has no effect. Remove this section from your config.";
 
     #[test]
@@ -2010,16 +2147,17 @@ gainn         = 2.0
         let parsed = loader
             .parse_toml(
                 r#"
-[ui.keyboard.shortcuts.my_custom]
-keys = "Ctrl+M"
-action = "app.custom"
-description = "My custom shortcut"
-context = "global"
+[network.custom_services.my_custom]
+name = "custom"
+url = "https://example.com"
+service_type = "custom"
+headers = {}
+parameters = {}
 enabled = true
 "#,
             )
             .unwrap();
-        assert!(parsed.ui.keyboard.shortcuts.contains_key("my_custom"));
+        assert!(parsed.network.custom_services.contains_key("my_custom"));
         let warnings = loader.load_warnings();
         assert!(warnings.is_empty(), "{warnings:?}");
     }
