@@ -102,7 +102,6 @@ PTT before confirmed audio flush and reports failure after acknowledgment, indep
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
 
-<<<<<<< HEAD
 ## Local client TX trust (PAN-309)
 
 Pairing does not write client trust keys. `pancetta trust-client <keyId>
@@ -117,7 +116,7 @@ publisher writes keys while holding that lock. Audit writes follow unlock.
 Cloud mode caches full owner edges separately from eligibility and refreshes
 local trust on its own timer, including during failed or stalled requests.
 The refresh reads live admission so it cannot restore a config removal.
-=======
+
 ## Station-agent endpoint validation (PAN-310)
 
 Supplied relay and pairing URLs are validated even when the agent is disabled.
@@ -126,7 +125,6 @@ or enrolling. Validate an override only once, since validating a plaintext
 loopback URL twice would emit duplicate warnings. Secure schemes and the
 loopback exception are specified in `docs/CONFIG.md` under
 `[network.station_agent]`.
->>>>>>> 244673a143300eb9fa23fdba7aba86432e76022b
 
 ## WSJT-X UDP peer pins and Replay (PAN-312)
 
