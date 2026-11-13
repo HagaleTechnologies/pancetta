@@ -272,7 +272,11 @@ fn is_operational_key(key: &str) -> bool {
 }
 
 /// Patch only saved changes, preserving unrelated values applied by the TUI.
-fn patch_live_operational_fields(running: &mut Config, keys: &[String], new: &Config) {
+fn patch_live_operational_fields(
+    running: &mut Config,
+    keys: &[String],
+    new: &Config,
+) -> Option<pancetta_config::TxSelfParity> {
     macro_rules! patch {
         ($section:ident, $field:ident) => {
             if keys
@@ -300,6 +304,9 @@ fn patch_live_operational_fields(running: &mut Config, keys: &[String], new: &Co
     {
         running.rig.receive_gain_presets = new.rig.receive_gain_presets.clone();
     }
+    keys.iter()
+        .any(|k| k == "station.tx_self_parity")
+        .then_some(running.station.tx_self_parity)
 }
 
 /// Whether a dotted key is covered by [`SecurityConfigDiff`] (and so has its
@@ -861,7 +868,8 @@ impl super::ApplicationCoordinator {
         let _ptt = self.ptt_sync_gate.lock().await;
         let mut running = self.config.write().await;
         patch_live_security_fields(&mut running, &plan.apply_security, new);
-        patch_live_operational_fields(&mut running, &plan.operational_keys, new);
+        let parity_update =
+            patch_live_operational_fields(&mut running, &plan.operational_keys, new);
         self.autonomous_config_enabled.store(
             running.autonomous.enabled,
             std::sync::atomic::Ordering::SeqCst,
@@ -870,6 +878,19 @@ impl super::ApplicationCoordinator {
             running.station.tx_late_max_ms,
             std::sync::atomic::Ordering::SeqCst,
         );
+        drop(running);
+        drop(_ptt);
+        if let Some(parity) = parity_update {
+            let _ = self
+                .message_bus
+                .send_message(crate::message_bus::ComponentMessage::new(
+                    ComponentId::Coordinator,
+                    ComponentId::Tui,
+                    crate::message_bus::MessageType::TxSelfParityUpdate(parity),
+                    std::time::Instant::now(),
+                ))
+                .await;
+        }
     }
 
     /// Apply the per-channel consent changes in `diff` whose new value is
@@ -1407,12 +1428,29 @@ mod tests {
             plan.restart_required_keys
         );
         let mut running = old.clone();
-        patch_live_operational_fields(&mut running, &plan.operational_keys, &new);
+        let _ = patch_live_operational_fields(&mut running, &plan.operational_keys, &new);
         assert!(
             changed_keys(&running, &new).is_empty(),
             "{:?}",
             changed_keys(&running, &new)
         );
+    }
+
+    #[tokio::test]
+    async fn pan302_reload_publishes_self_parity_to_tui() {
+        use pancetta_config::TxSelfParity;
+        let mut initial = base();
+        initial.station.tx_self_parity = TxSelfParity::Even;
+        let (mut c, _audit) = test_coordinator(initial).await;
+        let rx = tui_rx(&c).await;
+        for parity in [TxSelfParity::Odd, TxSelfParity::Auto, TxSelfParity::Even] {
+            let mut saved = c.config.read().await.clone();
+            saved.station.tx_self_parity = parity;
+            c.handle_config_reload(Ok((saved, vec![]))).await;
+            assert!(rx.try_iter().any(
+                |m| matches!(m.message_type, MessageType::TxSelfParityUpdate(p) if p == parity)
+            ));
+        }
     }
 
     #[tokio::test]

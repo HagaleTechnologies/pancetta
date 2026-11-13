@@ -147,6 +147,9 @@ pub enum MessageType {
         metrics: ComponentMetrics,
     },
 
+    /// Live self-CQ parity preference for the TUI config copy.
+    TxSelfParityUpdate(pancetta_config::TxSelfParity),
+
     /// Configuration update notification
     ConfigUpdate {
         section: String,

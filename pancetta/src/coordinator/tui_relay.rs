@@ -812,6 +812,7 @@ pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
 /// inline loop arms. The [`RelayDriver`] owns the scheduling.
 struct TuiRelayLoop {
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    live_config: Arc<tokio::sync::RwLock<pancetta_config::Config>>,
     tui_out: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
     pending_gain_save: Arc<std::sync::Mutex<Option<(u64, Instant, u64)>>>,
     gain_mutation_tx:
@@ -993,6 +994,11 @@ impl RelayDriverHost for TuiRelayLoop {
         let watchlist_path = &self.watchlist_path;
         let watchlist_is_toml = self.watchlist_is_toml;
         match bus_msg.message_type {
+            MessageType::TxSelfParityUpdate(parity) => {
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::TxSelfParityUpdate(parity),
+                );
+            }
             MessageType::AutonomousStatus(ref status) => {
                 // Batch 93: forward the STRUCTURED status so the live
                 // `[AUTO]` panel renders (previously this was flattened
@@ -1415,6 +1421,15 @@ impl RelayDriverHost for TuiRelayLoop {
     }
 
     fn on_health_tick(&mut self) -> RelayFlow {
+        // Heal a best-effort reload notification lost to a full bus channel.
+        // Never block this OS thread on the async config lock; retry next tick.
+        if let Ok(config) = self.live_config.try_read() {
+            let _ = self
+                .tui_out
+                .send(pancetta_tui::tui_runner::TuiMessage::TxSelfParityUpdate(
+                    config.station.tx_self_parity,
+                ));
+        }
         // Local rebinding of the loop's former closure captures, so the
         // transplanted tick body below stays byte-for-byte the production
         // code that ran inline in the old polling loop.
@@ -1781,6 +1796,7 @@ impl super::ApplicationCoordinator {
         let pending_pin_writes = std::collections::VecDeque::<
             tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
         >::new();
+        let relay_live_config = self.config.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -1795,6 +1811,7 @@ impl super::ApplicationCoordinator {
                     Box::new(relay_scorer_lookup),
                 );
                 let mut relay = TuiRelayLoop {
+                    live_config: relay_live_config,
                     shutdown_flag: relay_shutdown,
                     tui_out: tui_msg_tx_relay,
                     pending_gain_save: relay_pending_gain_save,
