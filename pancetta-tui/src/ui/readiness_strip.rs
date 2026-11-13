@@ -225,6 +225,41 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pan302_config_notice_renders_and_overflows() {
+        use crate::readiness::StationReadiness;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(StationReadiness {
+            autonomous_config_disabled: true,
+            ..StationReadiness::default()
+        });
+        for width in [100, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| render_readiness_strip(f, f.area(), &app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("TX READY"), "{text}");
+            if width == 100 {
+                assert!(text.contains("AUTO OFF IN CONFIG"), "{text}");
+            } else {
+                assert!(text.contains("…") || text.contains("more"), "{text}");
+            }
+        }
+        assert!(readiness_items(&app)[0]
+            .detail
+            .contains("Edit pancetta.toml"));
+    }
+
     /// Emoji-presentation sequences (`⚠️` = U+26A0 U+FE0F) measure wider as a
     /// string than char by char; the cut must still fit `max`.
     #[test]

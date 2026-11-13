@@ -145,3 +145,15 @@ re-capturing the data file you must rerun
 `docs/SUPPORTED_RIGS.md`; upstream reuses one macro for two rows
 (RIG_MODEL_FT450 → 1027 and 1046), so curated tables must pin macros only
 the catalog carries once.
+
+
+## What can a PAN-302 reload change?
+
+See `docs/CONFIG.md` for the exact allowlist. Never replace the whole running
+snapshot: rig interface enablement also controls shutdown unkey behavior.
+Do not rebuild the autonomous operator to refresh policy; it owns CQ attempts,
+sequencer state and spectral history. Keep file permission apart from runtime
+intent, and initialize intent once, so reloads and supervisor restarts cannot
+undo an operator pause. Lead/parity belong to new attempts; the late cap must
+also be read at key-time. Receive preset saves take effect on a later band
+crossing and must not write CAT immediately.

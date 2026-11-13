@@ -1114,6 +1114,12 @@ pub struct ApplicationCoordinator {
     /// this is the queue-independent fallback -- it never goes through
     /// `message_bus` at all.
     pending_autonomous_cq_dispatch_failures: Arc<std::sync::Mutex<Vec<u64>>>,
+    #[cfg(test)]
+    qso_admission_for_test: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// First-frame autonomous CQ markers survive backlog bundling without changing the wire schema.
+    autonomous_cq_attempts: Arc<
+        std::sync::Mutex<std::collections::HashSet<(String, Option<pancetta_qso::TxAttemptId>)>>,
+    >,
 
     /// PAN-72: mailbox of resolved-needed TX-offset actions for in-progress
     /// QSOs, pushed by the QSO event-forwarding task (`coordinator/qso.rs`)
@@ -1147,21 +1153,15 @@ pub struct ApplicationCoordinator {
     /// the flag at the start of the next message, and continues.
     /// Distinct from `shutdown_signal` (which means "stop the whole app").
     abort_current_tx: Arc<AtomicBool>,
-    /// hb-161 — Phase 5 emergency-stop runtime gate. Seeded at startup in
-    /// `start_autonomous_component`: `--headless` launches auto-arm
-    /// straight from `config.autonomous.enabled` (RUNBOOK.md: config is
-    /// the only switch for a supervised headless station, no TUI to press
-    /// `a` in); interactive (TUI) launches always start `false` regardless
-    /// of config — the operator must press `a` to arm (2026-07-29 fix; an
-    /// interactive launch auto-arming from config alone surprised the
-    /// operator and was not desirable). Cleared (set to `false`) when the
-    /// operator presses Shift+Q in the TUI; the autonomous decision loop
-    /// reads this every cycle and skips `TransmitRequest` dispatch when
-    /// it's false. Toggled back on by the autonomous TUI command (`a`) or
-    /// by re-pressing Shift+Q (the latter is reserved for future use;
-    /// today it's one-shot off). Separate from `shutdown_signal` and
-    /// `abort_current_tx`.
+    /// Operator runtime intent, initialized once per application lifetime.
+    /// Headless startup opts in; interactive startup requires the operator's
+    /// toggle. File permission is a separate gate. Component restarts and
+    /// file re-enables must never clear an operator pause or emergency stop.
     autonomous_enabled_runtime: Arc<AtomicBool>,
+    /// Effective file permission, published by both reload paths.
+    autonomous_config_enabled: Arc<AtomicBool>,
+    /// Final PTT refusal cap; publication is serialized with key-down.
+    tx_late_max_ms_live: Arc<std::sync::atomic::AtomicU64>,
 
     /// Global tri-state TX policy (`pancetta_core::TxPolicy` encoded via
     /// `as_u8`/`from_u8`). Initialized to `Full`. Orthogonal to
@@ -2353,6 +2353,11 @@ impl ApplicationCoordinator {
             active_protocol, active_slot_ns_init, active_decode_phase_ns_init
         );
 
+        let autonomous_config_enabled = Arc::new(AtomicBool::new(config.autonomous.enabled));
+        let tx_late_max_ms_live = Arc::new(std::sync::atomic::AtomicU64::new(
+            config.station.tx_late_max_ms,
+        ));
+
         // Wrap config in Arc<RwLock> for hot-reloading
         let config = Arc::new(RwLock::new(config));
 
@@ -2453,11 +2458,10 @@ impl ApplicationCoordinator {
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
             abort_current_tx: Arc::new(AtomicBool::new(false)),
-            // Initial value is overwritten in start_autonomous_component
-            // once config.autonomous.enabled is read. Start `true` so a
-            // Q-press before component start still records the operator's
-            // intent (the autonomous start path also respects this gate).
-            autonomous_enabled_runtime: Arc::new(AtomicBool::new(true)),
+            // Runtime intent belongs to the application lifetime, not a component restart.
+            autonomous_enabled_runtime: Arc::new(AtomicBool::new(headless)),
+            autonomous_config_enabled,
+            tx_late_max_ms_live,
             // Default global TX policy = Full (initiate + respond, the
             // historical behavior). Operator cycles it from the TUI.
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -2598,6 +2602,11 @@ impl ApplicationCoordinator {
             config_file_baseline: None,
             config_reload_loader: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            qso_admission_for_test: None,
+            autonomous_cq_attempts: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),

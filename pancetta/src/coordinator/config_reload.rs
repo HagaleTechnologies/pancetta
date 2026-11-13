@@ -11,6 +11,7 @@
 //!   (session + poll stopped, definitive disarm). They are never deferred.
 //!   The TX worker's key-time and per-chunk playback re-checks then refuse
 //!   queued remote frames and stop a transmission in progress.
+//! - **Allowlisted autonomous policy, station timing and receive presets also apply live.
 //! - **Grant-direction security edits and every other key are
 //!   restart-required.** The handler says so in a diagnostic line naming the
 //!   keys. Only the live remote-access fields are written into the shared
@@ -188,6 +189,8 @@ pub enum SnapshotAction {
     /// Write the applied remote-access fields into the snapshot (see
     /// [`patch_live_security_fields`]); nothing else in it changes.
     PatchSecurity,
+    /// Patch allowlisted operational fields, with any security changes.
+    PatchLive,
     /// No remote-access field changed; leave the snapshot alone.
     Keep,
 }
@@ -199,6 +202,7 @@ pub struct ReloadApplyPlan {
     /// Remote-access changes. Applied immediately, even while a QSO is
     /// active: a revocation never waits.
     pub apply_security: SecurityConfigDiff,
+    pub operational_keys: Vec<String>,
     /// What happens to the shared snapshot.
     pub snapshot: SnapshotAction,
     /// C19 classification of the edit. A QSO-latched change is never
@@ -217,7 +221,15 @@ impl ReloadApplyPlan {
     pub fn decide(old: &Config, new: &Config, qso_active: bool) -> Self {
         let applicability = classify_config_reload(old, new, qso_active);
         let apply_security = SecurityConfigDiff::diff(old, new);
-        let snapshot = if apply_security.is_empty() {
+        let keys = changed_keys(old, new);
+        let operational_keys: Vec<String> = keys
+            .iter()
+            .filter(|k| is_operational_key(k))
+            .cloned()
+            .collect();
+        let snapshot = if !operational_keys.is_empty() {
+            SnapshotAction::PatchLive
+        } else if apply_security.is_empty() {
             SnapshotAction::Keep
         } else {
             SnapshotAction::PatchSecurity
@@ -227,15 +239,66 @@ impl ReloadApplyPlan {
         } else {
             changed_keys(old, new)
                 .into_iter()
-                .filter(|k| !is_security_key(k))
+                .filter(|k| !is_security_key(k) && !is_operational_key(k))
                 .collect()
         };
         Self {
             apply_security,
+            operational_keys,
             snapshot,
             applicability,
             restart_required_keys,
         }
+    }
+}
+
+/// Exact live policy allowlist. Hardware bindings and stateful helpers stay latched.
+fn is_operational_key(key: &str) -> bool {
+    matches!(
+        key,
+        "autonomous.enabled"
+            | "autonomous.min_dx_score"
+            | "autonomous.min_multi_slot_score"
+            | "autonomous.pounce_min_tier"
+            | "autonomous.cq_after_idle_cycles"
+            | "autonomous.cq_no_response_switch_after"
+            | "autonomous.cq_direction"
+            | "autonomous.dry_run"
+            | "station.tx_late_max_ms"
+            | "station.ptt_lead_ms"
+            | "station.tx_self_parity"
+    ) || key == "rig.receive_gain_presets"
+        || key.starts_with("rig.receive_gain_presets.")
+}
+
+/// Patch only saved changes, preserving unrelated values applied by the TUI.
+fn patch_live_operational_fields(running: &mut Config, keys: &[String], new: &Config) {
+    macro_rules! patch {
+        ($section:ident, $field:ident) => {
+            if keys
+                .iter()
+                .any(|k| k == concat!(stringify!($section), ".", stringify!($field)))
+            {
+                running.$section.$field = new.$section.$field.clone();
+            }
+        };
+    }
+    patch!(autonomous, enabled);
+    patch!(autonomous, min_dx_score);
+    patch!(autonomous, min_multi_slot_score);
+    patch!(autonomous, pounce_min_tier);
+    patch!(autonomous, cq_after_idle_cycles);
+    patch!(autonomous, cq_no_response_switch_after);
+    patch!(autonomous, cq_direction);
+    patch!(autonomous, dry_run);
+    patch!(station, tx_late_max_ms);
+    patch!(station, ptt_lead_ms);
+    patch!(station, tx_self_parity);
+    if keys
+        .iter()
+        .any(|k| k == "rig.receive_gain_presets" || k.starts_with("rig.receive_gain_presets."))
+    {
+        running.rig.receive_gain_presets = new.rig.receive_gain_presets.clone();
     }
 }
 
@@ -300,6 +363,9 @@ fn flatten_toml(
 ) {
     match value {
         toml::Value::Table(table) => {
+            if table.is_empty() {
+                out.insert(prefix.to_string(), value.clone());
+            }
             for (k, v) in table {
                 let key = if prefix.is_empty() {
                     k.clone()
@@ -727,9 +793,7 @@ impl super::ApplicationCoordinator {
             .collect();
         self.config_file_warnings = warnings;
         let plan = ReloadApplyPlan::decide(&old, &new, self.config_reload_qso_active());
-        if plan.applicability == ConfigReloadApplicability::NoChange
-            && plan.apply_security.is_empty()
-        {
+        if changed_keys(&old, &new).is_empty() && plan.apply_security.is_empty() {
             self.config_file_baseline = Some(new);
             debug!("Config file event with no content change — nothing to apply");
             self.emit_config_reload_lines(warning_lines).await;
@@ -751,9 +815,7 @@ impl super::ApplicationCoordinator {
 
         // The snapshot is patched before the security actions: disabling the
         // station agent restarts it, and the restart re-reads this snapshot.
-        if plan.snapshot == SnapshotAction::PatchSecurity {
-            patch_live_security_fields(&mut *self.config.write().await, &plan.apply_security, &new);
-        }
+        self.patch_live_reload(&plan, &new).await;
         info!(?plan.applicability, "Config reloaded");
 
         let mut lines = vec![(DiagnosticLevel::Info, MSG_RELOADED.to_string())];
@@ -781,13 +843,7 @@ impl super::ApplicationCoordinator {
             return;
         }
         warn!("{MSG_CHANGED_DURING_STARTUP}");
-        if plan.snapshot == SnapshotAction::PatchSecurity {
-            patch_live_security_fields(
-                &mut *self.config.write().await,
-                &plan.apply_security,
-                baseline,
-            );
-        }
+        self.patch_live_reload(&plan, baseline).await;
         let mut lines = vec![(
             DiagnosticLevel::Warn,
             MSG_CHANGED_DURING_STARTUP.to_string(),
@@ -795,6 +851,25 @@ impl super::ApplicationCoordinator {
         lines.extend(self.apply_security_config(&plan.apply_security).await);
         lines.extend(restart_required_line(&plan.restart_required_keys));
         self.emit_config_reload_lines(lines).await;
+    }
+
+    /// Publish the snapshot and synchronous gates before any waiting PTT-on.
+    async fn patch_live_reload(&self, plan: &ReloadApplyPlan, new: &Config) {
+        if plan.snapshot == SnapshotAction::Keep {
+            return;
+        }
+        let _ptt = self.ptt_sync_gate.lock().await;
+        let mut running = self.config.write().await;
+        patch_live_security_fields(&mut running, &plan.apply_security, new);
+        patch_live_operational_fields(&mut running, &plan.operational_keys, new);
+        self.autonomous_config_enabled.store(
+            running.autonomous.enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.tx_late_max_ms_live.store(
+            running.station.tx_late_max_ms,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// Apply the per-channel consent changes in `diff` whose new value is
@@ -1008,7 +1083,7 @@ mod tests {
     use crate::message_bus::MessageType;
     use pancetta_agent::arm::{ArmTime, VerifiedArmGrant};
     use pancetta_config::SlotParitySetting;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     fn base() -> Config {
@@ -1268,6 +1343,231 @@ mod tests {
             classify_config_reload(&old, &old.clone(), true),
             ConfigReloadApplicability::NoChange
         );
+    }
+
+    #[test]
+    fn pan302_live_key_classification_is_explicit() {
+        for key in [
+            "autonomous.enabled",
+            "autonomous.min_dx_score",
+            "autonomous.min_multi_slot_score",
+            "autonomous.pounce_min_tier",
+            "autonomous.cq_after_idle_cycles",
+            "autonomous.cq_no_response_switch_after",
+            "autonomous.cq_direction",
+            "autonomous.dry_run",
+            "station.tx_late_max_ms",
+            "station.ptt_lead_ms",
+            "station.tx_self_parity",
+            "rig.receive_gain_presets",
+            "rig.receive_gain_presets.20m.preamp_db",
+        ] {
+            assert!(is_operational_key(key), "{key}");
+        }
+        for key in [
+            "autonomous.slot_parity",
+            "autonomous.unattended_policy",
+            "autonomous.needed_means",
+            "autonomous.max_concurrent_qsos",
+            "autonomous.tx_offset_hz",
+            "autonomous.frequency.enabled",
+            "autonomous.listen_cycle.enabled",
+            "autonomous.band_hopping.enabled",
+            "autonomous.priorities.needed",
+            "station.callsign",
+            "station.grid_square",
+            "station.power_watts",
+            "rig.interface.enabled",
+            "rig.band_plan",
+            "rig.swr_protection",
+        ] {
+            assert!(!is_operational_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn pan302_every_live_leaf_is_patched() {
+        let old = base();
+        let mut new = old.clone();
+        new.autonomous.enabled = !old.autonomous.enabled;
+        new.autonomous.min_dx_score = 0.81;
+        new.autonomous.min_multi_slot_score = 0.91;
+        new.autonomous.pounce_min_tier = Some(pancetta_config::alerts::DxTier::PerBandDxccNew);
+        new.autonomous.cq_after_idle_cycles += 1;
+        new.autonomous.cq_no_response_switch_after += 1;
+        new.autonomous.cq_direction = "DX".into();
+        new.autonomous.dry_run = !old.autonomous.dry_run;
+        new.station.tx_late_max_ms += 100;
+        new.station.ptt_lead_ms += 10;
+        new.station.tx_self_parity = pancetta_config::TxSelfParity::Even;
+        let plan = ReloadApplyPlan::decide(&old, &new, true);
+        assert!(
+            plan.restart_required_keys.is_empty(),
+            "{:?}",
+            plan.restart_required_keys
+        );
+        let mut running = old.clone();
+        patch_live_operational_fields(&mut running, &plan.operational_keys, &new);
+        assert!(
+            changed_keys(&running, &new).is_empty(),
+            "{:?}",
+            changed_keys(&running, &new)
+        );
+    }
+
+    #[tokio::test]
+    async fn pan302_mixed_reload_patches_only_allowlisted_fields() {
+        let (mut c, _audit) = test_coordinator(base()).await;
+        let rx = tui_rx(&c).await;
+        let old = c.config.read().await.clone();
+        let mut saved = old.clone();
+        saved.autonomous.enabled = !old.autonomous.enabled;
+        saved.autonomous.min_dx_score = 0.8;
+        saved.station.tx_late_max_ms = 1250;
+        saved.station.ptt_lead_ms = 120;
+        saved.rig.interface.enabled = !old.rig.interface.enabled;
+        saved.station.callsign = "K9NEW".into();
+        saved.station.grid_square = "EM10".into();
+        saved.autonomous.slot_parity = pancetta_config::SlotParitySetting::Even;
+        saved.network.station_agent.remote_tx_enabled = false;
+        c.handle_config_reload(Ok((saved.clone(), vec![]))).await;
+        let running = c.config.read().await;
+        assert_eq!(running.autonomous.enabled, saved.autonomous.enabled);
+        assert_eq!(running.autonomous.min_dx_score, 0.8);
+        assert_eq!(running.station.tx_late_max_ms, 1250);
+        assert_eq!(running.station.ptt_lead_ms, 120);
+        assert_eq!(running.rig.interface.enabled, old.rig.interface.enabled);
+        assert_eq!(running.station.callsign, old.station.callsign);
+        assert_eq!(running.station.grid_square, old.station.grid_square);
+        assert_eq!(running.autonomous.slot_parity, old.autonomous.slot_parity);
+        assert!(!running.network.station_agent.remote_tx_enabled);
+        assert_eq!(c.tx_late_max_ms_live.load(Ordering::SeqCst), 1250);
+        assert_eq!(
+            c.autonomous_config_enabled.load(Ordering::SeqCst),
+            saved.autonomous.enabled
+        );
+        let lines = diagnostics(&rx);
+        let restart = lines
+            .iter()
+            .find(|(_, t)| t.starts_with(MSG_RESTART_REQUIRED_PREFIX))
+            .unwrap();
+        assert!(!restart.1.contains("autonomous.enabled"));
+        assert!(!restart.1.contains("station.tx_late_max_ms"));
+        assert!(restart.1.contains("rig.interface.enabled"));
+    }
+
+    #[tokio::test]
+    async fn pan302_startup_and_repeated_saves_share_live_patch() {
+        let (mut c, _audit) = test_coordinator(base()).await;
+        let rx = tui_rx(&c).await;
+        let mut saved = c.config.read().await.clone();
+        saved.autonomous.min_dx_score = 0.8;
+        saved.station.tx_late_max_ms = 900;
+        c.reconcile_startup_window(&saved).await;
+        assert_eq!(c.config.read().await.autonomous.min_dx_score, 0.8);
+        assert_eq!(c.tx_late_max_ms_live.load(Ordering::SeqCst), 900);
+        diagnostics(&rx);
+        c.config_file_baseline = Some(saved.clone());
+        c.autonomous_enabled_runtime.store(false, Ordering::SeqCst);
+        // An unrelated edit must not overwrite an independently applied TUI value.
+        c.config.write().await.station.ptt_lead_ms = 321;
+        c.handle_config_reload(Ok((saved.clone(), vec![]))).await;
+        assert!(diagnostics(&rx).is_empty());
+        assert_eq!(c.config.read().await.station.ptt_lead_ms, 321);
+        assert!(!c.autonomous_enabled_runtime.load(Ordering::SeqCst));
+        saved.ui.theme.push('x');
+        c.handle_config_reload(Ok((saved, vec![]))).await;
+        assert_eq!(c.config.read().await.station.ptt_lead_ms, 321);
+    }
+
+    #[tokio::test]
+    async fn pan302_invalid_reload_keeps_live_values() {
+        let (mut c, _audit) = test_coordinator(base()).await;
+        let before = c.config.read().await.clone();
+        let rx = tui_rx(&c).await;
+        c.handle_config_reload(Err("invalid min_dx_score".into()))
+            .await;
+        assert!(changed_keys(&before, &*c.config.read().await).is_empty());
+        assert_eq!(
+            texts(&diagnostics(&rx)),
+            vec![
+                "Config reload failed: invalid min_dx_score — previous configuration still active"
+            ]
+        );
+    }
+
+    #[test]
+    fn pan302_reordered_maps_are_no_change() {
+        let mut input = base();
+        input.rig.receive_gain_presets = Some(std::collections::HashMap::from([
+            (
+                "20m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db: 0,
+                    attenuator_db: 6,
+                },
+            ),
+            (
+                "40m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+            ),
+        ]));
+        let first: Config = toml::from_str(&toml::to_string(&input).unwrap()).unwrap();
+        let mut second: Config = toml::from_str(&toml::to_string(&first).unwrap()).unwrap();
+        second.rig.receive_gain_presets = Some(
+            ["40m", "20m"]
+                .into_iter()
+                .map(|band| {
+                    (
+                        band.into(),
+                        first.rig.receive_gain_presets.as_ref().unwrap()[band].clone(),
+                    )
+                })
+                .collect(),
+        );
+        assert!(changed_keys(&first, &second).is_empty());
+        assert!(ReloadApplyPlan::decide(&first, &second, false)
+            .operational_keys
+            .is_empty());
+    }
+
+    #[test]
+    fn pan302_preset_map_add_modify_remove_and_clear() {
+        let mut old = base();
+        for preset in [
+            Some(std::collections::HashMap::from([(
+                "20m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db: 0,
+                    attenuator_db: 6,
+                },
+            )])),
+            Some(std::collections::HashMap::from([(
+                "20m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db: 10,
+                    attenuator_db: 0,
+                },
+            )])),
+            Some(std::collections::HashMap::new()),
+            None,
+        ] {
+            let mut saved = old.clone();
+            saved.rig.receive_gain_presets = preset;
+            let plan = ReloadApplyPlan::decide(&old, &saved, false);
+            assert!(!plan.operational_keys.is_empty());
+            assert!(plan.restart_required_keys.is_empty());
+            let mut running = old.clone();
+            patch_live_operational_fields(&mut running, &plan.operational_keys, &saved);
+            assert_eq!(
+                running.rig.receive_gain_presets,
+                saved.rig.receive_gain_presets
+            );
+            old = saved;
+        }
     }
 
     // --- coordinator integration ---------------------------------------------
@@ -1562,6 +1862,44 @@ mod tests {
             .lock()
             .unwrap()
             .channel_consent(ConsentChannel::StationAgent)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan302_watcher_save_updates_live_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let mut initial = base();
+        initial.station.callsign = "K1TEST".into();
+        initial.station.grid_square = "FN42".into();
+        std::fs::write(&path, toml::to_string(&initial).unwrap()).unwrap();
+        let (mut c, _audit) = test_coordinator(initial.clone()).await;
+        c.config_path = path.clone();
+        c.set_config_watch_path(path.clone());
+        c.start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut rx = c.config_reload_rx.take().unwrap();
+        initial.autonomous.min_dx_score = 0.8;
+        initial.autonomous.enabled = false;
+        let text = toml::to_string(&initial).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            std::fs::write(&path, &text).unwrap();
+            if let Ok(Some(outcome)) =
+                tokio::time::timeout(Duration::from_millis(700), rx.recv()).await
+            {
+                c.handle_config_reload(outcome).await;
+                if c.config.read().await.autonomous.min_dx_score == 0.8 {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watcher did not apply save"
+            );
+        }
+        assert!(!c.autonomous_config_enabled.load(Ordering::SeqCst));
+        assert_eq!(c.config.read().await.autonomous.min_dx_score, 0.8);
     }
 
     /// Codex P1 on #436: without `--config`, a higher-priority source that

@@ -8557,7 +8557,7 @@ struct SlotTimingContext {
     utc_clock: pancetta_core::time::UtcClock,
     active_protocol: pancetta_ft8::Protocol,
     /// Raw `station.tx_late_max_ms`; [`Self::late_cap_ms`] scales it per mode.
-    tx_late_max_ms: u64,
+    tx_late_max_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx_self_parity: pancetta_config::station::TxSelfParity,
     ptt_lead_ms: u64,
     sample_rate: u32,
@@ -8569,7 +8569,10 @@ struct SlotTimingContext {
 impl SlotTimingContext {
     /// The mode-scaled late cap, [`tx_late_max_ms_effective`].
     fn late_cap_ms(&self) -> u64 {
-        tx_late_max_ms_effective(self.active_protocol, self.tx_late_max_ms)
+        tx_late_max_ms_effective(
+            self.active_protocol,
+            self.tx_late_max_ms.load(Ordering::Acquire),
+        )
     }
 
     /// The PTT engage instant: `target_slot` minus `ptt_lead_ms`.
@@ -9390,20 +9393,10 @@ impl super::ApplicationCoordinator {
             .await?;
         let message_bus = self.message_bus.clone();
 
-        // Capture config snapshot for TX timing parameters.
-        let (
-            tx_late_max_ms,
-            tx_self_parity,
-            ptt_lead_ms,
-            sample_rate,
-            max_concurrent_qsos,
-            band_plan,
-        ) = {
+        // Hardware bindings remain restart-only. Timing preferences are read per attempt.
+        let (sample_rate, max_concurrent_qsos, band_plan) = {
             let cfg = self.config.read().await;
             (
-                cfg.station.tx_late_max_ms,
-                cfg.station.tx_self_parity,
-                cfg.station.ptt_lead_ms,
                 12000u32, // FT8 sample rate
                 // Mid-TX supersede bundle-add (Task 7): when the station runs
                 // concurrent QSOs, a superseding manual request folds into the
@@ -9412,16 +9405,17 @@ impl super::ApplicationCoordinator {
                 // keeps the single-item replace path byte-identical to Task 6.
                 cfg.autonomous.max_concurrent_qsos,
                 // PAN-118: band-plan snapshot for the frequency-aware TX
-                // gate (`tx_band_plan_mute_reason`). Config is loaded once
-                // at startup (the hot-reload apply task is a documented
-                // no-op), so a startup snapshot is always the live value,
-                // and it keeps the last-instant re-check synchronous (no
-                // lock acquisition on the hot path).
+                // gate (`tx_band_plan_mute_reason`). Band-plan changes require
+                // restart, keeping the last-instant check synchronous.
                 cfg.rig.frequency.band_plan.clone(),
             )
         };
 
         let tx_handle = {
+            let live_config = self.config.clone();
+            let live_late_cap = self.tx_late_max_ms_live.clone();
+            let autonomous_config_enabled = self.autonomous_config_enabled.clone();
+            let autonomous_cq_attempts = self.autonomous_cq_attempts.clone();
             let shutdown = self.shutdown_signal.clone();
             let abort_current_tx = self.abort_current_tx.clone();
             // Tri-state TX policy. The TX worker only enforces the hard
@@ -9639,6 +9633,24 @@ impl super::ApplicationCoordinator {
 
                     match inbox.try_recv() {
                         Ok(mut message) => {
+                            let (tx_late_max_ms, tx_self_parity) = {
+                                let config = live_config.read().await;
+                                (
+                                    live_late_cap.load(Ordering::Acquire),
+                                    config.station.tx_self_parity,
+                                )
+                            };
+                            let autonomous_request = message.source == ComponentId::Autonomous;
+                            let is_autonomous_cq = |id: Option<&str>, attempt, text: &str| {
+                                text.starts_with("CQ ")
+                                    && (autonomous_request
+                                        || id.is_some_and(|id| {
+                                            autonomous_cq_attempts
+                                                .lock()
+                                                .map(|set| set.contains(&(id.to_string(), attempt)))
+                                                .unwrap_or(true)
+                                        }))
+                            };
                             let _gain_tx_intent = matches!(
                                 &message.message_type,
                                 MessageType::TransmitRequest { .. }
@@ -10251,10 +10263,18 @@ impl super::ApplicationCoordinator {
                                         };
 
                                         // --- Step 2: Resolve required parity ---
+                                        let (tx_late_max_ms, tx_self_parity, ptt_lead_ms) = {
+                                            let config = live_config.read().await;
+                                            (
+                                                live_late_cap.load(Ordering::Acquire),
+                                                config.station.tx_self_parity,
+                                                config.station.ptt_lead_ms,
+                                            )
+                                        };
                                         let timing = SlotTimingContext {
                                             utc_clock: utc_clock.clone(),
                                             active_protocol,
-                                            tx_late_max_ms,
+                                            tx_late_max_ms: live_late_cap.clone(),
                                             tx_self_parity,
                                             ptt_lead_ms,
                                             sample_rate,
@@ -10972,6 +10992,33 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
 
+                                        let live_timing_guard = ptt_sync_gate.lock().await;
+                                        if is_autonomous_cq(
+                                            qso_id.as_deref(),
+                                            attempt_id,
+                                            &message_text,
+                                        ) && !autonomous_config_enabled.load(Ordering::Acquire)
+                                        {
+                                            ptt_guard.disarm();
+                                            ptt_active.store(false, Ordering::Release);
+                                            drop(live_timing_guard);
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                attempt_id,
+                                                pivot_replaced,
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
                                         // --- Step 4d: final atomic pre-PTT gate ---
                                         // PAN-148: Step 4b/4b-parity's liveness/DX-parity
                                         // evidence is read BEFORE Step 4c's pivot/remodulation
@@ -11263,6 +11310,7 @@ impl super::ApplicationCoordinator {
                                                 )
                                             },
                                         );
+                                        drop(live_timing_guard);
                                         match outcome {
                                             SendIfOutcome::Enqueued => {
                                                 info!(
@@ -12657,10 +12705,18 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Resolve required parity ---
+                                    let (tx_late_max_ms, tx_self_parity, ptt_lead_ms) = {
+                                        let config = live_config.read().await;
+                                        (
+                                            live_late_cap.load(Ordering::Acquire),
+                                            config.station.tx_self_parity,
+                                            config.station.ptt_lead_ms,
+                                        )
+                                    };
                                     let timing = SlotTimingContext {
                                         utc_clock: utc_clock.clone(),
                                         active_protocol,
-                                        tx_late_max_ms,
+                                        tx_late_max_ms: live_late_cap.clone(),
                                         tx_self_parity,
                                         ptt_lead_ms,
                                         sample_rate,
@@ -13838,6 +13894,7 @@ impl super::ApplicationCoordinator {
                                         send_tx_queue_status(&message_bus, head, bundle).await;
                                     }
 
+                                    let live_timing_guard = ptt_sync_gate.lock().await;
                                     // --- Step 4d: final atomic pre-PTT gate ---
                                     // PAN-148 (Finding 1, PR #370 round 2): the
                                     // partial-staleness branch above emits per-item
@@ -14110,6 +14167,38 @@ impl super::ApplicationCoordinator {
                                     // branch above. SYNCHRONOUS through the key-down
                                     // enqueue below: `send_ptt_command` takes no lock and
                                     // no await (PAN-202).
+                                    if items.iter().any(|item| {
+                                        is_autonomous_cq(
+                                            item.qso_id.as_deref(),
+                                            item.attempt_id,
+                                            &item.message_text,
+                                        )
+                                    }) && !autonomous_config_enabled.load(Ordering::Acquire)
+                                    {
+                                        ptt_guard.disarm();
+                                        ptt_active.store(false, Ordering::Release);
+                                        drop(live_timing_guard);
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                item.attempt_id,
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
                                     let key_time_now = utc_clock();
                                     let key_time_late_max_ms = timing.late_cap_ms();
                                     if key_time_too_late(
@@ -14183,6 +14272,7 @@ impl super::ApplicationCoordinator {
                                             )
                                         },
                                     );
+                                    drop(live_timing_guard);
                                     match outcome {
                                         SendIfOutcome::Enqueued => {
                                             info!(
@@ -15036,7 +15126,7 @@ impl SlotTimingContext {
     ) -> Self {
         Self {
             active_protocol: pancetta_ft8::Protocol::Ft8,
-            tx_late_max_ms,
+            tx_late_max_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(tx_late_max_ms)),
             tx_self_parity,
             ptt_lead_ms: 80,
             sample_rate,
@@ -15059,7 +15149,7 @@ mod slot_timing_context_tests {
         SlotTimingContext {
             utc_clock: pancetta_core::time::system_utc_clock(),
             active_protocol,
-            tx_late_max_ms,
+            tx_late_max_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(tx_late_max_ms)),
             tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
             ptt_lead_ms,
             sample_rate: 12_000,
@@ -19760,7 +19850,7 @@ tx_parity: None,
             new_request,
             &super::SupersedeInFlight {
                 items: in_flight,
-                origin: origin,
+                origin,
                 remote_client_key_id: key.map(str::to_string),
                 tx_parity: Some(cur),
             },
@@ -24110,7 +24200,7 @@ mod classifier_tests {
 /// while the rig CAT link is lost, or while the audio output is dead, is
 /// refused at the key-time gate with no `SetPtt{true}` ever reaching Hamlib.
 #[cfg(test)]
-mod pan115_worker_gate_tests {
+pub(super) mod pan115_worker_gate_tests {
     use super::super::hamlib::RigConnState;
     use super::super::ApplicationCoordinator;
     use crate::message_bus::{
@@ -24193,12 +24283,16 @@ mod pan115_worker_gate_tests {
     }
 
     pub(super) async fn build_worker_harness(
-        cfg: Config,
+        mut cfg: Config,
         prepare: impl FnOnce(&mut ApplicationCoordinator),
         arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
         utc_clock: pancetta_core::time::UtcClock,
         register_rig: bool,
     ) -> Harness {
+        // This TX-only fixture historically sends CQ requests as Autonomous.
+        // Grant their config permission so each test reaches the gate it targets;
+        // permission-revocation tests explicitly close the live gate afterwards.
+        cfg.autonomous.enabled = true;
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
             cfg,
@@ -24514,6 +24608,375 @@ mod pan115_worker_gate_tests {
         );
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
         assert!(!h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pan302_new_attempt_uses_live_timing_preferences() {
+        use pancetta_config::station::TxSelfParity;
+        use pancetta_core::slot::SlotParity;
+        for contact_parity in [None, Some(SlotParity::Even)] {
+            let start = tokio::time::Instant::now();
+            let base = pancetta_core::time::slot_grid_origin();
+            let clock: pancetta_core::time::UtcClock =
+                Arc::new(move || base + chrono::Duration::from_std(start.elapsed()).unwrap());
+            let mut config = Config::default();
+            config.station.tx_self_parity = TxSelfParity::Even;
+            let h = build_worker_harness(
+                config,
+                |_| {},
+                Arc::new(pancetta_agent::arm::ArmTime::now),
+                clock.clone(),
+                true,
+            )
+            .await;
+            {
+                let mut config = h.coordinator.config.write().await;
+                config.station.tx_self_parity = TxSelfParity::Odd;
+                config.station.ptt_lead_ms = 500;
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            h.coordinator
+                .active_tx_qsos
+                .write()
+                .unwrap()
+                .insert(super::super::active_tx_qso_key(&id));
+            let held = h.coordinator.ptt_sync_gate.lock().await;
+            h.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Qso,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: "CQ N0CALL FN20".into(),
+                        frequency_offset: 1500.0,
+                        qso_id: Some(id),
+                        attempt_id: Some(pancetta_qso::TxAttemptId(1)),
+                        tx_parity: contact_parity,
+                        origin: TxOrigin::Local,
+                        remote_client_key_id: None,
+                    },
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            let target = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    for message in h.qso_rx.try_iter() {
+                        if let MessageType::QsoMessage(
+                            crate::message_bus::QsoMessage::TxFrameScheduled {
+                                target_slot, ..
+                            },
+                        ) = message.message_type
+                        {
+                            return target_slot;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let expected_parity = contact_parity.unwrap_or(SlotParity::Odd);
+            assert_eq!(
+                SlotParity::of(target),
+                expected_parity,
+                "new attempt reads live preference, active QSO parity wins"
+            );
+            // This request is already sleeping. A later edit must not move its lead or target.
+            {
+                let mut config = h.coordinator.config.write().await;
+                config.station.tx_self_parity = TxSelfParity::Even;
+                config.station.ptt_lead_ms = 10;
+            }
+            wait_for_ptt_gate(&h).await;
+            if target > base {
+                let lead = (target - clock()).num_milliseconds();
+                assert!(
+                    (450..=500).contains(&lead),
+                    "sleep retains its scheduled 500ms lead: {lead}"
+                );
+            }
+            drop(held);
+            assert!(await_ptt_on(&h, Duration::from_secs(5)).await);
+            h.coordinator.config.write().await.station.ptt_lead_ms = 900;
+            assert!(
+                !h.coordinator.abort_current_tx.load(Ordering::Acquire),
+                "editing timing does not abort a keyed attempt"
+            );
+            assert!(!h.hamlib_rx.try_iter().any(|m| matches!(
+                m.message_type,
+                MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+            )));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pan302_queued_self_cq_refuses_after_disable_but_manual_cq_keys() {
+        for autonomous in [false, true] {
+            let mut config = Config::default();
+            config.station.tx_late_max_ms = 8000;
+            let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+            let h = build_worker_harness(
+                config,
+                |_| {},
+                Arc::new(pancetta_agent::arm::ArmTime::now),
+                Arc::new(move || now),
+                true,
+            )
+            .await;
+            h.coordinator
+                .autonomous_config_enabled
+                .store(false, Ordering::Release);
+            let id = uuid::Uuid::new_v4().to_string();
+            let attempt = Some(pancetta_qso::TxAttemptId(1));
+            h.coordinator
+                .active_tx_qsos
+                .write()
+                .unwrap()
+                .insert(super::super::active_tx_qso_key(&id));
+            if autonomous {
+                h.coordinator
+                    .autonomous_cq_attempts
+                    .lock()
+                    .unwrap()
+                    .insert((id.clone(), attempt));
+            }
+            let items = vec![crate::message_bus::TransmitRequestItem {
+                message_text: "CQ N0CALL FN20".into(),
+                frequency_offset: 1500.0,
+                qso_id: Some(id),
+                attempt_id: attempt,
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            }];
+            // Source Qso deliberately models the real event forwarder and proves
+            // the per-attempt marker survives bundle construction.
+            h.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Qso,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::MultiTransmitRequest {
+                        items,
+                        tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+                        origin: TxOrigin::Local,
+                        remote_client_key_id: None,
+                    },
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            if autonomous {
+                let (success, _, keyed) =
+                    await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+                assert_eq!(success, Some(false));
+                assert!(!keyed, "queued autonomous CQ cannot key after file disable");
+            } else {
+                assert!(
+                    await_ptt_on(&h, Duration::from_secs(5)).await,
+                    "manual CQ retains permission"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pan302_queued_frame_uses_live_late_cap_on_rekey() {
+        let mut config = Config::default();
+        config.station.tx_late_max_ms = 8000;
+        config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let h = build_worker_harness(
+            config,
+            |_| {},
+            Arc::new(pancetta_agent::arm::ArmTime::now),
+            Arc::new(move || now),
+            true,
+        )
+        .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&id));
+        async fn send_attempt(h: &Harness, id: &str, text: &str, attempt: u64) {
+            h.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Qso,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.into(),
+                        frequency_offset: 1500.0,
+                        qso_id: Some(id.into()),
+                        attempt_id: Some(pancetta_qso::TxAttemptId(attempt)),
+                        tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+                        origin: TxOrigin::Local,
+                        remote_client_key_id: None,
+                    },
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        send_attempt(&h, &id, "CQ N0CALL FN20", 1).await;
+        assert!(await_ptt_on(&h, Duration::from_secs(5)).await);
+        h.coordinator.tx_before_ptt_gate.notified().await; // consume initial key's notification
+        let audio = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap()
+            .1;
+        // The initial key may still be before audio enqueue; the replacement is
+        // captured by the real worker's keyed supersede poll in either case.
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        send_attempt(&h, &id, "CQ N0CALL EM12", 2).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.coordinator.tx_before_ptt_gate.notified(),
+        )
+        .await
+        .expect("replacement must reach re-key gate");
+        let _ = audio.try_iter().collect::<Vec<_>>();
+        h.coordinator
+            .tx_late_max_ms_live
+            .store(1000, Ordering::Release);
+        drop(held);
+        let (success, diagnostics, keyed) =
+            await_completion(&h, "CQ N0CALL EM12", Duration::from_secs(5)).await;
+        assert_eq!(success, Some(false));
+        let mut rolled_back: Vec<_> = h
+            .qso_rx
+            .try_iter()
+            .filter_map(|message| match message.message_type {
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                    qso_id,
+                    attempt_id,
+                    ..
+                }) if qso_id == id => attempt_id.map(|id| id.0),
+                _ => None,
+            })
+            .collect();
+        rolled_back.sort_unstable();
+        assert_eq!(
+            rolled_back,
+            vec![1, 2],
+            "original and refused replacement each settle exactly once"
+        );
+        assert!(!keyed, "re-key refuses the newly over-cap replacement");
+        assert!(
+            diagnostics.iter().any(|s| s.contains("1000ms")),
+            "{diagnostics:?}"
+        );
+        assert!(!audio
+            .try_iter()
+            .any(|m| matches!(m.message_type, MessageType::AudioOutput { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pan302_queued_frame_uses_live_late_cap() {
+        for bundle in [false, true] {
+            let mut config = Config::default();
+            config.station.tx_late_max_ms = 8000;
+            config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+            let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+            let h = build_worker_harness(
+                config,
+                |_| {},
+                Arc::new(pancetta_agent::arm::ArmTime::now),
+                Arc::new(move || now),
+                true,
+            )
+            .await;
+            let id = uuid::Uuid::new_v4().to_string();
+            h.coordinator
+                .active_tx_qsos
+                .write()
+                .unwrap()
+                .insert(super::super::active_tx_qso_key(&id));
+            let held = h.coordinator.ptt_sync_gate.lock().await;
+            let item = crate::message_bus::TransmitRequestItem {
+                message_text: "CQ N0CALL FN20".into(),
+                frequency_offset: 1500.0,
+                qso_id: Some(id.clone()),
+                attempt_id: Some(pancetta_qso::TxAttemptId(1)),
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            };
+            let msg = if bundle {
+                MessageType::MultiTransmitRequest {
+                    items: vec![item],
+                    tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                }
+            } else {
+                MessageType::TransmitRequest {
+                    message_text: item.message_text,
+                    frequency_offset: item.frequency_offset,
+                    qso_id: item.qso_id,
+                    attempt_id: item.attempt_id,
+                    tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                }
+            };
+            h.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Ft8Transmitter,
+                    msg,
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            wait_for_ptt_gate(&h).await;
+            h.coordinator
+                .tx_late_max_ms_live
+                .store(1000, Ordering::Release);
+            drop(held);
+            let (success, diagnostics, keyed) =
+                await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+            assert_eq!(success, Some(false));
+            assert!(!keyed);
+            let unaired: Vec<_> = h
+                .qso_rx
+                .try_iter()
+                .filter_map(|m| match m.message_type {
+                    MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                        qso_id,
+                        attempt_id,
+                        ..
+                    }) => Some((qso_id, attempt_id)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                unaired,
+                vec![(id, Some(pancetta_qso::TxAttemptId(1)))],
+                "one durable rollback for the refused attempt"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|s| s.contains("final pre-PTT check") && s.contains("1000ms")),
+                "{diagnostics:?}"
+            );
+            let audio = h
+                .coordinator
+                .message_bus
+                .get_or_create_channel(ComponentId::Audio)
+                .await
+                .unwrap()
+                .1;
+            assert!(!audio
+                .try_iter()
+                .any(|m| matches!(m.message_type, MessageType::AudioOutput { .. })));
+        }
     }
 
     #[tokio::test]
@@ -29158,7 +29621,7 @@ mod pan223_scheduled_slot_worker_tests {
     async fn scheduled_reports(h: &Harness, count: usize) -> Vec<Report> {
         let mut reports = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut drain = |reports: &mut Vec<Report>| {
+        let drain = |reports: &mut Vec<Report>| {
             while let Ok(msg) = h.qso_rx.try_recv() {
                 if let MessageType::QsoMessage(QsoMessage::TxFrameScheduled {
                     qso_id,

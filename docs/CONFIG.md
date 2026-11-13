@@ -2,9 +2,9 @@
 
 Pancetta's configuration lives in a single TOML file at
 `~/.pancetta/pancetta.toml`. The file is loaded at startup. It is also
-watched for changes, but only the remote-access revocations listed under
-[Hot reload](#hot-reload) apply to a running station; every other key
-needs a restart.
+watched for changes. The operational settings and remote-access revocations
+listed under [Hot reload](#hot-reload) apply to a running station; every
+other key needs a restart.
 
 This document covers the keys you'll actually touch, with explanations.
 The complete schema — every section, every key, every default — is
@@ -1264,6 +1264,50 @@ Editors that save by removing the file and writing a new one are read
 as a save, not a deletion: while the file is missing, pancetta waits a
 moment longer before reloading.
 
+**Applied live: operational settings (Unreleased)**
+
+- `[autonomous]`: `enabled`, `min_dx_score`, `min_multi_slot_score`,
+  `pounce_min_tier`, `cq_after_idle_cycles`, `cq_no_response_switch_after`,
+  `cq_direction` and `dry_run`. Decisions use the new policy on their next
+  pass, within one FT8 slot under normal watcher operation. A configured
+  `pounce_min_tier` replaces the numeric pounce threshold.
+- `[station]`: `tx_late_max_ms`, `ptt_lead_ms` and `tx_self_parity`. The late
+  cap also applies to queued frames at their final pre-PTT check. Lead and
+  parity changes apply to new scheduling attempts; sleeping or keyed attempts
+  retain their schedule, and active-contact parity takes precedence.
+- `[rig.receive_gain_presets]`: adding, changing, removing or clearing entries
+  applies on the next successful known-band crossing. Saving sends no CAT
+  command. A missing preset leaves the rig controls untouched.
+
+File permission and the operator's pause are separate. Disabling then
+re-enabling `autonomous.enabled` preserves an `a` pause or Shift+Q stop and
+never changes TX policy. Headless startup can enable autonomy through a later
+file edit; interactive startup still needs operator opt-in. Disabling autonomy
+leaves manual TX and the direct-caller reply policy unchanged. The readiness
+strip and Shift+S show `AUTO OFF IN CONFIG` until the file permits autonomy.
+
+For example, these settings can be merged into your existing configuration:
+
+```toml
+[autonomous]
+enabled = false
+min_dx_score = 0.8
+min_multi_slot_score = 0.9
+cq_after_idle_cycles = 10
+cq_no_response_switch_after = 4
+cq_direction = "DX"
+dry_run = false
+
+[station]
+tx_late_max_ms = 2000
+ptt_lead_ms = 120
+tx_self_parity = "even"
+
+[rig.receive_gain_presets.20m]
+preamp_db = 0
+attenuator_db = 6
+```
+
 **Applied live — remote-access revocations (security):**
 
 - `[network.station_agent].remote_tx_enabled` — the station-agent
@@ -1298,6 +1342,12 @@ moment longer before reloading.
 
 **Explicitly restart-required (a diagnostic says so on save):**
 
+- Autonomous `slot_parity`, `needed_means`, `unattended_policy`,
+  `max_concurrent_qsos`, `tx_offset_hz`, `qso_stall_switch_after`, `frequency.*`,
+  `listen_cycle.*`, `band_hopping.*` and `priorities.*`.
+- Station identity and `power_watts` (log metadata), and every rig setting
+  except receive gain presets, including hardware bindings, band plans and
+  protection settings.
 - Adding a `tx_allow_list` entry, `station_agent.enabled = true` on a
   disabled station, and the station agent's `relay_url`,
   `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
@@ -1306,10 +1356,10 @@ moment longer before reloading.
   running gateway still accepts the old token and origins and keeps
   clients that are already connected.
 - Every other key: `[audio]` device names, `[rig.interface]`,
-  `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
+  unlisted `[station]` and `[autonomous]` keys, `[ui]`, upload/logging settings, …
   Nothing outside the live list above is applied to a running process,
   not even to its in-memory copy of the config; restart pancetta to
-  enforce them. Non-security changes are all classified restart-required,
+  enforce them. Changes outside the live allowlist are restart-required,
   but a restart does not activate the unused `[ui]` settings (see
   `[ui]` — TUI behaviour above). (`[station].callsign`,
   `[station].grid_square` and `[autonomous].slot_parity` in particular

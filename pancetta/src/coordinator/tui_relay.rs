@@ -1616,6 +1616,19 @@ impl RelayDriverHost for TuiRelayLoop {
     }
 }
 
+const AUTONOMOUS_CONFIG_DISABLED_GUIDANCE: &str =
+    "Autonomous disabled in config. Set autonomous.enabled=true in pancetta.toml.";
+
+fn toggle_autonomous_with_permission(
+    permission: &std::sync::atomic::AtomicBool,
+    runtime: &std::sync::atomic::AtomicBool,
+) -> Result<bool, &'static str> {
+    if !permission.load(Ordering::Acquire) {
+        return Err(AUTONOMOUS_CONFIG_DISABLED_GUIDANCE);
+    }
+    Ok(!runtime.fetch_xor(true, Ordering::AcqRel))
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -1968,14 +1981,8 @@ impl super::ApplicationCoordinator {
         // CycleOperatingMode success arm relays the new mode to already-
         // connected remote clients, same additive pattern as Frequency/Split.
         let cmd_display_feed_enabled = self.display_feed_enabled.clone();
-        // Whether the autonomous component is running at all (config
-        // gate). If it's config-disabled there is no decision loop to
-        // re-enable — `a` should say so honestly instead of flipping a
-        // gate nothing reads.
-        let cmd_autonomous_config_enabled = {
-            let cfg = self.config.read().await;
-            cfg.autonomous.enabled
-        };
+        // File permission changes independently of the operator's runtime pause.
+        let cmd_autonomous_config_enabled = self.autonomous_config_enabled.clone();
         // Direct path back to the TUI so ToggleAutonomous can confirm
         // immediately (the structured panel update follows on the next
         // autonomous slot tick, ≤15s later).
@@ -3301,25 +3308,25 @@ impl super::ApplicationCoordinator {
                             // is only read by the autonomous loop before
                             // dispatching TX items its decision engine (with
                             // its own slot/priority/QSO gates) produced.
-                            if !cmd_autonomous_config_enabled {
+                            let toggled = toggle_autonomous_with_permission(
+                                &cmd_autonomous_config_enabled,
+                                &cmd_autonomous_enabled,
+                            );
+                            if let Err(guidance) = toggled {
                                 info!(
                                     "TUI ToggleAutonomous: autonomous disabled in config; \
-                                     no decision loop to toggle"
+                                     runtime intent unchanged"
                                 );
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "Autonomous".to_string(),
-                                        status: "Autonomous disabled in config — restart with \
-                                                 autonomous.enabled=true"
-                                            .to_string(),
+                                        status: guidance.to_string(),
 
                                         level: pancetta_core::DiagnosticLevel::Warn,
                                     },
                                 );
                             } else {
-                                let was = cmd_autonomous_enabled.load(Ordering::Acquire);
-                                let now_enabled = !was;
-                                cmd_autonomous_enabled.store(now_enabled, Ordering::Release);
+                                let now_enabled = toggled.expect("successful permission check");
                                 if now_enabled {
                                     warn!(
                                         target: "operator.override",
@@ -8877,6 +8884,34 @@ mod tui_relay_tests {
     fn map_engine_disabled_wins_over_open_gate() {
         let mapped = map_autonomous_status(&sample_status(false), true);
         assert!(!mapped.enabled);
+    }
+
+    #[test]
+    fn pan302_toggle_uses_live_config_permission() {
+        use std::sync::atomic::AtomicBool;
+        let permission = AtomicBool::new(false);
+        let runtime = AtomicBool::new(false);
+        assert_eq!(
+            super::toggle_autonomous_with_permission(&permission, &runtime),
+            Err("Autonomous disabled in config. Set autonomous.enabled=true in pancetta.toml.")
+        );
+        assert!(!runtime.load(Ordering::Acquire));
+        permission.store(true, Ordering::Release);
+        assert_eq!(
+            super::toggle_autonomous_with_permission(&permission, &runtime),
+            Ok(true)
+        );
+        permission.store(false, Ordering::Release);
+        assert!(super::toggle_autonomous_with_permission(&permission, &runtime).is_err());
+        assert!(
+            runtime.load(Ordering::Acquire),
+            "file denial preserves operator intent"
+        );
+        permission.store(true, Ordering::Release);
+        assert_eq!(
+            super::toggle_autonomous_with_permission(&permission, &runtime),
+            Ok(false)
+        );
     }
 
     /// End-to-end gate semantics for the Shift+Q → `a` recovery path,
