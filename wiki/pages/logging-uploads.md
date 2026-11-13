@@ -89,9 +89,10 @@ service response (duplicate included) as the only acceptance; absence is
 unknown, an empty captured target set is disabled, and config changes after
 completion never rewrite a contact's captured denominator.
 
-<<<<<<< HEAD
-PAN-300 verifies actual subprocess execution with fake tqsl, including optional certificate passwords and duplicate exits 8/9. Child output is excluded from errors because it may echo a password. Live-account qualification remains pending.
-=======
+PAN-300 verifies actual subprocess execution with fake tqsl, including optional
+certificate passwords and duplicate exits 8/9. Child output is excluded from
+errors because it may echo a password. Live-account qualification remains
+pending.
 
 ## Startup ADIF snapshots (PAN-304)
 
@@ -104,4 +105,3 @@ Only complete generated ADIF names count, separately from SQLite and import
 backups. Retention never rotates or replaces the source `qsos.adi`.
 A temporary owner-only file is synced before no-clobber hard-link publication;
 a failed write or publication never prunes old snapshots.
->>>>>>> a790ea9cd2e813441efa6f9cfe313016defd4819
