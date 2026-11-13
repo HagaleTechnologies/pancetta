@@ -1253,6 +1253,7 @@ warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
 
+<<<<<<< HEAD
 
 ## PAN-302: live operational allowlist
 
@@ -1270,3 +1271,26 @@ must not write CAT on save. Hardware binding, protection, identity and
 stateful autonomous helper settings remain restart-only. See CONFIG.md's
 explicit allowlist; section-wide reload would change values that running
 components still latch.
+=======
+## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
+
+The release workflow's build job now holds `id-token: write` and
+`attestations: write` alongside `contents: read`. Only the tag-gated
+build-provenance step uses the attestation scopes; workflow-dispatch dry runs
+do not attest. This executes PAN-106's recorded attestation deferral and
+narrows its rule to no build write scope beyond the attestation pair.
+The release job retains `contents: write` for draft creation.
+
+Release CI overrides Cargo profiles with debug=1, strip=none and
+split-debuginfo=off. Post-link splitting produces separate ELF/PE `.debug`
+assets or a macOS dSYM tarball before the binary is packaged.
+`Cargo.toml` and local build profiles stay unchanged. The first tagged run
+must check symbol sizes and native macOS/Windows extraction.
+`SHA256SUMS` lists platform archives only, excluding dSYM tarballs;
+per-archive checksum sidecars remain available.
+
+Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
+receive a release-candidate notice. They require a real, matching CHANGELOG
+section; there is no Unreleased fallback. The operator still publishes the
+draft. macOS signing and notarization remain PAN-265.
+>>>>>>> 8e44bf5e6c567ce4c481a134f2ecada36a44da00
