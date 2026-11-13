@@ -1252,97 +1252,6 @@ impl super::ApplicationCoordinator {
 
                         log_window_received(window.len());
 
-<<<<<<< HEAD
-                        // PAN-165: covers generation, normalisation and the
-                        // channel sends below, all time the native call loses.
-                        let waterfall_start = Instant::now();
-                        // Generate waterfall data
-                        let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
-                        match decoder.generate_waterfall_data(&audio_f64) {
-                            Ok(wf) => {
-                                let range = wf.max_power - wf.min_power;
-                                log_waterfall_dimensions(
-                                    wf.power_matrix.len(),
-                                    wf.power_matrix.first().map(|r| r.len()).unwrap_or(0),
-                                    wf.min_power,
-                                    wf.max_power,
-                                );
-                                let rows: Vec<Vec<f32>> = if range > 0.0 {
-                                    wf.power_matrix
-                                        .iter()
-                                        .map(|row| {
-                                            row.iter()
-                                                .map(|&p| ((p - wf.min_power) / range) as f32)
-                                                .collect()
-                                        })
-                                        .collect()
-                                } else {
-                                    wf.power_matrix
-                                        .iter()
-                                        .map(|row| vec![0.0f32; row.len()])
-                                        .collect()
-                                };
-                                let _ = waterfall_tx.send(rows.clone());
-                                if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
-                                    let _ = auto_wf_tx.try_send(rows);
-                                }
-
-                                // Additive: also forward the RAW (pre-
-                                // normalization) rows to the read-only remote
-                                // gateway for the `spectrum` serverEvent
-                                // (dispensa Q-0024), gated exactly like the
-                                // DecodedMessage relay below — no clone/send
-                                // when off. The →Tui `waterfall_tx`/
-                                // `self_waterfall_to_auto_tx` sends above
-                                // (0-1 normalized) are untouched.
-                                if display_feed_enabled.load(Ordering::Relaxed) {
-                                    let bin_width_hz = if wf.frequency_bins.len() >= 2 {
-                                        wf.frequency_bins[1] - wf.frequency_bins[0]
-                                    } else {
-                                        0.0
-                                    };
-                                    let audio_bin_start_hz =
-                                        wf.frequency_bins.first().copied().unwrap_or(0.0);
-                                    for (row, &t_offset) in
-                                        wf.power_matrix.iter().zip(wf.time_bins.iter())
-                                    {
-                                        let mags_db: Vec<f32> =
-                                            row.iter().map(|&v| v as f32).collect();
-                                        let timestamp = window_received_utc
-                                            + chrono::Duration::milliseconds(
-                                                (t_offset * 1000.0) as i64,
-                                            );
-                                        let gw_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Decoder,
-                                            ComponentId::RemoteGateway,
-                                            MessageType::SpectrumRow {
-                                                audio_bin_start_hz,
-                                                bin_width_hz,
-                                                mags_db,
-                                                timestamp,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let bus_spectrum = message_bus.clone();
-                                        rt.spawn(async move {
-                                            if let Err(e) =
-                                                bus_spectrum.send_message(gw_msg).await
-                                            {
-                                                debug!(
-                                                    "Failed to forward spectrum row to RemoteGateway: {}",
-                                                    e
-                                                );
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Waterfall generation error: {}", e);
-                            }
-                        }
-                        let waterfall_ms = waterfall_start.elapsed().as_millis() as u64;
-=======
                         // PAN-318: the waterfall is no longer generated in
                         // the pre-native prefix. It ran first, so its FFT
                         // (~5-10 ms) plus the ft8_lib pass (~8-15 ms) were
@@ -1352,7 +1261,6 @@ impl super::ApplicationCoordinator {
                         // overlapped pair) off the native entry path, using
                         // the unchanged legacy generator so its rows stay
                         // byte-identical.
->>>>>>> 617480a6f0d48a39b27e2f0ef1670ba5bcd41faa
 
                         // hb-091 scoped fast-path: when activeQso is set
                         // and scoped_fast_path is enabled (hb-216 S2: set
@@ -1793,8 +1701,7 @@ impl super::ApplicationCoordinator {
                         match waterfall_result {
                             Ok(wf) => {
                                 let range = wf.max_power - wf.min_power;
-                                info!(
-                                    "Waterfall: {}x{} matrix, power range {:.1}..{:.1} dB",
+                                log_waterfall_dimensions(
                                     wf.power_matrix.len(),
                                     wf.power_matrix.first().map(|r| r.len()).unwrap_or(0),
                                     wf.min_power,
