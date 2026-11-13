@@ -63,6 +63,26 @@ in the Default column means no default, never `""`), and
 `docs/ARCHITECTURE.md` from `ls pancetta/src/coordinator`
 (`PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`).
 
+Malformed-config startup boundary (PAN-301): **a discovered `pancetta.toml`
+that exists but does not load — parse error or validation error — is fatal at
+every entry point; only a *missing* discovered file is a normal first run on
+defaults.** Plain `--headless` startup exits 1 naming the file and the TOML
+source line before the coordinator is built, and startup without
+`--headless` does the same whenever stdin is not a terminal. The de-brick
+offer (`Re-run first-time setup?`, default No) requires a terminal on stdin
+and is also off for `--wav`/`--replay`; declining exits 1 and leaves the file
+untouched, accepting enters the first-run wizard, which backs the file up on
+save. `config --validate` prints the parse error and exits 1 without ever
+prompting, terminal stdin included; an explicit `--config` file fails closed
+through a separate branch that does not offer the wizard. Proven by the
+process tests in `pancetta/tests/config_cli.rs`:
+`headless_startup_refuses_broken_config`,
+`nonterminal_syntax_error_never_offers_repair`,
+`interactive_broken_config_offers_repair_and_decline_preserves_file`,
+`interactive_syntax_error_accept_enters_setup`, and
+`terminal_validate_syntax_error_never_offers_repair`.
+
+
 Queue recovery gotcha (PAN-150): restoring a missing native queue rule does not
 schedule a retry. Rerun the failed handler after restoration. An interrupted
 bot-owned pause can repair its missing provenance marker on handoff rerun;

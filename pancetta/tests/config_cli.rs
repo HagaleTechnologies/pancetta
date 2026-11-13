@@ -5,6 +5,13 @@
 //! startup) with a non-zero exit naming the file -- never silently fall back
 //! to an all-defaults (N0CALL) config while printing PASS.
 //!
+//! PAN-301: that contract runs deeper than "exit non-zero". A malformed
+//! discovered file stops plain `--headless` startup before station
+//! initialization, naming the TOML source line; interactive startup offers
+//! the de-brick wizard (declining leaves the file untouched); unattended
+//! non-terminal startup never prompts; and `config --validate` never offers
+//! repair even with a terminal on stdin.
+//!
 //! Each test runs the binary with `$HOME`/XDG pinned to a scratch directory
 //! and an empty scratch cwd, so config discovery sees only what the test
 //! wrote (same env pinning as `replay_mode.rs`'s `ScratchStation`).
@@ -29,6 +36,14 @@ multicast_ttl = 3
 "#;
 
 const SYNTAX_ERROR: &str = "[station\n";
+
+/// Malformed on line 2 (comment first), so a diagnostic has to name the
+/// parser's real source line instead of a hardcoded `line 1`.
+const SYNTAX_ERROR_LINE_2: &str = "# PAN-301\n[station\n";
+
+/// Parses, then fails `Config::validate()`: the brick-by-values counterpart
+/// to a parse error (same fixture the show/doctor tests use).
+const VALIDATION_ERROR: &str = "[autonomous]\ncq_after_idle_cycles = 0\n";
 
 /// A scratch `$HOME` and an empty scratch working directory.
 struct Scratch {
@@ -76,9 +91,32 @@ impl Scratch {
             // `dirs::home_dir()` uses the profile directory on Windows.
             .env("USERPROFILE", self.home.path())
             .env_remove("PANCETTA_CALLSIGN")
+            // Startup-only children: no macOS responsibility relaunch
+            // (PAN-264), and a pinned filter so an inherited RUST_LOG cannot
+            // hide this crate's info-level startup boundary log.
+            .env("PANCETTA_MACOS_RELAUNCH", "0")
+            .env("RUST_LOG", "pancetta=info,warn")
             .current_dir(self.cwd.path())
             .timeout(Duration::from_secs(60))
             .arg("--headless");
+        cmd
+    }
+
+    /// The same isolated binary with no run-mode flag, as a plain std
+    /// command so a test can attach a pseudo-terminal or null stdin itself
+    /// (PAN-301 interactive and unattended startup). Keep the env list in
+    /// sync with [`Scratch::command`].
+    fn raw_command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_pancetta"));
+        cmd.env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
+            .env("USERPROFILE", self.home.path())
+            .env("PANCETTA_MACOS_RELAUNCH", "0")
+            .env("RUST_LOG", "pancetta=info,warn")
+            .env_remove("PANCETTA_CALLSIGN")
+            .current_dir(self.cwd.path());
         cmd
     }
 
@@ -100,23 +138,48 @@ fn stderr(o: &std::process::Output) -> String {
 }
 
 /// Gherkin scenario 3: a malformed config cannot pass validation silently.
+/// PAN-301: exit exactly 1, name the file and the parser's source line, and
+/// never offer repair or the wizard.
 #[test]
 fn validate_fails_on_auto_discovered_syntax_error() {
     let s = Scratch::new();
-    let path = s.write_default_config(SYNTAX_ERROR);
+    let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
     let out = s.validate(None);
-    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    let so = stdout(&out);
+    let se = stderr(&out);
+    let all = format!("{so}{se}");
+    assert_eq!(out.status.code(), Some(1), "stdout: {so}\nstderr: {se}");
     assert!(
-        stdout(&out).contains("Configuration validation: FAIL"),
-        "stdout: {}",
-        stdout(&out)
+        so.contains(&format!("Config file: {} — FAILED TO LOAD", path.display())),
+        "{all}"
     );
-    assert!(!stdout(&out).contains("PASS"), "stdout: {}", stdout(&out));
+    assert!(so.contains("Configuration validation: FAIL"), "{all}");
+    assert!(!so.contains("PASS"), "{all}");
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert!(!all.contains("First-Run Setup"), "{all}");
+}
+
+/// PAN-301: the explicit `--config` counterpart reports the same parse
+/// diagnostic and exits exactly 1.
+#[test]
+fn validate_fails_on_explicit_syntax_error() {
+    let s = Scratch::new();
+    let path = s.write_file("broken-explicit.toml", SYNTAX_ERROR_LINE_2);
+    let out = s.validate(Some(&path));
+    let so = stdout(&out);
+    let se = stderr(&out);
+    let all = format!("{so}{se}");
+    assert_eq!(out.status.code(), Some(1), "stdout: {so}\nstderr: {se}");
     assert!(
-        stderr(&out).contains(&path.display().to_string()),
-        "stderr: {}",
-        stderr(&out)
+        so.contains(&format!("Config file: {} — FAILED TO LOAD", path.display())),
+        "{all}"
     );
+    assert!(so.contains("Configuration validation: FAIL"), "{all}");
+    assert!(!so.contains("PASS"), "{all}");
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert!(!all.contains("First-Run Setup"), "{all}");
 }
 
 #[test]
@@ -251,16 +314,78 @@ fn validate_reports_unknown_key_warning_for_config_flag() {
     assert!(all.contains("Unknown config key `enable`"), "{all}");
 }
 
+/// PAN-301 scenario 1: plain `--headless` startup (no WAV fixture) stops on
+/// a malformed discovered file before station initialization — nonzero exit
+/// naming the file and the parser's source line, no success log (info
+/// logging is on), no repair offer, file untouched. Both discovery
+/// locations, the home file and the cwd file, are covered separately.
 #[test]
 fn headless_startup_refuses_broken_config() {
+    // Discovered ~/.pancetta/pancetta.toml.
     let s = Scratch::new();
-    let path = s.write_default_config(SYNTAX_ERROR);
-    let missing_wav = s.home.path().join("missing.wav");
-    let out = s.command().arg("--wav").arg(&missing_wav).output().unwrap();
-    assert!(!out.status.success());
-    let err = stderr(&out);
-    assert!(err.contains(&path.display().to_string()), "stderr: {err}");
-    assert!(err.contains("failed to load"), "stderr: {err}");
+    let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
+    let before = std::fs::read(&path).unwrap();
+    let out = s.command().output().unwrap();
+    let all = format!("{}{}", stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(
+        stderr(&out).contains(&path.display().to_string()),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(all.contains("failed to load"), "{all}");
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Configuration loaded successfully"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file changed");
+
+    // Discovered pancetta.toml in the working directory. The binary sees
+    // its cwd with symlinks resolved, so compare against that form.
+    let s = Scratch::new();
+    let path = s.cwd.path().join("pancetta.toml");
+    std::fs::write(&path, SYNTAX_ERROR_LINE_2).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let out = s.command().output().unwrap();
+    let all = format!("{}{}", stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    let cwd_file = std::fs::canonicalize(s.cwd.path())
+        .unwrap()
+        .join("pancetta.toml");
+    assert!(
+        stderr(&out).contains(&cwd_file.display().to_string()),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Configuration loaded successfully"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file changed");
+}
+
+/// PAN-301: unattended startup WITHOUT `--headless` and without a terminal
+/// on stdin fails on the malformed discovered file instead of prompting —
+/// `is_terminal()` is false, so the repair offer must stay off.
+#[test]
+fn nonterminal_syntax_error_never_offers_repair() {
+    let s = Scratch::new();
+    let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
+    let before = std::fs::read(&path).unwrap();
+    let out = s
+        .raw_command()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let all = format!("{}{}", stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{all}");
+    assert!(
+        all.contains(&path.display().to_string()) && all.contains("failed to load"),
+        "{all}"
+    );
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert!(!all.contains("First-Run Setup"), "{all}");
+    assert!(!all.contains("Edit the file by hand"), "{all}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file changed");
 }
 
 /// `config --generate` writes the same header-annotated, drift-tested text
@@ -480,4 +605,273 @@ fn pair_override_rejects_plaintext_before_identity() {
         "identity directory was created before validation"
     );
     assert!(!scratch.home.path().join(".pancetta/agent").exists());
+}
+
+/// PAN-301: a station child with its stdin on a pseudo-terminal slave, so
+/// `is_terminal()` is true and prompts render, while stdout and stderr stay
+/// piped and are drained concurrently into separate transcripts.
+#[cfg(unix)]
+mod terminal {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// How long a child may take to show expected output, or to exit.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    pub(super) struct TerminalChild {
+        child: Child,
+        master: File,
+        stdout: Arc<Mutex<String>>,
+        stderr: Arc<Mutex<String>>,
+        readers: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    /// Read `pipe` to EOF into a shared transcript on its own thread, so a
+    /// chatty child can never fill the pipe and block.
+    fn drain(mut pipe: Box<dyn Read + Send>) -> (Arc<Mutex<String>>, std::thread::JoinHandle<()>) {
+        let text = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&text);
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        (text, handle)
+    }
+
+    impl TerminalChild {
+        pub(super) fn spawn(mut cmd: Command) -> Self {
+            // SAFETY: openpty receives two writable fd slots and a valid
+            // winsize; the null name/termios pointers request defaults. The
+            // return value is checked before any fd is used, and each fd is
+            // moved into exactly one owned File — the slave is consumed by
+            // the child's stdin config, so the parent's copy closes at spawn
+            // and the master stays open for input.
+            let (master, slave) = unsafe {
+                let (mut master, mut slave) = (0, 0);
+                let size = libc::winsize {
+                    ws_row: 40,
+                    ws_col: 120,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                assert_eq!(
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &size
+                    ),
+                    0
+                );
+                (File::from_raw_fd(master), File::from_raw_fd(slave))
+            };
+            cmd.env("TERM", "xterm-256color")
+                .stdin(slave)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().expect("failed to spawn pancetta");
+            let (stdout, out_reader) = drain(Box::new(child.stdout.take().expect("stdout piped")));
+            let (stderr, err_reader) = drain(Box::new(child.stderr.take().expect("stderr piped")));
+            Self {
+                child,
+                master,
+                stdout,
+                stderr,
+                readers: vec![out_reader, err_reader],
+            }
+        }
+
+        /// Everything the child has printed so far, both streams.
+        pub(super) fn combined(&self) -> String {
+            format!(
+                "{}{}",
+                self.stdout.lock().unwrap(),
+                self.stderr.lock().unwrap()
+            )
+        }
+
+        pub(super) fn stdout_text(&self) -> String {
+            self.stdout.lock().unwrap().clone()
+        }
+
+        /// Block until `needle` appears in the combined transcript; a child
+        /// that never prints it fails the test at the deadline with the
+        /// transcript instead of hanging.
+        pub(super) fn wait_for(&self, needle: &str) {
+            let deadline = Instant::now() + DEADLINE;
+            while !self.combined().contains(needle) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {needle:?}; transcript:\n{}",
+                    self.combined()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Send one line of terminal input through the pty master.
+        pub(super) fn reply(&mut self, line: &[u8]) {
+            self.master.write_all(line).expect("write to pty master");
+        }
+
+        /// Wait for the child to exit on its own within the deadline, then
+        /// join the readers so both transcripts are complete.
+        pub(super) fn wait_exit(&mut self) -> std::process::ExitStatus {
+            let deadline = Instant::now() + DEADLINE;
+            loop {
+                if let Some(status) = self.child.try_wait().expect("try_wait child") {
+                    self.join_readers();
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "child did not exit; transcript:\n{}",
+                    self.combined()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn join_readers(&mut self) {
+            for reader in self.readers.drain(..) {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    impl Drop for TerminalChild {
+        /// Cleanup guard: a live child (a failed assertion, or a test that
+        /// stops at a prompt by design) is killed and reaped so nothing
+        /// leaks past the test.
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.join_readers();
+        }
+    }
+}
+
+/// PAN-301 scenario 2: interactive startup on a broken discovered file
+/// offers the de-brick wizard for a syntax error AND a validation error.
+/// Declining — explicit `n`, or Enter taking the default No — exits nonzero,
+/// leaves the file byte-identical, and creates no backup.
+#[cfg(unix)]
+#[test]
+fn interactive_broken_config_offers_repair_and_decline_preserves_file() {
+    for (label, broken, diagnostic) in [
+        ("syntax", SYNTAX_ERROR_LINE_2, "TOML parse error at line 2"),
+        ("validation", VALIDATION_ERROR, "cq_after_idle_cycles"),
+    ] {
+        for reply in ["n\n", "\n"] {
+            let s = Scratch::new();
+            let path = s.write_default_config(broken);
+            let before = std::fs::read(&path).unwrap();
+            let mut child = terminal::TerminalChild::spawn(s.raw_command());
+            child.wait_for(
+                "Re-run first-time setup? (overwrites the broken config on save) [y/N]: ",
+            );
+            let offered = child.combined();
+            assert!(
+                offered.contains("ERROR: your saved configuration failed to load:"),
+                "{label} {reply:?}: {offered}"
+            );
+            assert!(
+                offered.contains(&path.display().to_string()),
+                "{label} {reply:?}: {offered}"
+            );
+            assert!(offered.contains(diagnostic), "{label} {reply:?}: {offered}");
+            child.reply(reply.as_bytes());
+            let status = child.wait_exit();
+            let after = child.combined();
+            assert_eq!(status.code(), Some(1), "{label} {reply:?}: {after}");
+            assert!(
+                after.contains("Edit the file by hand, or delete it to start fresh."),
+                "{label} {reply:?}: {after}"
+            );
+            assert!(
+                !after.contains("=== Pancetta First-Run Setup ==="),
+                "{label} {reply:?}: {after}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{label} {reply:?}: file changed"
+            );
+            let bak = path.with_file_name(format!(
+                "{}.bak",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                !bak.exists(),
+                "{label} {reply:?}: backup {} was created",
+                bak.display()
+            );
+        }
+    }
+}
+
+/// PAN-301 scenario 2 (accept): Yes enters the existing first-run setup
+/// wizard before any station initialization. The test stops at the callsign
+/// prompt — the N0CALL shown there is the wizard's own default, not a
+/// station run — killing and reaping the child at that point, with the
+/// broken file still unchanged.
+#[cfg(unix)]
+#[test]
+fn interactive_syntax_error_accept_enters_setup() {
+    let s = Scratch::new();
+    let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
+    let before = std::fs::read(&path).unwrap();
+    let mut child = terminal::TerminalChild::spawn(s.raw_command());
+    child.wait_for("Re-run first-time setup? (overwrites the broken config on save) [y/N]: ");
+    child.reply(b"y\n");
+    child.wait_for("=== Pancetta First-Run Setup ===");
+    child.wait_for("Callsign [N0CALL]:");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file changed before any wizard save"
+    );
+    // Wizard entry is the claim; nothing further is answered. Drop kills
+    // and reaps the child.
+}
+
+/// PAN-301: `config --validate` never offers repair even with a real
+/// terminal on stdin and no `--headless` — it reports and exits 1 without
+/// reading any input.
+#[cfg(unix)]
+#[test]
+fn terminal_validate_syntax_error_never_offers_repair() {
+    let s = Scratch::new();
+    let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
+    let mut cmd = s.raw_command();
+    cmd.args(["config", "--validate"]);
+    let mut child = terminal::TerminalChild::spawn(cmd);
+    // No input is sent: a prompt here would block until the deadline and
+    // fail the wait below with the transcript.
+    let status = child.wait_exit();
+    let so = child.stdout_text();
+    let all = child.combined();
+    assert_eq!(status.code(), Some(1), "{all}");
+    assert!(
+        so.contains(&format!("Config file: {} — FAILED TO LOAD", path.display())),
+        "{all}"
+    );
+    assert!(so.contains("Configuration validation: FAIL"), "{all}");
+    assert!(!so.contains("PASS"), "{all}");
+    assert!(all.contains("TOML parse error at line 2"), "{all}");
+    assert!(!all.contains("Re-run first-time setup"), "{all}");
+    assert!(!all.contains("First-Run Setup"), "{all}");
 }
