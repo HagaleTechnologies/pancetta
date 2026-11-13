@@ -24,15 +24,17 @@ name: Supply Chain
 #   * install-policy -- every Cargo.toml covered by its workspace's Cargo.lock; crate sources
 #                       registry-only (cargo metadata --locked); .cargo/config may not
 #                       override sources/registries/transport; cargo fetch --locked.
-#   * actions-pins   -- on EVERY PR: every NEWLY
-#                       ADDED executable reference (parsed from the YAML at the
-#                       merge-base and head, per file and per occurrence: step
-#                       and reusable-workflow `uses:`, job container / service
-#                       images, local ./actions expanded, docker-action images)
-#                       must be pinned: a floating branch ref, no version, or an
-#                       image without an @sha256 digest fails; a tag pin warns --
-#                       SHA pinning of the whole fleet's workflows is a separate
-#                       decision, ADR-0014 open questions.
+#   * actions-pins   -- on EVERY PR and merge-group run: EVERY executable
+#                       reference in EVERY workflow and action manifest at HEAD
+#                       (step and reusable-workflow `uses:`, job container /
+#                       service images, local ./actions expanded, docker-action
+#                       images) must be pinned by a full commit SHA carrying a
+#                       `#` version comment: a floating branch ref, no version,
+#                       a mutable tag, or an image without an @sha256 digest
+#                       fails, naming file:line. No grandfathering: refs that
+#                       predate the gate are judged exactly like new ones
+#                       (PAN-311 closed ADR-0014's open tag-pins question for
+#                       pancetta by pinning the whole fleet).
 #
 # THREAT MODEL / KNOWN LIMIT: this gate defends against malicious DEPENDENCY
 # CONTENT. It does not defend against a PR author who rewrites this file --
@@ -52,6 +54,17 @@ on:
   # merge-group SHA; the scans then run against merge_group.base_sha/head_sha.
   merge_group:
     types: [checks_requested]
+  # PAN-311: weekly full OSV scan of main between PRs, so a newly published
+  # advisory on an already-merged dependency surfaces within days instead of
+  # waiting for the next dependency-changing PR. The PR/merge_group-gated jobs
+  # below (changes, actions-pins, install-policy, the osv diff scans and the
+  # fan-in) skip schedule/dispatch runs; osv-scheduled is the only job that
+  # runs on them. A scheduled red on a pre-existing advisory is the intent --
+  # findings visible between PRs -- and blocks nothing: the ruleset requires
+  # only CI, Supply Chain and Codex review clean.
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -59,6 +72,9 @@ permissions:
 jobs:
   changes:
     name: Detect dependency changes
+    # paths-filter talks to the PR API; on schedule/dispatch runs there is no
+    # PR to diff and osv-scheduled needs nothing from this job (PAN-311).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     # paths-filter lists the PR's files through the API on pull_request events;
     # without pull-requests:read it fails "Resource not accessible by
@@ -198,6 +214,58 @@ jobs:
             --gh-annotations=true
             --fail-on-vuln=true
 
+  # PAN-311: full (non-differential) OSV scan of main's HEAD on the weekly
+  # schedule and on manual dispatch, so advisories published between PRs are
+  # found without waiting for the next dependency change. Mirrors
+  # google/osv-scanner-action's own single-scan reusable job shape (scanner
+  # with continue-on-error writing JSON results, a completion guard that
+  # fails when the scan errored without writing results, then the reporter
+  # with --new only and --fail-on-vuln=true) and reuses the same pinned
+  # scanner trio generation osv-merge-group already runs. A red here is a
+  # visible signal, not a merge blocker: no ruleset requires this check.
+  osv-scheduled:
+    name: OSV advisories (incl. malicious-package MAL-*) -- scheduled
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: "Prepare an unpredictable scan-output directory"
+        run: |
+          dir=".osv-scan-${GITHUB_RUN_ID}-${RANDOM}${RANDOM}"
+          mkdir -p "$dir"
+          echo "OSV_SCAN_DIR=$dir" >> "$GITHUB_ENV"
+      - name: "Run scanner on HEAD"
+        id: scan
+        uses: google/osv-scanner-action/osv-scanner-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        env:
+          GOTOOLCHAIN: auto
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=${{ env.OSV_SCAN_DIR }}/results.json
+            -r
+            ./
+      - name: "Fail when the scanner errored without results"
+        if: always() && steps.scan.outcome == 'failure'
+        run: |
+          if [ ! -s "${{ env.OSV_SCAN_DIR }}/results.json" ]; then
+            echo "::error::osv-scanner errored and wrote no results file -- refusing to report success for a scan that did not run"
+            exit 1
+          fi
+      - name: "Run osv-scanner-reporter"
+        uses: google/osv-scanner-action/osv-reporter-action@9a96bc4d2b09685b6142bcfe25a3dc17cb2d7347 # v2.5.1
+        with:
+          scan-args: |-
+            --output=${{ env.OSV_SCAN_DIR }}/results.sarif
+            --new=${{ env.OSV_SCAN_DIR }}/results.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+
   install-policy:
     name: Lockfile integrity (cargo fetch --locked) + source policy
     # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
@@ -234,7 +302,7 @@ jobs:
       WORKSPACE_ACCEPT: cargo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       # The npm/pnpm workspace-glob matchers below are themselves a dependency
       # of this gate's own trust chain, same reasoning as the pnpm bootstrap
       # above: each installed from a pinned version + byte-verified tarball
@@ -568,17 +636,21 @@ jobs:
             n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
           done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
           echo "checked $n Cargo lockfile(s)"
-  # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
-  # Docker action's runs.image may point at, so the script classifies every
-  # changed file itself (local review gate, round 3).
+  # Runs on every PR and merge-group run (~10s): no path filter can know the
+  # custom filenames a Docker action's runs.image may point at, and judging the
+  # whole tree at HEAD (PAN-311) makes any path filter unsound anyway. Skipped
+  # on schedule/workflow_dispatch runs, where osv-scheduled takes over.
   actions-pins:
-    name: Newly added actions are pinned
+    name: Actions are pinned
+    # The pin gate judges a PR's/merge group's tree; a schedule/dispatch run
+    # has no new tree to gate (PAN-311).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - name: Newly added actions must be pinned (structural YAML check)
+      - name: Actions must be pinned (every executable ref at HEAD)
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
@@ -596,26 +668,30 @@ jobs:
           # failed with zero jobs, "workflow file issue") because GitHub tried to
           # evaluate it as a real expression (Codex round, cqdx #349).
           EXPR_MARK = "$" + "{{"
-          # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
-          # every workflow (.github/workflows/*.yml) and every action manifest
-          # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
-          # HEAD; the executable references of each file -- step `uses`, job-level
-          # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
-          # action `runs.image` (a Dockerfile-backed action's FROM images; any changed
-          # Dockerfile, or any file an action manifest names as its runs.image, whatever its
-          # filename; COPY/ADD/RUN --from images too), with local `./path` actions expanded
-          # recursively -- are
-          # counted PER FILE, and only occurrences new in that file are judged: floating
-          # branch ref or no version -> fail; docker:// or container image without an
-          # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
-          # references are expanded per invocation (cycle-safe, fail-closed on depth) and
-          # a file renamed INTO an executable location is judged as new.
+          # Action pin policy (CAT-299 / ADR-0014; PAN-311 made it whole-fleet and
+          # strict). Structural, not textual: every executable file at HEAD -- every
+          # workflow (.github/workflows/*.yml), every action manifest
+          # (**/action.yml|yaml), every Dockerfile (by name, or because an action
+          # manifest names it as its runs.image, whatever its filename) -- is parsed
+          # at HEAD; its executable references -- step `uses`, job-level
+          # reusable-workflow `uses`, job `container`/`services.*.image`,
+          # composite/docker action `runs.image` (a Dockerfile-backed action's FROM
+          # images; COPY/ADD/RUN --from images too), with local `./path` actions
+          # expanded recursively (cycle-safe, fail-closed on depth) -- are judged
+          # with NO diff against the base: a grandfathered mutable tag is exactly
+          # as visible as a newly added one. Floating branch ref or no version ->
+          # fail; docker:// or container image without an immutable @sha256 digest
+          # -> fail; mutable tag -> fail; SHA -> ok. Failing verdicts name
+          # file:line (git grep over the target set at HEAD), and a raw-text pass
+          # after the structural one requires a `#` version comment on every
+          # SHA-pinned `uses:` line (yaml.safe_load discards comments).
           # HagaleTechnologies/ refs are the fleet's own code.
           base_arg, head = sys.argv[1], sys.argv[2]
+          # base_arg is accepted (the runner passes BASE HEAD) but no longer used:
+          # the whole-tree policy judges HEAD as it is, additions and grandfathered
+          # refs alike.
           def sh(*a):
               r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
-          rc, mb = sh("git", "merge-base", base_arg, head)
-          base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
           def dockerfile_images(text, hard_fail=None, label="Dockerfile"):
               """container:<image> for every FROM that is not `scratch`, an earlier build
               stage (alias OR numeric index), honouring a leading `# escape=` directive for
@@ -780,31 +856,16 @@ jobs:
           REFERENCED = None
           def is_target(p):
               global REFERENCED
-              if REFERENCED is None: REFERENCED = referenced_at(head) | referenced_at(base)   # union: classify the CHANGE
+              if REFERENCED is None: REFERENCED = referenced_at(head)   # what EXECUTES at HEAD
               b = os.path.basename(p); bl = b.lower()
               return ((p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or b in ("action.yml", "action.yaml")
                       or bl.startswith("dockerfile") or bl.endswith(".dockerfile") or p in REFERENCED)
-          def changed_pairs():
-              """[(base_path|None, head_path|None)] rename-aware, NUL-safe."""
-              _, raw = sh("git", "diff", "-z", "--name-status", "-M", base, head, "--", ".")
-              raw = raw.split("\0"); pairs, i = [], 0
-              while i < len(raw) and raw[i]:
-                  st = raw[i]; i += 1
-                  if st[0] in "RC":
-                      old, new = raw[i], raw[i + 1]; i += 2
-                      pairs.append((old if st[0] == "R" else None, new))
-                  else:
-                      p = raw[i]; i += 1
-                      pairs.append((None if st[0] == "A" else p, None if st[0] == "D" else p))
-              out = []
-              for b, h in pairs:
-                  if h is not None and not is_target(h): continue
-                  if h is None and not is_target(b): continue
-                  # a file renamed INTO an executable location was not executable before:
-                  # judge it as new rather than subtracting its old, inert contents
-                  if b is not None and not is_target(b): b = None
-                  out.append((b, h))
-              return out
+          def targets_at(rev):
+              """Every executable-path file at `rev`, the universe the strict gate
+              judges -- independent of any diff, so a grandfathered ref is as
+              visible as a newly added one (PAN-311)."""
+              _, out = sh("git", "ls-tree", "-r", "--name-only", "-z", rev)
+              return [p for p in out.split("\0") if p and is_target(p)]
           def is_symlink(rev, path):
               _, out = sh("git", "ls-tree", rev, "--", path)
               return out.startswith("120000 ")
@@ -922,39 +983,78 @@ jobs:
               doc = load(rev, path)
               if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
               return acc
-          fail = 0; new = Counter()
-          for mpath in sorted(set(manifests_at(head)) | referenced_at(head)):
-              if is_symlink(head, mpath) and mpath not in SYMLINKED:
-                  print(f"::error::{mpath} is a symlink -- executable manifests and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(mpath)
-          for b, h in changed_pairs():
-              if h is None: continue                               # deleted file: nothing new runs
-              new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
+          fail = 0; refs = Counter()
+          target_files = targets_at(head)
+          target_set = set(target_files)
+          for path in target_files:                # judge EVERY executable file at HEAD -- no grandfathering (PAN-311)
+              if is_symlink(head, path) and path not in SYMLINKED:
+                  print(f"::error::{path} is a symlink -- executable manifests, workflows and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(path)
+              refs += refs_at(head, path)
           if SYMLINKED: fail = 1
           check_dependency_symlinks(head)
           for msg in sorted(HARD_FAIL): print(f"::error::{msg}"); fail = 1
-          for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
+          def locate(ref):
+              """file:line of every occurrence of a failing ref at HEAD: git grep -F
+              restricted to the target set (container-image refs are located by their
+              inner image string). Synthesized/MISSING refs have no source line to
+              name and return [] rather than a guess."""
+              needle = ref
+              for pre in ("container:", "docker://"):
+                  if ref.startswith(pre): needle = ref[len(pre):]
+              rc, out = sh("git", "grep", "-n", "-F", "-e", needle, head)
+              hits = []
+              for line in out.splitlines():
+                  rest = line.partition(":")[2]                    # drop the "<rev>:" prefix git grep adds
+                  path, _, found = rest.partition(":")
+                  if path in target_set and found.partition(":")[0].isdigit():
+                      hits.append(f"{path}:{found.partition(':')[0]}")
+              return sorted(set(hits))
+          def where(ref):
+              hits = locate(ref)
+              return " (" + ", ".join(hits) + ")" if hits else ""
+          for ref in sorted(refs):            # one verdict per distinct ref (a ref reached via a local action AND its own manifest is reported once)
               if ref.startswith("MISSING:"): fail = 1; continue
               if ref.startswith("HagaleTechnologies/"): continue
               if ref.startswith(("docker://", "container:")):
                   if re.search(r"@sha256:[0-9a-f]{64}$", ref): print(f"pinned by digest: {ref}")
-                  else: print(f"::error::image without an immutable @sha256 digest: {ref}"); fail = 1
+                  else: print(f"::error::image without an immutable @sha256 digest: {ref}{where(ref)}"); fail = 1
                   continue
-              if "@" not in ref: print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
+              if "@" not in ref: print(f"::error::unpinned action (no @version): {ref}{where(ref)}"); fail = 1; continue
               ver = ref.rsplit("@", 1)[1]
               if re.fullmatch(r"[0-9a-f]{40}", ver): print(f"pinned by SHA: {ref}")
-              elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::warning::tag-pinned (mutable) action added: {ref} -- prefer a full commit SHA")
-              else: print(f"::error::floating ref (branch) action added: {ref}"); fail = 1
-          print("added-action pin check " + ("FAILED" if fail else "passed")); sys.exit(fail)
+              elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::error::tag-pinned (mutable) action: {ref} -- pin it to a full commit SHA{where(ref)}"); fail = 1
+              else: print(f"::error::floating ref (branch) action: {ref}{where(ref)}"); fail = 1
+          # Raw-text pass (PAN-311): yaml.safe_load discards comments, so the
+          # version-comment policy is enforced on raw lines -- every SHA-pinned
+          # `uses:` value must carry a `#` comment on the same line naming what
+          # is pinned, so a pin is reviewable at a glance and Dependabot's
+          # grouped updates have a version to diff against. Single-line scalars
+          # only: every `uses:` in this repository is single-line (verified when
+          # this pass was added).
+          for path in target_files:
+              txt = show(head, path)
+              if txt is None: continue
+              for i, line in enumerate(txt.splitlines(), 1):
+                  m = re.match(r"\s*(?:-\s+)?uses:\s*(\S+)(.*)$", line)
+                  if not m: continue
+                  val, rest = m.group(1).strip("\"'"), m.group(2)
+                  at = val.rsplit("@", 1)
+                  if len(at) == 2 and re.fullmatch(r"[0-9a-f]{40}", at[1]) and "#" not in rest:
+                      print(f"::error::{path}:{i}: SHA-pinned `{val}` carries no version comment -- add ` # <version>` so the pin is reviewable"); fail = 1
+          print("action pin check " + ("FAILED" if fail else "passed")); sys.exit(fail)
           PY
           python3 /tmp/action-pins.py "$BASE" "$HEAD"
 
   # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
   # required status check. NEVER rename this job. Runs with if: always() so a
   # failed/cancelled upstream job FAILS this check instead of skipping it (a
-  # skipped required check does NOT block merge).
+  # skipped required check does NOT block merge). The event guard keeps
+  # schedule/dispatch runs from producing a red "Supply Chain" check run: the
+  # fan-in has nothing to aggregate there, so it reports a native `skipped`
+  # conclusion (PAN-107 doctrine), and osv-scheduled carries the verdict.
   supply-chain:
     name: Supply Chain
-    if: always()
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins]
     runs-on: ubuntu-latest
     steps:
@@ -975,7 +1075,7 @@ jobs:
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
           if [ "$PINS" != success ]; then
-            echo "::error::newly added actions/images are not acceptably pinned ($PINS)"; exit 1
+            echo "::error::actions/images are not acceptably pinned ($PINS)"; exit 1
           fi
           if [ "$DEPS" != true ]; then
             echo "No dependency manifest, lockfile, or workflow changed -- nothing more to scan."; exit 0

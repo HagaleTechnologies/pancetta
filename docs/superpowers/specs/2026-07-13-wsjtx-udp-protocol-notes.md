@@ -34,6 +34,45 @@ from each received packet and sends Reply/HaltTx/Configure to exactly that addr:
 k0swe/wsjtx-go (Apache-2.0) does the same. So pancetta must keep its sending socket
 open and poll it for requests — there is no separate listening port on the WSJT-X side.
 
+### Pancetta admission policy (PAN-312, not an upstream protocol requirement)
+
+Unicast uses the route-selected local IPv4 address and an ephemeral port on one
+unconnected socket, including outbound-only configurations. A separate UDP route
+probe sends no application datagram. Route discovery or bind failure disables the
+companion component for this run and drains its bus channel; the station continues.
+There is no wildcard fallback. IPv6 destinations are unsupported. Multicast keeps
+its wildcard bind and configured TTL/interface options.
+
+After decoding and matching the instance Id, inbound admission requires
+`accept_udp_requests = true` and the destination host (unicast) or an explicitly
+listed `allowed_request_hosts` IP (multicast; an empty list refuses all).
+The first valid, correctly targeted datagram from an allowed host pins its source
+address and port and may act immediately, supporting companions without Heartbeats.
+A correctly targeted Heartbeat from that host refreshes its port. Other datagrams
+must match the pin exactly and cannot change it. Wrong Ids and refused hosts never
+learn pins. Pins last until component restart, including across Close and Clear.
+A port change without Heartbeats requires a restart.
+
+HaltTx requires all those admission checks but does not require initiation consent.
+For example, after Heartbeat from `192.168.1.20:2237`, HaltTx from
+`192.168.1.20:40000` is ignored with a Warn diagnostic on `remote.wsjtx`:
+`refused request from 192.168.1.20:40000: HaltTx`.
+The pinned port's HaltTx retains the existing stop behavior.
+
+Replay has one global one-second minimum interval across all peers. An accepted
+burst sends the retained ring in order as `New=false`, then Status. Empty rings and
+failed sends consume the interval too. Requests inside the interval are skipped,
+without replay decodes, post-Replay Status or deferred work; refusals do not extend
+the interval. Equality at one second permits another burst. Pins, Heartbeats and
+band changes do not reset it. A skipped request emits an Info diagnostic:
+`Replay from 192.168.1.20:2237 ignored (rate-limited; minimum interval 1s)`.
+Ordinary timer Status and Heartbeat traffic continues independently. Wrong-source
+or wrong-Id requests do not consume the budget.
+
+These checks reduce exposure; UDP source pinning does not authenticate a sender.
+Forged pinned tuples or allowed Heartbeats remain possible. Disabled defaults,
+wire encodings and downstream Reply consent, policy and arm checks are unchanged.
+
 **Unicast vs multicast.** With unicast, only one app can own `0.0.0.0:2237` (JTAlert
 historically monopolized it and offered a "rebroadcast on another port" workaround).
 The modern convention is **multicast**: send to an administratively-scoped group
