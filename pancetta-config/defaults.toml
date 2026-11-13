@@ -252,6 +252,7 @@ username = ""
 
 [network.lotw]
 enabled = false
+password = ""
 station_location = ""
 tqsl_path = ""
 

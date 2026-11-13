@@ -685,6 +685,7 @@ password = ""        # plaintext on disk
 enabled          = false
 tqsl_path        = ""   # path to your installed tqsl binary
 station_location = ""   # must match a "Station Location" name in TQSL
+password         = ""   # optional Callsign Certificate password, plaintext on disk
 
 [network.eqsl]
 enabled      = false
@@ -707,17 +708,28 @@ enabled = true
 See "Customizing PSKReporter" below if you want to see or change the
 other defaults.
 
-LoTW has no username/password/`base_url` fields — unlike the other
+LoTW has no username or `base_url` fields — unlike the other
 integrations, pancetta never talks to LoTW's servers directly. It shells
 out to your locally-installed `tqsl` binary, which signs the QSO record
 with your TQSL certificate and handles the actual upload itself.
+
+The optional password unlocks your TQSL Callsign Certificate. It is stored in
+plaintext in your local config and passed to tqsl with `-p`. Keep the config
+readable only by you. Omit it or leave it empty for a certificate without a
+password. Local users who can inspect process arguments may see it.
+
+LoTW signing uses `-a compliant -d -x -u -l <station_location>`, with the
+optional password and ADIF path passed as separate arguments. Exit codes 8
+and 9 are accepted duplicate outcomes, including records outside the date
+range. Acceptance is a delivery result, not QSL confirmation. Fake-tqsl
+integration tests cover this path; live-account qualification is pending.
 
 ### Per-QSO log upload — ClubLog, QRZ Logbook, LoTW, and eQSL
 
 When a QSO completes, pancetta can upload that single QSO (as one ADIF
 record) straight to your online logbooks. All four integrations are
 **opt-in and default `enabled = false`**. They never block or fail the
-QSO pipeline. ClubLog, QRZ Logbook, eQSL and cqdx.io uploads go through a
+QSO pipeline. ClubLog, QRZ Logbook, LoTW, eQSL and cqdx.io uploads go through a
 durable pending-upload queue (`~/.pancetta/upload_outbox.json`) with
 retries and readiness-strip warnings — see
 [Upload retries and the pending-upload queue](#upload-retries-and-the-pending-upload-queue)
@@ -729,9 +741,8 @@ this file and never logged. Keep the file readable only by you:
 > must be digitally signed with your TQSL certificate, not a raw ADIF
 > POST — so instead of an HTTP client, pancetta shells out to your
 > locally-installed `tqsl` binary per completed QSO (`[network.lotw]`
-> above). If `tqsl` is missing or fails, the upload is skipped after
-> that single attempt: LoTW does not use the retry queue the HTTP
-> services use. `~/.pancetta/qsos.adi` remains
+> above). If `tqsl` is missing or fails, the outbox retains the record
+> and retries with the same backoff as the HTTP services. `~/.pancetta/qsos.adi` remains
 > available if you'd rather point WSJT-X / TQSL at it manually.
 
 ```toml
@@ -821,8 +832,7 @@ Every ClubLog, QRZ Logbook, eQSL and cqdx.io upload for a completed QSO
 is written to `~/.pancetta/upload_outbox.json` **before** its first
 attempt, and leaves it only when the service accepts it (or reports it as
 a duplicate). The queue is sent again at every start, so a service
-outage or a restart no longer loses an upload. LoTW (tqsl) keeps its
-single attempt.
+outage or a restart no longer loses an upload. LoTW (tqsl) uses this same queue.
 
 `[network.reliability.retry]` sets the quick retries:
 

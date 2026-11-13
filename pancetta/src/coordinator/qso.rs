@@ -3724,6 +3724,7 @@ impl super::ApplicationCoordinator {
             eqsl_cfg.enabled,
             cqdx_upload_enabled,
             replay_mode,
+            lotw_cfg.enabled,
         );
         if upload_enabled && !outbox_dests.is_empty() && self.upload_outbox.is_none() {
             let clients = super::upload_outbox::build_logbook_clients(
@@ -3732,6 +3733,7 @@ impl super::ApplicationCoordinator {
                 &eqsl_cfg,
                 &cqdx_cfg,
                 &upload_our_callsign,
+                &lotw_cfg,
             );
             let path = pancetta_home(&pancetta_home_override)
                 .join(".pancetta")
@@ -4102,14 +4104,13 @@ impl super::ApplicationCoordinator {
                 // (see `upload_enabled`). Fully decoupled from the QSO
                 // pipeline: ClubLog/QRZ/eQSL/cqdx.io uploads are handed to the
                 // durable pending-upload queue (PAN-57), which retries them
-                // and survives restarts; LoTW keeps its single tqsl attempt in
-                // its own task. At shutdown it cancels a QRZ lookup in flight
+                // and survives restarts, including LoTW. At shutdown it cancels
+                // a QRZ lookup in flight
                 // and keeps queuing completions until `stop_upload_outbox`
                 // asks it to finish (PAN-232).
                 if upload_enabled {
                     start_qso_upload_subscriber(
                         upload_outbox.clone(),
-                        lotw_cfg.clone(),
                         qrz_xml_cfg.clone(),
                         station_power_watts,
                         qso_manager.subscribe(),
@@ -10914,7 +10915,7 @@ mod completed_tx_grace_tests {
 /// Decoupled from the QSO pipeline and never blocks it. ClubLog, QRZ
 /// Logbook, eQSL and cqdx.io uploads are handed to the durable pending-upload
 /// queue (`upload_outbox`, PAN-57), which retries them and survives restarts;
-/// LoTW keeps a single tqsl attempt in its own task. Successes log at
+/// LoTW uses this same queue. Successes log at
 /// `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
 /// `"qso.upload"`). Credentials / tokens are never logged.
 /// Whether the opt-in cqdx.io per-QSO logbook upload should run: the
@@ -11230,23 +11231,22 @@ async fn upload_subscriber_finish(outbox: Option<&super::upload_outbox::UploadOu
 }
 
 // rationale: the queue handle, one explicit config arg per remaining direct
-// destination (LoTW, QRZ XML) plus the event source + shared handles and the
+// destination (QRZ XML) plus the event source + shared handles and the
 // QRZ XML test endpoint — bundling them into a struct would just move the
 // same fields without improving clarity.
 #[allow(clippy::too_many_arguments)]
 /// PAN-344: the enabled upload targets captured for one completion — the
-/// outbox's runtime-enabled destinations plus LoTW when its client is on,
+/// outbox's runtime-enabled destinations, including LoTW,
 /// each starting Pending ("queued" means upload work has been scheduled,
 /// not accepted). Later config changes never rewrite a contact's captured
 /// set; an empty set means "uploads disabled".
 fn completion_upload_targets(
     destinations: &[pancetta_dx::upload_outbox::UploadDestination],
-    lotw_enabled: bool,
 ) -> Vec<(
     pancetta_tui::upload_status::UploadTarget,
     pancetta_tui::upload_status::TargetUploadStatus,
 )> {
-    use pancetta_tui::upload_status::{sort_targets, TargetUploadStatus, UploadTarget};
+    use pancetta_tui::upload_status::{sort_targets, TargetUploadStatus};
     let mut targets: Vec<_> = destinations
         .iter()
         .map(|d| {
@@ -11256,37 +11256,13 @@ fn completion_upload_targets(
             )
         })
         .collect();
-    if lotw_enabled {
-        targets.push((UploadTarget::Lotw, TargetUploadStatus::pending("queued")));
-    }
     sort_targets(&mut targets);
     targets
-}
-
-/// PAN-344: map one LoTW one-shot result to its registry state and reason.
-/// Logged and Duplicate mean Accepted; an error means Failed — no retry
-/// behaviour is added, matching the existing best-effort single attempt.
-fn lotw_result_state<E: std::fmt::Display>(
-    result: &Result<pancetta_dx::QsoUploadOutcome, E>,
-) -> (pancetta_tui::upload_status::UploadState, String) {
-    use pancetta_tui::upload_status::UploadState;
-    match result {
-        Ok(pancetta_dx::QsoUploadOutcome::Logged) => (UploadState::Accepted, String::new()),
-        Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => (
-            UploadState::Accepted,
-            "duplicate \u{2014} already logged".to_string(),
-        ),
-        Err(_) => (
-            UploadState::Failed,
-            "tqsl failed · check local upload diagnostics".into(),
-        ),
-    }
 }
 
 #[allow(clippy::too_many_arguments)] // Keep upload configuration, event stream and shared lifecycle state explicit at subscriber startup.
 fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
-    lotw_cfg: pancetta_config::network::LotwUploadConfig,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
     station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
@@ -11299,19 +11275,6 @@ fn start_qso_upload_subscriber(
 
     // ClubLog, QRZ Logbook, eQSL and cqdx.io clients live in the
     // pending-upload worker (`upload_outbox::build_logbook_clients`).
-
-    // LoTW client. Opt-in: enabled + tqsl_path + station_location (config
-    // validation already rejects enabled-without-creds). Signs + uploads each
-    // QSO by shelling out to the operator's tqsl CLI; a missing/erroring tqsl
-    // is logged best-effort and never takes down the subscriber.
-    let lotw_client = if lotw_cfg.enabled {
-        Some(Arc::new(pancetta_dx::LotwUploadClient::new(
-            lotw_cfg.tqsl_path.clone(),
-            lotw_cfg.station_location.clone(),
-        )))
-    } else {
-        None
-    };
 
     // QRZ paid-XML lookup client (read-side enrichment). Opt-in: enabled +
     // creds (config validation already rejects enabled-without-creds). When
@@ -11344,9 +11307,6 @@ fn start_qso_upload_subscriber(
     let qrz_xml_cache: Arc<Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    if lotw_client.is_some() {
-        info!(target: "qso.upload", "LoTW per-QSO (TQSL-signed) upload enabled");
-    }
     if qrz_xml_client.is_some() {
         info!(
             target: "dx.qrz",
@@ -11401,8 +11361,7 @@ fn start_qso_upload_subscriber(
                             .unwrap_or_else(|| "?".to_string());
                         let destinations: &[pancetta_dx::upload_outbox::UploadDestination] =
                             outbox.as_ref().map(|o| o.destinations()).unwrap_or(&[]);
-                        let targets =
-                            completion_upload_targets(destinations, lotw_client.is_some());
+                        let targets = completion_upload_targets(destinations);
                         // Registered even when EMPTY: a confirmed empty
                         // target set is "uploads disabled", never unknown.
                         upload_statuses
@@ -11532,46 +11491,6 @@ fn start_qso_upload_subscriber(
                                 );
                             }
                         }
-                    }
-
-                    // LoTW signs + uploads the same rendered ADIF record by
-                    // shelling out to the operator's tqsl CLI. Best-effort: a
-                    // missing/erroring tqsl never blocks or fails the pipeline.
-                    if let Some(client) = lotw_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        let upload_statuses = upload_statuses.clone();
-                        let lotw_uuid = metadata.qso_id.to_string();
-                        tokio::spawn(async move {
-                            // PAN-344: the LoTW one-shot result feeds the
-                            // registry through the tested mapping helper.
-                            let result = client.upload_adif(&record).await;
-                            match &result {
-                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
-                                    target: "qso.upload",
-                                    "LoTW: signed + uploaded QSO with {}", their
-                                ),
-                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
-                                    target: "qso.upload",
-                                    "LoTW: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "LoTW: upload failed for {}: {}", their, e
-                                ),
-                            }
-                            let (state, reason) = lotw_result_state(&result);
-                            upload_statuses
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .record(
-                                    &lotw_uuid,
-                                    pancetta_tui::upload_status::UploadTarget::Lotw,
-                                    state,
-                                    &reason,
-                                );
-                        });
                     }
                 }
                 Ok(_) => {}
@@ -12402,6 +12321,145 @@ mod cqdx_upload_tests {
         }
     }
 
+    #[test]
+    fn pan300_lotw_target_and_replay_matrix() {
+        use super::super::upload_outbox::outbox_destinations;
+        use pancetta_tui::upload_status::UploadTarget;
+        // LoTW alone, mixed, disabled, all off, and QRZ XML alone.
+        for (http, lotw, xml) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            for replay in [false, true] {
+                let destinations = outbox_destinations(http, http, http, http, replay, lotw);
+                let targets = super::completion_upload_targets(&destinations);
+                assert_eq!(
+                    targets
+                        .iter()
+                        .filter(|(t, _)| *t == UploadTarget::Lotw)
+                        .count(),
+                    usize::from(lotw && !replay)
+                );
+                if replay {
+                    assert!(destinations.is_empty(), "no worker or outbox opened");
+                    assert!(!super::logbook_upload_enabled(
+                        http, http, lotw, http, http, xml, true
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_only_completion_is_queued_once() {
+        use super::super::upload_outbox::{self, LogbookClients, OutboxTiming, UploadHealth};
+        use pancetta_dx::upload_outbox::{OutboxStore, RetrySchedule, UploadDestination};
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex,
+            },
+            time::Duration,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("fake tqsl");
+        let invoked = dir.path().join("invoked");
+        let release = dir.path().join("release");
+        std::fs::write(
+            &binary,
+            format!(
+            "#!/bin/sh\necho attempt >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 0\n",
+            invoked.display(), release.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let clients = LogbookClients {
+            lotw: Some(Arc::new(pancetta_dx::LotwUploadClient::new(
+                binary.to_str().unwrap(),
+                "Home Station",
+            ))),
+            clublog: None,
+            qrz: None,
+            eqsl: None,
+            cqdx: None,
+        };
+        let statuses = super::super::qso_upload_status::UploadStatusRegistry::shared();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let path = dir.path().join("queue.json");
+        let (handle, task) = upload_outbox::start_upload_outbox(
+            path.clone(),
+            Arc::new(clients),
+            RetrySchedule::new(3, 10, 40, 2.0, 0.0, Duration::from_millis(100)),
+            OutboxTiming::PRODUCTION,
+            Arc::new(Mutex::new(UploadHealth::default())),
+            None,
+            shutdown.clone(),
+            Some(statuses.clone()),
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        super::start_qso_upload_subscriber(
+            Some(handle.clone()),
+            Default::default(),
+            100,
+            rx,
+            shutdown.clone(),
+            Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+            None,
+            statuses.clone(),
+        );
+        let metadata = metadata_with_call(Some("K1ABC"));
+        let uuid = metadata.qso_id;
+        tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+            qso_id: uuid,
+            metadata,
+            state_history: vec![],
+            messages: vec![],
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !invoked.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (store, quarantine) = OutboxStore::open(path.clone());
+        assert!(quarantine.is_none());
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].qso_id, uuid);
+        assert_eq!(store.entries()[0].destination, UploadDestination::Lotw);
+        assert!(store.entries()[0].payload.contains("K1ABC"));
+        std::fs::write(release, "").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let accepted = statuses.lock().unwrap().snapshot().iter().any(|s| {
+                    s.uuid == uuid.to_string()
+                        && s.state(UploadTarget::Lotw) == Some(UploadState::Accepted)
+                });
+                if accepted && OutboxStore::open(path.clone()).0.entries().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(std::fs::read_to_string(invoked).unwrap().lines().count(), 1);
+        shutdown.store(true, Ordering::Release);
+        drop(tx);
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[tokio::test]
     async fn pan344_subscriber_missing_payload_and_closed_worker() {
         use super::super::upload_outbox::{
@@ -12442,7 +12500,6 @@ mod cqdx_upload_tests {
             let (tx, rx) = tokio::sync::broadcast::channel(4);
             super::start_qso_upload_subscriber(
                 Some(handle),
-                Default::default(),
                 Default::default(),
                 100,
                 rx,
@@ -20361,7 +20418,7 @@ mod completed_tx_purge_tests {
     }
 
     /// PAN-344 AC5: the enabled-target matrix captured at completion.
-    /// Every enabled outbox destination plus an enabled LoTW client is
+    /// Every enabled outbox destination, including LoTW, is
     /// captured, in canonical display order, all Pending; an empty captured
     /// set is "uploads disabled"; a preparation failure marks the whole
     /// captured set Failed so an enabled target can never disappear from
@@ -20372,7 +20429,7 @@ mod completed_tx_purge_tests {
         use pancetta_dx::upload_outbox::UploadDestination::*;
         use pancetta_tui::upload_status::{verdict, UploadState, UploadTarget, UploadVerdict};
 
-        let all = completion_upload_targets(&[ClubLog, QrzLogbook, Eqsl, Cqdx], true);
+        let all = completion_upload_targets(&[ClubLog, QrzLogbook, Eqsl, Cqdx, Lotw]);
         assert_eq!(
             all.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             vec![
@@ -20388,14 +20445,14 @@ mod completed_tx_purge_tests {
             .iter()
             .all(|(_, s)| s.state == UploadState::Pending && s.reason == "queued"));
 
-        let subset = completion_upload_targets(&[QrzLogbook], false);
+        let subset = completion_upload_targets(&[QrzLogbook]);
         assert_eq!(
             subset.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             vec![UploadTarget::Qrz]
         );
 
         // Empty captured set: disabled, never vacuously all-accepted.
-        let none = completion_upload_targets(&[], false);
+        let none = completion_upload_targets(&[]);
         let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
         registry.lock().unwrap().register("u-none", "K1ABC", none);
         let snap = registry.lock().unwrap().snapshot();
@@ -20406,7 +20463,7 @@ mod completed_tx_purge_tests {
         registry.lock().unwrap().register(
             uuid,
             "K1ABC",
-            completion_upload_targets(&[ClubLog, QrzLogbook], true),
+            completion_upload_targets(&[ClubLog, QrzLogbook, Lotw]),
         );
         registry.lock().unwrap().record_all(
             uuid,
@@ -20421,53 +20478,6 @@ mod completed_tx_purge_tests {
             .iter()
             .all(|(_, s)| s.state == UploadState::Failed));
         assert_eq!(verdict(entry), UploadVerdict::NeedsAttention);
-    }
-
-    /// PAN-344 AC5: LoTW's own result is included — Logged and Duplicate
-    /// mean Accepted, an error means Failed, and a registered Lotw target
-    /// transitions accordingly (it stays pending until its own result).
-    #[test]
-    fn pan344_lotw_result_is_included() {
-        use super::{completion_upload_targets, lotw_result_state};
-        use pancetta_tui::upload_status::{UploadState, UploadTarget};
-
-        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
-            pancetta_dx::QsoUploadOutcome::Logged,
-        ));
-        assert_eq!(state, UploadState::Accepted);
-        assert!(reason.is_empty());
-
-        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
-            pancetta_dx::QsoUploadOutcome::Duplicate,
-        ));
-        assert_eq!(state, UploadState::Accepted);
-        assert!(reason.contains("duplicate"));
-
-        let (state, reason) = lotw_result_state(&Err("tqsl not found".to_string()));
-        assert_eq!(state, UploadState::Failed);
-        assert!(reason.contains("tqsl failed"), "{reason}");
-
-        let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
-        registry
-            .lock()
-            .unwrap()
-            .register("u-lotw", "K1ABC", completion_upload_targets(&[], true));
-        {
-            let snap = registry.lock().unwrap().snapshot();
-            let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
-            assert_eq!(
-                entry.state(UploadTarget::Lotw),
-                Some(UploadState::Pending),
-                "LoTW stays pending until its own result"
-            );
-        }
-        registry
-            .lock()
-            .unwrap()
-            .record("u-lotw", UploadTarget::Lotw, state, &reason);
-        let snap = registry.lock().unwrap().snapshot();
-        let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
-        assert_eq!(entry.state(UploadTarget::Lotw), Some(UploadState::Failed));
     }
 }
 

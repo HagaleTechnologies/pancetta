@@ -151,7 +151,7 @@ pub struct QrzLogbookConfig {
 /// rather than raw-POSTing ADIF. When [`enabled`](Self::enabled) is `true`,
 /// each completed QSO is signed + uploaded via `tqsl`. No credential value is
 /// ever logged; the certificate lives in the operator's TQSL install.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LotwUploadConfig {
     /// Enable per-QSO signed uploads to LoTW.
@@ -167,6 +167,19 @@ pub struct LotwUploadConfig {
     /// uses this to select the certificate + station details for signing.
     #[serde(default)]
     pub station_location: String,
+    /// Optional TQSL Callsign Certificate password, stored only in local config.
+    #[serde(default)]
+    pub password: String,
+}
+impl std::fmt::Debug for LotwUploadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LotwUploadConfig")
+            .field("enabled", &self.enabled)
+            .field("tqsl_path", &self.tqsl_path)
+            .field("station_location", &self.station_location)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// eQSL.cc per-QSO upload configuration.
@@ -1969,6 +1982,21 @@ mod tests {
             base.remote_gateway.enabled,
             "remote_gateway.enabled must survive merge"
         );
+    }
+
+    #[test]
+    fn pan300_lotw_password_defaults_roundtrip_merge_and_debug() {
+        let legacy: LotwUploadConfig = toml::from_str("enabled = false").unwrap();
+        assert!(legacy.password.is_empty());
+        let mut cfg = NetworkConfig::default();
+        cfg.lotw.password = "certificate secret with spaces".into();
+        let encoded = toml::to_string(&cfg).unwrap();
+        let restored: NetworkConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.lotw.password, cfg.lotw.password);
+        assert!(!format!("{:?}", restored).contains(&cfg.lotw.password));
+        let mut base = NetworkConfig::default();
+        base.merge_with(restored);
+        assert_eq!(base.lotw.password, cfg.lotw.password);
     }
 
     #[test]
