@@ -178,7 +178,9 @@ current status.
 Upgrading an existing station? Stop Pancetta and all logbook writers, then
 complete the verified backup in [Upgrade and rollback](docs/UPGRADING.md)
 before replacing or starting a binary. Keep the prior version directory.
-Automatic database backups do not include your complete logbook or configuration.
+Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
+These copies do not include contacts logged since the latest startup.
+Preserve the whole stopped installation before upgrading.
 
 **Prebuilt binaries.** No Rust toolchain needed. Starting with the first
 tagged release after this note was added, every
@@ -321,6 +323,8 @@ worked. Confirmations on another band do not clear band need. Duplicate admissio
 rules still apply. Remote clients retain cqdx-only verdicts.
 
 ## Capability status
+
+Startup ADIF snapshots are implemented, unreleased. Directory and retention are configurable.
 
 Contest scoring is opt-in for Kansas FT4/FT8 2026 and SC fixed digital 2026.
 The TUI shows local claimed score, multipliers, contest dupes and hourly rate
