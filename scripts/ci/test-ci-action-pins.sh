@@ -44,9 +44,16 @@ ruby -ryaml <<'RUBY' || struct_fail=1
   Encoding.default_external = Encoding::UTF_8
   failures = []
   count = 0
+  # Tracks which plan AC's proof section each check belongs to, so the green
+  # run reports one PASS line per section (fleet-scan proves AC3/AC4,
+  # schedule-structure proves AC6, retirement proves AC7/AC8) instead of one
+  # undifferentiated count.
+  section = nil
+  section_counts = Hash.new(0)
   check = lambda do |name, &blk|
     blk.call
     count += 1
+    section_counts[section] += 1
   rescue StandardError => e
     failures << "#{name}: #{e.message}"
   end
@@ -56,6 +63,7 @@ ruby -ryaml <<'RUBY' || struct_fail=1
   raise 'no workflow files under .github/workflows' if workflows.empty?
 
   # -- 1. fleet scan ---------------------------------------------------------
+  section = 'fleet-scan'
   sha_re = /\A[0-9a-f]{40}\z/
   uses_line_re = /\A\s*(?:-\s+)?uses:\s*(\S+)(.*)\z/
   dtolnay_shas = {}
@@ -97,6 +105,7 @@ ruby -ryaml <<'RUBY' || struct_fail=1
   end
 
   # -- 2. schedule structure -------------------------------------------------
+  section = 'schedule-structure'
   sc = YAML.load_file('.github/workflows/supply-chain.yml')
   sc_jobs = sc.fetch('jobs')
   on = sc['on'] || sc[true]
@@ -138,6 +147,7 @@ ruby -ryaml <<'RUBY' || struct_fail=1
   end
 
   # -- 3. retirement ----------------------------------------------------------
+  section = 'retirement'
   check.call('retire/docs.yml gone') do
     expect.call(!File.exist?('.github/workflows/docs.yml'), '.github/workflows/docs.yml still exists')
   end
@@ -190,6 +200,9 @@ ruby -ryaml <<'RUBY' || struct_fail=1
     warn failures.map { |f| "FAIL: #{f}" }.join("\n")
     warn "#{failures.size} structure check(s) failed, #{count} passed"
     exit 1
+  end
+  %w[fleet-scan schedule-structure retirement].each do |sec|
+    puts "PASS: #{sec} section (#{section_counts[sec]} checks)"
   end
   puts "PASS: #{count} structure checks (PAN-311)"
 RUBY
