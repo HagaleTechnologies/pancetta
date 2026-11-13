@@ -3321,6 +3321,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "lazy_static",
+ "pancetta-config",
  "pancetta-core",
  "pancetta-ft8",
  "proptest",

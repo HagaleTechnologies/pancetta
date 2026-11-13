@@ -1253,6 +1253,7 @@ warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
 
+<<<<<<< HEAD
 ## PAN-303: remove configuration without runtime consumers
 
 Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
@@ -1270,3 +1271,26 @@ by the conservative cutoff at each source file's first `#[cfg(test)]`.
 The waiver ceiling cannot grow. Remaining settings need separate consumer
 or removal work; optional values absent from defaults and user map entries
 are outside this test's enumeration.
+=======
+## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
+
+The release workflow's build job now holds `id-token: write` and
+`attestations: write` alongside `contents: read`. Only the tag-gated
+build-provenance step uses the attestation scopes; workflow-dispatch dry runs
+do not attest. This executes PAN-106's recorded attestation deferral and
+narrows its rule to no build write scope beyond the attestation pair.
+The release job retains `contents: write` for draft creation.
+
+Release CI overrides Cargo profiles with debug=1, strip=none and
+split-debuginfo=off. Post-link splitting produces separate ELF/PE `.debug`
+assets or a macOS dSYM tarball before the binary is packaged.
+`Cargo.toml` and local build profiles stay unchanged. The first tagged run
+must check symbol sizes and native macOS/Windows extraction.
+`SHA256SUMS` lists platform archives only, excluding dSYM tarballs;
+per-archive checksum sidecars remain available.
+
+Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
+receive a release-candidate notice. They require a real, matching CHANGELOG
+section; there is no Unreleased fallback. The operator still publishes the
+draft. macOS signing and notarization remain PAN-265.
+>>>>>>> a78c810274c556774c8180e1ad2415733aa22752

@@ -424,19 +424,41 @@ impl Config {
         }
     }
 
-    /// Write config text to `path` securely: owner-only permissions and
-    /// atomically, so the plaintext credentials this file holds (logbook
-    /// passwords, the cqdx PAT) are never group/other-readable and a crash
-    /// mid-write can never truncate the operator's config.
+    /// Write `contents` verbatim to `path` so a crash mid-write can never
+    /// truncate the destination (PAN-305): missing parent directories are
+    /// created, the text is written to a randomly-named exclusive temporary
+    /// sibling in the same directory, that file is synced, and it then
+    /// atomically replaces the destination via `rename`.
     ///
-    /// On Unix: the parent dir is forced to `0o700`, the file is created
-    /// `0o600` from the first byte (via a `0o600` temp sibling), and the temp
-    /// is atomically `rename`d over the target (rename preserves the temp's
-    /// mode). This also closes the *silent-reversion* trap where an operator who
-    /// hand-`chmod 600`'d the file lost it the next time pancetta rewrote it. On
-    /// non-Unix the per-user NTFS ACL on the Windows MiniPC already restricts
-    /// access; we still write atomically (temp + rename).
-    fn write_secure_atomic(path: &std::path::Path, contents: &str) -> ConfigResult<()> {
+    /// On Unix the temporary sibling is created `0o600` (owner-only from the
+    /// first byte) and the rename preserves that mode, so every file this
+    /// writes is owner-only. A parent directory this method just created —
+    /// or the default application-owned `~/.pancetta` directory — is forced
+    /// to `0o700` (best effort); a pre-existing custom parent is left at
+    /// whatever mode its owner intended. On non-Unix the per-user ACL
+    /// restricts access; the write is still atomic (temp + rename).
+    ///
+    /// This guarantees atomicity against process interruption: a reader
+    /// either sees the complete previous contents or the complete new
+    /// contents, never an empty or partial file. It does NOT promise
+    /// power-loss durability of the directory entry (the parent directory
+    /// is not fsynced).
+    pub fn write_secure_atomic(path: &std::path::Path, contents: &str) -> ConfigResult<()> {
+        Self::write_secure_atomic_with_hook(path, contents, || Ok(()))
+    }
+
+    /// The shared atomic-write implementation behind
+    /// [`Config::write_secure_atomic`], with a hook invoked after the
+    /// temporary sibling is fully written and synced but BEFORE it replaces
+    /// `path` (PAN-305). Production callers use the no-hook public method;
+    /// unit tests use this seam to deterministically park a child process at
+    /// the pre-replacement crash boundary or inject an I/O failure, keeping
+    /// that orchestration out of the public API.
+    fn write_secure_atomic_with_hook(
+        path: &std::path::Path,
+        contents: &str,
+        before_replace: impl FnOnce() -> std::io::Result<()>,
+    ) -> ConfigResult<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 // PAN-62 review round 1 (Codex P1), refined round 2 (Codex
@@ -498,6 +520,11 @@ impl Config {
             tmp.write_all(contents.as_bytes())?;
             tmp.as_file().sync_all()?;
         }
+        // PAN-305 test seam: the single point where the synced-but-not-yet-
+        // replaced boundary is observable. A hook failure aborts the write
+        // BEFORE the destination is touched, so the previous contents
+        // survive intact.
+        before_replace()?;
         // Atomic replace (same `rename` guarantee as before). On failure,
         // `PersistError` hands back the still-unpersisted `NamedTempFile`,
         // which cleans itself up on drop -- no manual `remove_file` needed.
@@ -505,7 +532,15 @@ impl Config {
         Ok(())
     }
 
-    /// Save configuration to a file in TOML format
+    /// Save configuration to a file in TOML format.
+    ///
+    /// The file holds plaintext credentials (logbook passwords, the cqdx
+    /// PAT), so it is written through [`Config::write_secure_atomic`]:
+    /// owner-only (`0o600`) from the first byte and atomically, so the
+    /// contents are never group/other-readable and a crash mid-write can
+    /// never truncate the operator's config. This also closes the
+    /// *silent-reversion* trap where an operator who hand-`chmod 600`'d the
+    /// file lost it the next time pancetta rewrote it.
     pub fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> ConfigResult<()> {
         let path = path.as_ref();
         debug!("Saving configuration to: {}", path.display());
@@ -1139,6 +1174,135 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the planted symlink itself must be left exactly as it was"
+        );
+    }
+
+    /// PAN-305 AC1: a writer killed after the temporary sibling is synced
+    /// but before the atomic replacement must leave the destination exactly
+    /// as it was — `042`, which loads as 42 — never an empty or partial
+    /// file. A write that completes the replacement contains `43`.
+    ///
+    /// The vulnerable interval is entered deterministically: this test
+    /// re-executes its own binary as a child that runs the SHARED atomic
+    /// write implementation with a hook parking it right after `sync_all`.
+    /// The child announces the pre-replacement boundary through a marker
+    /// file and blocks; the parent waits for that explicit signal (bounded),
+    /// then kills and reaps the child. No timed sleep guesses at the
+    /// interval. A killed child may leave its temporary sibling behind; that
+    /// cleanup is not part of the serial guarantee.
+    #[test]
+    fn serial_atomic_write_survives_interrupted_replace() {
+        use std::time::{Duration, Instant};
+
+        // Child role: re-executed test binary parks at the crash boundary.
+        if let (Ok(target), Ok(marker)) = (
+            std::env::var("PAN305_CHILD_INTERRUPT_TARGET"),
+            std::env::var("PAN305_CHILD_INTERRUPT_MARKER"),
+        ) {
+            let _ =
+                Config::write_secure_atomic_with_hook(std::path::Path::new(&target), "43", || {
+                    std::fs::write(&marker, b"pre-replacement boundary reached").ok();
+                    // Block until the parent kills us: the sibling is synced
+                    // but the rename has NOT happened.
+                    loop {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            // Unreachable while parked; a clean exit keeps a broken harness
+            // from hanging instead of failing.
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("contest_serial.txt");
+        std::fs::write(&target, "042").unwrap();
+        let marker = dir.path().join("boundary.marker");
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::serial_atomic_write_survives_interrupted_replace")
+            .env("PAN305_CHILD_INTERRUPT_TARGET", &target)
+            .env("PAN305_CHILD_INTERRUPT_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("child writer must spawn");
+
+        // Bounded wait for the explicit boundary announcement.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut early_exit: Option<std::process::ExitStatus> = None;
+        let announced = loop {
+            if marker.exists() {
+                break true;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                early_exit = Some(status);
+                break false;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Always clean up the child: killed while parked, reaped either way.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            announced,
+            "child writer never announced the pre-replacement boundary \
+             (early exit: {early_exit:?})"
+        );
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            after.trim(),
+            "042",
+            "an interrupted replace must leave exactly the previous serial, got {after:?}"
+        );
+        assert_eq!(
+            after.trim().parse::<u32>().unwrap(),
+            42,
+            "the preserved bytes must load as 42"
+        );
+
+        // A completed replacement contains the next serial, which loads as 43.
+        Config::write_secure_atomic(&target, "43").unwrap();
+        let done = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            done.trim().parse::<u32>().unwrap(),
+            43,
+            "a completed replacement must contain the next serial, got {done:?}"
+        );
+    }
+
+    /// PAN-305 AC2: a write that fails before the replacement must surface
+    /// the failure and leave the previous value's bytes unchanged. The hook
+    /// injects an I/O error at the synced-but-not-replaced boundary; the
+    /// production hook (a no-op) can never fail there.
+    #[test]
+    fn serial_atomic_write_failure_preserves_previous_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contest_serial.txt");
+        std::fs::write(&path, "042").unwrap();
+
+        let err = Config::write_secure_atomic_with_hook(&path, "43", || {
+            Err(std::io::Error::other("injected pre-replacement failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "the injected hook failure must surface as the write's error, got {err:?}"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, "042",
+            "a failure before replacement must preserve the previous bytes, got {after:?}"
+        );
+        assert_eq!(
+            after.trim().parse::<u32>().unwrap(),
+            42,
+            "the preserved bytes must load as 42"
         );
     }
 
