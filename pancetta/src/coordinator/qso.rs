@@ -2752,6 +2752,7 @@ mod pan6_diagnostic_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: Default::default(),
@@ -3127,7 +3128,7 @@ fn recent_qso_outcome(
     let mut brief_timeline = vec![format!(
         "{} started at {}",
         their_call,
-        metadata.start_time.format("%H:%M:%S")
+        metadata.contact_started_at().format("%H:%M:%S")
     )];
     if let Some(sent) = metadata.reports.sent {
         brief_timeline.push(format!("Report sent: {sent:+}"));
@@ -3472,6 +3473,7 @@ mod ap_ranking_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: pancetta_qso::states::SignalReports::default(),
@@ -7074,6 +7076,7 @@ mod secondary_decoder_hint_tests {
                 frequency: 1900.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: start,
                 end_time: None,
                 reports: SignalReports::default(),
@@ -9081,6 +9084,7 @@ mod snapshot_tests {
                 frequency: 1500.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: start,
                 end_time: None,
                 reports: SignalReports {
@@ -9288,7 +9292,7 @@ mod snapshot_tests {
     #[test]
     fn recent_qso_outcome_completed_carries_callsign_and_reports() {
         let progress = fixture_progress();
-        let metadata = progress.metadata;
+        let mut metadata = progress.metadata;
         let their_call = metadata.their_callsign.clone().expect("fixture has a call");
 
         let outcome = super::recent_qso_outcome(
@@ -9297,6 +9301,26 @@ mod snapshot_tests {
             &metadata,
         );
 
+        assert_eq!(
+            outcome.brief_timeline[0],
+            format!(
+                "JA1ABC started at {}",
+                metadata.start_time.format("%H:%M:%S")
+            )
+        );
+        metadata.first_answer_at = Some(metadata.start_time + chrono::Duration::minutes(4));
+        let answered = super::recent_qso_outcome(
+            &their_call,
+            crate::message_bus::QsoOutcome::Completed,
+            &metadata,
+        );
+        assert_eq!(
+            answered.brief_timeline[0],
+            format!(
+                "JA1ABC started at {}",
+                metadata.first_answer_at.unwrap().format("%H:%M:%S")
+            )
+        );
         assert_eq!(outcome.callsign, "JA1ABC");
         assert!(matches!(
             outcome.outcome,
@@ -10953,7 +10977,7 @@ fn cqdx_record_from_metadata(
         mode: metadata.mode.clone(),
         rst_sent: metadata.reports.sent.map(|r| r.to_string()),
         rst_received: metadata.reports.received.map(|r| r.to_string()),
-        start_time: metadata.start_time,
+        start_time: metadata.contact_started_at(),
         end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
     })
 }
@@ -12014,6 +12038,7 @@ mod adif_subscriber_tests {
                 frequency: 14_074_000.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: now,
                 end_time: Some(now),
                 reports: pancetta_qso::states::SignalReports::default(),
@@ -12330,6 +12355,7 @@ mod cqdx_upload_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
             reports: SignalReports {
@@ -12457,7 +12483,7 @@ mod cqdx_upload_tests {
     /// both grids, and stringified SNR reports the API expects.
     #[test]
     fn record_maps_metadata_fields() {
-        let md = metadata_with_call(Some("JA1ABC"));
+        let mut md = metadata_with_call(Some("JA1ABC"));
         let rec = cqdx_record_from_metadata(&md).expect("record");
         assert_eq!(rec.callsign, "JA1ABC");
         assert_eq!(rec.frequency, 14_074_000);
@@ -12468,6 +12494,9 @@ mod cqdx_upload_tests {
         assert_eq!(rec.rst_received.as_deref(), Some("-12"));
         assert_eq!(rec.start_time, md.start_time);
         assert_eq!(rec.end_time, md.end_time.unwrap());
+        md.first_answer_at = Some(md.start_time + chrono::Duration::minutes(4));
+        let rec = cqdx_record_from_metadata(&md).expect("answered record");
+        assert_eq!(rec.start_time, md.first_answer_at.unwrap());
     }
 
     /// No contra-callsign → nothing to upload.
@@ -12540,6 +12569,7 @@ mod qrz_enrichment_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
             reports: SignalReports {
@@ -13818,6 +13848,7 @@ mod replay_history_seed_tests {
                 frequency: FREQ_20M_HZ,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: chrono::Utc::now(),
                 end_time: None,
                 reports: SignalReports::default(),

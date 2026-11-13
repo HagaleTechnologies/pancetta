@@ -2656,6 +2656,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -2796,6 +2797,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3288,6 +3290,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3740,6 +3743,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -6471,6 +6475,9 @@ impl QsoManager {
             if progress.metadata.their_callsign.is_none() {
                 if let Some(call) = new_state.their_callsign() {
                     progress.metadata.their_callsign = Some(call.to_string());
+                    if progress.metadata.first_answer_at.is_none() {
+                        progress.metadata.first_answer_at = Some(message.timestamp);
+                    }
                 }
             }
 
@@ -15655,6 +15662,7 @@ mod tests {
                 frequency: freq,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: now,
                 end_time: None,
                 reports: SignalReports::default(),
@@ -16227,6 +16235,7 @@ mod sender_verification_tests {
             frequency: their_freq,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -21089,6 +21098,227 @@ mod pan72_stall_detection_tests {
             let clock = self.clone();
             Arc::new(move || clock.now())
         }
+    }
+
+    async fn time_on_answer(manager: &QsoManager, bare: bool, to: &str) {
+        let message = if bare {
+            MessageType::SignalReport {
+                to_station: to.into(),
+                from_station: DX.into(),
+                report: -10,
+            }
+        } else {
+            MessageType::CqResponse {
+                calling_station: to.into(),
+                responding_station: DX.into(),
+                grid: Some("FN31".into()),
+            }
+        };
+        manager
+            .process_message(message, format!("{to} {DX} FN31"), FREQ, Some(-10.0))
+            .await
+            .unwrap();
+    }
+
+    async fn check_completed_time_on(bare: bool) {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        let created = clock.now();
+        clock.advance(Duration::minutes(4));
+        let answered = clock.now();
+        time_on_answer(&manager, bare, OUR).await;
+        clock.advance(Duration::seconds(30));
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -12,
+                },
+                format!("{OUR} {DX} R-12"),
+                FREQ,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        clock.advance(Duration::seconds(30));
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{OUR} {DX} 73"),
+                FREQ,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::Completed { .. }));
+        assert_eq!(qso.metadata.start_time, created);
+        assert_eq!(qso.metadata.first_answer_at, Some(answered));
+        assert_eq!(
+            crate::adif::AdifProcessor::new()
+                .qso_to_adif(&qso.metadata, None)
+                .qso_date,
+            answered
+        );
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_is_first_answer_not_cq_start() {
+        check_completed_time_on(false).await;
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_bare_report_answer() {
+        check_completed_time_on(true).await;
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_rejected_and_repeated_answers() {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        clock.advance(Duration::minutes(4));
+        time_on_answer(&manager, false, "W9XYZ").await;
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::CallingCq { .. }));
+        assert_eq!(qso.metadata.first_answer_at, None);
+        time_on_answer(&manager, false, OUR).await;
+        let answered = clock.now();
+        clock.advance(Duration::seconds(30));
+        time_on_answer(&manager, false, OUR).await;
+        assert_eq!(
+            manager.get_qso(id).await.unwrap().metadata.first_answer_at,
+            Some(answered)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_cq_time_on_rolls_over_utc_midnight() {
+        let clock = PinnedClock::new();
+        clock.advance(Duration::hours(23) + Duration::minutes(58));
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        let created = clock.now();
+        clock.advance(Duration::minutes(4));
+        time_on_answer(&manager, false, OUR).await;
+        let metadata = manager.get_qso(id).await.unwrap().metadata;
+        assert_eq!(metadata.start_time, created);
+        assert_eq!(metadata.first_answer_at, Some(clock.now()));
+        let adif = crate::adif::AdifProcessor::new().qso_to_adif(&metadata, None);
+        assert_eq!(adif.qso_date, clock.now());
+        assert_ne!(adif.qso_date.date_naive(), created.date_naive());
+    }
+
+    #[tokio::test]
+    async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
+        use crate::contest::{
+            ledger,
+            scoring::{ContestPeriod, ContestScoringContext, KSQP_FT_2026},
+        };
+        let clock = PinnedClock::new();
+        let created = clock.now();
+        let context = ContestScoringContext::new(
+            "PAN-307-test",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "TX",
+            vec![ContestPeriod {
+                start: created,
+                end: created + Duration::hours(1),
+            }],
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.contest_scoring = Some(context.clone());
+        let manager = QsoManager::with_clock_for_test(config, clock.source());
+        let id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        clock.advance(Duration::minutes(4) + Duration::milliseconds(123));
+        let answered = clock.now();
+        time_on_answer(&manager, false, OUR).await;
+        for message in [
+            MessageType::ReportAck {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+                report: -12,
+            },
+            MessageType::SeventyThree {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+            },
+        ] {
+            clock.advance(Duration::seconds(30));
+            manager
+                .process_message(message, format!("{OUR} {DX}"), FREQ, Some(-11.0))
+                .await
+                .unwrap();
+        }
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::Completed { .. }));
+        assert_eq!(qso.metadata.start_time, created);
+        let db = crate::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        db.insert_qso(&qso).await.unwrap();
+        let indexed = db.contest_ledger(&context, OUR).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        db.export_to_adif(&path).await.unwrap();
+        let processor = crate::adif::AdifProcessor::new();
+        let file = processor
+            .parse_string(&std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        let record = processor.record_to_qso(&file.records[0]).unwrap();
+        let imported = processor.adif_to_qso(&record);
+        let durable = ledger::fact(&imported, &context, OUR).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].start, answered);
+        assert_eq!(durable, indexed[0]);
+        assert_eq!(
+            ledger::decode(&record.additional_fields)
+                .unwrap()
+                .unwrap()
+                .contact_start,
+            Some(answered)
+        );
+    }
+
+    #[tokio::test]
+    async fn responding_qso_time_on_unchanged() {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        clock.advance(Duration::seconds(30));
+        time_on_answer(&manager, true, OUR).await;
+        let metadata = manager.get_qso(id).await.unwrap().metadata;
+        assert_eq!(metadata.first_answer_at, None);
+        assert_eq!(
+            crate::adif::AdifProcessor::new()
+                .qso_to_adif(&metadata, None)
+                .qso_date,
+            metadata.start_time
+        );
     }
 
     #[tokio::test]
@@ -27275,6 +27505,7 @@ mod has_active_or_recent_qso_tests {
             frequency: 1500.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -27515,6 +27746,7 @@ mod hound_tests {
             frequency: 600.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
