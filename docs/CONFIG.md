@@ -996,11 +996,50 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 | `instance_id` | string | `"WSJT-X - pancetta"` | The protocol's `Id` field. Companion apps display and route by it; a second pancetta instance should get a distinct value. Must be non-empty when `enabled = true`. |
 | `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
 | `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `[network.station_agent].remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
-| `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (only the configured destination host is accepted) and this list is unused. |
+| `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (the configured destination host must also pass source-port pinning below) and this list is unused. |
 
 `destination` must parse as a valid `host:port` socket address, and
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
+
+#### WSJT-X UDP admission and Replay (PAN-312)
+
+Unicast uses the route-selected local IPv4 address and an ephemeral port on one
+unconnected socket, including outbound-only configurations. A separate UDP route
+probe sends no application datagram. Route discovery or bind failure disables the
+companion component for this run and drains its bus channel; the station continues.
+There is no wildcard fallback. IPv6 destinations are unsupported. Multicast keeps
+its wildcard bind and configured TTL/interface options.
+
+After decoding and matching the instance Id, inbound admission requires
+`accept_udp_requests = true` and the destination host (unicast) or an explicitly
+listed `allowed_request_hosts` IP (multicast; an empty list refuses all).
+The first valid, correctly targeted datagram from an allowed host pins its source
+address and port and may act immediately, supporting companions without Heartbeats.
+A correctly targeted Heartbeat from that host refreshes its port. Other datagrams
+must match the pin exactly and cannot change it. Wrong Ids and refused hosts never
+learn pins. Pins last until component restart, including across Close and Clear.
+A port change without Heartbeats requires a restart.
+
+HaltTx requires all those admission checks but does not require initiation consent.
+For example, after Heartbeat from `192.168.1.20:2237`, HaltTx from
+`192.168.1.20:40000` is ignored with a Warn diagnostic on `remote.wsjtx`:
+`refused request from 192.168.1.20:40000: HaltTx`.
+The pinned port's HaltTx retains the existing stop behavior.
+
+Replay has one global one-second minimum interval across all peers. An accepted
+burst sends the retained ring in order as `New=false`, then Status. Empty rings and
+failed sends consume the interval too. Requests inside the interval are skipped,
+without replay decodes, post-Replay Status or deferred work; refusals do not extend
+the interval. Equality at one second permits another burst. Pins, Heartbeats and
+band changes do not reset it. A skipped request emits an Info diagnostic:
+`Replay from 192.168.1.20:2237 ignored (rate-limited; minimum interval 1s)`.
+Ordinary timer Status and Heartbeat traffic continues independently. Wrong-source
+or wrong-Id requests do not consume the budget.
+
+These checks reduce exposure; UDP source pinning does not authenticate a sender.
+Forged pinned tuples or allowed Heartbeats remain possible. Disabled defaults,
+wire encodings and downstream Reply consent, policy and arm checks are unchanged.
 
 ### `[network.station_agent]` — remote operation
 

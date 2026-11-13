@@ -101,3 +101,14 @@ Single and summed-bundle playback rechecks the same gate about every 50 ms. Deni
 PTT before confirmed audio flush and reports failure after acknowledgment, independently of
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
+
+## WSJT-X UDP peer pins and Replay (PAN-312)
+
+Unicast binds the routed local IPv4 address, with no wildcard fallback on route
+failure. Multicast retains its wildcard bind and explicit host allowlist. After
+master, host and matching-Id checks, the first valid datagram bootstraps a port
+pin; only an allowed, correctly targeted Heartbeat can refresh it. Companions
+without Heartbeats need a restart after changing ports. Pins are not authentication.
+Replay shares one skip-only one-second budget across all peers, even after a pin
+refresh; empty or failed bursts consume it. Suppressed requests send no Replay
+Status and schedule no deferred burst. See the WSJT-X UDP design spec for policy.
