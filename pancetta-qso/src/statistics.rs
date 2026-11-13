@@ -2265,6 +2265,7 @@ mod tests {
                 frequency: 14074000.0 + (i as f64 * 1000.0),
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time,
                 end_time: Some(start_time + Duration::minutes(2)),
                 reports: SignalReports {

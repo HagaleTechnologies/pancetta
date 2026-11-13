@@ -1243,7 +1243,7 @@ pub(crate) fn qso_to_msgs(
     adif_record: String,
 ) -> (OutMsg, OutMsg) {
     let date_time_off = qdatetime_of(m.end_time.unwrap_or(m.start_time));
-    let date_time_on = qdatetime_of(m.start_time);
+    let date_time_on = qdatetime_of(m.contact_started_at());
 
     let qso_logged = OutMsg::QsoLogged {
         date_time_off,
@@ -2261,6 +2261,7 @@ mod qso_logged_tests {
             frequency: 14_074_200.4,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: start,
             end_time: Some(end),
             reports: SignalReports {
@@ -2313,6 +2314,23 @@ mod qso_logged_tests {
         assert_eq!(unix_to_jdn(midnight), 2_459_153);
         assert_eq!(unix_to_jdn(noon), 2_459_153);
         assert_eq!(unix_to_jdn(just_before_midnight), 2_459_153);
+    }
+
+    #[test]
+    fn qso_to_msgs_uses_first_answer_time() {
+        let mut m = metadata();
+        m.first_answer_at = Some(m.start_time + chrono::Duration::seconds(5));
+        let (logged, _) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            date_time_on,
+            date_time_off,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(date_time_on, qdatetime_of(m.first_answer_at.unwrap()));
+        assert_eq!(date_time_off, qdatetime_of(m.end_time.unwrap()));
     }
 
     #[test]

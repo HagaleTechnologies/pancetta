@@ -993,6 +993,7 @@ mod tests {
             frequency: 14074000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: Some(now),
             reports: SignalReports {

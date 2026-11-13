@@ -680,14 +680,19 @@ impl AdifProcessor {
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
-        if let Ok(Some(mut logged)) = crate::contest::ledger::decode(&additional_fields) {
+        if let Ok(Some(mut logged)) = crate::contest::ledger::contact_context(metadata) {
             let evidence = crate::contest::ledger::resolved_evidence(
                 &logged,
                 &additional_fields,
                 metadata.their_state.as_deref(),
             );
-            if evidence.source.as_deref() != Some("conflict") {
+            let evidence_conflicts = evidence.source.as_deref() == Some("conflict");
+            if !evidence_conflicts {
                 logged.evidence = evidence;
+            }
+            // Preserve conflicting imported context byte-for-byte. A live CQ
+            // answer still needs its corrected contact_start persisted.
+            if !evidence_conflicts || metadata.first_answer_at.is_some() {
                 if let Ok(json) = serde_json::to_string(&logged) {
                     additional_fields.insert(crate::contest::ledger::CONTEXT.into(), json);
                 }
@@ -710,7 +715,7 @@ impl AdifProcessor {
         }
 
         AdifQso {
-            qso_date: metadata.start_time,
+            qso_date: metadata.contact_started_at(),
             qso_date_off: metadata.end_time,
             call: metadata.their_callsign.clone().unwrap_or_default(),
             mode: metadata.mode.clone(),
@@ -775,6 +780,7 @@ impl AdifProcessor {
                 .submode
                 .clone()
                 .unwrap_or_else(|| adif_qso.mode.clone()),
+            first_answer_at: None,
             start_time: adif_qso.qso_date,
             end_time: adif_qso.qso_date_off,
             reports: SignalReports {
@@ -1762,6 +1768,7 @@ ADIF Export for Test Program
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: Utc::now(),
             end_time: None,
             reports: SignalReports {
