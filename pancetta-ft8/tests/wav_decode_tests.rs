@@ -734,6 +734,13 @@ fn budget_floor_still_decodes_top_candidates() {
         "floor (top-50 @ shallow BP) must still run, got {}",
         msgs.len()
     );
+    // PAN-313: the floor's COARSE decodes survive, but its candidates'
+    // optional FFT fallback is refused — zero extraction attempts and a
+    // positive refusal count on this fallback-eligible recording.
+    let rows = fft_fallback_rows(&report);
+    assert_eq!(rows.len(), 1, "stages: {:?}", report.stages);
+    assert_eq!(rows[0].1, 0, "expired budget: no fallback extraction");
+    assert!(rows[0].2 > 0, "expired budget: refusals must be recorded");
 }
 
 // =============================================================
@@ -1143,5 +1150,193 @@ fn max_shape_far_future_budget_matches_unlimited() {
         std::cmp::Ordering::Equal => assert_eq!(unl_texts, far_texts),
         std::cmp::Ordering::Less => assert!(unl_texts.is_subset(&far_texts)),
         std::cmp::Ordering::Greater => assert!(far_texts.is_subset(&unl_texts)),
+    }
+}
+
+// =============================================================
+// PAN-313: budget-gated legacy per-symbol FFT fallback
+// =============================================================
+
+/// The `fft-fallback` rows of a report: (label, elapsed ms, attempts,
+/// budget skips) for every pass.
+fn fft_fallback_rows(report: &DecodeBudgetReport) -> Vec<(u32, u32, u32)> {
+    report
+        .stages
+        .iter()
+        .filter(|(l, _, _, _)| *l == "fft-fallback")
+        .map(|(_, ms, done, skipped)| (*ms, *done, *skipped))
+        .collect()
+}
+
+/// PAN-313 AC3: with an already-expired budget the floor's coarse
+/// spectrogram decodes still happen (the floor stays unconditional for
+/// COARSE work), but the per-symbol FFT fallback is never entered:
+/// zero extraction attempts, a positive budget-refusal count, and the
+/// window's budget reported exhausted. Proven on the full
+/// `wsjt/210703_133430.wav` recording (the fallback-live shape — 180k
+/// samples admit non-zero time offsets) and on the explicit 162,000-
+/// sample production shape.
+#[test]
+fn expired_budget_floor_skips_fft_fallback() {
+    for (label, samples) in [
+        ("full", read_fixture_window("wsjt/210703_133430.wav")),
+        (
+            "162000",
+            read_fixture_window("wsjt/210703_133430.wav")[..162_000].to_vec(),
+        ),
+    ] {
+        let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let (msgs, report) = d
+            .decode_window_budgeted(&samples, DecodeBudget::until(std::time::Instant::now()))
+            .unwrap();
+        assert!(
+            report.budget_exhausted,
+            "{label}: expected an already-expired budget to report exhaustion"
+        );
+        assert!(
+            msgs.len() >= 3,
+            "{label}: floor coarse decodes must survive an expired budget, got {}",
+            msgs.len()
+        );
+        let rows = fft_fallback_rows(&report);
+        assert_eq!(
+            rows.len(),
+            1,
+            "{label}: exactly one fft-fallback row per pass: {:?}",
+            report.stages
+        );
+        assert_eq!(
+            rows[0].1, 0,
+            "{label}: an expired budget must record zero fallback extraction attempts"
+        );
+        assert!(
+            rows[0].2 > 0,
+            "{label}: fallback-eligible floor candidates must record budget refusals"
+        );
+    }
+}
+
+/// PAN-313 AC5: each FT8 legacy-candidate pass contributes an
+/// `fft-fallback` row whose attempt count is real extraction work
+/// aggregated across parallel workers (nonzero on a live-shape fixture
+/// under an unlimited budget), whose budget-skip count is zero under an
+/// unlimited budget, and whose counters reset between windows (a second
+/// decode of the same window reports its own row rather than
+/// accumulating the first).
+#[test]
+fn fft_fallback_report_counts_trials_and_resets() {
+    let samples = read_fixture_window("wsjt/210703_133430.wav");
+    let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    let (_msgs1, report1) = d
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    let rows1 = fft_fallback_rows(&report1);
+    assert_eq!(rows1.len(), 1, "stages: {:?}", report1.stages);
+    assert!(
+        rows1[0].1 > 0,
+        "a live unlimited fixture must produce nonzero fallback attempts \
+         (an always-disabled fallback cannot pass): {:?}",
+        rows1
+    );
+    assert_eq!(
+        rows1[0].2, 0,
+        "an unlimited budget must never record fallback budget skips"
+    );
+    assert!(
+        !report1.budget_exhausted,
+        "an unlimited budget must never report exhaustion"
+    );
+
+    // Second window on the SAME decoder: the row is per-window, not a
+    // running total.
+    let (_msgs2, report2) = d
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    let rows2 = fft_fallback_rows(&report2);
+    assert_eq!(rows2.len(), 1, "stages: {:?}", report2.stages);
+    assert_eq!(
+        rows2[0].1, rows1[0].1,
+        "identical windows must report identical attempt counts (reset per window)"
+    );
+
+    // A 2-pass config reports one row per pass that actually ran. Under
+    // parallel test load the legacy call-anchored tracker can cancel
+    // pass 1 (same tolerance as `max_shape_unlimited_budget_accounts_
+    // for_every_configured_pass`), so rows are compared against
+    // `passes_run`, not the configured 2.
+    let mut d2 = Ft8Decoder::new(Ft8Config {
+        max_decode_passes: 2,
+        ..Ft8Config::default()
+    })
+    .unwrap();
+    let (_msgs3, report3) = d2
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    assert!(report3.passes_run >= 1, "stages: {:?}", report3.stages);
+    assert_eq!(
+        fft_fallback_rows(&report3).len() as u32,
+        report3.passes_run,
+        "every run pass must contribute one fft-fallback row: {:?}",
+        report3.stages
+    );
+}
+
+/// PAN-313 AC4: unlimited-budget decoding returns exactly the frozen
+/// pre-change message sets for every committed WAV fixture at
+/// 151,680 / 162,000 / full-recording sample lengths. The baseline JSON
+/// is generated by `pancetta-ft8/examples/pan313_fallback_eval.rs`
+/// `--mode baseline` against the PARENT revision (2c60caf, before the
+/// gate existed), so this compares the gated decoder against genuinely
+/// pre-change behavior — not two entry points sharing the new code.
+/// Exact sets, not counts or subsets; a missing fixture entry fails.
+#[test]
+fn unlimited_fft_fallback_matches_frozen_baseline() {
+    let baseline_path = format!(
+        "{}/tests/fixtures/fft_fallback_baseline.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let baseline: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&baseline_path)
+            .unwrap_or_else(|e| panic!("failed to read {baseline_path}: {e}")),
+    )
+    .expect("baseline JSON must parse");
+
+    let recordings = baseline["recordings"]
+        .as_array()
+        .expect("baseline must hold a recordings array");
+    assert!(
+        recordings.len() >= 13,
+        "baseline must cover every committed fixture WAV"
+    );
+
+    for rec in recordings {
+        let path = rec["path"].as_str().expect("path");
+        let full = read_wav_file(&fixture(path));
+        for (label, len) in [
+            ("151680", WINDOW_SAMPLES),
+            ("162000", 162_000),
+            ("full", full.len()),
+        ] {
+            let expected: std::collections::BTreeSet<String> = rec["lengths"][label]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path}@{label}: baseline entry missing"))
+                .iter()
+                .map(|v| v.as_str().expect("baseline texts are strings").to_string())
+                .collect();
+            let actual: std::collections::BTreeSet<String> = {
+                let window = &full[..len.min(full.len())];
+                let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+                d.decode_window_budgeted(window, DecodeBudget::unlimited())
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .map(|m| m.text)
+                    .collect()
+            };
+            assert_eq!(
+                actual, expected,
+                "{path}@{label}: unlimited decode set changed against the frozen baseline"
+            );
+        }
     }
 }
