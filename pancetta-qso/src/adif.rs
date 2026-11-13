@@ -710,7 +710,7 @@ impl AdifProcessor {
         }
 
         AdifQso {
-            qso_date: metadata.start_time,
+            qso_date: metadata.contact_started_at(),
             qso_date_off: metadata.end_time,
             call: metadata.their_callsign.clone().unwrap_or_default(),
             mode: metadata.mode.clone(),
@@ -775,6 +775,7 @@ impl AdifProcessor {
                 .submode
                 .clone()
                 .unwrap_or_else(|| adif_qso.mode.clone()),
+            first_answer_at: None,
             start_time: adif_qso.qso_date,
             end_time: adif_qso.qso_date_off,
             reports: SignalReports {
@@ -1762,6 +1763,7 @@ ADIF Export for Test Program
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: Utc::now(),
             end_time: None,
             reports: SignalReports {
