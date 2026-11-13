@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-335: The Linux service waits for pipeline initialization and restarts after missed coordinator health passes. `pancetta doctor` now checks enabled network services, log disk space and microphone permission separately, with a fix for each problem. Real systemd restart and macOS TCC qualification remain pending.
 - PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
 - PAN-346: Needed and ATNO now match DXCC entity IDs across alternate prefixes. Exact calls and KG4 length rules correct entity resolution, and local history shares identity across cty subdivisions.

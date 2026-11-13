@@ -54,8 +54,12 @@ pub(crate) enum MicrophoneAuthorization {
 pub(crate) fn microphone_authorization() -> MicrophoneAuthorization {
     use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
     // SAFETY: querying authorization neither opens capture nor requests a prompt.
-    let status =
-        unsafe { AVCaptureDevice::authorizationStatusForMediaType(AVMediaTypeAudio.unwrap()) };
+    let status = unsafe {
+        let Some(audio) = AVMediaTypeAudio else {
+            return MicrophoneAuthorization::Unknown;
+        };
+        AVCaptureDevice::authorizationStatusForMediaType(audio)
+    };
     match status {
         AVAuthorizationStatus::Authorized => MicrophoneAuthorization::Authorized,
         AVAuthorizationStatus::Denied => MicrophoneAuthorization::Denied,

@@ -132,6 +132,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `remote_gateway/` | Local read-only WebSocket gateway (Panino). |
 | `replay.rs` | Replay mode: listing recorded WAVs and feeding decode windows. |
 | `restart_budget.rs` | Reconnect/restart backoff and restart budgets. |
+| `service_notify.rs` | systemd READY/WATCHDOG/STOPPING notifications driven by completed health passes (PAN-335). |
 | `session_state.rs` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |
 | `shutdown.rs` | Graceful shutdown, task join and direct rigctld PTT-off budgets. |
 | `spot_call.rs` | Space on a network spot: QSY to its dial and call (PAN-287). |

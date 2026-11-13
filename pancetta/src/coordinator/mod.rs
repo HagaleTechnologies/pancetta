@@ -36,6 +36,7 @@ mod pipeline;
 mod psk_reporter;
 mod qrz_lookup;
 mod qso;
+mod service_notify;
 #[doc(hidden)]
 pub use qso::{prepare_local_qso_index, LocalIndex};
 mod qso_filter;
@@ -1313,6 +1314,7 @@ pub struct ApplicationCoordinator {
     /// never / headless). Stamped by the TUI key handler, read by the autonomous
     /// engine's FCC §97.221 presence gate (see [`operator_present_now`]).
     last_operator_input_ms: Arc<std::sync::atomic::AtomicU64>,
+    service_notify: Arc<service_notify::ServiceNotify>,
     startup_time: Instant,
 
     /// Configuration
@@ -2492,6 +2494,7 @@ impl ApplicationCoordinator {
             // 0 = no console input seen yet → not present → respond-only
             // initiation until the operator touches the keyboard.
             last_operator_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            service_notify: Arc::new(service_notify::ServiceNotify::new()),
             startup_time,
             audio_device,
             no_audio,
@@ -2945,6 +2948,9 @@ impl ApplicationCoordinator {
                 return Err(error);
             }
         };
+        if !self.replay_mode() {
+            self.service_notify.startup.store(true, Ordering::Release);
+        }
         let main_loop_result = self.run_main_loop().await;
         // The clock-skew monitor is advisory and holds no resources; stop it
         // before the component teardown (or an early error return) rather

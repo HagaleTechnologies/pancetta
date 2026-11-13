@@ -60,11 +60,12 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   is an *anytime* algorithm with a per-window budget that self-tunes to the
   host, so slow hardware degrades recall instead of falling over.
 - **`pancetta doctor`.** One command checks config, clock vs. NTP, audio
-  device and level, decoder, and `rigctld`, with a fix for each problem.
-  Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT CONFIGURED (2),
-  and NOT READY (3). `pancetta doctor --json` emits one report with per-check
-  status, detail and fix. ON-AIR READY covers these prerequisites; doctor
-  does not test PTT or transmit audio.
+  device and level, decoder, `rigctld`, enabled network services, log disk
+  space and microphone permission. It prints the fix for each warning or
+  failure. Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT
+  CONFIGURED (2), and NOT READY (3). `pancetta doctor --json` emits one
+  report with per-check status, detail and fix. ON-AIR READY covers these
+  prerequisites; doctor does not test PTT or transmit audio.
 
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).
@@ -341,6 +342,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 
 | Capability | State | Environment and limits | Evidence |
 |---|---|---|---|
+| Linux service watchdog and field diagnostics | Implemented, unreleased | READY follows pipeline initialization; missed health passes trigger recovery. Real systemd restart and macOS TCC qualification pending. | `systemd_unit`, `service_notify`, doctor tests; [runbook](docs/RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) |
 | FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity of the shipped pipeline, and of the native decoder alone vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
