@@ -64,6 +64,87 @@ pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
 static EXACT_INDEX: LazyLock<HashMap<&'static str, &'static str>> =
     LazyLock::new(|| crate::dxcc_exact::EXACT_TABLE.iter().copied().collect());
 
+/// CQ and ITU zones for the entity selected by [`entity_for_callsign`].
+/// Full-call overrides precede KG4 rules and prefix overrides. Conflicting
+/// entity and zone tables fail closed instead of borrowing another entity's zones.
+pub fn zones_for_callsign(call: &str) -> Option<(u8, u8)> {
+    let entity = entity_for_callsign(call)?;
+    let normalized = call.trim().to_uppercase();
+    let c = crate::callsign::resolve_hash_render(&normalized)?;
+    ZONES.lookup(c, entity, EXACT_INDEX.contains_key(c))
+}
+
+type ZoneRow = (&'static str, &'static str, u8, u8);
+
+struct ZoneIndex {
+    defaults: HashMap<&'static str, (u8, u8)>,
+    prefixes: HashMap<&'static str, (&'static str, u8, u8)>,
+    exact: HashMap<&'static str, Vec<(&'static str, u8, u8)>>,
+    max_len: usize,
+}
+
+impl ZoneIndex {
+    fn new(defaults: &[(&'static str, u8, u8)], prefixes: &[ZoneRow], exact: &[ZoneRow]) -> Self {
+        let mut by_exact: HashMap<_, Vec<_>> = HashMap::new();
+        for &(call, entity, cq, itu) in exact {
+            by_exact.entry(call).or_default().push((entity, cq, itu));
+        }
+        Self {
+            defaults: defaults
+                .iter()
+                .map(|&(entity, cq, itu)| (entity, (cq, itu)))
+                .collect(),
+            prefixes: prefixes
+                .iter()
+                .map(|&(prefix, entity, cq, itu)| (prefix, (entity, cq, itu)))
+                .collect(),
+            exact: by_exact,
+            max_len: prefixes
+                .iter()
+                .map(|(prefix, _, _, _)| prefix.len())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn lookup(&self, c: &str, selected: &str, entity_exact: bool) -> Option<(u8, u8)> {
+        if let Some(rows) = self.exact.get(c) {
+            // Multiple source entities can name one exact call. Only the entity
+            // selected by the existing resolver may supply its zones.
+            return rows
+                .iter()
+                .find_map(|&(entity, cq, itu)| (entity == selected).then_some((cq, itu)));
+        }
+        // An old entity exception without matching zone evidence cannot safely
+        // inherit zones from a prefix or from the KG4 length rule.
+        if entity_exact {
+            return None;
+        }
+        if sub_entity_rule(c).is_some() {
+            return self.defaults.get(selected).copied();
+        }
+        for len in (1..=c.len().min(self.max_len)).rev() {
+            if let Some(&(entity, cq, itu)) =
+                c.get(..len).and_then(|prefix| self.prefixes.get(prefix))
+            {
+                return (entity == selected).then_some((cq, itu));
+            }
+        }
+        if us_safety_net(c) == Some(selected) {
+            return self.defaults.get(selected).copied();
+        }
+        None
+    }
+}
+
+static ZONES: LazyLock<ZoneIndex> = LazyLock::new(|| {
+    ZoneIndex::new(
+        crate::dxcc_zones::ZONE_DEFAULTS,
+        crate::dxcc_zones::ZONE_PREFIXES,
+        crate::dxcc_zones::ZONE_EXACT,
+    )
+});
+
 struct EntityIndex {
     by_name: HashMap<&'static str, (u16, &'static str)>,
     by_primary: HashMap<&'static str, u16>,
@@ -259,6 +340,68 @@ pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zones_follow_header_prefix_exact_and_kg4_precedence() {
+        for (call, expected) in [
+            ("DL1ABC", (14, 28)),
+            ("K0ABC", (4, 7)),
+            ("N2NL/MM", (7, 8)),
+            ("KG4AB", (8, 11)),
+            ("KG4ABC", (5, 8)),
+            ("KG4BKW", (27, 64)),
+            ("3Y0J", (38, 67)),
+        ] {
+            assert_eq!(zones_for_callsign(call), Some(expected), "{call}");
+        }
+        let fixture = ZoneIndex::new(
+            &[("Guantanamo Bay", 8, 11), ("United States", 5, 8)],
+            &[("KG4", "Guantanamo Bay", 8, 11)],
+            &[("KG4AB", "United States", 4, 7)],
+        );
+        // Inject an entity exact override that wins over the KG4 rule.
+        assert_eq!(fixture.lookup("KG4AB", "United States", true), Some((4, 7)));
+        // Full calls only; an exact row does not cover portable suffixes.
+        assert_eq!(
+            fixture.lookup("KG4AB/P", "Guantanamo Bay", false),
+            Some((8, 11))
+        );
+    }
+
+    #[test]
+    fn zones_normalize_calls_and_fail_closed() {
+        for call in ["dl1abc", " DL1ABC ", "<DL1ABC>", "DL1ABC/P"] {
+            assert_eq!(zones_for_callsign(call), Some((14, 28)), "{call}");
+        }
+        assert_eq!(zones_for_callsign("EA8/G8BCG"), Some((33, 36)));
+        assert_eq!(zones_for_callsign("AHA"), Some((5, 8)));
+        assert_eq!(zones_for_callsign("KG4ÉÉ"), Some((5, 8)));
+        for call in ["", "  ", "QQ1XYZ", "<...>", "É1ABC", "💡"] {
+            assert_eq!(zones_for_callsign(call), None, "{call}");
+        }
+    }
+
+    #[test]
+    fn zones_do_not_cross_entity_boundaries() {
+        let fixture = ZoneIndex::new(
+            &[("United States", 5, 8)],
+            &[("K", "United States", 5, 8), ("K0", "Other", 4, 7)],
+            &[
+                ("K1ABC", "Other", 1, 2),
+                ("K2ABC", "Other", 3, 4),
+                ("K2ABC", "United States", 4, 7),
+            ],
+        );
+        assert_eq!(fixture.lookup("K0ABC", "United States", false), None);
+        assert_eq!(fixture.lookup("K1ABC", "United States", true), None);
+        assert_eq!(fixture.lookup("K2ABC", "United States", true), Some((4, 7)));
+        // An entity-only exact exception without zone evidence must not guess.
+        assert_eq!(fixture.lookup("K3ABC", "United States", true), None);
+        assert_eq!(
+            fixture.lookup("K4ABC", "United States", false),
+            Some((5, 8))
+        );
+    }
 
     #[test]
     fn entity_registry_is_complete_and_ids_are_valid() {
