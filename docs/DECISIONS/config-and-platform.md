@@ -1253,7 +1253,6 @@ warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
 
-<<<<<<< HEAD
 ## PAN-303: remove configuration without runtime consumers
 
 Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
@@ -1271,7 +1270,7 @@ by the conservative cutoff at each source file's first `#[cfg(test)]`.
 The waiver ceiling cannot grow. Remaining settings need separate consumer
 or removal work; optional values absent from defaults and user map entries
 are outside this test's enumeration.
-=======
+
 ## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
 
 The release workflow's build job now holds `id-token: write` and
@@ -1293,4 +1292,3 @@ Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
 receive a release-candidate notice. They require a real, matching CHANGELOG
 section; there is no Unreleased fallback. The operator still publishes the
 draft. macOS signing and notarization remain PAN-265.
->>>>>>> a78c810274c556774c8180e1ad2415733aa22752
