@@ -159,7 +159,7 @@ cargo test --workspace --exclude pancetta-research --features transmit
 # pancetta-hamlib's mock-rig tests run single-threaded
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
-cargo check -p pancetta --no-default-features   # CI's no-default-features check
+cargo check -p pancetta --no-default-features   # local pre-push check (scripts/check.sh); CI dropped the duplicate in PAN-321
 
 # Run one test
 cargo test -p <crate> <test_name>

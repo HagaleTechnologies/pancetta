@@ -86,13 +86,13 @@ env:
 # local pre-push hook (scripts/check.sh) is now a FAST pre-flight (~5 min) and
 # defers the full test run + examples build to CI here. See scripts/check.sh.
 #
-#   - clippy + fmt + ft8-tests + workspace-check + deny: every PR + every push
+#   - clippy + fmt + workspace-check + deny: every PR + every push
 #     to main + schedule (weekly drift) + manual dispatch — but SKIPPED (not
 #     unfiltered) on docs/report-only diffs via the `changes` job below, so
 #     that traffic doesn't spend CI minutes while the required `CI` check
 #     still always runs and reports (see the `on:` comment above for why this
 #     replaced top-level `paths:` filtering).
-#   - merge_group: all five Rust lanes, except research/notes-only groups.
+#   - merge_group: all four Rust lanes, except research/notes-only groups.
 #     A failed scope detector runs every lane.
 #   - cross-platform-check: PR + schedule + dispatch only (macos runners ~10x
 #     cost; not worth gating every main push), same code-changed gate.
@@ -156,8 +156,8 @@ jobs:
           echo "notes_only=$notes_only" >> "$GITHUB_OUTPUT"
           printf 'merge group %s..%s notes_only=%s\n%s\n' "$BASE_SHA" "$HEAD_SHA" "$notes_only" "$changed"
 
-  # codex-clean gate: defers the heavier lanes below (ft8-tests,
-  # workspace-check, cross-platform-check, deny) until wait-for-codex.yml
+  # codex-clean gate: defers the heavier lanes below (workspace-check,
+  # cross-platform-check, deny) until wait-for-codex.yml
   # signals this exact revision's Codex round raised nothing new. clippy
   # and fmt stay ungated (fast, ~2min, immediate feedback regardless of
   # review-round status). Self-contained (no external `uses:` call) since
@@ -190,7 +190,7 @@ jobs:
   # same head_sha, with the ruleset about to be retargeted to require
   # exactly that name. Renamed the DISPLAY name only; the job id `codex-clean`
   # below is unchanged, so every `needs: codex-clean` reference elsewhere in
-  # this file (ft8-tests, workspace-check, cross-platform-check, deny) keeps
+  # this file (workspace-check, cross-platform-check, deny) keeps
   # working exactly as before -- `needs:` resolves by job id, never by name.
   codex-clean:
     name: Codex-clean label gate (waits for wait-for-codex.yml's verdict)
@@ -350,7 +350,7 @@ jobs:
     name: Clippy
     needs: changes
     # always() is load-bearing (Codex P2, this rollout's own review), same reasoning as
-    # ft8-tests below: GitHub auto-skips a job whenever any of its `needs` was itself
+    # workspace-check below: GitHub auto-skips a job whenever any of its `needs` was itself
     # skipped OR FAILED, regardless of a custom `if:`, unless that `if:` includes always().
     # Without it, a genuinely-failed `changes` job on a merge_group run (e.g. a transient
     # checkout failure) would silently skip this job too, and the aggregator's own
@@ -377,6 +377,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: clippy
 
       - name: Clippy (workspace)
@@ -406,10 +407,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # FT8 crate checks + tests — runs on every PR and every push to main
-  # (plus weekly schedule + manual dispatch). Part of the authoritative gate.
-  ft8-tests:
-    name: FT8 Tests
+  workspace-check:
+    name: Workspace Check
     needs: [changes, codex-clean]
     # always() is load-bearing, not decorative: GitHub Actions auto-skips a
     # job whenever any of its `needs` was itself skipped, REGARDLESS of a
@@ -421,6 +420,14 @@ jobs:
     # unrelated to codex-clean.
     if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
+    env:
+      # Examples and test binaries link a large dependency tree. Full
+      # debuginfo exhausted the runner's disk during cold-cache linking
+      # on 2026-06-13. CARGO_PROFILE_DEV_DEBUG supplies example backtraces;
+      # CARGO_PROFILE_TEST_DEBUG supplies test backtraces. line-tables-only
+      # keeps file:line diagnostics while reducing debuginfo size.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       # Explicit first step, not a richer `if:`: a bare
       # `if: ... && (needs.codex-clean.result == 'success' || == 'skipped')`
@@ -429,68 +436,6 @@ jobs:
       # `check-skipped = <job>` OR-clause, from a legitimate skip, letting a
       # real gate failure auto-merge with this job's real work never having
       # run. Fail explicitly instead, so a genuine failure produces `failure`.
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
-
-      # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
-      # toolchain up front instead of letting rustup's override auto-install
-      # it mid-job (a second, wasted download per run). See
-      # docs/DECISIONS/config-and-platform.md.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: 1.98.0
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ft8-tests
-
-      - name: Check (default features)
-        run: cargo check -p pancetta-ft8
-
-      - name: Check (no default features)
-        run: cargo check -p pancetta-ft8 --no-default-features
-
-      - name: Check (transmit feature)
-        run: cargo check --features transmit -p pancetta-ft8
-
-      - name: Run FT8 tests (default features, the standalone build)
-        # The configuration manta and other programs build (PAN-176,
-        # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
-        # run in workspace-check's `--features transmit` test step.
-        run: cargo test -p pancetta-ft8
-
-  workspace-check:
-    name: Workspace Check
-    needs: [changes, codex-clean]
-    # See ft8-tests's own comment above for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
-    runs-on: ubuntu-latest
-    env:
-      # This lane links the whole workspace THREE times (check, examples,
-      # tests). Each test/example binary statically links a large dep tree,
-      # and the workspace ships dozens of example binaries. With full
-      # debuginfo the accumulated target/ exhausted the runner's disk during
-      # linking on a cold cache — `ld` died with SIGBUS (ENOSPC on its
-      # mmap'd output) on 2026-06-13. line-tables-only keeps file:line in
-      # backtraces while dropping ~70-80% of debuginfo size, for both the
-      # dev profile (examples) and the test profile (integration tests).
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
-    steps:
-      # See ft8-tests's own comment above for why this explicit step exists
-      # instead of a richer `if:`.
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
         run: |
           result="${{ needs.codex-clean.result }}"
@@ -526,21 +471,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-check
 
-      - name: Check workspace
-        # Exclude the local-only research harness (CLAUDE.md): its sources and
-        # examples are never built in CI.
-        run: cargo check --workspace --exclude pancetta-research
+      - name: Check FT8 (no default features)
+        run: cargo check -p pancetta-ft8 --no-default-features
 
-      - name: Check pancetta without default features (PAN-331)
-        # The station crate must compile without its default features.
-        # `pancetta-hamlib` is a plain dependency (PAN-331) and the crate has
-        # no default features today (PAN-334 removed `metrics`), so this step
-        # differs from the default build only once a default feature gains
-        # cfg sites. GitHub #270 broke the old hamlib-off build silently
-        # because no lane built it. The opt-in `ft2` build is not checked here.
-        run: cargo check -p pancetta --no-default-features
+      - name: Run FT8 tests (default features, the standalone build)
+        # The configuration manta and other programs build (PAN-176,
+        # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
+        # run in workspace-check's `--features transmit` test step.
+        run: cargo test -p pancetta-ft8
 
       - name: Build examples
         run: cargo build --workspace --exclude pancetta-research --examples
@@ -569,7 +510,7 @@ jobs:
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
     needs: [changes, codex-clean]
-    # See ft8-tests's own comment above for why always() is load-bearing.
+    # See workspace-check's own comment above for why always() is load-bearing.
     if: always() && ((github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
@@ -584,7 +525,7 @@ jobs:
             target: x86_64-pc-windows-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      # See ft8-tests's own comment above for why this explicit step exists
+      # See workspace-check's own comment above for why this explicit step exists
       # instead of a richer `if:`.
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
         shell: bash
@@ -627,6 +568,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: cross-${{ matrix.os }}
 
       - name: Check workspace (default members)
@@ -655,11 +597,11 @@ jobs:
   deny:
     name: Cargo Deny
     needs: [changes, codex-clean]
-    # See ft8-tests's own comment above for why always() is load-bearing.
+    # See workspace-check's own comment above for why always() is load-bearing.
     if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
-      # See ft8-tests's own comment above for why this explicit step exists
+      # See workspace-check's own comment above for why this explicit step exists
       # instead of a richer `if:`.
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
         run: |
@@ -683,7 +625,7 @@ jobs:
     # failure|cancelled grep below wouldn't otherwise catch on its own --
     # codex-clean's own result flows into the SAME toJSON(needs.*.result)
     # string via this needs: entry, so a real gate failure still fails CI.
-    needs: [clippy, fmt, ft8-tests, workspace-check, cross-platform-check, deny, codex-clean, scan-trailers, research-scan-tests]
+    needs: [clippy, fmt, workspace-check, cross-platform-check, deny, codex-clean, scan-trailers, research-scan-tests]
     runs-on: ubuntu-latest
     if: always()
     steps:
