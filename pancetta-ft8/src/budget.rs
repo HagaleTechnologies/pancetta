@@ -7,6 +7,17 @@
 //! two via [`DecodeBudget::has_time_for`]). `DecodeBudget::unlimited()` (used
 //! by every existing entry point) must remain the default so tests, CI, and
 //! the research harness are unaffected and fully deterministic.
+//!
+//! PAN-313 scheduling policy (private to the decoder, no config surface):
+//! the legacy per-symbol FFT fallback — the 21-trial time/frequency sweep
+//! after a candidate's coarse spectrogram decode fails — is OPTIONAL work
+//! admitted only while the budget still covers a conservative sweep
+//! estimate, and each admitted trial re-checks a per-trial estimate
+//! immediately before its extraction (see the `fft-fallback` stage row the
+//! decoder publishes per pass). Floor candidates keep their coarse
+//! spectrogram attempts even after the budget expires; only the optional
+//! FFT refinement can be skipped. Checks happen between work items, so an
+//! in-flight attempt can overrun the deadline.
 
 use std::time::{Duration, Instant};
 
