@@ -3994,9 +3994,13 @@ mod key_tests {
         // its own throwaway state-file path, so no test — including the
         // `v`/`V` view-cycling tests, which actually write to it — ever
         // touches the operator's real `~/.pancetta/tui_state.json`, and no
-        // two tests running in parallel can race on the same file.
+        // two tests running in parallel can race on the same file. Include the
+        // process ID because nextest starts a fresh counter in each process.
         let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state_path = std::env::temp_dir().join(format!("pancetta_tui_test_state_{n}.json"));
+        let state_path = std::env::temp_dir().join(format!(
+            "pancetta_tui_test_state_{}_{n}.json",
+            std::process::id()
+        ));
         App::set_test_tui_state_path(state_path);
 
         let app = Arc::new(RwLock::new(

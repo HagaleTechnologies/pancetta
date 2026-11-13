@@ -1,0 +1,20 @@
+# Only the known wall-clock decoder budget gets a retry in CI.
+[profile.ci]
+retries = 0
+flaky-result = "pass"
+
+[test-groups.real-time-budget]
+max-threads = 1
+
+# Mock rig tests must not run concurrently within a partition.
+[test-groups.hamlib]
+max-threads = 1
+
+[[profile.ci.overrides]]
+filter = "package(=pancetta-ft8) & binary(=wav_decode_tests) & test(=test_decode_within_realtime_budget)"
+test-group = "real-time-budget"
+retries = 1
+
+[[profile.ci.overrides]]
+filter = "package(=pancetta-hamlib)"
+test-group = "hamlib"
