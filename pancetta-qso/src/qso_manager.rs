@@ -2529,7 +2529,7 @@ impl QsoManager {
 
     /// Resolve a CQ opening's TX parity to a CONCRETE value, latching it once.
     ///
-    /// docs/qso-engine-bugs.md BUG 1: calling CQ transmitted on EVERY 15s
+    /// docs/archive/qso-engine-bugs.md BUG 1: calling CQ transmitted on EVERY 15s
     /// window instead of alternating. Root cause: `start_cq`/`start_cq_manual`
     /// accepted `tx_parity: None` (the caller's "Auto, no fixed preference"
     /// case — the DEFAULT for both the manual and autonomous CQ paths) and
@@ -2622,7 +2622,7 @@ impl QsoManager {
             });
         }
         let now = Utc::now();
-        // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
+        // BUG 1 fix (docs/archive/qso-engine-bugs.md): latch a concrete parity ONCE at
         // QSO creation when the caller has no fixed preference (`None`, the
         // Auto-config default) — see `latch_cq_parity_if_none` doc.
         let tx_parity = Self::latch_cq_parity_if_none(tx_parity, now);
@@ -2756,7 +2756,7 @@ impl QsoManager {
         }
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
-        // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
+        // BUG 1 fix (docs/archive/qso-engine-bugs.md): latch a concrete parity ONCE at
         // QSO creation when the caller has no fixed preference (`None`, the
         // Auto-config default) — see `latch_cq_parity_if_none` doc.
         let tx_parity = Self::latch_cq_parity_if_none(tx_parity, now);
@@ -11261,7 +11261,7 @@ mod tests {
         assert_eq!(progress.metadata.frequency, 14074000.0);
     }
 
-    /// docs/qso-engine-bugs.md BUG 1, autonomous path: `SlotParityConfig::Auto`
+    /// docs/archive/qso-engine-bugs.md BUG 1, autonomous path: `SlotParityConfig::Auto`
     /// resolves to `tx_parity: None` for a self-CQ opening (see
     /// `classify_autonomous_opening`), so the AUTONOMOUS CQ path is exposed to
     /// the identical bug as the manual path — `start_cq` must latch a concrete
@@ -14435,7 +14435,7 @@ mod tests {
         }
     }
 
-    /// The KJ5NJF bug (docs/qso-engine-bugs.md BUG 2 / qso-state-machine-
+    /// The KJ5NJF bug (docs/archive/qso-engine-bugs.md BUG 2 / qso-state-machine-
     /// analysis.md GAP-2): a caller who entered SendingReport via the
     /// stuck-at-grid arm (DX re-sent grid/call, not a report — so we sent a
     /// PLAIN SignalReport and their_report is still None) must have the rearm
@@ -15913,7 +15913,7 @@ mod tests {
         assert_eq!(p.metadata.call_count, 2, "1 opening + 1 rearm");
     }
 
-    /// docs/qso-engine-bugs.md BUG 1: a `tx_parity: None` (no fixed
+    /// docs/archive/qso-engine-bugs.md BUG 1: a `tx_parity: None` (no fixed
     /// preference — the Auto-config default) CallingCq QSO MUST latch a
     /// single concrete parity at creation and hold it for the life of the
     /// QSO — the opening CQ and EVERY keep-call rearm across many slots must

@@ -117,7 +117,7 @@ requirement and the change from the previous unrestricted caller-admission path.
 > communications.
 
 Every pancetta transmission is a standard FT8 frame that contains our call sign
-(`CQ K5ARH …`, `DX K5ARH …`, `K5ARH …`), so the 10-minute and end-of-QSO ID
+(`CQ W5AU …`, `DX W5AU …`, `W5AU …`), so the 10-minute and end-of-QSO ID
 requirements are met by construction — the same mechanism WSJT-X relies on. **No
 issue.** (Caveat: never transmit a free-text/Tx5 frame that omits the call for
 >10 min; pancetta's structured messages always carry it.)
