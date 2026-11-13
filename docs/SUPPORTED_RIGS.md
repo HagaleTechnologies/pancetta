@@ -32,7 +32,7 @@ Every other rig is mapped to its Hamlib model, but nobody has recorded using it 
 
 ## What the columns mean
 
-- CAT: Pancetta reads and sets frequency and split, and keys PTT, through `rigctld`. Pancetta does not set the rig mode.
+- CAT: Pancetta controls frequency, split and PTT. Optional `[rig] data_mode` sets the CAT mode on connection and after commanded retunes. Omit it for manual mode control. This option is hardware-unverified.
 - Audio: Pancetta decodes from and transmits into the rig's USB sound device, which you pick as input and output in `pancetta setup`. Pancetta has no rig-specific audio code.
 - TX: Pancetta keys the rig and sends FT8 on air.
 - Tested: used on a real station with this rig, as recorded in the README [Capability status](../README.md#capability-status) table.

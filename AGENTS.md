@@ -84,7 +84,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - The TX worker never sends into its own `Ft8Transmitter` bus channel: messages it took off the channel and has not handled go back on the front of its coordinator-owned `TxRequeue`, which it reads before the channel, so no concurrent producer can overtake them and a full channel cannot drop them (PAN-73).
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - Band-plan gate (PAN-118): every PTT-on path — single TX, bundle item, tune, manual PTT, any origin — also refuses, before PTT, when the absolute TX RF (effective split-aware dial + audio offset) falls outside the configured band plan (`edge_warnings` is the master switch; skipped while the dial is the unknown-0 sentinel); bundles drop only the offending items wherever items are still separable, and hold the whole bundle once the waveform is summed. The split input is reconciled from rigs that support readback every poll interval (PAN-206), so front-panel or third-party-CAT split cannot bypass the gate after reconciliation.
-- SWR protection (PAN-251): with `swr_protection` on, the Hamlib poll loop reads SWR every tick while keyed (`ptt_active` or `ptt_on_since`, so manual PTT counts). One valid reading (finite, at least 1.0) above `max_swr` runs the shared `tx_halt` stop (abort, PTT-off, autonomous off, `TxPolicy::Disabled`, `CancelAllQsos`) and reports why. A rig that cannot report SWR is warned about, never blocked, and `get_swr` never invents a reading.
+- SWR protection (PAN-251): with `swr_protection` on, the Hamlib poll loop reads SWR every tick while keyed (`ptt_active` or `ptt_on_since`, so manual PTT counts). High-SWR keyed time reaching `swr_trip_delay_ms` (default 5000 ms) above `max_swr` (default 3.0) runs the shared `tx_halt` stop (abort, PTT-off, autonomous off, `TxPolicy::Disabled`, `CancelAllQsos`) and reports why. High keyed time accumulates across transmissions; unkeyed time does not count. A reading at or below the limit resets it, as does more than two minutes without a high reading. Zero delay trips on the first high reading. CAT support is required; real-rig trip qualification is pending. A rig that cannot report SWR is warned about, never blocked, and `get_swr` never invents a reading.
 - TX-offset candidates have one source, `frequency::admissible_candidates`: both `allocate_smart_frequency_in_range` paths (spectral and no-snapshot) filter it by one `TxOffsetConstraints` and share one exhaustion tail (`avoid_hz` returned unchanged), and the placement instrument ranks its unconstrained grid; a new constraint kind goes into `TxOffsetConstraints`, never into one path (PAN-80).
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - Stable decoder API (PAN-380): the items listed in `pancetta-ft8/README.md` § Stable API and compatibility policy are pinned at compile time by `pancetta-ft8/tests/stable_api_guard.rs`. Changing one needs a minor crate-version bump while below 1.0, the README list, the guard and `CHANGELOG.md` in one PR, proposed in dispensa first.
@@ -110,7 +110,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Where Things Live
 
-- `docs/superpowers/specs/` — design specs (authoritative for current behavior)
+- `docs/superpowers/specs/` — design specs
 - `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
@@ -149,3 +149,5 @@ docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
 credenza; edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
 instead of hand-editing this copy.
+
+When sources conflict: code > curated docs > docs/DECISIONS/ > docs/superpowers/specs/ and implementation plans.

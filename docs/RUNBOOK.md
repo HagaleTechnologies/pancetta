@@ -27,6 +27,13 @@ toggles autonomous mode live with `a` and pauses/resumes it with
 TX and forces autonomous off). Headless runs have no runtime toggle —
 for a supervised headless station, config is the only switch.
 
+Emergency and SWR halts are held in memory. Restarting the pancetta process, including
+an automatic restart by systemd or launchd, clears them. A headless process starts
+autonomous operation again when `[autonomous].enabled = true`. Before restarting,
+correct the fault and set that option to false if autonomous operation must remain off.
+In the TUI, fix the antenna, press `g` to re-enable TX, and press `a` to resume
+autonomous operation.
+
 ---
 
 ## Unattended operation & process supervision
@@ -108,10 +115,16 @@ operator-supervised.
 
 1. **Build is current.**
    ```bash
-   git fetch origin && git rev-parse HEAD == git rev-parse origin/main
+   git fetch origin && {
+     if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+       echo 'matches origin/main'
+     else
+       echo 'differs from origin/main'
+     fi
+   }
    ```
-   If the local main isn't at `origin/main`, either pull or stash; you
-   want the autonomous run on a known-clean tree.
+   If the revisions differ, inspect the local changes and branch history.
+   A different revision is not necessarily behind. Run on a known-clean tree.
 
 2. **Test suite is green locally.**
    ```bash
@@ -122,7 +135,7 @@ operator-supervised.
 
 3. **Hardware sanity.**
    - Rig powered on, USB cable seated, audio interface visible:
-     `pancetta --list-audio` shows your CODEC.
+     `pancetta test-audio --list` shows your CODEC.
    - `rigctld --list | grep -i ftdx10` confirms the model number
      (`1042` for the FTdx10).
    - Dummy load attached — *don't* go live on antenna for the first
@@ -137,7 +150,7 @@ operator-supervised.
    - `[station].grid_square` is your real grid (4 chars minimum)
    - `[rig.interface].enabled = true`, port and baud match your CAT
      setup (FTdx10 default: model `1042`, baud `38400`)
-   - `[audio]` device names match `--list-audio` output verbatim
+   - `[audio]` device names match `pancetta test-audio --list` output verbatim
    - `[autonomous].enabled = false` for now (we toggle it last)
    - `[autonomous].max_concurrent_qsos = 1` for first run (don't pile
      QSOs on top of each other while you're learning the behavior)
@@ -194,20 +207,25 @@ operator-supervised.
 ### Switch to antenna
 
 - **Pick a clean TX offset:** with the operator's TX parity selected
-  (Auto, Even, or Odd in `[station].tx_self_parity`), press `T` to
-  auto-pick a 25 Hz candidate. The waterfall's occupancy strip (top
-  row) shows the rationale: green/dim = clear, yellow = busy in
+  (Auto, Even, or Odd in `[station].tx_self_parity`), press `t` to
+  auto-pick a 25 Hz candidate. `Shift+T` sends a tune carrier. The waterfall's
+  occupancy strip (top row) shows the rationale: green/dim = clear, yellow = busy in
   opposite parity (won't collide but courtesy concern), red = busy in
   your parity. The TX cursor (`│`) recolors to match the column it's
   on so manual `[`/`]` adjustments give live feedback.
 
 8. **Switch to antenna.** Disconnect dummy load, connect antenna,
-   confirm SWR is sane on a brief tune-up tone. (Don't tune through
-   pancetta — use the rig's tune button.) Pancetta does not currently
-   tune the rig. With `swr_protection` on (the default), pancetta also
-   reads the rig's SWR meter while keyed and halts all TX on a reading
-   above `max_swr`. The strip then shows `■ RX ONLY` and
-   `⚠ High SWR …`. Fix the antenna, then press `g`. If the strip shows
+   confirm SWR is sane on a brief tune-up tone. Use the rig's tune button or `Shift+T`
+   for Pancetta's tune carrier. With `swr_protection` on (the default), Pancetta halts
+   all TX after high-SWR keyed time reaches `swr_trip_delay_ms`, default 5000 ms, above
+   `max_swr`, default 3.0. High keyed time accumulates across transmissions; unkeyed
+   time does not count. A reading at or below the limit resets it, as does more than two
+   minutes without a high reading. Zero delay trips on the first high reading. CAT
+   support is required; real-rig trip qualification is pending.
+
+   The strip then shows `■ RX ONLY` and `⚠ High SWR …`. Fix the antenna,
+   press `g` to re-enable TX, then `a` to resume autonomous operation.
+   See the process-restart warning under [Operating modes](#modes-of-operation). If the strip shows
    `⚠ SWR protection is unavailable on this rig`, your rig or Hamlib
    build does not report SWR, so keep watching an external meter.
 
