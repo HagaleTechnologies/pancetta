@@ -370,9 +370,10 @@ fn nonterminal_syntax_error_never_offers_repair() {
     let s = Scratch::new();
     let path = s.write_default_config(SYNTAX_ERROR_LINE_2);
     let before = std::fs::read(&path).unwrap();
-    let out = s
-        .raw_command()
-        .stdin(std::process::Stdio::null())
+    let mut cmd = s.raw_command();
+    cmd.stdin(std::process::Stdio::null());
+    let out = Command::from_std(cmd)
+        .timeout(Duration::from_secs(60))
         .output()
         .unwrap();
     let all = format!("{}{}", stdout(&out), stderr(&out));
