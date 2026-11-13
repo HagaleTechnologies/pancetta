@@ -1608,6 +1608,14 @@ fn verify_and_arm(
                      (revoked by a concurrent authorization refresh)"
                 ));
             }
+            // Trust may have been replaced while this grant was verified.
+            // The publisher holds arm while replacing keys, so compare the
+            // actual verifying key under arm, not just keyId eligibility.
+            if ctx.client_keys.read().unwrap().get(client_key_id) != Some(&client_vk) {
+                return Err(format!(
+                    "device key for client {client_key_id} changed during arm verification"
+                ));
+            }
             // Arming over this channel requires THIS channel's own consent
             // (`remote_tx_enabled`); another channel's consent never
             // satisfies it. Read under the same lock as the arm so a
@@ -2323,9 +2331,10 @@ fn publish_trust(
         .cloned()
         .collect();
     let mut effects = Vec::new();
+    let current_keys = live.client_keys.read().unwrap_or_else(|p| p.into_inner());
     if let Some(kid) = st
         .armed_client_key_id()
-        .filter(|kid| !eligible.contains(*kid))
+        .filter(|kid| !eligible.contains(*kid) || current_keys.get(*kid) != keys.get(*kid))
     {
         let reason = if candidates.contains(kid) {
             DisarmReason::LocalTrustRevoked
@@ -2335,6 +2344,7 @@ fn publish_trust(
         effects = st.disarm_with_reason(reason, now_ms());
         live.revocation_pending.store(true, Ordering::Release);
     }
+    drop(current_keys);
     let mut current = live
         .tx_arm_allow_list
         .write()
@@ -8595,6 +8605,105 @@ mod tests {
     #[tokio::test]
     async fn local_untrust_drops_remote_tx_permission() {
         exercise_trust_refresh(false, 0).await;
+    }
+
+    #[test]
+    fn trust_key_replacement_during_verification_refuses_arm() {
+        let mut ctx = ctx_with(true, true);
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        let arm = ctx.arm.clone();
+        let keys = ctx.client_keys.clone();
+        let eligible = ctx.tx_arm_allow_list.clone();
+        let arm_guard = arm.lock().unwrap();
+        // Pause verification at its initial key lookup. Its eligibility read
+        // lock tells us it reached that lookup, without timing assumptions.
+        let keys_guard = keys.write().unwrap();
+        let worker = std::thread::spawn(move || {
+            verify_and_arm(
+                &valid_token(),
+                &signed_grant("rotate-during-verify"),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                "sess-1",
+                at(NOW),
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while eligible.try_write().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "verification did not start"
+            );
+            std::thread::yield_now();
+        }
+        drop(keys_guard);
+        // Once verification releases eligibility, it can only be waiting on
+        // arm, which we hold. Publish a replacement key under that same lock.
+        loop {
+            if eligible.try_write().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "verification did not finish"
+            );
+            std::thread::yield_now();
+        }
+        keys.write().unwrap().insert(
+            CLIENT_KEY_ID.into(),
+            ed25519_dalek::SigningKey::from_bytes(&[99; 32]).verifying_key(),
+        );
+        drop(arm_guard);
+        let result = worker.join().unwrap();
+        assert!(
+            result.is_err(),
+            "verification using replaced key must not arm"
+        );
+        assert!(arm.lock().unwrap().armed_client_key_id().is_none());
+    }
+
+    #[test]
+    fn trust_key_replacement_disarms_existing_grant() {
+        let mut ctx = ctx_with(true, true);
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        verify_and_arm(
+            &valid_token(),
+            &signed_grant("rotate-key"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            "sess-1",
+            at(NOW),
+        )
+        .unwrap();
+        let live = trust_live(&ctx);
+        let dir = tempfile::tempdir().unwrap();
+        let old_key = client_key().verifying_key().to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &old_key, false)
+            .unwrap();
+        // An unchanged refresh preserves a valid arm.
+        publish_trust(&live, &ctx.arm, &ctx.audit, None, None, dir.path());
+        assert!(ctx.arm.lock().unwrap().armed_client_key_id().is_some());
+        let new_key = ed25519_dalek::SigningKey::from_bytes(&[99; 32])
+            .verifying_key()
+            .to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &new_key, true)
+            .unwrap();
+        publish_trust(&live, &ctx.arm, &ctx.audit, None, None, dir.path());
+        assert!(ctx
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(
+            ctx.arm.lock().unwrap().armed_client_key_id().is_none(),
+            "replacing trust material must disarm the old key's grant"
+        );
+        assert!(live.revocation_pending.load(Ordering::Acquire));
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
     }
 
     #[test]
