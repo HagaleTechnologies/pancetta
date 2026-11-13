@@ -27,7 +27,10 @@ fn crate_version_matches_documented_tag_scheme() {
         "pancetta-ft8/Cargo.toml must set an explicit `version`:\n{manifest}"
     );
     assert!(
-        !manifest.contains("version.workspace = true"),
+        // Match the package-version key, not `rust-version.workspace`.
+        !manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with("version.workspace")),
         "pancetta-ft8/Cargo.toml must not inherit the workspace version"
     );
 

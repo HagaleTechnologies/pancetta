@@ -26,9 +26,6 @@ name = "libasound2-dev"
 name = "libudev-dev"
 
 [[environment.system_packages]]
-name = "libssl-dev"
-
-[[environment.system_packages]]
 name = "pkg-config"
 
 # Catalyst's runner exports GIT_CONFIG_KEY_n overrides (remote.origin.url and

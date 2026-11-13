@@ -7,6 +7,7 @@ description = "High-performance FT8 digital mode decoder for Pancetta"
 # the matching tag on the merge commit.
 version = "0.9.7"
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -22,16 +23,12 @@ rustfft = "6.4"
 realfft = "3.5"
 # Numeric operations with SIMD optimization
 num-complex = "0.4"
-num-traits = "0.2"
 # Bit manipulation for FT8 protocol
 bitvec = "1.0"
-# Time handling
-time = "0.3"
 # Concurrency primitives
 rayon = "1.12"
 # Error handling
 thiserror = "2.0"
-anyhow = "1.0"
 # Logging/tracing
 tracing = "0.1"
 # Serial port communication for PTT/CAT control
@@ -40,8 +37,6 @@ serialport = { version = "4.9", optional = true }
 rppal = { version = "0.22", optional = true }
 # Audio output and control
 cpal = { version = "0.18", optional = true }
-# Date/time handling for transmission scheduling
-chrono = { version = "0.4", features = ["serde"], optional = true }
 # Atomic operations for thread-safe state
 parking_lot = { version = "0.12", optional = true }
 # Configuration handling (optional: required by benchmark and transmit features)
@@ -95,7 +90,7 @@ ffi = []
 gpio = ["rppal"]
 # The audio/PTT transmitter (`transmit.rs`: `Ft8Transmitter` and its device
 # stack). The encoder and modulator are in every build (PAN-331).
-transmit = ["serde", "serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde_json", "dep:sha2"]
+transmit = ["serde", "serialport", "cpal", "parking_lot", "tokio", "dep:serde_json", "dep:sha2"]
 # Enable benchmark harness for decoder comparison
 benchmark = ["dep:hound", "dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable serde Serialize/Deserialize for config types (used by research harness)

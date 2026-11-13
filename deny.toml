@@ -17,14 +17,6 @@ yanked = "deny"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
 ignore = [
-    # webpki-roots 0.26.11 is a compatibility shim: it depends on webpki-roots
-    # 1.x and re-exports its root list, and Cargo.lock resolves that to 1.0.10,
-    # which drops the distrusted emSign root. The advisory matches the shim on
-    # its version number alone. It comes in via sqlx-core 0.8.6
-    # (runtime-tokio-rustls); pancetta only uses sqlx for SQLite, so there is
-    # no TLS surface. Remove this once sqlx depends on webpki-roots 1.x directly.
-    { id = "RUSTSEC-2026-0381", reason = "0.26.11 shim re-exports webpki-roots 1.0.10 (fixed); sqlx SQLite-only, no TLS use" },
-
     # SQLite < 3.54.0 can return leftover process memory when it opens a
     # database next to a crafted `-wal` file with a different page size. The
     # bundled copy comes from libsqlite3-sys 0.30.1 via sqlx-sqlite 0.8.6. The
@@ -81,12 +73,66 @@ confidence-threshold = 0.93
 # Block a crate from showing up under multiple major versions in the graph
 # unless we explicitly allow it. Multiple-version skews are a common source
 # of bloat and behaviour drift.
-multiple-versions = "warn"
+multiple-versions = "deny"
 # Wildcard external deps are a footgun (silent major-version bumps), but
 # our internal `path = "../pancetta-foo"` workspace edges resolve as
 # wildcards and that's normal Rust workspace shape. allow-wildcard-paths
 # permits the path case while still denying `version = "*"` on a
 # crates.io dep.
+skip = [
+    # axum 0.8.9, hyper-util 0.1.20, sqlx-core 0.8.6, wiremock 0.6.5: upstream semver requirement cannot use the newer line.
+    { name = "base64", version = "=0.22.1" },
+    # nix 0.26.4: upstream semver requirement cannot use the newer line.
+    { name = "bitflags", version = "=1.3.2" },
+    # digest 0.10.7: upstream semver requirement cannot use the newer line.
+    { name = "block-buffer", version = "=0.10.4" },
+    # chacha20poly1305 0.10.1: upstream semver requirement cannot use the newer line.
+    { name = "chacha20", version = "=0.9.1" },
+    # system-configuration 0.7.0: upstream semver requirement cannot use the newer line.
+    { name = "core-foundation", version = "=0.9.4" },
+    # aes 0.8.4, chacha20 0.9.1, curve25519-dalek 4.1.3, poly1305 0.8.0, polyval 0.6.2, sha1 0.10.7, sha2 0.10.9: upstream semver requirement cannot use the newer line.
+    { name = "cpufeatures", version = "=0.2.17" },
+    # aead 0.5.2, cipher 0.4.4, digest 0.10.7, universal-hash 0.5.1: upstream semver requirement cannot use the newer line.
+    { name = "crypto-common", version = "=0.1.7" },
+    # snow 0.10.0: upstream semver requirement cannot use the newer line.
+    { name = "curve25519-dalek", version = "=4.1.3" },
+    # blake2 0.10.6, sha1 0.10.7, sha2 0.10.9: upstream semver requirement cannot use the newer line.
+    { name = "digest", version = "=0.10.7" },
+    # hashbrown 0.15.5: upstream semver requirement cannot use the newer line.
+    { name = "foldhash", version = "=0.1.5" },
+    # ring 0.17.14: upstream semver requirement cannot use the newer line.
+    { name = "getrandom", version = "=0.2.17" },
+    # rand_core 0.9.5, snow 0.10.0, tempfile 3.27.0: upstream semver requirement cannot use the newer line.
+    { name = "getrandom", version = "=0.3.4" },
+    # hashlink 0.10.0, sqlx-core 0.8.6: upstream semver requirement cannot use the newer line.
+    { name = "hashbrown", version = "=0.15.5" },
+    # kasuari 0.4.12: upstream semver requirement cannot use the newer line.
+    { name = "hashbrown", version = "=0.16.1" },
+    # biquad 0.4.2: upstream semver requirement cannot use the newer line.
+    { name = "libm", version = "=0.1.4" },
+    # io-kit-sys 0.4.1, serialport 4.10.1: upstream semver requirement cannot use the newer line.
+    { name = "mach2", version = "=0.4.3" },
+    # tungstenite 0.29.0: upstream semver requirement cannot use the newer line.
+    { name = "rand", version = "=0.9.5" },
+    # rand 0.9.5, rand_chacha 0.9.0: upstream semver requirement cannot use the newer line.
+    { name = "rand_core", version = "=0.9.5" },
+    # snow 0.10.0 and sqlx-core 0.8.6 require 0.10. Direct ft8/research
+    # migration and hash-identity tests are deferred to the PAN-315 follow-up slice.
+    { name = "sha2", version = "=0.10.9" },
+    # curve25519-dalek-derive 0.1.1, darling_core 0.23.0, darling_macro 0.23.0, derive_more-impl 2.1.1, instability 0.3.12, strum_macros 0.28.0, synstructure 0.13.2, tokio-macros 2.7.1, tracing-attributes 0.1.31, tracing-test-macro 0.2.6, validator_derive 0.20.1, visibility 0.1.1, windows-implement 0.60.2, windows-interface 0.59.3, yoke-derive 0.8.2, zerocopy-derive 0.8.55, zerofrom-derive 0.1.7, zerovec-derive 0.11.3: upstream semver requirement cannot use the newer line.
+    { name = "syn", version = "=2.0.119" },
+    # winapi-util 0.1.11: upstream semver requirement cannot use the newer line.
+    { name = "windows-sys", version = "=0.48.0" },
+    # errno 0.3.14, rustix 1.1.4, rustls-platform-verifier 0.7.0, serialport 4.10.1, tempfile 3.27.0: upstream semver requirement cannot use the newer line.
+    { name = "windows-sys", version = "=0.52.0" },
+    # windows-sys 0.48.0: upstream semver requirement cannot use the newer line.
+    { name = "windows-targets", version = "=0.48.5" },
+    # windows-targets 0.48.5: upstream semver requirement cannot use the newer line.
+    { name = "windows_x86_64_gnu", version = "=0.48.5" },
+    # windows-targets 0.48.5: upstream semver requirement cannot use the newer line.
+    { name = "windows_x86_64_msvc", version = "=0.48.5" },
+]
+
 wildcards = "deny"
 allow-wildcard-paths = true
 # Add explicit `deny = [...]` entries here if a banned crate ever creeps

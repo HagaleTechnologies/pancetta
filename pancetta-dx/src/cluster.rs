@@ -1993,3 +1993,21 @@ mod tests {
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod tls_security_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-support/tls.rs"
+        ));
+    }
+    #[tokio::test]
+    async fn tls_untrusted_cluster() {
+        fixture::rejects_untrusted("wss", |url| async move {
+            DxClusterClient::new().connect_websocket(&url).await
+        })
+        .await;
+    }
+}

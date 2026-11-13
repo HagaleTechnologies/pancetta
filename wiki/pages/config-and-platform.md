@@ -136,3 +136,17 @@ re-capturing the data file you must rerun
 `docs/SUPPORTED_RIGS.md`; upstream reuses one macro for two rows
 (RIG_MODEL_FT450 → 1027 and 1046), so curated tables must pin macros only
 the catalog carries once.
+
+## Dependency TLS choices (PAN-315)
+
+Reqwest 0.13 calls its TLS feature `rustls`, not `rustls-tls`. Keep
+`charset`, `http2` and `system-proxy` when disabling its defaults so response
+decoding and operator proxy settings keep working. WSS uses native OS roots
+through tokio-tungstenite, preserving private-CA support. SQLite SQLx needs
+`runtime-tokio` without TLS. Test TLS servers choose aws-lc explicitly without
+installing a global provider, so tests still expose a broken client provider
+configuration. The graph intentionally retains ring in other crypto consumers.
+
+Validator remains live in `StationConfig::validate_section`. Its six derived
+length/range constraints are not redundant with the semantic checks. Removing
+it must preserve those rules and diagnostic structure in a separate change.
