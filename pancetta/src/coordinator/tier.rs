@@ -300,6 +300,23 @@ fn probe_completion_should_reseed_budget(live_effort: DecodeEffort) -> bool {
     live_effort == DecodeEffort::Auto
 }
 
+// A slow startup calibration must not hold process exit after coordinator
+// shutdown. Like the clock probe, it owns a detached OS thread rather than
+// Tokio's blocking pool, which runtime teardown waits for. Enter the captured
+// handle because the callback publishes its result through async locks.
+fn spawn_probe_thread(work: impl FnOnce() + Send + 'static) {
+    let runtime = tokio::runtime::Handle::current();
+    if let Err(error) = std::thread::Builder::new()
+        .name("hardware-tier-probe".to_string())
+        .spawn(move || {
+            let _entered = runtime.enter();
+            work();
+        })
+    {
+        warn!("tier probe: could not start thread ({error}); leaving defaults active");
+    }
+}
+
 /// Spawn the background probe worker. Runs `probe_hardware_tier(10)`,
 /// persists the cache, and applies the tier to runtime state. All
 /// failures log and return — never panic.
@@ -333,7 +350,7 @@ fn spawn_probe_worker(
     resolved_hardware_tier: Arc<AtomicU8>,
     decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
 ) {
-    tokio::task::spawn_blocking(move || {
+    spawn_probe_thread(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
             Ok(r) => r,
             Err(e) => {
@@ -547,6 +564,38 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn slow_tier_probe_does_not_hold_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.block_on(async {
+            spawn_probe_thread(move || {
+                // The production callback uses Handle::current().block_on.
+                tokio::runtime::Handle::current().block_on(async {});
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            drop(runtime);
+            let _ = done_tx.send(());
+        });
+        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Always release the fake probe, including when the assertion fails.
+        let _ = release_tx.send(());
+        shutdown.join().unwrap();
+        stopped.expect("runtime shutdown waited for the tier probe");
+    }
+
     fn make_cache(tier: &str) -> TierCache {
         TierCache {
             schema_version: CACHE_SCHEMA_VERSION,
@@ -719,7 +768,7 @@ mod tests {
     // exercised end-to-end here — `initialize` reads/writes the real
     // `~/.pancetta/tier_cache.json` (via `default_cache_path`) and
     // `spawn_probe_worker` runs the genuine `probe_hardware_tier` hardware
-    // timing probe on a `spawn_blocking` thread, so driving them from a
+    // timing probe on a detached OS thread, so driving them from a
     // unit test would have real side effects on the developer's machine
     // and non-deterministic timing — the existing test suite already
     // avoids calling `initialize` directly for the same reason. The
