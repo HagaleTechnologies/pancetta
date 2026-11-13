@@ -32,6 +32,16 @@ pub enum ExchangeError {
 
     #[error("Missing capture group {group} in message: {message}")]
     MissingCapture { group: usize, message: String },
+
+    /// PAN-305: persisting the next contest serial failed. The destination
+    /// still holds the last successfully saved value (the write is atomic);
+    /// no contest response was produced for an unpersisted serial.
+    #[error("Failed to persist contest serial at {}: {source}", path.display())]
+    SerialPersistence {
+        path: PathBuf,
+        #[source]
+        source: pancetta_config::ConfigError,
+    },
 }
 
 /// FT8 message exchange handler
@@ -266,18 +276,23 @@ impl MessageExchange {
         }
     }
 
-    /// Save the current contest serial number to the persistence file.
+    /// Save the next contest serial number to the persistence file.
     ///
-    /// Silently ignores I/O errors so a missing or unwritable file never
-    /// disrupts normal operation.
-    fn save_serial(&self, serial: u32) {
+    /// The write goes through [`pancetta_config::Config::write_secure_atomic`]
+    /// (PAN-305): a synced temporary sibling is atomically renamed over the
+    /// destination, so a crash mid-write can never truncate the previous
+    /// value and reset numbering to 001. Failures are returned to the caller
+    /// — an unpersisted serial must not silently produce a contest response.
+    fn save_serial(&self, serial: u32) -> Result<(), ExchangeError> {
         if let Some(ref path) = self.serial_persist_path {
-            // Best-effort: create parent directory if needed
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, serial.to_string());
+            pancetta_config::Config::write_secure_atomic(path, &serial.to_string()).map_err(
+                |source| ExchangeError::SerialPersistence {
+                    path: path.clone(),
+                    source,
+                },
+            )?;
         }
+        Ok(())
     }
 
     /// Load a contest serial number from `path`.
@@ -941,8 +956,14 @@ impl MessageExchange {
                 let serial = self
                     .contest_serial
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Persist the next serial (serial + 1) so a restart picks up where we left off.
-                self.save_serial(serial + 1);
+                // Persist the next serial (serial + 1) so a restart picks up
+                // where we left off, BEFORE the response exists: a caller
+                // only ever receives a serial that was actually saved
+                // (PAN-305). The allocation is NOT rolled back on failure —
+                // reusing an allocation risks handing two QSOs the same
+                // serial; a restart reloads the last successfully saved
+                // value instead.
+                self.save_serial(serial + 1)?;
                 Ok(Some(MessageType::ContestExchange {
                     to_station: target_callsign.clone(),
                     from_station: self.our_callsign.clone(),
@@ -1463,6 +1484,179 @@ mod tests {
                 assert_eq!(grid, Some("EM10".to_string()));
             }
             other => panic!("expected CqResponse, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // PAN-305: crash-safe contest serial persistence. Tests in this module
+    // may construct MessageExchange directly so the private counter and
+    // persistence path are under test control (no HOME mutation, no writes
+    // to the operator's files).
+    // ========================================================================
+
+    /// A contest-mode exchange whose serial counter starts at `start` and
+    /// persists to `persist` (None models "no home directory").
+    fn contest_exchange_with_serial(
+        start: u32,
+        persist: Option<std::path::PathBuf>,
+    ) -> MessageExchange {
+        MessageExchange {
+            our_callsign: "K5ARH".to_string(),
+            contest_mode: Some(ContestExchangeConfig {
+                contest_name: "PAN-305 TEST".to_string(),
+                exchange_format: ExchangeFormat::RstSerial,
+                our_exchange: "599 001".to_string(),
+            }),
+            contest_serial: std::sync::atomic::AtomicU32::new(start),
+            serial_persist_path: persist,
+        }
+    }
+
+    fn responding_to_k5td() -> QsoState {
+        QsoState::RespondingToCq {
+            target_callsign: "K5TD".to_string(),
+            frequency: 14_074_000.0,
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    fn incoming_contest_exchange() -> MessageType {
+        MessageType::ContestExchange {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            report: -10,
+            serial: 7,
+        }
+    }
+
+    /// AC1/AC3: a successful contest response carries the allocated serial
+    /// (42) and persists its successor (43); a restart reloads the last
+    /// successfully saved value, so the next response allocates 43 and
+    /// persists 44.
+    #[test]
+    fn contest_serial_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contest_serial.txt");
+
+        let exchange = contest_exchange_with_serial(42, Some(path.clone()));
+        match exchange
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect("a successful save must produce a contest response")
+        {
+            Some(MessageType::ContestExchange { serial, .. }) => {
+                assert_eq!(serial, 42, "the response carries the allocated serial");
+            }
+            other => panic!("expected a contest exchange response, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "43",
+            "the successor must be persisted through the public call"
+        );
+
+        // A restart reloads the last successfully saved value.
+        let restarted =
+            contest_exchange_with_serial(MessageExchange::load_serial(&path), Some(path.clone()));
+        match restarted
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect("the restarted exchange must answer")
+        {
+            Some(MessageType::ContestExchange { serial, .. }) => {
+                assert_eq!(serial, 43, "the restart must allocate the saved successor");
+            }
+            other => panic!("expected a contest exchange response, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "44");
+    }
+
+    /// AC2: a persistence failure is returned through the public
+    /// `generate_response` call as `SerialPersistence` (path + source) and
+    /// produces no contest response. A regular file used as the would-be
+    /// parent fails deterministically (ENOTDIR) even when tests run as root.
+    #[test]
+    fn contest_serial_write_failure_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let unreachable = blocker.join("contest_serial.txt");
+
+        let exchange = contest_exchange_with_serial(42, Some(unreachable.clone()));
+        let err = exchange
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect_err("a failed serial save must not produce a contest response");
+        match &err {
+            ExchangeError::SerialPersistence { path, source } => {
+                assert_eq!(
+                    path, &unreachable,
+                    "the error must name the persistence path"
+                );
+                assert!(
+                    matches!(source, pancetta_config::ConfigError::Io(_)),
+                    "the error must carry the underlying write failure, got {source:?}"
+                );
+            }
+            other => panic!("expected SerialPersistence, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .starts_with("Failed to persist contest serial at "),
+            "unexpected error text: {err}"
+        );
+    }
+
+    /// AC3: after a failed allocation the in-memory counter stays advanced
+    /// (no rollback — an allocation must never be reused); repairing the
+    /// path lets the next call persist its own successor and return its
+    /// allocated number.
+    #[test]
+    fn contest_serial_retry_after_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let bad = blocker.join("contest_serial.txt");
+        let good = dir.path().join("contest_serial.txt");
+
+        let mut exchange = contest_exchange_with_serial(42, Some(bad));
+        let err = exchange
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect_err("the blocked path must fail");
+        assert!(matches!(err, ExchangeError::SerialPersistence { .. }));
+        assert!(!good.exists(), "nothing was persisted yet");
+
+        // The failed call consumed 42: the retry returns 43 and persists 44.
+        exchange.serial_persist_path = Some(good.clone());
+        match exchange
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect("the repaired path must succeed")
+        {
+            Some(MessageType::ContestExchange { serial, .. }) => {
+                assert_eq!(
+                    serial, 43,
+                    "the failed call's allocation must stay consumed"
+                );
+            }
+            other => panic!("expected a contest exchange response, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&good).unwrap(),
+            "44",
+            "the retry must persist its own successor"
+        );
+    }
+
+    /// AC3: with no persistence path (no home directory), contest responses
+    /// succeed exactly as before and nothing is written.
+    #[test]
+    fn contest_serial_without_persist_path() {
+        let exchange = contest_exchange_with_serial(42, None);
+        match exchange
+            .generate_response(&responding_to_k5td(), &incoming_contest_exchange(), None)
+            .expect("no persistence path must not fail the response")
+        {
+            Some(MessageType::ContestExchange { serial, .. }) => {
+                assert_eq!(serial, 42);
+            }
+            other => panic!("expected a contest exchange response, got {other:?}"),
         }
     }
 }
