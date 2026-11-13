@@ -418,3 +418,66 @@ fn doctor_json_logging_stays_on_stderr() {
         }
     }
 }
+
+#[test]
+fn station_agent_public_plaintext_fails_validation() {
+    for (field, value, scheme) in [
+        ("relay_url", "ws://service.example/agent", "wss"),
+        ("pairing_api_url", "http://cqdx.io/api/v1", "https"),
+    ] {
+        let scratch = Scratch::new();
+        let path = scratch.write_file(
+            "plaintext.toml",
+            &format!("[network.station_agent]\n{field} = {value:?}\n"),
+        );
+        let output = scratch.validate(Some(&path));
+        assert!(!output.status.success());
+        let text = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            text.contains(&format!(
+                "network.station_agent.{field} must use {scheme}://"
+            )),
+            "{text}"
+        );
+        assert!(stdout(&output).contains("Configuration validation: FAIL"));
+    }
+}
+
+#[test]
+fn pair_override_rejects_plaintext_before_identity() {
+    let scratch = Scratch::new();
+    let key_dir = scratch.home.path().join("station-identity");
+    let path = scratch.write_file(
+        "pair.toml",
+        &format!(
+            "[network.station_agent]\npairing_api_url = \"https://cqdx.io/api/v1\"\nkey_dir = {:?}\n",
+            key_dir.to_string_lossy()
+        ),
+    );
+    let output = scratch
+        .command()
+        .arg("--config")
+        .arg(&path)
+        .args([
+            "pair",
+            "PAN310-SECRET-CODE",
+            "--pairing-api-url",
+            "http://cqdx.io/api/v1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("network.station_agent.pairing_api_url must use https://"),
+        "{text}"
+    );
+    assert!(!text.contains("Loading (or generating)"));
+    assert!(!text.contains("Enrolling"));
+    assert!(!text.contains("PAN310-SECRET-CODE"));
+    assert!(
+        !key_dir.exists(),
+        "identity directory was created before validation"
+    );
+    assert!(!scratch.home.path().join(".pancetta/agent").exists());
+}
