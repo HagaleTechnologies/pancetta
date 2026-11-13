@@ -36,7 +36,7 @@ name: Regenerate demo assets
 #   - "pancetta-config/src/**"
 #   - "pancetta-ft8/src/**"
 #
-# Mirrors this repo's other CI lanes (see ci.yml/docs.yml/release.yml):
+# Mirrors this repo's other CI lanes (see ci.yml/release.yml):
 # checkout MUST be `submodules: recursive` and the Linux runner needs the
 # same system packages (libasound2-dev/libudev-dev/libssl-dev/pkg-config)
 # to link cpal/audio + reqwest/TLS deps, or `cargo build -p pancetta` fails
