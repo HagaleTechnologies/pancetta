@@ -433,8 +433,30 @@ fn opens_microphone(cli: &Cli, stub_audio: bool) -> bool {
     }
 }
 
-#[tokio::main]
-async fn async_main(cli: Cli) -> Result<()> {
+/// PAN-314: build the runtime by hand instead of `#[tokio::main]` so the
+/// final teardown is bounded. After the coordinator's graceful shutdown
+/// completes, dropping a runtime still waits for every in-flight
+/// `spawn_blocking` task to return, and on a loaded host those stragglers
+/// can take tens of seconds past the point where anything useful remains.
+/// CI runs the workspace suite one process per test (nextest), so this
+/// binary's lifecycle test shares its host with a whole test shard, and
+/// `tests/tui_lifecycle.rs` asserts the process exits promptly (within
+/// 10 s) after a confirmed quit. `shutdown_timeout` keeps that promise
+/// while the graceful phase — which owns every PTT/Hamlib safety path in
+/// `shutdown_with_gain_sweep` — still runs to completion first. Two
+/// seconds is slack for well-behaved blocking tasks to notice the
+/// shutdown, not a new grace period: the cooperative teardown is already
+/// done when this cap applies.
+fn async_main(cli: Cli) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main_body(cli));
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+async fn async_main_body(cli: Cli) -> Result<()> {
     // Local maintenance needs neither station startup nor logging/config discovery.
     if let Some(Commands::ImportConfirmations(args)) = &cli.command {
         return import_confirmations_command(args.clone()).await;
