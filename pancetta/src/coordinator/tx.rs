@@ -9416,6 +9416,7 @@ impl super::ApplicationCoordinator {
             let live_late_cap = self.tx_late_max_ms_live.clone();
             let autonomous_config_enabled = self.autonomous_config_enabled.clone();
             let autonomous_cq_attempts = self.autonomous_cq_attempts.clone();
+            let autonomous_self_cq_dispatches = self.autonomous_self_cq_dispatches.clone();
             let shutdown = self.shutdown_signal.clone();
             let abort_current_tx = self.abort_current_tx.clone();
             // Tri-state TX policy. The TX worker only enforces the hard
@@ -9640,7 +9641,19 @@ impl super::ApplicationCoordinator {
                                     config.station.tx_self_parity,
                                 )
                             };
-                            let autonomous_request = message.source == ComponentId::Autonomous;
+                            // PAN-302: only a self-CQ the autonomous engine
+                            // actually dispatched (marked at send) is refused
+                            // by the pre-PTT permission recheck below.
+                            // `source == Autonomous` alone is not evidence of
+                            // an engine dispatch — any bus participant can
+                            // name that source (PAN-277's shutdown fixture
+                            // sends exactly the self-CQ shape), and refusing
+                            // its synthetic request silently broke keying.
+                            let autonomous_request = message.source == ComponentId::Autonomous
+                                && super::autonomous::is_marked_autonomous_self_cq_dispatch(
+                                    &autonomous_self_cq_dispatches,
+                                    message.id,
+                                );
                             let is_autonomous_cq = |id: Option<&str>, attempt, text: &str| {
                                 text.starts_with("CQ ")
                                     && (autonomous_request
@@ -24778,6 +24791,77 @@ pub(super) mod pan115_worker_gate_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pan302_unmarked_autonomous_source_cq_still_keys_after_disable() {
+        // PAN-277 regression: `source == Autonomous` alone must not make the
+        // pre-PTT recheck refuse a CQ after a file disable — only a self-CQ
+        // the engine actually dispatched (marked at send) is refused. The
+        // PAN-277 shutdown fixture sends exactly the self-CQ shape with
+        // `source == Autonomous` and `Config::default()`, and must key.
+        let mut config = Config::default();
+        config.station.tx_late_max_ms = 8000;
+        let now = pancetta_core::time::slot_grid_origin() + chrono::Duration::seconds(2);
+        let h = build_worker_harness(
+            config,
+            |_| {},
+            Arc::new(pancetta_agent::arm::ArmTime::now),
+            Arc::new(move || now),
+            true,
+        )
+        .await;
+        h.coordinator
+            .autonomous_config_enabled
+            .store(false, Ordering::Release);
+        let send = |marked: bool| {
+            let msg = ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    attempt_id: None,
+                    message_text: "CQ N0CALL FN20".into(),
+                    frequency_offset: 1500.0,
+                    qso_id: None,
+                    tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            );
+            if marked {
+                super::super::autonomous::mark_autonomous_self_cq_dispatch(
+                    &h.coordinator.autonomous_self_cq_dispatches,
+                    msg.id,
+                );
+            }
+            msg
+        };
+        // Engine-dispatched (marked): refused, settled unaired.
+        let marked = send(true);
+        h.coordinator
+            .message_bus
+            .send_message(marked)
+            .await
+            .unwrap();
+        let (success, _, keyed) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(success, Some(false));
+        assert!(
+            !keyed,
+            "engine-dispatched self-CQ cannot key after file disable"
+        );
+        // Synthetic (unmarked, same shape): keys as before PAN-302.
+        let unmarked = send(false);
+        h.coordinator
+            .message_bus
+            .send_message(unmarked)
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(5)).await,
+            "unmarked Autonomous-source request must still key"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
@@ -1593,6 +1594,46 @@ fn consume_rolled_back_attempt_tombstone(
     }
 }
 
+/// PAN-302: how long a dispatched self-CQ message id stays recognizable to
+/// the TX worker's pre-PTT permission recheck. One slot settles in ~15 s;
+/// two minutes covers slot deferrals and worker requeues while keeping the
+/// marker set bounded (self-CQs dispatch at most once per slot).
+pub(super) const AUTONOMOUS_SELF_CQ_DISPATCH_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// PAN-302: mark a self-CQ TX message the autonomous engine is about to
+/// dispatch, so the TX worker's final pre-PTT permission recheck can tell an
+/// engine-dispatched self-CQ from a request another bus participant
+/// synthesized with `source == Autonomous` (PAN-277's shutdown fixture sends
+/// exactly the self-CQ shape). Prunes expired entries on insert.
+pub(super) fn mark_autonomous_self_cq_dispatch(
+    dispatches: &Arc<std::sync::Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>>,
+    message_id: u64,
+) {
+    if let Ok(mut dispatches) = dispatches.lock() {
+        let now = std::time::Instant::now();
+        dispatches.retain(|(_, marked_at)| {
+            now.duration_since(*marked_at) < AUTONOMOUS_SELF_CQ_DISPATCH_RETENTION
+        });
+        dispatches.push_back((message_id, now));
+    }
+}
+
+/// PAN-302: whether `message_id` is a self-CQ dispatch the autonomous engine
+/// sent within the retention window (see [`mark_autonomous_self_cq_dispatch`]).
+pub(super) fn is_marked_autonomous_self_cq_dispatch(
+    dispatches: &Arc<std::sync::Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>>,
+    message_id: u64,
+) -> bool {
+    match dispatches.lock() {
+        Ok(dispatches) => dispatches.iter().any(|(id, _)| *id == message_id),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .iter()
+            .any(|(id, _)| *id == message_id),
+    }
+}
+
 pub(crate) fn self_cq_suppressed(
     self_cq_emitted: bool,
     runtime_gate_open: bool,
@@ -2261,6 +2302,7 @@ impl super::ApplicationCoordinator {
         let watchlist_config = self.config.clone();
         let live_config = self.config.clone();
         let config_permission = self.autonomous_config_enabled.clone();
+        let self_cq_dispatches = self.autonomous_self_cq_dispatches.clone();
         let headless_persist = if self.headless && self.config_write_is_toml {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
             let path = self.config_path.clone();
@@ -3243,6 +3285,9 @@ impl super::ApplicationCoordinator {
                                         tx_parity
                                     );
                                 } else {
+                                    // PAN-302: capture the self-CQ shape
+                                    // before the constructor moves the item.
+                                    let is_self_cq = item.qso_id.is_none();
                                     let msg = ComponentMessage::new(
                                         ComponentId::Autonomous,
                                         ComponentId::Ft8Transmitter,
@@ -3256,6 +3301,14 @@ impl super::ApplicationCoordinator {
                                         },
                                         Instant::now(),
                                     );
+                                    // PAN-302: mark before send so the TX worker's
+                                    // pre-PTT recheck never races the marker insert.
+                                    if is_self_cq {
+                                        mark_autonomous_self_cq_dispatch(
+                                            &self_cq_dispatches,
+                                            msg.id,
+                                        );
+                                    }
                                     if let Err(e) = message_bus.send_message(msg).await {
                                         warn!("Failed to send TransmitRequest: {}", e);
                                     }
@@ -3360,6 +3413,9 @@ impl super::ApplicationCoordinator {
                                             p
                                         );
                                     } else {
+                                        // PAN-302: capture the self-CQ shape
+                                        // before the constructor moves the item.
+                                        let is_self_cq = item.qso_id.is_none();
                                         let msg = ComponentMessage::new(
                                             ComponentId::Autonomous,
                                             ComponentId::Ft8Transmitter,
@@ -3373,6 +3429,14 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
+                                        // PAN-302: mark before send (see the
+                                        // single-item path above).
+                                        if is_self_cq {
+                                            mark_autonomous_self_cq_dispatch(
+                                                &self_cq_dispatches,
+                                                msg.id,
+                                            );
+                                        }
                                         if let Err(e) = message_bus.send_message(msg).await {
                                             warn!(
                                                 "Failed to send TransmitRequest for parity-excluded item: {}",
@@ -3410,6 +3474,10 @@ impl super::ApplicationCoordinator {
                                     }
                                 } else {
                                     info!("Bundling {} TX items into MultiTransmitRequest", items.len());
+                                    // PAN-302: mark before send when the bundle
+                                    // carries a self-CQ (qso_id: None) item.
+                                    let bundle_carries_self_cq =
+                                        items.iter().any(|item| item.qso_id.is_none());
                                     let msg = ComponentMessage::new(
                                         ComponentId::Autonomous,
                                         ComponentId::Ft8Transmitter,
@@ -3421,6 +3489,12 @@ impl super::ApplicationCoordinator {
                                         },
                                         Instant::now(),
                                     );
+                                    if bundle_carries_self_cq {
+                                        mark_autonomous_self_cq_dispatch(
+                                            &self_cq_dispatches,
+                                            msg.id,
+                                        );
+                                    }
                                     if let Err(e) = message_bus.send_message(msg).await {
                                         warn!("Failed to send MultiTransmitRequest: {}", e);
                                     }

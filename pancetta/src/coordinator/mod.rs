@@ -1120,6 +1120,15 @@ pub struct ApplicationCoordinator {
     autonomous_cq_attempts: Arc<
         std::sync::Mutex<std::collections::HashSet<(String, Option<pancetta_qso::TxAttemptId>)>>,
     >,
+    /// PAN-302: message ids of self-CQ TX dispatches the autonomous engine
+    /// sent, with the dispatch instant for retention pruning. The TX
+    /// worker's final pre-PTT permission recheck refuses an engine-dispatched
+    /// self-CQ when the file disables autonomy; `ComponentMessage::source`
+    /// alone cannot identify one (any bus participant can name Autonomous as
+    /// the source — PAN-277's shutdown fixture does), so the engine marks
+    /// what it actually dispatched.
+    autonomous_self_cq_dispatches:
+        Arc<std::sync::Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>>,
 
     /// PAN-72: mailbox of resolved-needed TX-offset actions for in-progress
     /// QSOs, pushed by the QSO event-forwarding task (`coordinator/qso.rs`)
@@ -2606,6 +2615,9 @@ impl ApplicationCoordinator {
             qso_admission_for_test: None,
             autonomous_cq_attempts: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
+            )),
+            autonomous_self_cq_dispatches: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
             )),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
