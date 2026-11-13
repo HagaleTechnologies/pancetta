@@ -3,6 +3,7 @@ name = "pancetta-dsp"
 description = "High-performance digital signal processing pipeline for amateur radio applications"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,14 +17,12 @@ thiserror = "2.0"
 tracing = "0.1"
 
 # Signal processing
-rustfft = "6.4"
 realfft = "3.3"
 rubato = "5.0"  # High-quality resampling
 biquad = "0.4"   # IIR filters
 
 # Numerical computing
 num-complex = "0.4"
-num-traits = "0.2"
 
 # Synchronization
 crossbeam-channel = "0.5"

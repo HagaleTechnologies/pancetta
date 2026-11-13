@@ -117,9 +117,6 @@ pub enum DxErrorInner {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("CSV error: {0}")]
-    Csv(#[from] csv::Error),
-
     #[error("XML error: {0}")]
     Xml(#[from] quick_xml::Error),
 
@@ -185,12 +182,6 @@ impl From<std::io::Error> for DxError {
 impl From<serde_json::Error> for DxError {
     fn from(error: serde_json::Error) -> Self {
         DxErrorInner::Serialization(error).into()
-    }
-}
-
-impl From<csv::Error> for DxError {
-    fn from(error: csv::Error) -> Self {
-        DxErrorInner::Csv(error).into()
     }
 }
 
@@ -381,10 +372,6 @@ mod tests {
         check_source(
             serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
             "Serialization error",
-        );
-        check_source(
-            csv::Error::from(std::io::Error::other("csv read failed")),
-            "CSV error",
         );
         check_source(
             quick_xml::Error::from(std::io::Error::other("xml read failed")),

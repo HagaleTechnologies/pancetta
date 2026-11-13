@@ -69,6 +69,12 @@ pub(super) struct AlertDispatcher {
     delivery: [Arc<Mutex<DeliveryState>>; 2],
 }
 impl AlertDispatcher {
+    fn http_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+    }
+
     pub(super) fn new(
         config: AlertsConfig,
         lookup: CachedStationLookup,
@@ -77,10 +83,7 @@ impl AlertDispatcher {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: Self::http_builder().build()?,
             scorer: PriorityScorer::new(weights, Box::new(lookup.clone())),
             lookup,
             tui,
@@ -642,5 +645,20 @@ mod evidence_tests {
                 .on_decode(&msg, 14_074_000, &[])
                 .0
         );
+    }
+}
+
+#[cfg(test)]
+mod tls_security_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-support/tls.rs"
+        ));
+    }
+    #[tokio::test]
+    async fn tls_untrusted_alerts() {
+        fixture::rejects_http(AlertDispatcher::http_builder().no_proxy().build().unwrap()).await;
     }
 }

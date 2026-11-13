@@ -9,6 +9,7 @@ description = "Terminal User Interface for Pancetta"
 autobins = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -28,7 +29,6 @@ crossterm = "0.29"
 
 # Async runtime and channels
 tokio = { version = "1.50", features = ["full"] }
-tokio-util = "0.7"
 crossbeam-channel = "0.5"
 
 # Serialization and configuration
@@ -41,13 +41,12 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
 
 # Additional utility crates
-dirs = "5.0"
+dirs = { workspace = true }
 
 # Ham radio specific
 # ft8-lib = { path = "../ft8-lib" }

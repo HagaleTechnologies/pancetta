@@ -3,6 +3,7 @@ name = "pancetta-audio"
 description = "Real-time audio processing for Pancetta"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

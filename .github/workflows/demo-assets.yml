@@ -38,8 +38,8 @@ name: Regenerate demo assets
 #
 # Mirrors this repo's other CI lanes (see ci.yml/docs.yml/release.yml):
 # checkout MUST be `submodules: recursive` and the Linux runner needs the
-# same system packages (libasound2-dev/libudev-dev/libssl-dev/pkg-config)
-# to link cpal/audio + reqwest/TLS deps, or `cargo build -p pancetta` fails
+# same system packages (libasound2-dev/libudev-dev/pkg-config)
+# to link cpal/audio dependencies, or `cargo build -p pancetta` fails
 # outright on ubuntu-latest.
 #
 # Note: this workflow's job is only to re-render whatever the tape currently
@@ -78,7 +78,7 @@ jobs:
           # push to. Dispatch against a BRANCH, not a tag.
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
