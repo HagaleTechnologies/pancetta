@@ -102,6 +102,15 @@ PTT before confirmed audio flush and reports failure after acknowledgment, indep
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
 
+## Station-agent endpoint validation (PAN-310)
+
+Supplied relay and pairing URLs are validated even when the agent is disabled.
+The pairing CLI override uses the shared config validator before loading identity
+or enrolling. Validate an override only once, since validating a plaintext
+loopback URL twice would emit duplicate warnings. Secure schemes and the
+loopback exception are specified in `docs/CONFIG.md` under
+`[network.station_agent]`.
+
 ## WSJT-X UDP peer pins and Replay (PAN-312)
 
 Unicast binds the routed local IPv4 address, with no wildcard fallback on route

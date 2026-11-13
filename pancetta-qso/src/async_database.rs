@@ -1534,6 +1534,7 @@ impl QsoDatabase {
         struct ContactFields {
             their_callsign: Option<String>,
             start_time: DateTime<Utc>,
+            first_answer_at: Option<DateTime<Utc>>,
         }
         fn key(call: Option<&str>, time: DateTime<Utc>) -> Option<(String, i64)> {
             call.map(str::trim)
@@ -1553,7 +1554,11 @@ impl QsoDatabase {
         for (raw,) in rows {
             match serde_json::from_str::<ContactFields>(&raw) {
                 Ok(row) => {
-                    if let Some(k) = key(row.their_callsign.as_deref(), row.start_time) {
+                    // Key an indexed contact on the same time ADIF records
+                    // (PAN-307): the first answer for a CQ-initiated QSO,
+                    // falling back to the creation time.
+                    let started = row.first_answer_at.unwrap_or(row.start_time);
+                    if let Some(k) = key(row.their_callsign.as_deref(), started) {
                         *counts.entry(k).or_default() -= 1;
                     }
                 }
@@ -3725,6 +3730,82 @@ mod pan282_tests {
                 .missing_from_adif,
             1
         );
+    }
+    #[tokio::test]
+    async fn drift_keys_an_indexed_cq_qso_on_its_first_answer_time() {
+        // A live CQ-initiated QSO logs start_time at CQ creation and
+        // first_answer_at minutes later; ADIF records the answer time
+        // (PAN-307). The index comparison must key the row on the same
+        // time, or the next startup sees the contact missing from both
+        // stores and rebuilds the index from ADIF.
+        let dir = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let cq_start = DateTime::parse_from_rfc3339("2026-11-13T18:21:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first_answer = cq_start + chrono::Duration::minutes(4);
+        db.insert_qso(&live_cq_progress(cq_start, first_answer))
+            .await
+            .unwrap();
+        let adif_path = dir.path().join("qsos.adi");
+        db.export_to_adif(&adif_path).await.unwrap();
+        assert!(db
+            .drift_from(&AdifSnapshot::load(&adif_path).await.unwrap())
+            .await
+            .unwrap()
+            .is_current());
+    }
+    fn live_cq_progress(cq_start: DateTime<Utc>, first_answer: DateTime<Utc>) -> QsoProgress {
+        let frequency = 14_074_200.0;
+        QsoProgress {
+            state: QsoState::Completed {
+                their_callsign: "DL1ABC".into(),
+                their_report: -10,
+                our_report: -12,
+                frequency,
+                grid_square: None,
+                completed_at: first_answer + chrono::Duration::minutes(2),
+                duration_seconds: 360,
+            },
+            state_history: vec![],
+            messages: vec![],
+            metadata: QsoMetadata {
+                qso_id: Uuid::new_v4(),
+                our_callsign: "W1ABC".to_string(),
+                their_callsign: Some("DL1ABC".to_string()),
+                frequency,
+                completed_rf_frequency_hz: None,
+                mode: "FT8".to_string(),
+                first_answer_at: Some(first_answer),
+                start_time: cq_start,
+                end_time: Some(first_answer + chrono::Duration::minutes(2)),
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                their_state: None,
+                contest_info: None,
+                tags: HashMap::new(),
+                adif_field_types: HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: Default::default(),
+                role: Default::default(),
+                call_count: 0,
+                first_call_at: Some(cq_start),
+                last_call_at: Some(cq_start),
+                progressed_this_cycle: false,
+                stall_cycles: 0,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset: None,
+                hound: false,
+                partner_freq: None,
+                pending_freq_drift: None,
+                hound_qsyed: false,
+                remote_origin: false,
+                remote_client_key_id: None,
+                tx_parity_provisional: false,
+            },
+        }
     }
     #[tokio::test]
     async fn migration_refuses_an_unreadable_row_and_keeps_a_copy() {

@@ -85,7 +85,7 @@ admit Dependabot PRs to automatic merge. See
 
 Toolchain gotcha (PAN-56): **`rust-toolchain.toml` pins an exact Rust release
 (`1.98.0`, matching the Catalyst runner image), and the `dtolnay/rust-toolchain`
-steps in `ci.yml`, `docs.yml`, `demo-assets.yml` and `release.yml` pass the same
+steps in `ci.yml`, `demo-assets.yml` and `release.yml` pass the same
 version as `toolchain:`.** Bump the channel and all of those inputs in one PR. A missed input still builds with the
 pinned compiler, because rustup's override wins, but that job downloads a second
 toolchain and its rust-cache key churns. See
