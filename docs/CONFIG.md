@@ -1296,7 +1296,7 @@ transmits. Existing files require `--force` for atomic replacement. Windows
 uses inherited per-user directory ACLs rather than POSIX modes.
 
 `pancetta untrust-client <keyId>` removes the file. Removing an absent file is
-safe. The next successful authorization poll disarms that client and the TX
+safe. The next local trust refresh disarms that client and the TX
 worker drops queued frames or aborts a keyed frame on its next recheck. It
 remains admitted for read and status; remove its cqdx edge or static
 `tx_allow_list` entry to revoke admission too.
@@ -1307,8 +1307,10 @@ The live `tx_arm_allow_list` is the explicit intersection
 in cqdx mode until the first successful poll. Both modes reread local keys
 at `[network.cqdx].authorizations_poll_interval_secs` intervals, default 45 s,
 minimum 10 s. Static refreshes read the current admission list, respecting
-live config removals. Failed cqdx polls keep the last published state, so
-local revocation in cqdx mode requires a successful poll.
+live config removals. Cloud mode retains the last successful admission and
+owner-edge sets on fetch failure, but refreshes their intersection with local
+keys every interval, including while a cloud request is stalled. Local
+revocation does not depend on cqdx availability.
 
 **Explicitly restart-required (a diagnostic says so on save):**
 

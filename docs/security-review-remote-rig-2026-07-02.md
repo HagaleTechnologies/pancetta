@@ -204,8 +204,9 @@ Local trust removal disarms under the arm lock, flags the control-state
 broadcast, and bumps the authorization generation. Its audit detail is
 `disarmed: local-trust-revoked`. Existing TX-worker checks then refuse queued
 remote frames and abort keyed frames on the next recheck. Admission remains
-intact. Failed cloud polls retain the last published state; cqdx-mode local
-revocation takes effect on the next successful poll.
+intact. Failed cloud polls retain the last successful admission and owner-edge
+sets. Their intersection with local keys is refreshed every interval, even
+while a cloud request is stalled, so local revocation does not wait for cqdx.
 
 Pending-key capture from msg1 remains blocked on dispensa Q-0069. The TUI
 trust prompt remains a follow-up. Pairing does not populate client trust files.

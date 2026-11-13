@@ -2294,17 +2294,19 @@ type ClientKeys = std::collections::HashMap<String, VerifyingKey>;
 type AuthorizationSnapshot = (HashSet<String>, HashSet<String>, ClientKeys);
 
 /// Publish eligibility and disarm under the same lock used at arm time.
-/// None means static mode: read current admission under that lock so a
-/// concurrent config removal cannot be restored from a stale snapshot.
+/// Without a fresh cloud snapshot, read current admission under that lock so
+/// a concurrent config removal cannot be restored from a stale snapshot.
+/// Cached owner edges distinguish cloud refresh from static mode.
 fn publish_trust(
     live: &StationAgentLiveHandles,
     arm: &Mutex<ArmState>,
     audit: &AuditLog,
     cloud: Option<AuthorizationSnapshot>,
+    cached_owners: Option<&HashSet<String>>,
     key_dir: &std::path::Path,
 ) {
     let mut st = arm.lock().unwrap_or_else(|p| p.into_inner());
-    let is_cloud = cloud.is_some();
+    let is_cloud = cloud.is_some() || cached_owners.is_some();
     let (admission, candidates, keys) = cloud.unwrap_or_else(|| {
         let admission = live
             .tx_allow_list
@@ -2312,7 +2314,8 @@ fn publish_trust(
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let keys = load_client_device_keys(key_dir, &admission);
-        (admission.clone(), admission, keys)
+        let candidates = cached_owners.cloned().unwrap_or_else(|| admission.clone());
+        (admission, candidates, keys)
     });
     let eligible: HashSet<String> = candidates
         .iter()
@@ -2372,7 +2375,7 @@ async fn local_trust_refresh_loop(
     interval: Duration,
 ) {
     while !shutdown.load(Ordering::Acquire) {
-        publish_trust(&live, &arm, &audit, None, &key_dir);
+        publish_trust(&live, &arm, &audit, None, None, &key_dir);
         tokio::time::sleep(interval).await;
     }
 }
@@ -2385,12 +2388,10 @@ async fn local_trust_refresh_loop(
 /// `start_station_agent_component`).
 ///
 /// Fail-safe: any poll failure (network error, non-2xx status including a
-/// 404, malformed JSON) is logged at WARN and the shared state is left
-/// UNTOUCHED — a transient cqdx outage (relevant right now: cqdx.io's
-/// production deploy is currently down) must never spuriously revoke an
-/// already-admitted, connected client. Only a successful poll (a 200 with a
-/// parseable body, even if `authorizations` is genuinely empty) replaces
-/// the shared contents.
+/// 404, malformed JSON) is logged at WARN and retains cloud admission and
+/// owner edges. Local trust is refreshed independently every interval, even
+/// while a request is pending, so an outage cannot postpone local untrust.
+/// Only a successful poll replaces cloud authority; an empty response revokes it.
 ///
 /// Disarm-on-revocation + atomic publish (CQD-11 / dispensa Q-0052
 /// follow-up): `verify_and_arm`'s `tx_arm_allow_list` gate only runs at ARM
@@ -2421,7 +2422,7 @@ async fn local_trust_refresh_loop(
 /// bumps `authz_generation` after publishing them. The session loop notices
 /// within one `RECV_TICK` and runs [`reconcile_authorizations`], which evicts
 /// already-connected peers the new lists dropped and admits newly listed ones.
-/// A poll that changes nothing, or fails, bumps nothing.
+/// Local trust changes also bump the generation. A failed poll alone does not.
 #[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
@@ -2448,8 +2449,34 @@ async fn poll_authorizations_loop(
         }
     };
 
+    let live = StationAgentLiveHandles {
+        tx_allow_list,
+        tx_arm_allow_list,
+        client_keys,
+        revocation_pending,
+        authz_generation,
+        stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    // Keep full owner edges, not the locally intersected eligibility set.
+    // Before the first successful response the cloud seed remains fail-closed.
+    let mut owner_edges: Option<HashSet<String>> = None;
+    let mut refresh = tokio::time::interval(interval);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let client = &client;
+    let fetch = |delay| async move {
+        tokio::time::sleep(delay).await;
+        client.fetch_authorizations().await
+    };
+    let mut poll = Box::pin(fetch(Duration::ZERO));
     while !shutdown.load(Ordering::Acquire) {
-        match client.fetch_authorizations().await {
+        tokio::select! {
+        _ = refresh.tick() => {
+            if let Some(owners) = &owner_edges {
+                publish_trust(&live, &arm, &audit, None, Some(owners), &key_dir);
+            }
+        }
+        result = &mut poll => {
+        match result {
             Ok(edges) => {
                 // Connection-admission set: scope-blind, `agentKeyId` only —
                 // a delegated status/qsy guest edge (CQD-4) legitimately
@@ -2472,31 +2499,27 @@ async fn poll_authorizations_loop(
                     .map(|e| e.client_key_id.clone())
                     .collect();
                 let new_keys = load_client_device_keys(&key_dir, &new_allow);
-                let live = StationAgentLiveHandles {
-                    tx_allow_list: tx_allow_list.clone(),
-                    tx_arm_allow_list: tx_arm_allow_list.clone(),
-                    client_keys: client_keys.clone(),
-                    revocation_pending: revocation_pending.clone(),
-                    authz_generation: authz_generation.clone(),
-                    stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                };
+                owner_edges = Some(new_tx_arm_allow.clone());
                 publish_trust(
                     &live,
                     &arm,
                     &audit,
                     Some((new_allow, new_tx_arm_allow, new_keys)),
+                    None,
                     &key_dir,
                 );
             }
             Err(e) => {
                 warn!(
                     target: "agent",
-                    "authorizations poll failed: {e} — keeping last-known-good tx_allow_list/tx_arm_allow_list, retrying in {:?}",
+                    "authorizations poll failed: {e}; retaining cloud authority and refreshing local trust, retrying in {:?}",
                     interval
                 );
             }
         }
-        tokio::time::sleep(interval).await;
+        poll = Box::pin(fetch(interval));
+        }
+        }
     }
 }
 
@@ -8337,7 +8360,7 @@ mod tests {
         );
     }
 
-    async fn exercise_trust_refresh(cloud: bool) {
+    async fn exercise_trust_refresh(cloud: bool, outage: u8) {
         let dir = tempfile::tempdir().unwrap();
         let admission = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
         let ctx = fresh_ctx("agent_this", admission.clone());
@@ -8347,14 +8370,30 @@ mod tests {
             .unwrap();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interval = Duration::from_millis(10);
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let outage_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server;
         let task = if cloud {
-            let app = axum::Router::new().route("/api/v1/authorizations", axum::routing::get(|| async {
+            let mode = mode.clone();
+            let outage_seen = outage_seen.clone();
+            let app = axum::Router::new().route("/api/v1/authorizations", axum::routing::get(move || {
+                let mode = mode.clone();
+                let outage_seen = outage_seen.clone();
+                async move {
+                use axum::response::IntoResponse;
+                let mode = mode.load(Ordering::Acquire);
+                if mode != 0 {
+                    outage_seen.store(true, Ordering::Release);
+                    if mode == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
                 axum::Json(serde_json::json!({"authorizations": [
                     {"id":"a", "agentKeyId":"agent_this", "clientKeyId":CLIENT_KEY_ID, "scopes":["status","tx"], "createdAt":1786752000, "role":"owner"},
                     {"id":"b", "agentKeyId":"agent_this", "clientKeyId":PEER_B, "scopes":["status","tx"], "createdAt":1786752000, "role":"owner"}
-                ]}))
-            }));
+                ]})).into_response()
+            }}));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             server = Some(tokio::spawn(async move {
@@ -8439,6 +8478,16 @@ mod tests {
             || at(NOW),
             Some(CLIENT_KEY_ID)
         ));
+        if outage != 0 {
+            mode.store(outage, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !outage_seen.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
         let generation = live.authz_generation.load(Ordering::Acquire);
         pancetta_agent::trust::remove_client_device_key(dir.path(), CLIENT_KEY_ID).unwrap();
         wait_set(HashSet::new()).await;
@@ -8498,6 +8547,12 @@ mod tests {
             assert!(!live.tx_allow_list.read().unwrap().contains(PEER_B));
         }
         shutdown.store(true, Ordering::Release);
+        if outage == 2 {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            server.unwrap().abort();
+            return;
+        }
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
@@ -8508,28 +8563,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_disarms_local_untrust_during_cloud_errors() {
+        exercise_trust_refresh(true, 1).await;
+    }
+
+    #[tokio::test]
+    async fn poll_disarms_local_untrust_during_stalled_cloud_request() {
+        exercise_trust_refresh(true, 2).await;
+    }
+
+    #[tokio::test]
     async fn poll_intersects_tx_arm_set_with_local_trust() {
-        exercise_trust_refresh(true).await;
+        exercise_trust_refresh(true, 0).await;
     }
     #[tokio::test]
     async fn static_trust_refresh_intersects_with_static_allow_list() {
-        exercise_trust_refresh(false).await;
+        exercise_trust_refresh(false, 0).await;
     }
     #[tokio::test]
     async fn poll_disarms_when_local_trust_file_is_removed() {
-        exercise_trust_refresh(true).await;
+        exercise_trust_refresh(true, 0).await;
     }
     #[tokio::test]
     async fn static_trust_refresh_disarms_when_local_trust_file_is_removed() {
-        exercise_trust_refresh(false).await;
+        exercise_trust_refresh(false, 0).await;
     }
     #[tokio::test]
     async fn local_untrust_audit_records_local_trust_revoked() {
-        exercise_trust_refresh(true).await;
+        exercise_trust_refresh(true, 0).await;
     }
     #[tokio::test]
     async fn local_untrust_drops_remote_tx_permission() {
-        exercise_trust_refresh(false).await;
+        exercise_trust_refresh(false, 0).await;
     }
 
     #[test]
@@ -8562,6 +8627,7 @@ mod tests {
             &ctx.arm,
             &ctx.audit,
             Some((admission.clone(), admission.clone(), keys)),
+            None,
             dir.path(),
         );
         assert_eq!(

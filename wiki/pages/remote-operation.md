@@ -102,7 +102,6 @@ PTT before confirmed audio flush and reports failure after acknowledgment, indep
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
 
-<<<<<<< HEAD
 ## Local client TX trust (PAN-309)
 
 Pairing does not write client trust keys. `pancetta trust-client <keyId>
@@ -114,7 +113,10 @@ aborts either mode. Static config removals hold the arm lock through the
 admission publish to prevent a refresh from restoring stale eligibility.
 Release device-key read guards before acquiring the arm lock, since the
 publisher writes keys while holding that lock. Audit writes follow unlock.
-=======
+Cloud mode caches full owner edges separately from eligibility and refreshes
+local trust on its own timer, including during failed or stalled requests.
+The refresh reads live admission so it cannot restore a config removal.
+
 ## WSJT-X UDP peer pins and Replay (PAN-312)
 
 Unicast binds the routed local IPv4 address, with no wildcard fallback on route
@@ -125,4 +127,3 @@ without Heartbeats need a restart after changing ports. Pins are not authenticat
 Replay shares one skip-only one-second budget across all peers, even after a pin
 refresh; empty or failed bursts consume it. Suppressed requests send no Replay
 Status and schedule no deferred burst. See the WSJT-X UDP design spec for policy.
->>>>>>> c63a03623fcaa3eabd906bff7110ef59f3b3db55
