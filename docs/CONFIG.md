@@ -628,9 +628,27 @@ Duplicate checking blocks autonomous calls to a callsign worked within the rolli
 ```toml
 [database]
 persist_qso_timeline = false
+adif_backup_enabled = true
+adif_backup_directory = "backups"
+adif_backup_retain_count = 7
 ```
 
-Off by default. When `true`, a completed or failed QSO's full
+On live startup, `adif_backup_enabled` makes a byte-exact snapshot of a changed
+`qsos.adi` before its writer opens. The default directory is
+`~/.pancetta/backups`. Relative directories resolve beside `qsos.adi`;
+absolute directories stay unchanged. `~`, `~/` and `~\` expand to the
+operator's home. Blank directories and zero retention counts are rejected.
+Changes require a restart.
+
+Names use UTC, for example `qsos_adi_20261113_121238_123456.adi`, with a
+six-digit numeric suffix on collision. Retention counts only these ADIF
+snapshots, independently of SQLite backups and import `.bak` copies.
+Unchanged bytes create no copy; reducing retention still prunes old snapshots.
+Replay and refused migration create no snapshot. A missing source is skipped.
+A busy logbook lock is skipped after one second; other backup failures log a
+warning and allow startup to continue. Failed copies never trigger pruning.
+
+`persist_qso_timeline` is off by default. When `true`, a completed or failed QSO's full
 state-transition + message timeline (`QsoProgress.state_history` /
 `.messages` — every rung the QSO climbed and every frame sent/received)
 is persisted so it can be reconstructed offline, keyed by QSO id
@@ -1335,21 +1353,24 @@ To revoke a suspect remote client step by step, see
 All persistent state lives under `~/.pancetta/`.
 
 Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
-Automatic database backups do not cover configuration, the complete logbook or
-external keys. Preserve the whole stopped installation and data directory.
+Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
+These copies do not include contacts logged since the latest startup.
+Preserve the whole stopped installation before upgrading, including configuration
+and external keys.
 
 ### QSO log files
 
 | File | Role | Recoverable? |
 |---|---|---|
-| `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
+| `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | Startup snapshots omit contacts logged since startup. Back this up. |
 | `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or if its contacts differ from the ADIF; writes `qso.db.new` and swaps it in. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
 | `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
 | `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
 | `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
-| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
+| `~/.pancetta/backups/qsos_adi_YYYYMMDD_HHMMSS_microseconds.adi` | Changed startup snapshots of the ADIF source. Seven kept by default, configurable under `[database]`. | Contains contacts only through the latest snapshot. |
+| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only; ADIF snapshots have independent retention. | Yes — same recovery path as `qso.db`. |
 
 Durability: each `qsos.adi` record is one `write_all`, a flush and a
 `sync_all` before the write returns, so a logged QSO survives a pancetta

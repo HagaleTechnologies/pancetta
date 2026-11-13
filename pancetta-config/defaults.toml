@@ -188,6 +188,9 @@ recent_failure_penalty = -0.15
 signal_strength = 0.05
 
 [database]
+adif_backup_directory = "backups"
+adif_backup_enabled = true
+adif_backup_retain_count = 7
 persist_qso_timeline = false
 
 [decoder]
