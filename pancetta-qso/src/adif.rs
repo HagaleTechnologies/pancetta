@@ -680,7 +680,6 @@ impl AdifProcessor {
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
-<<<<<<< HEAD
         // Imported values are authoritative per field. Canonicalize only these
         // keys so mixed-case tags cannot compete with inferred typed fields.
         for field in ["COUNTRY", "DXCC", "CQZ", "ITUZ"] {
@@ -706,10 +705,7 @@ impl AdifProcessor {
         let dxcc = country.and_then(pancetta_core::dxcc::entity_id_of_name);
         let zones = pancetta_core::dxcc::zones_for_callsign(their_call);
 
-        if let Ok(Some(mut logged)) = crate::contest::ledger::decode(&additional_fields) {
-=======
         if let Ok(Some(mut logged)) = crate::contest::ledger::contact_context(metadata) {
->>>>>>> 7496e8346cfb873be022bcc7e6b7a53ae2ab1b9e
             let evidence = crate::contest::ledger::resolved_evidence(
                 &logged,
                 &additional_fields,
