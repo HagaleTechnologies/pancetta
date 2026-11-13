@@ -21218,6 +21218,82 @@ mod pan72_stall_detection_tests {
     }
 
     #[tokio::test]
+    async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
+        use crate::contest::{
+            ledger,
+            scoring::{ContestPeriod, ContestScoringContext, KSQP_FT_2026},
+        };
+        let clock = PinnedClock::new();
+        let created = clock.now();
+        let context = ContestScoringContext::new(
+            "PAN-307-test",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "TX",
+            vec![ContestPeriod {
+                start: created,
+                end: created + Duration::hours(1),
+            }],
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.contest_scoring = Some(context.clone());
+        let manager = QsoManager::with_clock_for_test(config, clock.source());
+        let id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        clock.advance(Duration::minutes(4) + Duration::milliseconds(123));
+        let answered = clock.now();
+        time_on_answer(&manager, false, OUR).await;
+        for message in [
+            MessageType::ReportAck {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+                report: -12,
+            },
+            MessageType::SeventyThree {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+            },
+        ] {
+            clock.advance(Duration::seconds(30));
+            manager
+                .process_message(message, format!("{OUR} {DX}"), FREQ, Some(-11.0))
+                .await
+                .unwrap();
+        }
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::Completed { .. }));
+        assert_eq!(qso.metadata.start_time, created);
+        let db = crate::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        db.insert_qso(&qso).await.unwrap();
+        let indexed = db.contest_ledger(&context, OUR).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        db.export_to_adif(&path).await.unwrap();
+        let processor = crate::adif::AdifProcessor::new();
+        let file = processor
+            .parse_string(&std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        let record = processor.record_to_qso(&file.records[0]).unwrap();
+        let imported = processor.adif_to_qso(&record);
+        let durable = ledger::fact(&imported, &context, OUR).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].start, answered);
+        assert_eq!(durable, indexed[0]);
+        assert_eq!(
+            ledger::decode(&record.additional_fields)
+                .unwrap()
+                .unwrap()
+                .contact_start,
+            Some(answered)
+        );
+    }
+
+    #[tokio::test]
     async fn responding_qso_time_on_unchanged() {
         let clock = PinnedClock::new();
         let manager = QsoManager::with_clock_for_test(test_config(), clock.source());

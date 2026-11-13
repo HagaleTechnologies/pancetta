@@ -73,6 +73,22 @@ pub fn decode(tags: &HashMap<String, String>) -> Result<Option<LoggedContestCont
     Ok(Some(logged))
 }
 
+/// Interpret a CQ enrollment stamp using the latched first answer. Imported
+/// records have no first_answer_at and retain their exact logged timestamp.
+/// Only the original creation stamp may move; conflicting evidence still fails
+/// validation in fact(). Export and indexed facts must use the same context.
+pub(crate) fn contact_context(
+    metadata: &QsoMetadata,
+) -> Result<Option<LoggedContestContext>, String> {
+    let mut logged = decode(&metadata.tags)?;
+    if let Some(logged) = logged.as_mut() {
+        if metadata.first_answer_at.is_some() && logged.contact_start == Some(metadata.start_time) {
+            logged.contact_start = Some(metadata.contact_started_at());
+        }
+    }
+    Ok(logged)
+}
+
 fn normalized(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -178,7 +194,7 @@ pub fn attach(metadata: &mut QsoMetadata, context: &ContestScoringContext) {
         operator_region: context.operator_region.clone(),
         periods: context.periods.clone(),
         evidence: ContestEvidence::default(),
-        contact_start: Some(metadata.start_time),
+        contact_start: Some(metadata.contact_started_at()),
     };
     metadata
         .tags
@@ -209,7 +225,7 @@ pub fn fact(
     context: &ContestScoringContext,
     operator_callsign: &str,
 ) -> Result<ContestContactFact, String> {
-    let logged = decode(&metadata.tags)?.ok_or("contest: missing context")?;
+    let logged = contact_context(metadata)?.ok_or("contest: missing context")?;
     if metadata.tags[INSTANCE] != context.instance_id
         || metadata.tags[RULES] != context.rules_id
         || logged.profile_id != context.profile_id
@@ -222,8 +238,10 @@ pub fn fact(
     {
         return Err("contest: instance_id conflicts with logged contest settings".into());
     }
-    let start = logged.contact_start.unwrap_or(metadata.start_time);
-    if start.timestamp() != metadata.start_time.timestamp() {
+    let start = logged
+        .contact_start
+        .unwrap_or(metadata.contact_started_at());
+    if start.timestamp() != metadata.contact_started_at().timestamp() {
         return Err("contest: contact start conflicts with logged QSO time".into());
     }
     let evidence = resolved_evidence(&logged, &metadata.tags, metadata.their_state.as_deref());

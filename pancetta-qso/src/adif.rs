@@ -680,14 +680,19 @@ impl AdifProcessor {
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
-        if let Ok(Some(mut logged)) = crate::contest::ledger::decode(&additional_fields) {
+        if let Ok(Some(mut logged)) = crate::contest::ledger::contact_context(metadata) {
             let evidence = crate::contest::ledger::resolved_evidence(
                 &logged,
                 &additional_fields,
                 metadata.their_state.as_deref(),
             );
-            if evidence.source.as_deref() != Some("conflict") {
+            let evidence_conflicts = evidence.source.as_deref() == Some("conflict");
+            if !evidence_conflicts {
                 logged.evidence = evidence;
+            }
+            // Preserve conflicting imported context byte-for-byte. A live CQ
+            // answer still needs its corrected contact_start persisted.
+            if !evidence_conflicts || metadata.first_answer_at.is_some() {
                 if let Ok(json) = serde_json::to_string(&logged) {
                     additional_fields.insert(crate::contest::ledger::CONTEXT.into(), json);
                 }
