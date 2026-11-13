@@ -27,15 +27,15 @@ raise 'standalone commands must precede examples and workspace tests' unless
   commands.index(no_default) < commands.index(standalone) &&
   commands.index(standalone) < commands.index(examples) &&
   commands.index(examples) < commands.index(transmit)
-cache_jobs = jobs.select { |_, j| j.fetch('steps', []).any? { |s| s['uses'] == 'Swatinem/rust-cache@v2' } }
+cache_jobs = jobs.select { |_, j| j.fetch('steps', []).any? { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') } }
 raise 'wrong cache jobs' unless cache_jobs.keys.sort == %w[clippy cross-platform-check workspace-check]
 cache_jobs.each do |name, job|
-  caches = job['steps'].select { |s| s['uses'] == 'Swatinem/rust-cache@v2' }
+  caches = job['steps'].select { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') }
   raise "#{name}: wrong cache count" unless caches.length == 1
   raise "#{name}: cache must save only on main" unless
     caches.first.fetch('with').fetch('save-if') == "${{ github.ref == 'refs/heads/main' }}"
 end
-cache_index = steps.index { |s| s['uses'] == 'Swatinem/rust-cache@v2' }
+cache_index = steps.index { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') }
 raise 'standalone check before cache restore' unless cache_index < steps.index { |s| s['run'] == no_default }
 clippy = 'cargo clippy --workspace --exclude pancetta-research --all-targets --features transmit -- -D clippy::undocumented_unsafe_blocks'
 raise 'Clippy target coverage or lint changed' unless jobs['clippy']['steps'].any? { |s| s['run'] == clippy }
