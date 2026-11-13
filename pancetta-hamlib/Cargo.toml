@@ -3,6 +3,7 @@ name = "pancetta-hamlib"
 description = "Hamlib integration and CAT control for amateur radio transceivers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,9 +15,7 @@ pancetta-core = { path = "../pancetta-core" }
 
 # Workspace dependencies
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 futures = { workspace = true }
-crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -25,13 +24,11 @@ serde = { workspace = true }
 chrono = { workspace = true }
 
 # Serialization for configuration
-serde_json = { workspace = true }
 
 # Async utilities
 async-trait = "0.1"
 
 # Numeric types for frequency/power handling
-num-traits = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

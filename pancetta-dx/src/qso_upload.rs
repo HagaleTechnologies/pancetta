@@ -101,11 +101,12 @@ fn http_failure(service: &str, status: reqwest::StatusCode, body: &str) -> DxErr
     })
 }
 
+fn http_builder() -> reqwest::ClientBuilder {
+    Client::builder().timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+}
+
 fn build_client() -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| Client::new())
+    http_builder().build().unwrap_or_else(|_| Client::new())
 }
 
 /// Outcome of a single per-QSO upload to a service that distinguishes a fresh
@@ -1272,5 +1273,21 @@ mod tests {
         );
         let parse = DxError::from(DxErrorInner::Parse("x".to_string()));
         assert_eq!(parse.upload_failure_text(), parse.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tls_security_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-support/tls.rs"
+        ));
+    }
+    // ClubLog, QRZ Logbook and eQSL all call this same production builder.
+    #[tokio::test]
+    async fn tls_untrusted_upload_services() {
+        fixture::rejects_http(http_builder().no_proxy().build().unwrap()).await;
     }
 }

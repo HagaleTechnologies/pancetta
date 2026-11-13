@@ -342,6 +342,10 @@ pub struct ReqwestPairingHttp {
 }
 
 impl ReqwestPairingHttp {
+    fn http_builder(timeout: Duration) -> reqwest::ClientBuilder {
+        reqwest::Client::builder().timeout(timeout)
+    }
+
     /// Create a pairing HTTP client rooted at `base_url` (e.g.
     /// `https://pair.example/api/v1`). Must be constructed within a Tokio
     /// runtime.
@@ -359,8 +363,7 @@ impl ReqwestPairingHttp {
     fn with_timeout(base_url: String, origin: Option<String>, timeout: Duration) -> Self {
         Self {
             handle: Handle::current(),
-            client: reqwest::Client::builder()
-                .timeout(timeout)
+            client: Self::http_builder(timeout)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -1069,5 +1072,34 @@ mod tests {
             matches!(result, Err(PairingError::Transport(_))),
             "expected Transport error, got {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tls_security_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-support/tls.rs"
+        ));
+    }
+    #[tokio::test]
+    async fn tls_untrusted_pairing() {
+        fixture::rejects_http(
+            ReqwestPairingHttp::http_builder(PAIRING_HTTP_TIMEOUT)
+                .no_proxy()
+                .build()
+                .unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tls_untrusted_relay() {
+        fixture::rejects_untrusted("wss", |url| async move {
+            RealWsConn::connect(&url, RelayTimeouts::default()).await
+        })
+        .await;
     }
 }

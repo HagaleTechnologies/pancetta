@@ -5,6 +5,7 @@ keywords = ["amateur-radio", "dx", "dxcc", "ham-radio", "contest"]
 categories = ["multimedia", "science"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,12 +26,13 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 encoding_rs = { workspace = true }
 quick-xml = { workspace = true }
-csv = { workspace = true }
 url = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-test = "0.4"
 tempfile = "3.27"
 approx = { workspace = true }
