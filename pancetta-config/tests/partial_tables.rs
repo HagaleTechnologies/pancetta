@@ -13,21 +13,12 @@
 //! `Default` impl) fails `every_config_table_accepts_an_empty_table`.
 use pancetta_config::{CatInterfaceConfig, Config, SlotParitySetting};
 
-const RECORD_TABLES: &[(&str, &str)] = &[(
-    "ui.keyboard.shortcuts.",
-    "entries of HashMap<String, KeyboardShortcut>; each entry is a complete record",
-)];
-const PARSE_ONLY: &[(&str, &str)] = &[
-    (
-        "ui.keyboard.shortcuts",
-        "HashMap field: an explicit table replaces the map",
-    ),
-    (
-        "ui.colors.secondary",
-        "ColorPalette is reused for primary/secondary with different defaults; \
+const RECORD_TABLES: &[(&str, &str)] = &[];
+const PARSE_ONLY: &[(&str, &str)] = &[(
+    "ui.colors.secondary",
+    "ColorPalette is reused for primary/secondary with different defaults; \
          ui.colors has no reader outside pancetta-config",
-    ),
-];
+)];
 
 fn defaults_table() -> toml::Table {
     let c = Config {
@@ -57,7 +48,7 @@ fn every_config_table_accepts_an_empty_table() {
     let mut paths = Vec::new();
     table_paths(&defaults, "", &mut paths);
     assert!(
-        paths.len() >= 140,
+        paths.len() >= 129,
         "walker found only {} table paths",
         paths.len()
     );

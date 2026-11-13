@@ -1230,7 +1230,8 @@ section. With the old values a WSJT-X Fox never sees your call.
 > including after restart. The remaining schema keys are listed in
 > `defaults.toml`. Keybindings are not configurable; see
 > [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
-> `[ui.keyboard]` schema is also unused by the runtime.
+> `[ui.keyboard]` section was removed in PAN-303. Old configs still load
+> with one warning naming the removed section.
 
 ---
 
