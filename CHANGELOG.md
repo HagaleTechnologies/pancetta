@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-305: The next contest serial number is saved with a crash-safe atomic write (synced temporary sibling, atomic rename) instead of a truncating `fs::write` whose errors were ignored, so a crash mid-write can no longer leave the serial file empty and reset numbering to 001. A failed save is now returned to the contest-response caller instead of being silently swallowed. This fixes persistence only; the dormant contest-exchange scaffolding is not activated by it.
 - PAN-335: The Linux service waits for pipeline initialization and restarts after missed coordinator health passes. `pancetta doctor` now checks enabled network services, log disk space and microphone permission separately, with a fix for each problem. Real systemd restart and macOS TCC qualification remain pending.
 - PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.
