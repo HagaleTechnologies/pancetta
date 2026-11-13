@@ -40,7 +40,7 @@ fn coordinator_dir() -> PathBuf {
 /// One concise, accurate role per immediate coordinator module. Keys are
 /// names without the directory suffix. Keep in sync with the module docs.
 fn roles() -> BTreeMap<&'static str, &'static str> {
-    let entries: [(&str, &str); 44] = [
+    let entries: [(&str, &str); 45] = [
         (
             "alerts",
             "Decode alert evaluation and bell/ntfy/webhook deliveries.",
@@ -142,6 +142,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
         (
             "session_state",
             "Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270).",
+        ),
+        (
+            "service_notify",
+            "systemd READY/WATCHDOG/STOPPING notifications driven by completed health passes (PAN-335).",
         ),
         (
             "shutdown",

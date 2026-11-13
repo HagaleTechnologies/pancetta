@@ -60,16 +60,12 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   is an *anytime* algorithm with a per-window budget that self-tunes to the
   host, so slow hardware degrades recall instead of falling over.
 - **`pancetta doctor`.** One command checks config, clock vs. NTP, audio
-<<<<<<< HEAD
   device and level, decoder, `rigctld`, enabled network services, log disk
-  space and microphone permission. It prints the fix for each warning or failure.
-=======
-  device and level, decoder, and `rigctld`, with a fix for each problem.
-  Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT CONFIGURED (2),
-  and NOT READY (3). `pancetta doctor --json` emits one report with per-check
-  status, detail and fix. ON-AIR READY covers these prerequisites; doctor
-  does not test PTT or transmit audio.
->>>>>>> 271f785b629d38e7f07350848cba3f517343e546
+  space and microphone permission. It prints the fix for each warning or
+  failure. Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT
+  CONFIGURED (2), and NOT READY (3). `pancetta doctor --json` emits one
+  report with per-check status, detail and fix. ON-AIR READY covers these
+  prerequisites; doctor does not test PTT or transmit audio.
 
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).

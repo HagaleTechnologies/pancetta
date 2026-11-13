@@ -665,22 +665,6 @@ pub(crate) fn check_submodule() -> DoctorCheck {
     }
 }
 
-/// Render a registry result identically for the CLI and diagnostic fixtures.
-pub fn render_check(name: &str, outcome: &CheckOutcome) -> String {
-    let mut row = format!(
-        "[{}] {:<20} {}",
-        status_label(outcome.status),
-        name,
-        outcome.detail
-    );
-    if outcome.status != CheckStatus::Pass {
-        if let Some(fix) = &outcome.fix {
-            row.push_str(&format!("\n       fix: {fix}"));
-        }
-    }
-    row
-}
-
 const MIB: u64 = 1024 * 1024;
 
 fn log_directory() -> PathBuf {
@@ -752,7 +736,7 @@ fn disk_outcome(path: &std::path::Path, result: std::io::Result<u64>) -> CheckOu
 fn check_disk() -> DoctorCheck {
     DoctorCheck {
         name: "log disk space",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|_| {
             #[cfg(unix)]
             {
@@ -800,7 +784,7 @@ fn permission_outcome(is_macos: bool, state: MicrophoneAuthorization) -> CheckOu
 fn check_microphone() -> DoctorCheck {
     DoctorCheck {
         name: "microphone permission",
-        hard: true,
+        role: CheckRole::Receive,
         run: Box::new(|_| {
             permission_outcome(cfg!(target_os = "macos"), microphone_authorization())
         }),
@@ -888,8 +872,12 @@ async fn cqdx_probe(base: String) -> Reachability {
         Ok(client) => client,
         Err(_) => return (endpoint, Err("HTTP client unavailable".into())),
     };
+    // A 401 also proves reachability: the endpoint answered and doctor sends
+    // no credentials to take that answer further (PAN-406).
     let result = match client.get(url).send().await {
-        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) if response.status().is_success() || response.status().as_u16() == 401 => {
+            Ok(())
+        }
         Ok(response) => Err(format!("HTTP {}", response.status().as_u16())),
         Err(error) => Err(transport_reason(&error)),
     };
@@ -999,7 +987,7 @@ async fn collect_network_probes(
 fn check_network() -> DoctorCheck {
     DoctorCheck {
         name: "network services",
-        hard: false,
+        role: CheckRole::Advisory,
         run: Box::new(|ctx| {
             let Some(cfg) = ctx.config.clone() else {
                 return not_configured();
@@ -1032,7 +1020,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-<<<<<<< HEAD
     async fn http_fixture(status: u16, stall: bool) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1061,7 +1048,8 @@ mod tests {
     async fn network_probe_matrix() {
         for (status, expected) in [
             (200, CheckStatus::Pass),
-            (401, CheckStatus::Warn),
+            // A 401 proves the endpoint answered; doctor sends no credentials.
+            (401, CheckStatus::Pass),
             (302, CheckStatus::Warn),
             (503, CheckStatus::Warn),
         ] {
@@ -1229,9 +1217,24 @@ mod tests {
         assert_eq!(checks[7].name, "network services");
         assert_eq!(checks[8].name, "log disk space");
         assert_eq!(checks[9].name, "microphone permission");
-        assert_eq!(doctor_exit_code(&[(checks[7].hard, CheckStatus::Fail)]), 0);
-        for check in &checks[8..] {
-            assert_eq!(doctor_exit_code(&[(check.hard, CheckStatus::Fail)]), 1);
+        // Network is advisory; disk and microphone are receive prerequisites.
+        assert!(checks[7].role == CheckRole::Advisory);
+        assert!(checks[8].role == CheckRole::Receive);
+        assert!(checks[9].role == CheckRole::Receive);
+        let ctx = fixture_ctx();
+        let mut statuses = [CheckStatus::Pass; 10];
+        statuses[7] = CheckStatus::Fail;
+        assert_eq!(
+            fixture_report(&ctx, statuses).verdict,
+            Verdict::OnAirReady,
+            "a network failure stays advisory"
+        );
+        for index in [8, 9] {
+            let mut statuses = [CheckStatus::Pass; 10];
+            statuses[index] = CheckStatus::Fail;
+            let report = fixture_report(&ctx, statuses);
+            assert_eq!(report.verdict, Verdict::NotReady, "check {index} is hard");
+            assert_eq!(report.exit_code, 3);
         }
     }
 
@@ -1243,15 +1246,15 @@ mod tests {
             Box::new(|_| network_outcome(vec![("cqdx.io:443".into(), Err("timed out".into()))]));
         checks[8].run = Box::new(|_| disk_outcome(std::path::Path::new("/logs"), Ok(0)));
         checks[9].run = Box::new(|_| permission_outcome(true, MicrophoneAuthorization::Denied));
-        let rows: Vec<_> = checks[7..]
-            .iter()
+        let results: Vec<_> = checks
+            .into_iter()
             .map(|check| {
                 let outcome = (check.run)(&ctx);
-                render_check(check.name, &outcome)
+                (check, outcome)
             })
             .collect();
-        let text = rows.join("\n");
-        assert_eq!(text.matches("fix:").count(), 3);
+        let report = DoctorReport::from_results(&ctx, results);
+        let text = report.text();
         for label in [
             "network services",
             "log disk space",
@@ -1259,14 +1262,15 @@ mod tests {
         ] {
             assert!(text.contains(label));
         }
-        assert!(text.contains("keep qsos.adi and qso.db"));
-        assert!(!(build_checks()[8].run)(&ctx)
-            .detail
-            .contains("not configured"));
-        assert!(!(build_checks()[9].run)(&ctx)
-            .detail
-            .contains("not configured"));
-=======
+        assert!(text.contains("fix: check DNS, routing and firewall access to cqdx.io:443"));
+        assert!(text
+            .contains("fix: free space on the volume containing /logs; keep qsos.adi and qso.db"));
+        assert!(text.contains("fix: open System Settings > Privacy & Security > Microphone"));
+        let fresh = build_checks();
+        assert!(!(fresh[8].run)(&ctx).detail.contains("not configured"));
+        assert!(!(fresh[9].run)(&ctx).detail.contains("not configured"));
+    }
+
     fn fixture_ctx() -> DoctorCtx {
         let mut config = Config::default();
         config.station.callsign = "K1ABC".into();
@@ -1278,7 +1282,7 @@ mod tests {
         }
     }
 
-    fn fixture_report(ctx: &DoctorCtx, statuses: [CheckStatus; 7]) -> DoctorReport {
+    fn fixture_report(ctx: &DoctorCtx, statuses: [CheckStatus; 10]) -> DoctorReport {
         let checks = build_checks()
             .into_iter()
             .zip(statuses)
@@ -1320,30 +1324,44 @@ mod tests {
         use CheckStatus::*;
         let ctx = fixture_ctx();
         let cases = [
-            ([Pass; 7], Verdict::OnAirReady),
+            ([Pass; 10], Verdict::OnAirReady),
             (
-                [Pass, Warn, Warn, Pass, Fail, Pass, Fail],
+                [Pass, Warn, Warn, Pass, Fail, Pass, Fail, Pass, Pass, Pass],
                 Verdict::OnAirReady,
             ),
             (
-                [Pass, Fail, Pass, Pass, Pass, Fail, Pass],
+                [Pass, Fail, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Fail, Pass, Pass, Pass, Pass, Fail, Pass],
+                [Fail, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Fail, Pass, Pass, Fail, Pass],
+                [Pass, Pass, Fail, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Pass, Fail, Pass, Fail, Pass],
+                [Pass, Pass, Pass, Fail, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Pass, Pass, Pass, Fail, Pass],
+                [Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::DecodeOnly,
+            ),
+            // PAN-335: network is advisory, disk and microphone are receive
+            // prerequisites.
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass],
+                Verdict::OnAirReady,
+            ),
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail],
+                Verdict::NotReady,
             ),
         ];
         for (statuses, expected) in cases {
@@ -1351,13 +1369,13 @@ mod tests {
         }
         let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
         assert_eq!(
-            fixture_report(&missing, [Fail; 7]).verdict,
+            fixture_report(&missing, [Fail; 10]).verdict,
             Verdict::NotConfigured
         );
         let mut invalid = fixture_ctx();
         invalid.config_error = Some("invalid".into());
         assert_eq!(
-            fixture_report(&invalid, [Pass; 7]).verdict,
+            fixture_report(&invalid, [Pass; 10]).verdict,
             Verdict::NotReady
         );
     }
@@ -1367,13 +1385,13 @@ mod tests {
         let mut ctx = fixture_ctx();
         ctx.config.as_mut().unwrap().rig.interface.enabled = false;
         assert_eq!(
-            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            fixture_report(&ctx, [CheckStatus::Pass; 10]).verdict,
             Verdict::DecodeOnly
         );
         ctx.config.as_mut().unwrap().rig.interface.enabled = true;
         ctx.config.as_mut().unwrap().station.callsign = "N0CALL".into();
         assert_eq!(
-            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            fixture_report(&ctx, [CheckStatus::Pass; 10]).verdict,
             Verdict::DecodeOnly
         );
     }
@@ -1434,13 +1452,13 @@ mod tests {
         let ctx = fixture_ctx();
         let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
         let fixtures = [
-            (fixture_report(&missing, [Pass; 7]), "NOT CONFIGURED", 2,
+            (fixture_report(&missing, [Pass; 10]), "NOT CONFIGURED", 2,
                 "Result: NOT CONFIGURED. Run `pancetta setup`, then re-run `pancetta doctor`."),
-            (fixture_report(&ctx, [Pass, Pass, Pass, Pass, Pass, Fail, Pass]), "DECODE-ONLY", 1,
+            (fixture_report(&ctx, [Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass]), "DECODE-ONLY", 1,
                 "Result: DECODE-ONLY. Receive checks passed; fix the transmit prerequisites above to go on-air."),
-            (fixture_report(&ctx, [Pass; 7]), "ON-AIR READY", 0,
+            (fixture_report(&ctx, [Pass; 10]), "ON-AIR READY", 0,
                 "Result: ON-AIR READY. Doctor prerequisites passed; PTT and transmit audio are not tested."),
-            (fixture_report(&ctx, [Pass, Pass, Pass, Fail, Pass, Fail, Pass]), "NOT READY", 3,
+            (fixture_report(&ctx, [Pass, Pass, Pass, Fail, Pass, Fail, Pass, Pass, Pass, Pass]), "NOT READY", 3,
                 "Result: NOT READY. Fix the failed receive or configuration checks above, then re-run `pancetta doctor`."),
         ];
         let names = [
@@ -1451,6 +1469,9 @@ mod tests {
             "ft8_lib decoder",
             "rig / rigctld",
             "ft8_lib submodule",
+            "network services",
+            "log disk space",
+            "microphone permission",
         ];
         for (report, label, code, result_line) in fixtures {
             let text = report.text();
@@ -1474,10 +1495,9 @@ mod tests {
                 )));
             }
         }
-        let mut report = fixture_report(&ctx, [Pass; 7]);
+        let mut report = fixture_report(&ctx, [Pass; 10]);
         report.checks[0].fix = None;
         assert!(serde_json::to_value(&report).unwrap()["checks"][0]["fix"].is_null());
->>>>>>> 271f785b629d38e7f07350848cba3f517343e546
     }
 
     #[test]

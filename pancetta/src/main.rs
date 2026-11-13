@@ -3018,21 +3018,6 @@ async fn setup_command() -> Result<()> {
 async fn doctor_command(cli: &Cli, json: bool) -> Result<()> {
     use std::io::Write;
     let ctx = doctor::build_ctx(cli.config.clone());
-<<<<<<< HEAD
-    let checks = doctor::build_checks();
-    println!();
-    println!(
-        "pancetta doctor — {} checks (config: {})",
-        checks.len(),
-        ctx.config_path.display()
-    );
-    println!();
-    let mut results = Vec::with_capacity(checks.len());
-    for check in &checks {
-        let outcome = (check.run)(&ctx);
-        println!("{}", doctor::render_check(check.name, &outcome));
-        results.push((check.hard, outcome.status));
-=======
     let report = doctor::DoctorReport::collect(&ctx);
     {
         let mut stdout = std::io::stdout().lock();
@@ -3043,7 +3028,6 @@ async fn doctor_command(cli: &Cli, json: bool) -> Result<()> {
             write!(stdout, "{}", report.text())?;
         }
         stdout.flush()?;
->>>>>>> 271f785b629d38e7f07350848cba3f517343e546
     }
     if report.exit_code != 0 {
         std::process::exit(report.exit_code);

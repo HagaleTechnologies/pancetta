@@ -311,7 +311,6 @@ fn generate_creates_missing_parent_directories_owner_only() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn doctor_lists_field_checks() {
     let scratch = Scratch::new();
     let out = scratch.command().arg("doctor").output().unwrap();
@@ -337,7 +336,10 @@ fn doctor_lists_field_checks() {
     assert!(text.contains("not applicable on this OS") || cfg!(target_os = "macos"));
     for line in text.lines().filter(|line| line.contains("fix:")) {
         assert!(line.starts_with("       fix: "));
-=======
+    }
+}
+
+#[test]
 fn doctor_missing_config_exits_2() {
     let s = Scratch::new();
     for explicit in [false, true] {
@@ -361,7 +363,7 @@ fn assert_doctor_json(out: &std::process::Output, verdict: &str, code: i32) {
     assert_eq!(report["exit_code"], code);
     assert!(report["config_path"].is_string());
     let checks = report["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 7);
+    assert_eq!(checks.len(), 10);
     for check in checks {
         assert!(check["name"].is_string());
         assert!(["PASS", "WARN", "FAIL"].contains(&check["status"].as_str().unwrap()));
@@ -414,6 +416,5 @@ fn doctor_json_logging_stays_on_stderr() {
             assert_doctor_json(&out, "NOT CONFIGURED", 2);
             assert!(stderr(&out).contains("Starting Pancetta"));
         }
->>>>>>> 271f785b629d38e7f07350848cba3f517343e546
     }
 }
