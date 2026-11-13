@@ -178,7 +178,9 @@ current status.
 Upgrading an existing station? Stop Pancetta and all logbook writers, then
 complete the verified backup in [Upgrade and rollback](docs/UPGRADING.md)
 before replacing or starting a binary. Keep the prior version directory.
-Automatic database backups do not include your complete logbook or configuration.
+Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
+These copies do not include contacts logged since the latest startup.
+Preserve the whole stopped installation before upgrading.
 
 **Prebuilt binaries.** No Rust toolchain needed. Starting with the first
 tagged release after this note was added, every
@@ -322,6 +324,8 @@ rules still apply. Remote clients retain cqdx-only verdicts.
 
 ## Capability status
 
+Startup ADIF snapshots are implemented, unreleased. Directory and retention are configurable.
+
 Contest scoring is opt-in for Kansas FT4/FT8 2026 and SC fixed digital 2026.
 The TUI shows local claimed score, multipliers, contest dupes and hourly rate
 from durable evidence. SC grid-only contacts remain pending. See
@@ -367,7 +371,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
-| ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
+| ADIF export / import | Integration-tested; import and entity enrichment *Unreleased* | Offline COUNTRY/DXCC/CQZ/ITUZ inference uses prefix and exact-call zone overrides. Stored fields take precedence individually; unresolved calls gain no inferred fields. Old rows can gain fields on export; existing files are not rewritten. Automated coverage; live qualification pending. Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station; compile-checked for `x86_64-pc-windows-gnu` on every code PR). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 

@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 - PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.
+=======
+- PAN-306: logged and exported ADIF records infer COUNTRY, DXCC, CQZ and ITUZ offline, including prefix and exact-call zone overrides. Stored imported fields take precedence individually; unknown calls gain no inferred fields. Existing logs are not rewritten. Automated coverage only; live qualification pending.
+>>>>>>> a790ea9cd2e813441efa6f9cfe313016defd4819
 
 - PAN-310 security: refuse plaintext station-agent relay and pairing URLs outside loopback, including pairing CLI overrides. Loopback plaintext emits an unencrypted-link warning. Supplied endpoints are validated even when the agent is disabled.
 
@@ -19,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
 
 ### Added
+
+- PAN-304: Keep rotating, byte-exact startup snapshots of changed `qsos.adi` logbooks. Enabled by default with seven copies; directory and retention are configurable.
 
 - PAN-340: `rig.model` now accepts any Hamlib model — a name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, `"Barrett 950"`), a manufacturer-qualified name, or a numeric Hamlib model ID (`"1045"`), so rigs newer than the bundled catalog still work by number. Case, hyphens and spaces are ignored when matching names; ambiguous names and all-digit model names require the manufacturer-qualified form or the numeric ID. Unknown, malformed or ambiguous values fail config validation with the closest matches and a `rigctl -l` numeric-ID hint, and `pancetta doctor` reports the same message. Selecting more models adds no hardware qualification: only the FTdx10 is radio-qualified. Empty and `Generic` keep their placeholder behavior, and external `rigctld` users with an unknown name must now use its numeric ID.
 - PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.
