@@ -98,6 +98,7 @@ fn snapshot(
         Some(path) => fs::read(path)? == bytes,
         None => false,
     };
+    let mut published: Option<PathBuf> = None;
     if !unchanged {
         let temp = directory.join(format!(".qsos_adi_{}.tmp", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
@@ -118,7 +119,10 @@ fn snapshot(
                 };
                 let final_path = directory.join(name);
                 match fs::hard_link(&temp, &final_path) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        published = Some(final_path);
+                        return Ok(());
+                    }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(e),
                 }
@@ -132,6 +136,12 @@ fn snapshot(
         result?;
         cleanup?;
         copies = snapshots(directory)?;
+    }
+    // A backward wall clock can stamp the new snapshot before older ones; the
+    // snapshot just published is still the newest, so never prune it first.
+    if let Some(path) = published {
+        copies.retain(|p| *p != path);
+        copies.push(path);
     }
     for path in copies.iter().take(copies.len().saturating_sub(retain)) {
         fs::remove_file(path)?;
@@ -257,6 +267,23 @@ mod tests {
                 .unwrap()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn backward_clock_preserves_newest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("qsos.adi");
+        // A startup whose wall clock ran an hour ahead left this snapshot.
+        fs::write(
+            dir.path().join("qsos_adi_20261113_131238_123456.adi"),
+            b"stale",
+        )
+        .unwrap();
+        fs::write(&source, b"fresh").unwrap();
+        run(&source, dir.path(), 1).unwrap();
+        let copies = snapshots(dir.path()).unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(fs::read(&copies[0]).unwrap(), b"fresh");
     }
 
     #[test]
