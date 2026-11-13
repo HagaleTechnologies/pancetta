@@ -732,6 +732,11 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
         );
         std::process::exit(1);
     };
+    // Config-sourced URLs were already validated during load. Recheck only
+    // overrides so loopback warnings are emitted once per field validation.
+    if args.pairing_api_url.is_some() {
+        pancetta_config::StationAgentConfig::validate_pairing_api_url(&pairing_api_url)?;
+    }
     let origin = sa_cfg.pairing_origin.clone();
 
     let key_dir = resolve_key_dir(sa_cfg);
