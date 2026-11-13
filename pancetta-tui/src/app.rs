@@ -2287,6 +2287,26 @@ impl App {
             crate::ui::station_card::focused_qrz_info(self).is_some(),
         )?;
 
+        // Compute from the pre-click focus and geometry, before changing panels.
+        let dx_start = crate::ui::view_rects(
+            self.active_view,
+            self.zoomed,
+            self.active_panel,
+            content_area,
+            crate::ui::station_card::focused_qrz_info(self).is_some(),
+        )
+        .into_iter()
+        .find(|(p, _)| *p == ActivePanel::DxHunter)
+        .map(|(_, area)| {
+            crate::ui::dx_hunter::viewport(
+                area,
+                self.dx_hunter_scroll,
+                self.active_panel == ActivePanel::DxHunter,
+                self.displayed_dx_stations().len(),
+            )
+            .start
+        })
+        .unwrap_or(0);
         if panel != ActivePanel::TxPlacement {
             self.active_panel = panel;
             let row = row as usize;
@@ -2301,7 +2321,7 @@ impl App {
                 ActivePanel::DxHunter => {
                     let len = self.displayed_dx_stations().len();
                     if len > 0 {
-                        self.dx_hunter_scroll = row.min(len - 1);
+                        self.dx_hunter_scroll = (dx_start + row).min(len - 1);
                         self.repin_dx_hunter();
                     }
                 }
@@ -2428,6 +2448,7 @@ impl App {
 
     pub async fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
         self.terminal_size = (width, height);
+        self.clamp_dx_hunter_selection();
         debug!("Terminal resized to {}x{}", width, height);
         Ok(())
     }
@@ -2921,7 +2942,11 @@ impl App {
     }
 
     fn cleanup_old_data(&mut self) {
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
+        self.cleanup_old_data_at(Utc::now());
+    }
+
+    fn cleanup_old_data_at(&mut self, now: chrono::DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::hours(24);
 
         // Remove old messages
         while let Some(front) = self.decoded_messages.front() {
@@ -2936,27 +2961,15 @@ impl App {
         self.dx_stations
             .retain(|_, station| station.last_seen > cutoff);
 
-        // Keep the state map in lockstep with the station window: an entry
-        // survives only while its station is still listed (PAN-85). Note that
-        // `dx_states` is keyed by `station_state_key` (uppercase, hash-render
-        // resolved) while `dx_stations` is keyed by the callsign exactly as it
-        // was received, so the membership test must put each station key
-        // through the same normalization — a plain `contains_key` would drop
-        // every state for a station spotted lower-case or hash-rendered.
-        //
-        // This bounds `dx_states` exactly as much as `cleanup_old_data` bounds
-        // `dx_stations` — no more: the function currently has no production
-        // caller, so neither map is pruned on a live station today.
-        let Self {
-            dx_states,
-            dx_stations,
-            ..
-        } = self;
-        dx_states.retain(|call, _| {
-            dx_stations
-                .keys()
-                .any(|k| station_state_key(k).is_some_and(|key| key == *call))
-        });
+        let live_keys: HashSet<String> = self
+            .dx_stations
+            .keys()
+            .filter_map(|call| station_state_key(call))
+            .collect();
+        self.dx_states.retain(|call, _| live_keys.contains(call));
+        self.clamp_band_activity_selection();
+        self.clamp_dx_hunter_selection();
+        self.clamp_callers_selection();
     }
 
     /// Record a station's US state/territory (PAN-85), validating first. An
@@ -4009,6 +4022,7 @@ impl App {
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
     pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
+        self.cleanup_old_data();
         // 15 rows per 15s FT8 cycle (1 row/sec) × 30 cycles = ~7.5 minutes of history
         const MAX_WATERFALL_ROWS: usize = 450;
         self.waterfall_data.extend(rows);
@@ -4731,11 +4745,10 @@ impl App {
     /// `true` if `callsign` appears to be mid-exchange with a THIRD party
     /// (BUSY flag): seen within the last ~90s in a 3-token `<to> <from>
     /// <payload>` exchange where neither party is us and the payload is a
-    /// committed report/RR73/RRR/73. Mirrors
-    /// `pancetta_qso::autonomous::third_party_exchange_callsigns` /
-    /// `is_exchange_payload` (re-implemented here because `pancetta-tui` does
-    /// not depend on `pancetta-qso`); the canonical versions are `pub` + unit
-    /// tested in that crate to guard both copies against drift.
+    /// committed report/RR73/RRR/73. PAN-330: the payload classification is
+    /// `pancetta_core::ft8_tokens::is_exchange_payload` — the same single
+    /// definition `pancetta_qso::autonomous` uses (the TUI already depends
+    /// on pancetta-qso and pancetta-core; the old private copy is gone).
     pub fn is_caller_busy(&self, callsign: &str) -> bool {
         const BUSY_WINDOW_SECS: i64 = 90;
         let now = chrono::Utc::now();
@@ -4880,6 +4893,7 @@ impl App {
     /// the reply was read before the coordinator handled the operator's latest
     /// `SelectRig`, it merges only the refreshed port and bookmark lists
     /// instead of overwriting the form.
+    #[allow(clippy::too_many_arguments)] // Mirror the rig update message fields and ordering token without changing modal merge behavior.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,
@@ -5448,7 +5462,12 @@ fn third_party_exchange_participants(text: &str, our_call: &str) -> Vec<String> 
     if !is_committed_exchange_payload(payload) {
         return Vec::new();
     }
-    if to.eq_ignore_ascii_case(our_call) || from.eq_ignore_ascii_case(our_call) {
+    // PAN-330: party identity is the core compound-aware matcher, so our own
+    // portable-form traffic ("EA8/K5ARH DL1ABC -10" while we are K5ARH) is
+    // our exchange, not a third party's.
+    if pancetta_core::callsign::callsigns_match(to, our_call)
+        || pancetta_core::callsign::callsigns_match(from, our_call)
+    {
         return Vec::new();
     }
     let looks_like_call =
@@ -5464,17 +5483,11 @@ fn third_party_exchange_participants(text: &str, our_call: &str) -> Vec<String> 
 }
 
 /// `true` if `tok` is the payload of a committed exchange (report / RR73 /
-/// RRR / 73 / RR). Mirrors `pancetta_qso::autonomous::is_exchange_payload`.
+/// RRR / 73 / RR). PAN-330: one shared definition —
+/// `pancetta_core::ft8_tokens::is_exchange_payload`, the same function
+/// `pancetta_qso::autonomous` re-exports.
 fn is_committed_exchange_payload(tok: &str) -> bool {
-    let u = tok.to_uppercase();
-    if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
-        return true;
-    }
-    let body = u.strip_prefix('R').unwrap_or(&u);
-    if let Some(rest) = body.strip_prefix(['-', '+']) {
-        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
-    }
-    false
+    pancetta_core::ft8_tokens::is_exchange_payload(tok)
 }
 
 /// Shared staleness window for rig S-meter readings, used by both
@@ -6710,6 +6723,137 @@ mod tests {
         assert_eq!(app.station_state_for("W5ABC"), Some("AR"));
         assert_eq!(app.station_state_for("w5abc"), Some("AR"));
         assert_eq!(app.station_state_for("W1XYZ"), None);
+    }
+
+    #[tokio::test]
+    async fn pan319_cleanup_boundary_and_selection() {
+        let mut app = fixture_app().await;
+        let now = Utc::now();
+        for (call, age) in [
+            ("W5ABC", chrono::Duration::hours(24)),
+            (
+                "W6ABC",
+                chrono::Duration::hours(24) - chrono::Duration::nanoseconds(1),
+            ),
+            ("W7ABC", chrono::Duration::zero()),
+        ] {
+            app.add_decoded_message(fixture_view(call, -10))
+                .await
+                .unwrap();
+            app.dx_stations.get_mut(call).unwrap().last_seen = now - age;
+            app.set_station_state(call, "AR");
+        }
+        app.dx_hunter_scroll = 40;
+        app.cleanup_old_data_at(now);
+        assert!(!app.dx_stations.contains_key("W5ABC"));
+        assert!(app.dx_stations.contains_key("W6ABC"));
+        assert_eq!(app.station_state_for("W5ABC"), None);
+        assert_eq!(app.station_state_for("W6ABC"), Some("AR"));
+        assert_eq!(app.dx_hunter_scroll, 0);
+        assert_eq!(app.dx_hunter_pinned_call.as_deref(), Some("W7ABC"));
+    }
+
+    #[tokio::test]
+    async fn pan319_cleanup_preserves_band_activity_call_target() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        let now = Utc::now();
+        let mut expired = fixture_view_directed("K1OLD", -10);
+        expired.timestamp = now - chrono::Duration::hours(25);
+        app.add_decoded_message(expired).await.unwrap();
+        app.add_decoded_message(fixture_view("K2AAA", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K3BBB", -6))
+            .await
+            .unwrap();
+        // Directed messages sort first: [K1OLD, K3BBB, K2AAA].
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now);
+
+        assert_eq!(app.decoded_messages.len(), 2);
+        assert_eq!(app.band_activity_scroll, 0);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        // When the selected call also expires, adopt the surviving row.
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        app.decoded_messages.front_mut().unwrap().timestamp = now - chrono::Duration::hours(25);
+        app.cleanup_old_data_at(now);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now + chrono::Duration::hours(25));
+        assert_eq!(app.band_activity_scroll, 0);
+        assert!(app.band_activity_pinned_call.is_none());
+        assert!(app.get_selected_station().is_none());
+    }
+
+    #[tokio::test]
+    async fn pan319_resized_dx_click_targets_visible_station() {
+        let mut app = fixture_app().await;
+        app.active_view = crate::view::ActiveView::Hunt;
+        app.active_panel = ActivePanel::DxHunter;
+        for i in 0..60 {
+            app.add_decoded_message(fixture_view(&format!("W{i}ABC"), -10))
+                .await
+                .unwrap();
+        }
+        app.dx_hunter_scroll = 40;
+        app.clamp_dx_hunter_selection();
+        app.handle_resize(132, 24).await.unwrap();
+        let focused = app.get_selected_station().unwrap().0;
+        app.qrz_stations.insert(
+            focused,
+            QrzStationInfo {
+                name: Some("Test Operator".into()),
+                qth: None,
+                country: None,
+                state: None,
+                grid: None,
+            },
+        );
+        for (zoomed, height, contest) in [(false, 24, false), (true, 24, false), (false, 48, true)]
+        {
+            app.handle_resize(132, height).await.unwrap();
+            app.contest_score =
+                contest.then(|| pancetta_qso::contest::ledger::ContestScoreUpdate {
+                    generation: 1,
+                    instance_id: "test".into(),
+                    rules_id: "test".into(),
+                    display_name: "Test".into(),
+                    outside_period: false,
+                    state: pancetta_qso::contest::ledger::ContestScoreState::Loading,
+                });
+            app.zoomed = zoomed;
+            let content = crate::contest_score::content(
+                crate::ui::content_area(Rect::new(0, 0, 132, height)),
+                app.contest_score.as_ref(),
+            );
+            let rect = crate::ui::view_rects(
+                app.active_view,
+                app.zoomed,
+                app.active_panel,
+                content,
+                crate::ui::station_card::focused_qrz_info(&app).is_some(),
+            )
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::DxHunter)
+            .unwrap()
+            .1;
+            let start = crate::ui::dx_hunter::viewport(rect, app.dx_hunter_scroll, true, 60).start;
+            let expected = app.displayed_dx_stations()[start].call_sign.clone();
+            app.handle_left_click(rect.x + 2, rect.y + 2);
+            assert_eq!(app.get_selected_station().unwrap().0, expected);
+            assert_eq!(
+                app.dx_hunter_pinned_call.as_deref(),
+                Some(expected.as_str())
+            );
+        }
     }
 
     #[tokio::test]
@@ -9900,6 +10044,68 @@ mod tests {
         assert!(app.is_caller_busy("JA1ABC"));
         assert!(app.is_caller_busy("W1XYZ"));
         assert!(!app.is_caller_busy("K9ZZ"));
+    }
+
+    /// PAN-330 AC2: a prefix-portable decode the relay marked directed at
+    /// us surfaces the caller (DL1ABC) in the eligible Callers list.
+    #[tokio::test]
+    async fn prefix_portable_caller_visible() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+        // The relay-produced directed flag for `EA8/K5ARH DL1ABC -10`.
+        let mut v = fixture_view("DL1ABC", -10);
+        v.is_directed_at_us = true;
+        v.message = "EA8/K5ARH DL1ABC -10".to_string();
+        app.add_decoded_message(v).await.unwrap();
+
+        let callers = app.displayed_callers();
+        assert_eq!(
+            callers
+                .iter()
+                .map(|m| m.call_sign.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("DL1ABC")],
+            "prefix-portable directed decode must surface its caller"
+        );
+        // And it is not flagged busy (nobody is mid-third-party-exchange).
+        assert!(!app.is_caller_busy("DL1ABC"));
+        // A non-directed decode never becomes a caller row.
+        let mut plain = fixture_view("W2XYZ", -10);
+        plain.message = "CQ W2XYZ FN42".to_string();
+        app.add_decoded_message(plain).await.unwrap();
+        assert!(app
+            .displayed_callers()
+            .iter()
+            .all(|m| m.call_sign.as_deref() != Some("W2XYZ")));
+    }
+
+    /// PAN-330 AC5: the TUI busy detector classifies committed payloads
+    /// through the same core function as pancetta-qso (parity with
+    /// `pancetta_qso::autonomous`'s table).
+    #[tokio::test]
+    async fn committed_exchange_payload_table() {
+        for payload in ["-12", "+05", "R-12", "R+05", "RR73", "RRR", "73", "rr73"] {
+            let mut app = fixture_app().await;
+            app.station_info.call_sign = "K5ARH".to_string();
+            let mut v = fixture_view("JA1ABC", -10);
+            v.message = format!("W1XYZ JA1ABC {payload}");
+            app.add_decoded_message(v).await.unwrap();
+            assert!(
+                app.is_caller_busy("JA1ABC"),
+                "expected busy for {payload:?}"
+            );
+        }
+        for payload in ["FN42", "ZZ99", "12", "-", "+", "R", "RR7", "-12x"] {
+            let mut app = fixture_app().await;
+            app.station_info.call_sign = "K5ARH".to_string();
+            let mut v = fixture_view("JA1ABC", -10);
+            v.message = format!("W1XYZ JA1ABC {payload}");
+            app.add_decoded_message(v).await.unwrap();
+            assert!(
+                !app.is_caller_busy("JA1ABC"),
+                "expected not busy for {payload:?}"
+            );
+        }
     }
 
     // === UX audit Batch 1: callsign-pinned cursors ====================

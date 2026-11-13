@@ -43,3 +43,6 @@ tracing-subscriber = { workspace = true }
 default = ["mock-rig"]
 # Mock rig implementation for testing without hardware
 mock-rig = []
+
+[lints]
+workspace = true

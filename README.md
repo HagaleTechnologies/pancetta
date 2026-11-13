@@ -60,11 +60,12 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   is an *anytime* algorithm with a per-window budget that self-tunes to the
   host, so slow hardware degrades recall instead of falling over.
 - **`pancetta doctor`.** One command checks config, clock vs. NTP, audio
-  device and level, decoder, and `rigctld`, with a fix for each problem.
-  Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT CONFIGURED (2),
-  and NOT READY (3). `pancetta doctor --json` emits one report with per-check
-  status, detail and fix. ON-AIR READY covers these prerequisites; doctor
-  does not test PTT or transmit audio.
+  device and level, decoder, `rigctld`, enabled network services, log disk
+  space and microphone permission. It prints the fix for each warning or
+  failure. Verdicts are ON-AIR READY (exit 0), DECODE-ONLY (1), NOT
+  CONFIGURED (2), and NOT READY (3). `pancetta doctor --json` emits one
+  report with per-check status, detail and fix. ON-AIR READY covers these
+  prerequisites; doctor does not test PTT or transmit audio.
 
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).
@@ -341,6 +342,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 
 | Capability | State | Environment and limits | Evidence |
 |---|---|---|---|
+| Linux service watchdog and field diagnostics | Implemented, unreleased | READY follows pipeline initialization; missed health passes trigger recovery. Real systemd restart and macOS TCC qualification pending. | `systemd_unit`, `service_notify`, doctor tests; [runbook](docs/RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) |
 | FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity of the shipped pipeline, and of the native decoder alone vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
@@ -351,10 +353,10 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT. Optional `rig.data_mode` applies the CAT mode before TX at connection and after commanded retunes; this new option is hardware-unverified. Omit it for manual rig-mode control. Other Hamlib rigs are mapped but unproven: [supported rigs](docs/SUPPORTED_RIGS.md) | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
-| SWR protection | Integration-tested, *Unreleased* | Halts all TX on one SWR reading above `max_swr` (default 3.0) while keyed; needs CAT. Mock rig and fake `rigctld` only; no real-rig trip recorded | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
+| SWR protection | Integration-tested, *Unreleased* | Halts all TX after high-SWR keyed time reaches `swr_trip_delay_ms` (default 5000 ms; `0` trips on the first high reading) above `max_swr` (default 3.0). High keyed time accumulates across transmissions; unkeyed time does not count. A reading at or below the limit resets it, as does more than two minutes without a high reading. CAT support is required; real-rig trip qualification is pending | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
 | Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
-| ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| ClubLog, QRZ Logbook upload | Integration-tested, *Unreleased* | Opt-in. Local mock server only; no live-account run recorded. ClubLog, QRZ Logbook, eQSL and cqdx.io uploads use a persistent outbox (`~/.pancetta/upload_outbox.json`, unreleased): transient failures retry on `[network.reliability.retry]`, then every five minutes; login rejection pauses a destination for the session; record rejection holds that entry until restart; startup drains pending entries. LoTW remains a single TQSL attempt outside the outbox. Local ADIF remains the durable log | [upload clients](pancetta-dx/src/qso_upload.rs), [upload outbox](pancetta/src/coordinator/upload_outbox.rs) |
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
 | LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
@@ -391,8 +393,10 @@ Honest gaps, so you can judge whether it fits your station:
 
 - **Pre-1.0.** Config keys, CLI surface, and on-disk formats can still change
   between releases.
-- **Uploads are best-effort.** A failed upload is logged and not retried;
-  see [Capability status](#capability-status).
+- **Uploads can still be lost.** Per-QSO logbook uploads now go through a
+  persistent outbox with retries (*unreleased* — see
+  [Capability status](#capability-status)), but no live-account run has been
+  recorded; `~/.pancetta/qsos.adi` stays the durable log.
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
   Linux, deployed on a Windows 11 MiniPC. Prebuilt Linux aarch64 binaries are
   published for Pi-class ARM, but real-hardware validation (the

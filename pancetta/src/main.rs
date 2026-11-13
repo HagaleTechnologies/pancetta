@@ -3299,6 +3299,19 @@ mod test_rig_tests {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Restore only when this panic is on the process-exit path: the
+        // main thread's unwind is the only one that takes the process
+        // down, so the terminal must be back before the diagnostic is
+        // printed. Panics on every other thread are survived by design —
+        // the FT8 decode loop catches them (`catch_unwind` in
+        // `coordinator/ft8.rs`, a `spawn_blocking` thread) and the
+        // supervisor restarts panicked component tasks — while the TUI
+        // keeps running on its relay thread; restoring there would drop
+        // the alternate screen and raw mode mid-session with
+        // `TERMINAL_OWNED` left permanently false.
+        if std::thread::current().name() == Some("main") {
+            pancetta_tui::tui_runner::restore_terminal();
+        }
         let n = pancetta_lib::coordinator::record_panic();
         let location = info
             .location()
@@ -4513,5 +4526,226 @@ mod microphone_command_tests {
         }
         let doctor = Cli::try_parse_from(["pancetta", "doctor"]).unwrap();
         assert!(opens_microphone(&doctor, true));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pan333_panic_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn isolated(mode: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pan333_panic_tests::pan333_hook_child",
+                "--nocapture",
+            ])
+            .env("PAN333_HOOK_CHILD", mode)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn pan333_headless_restore_is_noop() {
+        let output = isolated("headless");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(!output.stderr.contains(&0x1b));
+    }
+
+    #[test]
+    fn pan333_panic_restores_before_diagnostic() {
+        let output = isolated("active");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Validate round 1 finding (`main.rs` panic hook): a panic on a
+    /// non-main thread is caught or supervised and the process keeps
+    /// running the TUI; the hook must not restore the terminal under it.
+    #[test]
+    fn pan333_worker_panic_keeps_terminal_for_running_tui() {
+        let output = isolated("worker");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn pan333_hook_child() {
+        let Ok(mode) = std::env::var("PAN333_HOOK_CHILD") else {
+            return;
+        };
+        if mode == "headless" {
+            pancetta_tui::tui_runner::restore_terminal();
+            return;
+        }
+        // SAFETY: openpty receives writable fd slots and a valid winsize; null
+        // name/termios pointers request defaults. Success is checked before using
+        // the fds, which become uniquely owned Files. dup saves stdin/stdout before
+        // dup2 redirects them in this isolated child process.
+        let (mut master, slave, saved_stdout, saved_stdin) = unsafe {
+            let (mut master, mut slave) = (0, 0);
+            let mut size = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                0
+            );
+            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
+            let saved = libc::dup(1);
+            assert!(saved >= 0);
+            let saved_stdin = libc::dup(0);
+            assert!(saved_stdin >= 0);
+            assert_eq!(libc::dup2(slave, 0), 0);
+            assert_eq!(libc::dup2(slave, 1), 1);
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+                saved,
+                saved_stdin,
+            )
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut output = Vec::new();
+            let mut scan = 0;
+            loop {
+                let mut buf = [0; 4096];
+                match master.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        output.extend_from_slice(&buf[..n]);
+                        while let Some(i) = output[scan..].windows(4).position(|s| s == b"\x1b[6n")
+                        {
+                            scan += i + 4;
+                            master.write_all(b"\x1b[1;1R").unwrap();
+                        }
+                    }
+                    _ if reader_stop.load(Ordering::Acquire) => break,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(15));
+            }
+            (output, master)
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runner = rt.block_on(async {
+            let config = pancetta_tui::Config::default();
+            let app = Arc::new(tokio::sync::RwLock::new(
+                pancetta_tui::App::new(config.clone(), None).await.unwrap(),
+            ));
+            let (_tx, rx) = crossbeam_channel::unbounded();
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            pancetta_tui::tui_runner::TuiRunner::new(
+                app,
+                config,
+                rx,
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+            .unwrap()
+        });
+        let before = pancetta_lib::coordinator::panic_count();
+        // The captured default hook proves chaining happens after restoration.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            std::io::stdout()
+                .write_all(b"PAN333_DEFAULT_DIAGNOSTIC")
+                .unwrap();
+            default_hook(info);
+        }));
+        install_panic_hook();
+        if mode == "worker" {
+            // A non-main-thread panic that the process survives: the hook
+            // must count it but leave the terminal to the running TUI.
+            std::thread::Builder::new()
+                .name("pan333-worker".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("worker panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+            // Raw mode must still be active: the hook skipped restoration,
+            // so the TUI keeps its alternate screen and input handling.
+            // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
+            let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+            // SAFETY: slave owns an open PTY fd and term is writable for the call.
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+            assert_eq!(
+                term.c_lflag & libc::ICANON,
+                0,
+                "hook restored the terminal under the still-running TUI"
+            );
+        } else {
+            // The hook restores only on the process-exit path, so the panic
+            // must come from a thread named like the main thread; libtest
+            // runs this test on a thread named after the test itself.
+            std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("simulated panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+        }
+        drop(runner);
+        std::io::stdout().flush().unwrap();
+        // SAFETY: saved_stdout and saved_stdin are live dup-owned fds. Restore
+        // their standard descriptors before closing each saved fd exactly once.
+        unsafe {
+            libc::dup2(saved_stdout, 1);
+            libc::close(saved_stdout);
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+        }
+        stop.store(true, Ordering::Release);
+        let (output, _master) = reader.join().unwrap();
+        let output = String::from_utf8_lossy(&output).into_owned();
+        let diagnostic = output.find("PAN333_DEFAULT_DIAGNOSTIC").unwrap();
+        if mode == "worker" {
+            // The hook restored nothing during the panic: the alternate
+            // screen is left only by the runner's own teardown (drop),
+            // which still owns the terminal, so it comes after the
+            // diagnostic instead of before it.
+            assert!(diagnostic < output.find("\x1b[?1049l").unwrap(), "{output}");
+        } else {
+            assert!(output.find("\x1b[?1049l").unwrap() < diagnostic, "{output}");
+            assert!(output.find("\x1b[?25h").unwrap() < diagnostic, "{output}");
+        }
+        // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
+        let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: slave owns an open PTY fd and term is writable for the call.
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+        assert_ne!(term.c_lflag & libc::ICANON, 0);
     }
 }

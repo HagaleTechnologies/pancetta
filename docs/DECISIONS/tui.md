@@ -567,3 +567,20 @@ grid history adds no marker and triggers no lookup during rendering.
 Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
 borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
 below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.
+
+## Redraw cadence and station retention (PAN-319)
+
+The TUI draws an initial frame, then redraws on state changes or a one-second
+monotonic clock tick. Message bursts share the 30 FPS ceiling. Input, focus gain
+and resize bypass that ceiling. Delayed ticks coalesce. Every frame refreshes
+status expiry, display needs and operator-presence state before drawing.
+Complete frames, including overlays, use synchronized output with an attempted
+end marker and flush even when drawing returns an error. Terminal support is
+required for atomic presentation.
+
+Resize records current dimensions and retains logical callsign focus. DX Hunter
+formats only the visible range. Rendering and clicks use the same viewport,
+computed from the panel rectangle after contest, QRZ-card and zoom layout.
+At short Hunt sizes, TX Placement compresses to leave DX Hunter a data row.
+Waterfall updates prune stations at the strict 24-hour cutoff and retain state
+entries only for normalized surviving callsigns. Watchlist pins remain stored.

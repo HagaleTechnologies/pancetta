@@ -16,7 +16,7 @@
 
 pub mod codec;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -46,9 +46,8 @@ const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// A decode within this many ms of "now" counts as `Decoding = true`.
 const DECODING_WINDOW_MS: u64 = 2_000;
 
-/// Inbound-poll timeout: bounds how long one `recv_from` wait can delay
-/// servicing the Heartbeat/Status timers and the shutdown flag. Small enough
-/// that the component stays responsive; large enough to avoid a busy loop.
+/// Idle receive timeout. Timers remain selectable while receive is pending;
+/// this does not rate-limit a continuously readable socket.
 const INBOUND_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// `Heartbeat.Version` string pancetta advertises. JTAlert reads this field
@@ -61,6 +60,7 @@ const HEARTBEAT_VERSION: &str = "2.6.1";
 /// channel bound so this never grows without limit across a long idle
 /// session. Oldest entry evicted once a new decode would exceed this.
 const DECODE_RING_CAPACITY: usize = 500;
+const REPLAY_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 impl super::ApplicationCoordinator {
     /// Start the WSJT-X UDP companion-protocol component.
@@ -77,8 +77,8 @@ impl super::ApplicationCoordinator {
     /// and emitting it), a 15s Heartbeat (+ Status right after each one)
     /// and a 1s change-driven Status sample (both also sample the dial
     /// frequency for Clear-on-band-change), and polling for inbound
-    /// datagrams (answering Replay(7) by re-emitting the ring with
-    /// `New=false` then a Status). Emits Close(6) on loop exit.
+    /// datagrams (answering admitted Replay(7) at most once per second
+    /// by re-emitting the ring with `New=false` then a Status). Emits Close(6) on loop exit.
     pub(crate) async fn start_wsjtx_udp_component(&mut self) -> Result<()> {
         // `--replay` decodes are historical off-air captures, but every
         // Decode(2) datagram built from them is stamped with the current
@@ -214,6 +214,7 @@ impl super::ApplicationCoordinator {
             // disabled for the run in that case — every other message type is
             // unaffected.
             let mut qso_events = qso_events_handoff;
+            let mut requests = RequestState::default();
             // Renders each completed QSO's ADIF record the identical way the
             // source-of-truth writer and the per-QSO upload subscriber do
             // (`qso.rs`'s `start_adif_subscriber` / `start_qso_upload_subscriber`)
@@ -346,8 +347,8 @@ impl super::ApplicationCoordinator {
                     // refused-with-audit, never partially acted on.
                     // Every honored AND refused request gets a retained
                     // `DiagnosticEvent` (design spec's audit-trail
-                    // requirement). The timeout throttles this branch so the
-                    // loop never busy-spins.
+                    // requirement). The timeout bounds idle receive waits;
+                    // Replay output has its own skip-only budget.
                     recv = tokio::time::timeout(INBOUND_POLL_TIMEOUT, socket.recv_from(&mut inbound_buf)) => {
                         if let Ok(Ok((n, from))) = recv {
                             match InMsg::decode(&inbound_buf[..n]) {
@@ -358,7 +359,7 @@ impl super::ApplicationCoordinator {
                                         n, from, id, instance_id
                                     );
                                 }
-                                Some((_id, msg)) if !request_allowed(&cfg, from.ip(), &dest) => {
+                                Some((_id, msg)) if !requests.admit(&cfg, from, &dest, &msg) => {
                                     emit_diagnostic(
                                         &message_bus,
                                         DiagnosticLevel::Warn,
@@ -418,6 +419,11 @@ impl super::ApplicationCoordinator {
                                     .await;
                                 }
                                 Some((_id, InMsg::Replay)) => {
+                                    if !requests.replay_allowed(Instant::now()) {
+                                        emit_diagnostic(&message_bus, DiagnosticLevel::Info,
+                                            format!("Replay from {from} ignored (rate-limited; minimum interval 1s)")).await;
+                                        continue;
+                                    }
                                     for (out, _key) in &decode_ring {
                                         if let Some(replay) = as_replay(out) {
                                             if let Err(e) = socket
@@ -1328,7 +1334,8 @@ fn is_multicast_dest(dest: &SocketAddr) -> bool {
 
 /// Fail-closed source gate for every inbound WSJT-X UDP request
 /// (Reply/HaltTx/Replay/...) — design spec's gates 1 ("master switch") and 3
-/// ("source filtering"), ANDed. Pure and side-effect-free (no I/O, no
+/// ("source filtering"), ANDed. `RequestState::admit` then applies port pins.
+/// Pure and side-effect-free (no I/O, no
 /// atomics) so it is exhaustively unit-tested in isolation; the inbound-poll
 /// arm of `start_wsjtx_udp_component`'s select loop is the only caller and
 /// checks this before dispatching anything.
@@ -1354,6 +1361,44 @@ pub(crate) fn request_allowed(cfg: &WsjtxUdpConfig, src: IpAddr, dest: &SocketAd
             .any(|host| host.parse::<IpAddr>().map(|ip| ip == src).unwrap_or(false))
     } else {
         src == dest.ip()
+    }
+}
+
+/// Task-local admission state. Id targeting is checked before calling `admit`.
+#[derive(Default)]
+struct RequestState {
+    peers: HashMap<IpAddr, SocketAddr>,
+    last_replay: Option<Instant>,
+}
+
+impl RequestState {
+    fn admit(
+        &mut self,
+        cfg: &WsjtxUdpConfig,
+        from: SocketAddr,
+        dest: &SocketAddr,
+        msg: &InMsg,
+    ) -> bool {
+        if !request_allowed(cfg, from.ip(), dest) {
+            return false;
+        }
+        if matches!(msg, InMsg::Heartbeat { .. }) {
+            self.peers.insert(from.ip(), from);
+            return true;
+        }
+        *self.peers.entry(from.ip()).or_insert(from) == from
+    }
+
+    /// Charge before attempting any sends, including empty or failed bursts.
+    fn replay_allowed(&mut self, now: Instant) -> bool {
+        if self
+            .last_replay
+            .is_some_and(|last| now.saturating_duration_since(last) < REPLAY_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_replay = Some(now);
+        true
     }
 }
 
@@ -1401,8 +1446,25 @@ async fn emit_diagnostic(message_bus: &MessageBus, level: DiagnosticLevel, text:
 /// and set non-blocking so the tokio-wrapped socket can be polled in the
 /// component's select loop (protocol notes §1: one socket, both send and
 /// `recv_from`, no `connect()` — multicast destinations aren't reply
-/// sources).
+/// sources). Unicast binds the routed local IPv4 address, with no wildcard
+/// fallback if route discovery fails. Multicast retains its wildcard bind.
 pub(crate) fn open_socket(cfg: &WsjtxUdpConfig) -> Result<tokio::net::UdpSocket> {
+    open_socket_with_resolver(cfg, routed_local_ipv4)
+}
+
+fn routed_local_ipv4(dest: SocketAddr) -> Result<Ipv4Addr> {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    probe.connect(dest)?;
+    match probe.local_addr()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Ok(ip),
+        _ => anyhow::bail!("route did not select a local IPv4 address"),
+    }
+}
+
+fn open_socket_with_resolver(
+    cfg: &WsjtxUdpConfig,
+    resolve: impl FnOnce(SocketAddr) -> Result<Ipv4Addr>,
+) -> Result<tokio::net::UdpSocket> {
     let dest: SocketAddr = cfg
         .destination
         .parse()
@@ -1417,7 +1479,18 @@ pub(crate) fn open_socket(cfg: &WsjtxUdpConfig) -> Result<tokio::net::UdpSocket>
         Some(socket2::Protocol::UDP),
     )
     .context("failed to create wsjtx_udp UDP socket")?;
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("valid bind literal");
+    anyhow::ensure!(dest.is_ipv4(), "wsjtx_udp requires an IPv4 destination");
+    let local = if is_multicast_dest(&dest) {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        let ip = resolve(dest).context("failed to discover wsjtx_udp unicast route")?;
+        anyhow::ensure!(
+            !ip.is_unspecified(),
+            "wsjtx_udp route selected wildcard address"
+        );
+        ip
+    };
+    let bind_addr = SocketAddr::from((local, 0));
     socket
         .bind(&bind_addr.into())
         .context("failed to bind wsjtx_udp UDP socket")?;
@@ -1478,6 +1551,35 @@ mod socket_tests {
     }
 
     #[tokio::test]
+    async fn unicast_socket_binds_routed_local_address() {
+        let cfg = WsjtxUdpConfig {
+            destination: "127.0.0.1:2237".into(),
+            accept_udp_requests: true,
+            ..Default::default()
+        };
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect(&cfg.destination).unwrap();
+        let socket = open_socket(&cfg).unwrap();
+        assert_eq!(
+            socket.local_addr().unwrap().ip(),
+            probe.local_addr().unwrap().ip()
+        );
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+        assert!(
+            socket.peer_addr().is_err(),
+            "production socket stays unconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn unicast_route_failure_returns_error() {
+        let cfg = WsjtxUdpConfig::default();
+        let error = open_socket_with_resolver(&cfg, |_| anyhow::bail!("injected route failure"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected route failure"));
+    }
+
+    #[tokio::test]
     async fn open_socket_binds_ephemeral_port_for_unicast_destination() {
         let cfg = WsjtxUdpConfig {
             destination: "127.0.0.1:2237".to_string(),
@@ -1500,6 +1602,8 @@ mod socket_tests {
         // setup (set_multicast_ttl_v4 / set_nonblocking) on a real bound
         // socket, confirming it doesn't error for a multicast destination.
         let socket = open_socket(&cfg).expect("multicast open_socket should succeed");
+        assert!(socket.local_addr().unwrap().ip().is_unspecified());
+        assert_eq!(socket.multicast_ttl_v4().unwrap(), 3);
         assert_ne!(socket.local_addr().unwrap().port(), 0);
     }
 }
@@ -1507,6 +1611,69 @@ mod socket_tests {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+
+    fn heartbeat() -> InMsg {
+        InMsg::Heartbeat {
+            max_schema: 3,
+            version: String::new(),
+            revision: String::new(),
+        }
+    }
+
+    #[test]
+    fn peer_pin_bootstrap_refresh_and_refusal() {
+        let cfg = WsjtxUdpConfig {
+            accept_udp_requests: true,
+            ..Default::default()
+        };
+        let dest = "127.0.0.1:2237".parse().unwrap();
+        let a = "127.0.0.1:4000".parse().unwrap();
+        let b = "127.0.0.1:4001".parse().unwrap();
+        let mut state = RequestState::default();
+        assert!(state.admit(&cfg, a, &dest, &InMsg::Replay));
+        assert!(state.admit(&cfg, a, &dest, &InMsg::Replay));
+        for msg in [
+            InMsg::Replay,
+            InMsg::Clear { window: None },
+            InMsg::Close,
+            InMsg::Reply {
+                time_ms: 0,
+                snr: 0,
+                delta_time: 0.0,
+                delta_freq: 0,
+                mode: "~".into(),
+                message: "CQ W1AW FN31".into(),
+                low_confidence: false,
+                modifiers: 0,
+            },
+            InMsg::HaltTx {
+                auto_tx_only: false,
+            },
+        ] {
+            assert!(!state.admit(&cfg, b, &dest, &msg));
+            assert_eq!(state.peers[&a.ip()], a);
+        }
+        assert!(state.admit(&cfg, b, &dest, &heartbeat()));
+        assert!(!state.admit(&cfg, a, &dest, &InMsg::Replay));
+        assert!(state.admit(&cfg, b, &dest, &InMsg::Replay));
+    }
+
+    #[test]
+    fn refused_sources_never_change_pins() {
+        let mut cfg = WsjtxUdpConfig::default();
+        let dest = "127.0.0.1:2237".parse().unwrap();
+        let a = "127.0.0.1:4000".parse().unwrap();
+        let mut state = RequestState::default();
+        assert!(!state.admit(&cfg, a, &dest, &heartbeat()));
+        cfg.accept_udp_requests = true;
+        assert!(!state.admit(&cfg, "127.0.0.2:4000".parse().unwrap(), &dest, &heartbeat()));
+        let multicast = "224.0.0.73:2237".parse().unwrap();
+        assert!(!state.admit(&cfg, a, &multicast, &heartbeat()));
+        assert!(state.peers.is_empty());
+        cfg.allowed_request_hosts.push("127.0.0.1".into());
+        assert!(state.admit(&cfg, a, &multicast, &heartbeat()));
+        assert_eq!(state.peers.len(), 1);
+    }
 
     #[test]
     fn request_gate_is_fail_closed() {
@@ -3000,7 +3167,7 @@ mod ft4_component_tests {
     use crate::coordinator::ApplicationCoordinator;
     use pancetta_config::{Config, OperatingMode};
 
-    async fn setup() -> (
+    pub(super) async fn setup() -> (
         ApplicationCoordinator,
         tokio::net::UdpSocket,
         tempfile::TempDir,
@@ -3031,7 +3198,7 @@ mod ft4_component_tests {
         (coordinator, listener, scratch)
     }
 
-    async fn receive(listener: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+    pub(super) async fn receive(listener: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
         let mut bytes = [0u8; 4096];
         let (n, source) =
             tokio::time::timeout(Duration::from_secs(4), listener.recv_from(&mut bytes))
@@ -3045,7 +3212,7 @@ mod ft4_component_tests {
         u32::from_be_bytes(bytes[8..12].try_into().unwrap())
     }
 
-    async fn packet(listener: &tokio::net::UdpSocket, kind: u32) -> Vec<u8> {
+    pub(super) async fn packet(listener: &tokio::net::UdpSocket, kind: u32) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 let (bytes, _) = receive(listener).await;
@@ -3058,7 +3225,7 @@ mod ft4_component_tests {
         .unwrap()
     }
 
-    fn payload(bytes: &[u8]) -> codec::Reader<'_> {
+    pub(super) fn payload(bytes: &[u8]) -> codec::Reader<'_> {
         let mut r = codec::Reader::new(bytes);
         assert_eq!(r.read_u32(), Some(0xadbc_cbda));
         assert_eq!(r.read_u32(), Some(2));
@@ -3067,7 +3234,7 @@ mod ft4_component_tests {
         r
     }
 
-    async fn send_decode(c: &ApplicationCoordinator, text: &str, dial: u64) -> OutMsg {
+    pub(super) async fn send_decode(c: &ApplicationCoordinator, text: &str, dial: u64) -> OutMsg {
         let mut decoded =
             pancetta_ft8::DecodedMessage::new(Ft8Message::default(), -10.0, 1.0, 1302.0, 0.2);
         decoded.text = text.into();
@@ -3085,7 +3252,7 @@ mod ft4_component_tests {
         expected
     }
 
-    async fn stop(mut c: ApplicationCoordinator) {
+    pub(super) async fn stop(mut c: ApplicationCoordinator) {
         c.shutdown_signal.store(true, Ordering::Release);
         for (_, task) in c.named_task_handles.drain(..) {
             task.await.unwrap().unwrap();
@@ -3376,5 +3543,321 @@ mod ft4_component_tests {
         until_contact(&listener, |s| *s == ContactStatus::default()).await;
         c.qso_manager_watch.send_replace(None);
         stop(c).await;
+    }
+}
+
+#[cfg(test)]
+mod replay_limit_tests {
+    use super::*;
+
+    #[test]
+    fn replay_interval_boundaries() {
+        let mut state = RequestState::default();
+        let now = Instant::now();
+        assert!(state.replay_allowed(now));
+        assert!(!state.replay_allowed(now));
+        assert!(!state.replay_allowed(now + Duration::from_millis(999)));
+        assert!(state.replay_allowed(now + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn rejected_replays_do_not_extend_interval() {
+        let mut state = RequestState::default();
+        let now = Instant::now();
+        assert!(state.replay_allowed(now));
+        for ms in 1..1000 {
+            assert!(!state.replay_allowed(now + Duration::from_millis(ms)));
+        }
+        assert_eq!(state.last_replay, Some(now));
+        assert!(state.replay_allowed(now + REPLAY_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn budget_is_global_and_charged_before_sends() {
+        let cfg = WsjtxUdpConfig {
+            accept_udp_requests: true,
+            allowed_request_hosts: vec!["192.0.2.1".into(), "192.0.2.2".into()],
+            ..Default::default()
+        };
+        let dest = "224.0.0.73:2237".parse().unwrap();
+        let mut state = RequestState::default();
+        let now = Instant::now();
+        assert!(state.admit(
+            &cfg,
+            "192.0.2.1:2000".parse().unwrap(),
+            &dest,
+            &InMsg::Replay
+        ));
+        assert!(state.replay_allowed(now)); // no send occurs, just like an empty or failed burst
+        assert!(state.admit(
+            &cfg,
+            "192.0.2.2:2000".parse().unwrap(),
+            &dest,
+            &InMsg::Replay
+        ));
+        assert!(!state.replay_allowed(now));
+        let hb = InMsg::Heartbeat {
+            max_schema: 3,
+            version: String::new(),
+            revision: String::new(),
+        };
+        assert!(state.admit(&cfg, "192.0.2.1:3000".parse().unwrap(), &dest, &hb));
+        assert!(!state.replay_allowed(now + Duration::from_millis(999)));
+        assert!(state.replay_allowed(now + REPLAY_MIN_INTERVAL));
+    }
+}
+
+#[cfg(test)]
+mod pan312_component_tests {
+    use super::ft4_component_tests::{packet, payload, receive, send_decode, setup, stop};
+    use super::*;
+
+    fn request(kind: u32, id: &str, auto: bool) -> Vec<u8> {
+        let mut w = codec::Writer::new();
+        w.u32(0xadbc_cbda);
+        w.u32(2);
+        w.u32(kind);
+        w.utf8(id);
+        if kind == 0 {
+            w.u32(3);
+            w.utf8("2.6.1");
+            w.utf8("");
+        }
+        if kind == 8 {
+            w.bool(auto);
+        }
+        w.into_vec()
+    }
+
+    async fn send(socket: &tokio::net::UdpSocket, dest: SocketAddr, kind: u32, auto: bool) {
+        socket
+            .send_to(&request(kind, "WSJT-X - pancetta", auto), dest)
+            .await
+            .unwrap();
+    }
+
+    async fn diagnostic(
+        rx: &crossbeam_channel::Receiver<ComponentMessage>,
+        needle: &str,
+    ) -> (DiagnosticLevel, String) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                while let Ok(msg) = rx.try_recv() {
+                    if let MessageType::DiagnosticEvent {
+                        target: "remote.wsjtx",
+                        level,
+                        text,
+                        ..
+                    } = msg.message_type
+                    {
+                        if text.contains(needle) {
+                            return (level, text);
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn halt_case(auto: bool) {
+        let (mut c, peer, _scratch) = setup().await;
+        let (_, qso) = c
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .unwrap();
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_wsjtx_udp_component().await.unwrap();
+        let (_, dest) = receive(&peer).await;
+        send(&peer, dest, 0, false).await;
+        send(&peer, dest, 7, false).await;
+        diagnostic(&tui, "Replay from").await; // Heartbeat processed before crossing sockets
+        let forged = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        send(&forged, dest, 8, auto).await;
+        let (level, text) = diagnostic(&tui, "refused request").await;
+        assert_eq!(level, DiagnosticLevel::Warn);
+        assert_eq!(
+            text,
+            format!(
+                "refused request from {}: HaltTx",
+                forged.local_addr().unwrap()
+            )
+        );
+        assert!(!c.abort_current_tx.load(Ordering::Acquire));
+        assert!(qso.try_recv().is_err());
+        send(&peer, dest, 8, auto).await;
+        diagnostic(&tui, "honored").await;
+        assert!(c.abort_current_tx.load(Ordering::Acquire));
+        let effects: Vec<_> = qso.try_iter().map(|m| m.message_type).collect();
+        if auto {
+            assert!(effects.is_empty());
+        } else {
+            assert_eq!(effects.len(), 2);
+            assert!(matches!(
+                effects[0],
+                MessageType::QsoMessage(QsoMessage::CancelAllQsos)
+            ));
+            assert!(matches!(
+                effects[1],
+                MessageType::QsoMessage(QsoMessage::StopCq)
+            ));
+        }
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_port_halt_is_ignored_and_logged() {
+        halt_case(false).await;
+        halt_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn pinned_halt_does_not_require_initiation_consent() {
+        halt_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rebinds_peer_but_wrong_id_does_not() {
+        let (mut c, peer, _scratch) = setup().await;
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_wsjtx_udp_component().await.unwrap();
+        let (_, dest) = receive(&peer).await;
+        send(&peer, dest, 0, false).await;
+        send(&peer, dest, 7, false).await;
+        diagnostic(&tui, "Replay from").await;
+        let next = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        next.send_to(&request(0, "wrong instance", false), dest)
+            .await
+            .unwrap();
+        send(&next, dest, 8, true).await;
+        diagnostic(&tui, "refused request").await;
+        assert!(!c.abort_current_tx.load(Ordering::Acquire));
+        send(&next, dest, 0, false).await;
+        send(&next, dest, 8, true).await;
+        diagnostic(&tui, "honored").await;
+        assert!(c.abort_current_tx.load(Ordering::Acquire));
+        c.abort_current_tx.store(false, Ordering::Release);
+        send(&peer, dest, 8, true).await;
+        diagnostic(&tui, "refused request").await;
+        assert!(!c.abort_current_tx.load(Ordering::Acquire));
+        stop(c).await;
+    }
+
+    async fn replays(empty: bool, refused_first: bool) {
+        let (mut c, peer, _scratch) = setup().await;
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_wsjtx_udp_component().await.unwrap();
+        let (_, dest) = receive(&peer).await;
+        // Consume the immediate Heartbeat and its Status before measuring Replay
+        // Status output. The periodic unchanged Status sampler emits nothing.
+        packet(&peer, 0).await;
+        packet(&peer, 1).await;
+        let mut expected = Vec::new();
+        if !empty {
+            for text in ["CQ W1AW FN31", "CQ K1ABC FN42", "CQ N0CALL EM00"] {
+                send_decode(&c, text, 0).await;
+                let live = packet(&peer, 2).await;
+                let mut r = payload(&live);
+                assert_eq!(r.read_bool(), Some(true));
+                expected.push(live);
+            }
+        }
+        send(&peer, dest, 0, false).await;
+        send(&peer, dest, 8, true).await;
+        diagnostic(&tui, "HaltTx from").await;
+        c.abort_current_tx.store(false, Ordering::Release);
+        if refused_first {
+            let wrong = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            send(&wrong, dest, 7, false).await;
+            diagnostic(&tui, "refused request").await;
+            peer.send_to(&request(7, "wrong instance", false), dest)
+                .await
+                .unwrap();
+        }
+        let start = Instant::now();
+        for _ in 0..10 {
+            send(&peer, dest, 7, false).await;
+        }
+        // Sequential diagnostics form a processing barrier for all ten requests.
+        let mut honored = 0;
+        let mut limited = 0;
+        for _ in 0..10 {
+            let (level, text) = diagnostic(&tui, "Replay from").await;
+            assert_eq!(level, DiagnosticLevel::Info);
+            if text.ends_with("honored") {
+                honored += 1;
+            } else {
+                assert!(text.ends_with("ignored (rate-limited; minimum interval 1s)"));
+                limited += 1;
+            }
+        }
+        assert!(start.elapsed() < REPLAY_MIN_INTERVAL);
+        assert_eq!((honored, limited), (1, 9));
+        let mut replay_count = 0;
+        let mut statuses = 0;
+        while let Ok(Ok((n, _))) = {
+            let mut buf = [0u8; 4096];
+            let result =
+                tokio::time::timeout(Duration::from_millis(30), peer.recv_from(&mut buf)).await;
+            if let Ok(Ok((n, _))) = &result {
+                let bytes = &buf[..*n];
+                let kind = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+                if kind == 2 {
+                    let mut r = payload(bytes);
+                    assert_eq!(r.read_bool(), Some(false));
+                    let mut expected_bytes = expected[replay_count].clone();
+                    // New is the first payload byte after the instance Id.
+                    let index = 16 + "WSJT-X - pancetta".len();
+                    expected_bytes[index] = 0;
+                    assert_eq!(bytes, expected_bytes);
+                    replay_count += 1;
+                }
+                if kind == 1 {
+                    statuses += 1;
+                }
+            }
+            result
+        } {
+            let _ = n;
+        }
+        assert_eq!(replay_count, expected.len());
+        if empty {
+            assert_eq!(statuses, 1, "only the accepted Replay emits Status");
+        } else {
+            // A changed Decoding flag may also produce a timer Status.
+            assert!(
+                (1..=2).contains(&statuses),
+                "unexpected Status count: {statuses}"
+            );
+        }
+        stop(c).await;
+    }
+
+    #[tokio::test]
+    async fn ten_replays_produce_one_burst() {
+        replays(false, false).await;
+    }
+    #[tokio::test]
+    async fn empty_ring_replay_is_limited() {
+        replays(true, false).await;
+    }
+    #[tokio::test]
+    async fn refused_replay_does_not_consume_budget() {
+        replays(false, true).await;
     }
 }

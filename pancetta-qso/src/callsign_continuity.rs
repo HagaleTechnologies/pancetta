@@ -135,32 +135,20 @@ pub fn callsigns_in(message: &str) -> Vec<String> {
     out
 }
 
+/// Decoded-text CQ modifier policy, shared with the FT8 message validator
+/// (PAN-330): named whitelist tokens plus 1–3 letter/digit generic
+/// modifiers, ASCII case normalized. The encoder's separate *packable*
+/// policy lives in `pancetta_core::ft8_tokens::is_packable_cq_modifier`.
 fn is_cq_modifier(t: &str) -> bool {
-    matches!(t, "DX" | "NA" | "SA" | "EU" | "AS" | "AF" | "OC" | "QRP")
-        || t.chars().all(|c| c.is_ascii_digit())
-        || (t.len() <= 3 && t.chars().all(|c| c.is_ascii_alphabetic()))
+    pancetta_core::ft8_tokens::is_decoded_cq_modifier(t)
 }
 
+/// Callsign-token shape check, shared with simulation and scoring via
+/// `pancetta_core::callsign::is_callsign_token` (PAN-330): 3–11 chars of
+/// ASCII alphanumeric plus `/`, at least one letter and one digit, no empty
+/// slash components, not a bare 4-char grid shape.
 fn looks_like_callsign(t: &str) -> bool {
-    let len = t.len();
-    if !(3..=10).contains(&len) {
-        return false;
-    }
-    if is_grid_shape(t) {
-        return false;
-    }
-    let mut has_digit = false;
-    let mut has_alpha = false;
-    for c in t.chars() {
-        if c.is_ascii_digit() {
-            has_digit = true;
-        } else if c.is_ascii_alphabetic() {
-            has_alpha = true;
-        } else if c != '/' {
-            return false;
-        }
-    }
-    has_digit && has_alpha
+    pancetta_core::callsign::is_callsign_token(t)
 }
 
 /// Parse ADIF text and return all CALL field values. Format:
@@ -544,6 +532,42 @@ pub fn parse_seed_file(path: &Path) -> std::io::Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// PAN-330 AC7: token extraction uses the shared core callsign-token
+    /// helper and the decoded CQ-modifier policy.
+    #[test]
+    fn callsign_token_extraction_uses_core_policies() {
+        // Modifier handling: named, 1-3 letters/digits, case-folded.
+        assert_eq!(callsigns_in("CQ DX K5ARH FN42"), vec!["K5ARH".to_string()]);
+        assert_eq!(callsigns_in("CQ dx K5ARH FN42"), vec!["K5ARH".to_string()]);
+        assert_eq!(
+            callsigns_in("CQ 12 K5ARH FN42"),
+            vec!["K5ARH".to_string()] // 12 is a decoded modifier, not a call
+        );
+        // 4-letter modifier is NOT decoded-policy: it falls to token
+        // extraction, where ABCD (no digit) is not a callsign, so the
+        // following real call is still the first extracted token.
+        assert_eq!(
+            callsigns_in("CQ ABCD K5ARH FN42"),
+            vec!["K5ARH".to_string()]
+        );
+        // 4-digit modifier is no longer a decoded modifier (was: any-length
+        // digits); it is not callsign-shaped either (no letter), so the
+        // real call still wins.
+        assert_eq!(
+            callsigns_in("CQ 1234 K5ARH FN42"),
+            vec!["K5ARH".to_string()]
+        );
+        // Compound calls extract their bare base; grids/reports are not calls.
+        assert_eq!(
+            callsigns_in("EA8/K5ARH DL1ABC -10"),
+            vec!["EA8".to_string(), "DL1ABC".to_string()]
+        );
+        assert_eq!(callsigns_in("ZZ99 W1XYZ FN42"), vec!["W1XYZ".to_string()]);
+        assert!(callsigns_in("-12 +05 RR73").is_empty());
+        // Malformed slash forms are rejected by the shared helper.
+        assert!(callsigns_in("/K1ABC K1ABC/").is_empty());
+    }
 
     #[test]
     fn strict_filter_rejects_unknown_callsigns() {

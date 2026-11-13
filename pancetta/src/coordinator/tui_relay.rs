@@ -21,6 +21,19 @@
 //!    runs ratatui's draw loop, and exits when the user quits — at which
 //!    point we trigger global shutdown so the rest of the coordinator
 //!    tears down cleanly.
+//!
+//! PAN-316 scheduling and retention policy: the relay thread blocks on
+//! its input channels and the next deadline (see [`RelayDriver`]) — an
+//! idle relay wakes only at the 2 s health tick, never on a poll timer.
+//! The TUI output channel is UNBOUNDED, so a stalled TUI consumer never
+//! blocks the relay or the bus drain: reliable events (decodes, QSO and
+//! control traffic) are retained in memory, while low-value waterfall
+//! and audio-level samples are dropped behind per-kind counters once the
+//! output queue is at [`TUI_SAMPLE_QUEUE_LIMIT`]. This deliberately
+//! trades memory for responsiveness: a connected-but-permanently-stalled
+//! TUI can grow the reliable backlog without bound — there is no disk
+//! spool and no arbitrary reliable-event eviction. A quit TUI is caught
+//! by the coordinator shutdown flag within one health period.
 
 use anyhow::Result;
 use geographiclib_rs::InverseGeodesic;
@@ -132,6 +145,458 @@ fn display_grid(
         Some(grid.to_owned())
     } else {
         last_grids.get(&key).cloned()
+    }
+}
+
+/// The relay loop's cadence: health/readiness snapshots every 2 s. This
+/// is also the longest the relay can take to notice shutdown (PAN-316).
+const RELAY_HEALTH_PERIOD: Duration = Duration::from_secs(2);
+
+/// How long a receive-gain save request may stay unanswered before the
+/// relay reports it timed out. Extracted from the former inline loop
+/// check so the deadline rule is testable with injected instants.
+const GAIN_SAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many input messages the relay may service in one scheduling step
+/// before timers and shutdown are re-checked, so a firehose on one input
+/// cannot starve health/readiness publication.
+const RELAY_MAX_BATCH_ITERATIONS: usize = 64;
+
+/// Queue length of the shared TUI output at which incoming waterfall and
+/// audio-level samples stop being admitted. Reliable messages are never
+/// subject to this threshold.
+const TUI_SAMPLE_QUEUE_LIMIT: usize = 1000;
+
+/// What a relay callback decided after handling one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayFlow {
+    Continue,
+    /// Stop the relay loop: shutdown was observed or the TUI output
+    /// channel is known-disconnected.
+    Stop,
+}
+
+/// Low-value sample types that share the TUI output channel with
+/// reliable events. Only these are dropped under output pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleKind {
+    Waterfall,
+    AudioLevel,
+}
+
+/// Per-kind saturating drop counters for the lossy sample path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SampleDropCounters {
+    waterfall: u64,
+    audio_level: u64,
+}
+
+impl SampleDropCounters {
+    fn dropped(&self, kind: SampleKind) -> u64 {
+        match kind {
+            SampleKind::Waterfall => self.waterfall,
+            SampleKind::AudioLevel => self.audio_level,
+        }
+    }
+
+    fn record_drop(&mut self, kind: SampleKind) {
+        match kind {
+            SampleKind::Waterfall => self.waterfall = self.waterfall.saturating_add(1),
+            SampleKind::AudioLevel => self.audio_level = self.audio_level.saturating_add(1),
+        }
+    }
+}
+
+/// Outcome of admitting one low-value sample onto the TUI output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleAdmission {
+    Admitted,
+    Dropped,
+    /// Every receiver of the output channel is gone.
+    OutputDisconnected,
+}
+
+/// Admit one low-value sample (waterfall rows / audio level) onto the
+/// shared TUI output, or drop and count it while the queue is at the
+/// pressure limit. Reliable events must never go through here: they use
+/// blocking `send` on the same unbounded channel.
+fn admit_tui_sample(
+    tui_out: &crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+    kind: SampleKind,
+    message: pancetta_tui::tui_runner::TuiMessage,
+    drops: &mut SampleDropCounters,
+) -> SampleAdmission {
+    if tui_out.len() >= TUI_SAMPLE_QUEUE_LIMIT {
+        drops.record_drop(kind);
+        return SampleAdmission::Dropped;
+    }
+    match tui_out.try_send(message) {
+        Ok(()) => SampleAdmission::Admitted,
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            // Unreachable for the unbounded production channel, but keep
+            // the lossy policy if that ever changes.
+            drops.record_drop(kind);
+            SampleAdmission::Dropped
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            SampleAdmission::OutputDisconnected
+        }
+    }
+}
+
+/// PAN-85/PAN-316: forward a known US state only when it is new,
+/// changed, or its previous send has expired or been evicted from the
+/// bounded suppression cache. Both the decode and cluster-spot relay
+/// paths go through this one policy; `now` is injected so tests drive
+/// exact TTL/cap behaviour.
+fn station_state_message(
+    sent_states: &mut RelayCache<String, String>,
+    callsign: &str,
+    state: String,
+    now: Instant,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    let key = callsign.to_uppercase();
+    if sent_states.get_at(&key, now) != Some(&state) {
+        sent_states.insert_at(key, state.clone(), now);
+        return Some(pancetta_tui::tui_runner::TuiMessage::StationState {
+            callsign: callsign.to_string(),
+            state,
+        });
+    }
+    None
+}
+
+/// PAN-316: when a pending receive-gain save has expired. Absolute from
+/// the request instant, matching the former inline loop check.
+fn gain_save_expired(pending: &(u64, Instant, u64), now: Instant) -> bool {
+    now.saturating_duration_since(pending.1) >= GAIN_SAVE_TIMEOUT
+}
+
+/// Message-handling hooks the PAN-316 relay driver calls. The production
+/// relay thread implements this over its loop state ([`TuiRelayLoop`]);
+/// tests implement it over counting harnesses, so the scheduling under
+/// test is the same code the relay thread runs.
+trait RelayDriverHost {
+    /// Polled between scheduling steps; a true return stops the loop.
+    fn shutdown(&self) -> bool;
+    /// Absolute expiry of the outstanding receive-gain save request, if
+    /// any. The driver waits no later than this deadline.
+    fn gain_save_deadline(&mut self) -> Option<Instant>;
+    /// A wait deadline passed with no input work. The host expires its
+    /// receive-gain save here when it is due.
+    fn on_deadline(&mut self) -> RelayFlow;
+    fn on_decode(&mut self, relayed: super::pipeline::RelayedDecode) -> RelayFlow;
+    fn on_bus(&mut self, message: ComponentMessage) -> RelayFlow;
+    fn on_waterfall(&mut self, rows: Vec<Vec<f32>>) -> RelayFlow;
+    fn on_audio(&mut self, level: f32) -> RelayFlow;
+    fn on_health_tick(&mut self) -> RelayFlow;
+}
+
+/// Which relay input a selection came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Decode,
+    Bus,
+    Waterfall,
+    Audio,
+}
+
+impl InputKind {
+    fn name(self) -> &'static str {
+        match self {
+            InputKind::Decode => "FT8 decode",
+            InputKind::Bus => "message bus",
+            InputKind::Waterfall => "waterfall",
+            InputKind::Audio => "audio level",
+        }
+    }
+}
+
+/// One serviced relay input message.
+#[derive(Debug)]
+enum SelectedRelayMessage {
+    Decode(super::pipeline::RelayedDecode),
+    Bus(ComponentMessage),
+    Waterfall(Vec<Vec<f32>>),
+    Audio(f32),
+    /// The selected input was disconnected; the driver retires it.
+    Disconnected(InputKind),
+}
+
+/// Registered crossbeam select indices for the relay's live inputs.
+#[derive(Default)]
+struct RelayInputOps {
+    decode: Option<usize>,
+    bus: Option<usize>,
+    waterfall: Option<usize>,
+    audio: Option<usize>,
+}
+
+impl RelayInputOps {
+    fn is_empty(&self) -> bool {
+        self.decode.is_none()
+            && self.bus.is_none()
+            && self.waterfall.is_none()
+            && self.audio.is_none()
+    }
+}
+
+/// Wake and deadline accounting, for tests and diagnostics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelayDriverStats {
+    /// Blocking waits that returned (input work or a deadline).
+    wait_returns: u64,
+    /// Waits that returned because an input had work or disconnected.
+    input_wakes: u64,
+    /// Waits that returned because the deadline passed.
+    timeout_wakes: u64,
+    /// Health ticks fired.
+    health_ticks: u64,
+}
+
+/// Scheduling core of the TUI relay (PAN-316): replaces the former 10 ms
+/// sleep-poll loop. Blocks on the live input channels until the earlier
+/// of the next input message, the next health deadline and the
+/// outstanding receive-gain save deadline; retires disconnected inputs;
+/// and drains bursts in bounded batches so timers and shutdown stay
+/// re-checked. With no traffic the relay wakes only at deadlines.
+struct RelayDriver {
+    decode_rx: Option<crossbeam_channel::Receiver<super::pipeline::RelayedDecode>>,
+    bus_rx: Option<crossbeam_channel::Receiver<ComponentMessage>>,
+    waterfall_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
+    audio_rx: Option<crossbeam_channel::Receiver<f32>>,
+    health_period: Duration,
+    max_batch_iterations: usize,
+    /// Next absolute health deadline. Advances from the PREVIOUS
+    /// deadline (not from whenever handling finished), and a late tick
+    /// skips the missed periods instead of emitting a catch-up burst.
+    next_health: Instant,
+    stats: RelayDriverStats,
+}
+
+impl RelayDriver {
+    fn new(
+        health_period: Duration,
+        decode_rx: Option<crossbeam_channel::Receiver<super::pipeline::RelayedDecode>>,
+        bus_rx: Option<crossbeam_channel::Receiver<ComponentMessage>>,
+        waterfall_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
+        audio_rx: Option<crossbeam_channel::Receiver<f32>>,
+    ) -> Self {
+        Self {
+            decode_rx,
+            bus_rx,
+            waterfall_rx,
+            audio_rx,
+            health_period,
+            max_batch_iterations: RELAY_MAX_BATCH_ITERATIONS,
+            next_health: Instant::now() + health_period,
+            stats: RelayDriverStats::default(),
+        }
+    }
+
+    /// Register the live inputs on a fresh select. Borrows each receiver
+    /// field individually so the driver's stats stay mutable while the
+    /// registration is alive.
+    fn register_inputs<'a>(
+        decode_rx: &'a Option<crossbeam_channel::Receiver<super::pipeline::RelayedDecode>>,
+        bus_rx: &'a Option<crossbeam_channel::Receiver<ComponentMessage>>,
+        waterfall_rx: &'a Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
+        audio_rx: &'a Option<crossbeam_channel::Receiver<f32>>,
+        sel: &mut crossbeam_channel::Select<'a>,
+    ) -> RelayInputOps {
+        RelayInputOps {
+            decode: decode_rx.as_ref().map(|rx| sel.recv(rx)),
+            bus: bus_rx.as_ref().map(|rx| sel.recv(rx)),
+            waterfall: waterfall_rx.as_ref().map(|rx| sel.recv(rx)),
+            audio: audio_rx.as_ref().map(|rx| sel.recv(rx)),
+        }
+    }
+
+    /// Complete `selected` against whichever live input it reports.
+    /// Shared borrows only; retirement happens in [`Self::dispatch`]
+    /// once the registration borrows have ended.
+    fn complete_selected(
+        &self,
+        selected: crossbeam_channel::SelectedOperation<'_>,
+        index: usize,
+        ops: &RelayInputOps,
+    ) -> SelectedRelayMessage {
+        if ops.decode == Some(index) {
+            match selected.recv(self.decode_rx.as_ref().expect("live decode input")) {
+                Ok(relayed) => SelectedRelayMessage::Decode(relayed),
+                Err(_) => SelectedRelayMessage::Disconnected(InputKind::Decode),
+            }
+        } else if ops.bus == Some(index) {
+            match selected.recv(self.bus_rx.as_ref().expect("live bus input")) {
+                Ok(message) => SelectedRelayMessage::Bus(message),
+                Err(_) => SelectedRelayMessage::Disconnected(InputKind::Bus),
+            }
+        } else if ops.waterfall == Some(index) {
+            match selected.recv(self.waterfall_rx.as_ref().expect("live waterfall input")) {
+                Ok(rows) => SelectedRelayMessage::Waterfall(rows),
+                Err(_) => SelectedRelayMessage::Disconnected(InputKind::Waterfall),
+            }
+        } else if ops.audio == Some(index) {
+            match selected.recv(self.audio_rx.as_ref().expect("live audio input")) {
+                Ok(level) => SelectedRelayMessage::Audio(level),
+                Err(_) => SelectedRelayMessage::Disconnected(InputKind::Audio),
+            }
+        } else {
+            unreachable!("selected an input the relay never registered");
+        }
+    }
+
+    /// Hand one serviced message to the host, or retire a disconnected
+    /// input. A retired input is never registered again, so a gone
+    /// producer cannot spin the loop.
+    fn dispatch<H: RelayDriverHost>(
+        &mut self,
+        host: &mut H,
+        message: SelectedRelayMessage,
+    ) -> RelayFlow {
+        match message {
+            SelectedRelayMessage::Decode(relayed) => host.on_decode(relayed),
+            SelectedRelayMessage::Bus(message) => host.on_bus(message),
+            SelectedRelayMessage::Waterfall(rows) => host.on_waterfall(rows),
+            SelectedRelayMessage::Audio(level) => host.on_audio(level),
+            SelectedRelayMessage::Disconnected(kind) => {
+                warn!(
+                    "TUI relay: {} input channel disconnected, retiring it",
+                    kind.name()
+                );
+                match kind {
+                    InputKind::Decode => self.decode_rx = None,
+                    InputKind::Bus => self.bus_rx = None,
+                    InputKind::Waterfall => self.waterfall_rx = None,
+                    InputKind::Audio => self.audio_rx = None,
+                }
+                RelayFlow::Continue
+            }
+        }
+    }
+
+    /// Fire the health tick and advance the deadline past `now`.
+    fn fire_health<H: RelayDriverHost>(&mut self, host: &mut H) -> RelayFlow {
+        self.stats.health_ticks += 1;
+        let flow = host.on_health_tick();
+        self.advance_health_deadline(Instant::now());
+        flow
+    }
+
+    fn advance_health_deadline(&mut self, now: Instant) {
+        while now >= self.next_health {
+            self.next_health += self.health_period;
+        }
+    }
+
+    /// Fire due timers: the receive-gain expiry hook when its deadline
+    /// has passed, then the health tick. False stops the loop.
+    fn fire_due_timers<H: RelayDriverHost>(&mut self, host: &mut H) -> bool {
+        let now = Instant::now();
+        if let Some(deadline) = host.gain_save_deadline() {
+            if now >= deadline && host.on_deadline() == RelayFlow::Stop {
+                return false;
+            }
+        }
+        if now >= self.next_health && self.fire_health(host) == RelayFlow::Stop {
+            return false;
+        }
+        true
+    }
+
+    /// One scheduling step of the relay loop (one iteration of the
+    /// former polling loop). Returns false when the relay should stop.
+    fn step<H: RelayDriverHost>(&mut self, host: &mut H) -> bool {
+        if host.shutdown() || !self.fire_due_timers(host) {
+            return false;
+        }
+
+        let mut deadline = self.next_health;
+        if let Some(gain) = host.gain_save_deadline() {
+            deadline = deadline.min(gain);
+        }
+
+        // The relay's only blocking wait: park until an input is ready or
+        // the earlier deadline arrives. This is what an idle relay does
+        // instead of the former 10 ms sleep (~100 wakeups/s).
+        let selected = {
+            let mut sel = crossbeam_channel::Select::new();
+            let ops = Self::register_inputs(
+                &self.decode_rx,
+                &self.bus_rx,
+                &self.waterfall_rx,
+                &self.audio_rx,
+                &mut sel,
+            );
+            if ops.is_empty() {
+                // Every input is retired: nothing to select on. Park for
+                // the remaining window; shutdown is re-checked right
+                // after, so detection stays bounded by the health
+                // period.
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                self.stats.wait_returns += 1;
+                self.stats.timeout_wakes += 1;
+                None
+            } else {
+                match sel.select_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(selected) => {
+                        self.stats.wait_returns += 1;
+                        self.stats.input_wakes += 1;
+                        let index = selected.index();
+                        Some(self.complete_selected(selected, index, &ops))
+                    }
+                    Err(crossbeam_channel::SelectTimeoutError) => {
+                        self.stats.wait_returns += 1;
+                        self.stats.timeout_wakes += 1;
+                        None
+                    }
+                }
+            }
+        };
+
+        match selected {
+            None => !host.shutdown() && self.fire_due_timers(host),
+            Some(message) => {
+                if self.dispatch(host, message) == RelayFlow::Stop {
+                    return false;
+                }
+                // Each bounded round checks every input once. A busy sample
+                // channel cannot crowd a ready bus event out of the batch.
+                for _ in 1..self.max_batch_iterations {
+                    if host.shutdown() || !self.fire_due_timers(host) {
+                        return false;
+                    }
+                    let mut worked = false;
+                    macro_rules! drain_one {
+                        ($receiver:ident, $variant:ident, $kind:ident) => {
+                            if let Some(rx) = &self.$receiver {
+                                let message = match rx.try_recv() {
+                                    Ok(value) => Some(SelectedRelayMessage::$variant(value)),
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                        Some(SelectedRelayMessage::Disconnected(InputKind::$kind))
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                                };
+                                if let Some(message) = message {
+                                    worked = true;
+                                    if self.dispatch(host, message) == RelayFlow::Stop {
+                                        return false;
+                                    }
+                                }
+                            }
+                        };
+                    }
+                    drain_one!(decode_rx, Decode, Decode);
+                    drain_one!(bus_rx, Bus, Bus);
+                    drain_one!(waterfall_rx, Waterfall, Waterfall);
+                    drain_one!(audio_rx, Audio, Audio);
+                    if !worked {
+                        break;
+                    }
+                }
+                !host.shutdown()
+            }
+        }
     }
 }
 
@@ -341,6 +806,816 @@ pub(crate) async fn emergency_stop(ctx: &TxPolicyCmdCtx) {
     }
 }
 
+/// Loop state of the production `tui-relay` thread (PAN-316). Owns every
+/// capture the relay body used as closure locals of the old polling
+/// loop, so the [`RelayDriverHost`] methods below are the exact former
+/// inline loop arms. The [`RelayDriver`] owns the scheduling.
+struct TuiRelayLoop {
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    tui_out: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+    pending_gain_save: Arc<std::sync::Mutex<Option<(u64, Instant, u64)>>>,
+    gain_mutation_tx:
+        tokio::sync::mpsc::UnboundedSender<(String, pancetta_config::rig::ReceiveGainPreset)>,
+    gain_frequency: Arc<std::sync::atomic::AtomicU64>,
+    station_lookup: Arc<crate::priority_evaluator::CachedStationLookup>,
+    station_coords: Option<(f64, f64)>,
+    our_callsign: String,
+    scorer: pancetta_qso::PriorityScorer,
+    active_protocol_mode: Arc<std::sync::atomic::AtomicU8>,
+    autonomous_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// PAN-85: last US state actually forwarded per uppercased callsign.
+    /// PAN-316: bounded by the shared `RelayCache` policy (24 h TTL,
+    /// 4,096 entries) instead of an unbounded HashMap.
+    sent_states: RelayCache<String, String>,
+    last_grids: RelayCache<(String, String), String>,
+    last_rank_inputs: RelayCache<String, RankInputs>,
+    last_rig_state: Option<u8>,
+    last_audio_default: Option<bool>,
+    last_input_fallback: Option<bool>,
+    rf_no_decode: super::health::RfNoDecodeMonitor,
+    rf_no_decode_active: bool,
+    input_silent_active: bool,
+    readiness_publisher: super::readiness::ReadinessPublisher,
+    readiness_sources: super::readiness::ReadinessSources,
+    qso_upload_statuses: super::qso_upload_status::SharedUploadStatusRegistry,
+    health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
+    health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
+    health_last_rms: Arc<std::sync::atomic::AtomicU32>,
+    health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
+    decode_last_elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+    decode_last_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
+    rig_conn_state: Arc<std::sync::atomic::AtomicU8>,
+    audio_output_default: Arc<std::sync::atomic::AtomicBool>,
+    audio_input_fallback: Arc<std::sync::atomic::AtomicBool>,
+    clock_skew: crate::clock_skew::ClockSkewShared,
+    watchlist_pins: Arc<std::sync::Mutex<Vec<String>>>,
+    watchlist_write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
+    watchlist_path: std::path::PathBuf,
+    watchlist_is_toml: bool,
+    persisted_pins: Vec<String>,
+    pending_pin_writes: std::collections::VecDeque<
+        tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
+    >,
+    /// PAN-316: low-value samples dropped at the output pressure limit,
+    /// summarized at most once per health tick at DEBUG.
+    sample_drops: SampleDropCounters,
+    sample_drops_last_reported: SampleDropCounters,
+}
+
+impl TuiRelayLoop {
+    /// Forward one reliable event. The output channel is unbounded, so
+    /// this never blocks on a stalled TUI consumer.
+    fn forward(&self, message: pancetta_tui::tui_runner::TuiMessage) {
+        let _ = self.tui_out.send(message);
+    }
+
+    /// Admit one low-value sample through the shared output, or stop the
+    /// relay when the output channel is known-disconnected.
+    fn admit_sample(
+        &mut self,
+        kind: SampleKind,
+        message: pancetta_tui::tui_runner::TuiMessage,
+    ) -> RelayFlow {
+        match admit_tui_sample(&self.tui_out, kind, message, &mut self.sample_drops) {
+            SampleAdmission::OutputDisconnected => {
+                info!("TUI relay: TUI output channel disconnected, stopping");
+                RelayFlow::Stop
+            }
+            SampleAdmission::Admitted | SampleAdmission::Dropped => RelayFlow::Continue,
+        }
+    }
+}
+
+impl RelayDriverHost for TuiRelayLoop {
+    fn shutdown(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Acquire)
+    }
+
+    fn gain_save_deadline(&mut self) -> Option<Instant> {
+        if let Ok(pending) = self.pending_gain_save.lock() {
+            pending.map(|(_, since, _)| since + GAIN_SAVE_TIMEOUT)
+        } else {
+            None
+        }
+    }
+
+    fn on_deadline(&mut self) -> RelayFlow {
+        let expired = if let Ok(mut pending) = self.pending_gain_save.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|request| gain_save_expired(request, Instant::now()))
+            {
+                pending.take();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // Release the request lock before forwarding to the TUI.
+        if expired {
+            self.forward(gain_status(
+                "Could not read rig gain: request timed out — preset not saved".into(),
+                pancetta_core::DiagnosticLevel::Warn,
+            ));
+        }
+        RelayFlow::Continue
+    }
+
+    fn on_decode(&mut self, relayed: super::pipeline::RelayedDecode) -> RelayFlow {
+        let decoded_msg = &relayed.message;
+        let call_sign = decoded_msg.message.from_callsign.clone();
+
+        // PAN-85: forward a known US state whenever it is new or has
+        // changed since the last one sent (PAN-316: through the bounded
+        // suppression cache).
+        if let Some(call) = call_sign.as_deref() {
+            if let Some(state) = state_for(&self.station_lookup, Some(call)) {
+                if let Some(message) =
+                    station_state_message(&mut self.sent_states, call, state, Instant::now())
+                {
+                    self.forward(message);
+                }
+            }
+        }
+
+        // Everything else this decode produces — grid retention, the
+        // directed-at-us flag, enrichment, ranking and the view itself —
+        // is `decoded_view_for_relay`, so tests drive the exact
+        // production conversion (PAN-330 AC1).
+        let tui_decoded = decoded_view_for_relay(
+            &relayed,
+            &mut RelayDecodeCtx {
+                last_grids: &mut self.last_grids,
+                last_rank_inputs: &mut self.last_rank_inputs,
+                station_coords: self.station_coords,
+                lookup: &self.station_lookup,
+                scorer: &self.scorer,
+                our_callsign: &self.our_callsign,
+                protocol_mode: self.active_protocol_mode.load(Ordering::Relaxed),
+            },
+        );
+
+        match self
+            .tui_out
+            .send(pancetta_tui::tui_runner::TuiMessage::DecodedMessage(
+                tui_decoded,
+            )) {
+            // Perf (Pass 1): one decode forwards dozens of these per
+            // slot — demoted to debug so steady-state info logging isn't
+            // dominated by per-decode spam. PAN-316: the channel is
+            // unbounded, so an Err here means the TUI is gone for good —
+            // stop rather than warn once per decode forever.
+            Ok(()) => {
+                debug!("TUI relay: forwarded decoded message to TUI channel");
+                RelayFlow::Continue
+            }
+            Err(_) => {
+                info!("TUI relay: TUI output channel disconnected, stopping");
+                RelayFlow::Stop
+            }
+        }
+    }
+
+    fn on_bus(&mut self, bus_msg: ComponentMessage) -> RelayFlow {
+        // Local rebinding of the loop's former closure captures, so the
+        // transplanted match arms below stay byte-for-byte the production
+        // code that ran inline in the old polling loop.
+        let tui_msg_tx_relay = &self.tui_out;
+        let relay_autonomous_gate = &self.autonomous_gate;
+        let relay_gain_mutation_tx = &self.gain_mutation_tx;
+        let relay_gain_frequency = &self.gain_frequency;
+        let relay_station_lookup = &self.station_lookup;
+        let relay_scorer = &self.scorer;
+        let relay_watchlist_pins = &self.watchlist_pins;
+        let watchlist_write_tx = &self.watchlist_write_tx;
+        let watchlist_path = &self.watchlist_path;
+        let watchlist_is_toml = self.watchlist_is_toml;
+        match bus_msg.message_type {
+            MessageType::AutonomousStatus(ref status) => {
+                // Batch 93: forward the STRUCTURED status so the live
+                // `[AUTO]` panel renders (previously this was flattened
+                // to a transient status-bar string and
+                // `app.autonomous_status` stayed None forever).
+                let mapped =
+                    map_autonomous_status(status, relay_autonomous_gate.load(Ordering::Acquire));
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(mapped));
+                // Keep the status-bar text line too (additive).
+                let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                    component: "Autonomous".to_string(),
+                    status: status.state.clone(),
+                    level: pancetta_core::DiagnosticLevel::Info,
+                });
+            }
+            MessageType::TxStatus { active } => {
+                // Batch 93: TX worker brackets every transmission (PTT-on
+                // → PTT-off, including aborts) with these. Drives the
+                // title-bar " TX " badge.
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::TxStatus { active });
+            }
+            MessageType::TxQueueStatus {
+                ref sending,
+                ref queued,
+            } => {
+                // Richer NOW-SENDING / QUEUED view. Re-shape the
+                // coordinator's TxItem into the TUI's local TxQueueItem
+                // (decoupled so the TUI doesn't link the main crate).
+                let map = |it: &crate::message_bus::TxItem| pancetta_tui::app::TxQueueItem {
+                    text: it.text.clone(),
+                    freq_hz: it.freq_hz,
+                    qso_id: it.qso_id.clone(),
+                    deferred: it.deferred,
+                };
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
+                        sending: sending.as_ref().map(map),
+                        queued: queued.iter().map(map).collect(),
+                    });
+            }
+            MessageType::TxFrameLogged {
+                text,
+                freq_hz,
+                qso_id,
+                timestamp,
+            } => {
+                // #172: pass-through relay for Band Activity's own-TX
+                // history, same shape as QsoHistoryEntry.
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::TxFrameLogged {
+                        text,
+                        freq_hz,
+                        qso_id,
+                        timestamp,
+                    });
+            }
+            MessageType::TxPolicyStatus { policy } => {
+                // Echo the global TX policy to the bold banner.
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy });
+            }
+            MessageType::DecodeEffortStatus { effort, budget_ms } => {
+                // Echo the live decode-effort preset to the "DECODE:
+                // <PRESET> <ms>ms" title-bar chip
+                // (decoder-speed-overhaul Task 15).
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate { effort, budget_ms },
+                );
+            }
+            MessageType::SplitStatus { tx_hz } => {
+                // Echo the authoritative split TX state to the title-bar
+                // chip. Sent from all three split-atomic write sites
+                // (SetSplit command, manual band-change, autonomous
+                // band-hop).
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz });
+            }
+            MessageType::TxOffsetStatus { offset_hz } => {
+                // Whole-branch-review fix (Task 16 auto-repark): the
+                // autonomous task writes `tx_offset_hold_hz` directly
+                // with no operator keypress, so the TUI's own
+                // `App.tx_offset_hold_hz` copy would otherwise go stale.
+                // Echo it through so the park line + HOLD chip stay in
+                // sync.
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::TxOffsetUpdate { offset_hz });
+            }
+            MessageType::FoxModeStatus { on } => {
+                // Echo the authoritative Fox-mode state to the TUI FOX
+                // chip. Sent by the SetFoxMode handler on every path
+                // (engage, refused engage, disengage).
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on });
+            }
+            MessageType::ContestScore(ref update) => {
+                let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ContestScore(
+                    update.clone(),
+                ));
+            }
+            MessageType::ActiveQsosSnapshot {
+                ref qsos,
+                ref pending,
+            } => {
+                // Re-shape into the TUI's ActiveQsoBanner (decoupled
+                // struct so the TUI doesn't link pancetta_qso). Push as a
+                // TuiMessage; the TUI replaces its previous list with
+                // this. Batch 94: carries the QSO-detail panel fields too
+                // (last TX/RX message, SNR, reports, exchange count).
+                // #40: pending cross-parity calls are carried in the same
+                // push as pending_calls so the TUI sees a consistent
+                // (active, queued) pair.
+                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
+                    qsos.iter().map(map_qso_snapshot_item).collect();
+                let banner_pending: Vec<pancetta_tui::app::PendingCallBanner> =
+                    pending.iter().map(map_pending_call_item).collect();
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
+                        qsos: banner_qsos,
+                        pending_calls: banner_pending,
+                    });
+            }
+            MessageType::QsoHistoryEntry {
+                call_sign,
+                band,
+                success,
+                reason,
+                completed_at,
+            } => {
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::QsoHistoryEntry {
+                        call_sign,
+                        band,
+                        success,
+                        reason,
+                        completed_at,
+                    });
+            }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::FrequencyResponse {
+                vfo,
+                frequency,
+            }) => {
+                let _ = tui_msg_tx_relay
+                    .send(pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate { vfo, frequency });
+            }
+            MessageType::RigControl(
+                crate::message_bus::RigControlMessage::ReceiveGainResponse {
+                    frequency,
+                    request_id,
+                    preamp_db,
+                    att_db,
+                },
+            ) => {
+                if take_pending_gain_save(&self.pending_gain_save, frequency, request_id) {
+                    if relay_gain_frequency.load(Ordering::Acquire) != frequency {
+                        self.forward(gain_status(
+                            "Could not read rig gain: band changed — preset not saved".into(),
+                            pancetta_core::DiagnosticLevel::Warn,
+                        ));
+                    } else if let Some(band) = pancetta_core::Band::from_frequency(frequency) {
+                        let _ = relay_gain_mutation_tx.send((
+                            band.to_string(),
+                            pancetta_config::rig::ReceiveGainPreset {
+                                preamp_db,
+                                attenuator_db: att_db,
+                            },
+                        ));
+                    }
+                }
+            }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::ReceiveGainError {
+                frequency,
+                request_id,
+                ref error,
+            }) => {
+                if take_pending_gain_save(&self.pending_gain_save, frequency, request_id) {
+                    self.forward(gain_status(
+                        format!("Could not read rig gain: {error} — preset not saved"),
+                        pancetta_core::DiagnosticLevel::Warn,
+                    ));
+                }
+            }
+            MessageType::RigControl(
+                crate::message_bus::RigControlMessage::SignalStrengthResponse { db_over_s9 },
+            ) => {
+                // Batch 95: real rig S-meter read (hamlib STRENGTH, dB
+                // relative to S9) from the polling loop — forward
+                // verbatim.
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate { db_over_s9 },
+                );
+            }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SwrResponse { swr }) => {
+                // Real rig SWR (hamlib SWR) sampled while keyed —
+                // forward verbatim; the TUI shows it only during TX.
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
+            }
+            MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
+                callsign,
+                frequency,
+                mode,
+                band,
+                spotter,
+                ..
+            }) => {
+                // Worked-before keyed on the SPOT's frequency (cluster
+                // spots carry their own), same lookup/semantics as the
+                // decode path above.
+                let worked_before = worked_before_for(
+                    relay_station_lookup,
+                    Some(callsign.as_str()),
+                    frequency as f64,
+                );
+                let (needed, atno) = needed_atno_for(relay_station_lookup, Some(callsign.as_str()));
+                let band_needed = dxcc_needed_on_band_for(
+                    relay_station_lookup,
+                    Some(callsign.as_str()),
+                    frequency as f64,
+                );
+                // PAN-85: forward a known US state whenever it is new or
+                // has changed since the last one sent. PAN-316: the same
+                // bounded-cache policy as the decode path, through the
+                // same helper.
+                if let Some(state) = state_for(relay_station_lookup, Some(callsign.as_str())) {
+                    if let Some(message) = station_state_message(
+                        &mut self.sent_states,
+                        &callsign,
+                        state,
+                        Instant::now(),
+                    ) {
+                        let _ = tui_msg_tx_relay.send(message);
+                    }
+                }
+                let _ = tui_msg_tx_relay.send(cluster_spot_tui_message(ClusterSpotRelay {
+                    callsign,
+                    frequency,
+                    mode,
+                    band,
+                    spotter,
+                    worked_before,
+                    needed,
+                    atno,
+                    band_needed,
+                }));
+            }
+            MessageType::StatusUpdate { text, level } => {
+                // Free-form status emitted by other components (e.g. QSO
+                // component reports respond_to_cq success/failure here so
+                // Space-to-call surfaces "Calling X — TX queued" or the
+                // actual rejection reason instead of just an optimistic
+                // "Calling X..." that hides silent failures.
+                let _ = tui_msg_tx_relay.send(relayed_status(
+                    format!("{}", bus_msg.source),
+                    text,
+                    level,
+                ));
+            }
+            MessageType::Error {
+                component_id,
+                ref error_message,
+                error_code,
+            } => {
+                // Component-level errors (audio init failure, audio
+                // device stalls, etc.) get surfaced to the TUI's error
+                // log instead of dying silently in the log file. Without
+                // this hop the audio thread can fail to start and the
+                // user sees only an inert pipeline with no decodes.
+                let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::Error {
+                    component: format!("{component_id}"),
+                    message: error_message.clone(),
+                    code: error_code,
+                });
+            }
+            MessageType::ErrorResolved {
+                component_id,
+                error_code,
+            } => {
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ErrorResolved {
+                        component: format!("{component_id}"),
+                        code: error_code,
+                    });
+            }
+            MessageType::DiagnosticEvent {
+                target,
+                level,
+                ref text,
+                ref qso_id,
+                ref callsign,
+            } => {
+                // docs/observability-diagnostics-plan.md Layer 1 — relay
+                // the retained diagnostic stream into the TUI's bounded
+                // event history (Shift+D overlay).
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                        ts: chrono::Utc::now(),
+                        target,
+                        level,
+                        text: text.clone(),
+                        qso_id: qso_id.clone(),
+                        callsign: callsign.clone(),
+                    });
+            }
+            MessageType::RecentQsoOutcome(ref outcome) => {
+                // docs/observability-diagnostics-plan.md Layer 2 — relay
+                // the structured terminal-QSO-outcome stream into the
+                // TUI's own bounded ring (App::recent_qsos), sibling to
+                // the DiagnosticEvent relay above.
+                let _ =
+                    tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::RecentQsoOutcome(
+                        map_recent_qso_outcome(outcome),
+                    ));
+                // PAN-94: the QSO task records worked/failure history
+                // before emitting this outcome, so rescore the row now
+                // rather than at its next decode.
+                for refresh in
+                    outcome_rank_refresh(relay_scorer, &self.last_rank_inputs, &outcome.callsign)
+                {
+                    let _ = tui_msg_tx_relay.send(refresh);
+                }
+            }
+            MessageType::TxPlacementUpdate { ref snapshot } => {
+                // TX-placement instrument (Task 9/10): convert the
+                // qso-crate PlacementSnapshot into the TUI-local
+                // PlacementView field-for-field — pancetta-tui must not
+                // depend on pancetta-qso, so this relay is the ONLY place
+                // the conversion happens.
+                let slices = snapshot
+                    .slices
+                    .iter()
+                    .map(|c| pancetta_tui::app::PlacementSlice {
+                        offset_hz: c.offset_hz,
+                        score: c.score,
+                        clear_first: c.clear_first,
+                        clear_second: c.clear_second,
+                    })
+                    .collect();
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::TxPlacementUpdate {
+                        view: pancetta_tui::app::PlacementView {
+                            slices,
+                            openness: snapshot.openness.clone(),
+                            bin_hz: snapshot.bin_hz,
+                            range: snapshot.range,
+                            received_at: chrono::Utc::now(),
+                        },
+                    },
+                );
+            }
+            MessageType::AlertBell => {
+                let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::AlertBell);
+            }
+            MessageType::DxWatchlistUpdate {
+                ref callsigns,
+                ref pinned,
+            } => {
+                *relay_watchlist_pins
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = pinned.clone();
+                let mut retry_write = false;
+                while let Some(mut response) = self.pending_pin_writes.pop_front() {
+                    match response.try_recv() {
+                        Ok(Ok(())) => {}
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                            self.pending_pin_writes.push_front(response);
+                            break;
+                        }
+                        _ => {
+                            retry_write = true;
+                            warn!("Watchlist persistence failed; retrying latest pins");
+                        }
+                    }
+                }
+                // Queue every changed snapshot, including while an
+                // earlier write is running. The serialized writer drains
+                // these during shutdown.
+                if (*pinned != self.persisted_pins || retry_write) && watchlist_is_toml {
+                    let path = watchlist_path.clone();
+                    let pins = pinned.clone();
+                    let (respond, response) = tokio::sync::oneshot::channel();
+                    let sent = watchlist_write_tx.send(ConfigFileWriteRequest {
+                        work: Box::new(move || {
+                            let target = resolve_config_write_target(&path)?;
+                            pancetta_config::Config::default()
+                                .set_watchlist_pinned_in_file(&target, &pins)
+                        }),
+                        respond,
+                    });
+                    if sent.is_ok() {
+                        self.persisted_pins = pinned.clone();
+                        self.pending_pin_writes.push_back(response);
+                    }
+                }
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::DxWatchlistUpdate {
+                        callsigns: callsigns.clone(),
+                        pinned: pinned.clone(),
+                    },
+                );
+            }
+            _ => {}
+        }
+        RelayFlow::Continue
+    }
+
+    fn on_waterfall(&mut self, rows: Vec<Vec<f32>>) -> RelayFlow {
+        self.admit_sample(
+            SampleKind::Waterfall,
+            pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows },
+        )
+    }
+
+    fn on_audio(&mut self, level: f32) -> RelayFlow {
+        self.admit_sample(
+            SampleKind::AudioLevel,
+            pancetta_tui::tui_runner::TuiMessage::AudioLevel { level },
+        )
+    }
+
+    fn on_health_tick(&mut self) -> RelayFlow {
+        // Local rebinding of the loop's former closure captures, so the
+        // transplanted tick body below stays byte-for-byte the production
+        // code that ran inline in the old polling loop.
+        let tui_msg_tx_relay = &self.tui_out;
+        let qso_upload_statuses_relay = &self.qso_upload_statuses;
+        let health_audio_alive_relay = &self.health_audio_alive;
+        let health_dsp_windows_relay = &self.health_dsp_windows;
+        let health_last_rms_relay = &self.health_last_rms;
+        let health_total_decodes_relay = &self.health_total_decodes;
+        let decode_last_elapsed_ms_relay = &self.decode_last_elapsed_ms;
+        let decode_last_budget_exhausted_relay = &self.decode_last_budget_exhausted;
+        let rig_conn_state_relay = &self.rig_conn_state;
+        let audio_output_default_relay = &self.audio_output_default;
+        let audio_input_fallback_relay = &self.audio_input_fallback;
+        let clock_skew_relay = &self.clock_skew;
+        let readiness_sources = &self.readiness_sources;
+        let last_rig_state = &mut self.last_rig_state;
+        let last_audio_default = &mut self.last_audio_default;
+        let last_input_fallback = &mut self.last_input_fallback;
+        let rf_no_decode = &mut self.rf_no_decode;
+        let rf_no_decode_active = &mut self.rf_no_decode_active;
+        let input_silent_active = &mut self.input_silent_active;
+        let readiness_publisher = &mut self.readiness_publisher;
+
+        // PAN-344: relay the full bounded per-QSO upload-status snapshot
+        // on the same tick. Sent repeatedly; the App merges by UUID and
+        // revision.
+        let uploads = qso_upload_statuses_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(
+            uploads,
+        ));
+        let health = pancetta_tui::app::PipelineHealth {
+            audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
+            dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
+            last_rms: f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed)),
+            ft8lib_available: pancetta_ft8::ft8lib_is_available(),
+            total_decodes: health_total_decodes_relay.load(Ordering::Relaxed),
+            last_decode_elapsed_ms: decode_last_elapsed_ms_relay.load(Ordering::Relaxed),
+            last_decode_budget_exhausted: decode_last_budget_exhausted_relay
+                .load(Ordering::Relaxed),
+            tx_attempts: super::tx::tx_attempts_count(),
+            tx_defers: super::tx::tx_defers_count(),
+            decode_panic_count: super::ft8::decode_panic_count(),
+            wdt_panic_count: super::health::panic_count(),
+            clock_skew_warning_s: clock_skew_relay.warning(),
+        };
+        if tui_msg_tx_relay
+            .send(pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health))
+            .is_err()
+        {
+            return RelayFlow::Stop;
+        }
+
+        // Rig-connection badge — push only when it changes.
+        let rig_u8 = rig_conn_state_relay.load(Ordering::Relaxed);
+        if *last_rig_state != Some(rig_u8) {
+            *last_rig_state = Some(rig_u8);
+            let state = match super::hamlib::RigConnState::from_u8(rig_u8) {
+                super::hamlib::RigConnState::Connected => {
+                    pancetta_tui::app::RigConnDisplay::Connected
+                }
+                super::hamlib::RigConnState::PollingFailed => {
+                    pancetta_tui::app::RigConnDisplay::PollingFailed
+                }
+                super::hamlib::RigConnState::NotConnected => {
+                    pancetta_tui::app::RigConnDisplay::NotConnected
+                }
+            };
+            let _ = tui_msg_tx_relay
+                .send(pancetta_tui::tui_runner::TuiMessage::RigStatusUpdate { state });
+        }
+
+        // TX-output misconfig badge — push only when it changes.
+        let audio_default = audio_output_default_relay.load(Ordering::Relaxed);
+        if *last_audio_default != Some(audio_default) {
+            *last_audio_default = Some(audio_default);
+            let _ =
+                tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::AudioOutputDefault {
+                    is_default: audio_default,
+                });
+        }
+
+        // RX-input fallback badge — push only when it changes.
+        let input_fb = audio_input_fallback_relay.load(Ordering::Relaxed);
+        if *last_input_fallback != Some(input_fb) {
+            *last_input_fallback = Some(input_fb);
+            let _ =
+                tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::AudioInputFallback {
+                    active: input_fb,
+                });
+        }
+
+        // C20 — RF present but zero decodes over several slots → likely
+        // wrong mode (FT8/FT4) or a bad system clock. Feed the cumulative
+        // DSP-window + decode counters and the latest RMS; emit an
+        // operator status only on a warn on/off edge.
+        let rf_dsp_windows = health_dsp_windows_relay.load(Ordering::Relaxed);
+        let rf_total_decodes = health_total_decodes_relay.load(Ordering::Relaxed);
+        let rf_last_rms = f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed));
+        let edges = rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms);
+        if let Some(active) = edges.rf_no_decode {
+            *rf_no_decode_active = active;
+        }
+        if let Some(active) = edges.silent_input {
+            *input_silent_active = active;
+        }
+        match edges.rf_no_decode {
+            Some(true) => {
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
+                        component: "dsp".to_string(),
+                        code: RF_NO_DECODE_STATUS_CODE,
+                        status: "⚠ RF present but no decodes — check mode/clock?".to_string(),
+                        level: pancetta_core::DiagnosticLevel::Warn,
+                    },
+                );
+            }
+            Some(false) => {
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
+                        component: "dsp".to_string(),
+                        code: RF_NO_DECODE_STATUS_CODE,
+                        status: "Decodes resumed — RF/no-decode warning cleared".to_string(),
+                        level: pancetta_core::DiagnosticLevel::Info,
+                    },
+                );
+            }
+            None => {}
+        }
+        // Silent-input warning: the stream is running but the samples
+        // are ~0 (muted/missing device, denied mic permission, or a
+        // remote-desktop client holding the CODEC). Distinct from a
+        // quiet-but-live band.
+        match edges.silent_input {
+            Some(true) => {
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
+                        component: "audio".to_string(),
+                        code: SILENT_INPUT_STATUS_CODE,
+                        status: "⚠ INPUT SILENT (RMS≈0) — check Sound input device, \
+                                 mic permission, and that nothing else grabbed the CODEC"
+                            .to_string(),
+                        level: pancetta_core::DiagnosticLevel::Warn,
+                    },
+                );
+            }
+            Some(false) => {
+                let _ = tui_msg_tx_relay.send(
+                    pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
+                        component: "audio".to_string(),
+                        code: SILENT_INPUT_STATUS_CODE,
+                        status: "Audio input restored — silence warning cleared".to_string(),
+                        level: pancetta_core::DiagnosticLevel::Info,
+                    },
+                );
+            }
+            None => {}
+        }
+
+        // PAN-89: station-readiness strip — push only on change.
+        let readiness = readiness_sources.snapshot(*rf_no_decode_active, *input_silent_active);
+        let (send_readiness, ptt_cleared) = readiness_publisher.observe(&readiness);
+        if send_readiness {
+            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::StationReadiness(
+                readiness,
+            ));
+        }
+        if ptt_cleared {
+            const PTT_CLEARED: &str = "PTT-off confirmed by the rig — stuck-PTT warning cleared";
+            info!("{PTT_CLEARED}");
+            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                ts: chrono::Utc::now(),
+                target: "supervisor",
+                level: pancetta_core::DiagnosticLevel::Info,
+                text: PTT_CLEARED.into(),
+                qso_id: None,
+                callsign: None,
+            });
+        }
+
+        // PAN-316: at most one DEBUG summary per tick when the sample
+        // drop counters moved. No per-sample logging, ever.
+        if self.sample_drops != self.sample_drops_last_reported {
+            debug!(
+                "TUI relay: dropped {} waterfall and {} audio-level samples at the output pressure limit since the last summary",
+                self.sample_drops
+                    .dropped(SampleKind::Waterfall)
+                    .saturating_sub(self.sample_drops_last_reported.waterfall),
+                self.sample_drops
+                    .dropped(SampleKind::AudioLevel)
+                    .saturating_sub(self.sample_drops_last_reported.audio_level),
+            );
+            self.sample_drops_last_reported = self.sample_drops;
+        }
+        RelayFlow::Continue
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -368,9 +1643,15 @@ impl super::ApplicationCoordinator {
         // (FCC §97.221): the TUI stamps it on every keypress.
         let tui_last_input = self.last_operator_input_ms.clone();
 
-        // Create TUI message/command channels for the TuiRunner
+        // Create TUI message/command channels for the TuiRunner. The
+        // message channel is UNBOUNDED (PAN-316): a stalled TUI consumer
+        // must never block the relay — reliable events (decodes, QSO and
+        // control traffic) are retained in memory while low-value
+        // waterfall/audio samples are dropped behind counters at the
+        // output pressure limit. The command channel stays bounded
+        // (TUI → coordinator, small).
         let (tui_msg_tx, tui_msg_rx) =
-            crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiMessage>(1000);
+            crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
 
@@ -480,829 +1761,83 @@ impl super::ApplicationCoordinator {
         let watchlist_write_tx = cmd_config_write_tx.clone();
         let watchlist_path = self.config_path.clone();
         let watchlist_is_toml = self.config_write_is_toml;
-        let mut persisted_pins = self.config.read().await.watchlist.pinned.clone();
+        let persisted_pins = self.config.read().await.watchlist.pinned.clone();
         *watchlist_pins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = persisted_pins.clone();
-        let mut pending_pin_writes = std::collections::VecDeque::<
+        let pending_pin_writes = std::collections::VecDeque::<
             tokio::sync::oneshot::Receiver<pancetta_config::ConfigResult<()>>,
         >::new();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
-            let mut ft8_disconnected = false;
-            let mut last_health_send = std::time::Instant::now();
-            // Build the display priority scorer once per relay thread.
-            // Uses the same weights and lookup (via Arc-shared internals)
-            // as the autonomous scorer, but the DX Hunter's "Pri" column now
-            // reflects the #164 tiered score (0-5999, strict tier dominance
-            // — see TieredScore::as_display_u32) rather than the old
-            // continuous [0,1] mapped to [0,1000].
-            let relay_scorer = pancetta_qso::PriorityScorer::new(
-                relay_priority_weights,
-                Box::new(relay_scorer_lookup),
-            );
-            // Last-pushed badge state, so we only emit on change (and force the
-            // first push by seeding sentinels that differ from any real value).
-            let mut last_rig_state: Option<u8> = None;
-            let mut last_audio_default: Option<bool> = None;
-            let mut last_input_fallback: Option<bool> = None;
-            // C20 — RF-present / zero-decodes detector (mode/clock fault),
-            // fed from the cumulative DSP-window + decode telemetry below.
-            let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
-            // PAN-89: current RF/silent-input edge state for the readiness
-            // snapshot, and its push-on-change bookkeeping.
-            let mut rf_no_decode_active = false;
-            let mut input_silent_active = false;
-            let mut readiness_publisher = super::readiness::ReadinessPublisher::default();
-            // PAN-85: remember the last US state actually forwarded for each
-            // callsign (uppercased key) rather than merely that one was sent,
-            // so both a state learned later (QRZ enrichment mid-session) and a
-            // state *corrected* later (log-seeded code superseded by QRZ)
-            // reach the TUI on the next decode/spot for that callsign. Repeats
-            // of an unchanged value are still suppressed.
-            let mut sent_states: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            let mut last_grids = RelayCache::default();
-            let mut last_rank_inputs = RelayCache::default();
-            while !relay_shutdown.load(Ordering::Acquire) {
-                if let Ok(mut pending) = relay_pending_gain_save.lock() {
-                    if pending.is_some_and(|(_, since, _)| since.elapsed() >= Duration::from_secs(10)) {
-                        pending.take();
-                        let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: request timed out — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
-                    }
-                }
-                if !ft8_disconnected {
-                    match ft8_to_tui_rx.try_recv() {
-                        Ok(relayed) => {
-                            let decoded_msg = &relayed.message;
-                            let call_sign = decoded_msg.message.from_callsign.clone();
-                            let dial_mhz = decode_view_dial_mhz(&relayed);
-                            let grid_square = display_grid(
-                                &mut last_grids, call_sign.as_deref(),
-                                decoded_msg.message.grid_square.as_deref(), dial_mhz);
-                            // "Calling me" detection: the parser sets
-                            // to_callsign = our call when someone replies
-                            // to our CQ ("K5ARH F5ABC -10"). Match against
-                            // the bare callsign — strip any /R or /P suffix
-                            // on either side so "K5ARH/M" and "K5ARH" both
-                            // count.
-                            let is_directed_at_us = match decoded_msg.message.to_callsign.as_deref() {
-                                Some(to) => {
-                                    let to_base = to.split('/').next().unwrap_or(to);
-                                    let our_base = our_callsign_for_relay
-                                        .split('/')
-                                        .next()
-                                        .unwrap_or(&our_callsign_for_relay);
-                                    !to_base.is_empty()
-                                        && !our_base.is_empty()
-                                        && to_base.eq_ignore_ascii_case(our_base)
-                                }
-                                None => false,
-                            };
-
-                            // Compute distance and bearing if both grids are available
-                            let (distance, bearing) = match (&grid_square, &station_coords) {
-                                (Some(remote_grid), Some((home_lat, home_lon))) => {
-                                    match pancetta_core::gridsquare::grid_to_coordinates(remote_grid)
-                                    {
-                                        Ok((remote_lat, remote_lon)) => {
-                                            let geod = geographiclib_rs::Geodesic::wgs84();
-                                            let (dist_m, azi1, _azi2, _arc) = geod.inverse(
-                                                *home_lat, *home_lon, remote_lat, remote_lon,
-                                            );
-                                            let bearing_deg =
-                                                if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
-                                            (Some(dist_m / 1000.0), Some(bearing_deg))
-                                        }
-                                        Err(_) => (None, None),
-                                    }
-                                }
-                                _ => (None, None),
-                            };
-
-                            // Worked-before: same semantics as the scorer's
-                            // duplicate penalty — band-scoped (current
-                            // operating frequency), uppercase-exact match on
-                            // the full callsign. We deliberately do NOT strip
-                            // /P-style suffixes: record_worked stores the
-                            // callsign exactly as logged, and adding
-                            // stripping on the TUI side only would make the
-                            // TUI flag stations the scorer still treats as
-                            // new (divergence).
-                            let worked_before = worked_before_for(
-                                &relay_station_lookup,
-                                call_sign.as_deref(),
-                                dial_mhz * 1_000_000.0,
-                            );
-                            let (needed, atno) =
-                                needed_atno_for(&relay_station_lookup, call_sign.as_deref());
-                            let band_needed = dxcc_needed_on_band_for(
-                                &relay_station_lookup,
-                                call_sign.as_deref(),
-                                dial_mhz * 1_000_000.0,
-                            );
-
-                            // PAN-85: forward a known US state whenever it is
-                            // new or has changed since the last one sent.
-                            if let Some(call) = call_sign.as_deref() {
-                                if let Some(state) = state_for(&relay_station_lookup, Some(call)) {
-                                    let key = call.to_uppercase();
-                                    if sent_states.get(&key) != Some(&state) {
-                                        sent_states.insert(key, state.clone());
-                                        let _ = tui_msg_tx_relay.send(
-                                            pancetta_tui::tui_runner::TuiMessage::StationState {
-                                                callsign: call.to_string(),
-                                                state,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Compute the #164 tiered priority score via the
-                            // real PriorityScorer's classification (ATNO >
-                            // per-band-DXCC-new > special-station >
-                            // per-band-grid-new > everything else, encoded
-                            // to a single sortable u32 — see
-                            // TieredScore::as_display_u32). Every identified
-                            // frame updates DX Hunter, using the retained
-                            // grid and fresh signal/worked/failure inputs.
-                            let (priority_score, priority_factors) = display_rank(
-                                &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
-                                decoded_msg.snr_db, dial_mhz);
-                            if let Some(call) = call_sign.as_deref() {
-                                last_rank_inputs.insert(rank_inputs_key(call), RankInputs {
-                                    grid: grid_square.clone(),
-                                    snr_db: decoded_msg.snr_db,
-                                    dial_mhz,
-                                });
-                            }
-
-                            let tui_decoded = pancetta_tui::DecodedMessageView {
-                                timestamp: chrono::Utc::now(),
-                                frequency: dial_mhz,
-                                mode: super::mode_str(pancetta_config::OperatingMode::from_u8(
-                                    relay_active_protocol_mode.load(Ordering::Relaxed),
-                                ))
-                                .to_string(),
-                                snr: decoded_msg.snr_db as i32,
-                                delta_time: decoded_msg.time_offset as f32,
-                                delta_freq: decoded_msg.frequency_offset as f32,
-                                call_sign,
-                                grid_square,
-                                message: decoded_msg.text.clone(),
-                                distance,
-                                bearing,
-                                slot_parity: decoded_msg.slot_parity,
-                                is_directed_at_us,
-                                worked_before,
-                                needed,
-                                atno,
-                                band_needed,
-                                priority_score,
-                                priority_factors,
-                                is_own_tx: false,
-                            };
-
-                            match tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DecodedMessage(tui_decoded),
-                            ) {
-                                // Perf (Pass 1): one decode forwards dozens of
-                                // these per slot — demote to debug so steady-state
-                                // info logging isn't dominated by per-decode spam.
-                                Ok(()) => debug!("TUI relay: forwarded decoded message to TUI channel"),
-                                Err(e) => warn!("TUI relay: failed to send to TUI: {}", e),
-                            }
-                        }
-                        Err(crossbeam_channel::TryRecvError::Empty) => {}
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            warn!("FT8 decoder channel disconnected, TUI relay continuing without decode data");
-                            ft8_disconnected = true;
-                        }
-                    }
-                }
-
-                // Also drain control messages from the message bus
-                if let Ok(bus_msg) = tui_bus_rx.try_recv() {
-                    match bus_msg.message_type {
-                        MessageType::AutonomousStatus(ref status) => {
-                            // Batch 93: forward the STRUCTURED status so the
-                            // live `[AUTO]` panel renders (previously this was
-                            // flattened to a transient status-bar string and
-                            // `app.autonomous_status` stayed None forever).
-                            let mapped = map_autonomous_status(
-                                status,
-                                relay_autonomous_gate.load(Ordering::Acquire),
-                            );
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(
-                                    mapped,
-                                ),
-                            );
-                            // Keep the status-bar text line too (additive).
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "Autonomous".to_string(),
-                                    status: status.state.clone(),
-                                    level: pancetta_core::DiagnosticLevel::Info,
-                                },
-                            );
-                        }
-                        MessageType::TxStatus { active } => {
-                            // Batch 93: TX worker brackets every transmission
-                            // (PTT-on → PTT-off, including aborts) with these.
-                            // Drives the title-bar " TX " badge.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
-                            );
-                        }
-                        MessageType::TxQueueStatus {
-                            ref sending,
-                            ref queued,
-                        } => {
-                            // Richer NOW-SENDING / QUEUED view. Re-shape the
-                            // coordinator's TxItem into the TUI's local
-                            // TxQueueItem (decoupled so the TUI doesn't link
-                            // the main crate).
-                            let map = |it: &crate::message_bus::TxItem| {
-                                pancetta_tui::app::TxQueueItem {
-                                    text: it.text.clone(),
-                                    freq_hz: it.freq_hz,
-                                    qso_id: it.qso_id.clone(),
-                                    deferred: it.deferred,
-                                }
-                            };
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
-                                    sending: sending.as_ref().map(map),
-                                    queued: queued.iter().map(map).collect(),
-                                },
-                            );
-                        }
-                        MessageType::TxFrameLogged {
-                            text,
-                            freq_hz,
-                            qso_id,
-                            timestamp,
-                        } => {
-                            // #172: pass-through relay for Band Activity's
-                            // own-TX history, same shape as QsoHistoryEntry.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxFrameLogged {
-                                    text,
-                                    freq_hz,
-                                    qso_id,
-                                    timestamp,
-                                },
-                            );
-                        }
-                        MessageType::TxPolicyStatus { policy } => {
-                            // Echo the global TX policy to the bold banner.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
-                            );
-                        }
-                        MessageType::DecodeEffortStatus { effort, budget_ms } => {
-                            // Echo the live decode-effort preset to the
-                            // "DECODE: <PRESET> <ms>ms" title-bar chip
-                            // (decoder-speed-overhaul Task 15).
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
-                                    effort,
-                                    budget_ms,
-                                },
-                            );
-                        }
-                        MessageType::SplitStatus { tx_hz } => {
-                            // Echo the authoritative split TX state to the
-                            // title-bar chip. Sent from all three split-atomic
-                            // write sites (SetSplit command, manual band-change,
-                            // autonomous band-hop).
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
-                            );
-                        }
-                        MessageType::TxOffsetStatus { offset_hz } => {
-                            // Whole-branch-review fix (Task 16 auto-repark):
-                            // the autonomous task writes `tx_offset_hold_hz`
-                            // directly with no operator keypress, so the
-                            // TUI's own `App.tx_offset_hold_hz` copy would
-                            // otherwise go stale. Echo it through so the
-                            // park line + HOLD chip stay in sync.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxOffsetUpdate {
-                                    offset_hz,
-                                },
-                            );
-                        }
-                        MessageType::FoxModeStatus { on } => {
-                            // Echo the authoritative Fox-mode state to the TUI
-                            // FOX chip. Sent by the SetFoxMode handler on every
-                            // path (engage, refused engage, disengage).
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on },
-                            );
-                        }
-                        MessageType::ContestScore(ref update) => {
-                            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::ContestScore(update.clone()));
-                        }
-                        MessageType::ActiveQsosSnapshot {
-                            ref qsos,
-                            ref pending,
-                        } => {
-                            // Re-shape into the TUI's ActiveQsoBanner
-                            // (decoupled struct so the TUI doesn't link
-                            // pancetta_qso). Push as a TuiMessage; the
-                            // TUI replaces its previous list with this.
-                            // Batch 94: carries the QSO-detail panel
-                            // fields too (last TX/RX message, SNR,
-                            // reports, exchange count).
-                            // #40: pending cross-parity calls are carried in
-                            // the same push as pending_calls so the TUI sees
-                            // a consistent (active, queued) pair.
-                            let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
-                                qsos.iter().map(map_qso_snapshot_item).collect();
-                            let banner_pending: Vec<pancetta_tui::app::PendingCallBanner> =
-                                pending.iter().map(map_pending_call_item).collect();
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
-                                    qsos: banner_qsos,
-                                    pending_calls: banner_pending,
-                                },
-                            );
-                        }
-                        MessageType::QsoHistoryEntry {
-                            call_sign,
-                            band,
-                            success,
-                            reason,
-                            completed_at,
-                        } => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::QsoHistoryEntry {
-                                    call_sign,
-                                    band,
-                                    success,
-                                    reason,
-                                    completed_at,
-                                },
-                            );
-                        }
-                        MessageType::RigControl(
-                            crate::message_bus::RigControlMessage::FrequencyResponse {
-                                vfo,
-                                frequency,
-                            },
-                        ) => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
-                                    vfo,
-                                    frequency,
-                                },
-                            );
-                        }
-                        MessageType::RigControl(
-                            crate::message_bus::RigControlMessage::ReceiveGainResponse {
-                                frequency, request_id, preamp_db, att_db,
-                            },
-                        ) => {
-                            if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
-                                if relay_gain_frequency.load(Ordering::Acquire) != frequency {
-                                    let _ = tui_msg_tx_relay.send(gain_status("Could not read rig gain: band changed — preset not saved".into(), pancetta_core::DiagnosticLevel::Warn));
-                                } else if let Some(band) = pancetta_core::Band::from_frequency(frequency) {
-                                    let _ = relay_gain_mutation_tx.send((band.to_string(), pancetta_config::rig::ReceiveGainPreset { preamp_db, attenuator_db: att_db }));
-                                }
-                            }
-                        }
-                        MessageType::RigControl(
-                            crate::message_bus::RigControlMessage::ReceiveGainError { frequency, request_id, error },
-                        ) => {
-                            if take_pending_gain_save(&relay_pending_gain_save, frequency, request_id) {
-                                let _ = tui_msg_tx_relay.send(gain_status(format!("Could not read rig gain: {} — preset not saved", error), pancetta_core::DiagnosticLevel::Warn));
-                            }
-                        }
-                        MessageType::RigControl(
-                            crate::message_bus::RigControlMessage::SignalStrengthResponse {
-                                db_over_s9,
-                            },
-                        ) => {
-                            // Batch 95: real rig S-meter read (hamlib
-                            // STRENGTH, dB relative to S9) from the
-                            // polling loop — forward verbatim.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate {
-                                    db_over_s9,
-                                },
-                            );
-                        }
-                        MessageType::RigControl(
-                            crate::message_bus::RigControlMessage::SwrResponse { swr },
-                        ) => {
-                            // Real rig SWR (hamlib SWR) sampled while keyed —
-                            // forward verbatim; the TUI shows it only during TX.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr },
-                            );
-                        }
-                        MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
-                            callsign,
-                            frequency,
-                            mode,
-                            band,
-                            spotter,
-                            ..
-                        }) => {
-                            // Worked-before keyed on the SPOT's frequency
-                            // (cluster spots carry their own), same
-                            // lookup/semantics as the decode path above.
-                            let worked_before = worked_before_for(
-                                &relay_station_lookup,
-                                Some(callsign.as_str()),
-                                frequency as f64,
-                            );
-                            let (needed, atno) =
-                                needed_atno_for(&relay_station_lookup, Some(callsign.as_str()));
-                            let band_needed = dxcc_needed_on_band_for(
-                                &relay_station_lookup,
-                                Some(callsign.as_str()),
-                                frequency as f64,
-                            );
-                            // PAN-85: forward a known US state whenever it is
-                            // new or has changed since the last one sent.
-                            if let Some(state) =
-                                state_for(&relay_station_lookup, Some(callsign.as_str()))
-                            {
-                                let key = callsign.to_uppercase();
-                                if sent_states.get(&key) != Some(&state) {
-                                    sent_states.insert(key, state.clone());
-                                    let _ = tui_msg_tx_relay.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StationState {
-                                            callsign: callsign.clone(),
-                                            state,
-                                        },
-                                    );
-                                }
-                            }
-                            let _ = tui_msg_tx_relay.send(cluster_spot_tui_message(
-                                ClusterSpotRelay {
-                                    callsign,
-                                    frequency,
-                                    mode,
-                                    band,
-                                    spotter,
-                                    worked_before,
-                                    needed,
-                                    atno,
-                                    band_needed,
-                                },
-                            ));
-                        }
-                        MessageType::StatusUpdate { text, level } => {
-                            // Free-form status emitted by other components (e.g. QSO
-                            // component reports respond_to_cq success/failure here so
-                            // Space-to-call surfaces "Calling X — TX queued" or the
-                            // actual rejection reason instead of just an optimistic
-                            // "Calling X..." that hides silent failures.
-                            let _ = tui_msg_tx_relay.send(
-                                relayed_status(format!("{}", bus_msg.source), text, level),
-                            );
-                        }
-                        MessageType::Error {
-                            component_id,
-                            ref error_message,
-                            error_code,
-                        } => {
-                            // Component-level errors (audio init failure, audio
-                            // device stalls, etc.) get surfaced to the TUI's error
-                            // log instead of dying silently in the log file. Without
-                            // this hop the audio thread can fail to start and the
-                            // user sees only an inert pipeline with no decodes.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::Error {
-                                    component: format!("{}", component_id),
-                                    message: error_message.clone(),
-                                    code: error_code,
-                                },
-                            );
-                        }
-                        MessageType::ErrorResolved {
-                            component_id,
-                            error_code,
-                        } => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::ErrorResolved {
-                                    component: format!("{}", component_id),
-                                    code: error_code,
-                                },
-                            );
-                        }
-                        MessageType::DiagnosticEvent {
-                            target,
-                            level,
-                            ref text,
-                            ref qso_id,
-                            ref callsign,
-                        } => {
-                            // docs/observability-diagnostics-plan.md Layer 1 —
-                            // relay the retained diagnostic stream into the TUI's
-                            // bounded event history (Shift+D overlay).
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                                    ts: chrono::Utc::now(),
-                                    target,
-                                    level,
-                                    text: text.clone(),
-                                    qso_id: qso_id.clone(),
-                                    callsign: callsign.clone(),
-                                },
-                            );
-                        }
-                        MessageType::RecentQsoOutcome(ref outcome) => {
-                            // docs/observability-diagnostics-plan.md Layer 2 —
-                            // relay the structured terminal-QSO-outcome stream
-                            // into the TUI's own bounded ring (App::recent_qsos),
-                            // sibling to the DiagnosticEvent relay above.
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::RecentQsoOutcome(
-                                    map_recent_qso_outcome(outcome),
-                                ),
-                            );
-                            // PAN-94: the QSO task records worked/failure
-                            // history before emitting this outcome, so rescore
-                            // the row now rather than at its next decode.
-                            for refresh in outcome_rank_refresh(
-                                &relay_scorer, &last_rank_inputs, &outcome.callsign)
-                            {
-                                let _ = tui_msg_tx_relay.send(refresh);
-                            }
-                        }
-                        MessageType::TxPlacementUpdate { ref snapshot } => {
-                            // TX-placement instrument (Task 9/10): convert the
-                            // qso-crate PlacementSnapshot into the TUI-local
-                            // PlacementView field-for-field — pancetta-tui must
-                            // not depend on pancetta-qso, so this relay is the
-                            // ONLY place the conversion happens.
-                            let slices = snapshot
-                                .slices
-                                .iter()
-                                .map(|c| pancetta_tui::app::PlacementSlice {
-                                    offset_hz: c.offset_hz,
-                                    score: c.score,
-                                    clear_first: c.clear_first,
-                                    clear_second: c.clear_second,
-                                })
-                                .collect();
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::TxPlacementUpdate {
-                                    view: pancetta_tui::app::PlacementView {
-                                        slices,
-                                        openness: snapshot.openness.clone(),
-                                        bin_hz: snapshot.bin_hz,
-                                        range: snapshot.range,
-                                        received_at: chrono::Utc::now(),
-                                    },
-                                },
-                            );
-                        }
-                        MessageType::AlertBell => {
-                            let _ = tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::AlertBell);
-                        }
-                        MessageType::DxWatchlistUpdate { ref callsigns, ref pinned } => {
-                            *relay_watchlist_pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pinned.clone();
-                            let mut retry_write = false;
-                            while let Some(mut response) = pending_pin_writes.pop_front() {
-                                match response.try_recv() {
-                                    Ok(Ok(())) => {},
-                                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                                        pending_pin_writes.push_front(response);
-                                        break;
-                                    },
-                                    _ => {
-                                        retry_write = true;
-                                        warn!("Watchlist persistence failed; retrying latest pins");
-                                    },
-                                }
-                            }
-                            // Queue every changed snapshot, including while an earlier write
-                            // is running. The serialized writer drains these during shutdown.
-                            if (*pinned != persisted_pins || retry_write) && watchlist_is_toml {
-                                let path = watchlist_path.clone();
-                                let pins = pinned.clone();
-                                let (respond, response) = tokio::sync::oneshot::channel();
-                                let sent = watchlist_write_tx.send(ConfigFileWriteRequest {
-                                    work: Box::new(move || {
-                                        let target = resolve_config_write_target(&path)?;
-                                        pancetta_config::Config::default().set_watchlist_pinned_in_file(&target, &pins)
-                                    }), respond,
-                                });
-                                if sent.is_ok() {
-                                    persisted_pins = pinned.clone();
-                                    pending_pin_writes.push_back(response);
-                                }
-                            }
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::DxWatchlistUpdate {
-                                    callsigns: callsigns.clone(),
-                                    pinned: pinned.clone(),
-                                },
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Relay waterfall data from FT8 decoder to TUI
-                if let Ok(rows) = waterfall_rx.try_recv() {
-                    let _ = tui_msg_tx_relay
-                        .send(pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows });
-                }
-
-                // Relay audio level from DSP to TUI
-                if let Ok(level) = audio_level_rx.try_recv() {
-                    let _ = tui_msg_tx_relay
-                        .send(pancetta_tui::tui_runner::TuiMessage::AudioLevel { level });
-                }
-
-                // Sleep to prevent busy-spinning
-                std::thread::sleep(std::time::Duration::from_millis(10));
-
-                // Send pipeline health to TUI every 2 seconds
-                if last_health_send.elapsed() >= std::time::Duration::from_secs(2) {
-                    // PAN-344: relay the full bounded per-QSO upload-status
-                    // snapshot on the same tick. Sent repeatedly; the App
-                    // merges by UUID and revision.
-                    let uploads = qso_upload_statuses_relay
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .snapshot();
-                    let _ = tui_msg_tx_relay.send(
-                        pancetta_tui::tui_runner::TuiMessage::QsoUploadStatuses(uploads),
-                    );
-                    let health = pancetta_tui::app::PipelineHealth {
-                        audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
-                        dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
-                        last_rms: f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed)),
-                        ft8lib_available: pancetta_ft8::ft8lib_is_available(),
-                        total_decodes: health_total_decodes_relay.load(Ordering::Relaxed),
-                        last_decode_elapsed_ms: decode_last_elapsed_ms_relay
-                            .load(Ordering::Relaxed),
-                        last_decode_budget_exhausted: decode_last_budget_exhausted_relay
-                            .load(Ordering::Relaxed),
-                        tx_attempts: super::tx::tx_attempts_count(),
-                        tx_defers: super::tx::tx_defers_count(),
-                        decode_panic_count: super::ft8::decode_panic_count(),
-                        wdt_panic_count: super::health::panic_count(),
-                        clock_skew_warning_s: clock_skew_relay.warning(),
-                    };
-                    let _ = tui_msg_tx_relay.send(
-                        pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),
-                    );
-                    last_health_send = std::time::Instant::now();
-
-                    // Rig-connection badge — push only when it changes.
-                    let rig_u8 = rig_conn_state_relay.load(Ordering::Relaxed);
-                    if last_rig_state != Some(rig_u8) {
-                        last_rig_state = Some(rig_u8);
-                        let state = match super::hamlib::RigConnState::from_u8(rig_u8) {
-                            super::hamlib::RigConnState::Connected => {
-                                pancetta_tui::app::RigConnDisplay::Connected
-                            }
-                            super::hamlib::RigConnState::PollingFailed => {
-                                pancetta_tui::app::RigConnDisplay::PollingFailed
-                            }
-                            super::hamlib::RigConnState::NotConnected => {
-                                pancetta_tui::app::RigConnDisplay::NotConnected
-                            }
-                        };
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::RigStatusUpdate { state },
-                        );
-                    }
-
-                    // TX-output misconfig badge — push only when it changes.
-                    let audio_default = audio_output_default_relay.load(Ordering::Relaxed);
-                    if last_audio_default != Some(audio_default) {
-                        last_audio_default = Some(audio_default);
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::AudioOutputDefault {
-                                is_default: audio_default,
-                            },
-                        );
-                    }
-
-                    // RX-input fallback badge — push only when it changes.
-                    let input_fb = audio_input_fallback_relay.load(Ordering::Relaxed);
-                    if last_input_fallback != Some(input_fb) {
-                        last_input_fallback = Some(input_fb);
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::AudioInputFallback {
-                                active: input_fb,
-                            },
-                        );
-                    }
-
-                    // C20 — RF present but zero decodes over several slots →
-                    // likely wrong mode (FT8/FT4) or a bad system clock. Feed
-                    // the cumulative DSP-window + decode counters and the latest
-                    // RMS; emit an operator status only on a warn on/off edge.
-                    let rf_dsp_windows = health_dsp_windows_relay.load(Ordering::Relaxed);
-                    let rf_total_decodes =
-                        health_total_decodes_relay.load(Ordering::Relaxed);
-                    let rf_last_rms =
-                        f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed));
-                    let edges =
-                        rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms);
-                    if let Some(active) = edges.rf_no_decode {
-                        rf_no_decode_active = active;
-                    }
-                    if let Some(active) = edges.silent_input {
-                        input_silent_active = active;
-                    }
-                    match edges.rf_no_decode {
-                        Some(true) => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
-                                    component: "dsp".to_string(),
-                                    code: RF_NO_DECODE_STATUS_CODE,
-                                    status: "⚠ RF present but no decodes — check mode/clock?"
-                                        .to_string(),
-                                    level: pancetta_core::DiagnosticLevel::Warn,
-                                },
-                            );
-                        }
-                        Some(false) => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
-                                    component: "dsp".to_string(),
-                                    code: RF_NO_DECODE_STATUS_CODE,
-                                    status: "Decodes resumed — RF/no-decode warning cleared"
-                                        .to_string(),
-                                    level: pancetta_core::DiagnosticLevel::Info,
-                                },
-                            );
-                        }
-                        None => {}
-                    }
-                    // Silent-input warning: the stream is running but the
-                    // samples are ~0 (muted/missing device, denied mic
-                    // permission, or a remote-desktop client holding the
-                    // CODEC). Distinct from a quiet-but-live band.
-                    match edges.silent_input {
-                        Some(true) => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
-                                    component: "audio".to_string(),
-                                    code: SILENT_INPUT_STATUS_CODE,
-                                    status: "⚠ INPUT SILENT (RMS≈0) — check Sound input device, \
-                                             mic permission, and that nothing else grabbed the CODEC"
-                                        .to_string(),
-                                    level: pancetta_core::DiagnosticLevel::Warn,
-                                },
-                            );
-                        }
-                        Some(false) => {
-                            let _ = tui_msg_tx_relay.send(
-                                pancetta_tui::tui_runner::TuiMessage::CodedStatusUpdate {
-                                    component: "audio".to_string(),
-                                    code: SILENT_INPUT_STATUS_CODE,
-                                    status: "Audio input restored — silence warning cleared"
-                                        .to_string(),
-                                    level: pancetta_core::DiagnosticLevel::Info,
-                                },
-                            );
-                        }
-                        None => {}
-                    }
-
-                    // PAN-89: station-readiness strip — push only on change.
-                    let readiness =
-                        readiness_sources.snapshot(rf_no_decode_active, input_silent_active);
-                    let (send_readiness, ptt_cleared) = readiness_publisher.observe(&readiness);
-                    if send_readiness {
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::StationReadiness(readiness),
-                        );
-                    }
-                    if ptt_cleared {
-                        const PTT_CLEARED: &str =
-                            "PTT-off confirmed by the rig — stuck-PTT warning cleared";
-                        info!("{PTT_CLEARED}");
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
-                                ts: chrono::Utc::now(),
-                                target: "supervisor",
-                                level: pancetta_core::DiagnosticLevel::Info,
-                                text: PTT_CLEARED.into(),
-                                qso_id: None,
-                                callsign: None,
-                            },
-                        );
-                    }
-                }
-            }
-            info!("TUI relay thread stopped");
-        }).expect("Failed to spawn TUI relay thread");
+                // Build the display priority scorer once per relay thread.
+                // Uses the same weights and lookup (via Arc-shared internals)
+                // as the autonomous scorer, but the DX Hunter's "Pri" column now
+                // reflects the #164 tiered score (0-5999, strict tier dominance
+                // — see TieredScore::as_display_u32) rather than the old
+                // continuous [0,1] mapped to [0,1000].
+                let relay_scorer = pancetta_qso::PriorityScorer::new(
+                    relay_priority_weights,
+                    Box::new(relay_scorer_lookup),
+                );
+                let mut relay = TuiRelayLoop {
+                    shutdown_flag: relay_shutdown,
+                    tui_out: tui_msg_tx_relay,
+                    pending_gain_save: relay_pending_gain_save,
+                    gain_mutation_tx: relay_gain_mutation_tx,
+                    gain_frequency: relay_gain_frequency,
+                    station_lookup: relay_station_lookup,
+                    station_coords,
+                    our_callsign: our_callsign_for_relay,
+                    scorer: relay_scorer,
+                    active_protocol_mode: relay_active_protocol_mode,
+                    autonomous_gate: relay_autonomous_gate,
+                    sent_states: RelayCache::default(),
+                    last_grids: RelayCache::default(),
+                    last_rank_inputs: RelayCache::default(),
+                    last_rig_state: None,
+                    last_audio_default: None,
+                    last_input_fallback: None,
+                    rf_no_decode: super::health::RfNoDecodeMonitor::new(),
+                    rf_no_decode_active: false,
+                    input_silent_active: false,
+                    readiness_publisher: super::readiness::ReadinessPublisher::default(),
+                    readiness_sources,
+                    qso_upload_statuses: qso_upload_statuses_relay,
+                    health_audio_alive: health_audio_alive_relay,
+                    health_dsp_windows: health_dsp_windows_relay,
+                    health_last_rms: health_last_rms_relay,
+                    health_total_decodes: health_total_decodes_relay,
+                    decode_last_elapsed_ms: decode_last_elapsed_ms_relay,
+                    decode_last_budget_exhausted: decode_last_budget_exhausted_relay,
+                    rig_conn_state: rig_conn_state_relay,
+                    audio_output_default: audio_output_default_relay,
+                    audio_input_fallback: audio_input_fallback_relay,
+                    clock_skew: clock_skew_relay,
+                    watchlist_pins: relay_watchlist_pins,
+                    watchlist_write_tx,
+                    watchlist_path,
+                    watchlist_is_toml,
+                    persisted_pins,
+                    pending_pin_writes,
+                    sample_drops: SampleDropCounters::default(),
+                    sample_drops_last_reported: SampleDropCounters::default(),
+                };
+                // PAN-316: the relay blocks on its input channels and the
+                // next health deadline instead of sleep-polling at 10 ms;
+                // an idle relay wakes only at the 2 s health tick.
+                let mut driver = RelayDriver::new(
+                    RELAY_HEALTH_PERIOD,
+                    Some(ft8_to_tui_rx),
+                    Some(tui_bus_rx),
+                    Some(waterfall_rx),
+                    Some(audio_level_rx),
+                );
+                while driver.step(&mut relay) {}
+                info!("TUI relay thread stopped");
+            })
+            .expect("Failed to spawn TUI relay thread");
         self.tui_relay_handle = Some(tui_relay_jh);
 
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
@@ -3651,12 +4186,14 @@ impl super::ApplicationCoordinator {
 
         // Wrap the JoinHandle and ensure shutdown is triggered when TUI exits
         let tui_shutdown = self.shutdown_signal.clone();
+        let tui_failure = self.tui_failure.clone();
         let tui_wrapper = tokio::spawn(async move {
             let result = match tui_handle.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("TUI task panicked: {}", e)),
             };
+            record_tui_failure(&tui_failure, &result);
             // Always trigger shutdown when TUI exits (user quit, crash, etc.)
             tui_shutdown.store(true, Ordering::Release);
             result
@@ -4095,6 +4632,115 @@ fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
     }
 }
 
+/// State and services the per-decode view conversion shares with the relay
+/// thread: the grid/rank caches it owns across decodes, the station
+/// coordinates for distance/bearing, the worked-before/needed lookup, the
+/// display scorer, our callsign (directed detection) and the live protocol
+/// mode stamp. Extracted from the relay loop so tests drive the exact
+/// production conversion — the relay thread itself has no test harness
+/// (see the note at its spawn, and `TxPolicyCmdCtx` for the same pattern).
+struct RelayDecodeCtx<'a> {
+    last_grids: &'a mut RelayCache<(String, String), String>,
+    last_rank_inputs: &'a mut RelayCache<String, RankInputs>,
+    station_coords: Option<(f64, f64)>,
+    lookup: &'a crate::priority_evaluator::CachedStationLookup,
+    scorer: &'a pancetta_qso::PriorityScorer,
+    our_callsign: &'a str,
+    protocol_mode: u8,
+}
+
+/// Convert one decoded FT8 frame into the `DecodedMessageView` the relay
+/// forwards to the TUI: retained display grid, directed-at-us flag,
+/// distance/bearing, worked-before/needed/ATNO/band-needed enrichment,
+/// tiered display rank and the rank-input memory update (PAN-330 AC1 —
+/// the "relay output" the directed flag is proven against).
+fn decoded_view_for_relay(
+    relayed: &super::pipeline::RelayedDecode,
+    ctx: &mut RelayDecodeCtx<'_>,
+) -> pancetta_tui::DecodedMessageView {
+    let decoded_msg = &relayed.message;
+    let call_sign = decoded_msg.message.from_callsign.clone();
+    let dial_mhz = decode_view_dial_mhz(relayed);
+    let grid_square = display_grid(
+        ctx.last_grids,
+        call_sign.as_deref(),
+        decoded_msg.message.grid_square.as_deref(),
+        dial_mhz,
+    );
+    let is_directed_at_us =
+        decode_directed_at_us_flag(decoded_msg.message.to_callsign.as_deref(), ctx.our_callsign);
+
+    // Compute distance and bearing if both grids are available
+    let (distance, bearing) = match (&grid_square, ctx.station_coords) {
+        (Some(remote_grid), Some((home_lat, home_lon))) => {
+            match pancetta_core::gridsquare::grid_to_coordinates(remote_grid) {
+                Ok((remote_lat, remote_lon)) => {
+                    let geod = geographiclib_rs::Geodesic::wgs84();
+                    let (dist_m, azi1, _azi2, _arc) =
+                        geod.inverse(home_lat, home_lon, remote_lat, remote_lon);
+                    let bearing_deg = if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
+                    (Some(dist_m / 1000.0), Some(bearing_deg))
+                }
+                Err(_) => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+
+    // Worked-before: same semantics as the scorer's duplicate penalty —
+    // band-scoped (current operating frequency), uppercase-exact match on
+    // the full callsign. We deliberately do NOT strip /P-style suffixes:
+    // record_worked stores the callsign exactly as logged, and adding
+    // stripping on the TUI side only would make the TUI flag stations the
+    // scorer still treats as new (divergence).
+    let worked_before = worked_before_for(ctx.lookup, call_sign.as_deref(), dial_mhz * 1_000_000.0);
+    let (needed, atno) = needed_atno_for(ctx.lookup, call_sign.as_deref());
+    let band_needed =
+        dxcc_needed_on_band_for(ctx.lookup, call_sign.as_deref(), dial_mhz * 1_000_000.0);
+
+    let (priority_score, priority_factors) = display_rank(
+        ctx.scorer,
+        call_sign.as_deref(),
+        grid_square.as_deref(),
+        decoded_msg.snr_db,
+        dial_mhz,
+    );
+    if let Some(call) = call_sign.as_deref() {
+        ctx.last_rank_inputs.insert(
+            rank_inputs_key(call),
+            RankInputs {
+                grid: grid_square.clone(),
+                snr_db: decoded_msg.snr_db,
+                dial_mhz,
+            },
+        );
+    }
+
+    pancetta_tui::DecodedMessageView {
+        timestamp: chrono::Utc::now(),
+        frequency: dial_mhz,
+        mode: super::mode_str(pancetta_config::OperatingMode::from_u8(ctx.protocol_mode))
+            .to_string(),
+        snr: decoded_msg.snr_db as i32,
+        delta_time: decoded_msg.time_offset as f32,
+        delta_freq: decoded_msg.frequency_offset as f32,
+        call_sign,
+        grid_square,
+        message: decoded_msg.text.clone(),
+        distance,
+        bearing,
+        slot_parity: decoded_msg.slot_parity,
+        is_directed_at_us,
+        worked_before,
+        needed,
+        atno,
+        band_needed,
+        priority_score,
+        priority_factors,
+        is_own_tx: false,
+    }
+}
+
 /// Worked-before check for TUI enrichment (Batch 95).
 ///
 /// Delegates to `CachedStationLookup::is_duplicate` — the exact method
@@ -4433,6 +5079,14 @@ fn spawn_config_file_write_worker() -> (
 // Transient-only health identities, distinct from service error codes.
 const RF_NO_DECODE_STATUS_CODE: u32 = 0xC200_0001;
 const SILENT_INPUT_STATUS_CODE: u32 = 0xC200_0002;
+
+/// "Directed at us" flag for one relayed decode — the relay's single use of
+/// the shared core predicate (`pancetta_core::callsign::decode_directed_at_us`,
+/// PAN-330). See that function for the recognized forms; absent, empty,
+/// whitespace-only and unresolved-hash (`<...>`) destinations never match.
+fn decode_directed_at_us_flag(to: Option<&str>, our_callsign: &str) -> bool {
+    pancetta_core::callsign::decode_directed_at_us(to, our_callsign)
+}
 
 fn relayed_status(
     component: String,
@@ -4932,6 +5586,73 @@ mod pan351_tests {
 
 #[cfg(test)]
 mod tui_relay_tests {
+    /// PAN-330 AC1: the TUI relay's directed flag recognizes prefix/suffix
+    /// portable calls, mixed case and resolved hash renders, and rejects
+    /// absent, empty, whitespace-only, unresolved-hash and wrong-call
+    /// destinations — exercised through the relay's own output conversion
+    /// (`decoded_view_for_relay`, the exact production path the relay
+    /// thread runs), not just the core matcher.
+    #[test]
+    fn directed_decode_table() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let view = |to: Option<&str>| {
+            let ft8 = pancetta_ft8::Ft8Message {
+                from_callsign: Some("DL1ABC".into()),
+                to_callsign: to.map(str::to_string),
+                ..Default::default()
+            };
+            let mut message = pancetta_ft8::DecodedMessage::new(ft8, -10.0, 0.0, 1000.0, 0.0);
+            message.text = match to {
+                Some(t) => format!("{t} DL1ABC -10"),
+                None => "DL1ABC -10".into(),
+            };
+            let relayed = crate::coordinator::pipeline::RelayedDecode {
+                message,
+                dial_hz: 14_074_000,
+            };
+            let mut last_grids = super::RelayCache::default();
+            let mut last_rank_inputs = super::RelayCache::default();
+            super::decoded_view_for_relay(
+                &relayed,
+                &mut super::RelayDecodeCtx {
+                    last_grids: &mut last_grids,
+                    last_rank_inputs: &mut last_rank_inputs,
+                    station_coords: None,
+                    lookup: &lookup,
+                    scorer: &scorer,
+                    our_callsign: "K5ARH",
+                    protocol_mode: 0,
+                },
+            )
+        };
+        // The ticket's headline: `EA8/K5ARH DL1ABC -10` is directed at us.
+        assert!(view(Some("EA8/K5ARH")).is_directed_at_us);
+        assert!(view(Some("K5ARH/P")).is_directed_at_us);
+        assert!(view(Some("K5ARH/M")).is_directed_at_us);
+        assert!(view(Some("k5arh")).is_directed_at_us);
+        assert!(view(Some("<K5ARH>")).is_directed_at_us); // resolved hash render
+        assert!(view(Some("K5ARH")).is_directed_at_us); // plain reply to our CQ
+                                                        // Not directed at us.
+        assert!(!view(Some("EA8/K5ARG")).is_directed_at_us);
+        assert!(!view(Some("DL1ABC")).is_directed_at_us);
+        assert!(!view(Some("<...>")).is_directed_at_us); // unresolved hash placeholder
+        assert!(!view(None).is_directed_at_us);
+        assert!(!view(Some("")).is_directed_at_us);
+        assert!(!view(Some("   ")).is_directed_at_us);
+        // The conversion is the relay's own output: the frame's fields reach
+        // the view unchanged alongside the flag.
+        let v = view(Some("EA8/K5ARH"));
+        assert_eq!(v.call_sign.as_deref(), Some("DL1ABC"));
+        assert_eq!(v.message, "EA8/K5ARH DL1ABC -10");
+        assert_eq!(v.frequency, 14.074);
+        assert_eq!(v.snr, -10);
+        assert!(!v.worked_before);
+    }
+
     #[test]
     fn cluster_spot_relay_preserves_metadata() {
         // PAN-345: frequency (Hz), mode and band reach the TUI unchanged,
@@ -5149,6 +5870,781 @@ mod tui_relay_tests {
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.get_at(&"K5ABC".to_owned(), later), Some(&5));
         assert_eq!(cache.get_at(&"K6ABC".to_owned(), later), Some(&6));
+    }
+
+    // ---- PAN-316: blocking relay driver, backpressure, bounded state --
+
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    /// External bound for every driver-thread join in these tests: the
+    /// real 2 s health period must surface shutdown without any help, so
+    /// 3 s is generous. Never an unconditional join.
+    const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+    fn wait_until(what: &str, deadline: Duration, mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn marker_decode(i: usize) -> crate::coordinator::pipeline::RelayedDecode {
+        let ft8 = pancetta_ft8::Ft8Message {
+            from_callsign: Some("K1ABC".into()),
+            to_callsign: None,
+            ..Default::default()
+        };
+        let mut message = pancetta_ft8::DecodedMessage::new(ft8, -10.0, 0.0, 1000.0, 0.0);
+        message.text = format!("d:{i}");
+        crate::coordinator::pipeline::RelayedDecode {
+            message,
+            dial_hz: 14_074_000,
+        }
+    }
+
+    fn marker_bus(i: usize) -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Qso,
+            ComponentId::Tui,
+            MessageType::StatusUpdate {
+                text: format!("b:{i}"),
+                level: pancetta_core::DiagnosticLevel::Info,
+            },
+            Instant::now(),
+        )
+    }
+
+    /// Counting host for driver tests: records every callback and shapes
+    /// its output exactly like the production relay — reliable events via
+    /// blocking `send` on the unbounded shared output, low-value samples
+    /// through the production `admit_tui_sample` admission path.
+    struct CountingRelayHost {
+        shutdown_flag: Arc<AtomicBool>,
+        out: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+        decodes: Arc<AtomicU64>,
+        bus: Arc<AtomicU64>,
+        waterfalls: Arc<AtomicU64>,
+        audio: Arc<AtomicU64>,
+        health: Arc<AtomicU64>,
+        deadlines: Arc<AtomicU64>,
+        sample_drops: SampleDropCounters,
+        /// Simulates an outstanding receive-gain save: its install
+        /// instant and whether it already expired.
+        gain_pending_since: Option<Instant>,
+        gain_expired: Arc<AtomicBool>,
+        gain_completed: Arc<AtomicBool>,
+        pending_gain_save: Arc<std::sync::Mutex<Option<(u64, Instant, u64)>>>,
+    }
+
+    impl CountingRelayHost {
+        fn new(out: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>) -> Self {
+            Self {
+                shutdown_flag: Arc::new(AtomicBool::new(false)),
+                out,
+                decodes: Arc::new(AtomicU64::new(0)),
+                bus: Arc::new(AtomicU64::new(0)),
+                waterfalls: Arc::new(AtomicU64::new(0)),
+                audio: Arc::new(AtomicU64::new(0)),
+                health: Arc::new(AtomicU64::new(0)),
+                deadlines: Arc::new(AtomicU64::new(0)),
+                sample_drops: SampleDropCounters::default(),
+                gain_pending_since: None,
+                gain_expired: Arc::new(AtomicBool::new(false)),
+                gain_completed: Arc::new(AtomicBool::new(false)),
+                pending_gain_save: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        /// Install a pending gain save that is `age` old, driving the
+        /// production deadline rule.
+        fn install_gain_save(&mut self, age: Duration) {
+            self.gain_pending_since = Some(Instant::now() - age);
+        }
+    }
+
+    impl super::RelayDriverHost for CountingRelayHost {
+        fn shutdown(&self) -> bool {
+            self.shutdown_flag.load(AtomicOrdering::Acquire)
+        }
+
+        fn gain_save_deadline(&mut self) -> Option<Instant> {
+            self.gain_pending_since
+                .map(|since| since + super::GAIN_SAVE_TIMEOUT)
+        }
+
+        fn on_deadline(&mut self) -> super::RelayFlow {
+            self.deadlines.fetch_add(1, AtomicOrdering::Relaxed);
+            if let Some(since) = self.gain_pending_since {
+                // The production expiry rule.
+                if super::gain_save_expired(&(14_074_000, since, 1), Instant::now()) {
+                    self.gain_pending_since = None;
+                    self.gain_expired.store(true, AtomicOrdering::Release);
+                    let _ = self.out.send(status_marker("gain:timed-out"));
+                }
+            }
+            super::RelayFlow::Continue
+        }
+
+        fn on_decode(
+            &mut self,
+            relayed: crate::coordinator::pipeline::RelayedDecode,
+        ) -> super::RelayFlow {
+            self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = self.out.send(status_marker(&relayed.message.text));
+            super::RelayFlow::Continue
+        }
+
+        fn on_bus(&mut self, message: ComponentMessage) -> super::RelayFlow {
+            self.bus.fetch_add(1, AtomicOrdering::Relaxed);
+            // The production gain path: a matching response completes the
+            // pending request via the real matcher.
+            if let MessageType::RigControl(
+                crate::message_bus::RigControlMessage::ReceiveGainResponse {
+                    frequency,
+                    request_id,
+                    ..
+                },
+            ) = message.message_type
+            {
+                if super::take_pending_gain_save(&self.pending_gain_save, frequency, request_id) {
+                    self.gain_pending_since = None;
+                    self.gain_completed.store(true, AtomicOrdering::Release);
+                }
+            }
+            if let MessageType::StatusUpdate { text, .. } = message.message_type {
+                let _ = self.out.send(status_marker(&text));
+            }
+            super::RelayFlow::Continue
+        }
+
+        fn on_waterfall(&mut self, rows: Vec<Vec<f32>>) -> super::RelayFlow {
+            self.waterfalls.fetch_add(1, AtomicOrdering::Relaxed);
+            match super::admit_tui_sample(
+                &self.out,
+                super::SampleKind::Waterfall,
+                pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows },
+                &mut self.sample_drops,
+            ) {
+                super::SampleAdmission::OutputDisconnected => super::RelayFlow::Stop,
+                _ => super::RelayFlow::Continue,
+            }
+        }
+
+        fn on_audio(&mut self, level: f32) -> super::RelayFlow {
+            self.audio.fetch_add(1, AtomicOrdering::Relaxed);
+            match super::admit_tui_sample(
+                &self.out,
+                super::SampleKind::AudioLevel,
+                pancetta_tui::tui_runner::TuiMessage::AudioLevel { level },
+                &mut self.sample_drops,
+            ) {
+                super::SampleAdmission::OutputDisconnected => super::RelayFlow::Stop,
+                _ => super::RelayFlow::Continue,
+            }
+        }
+
+        fn on_health_tick(&mut self) -> super::RelayFlow {
+            self.health.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = self.out.send(status_marker("health"));
+            super::RelayFlow::Continue
+        }
+    }
+
+    fn status_marker(text: &str) -> pancetta_tui::tui_runner::TuiMessage {
+        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+            component: "relay-test".to_string(),
+            status: text.to_string(),
+            level: pancetta_core::DiagnosticLevel::Info,
+        }
+    }
+
+    fn marker_text(message: &pancetta_tui::tui_runner::TuiMessage) -> Option<&str> {
+        match message {
+            pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. } => Some(status),
+            _ => None,
+        }
+    }
+
+    /// Run the production driver + host on a background thread. The
+    /// completion channel enforces the external join timeout.
+    fn spawn_driver(
+        driver: super::RelayDriver,
+        mut host: CountingRelayHost,
+    ) -> crossbeam_channel::Receiver<super::RelayDriverStats> {
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<super::RelayDriverStats>(1);
+        std::thread::spawn(move || {
+            let mut driver = driver;
+            while driver.step(&mut host) {}
+            let _ = done_tx.send(driver.stats);
+        });
+        done_rx
+    }
+
+    /// Wake the parked driver for teardown: set shutdown and nudge one
+    /// live input so the test's own wait is not what the deadline
+    /// accounting has to cover.
+    fn teardown(
+        done_rx: &crossbeam_channel::Receiver<super::RelayDriverStats>,
+    ) -> super::RelayDriverStats {
+        done_rx
+            .recv_timeout(DRIVER_JOIN_TIMEOUT)
+            .expect("relay did not stop within the 3 s join timeout")
+    }
+
+    #[test]
+    fn relay_idle_waits_for_health_ticks() {
+        let (out_tx, _out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        let shutdown = host.shutdown_flag.clone();
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(8);
+        let (bus_tx, bus_rx) = crossbeam_channel::bounded::<ComponentMessage>(8);
+        let (wf_tx, wf_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(8);
+        let (au_tx, au_rx) = crossbeam_channel::bounded::<f32>(8);
+        let driver = super::RelayDriver::new(
+            Duration::from_secs(2),
+            Some(decode_rx),
+            Some(bus_rx),
+            Some(wf_rx),
+            Some(au_rx),
+        );
+        let done = spawn_driver(driver, host);
+        // All senders stay connected and silent for 5 s: the only
+        // wakeups allowed are the health deadlines at 2 s and 4 s.
+        std::thread::sleep(Duration::from_secs(5));
+        shutdown.store(true, AtomicOrdering::Release);
+        // Final teardown wake so the join timeout is not what proves
+        // shutdown detection (that is the other test's job).
+        let _ = decode_tx.send(marker_decode(999));
+        let stats = teardown(&done);
+        // Exactly the two health deadlines fired, each once.
+        assert_eq!(stats.health_ticks, 2);
+        assert_eq!(stats.timeout_wakes, 2);
+        // The only input wake is the test's own teardown nudge (excluded
+        // from the idle accounting above). The old 10 ms poll cadence
+        // woke ~496 times in the same window.
+        assert_eq!(stats.input_wakes, 1);
+        assert_eq!(stats.wait_returns, 3);
+        drop((bus_tx, wf_tx, au_tx));
+    }
+
+    #[test]
+    fn relay_input_wakes_before_health_deadline() {
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        let shutdown = host.shutdown_flag.clone();
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(8);
+        let driver =
+            super::RelayDriver::new(Duration::from_secs(2), Some(decode_rx), None, None, None);
+        let done = spawn_driver(driver, host);
+        // Work arriving between ticks is serviced without waiting for
+        // the next health deadline.
+        std::thread::sleep(Duration::from_millis(200));
+        decode_tx.send(marker_decode(7)).unwrap();
+        let got = crossbeam_channel::select! {
+            recv(out_rx) -> msg => msg.ok(),
+            default(Duration::from_millis(1500)) => None,
+        };
+        assert_eq!(
+            got.as_ref().and_then(marker_text),
+            Some("d:7"),
+            "input work must be serviced without waiting for a health tick"
+        );
+        shutdown.store(true, AtomicOrdering::Release);
+        drop(decode_tx);
+        let stats = teardown(&done);
+        assert!(stats.input_wakes >= 1);
+    }
+
+    #[test]
+    fn relay_low_value_updates_drop_and_count_at_pressure_limit() {
+        use super::{
+            admit_tui_sample, SampleAdmission, SampleDropCounters, SampleKind,
+            TUI_SAMPLE_QUEUE_LIMIT,
+        };
+        use pancetta_tui::tui_runner::TuiMessage;
+
+        let (tx, rx) = crossbeam_channel::unbounded::<TuiMessage>();
+        let mut drops = SampleDropCounters::default();
+        // Fill the shared output to the pressure limit with reliable
+        // events, as a busy stalled-TUI window would.
+        for i in 0..TUI_SAMPLE_QUEUE_LIMIT {
+            tx.send(status_marker(&format!("r:{i}"))).unwrap();
+        }
+        assert_eq!(tx.len(), TUI_SAMPLE_QUEUE_LIMIT);
+        // At the limit: waterfall and audio samples are dropped, each
+        // counted by its own counter, and the queue length does not move.
+        assert_eq!(
+            admit_tui_sample(
+                &tx,
+                SampleKind::Waterfall,
+                TuiMessage::WaterfallUpdate {
+                    rows: vec![vec![0.0]]
+                },
+                &mut drops
+            ),
+            SampleAdmission::Dropped
+        );
+        assert_eq!(
+            admit_tui_sample(
+                &tx,
+                SampleKind::AudioLevel,
+                TuiMessage::AudioLevel { level: 0.5 },
+                &mut drops
+            ),
+            SampleAdmission::Dropped
+        );
+        assert_eq!(drops.dropped(SampleKind::Waterfall), 1);
+        assert_eq!(drops.dropped(SampleKind::AudioLevel), 1);
+        assert_eq!(tx.len(), TUI_SAMPLE_QUEUE_LIMIT);
+        // Below the limit: admitted without touching the counters.
+        rx.recv().unwrap();
+        assert_eq!(
+            admit_tui_sample(
+                &tx,
+                SampleKind::Waterfall,
+                TuiMessage::WaterfallUpdate {
+                    rows: vec![vec![0.0]]
+                },
+                &mut drops
+            ),
+            SampleAdmission::Admitted
+        );
+        assert_eq!(drops.dropped(SampleKind::Waterfall), 1);
+        assert_eq!(tx.len(), TUI_SAMPLE_QUEUE_LIMIT);
+        // A gone output is reported as a disconnection, never counted as
+        // a pressure drop.
+        let (dead_tx, dead_rx) = crossbeam_channel::unbounded::<TuiMessage>();
+        drop(dead_rx);
+        assert_eq!(
+            admit_tui_sample(
+                &dead_tx,
+                SampleKind::Waterfall,
+                TuiMessage::WaterfallUpdate {
+                    rows: vec![vec![0.0]]
+                },
+                &mut drops
+            ),
+            SampleAdmission::OutputDisconnected
+        );
+        assert_eq!(drops.dropped(SampleKind::Waterfall), 1);
+    }
+
+    #[test]
+    fn relay_stalled_tui_keeps_reliable_events_and_drains_bus() {
+        const RELIABLE_PER_STREAM: usize = 600; // 1,200 reliable events total
+        const SAMPLES_PER_KIND: usize = 1_200;
+
+        // The production output shape: one unbounded shared channel whose
+        // receiver stays CONNECTED but is not drained for the whole
+        // 10 s stall window.
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        let decodes = host.decodes.clone();
+        let bus = host.bus.clone();
+        let waterfalls = host.waterfalls.clone();
+        let audio = host.audio.clone();
+        let shutdown = host.shutdown_flag.clone();
+        // Bounded upstream inputs: every send below only completes once
+        // the relay has drained it — the barrier proving the bus side
+        // kept draining while the TUI was stalled.
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(64);
+        let (bus_tx, bus_rx) = crossbeam_channel::bounded::<ComponentMessage>(64);
+        let (wf_tx, wf_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(64);
+        let (au_tx, au_rx) = crossbeam_channel::bounded::<f32>(64);
+        let driver = super::RelayDriver::new(
+            Duration::from_secs(2),
+            Some(decode_rx),
+            Some(bus_rx),
+            Some(wf_rx),
+            Some(au_rx),
+        );
+        let done = spawn_driver(driver, host);
+
+        let start = Instant::now();
+        let feeder = std::thread::spawn(move || {
+            for i in 0..RELIABLE_PER_STREAM {
+                decode_tx.send(marker_decode(i)).unwrap();
+                bus_tx.send(marker_bus(i)).unwrap();
+            }
+            for _ in 0..SAMPLES_PER_KIND {
+                let _ = wf_tx.send(vec![vec![0.0]]);
+                let _ = au_tx.send(0.5);
+            }
+        });
+
+        // Bus barrier: all bounded input queues empty and every reliable
+        // event handled while the TUI output was still undrained.
+        wait_until(
+            "relay drained the stalled inputs",
+            Duration::from_secs(10),
+            || {
+                decodes.load(AtomicOrdering::Relaxed) == RELIABLE_PER_STREAM as u64
+                    && bus.load(AtomicOrdering::Relaxed) == RELIABLE_PER_STREAM as u64
+            },
+        );
+        // Keep the consumer stalled for the full 10 s ticket window.
+        while start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Resume draining: every reliable event must be delivered once,
+        // in per-stream FIFO enqueue order.
+        let mut decode_seq = Vec::new();
+        let mut bus_seq = Vec::new();
+        let mut admitted_samples = 0usize;
+        let drain_start = Instant::now();
+        while decode_seq.len() < RELIABLE_PER_STREAM || bus_seq.len() < RELIABLE_PER_STREAM {
+            assert!(
+                drain_start.elapsed() < Duration::from_secs(5),
+                "reliable backlog did not drain after consumption resumed (d={}, b={})",
+                decode_seq.len(),
+                bus_seq.len()
+            );
+            let Ok(message) = out_rx.recv_timeout(Duration::from_millis(500)) else {
+                break;
+            };
+            match &message {
+                pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. } => {
+                    if let Some(rest) = status.strip_prefix("d:") {
+                        decode_seq.push(rest.parse::<usize>().unwrap());
+                    } else if let Some(rest) = status.strip_prefix("b:") {
+                        bus_seq.push(rest.parse::<usize>().unwrap());
+                    }
+                }
+                pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { .. }
+                | pancetta_tui::tui_runner::TuiMessage::AudioLevel { .. } => {
+                    admitted_samples += 1;
+                }
+                _ => {}
+            }
+        }
+        feeder.join().expect("feeder panicked");
+        assert_eq!(decode_seq, (0..RELIABLE_PER_STREAM).collect::<Vec<_>>());
+        assert_eq!(bus_seq, (0..RELIABLE_PER_STREAM).collect::<Vec<_>>());
+
+        // Low-value admissions stopped at the pressure limit and every
+        // rejected sample incremented its own counter.
+        let handled_waterfalls = waterfalls.load(AtomicOrdering::Relaxed) as usize;
+        let handled_audio = audio.load(AtomicOrdering::Relaxed) as usize;
+        assert_eq!(handled_waterfalls, SAMPLES_PER_KIND);
+        assert_eq!(handled_audio, SAMPLES_PER_KIND);
+        assert_eq!(
+            admitted_samples, 0,
+            "with >1,000 reliable events queued, every sample must be dropped"
+        );
+
+        shutdown.store(true, AtomicOrdering::Release);
+        let _ = teardown(&done);
+    }
+
+    #[test]
+    fn relay_disconnected_inputs_do_not_spin() {
+        let (out_tx, _out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        let audio_handled = host.audio.clone();
+        let shutdown = host.shutdown_flag.clone();
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(8);
+        let (bus_tx, bus_rx) = crossbeam_channel::bounded::<ComponentMessage>(8);
+        let (wf_tx, wf_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(8);
+        let (au_tx, au_rx) = crossbeam_channel::bounded::<f32>(8);
+        let driver = super::RelayDriver::new(
+            Duration::from_secs(2),
+            Some(decode_rx),
+            Some(bus_rx),
+            Some(wf_rx),
+            Some(au_rx),
+        );
+        let done = spawn_driver(driver, host);
+        // Disconnect three inputs: each retires once, then the wait set
+        // is quiet — no spin.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(decode_tx);
+        drop(bus_tx);
+        drop(wf_tx);
+        std::thread::sleep(Duration::from_millis(200));
+        // The remaining input is still serviceable.
+        au_tx.send(0.25).unwrap();
+        wait_until(
+            "audio serviced after the other inputs retired",
+            Duration::from_secs(2),
+            || audio_handled.load(AtomicOrdering::Relaxed) >= 1,
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        shutdown.store(true, AtomicOrdering::Release);
+        let _ = au_tx.send(0.5); // teardown nudge on the one live input
+        let stats = teardown(&done);
+        // One blocking wake for the disconnect burst (the bounded batch
+        // drain retires the rest without another blocking wait), one for
+        // the audio sample, one for the teardown nudge. A spin loop (the
+        // removed 10 ms poll, or a disconnected receiver treated as
+        // always-ready) would produce 100+ wakes in this window.
+        assert!(
+            stats.wait_returns <= 8,
+            "disconnected inputs must not spin the loop: {stats:?}"
+        );
+        // Separate producer drops may race the driver's next select.
+        // At most three disconnects, the audio sample and teardown wake.
+        assert!(stats.input_wakes <= 5, "{stats:?}");
+    }
+
+    #[test]
+    fn relay_shutdown_does_not_depend_on_tui_drain() {
+        // With every input already retired, a deadline still bounds
+        // shutdown and the driver does not spin on disconnected inputs.
+        let (empty_tx, _empty_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(empty_tx);
+        let shutdown = host.shutdown_flag.clone();
+        let driver = super::RelayDriver::new(Duration::from_secs(2), None, None, None, None);
+        let done = spawn_driver(driver, host);
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, AtomicOrdering::Release);
+        let stats = teardown(&done);
+        assert_eq!(stats.wait_returns, 1);
+        assert_eq!(stats.timeout_wakes, 1);
+
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        // The health tick forwards to a consumer that never drains — the
+        // loop must still notice shutdown and exit.
+        let shutdown = host.shutdown_flag.clone();
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(8);
+        let (bus_tx, bus_rx) = crossbeam_channel::bounded::<ComponentMessage>(8);
+        let (wf_tx, wf_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(8);
+        let (au_tx, au_rx) = crossbeam_channel::bounded::<f32>(8);
+        let driver = super::RelayDriver::new(
+            Duration::from_secs(2),
+            Some(decode_rx),
+            Some(bus_rx),
+            Some(wf_rx),
+            Some(au_rx),
+        );
+        let done = spawn_driver(driver, host);
+        std::thread::sleep(Duration::from_millis(300));
+        shutdown.store(true, AtomicOrdering::Release);
+        // No teardown nudge: every input stays connected and silent, so
+        // only the 2 s health deadline can surface the flag.
+        let stats = teardown(&done);
+        assert!(
+            stats.timeout_wakes >= 1,
+            "the 2 s health deadline, not a consumer, bounded shutdown detection"
+        );
+        drop((decode_tx, bus_tx, wf_tx, au_tx, out_rx));
+    }
+
+    #[test]
+    fn relay_busy_inputs_do_not_starve_health() {
+        // Inject monotonic time to verify cadence and skip missed ticks
+        // without shifting the schedule to the end of message handling.
+        let mut clock = super::RelayDriver::new(Duration::from_secs(2), None, None, None, None);
+        let deadline = clock.next_health;
+        clock.advance_health_deadline(deadline + Duration::from_millis(500));
+        assert_eq!(clock.next_health, deadline + Duration::from_secs(2));
+        clock.advance_health_deadline(deadline + Duration::from_millis(6_500));
+        assert_eq!(clock.next_health, deadline + Duration::from_secs(8));
+
+        let (out_tx, _out_rx) = crossbeam_channel::unbounded();
+        let host = CountingRelayHost::new(out_tx);
+        let waterfalls = host.waterfalls.clone();
+        let shutdown = host.shutdown_flag.clone();
+        let (wf_tx, wf_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(8);
+        let driver = super::RelayDriver::new(Duration::from_secs(2), None, None, Some(wf_rx), None);
+        let done = spawn_driver(driver, host);
+        // Continuous waterfall load for ~4.3 s: health must still fire on
+        // its 2 s schedule (deadlines at 2 s and 4 s).
+        let feeder = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut i = 0usize;
+            while started.elapsed() < Duration::from_millis(4_300) {
+                let _ = wf_tx.send(vec![vec![i as f32]]);
+                i += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            i
+        });
+        std::thread::sleep(Duration::from_millis(4_400));
+        shutdown.store(true, AtomicOrdering::Release);
+        let sent = feeder.join().unwrap();
+        let stats = teardown(&done);
+        assert_eq!(stats.health_ticks, 2);
+        let handled = waterfalls.load(AtomicOrdering::Relaxed) as usize;
+        assert!(handled + 10 >= sent, "handled {handled} of ~{sent} samples");
+    }
+
+    #[test]
+    fn relay_gain_save_timeout_without_bus_traffic() {
+        // Exact deadline rule with injected monotonic time: the request
+        // dies at precisely its absolute 10 s deadline, not before.
+        let t0 = Instant::now();
+        let pending = (14_074_000u64, t0, 1u64);
+        assert!(!super::gain_save_expired(
+            &pending,
+            t0 + Duration::from_millis(9_999)
+        ));
+        assert!(super::gain_save_expired(
+            &pending,
+            t0 + super::GAIN_SAVE_TIMEOUT
+        ));
+
+        // Real driver: with no bus traffic at all, the relay wakes at the
+        // gain deadline (not the 2 s health deadline) and expires it.
+        let (out_tx, _out_rx) = crossbeam_channel::unbounded();
+        let mut host = CountingRelayHost::new(out_tx);
+        host.install_gain_save(super::GAIN_SAVE_TIMEOUT - Duration::from_millis(300));
+        let gain_expired = host.gain_expired.clone();
+        let shutdown = host.shutdown_flag.clone();
+        let (decode_tx, decode_rx) =
+            crossbeam_channel::bounded::<crate::coordinator::pipeline::RelayedDecode>(8);
+        let driver =
+            super::RelayDriver::new(Duration::from_secs(2), Some(decode_rx), None, None, None);
+        let done = spawn_driver(driver, host);
+        wait_until(
+            "gain save expired at its deadline without bus traffic",
+            Duration::from_secs(2),
+            || gain_expired.load(AtomicOrdering::Acquire),
+        );
+        shutdown.store(true, AtomicOrdering::Release);
+        let _ = decode_tx.send(marker_decode(1));
+        let stats = teardown(&done);
+        assert!(
+            stats.timeout_wakes >= 1,
+            "a deadline pass, not a poll, did the waking"
+        );
+        assert!(
+            stats.input_wakes <= 1,
+            "no input work was needed to expire the request"
+        );
+    }
+
+    #[test]
+    fn relay_gain_response_before_deadline_does_not_timeout() {
+        let (out_tx, _out_rx) = crossbeam_channel::unbounded();
+        let mut host = CountingRelayHost::new(out_tx);
+        // A fresh request: its 10 s deadline is far away.
+        host.install_gain_save(Duration::from_millis(100));
+        *host.pending_gain_save.lock().unwrap() = Some((14_074_000, Instant::now(), 42));
+        let gain_expired = host.gain_expired.clone();
+        let gain_completed = host.gain_completed.clone();
+        let shutdown = host.shutdown_flag.clone();
+        let (bus_tx, bus_rx) = crossbeam_channel::bounded::<ComponentMessage>(8);
+        let driver =
+            super::RelayDriver::new(Duration::from_secs(2), None, Some(bus_rx), None, None);
+        let done = spawn_driver(driver, host);
+        // The rig answers well before the deadline: the response is a bus
+        // message, serviced by a channel wake — not by any timeout.
+        std::thread::sleep(Duration::from_millis(200));
+        bus_tx
+            .send(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Tui,
+                MessageType::RigControl(
+                    crate::message_bus::RigControlMessage::ReceiveGainResponse {
+                        frequency: 14_074_000,
+                        request_id: 42,
+                        preamp_db: 10,
+                        att_db: 0,
+                    },
+                ),
+                Instant::now(),
+            ))
+            .unwrap();
+        wait_until(
+            "matching gain response completed the request",
+            Duration::from_secs(2),
+            || gain_completed.load(AtomicOrdering::Acquire),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !gain_expired.load(AtomicOrdering::Acquire),
+            "a response received before expiry must not time out"
+        );
+        shutdown.store(true, AtomicOrdering::Release);
+        let _ = bus_tx.send(marker_bus(999));
+        let stats = teardown(&done);
+        assert!(
+            stats.timeout_wakes <= 1,
+            "no deadline pass was needed to complete the request"
+        );
+        assert!(
+            stats.input_wakes >= 1,
+            "a channel wake serviced the response"
+        );
+    }
+
+    #[test]
+    fn relay_station_states_expire_cap_and_resend_changes() {
+        use super::station_state_message;
+
+        let start = Instant::now();
+        let mut sent_states = super::RelayCache::new(Duration::from_secs(3_600), 3);
+
+        let station_state = |message: pancetta_tui::tui_runner::TuiMessage| match message {
+            pancetta_tui::tui_runner::TuiMessage::StationState { callsign, state } => {
+                (callsign, state)
+            }
+            other => panic!("expected StationState, got {other:?}"),
+        };
+
+        // Initial state is forwarded, keyed uppercased.
+        let (call, state) = station_state(
+            station_state_message(&mut sent_states, "k1abc", "TX".into(), start).unwrap(),
+        );
+        assert_eq!((call.as_str(), state.as_str()), ("k1abc", "TX"));
+        // Unchanged state is suppressed (same key, mixed case).
+        assert!(station_state_message(
+            &mut sent_states,
+            "K1ABC",
+            "TX".into(),
+            start + Duration::from_secs(1)
+        )
+        .is_none());
+        // A corrected state is forwarded immediately.
+        let (call, state) = station_state(
+            station_state_message(
+                &mut sent_states,
+                "K1ABC",
+                "OK".into(),
+                start + Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        assert_eq!((call.as_str(), state.as_str()), ("K1ABC", "OK"));
+        // Past the TTL an unchanged state is sent again (harmless resend,
+        // consistent with the TUI's retained rows).
+        assert!(
+            station_state_message(
+                &mut sent_states,
+                "K1ABC",
+                "OK".into(),
+                start + Duration::from_secs(3_603)
+            )
+            .is_some(),
+            "past the TTL an unchanged state is resent"
+        );
+        // Capacity eviction: pushing 3 newer keys past the cap evicts the
+        // oldest, so that station's unchanged state is sent again.
+        let later = start + Duration::from_secs(3_604);
+        station_state_message(&mut sent_states, "K2ABC", "NY".into(), later).unwrap();
+        station_state_message(&mut sent_states, "K3ABC", "WY".into(), later).unwrap();
+        station_state_message(&mut sent_states, "K4ABC", "CA".into(), later).unwrap();
+        assert!(station_state_message(
+            &mut sent_states,
+            "K1ABC",
+            "OK".into(),
+            later + Duration::from_secs(1)
+        )
+        .is_some());
+        assert_eq!(sent_states.len(), 3, "the cache itself stays capped");
+
+        // The production sites use the shared defaults: the 24 h TTL and
+        // 4,096-entry cap the ticket names.
+        assert_eq!(super::RELAY_CACHE_TTL, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(super::RELAY_CACHE_CAP, 4_096);
     }
 
     #[tokio::test]
@@ -7858,5 +9354,18 @@ mod tui_relay_tests {
             3,
         )));
         assert!(take_pending_gain_save(&slow, 21_074_000, 3));
+    }
+}
+
+// Store before publishing shutdown, independently of who collects the task handle.
+pub(super) fn record_tui_failure(
+    failure: &std::sync::Mutex<Option<String>>,
+    result: &anyhow::Result<()>,
+) {
+    if let Err(error) = result {
+        failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| format!("{error:#}"));
     }
 }

@@ -544,6 +544,26 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// PAN-330 AC3: the QSO utility band wrapper delegates to the ADIF
+    /// format adapter over the one core band table (compatibility contract).
+    #[test]
+    fn band_vocabulary_table() {
+        for (hz, expected) in [
+            (5_357_500.0, "60M"),
+            (5_330_000.0, "60M"),
+            (5_405_000.0, "60M"), // old ADIF table fell back to 5MHZ here
+            (5_405_001.0, "5MHZ"),
+            (14_074_000.0, "20M"),
+            (144_174_000.0, "2M"),
+            (450_000_000.0, "70CM"),
+            (450_000_001.0, "450MHZ"),
+            (0.0, "0MHZ"),
+            (-1.0, "-0MHZ"),
+        ] {
+            assert_eq!(utils::frequency_to_band(hz), expected, "at {hz} Hz");
+        }
+    }
+
     #[tokio::test]
     async fn test_qso_system_creation() {
         let system = QsoSystem::new("W1ABC".to_string(), Some("FN42".to_string()))

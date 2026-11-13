@@ -14,6 +14,7 @@
 //!  - record completed/failed QSOs in the worked-station lookup, and
 //!  - report completed QSOs to cqdx.io via the bridge.
 
+use super::ActiveQsoFreq;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -4461,7 +4462,7 @@ impl super::ApplicationCoordinator {
                                     // primary hint keeps its byte-identical
                                     // derivation (partner_freq, else our own
                                     // TX frequency). The secondary hint
-                                    // (`decoder_hint_pair.1`) is the
+                                    // (`decoder_hint.secondary`) is the
                                     // still-in-grace vacated offset of an
                                     // unanswered `CallingCq` relocation — see
                                     // `secondary_decoder_hint_freq_for`.
@@ -4472,11 +4473,9 @@ impl super::ApplicationCoordinator {
                                     // re-check freshness on every READ
                                     // instead of trusting a value latched
                                     // once at this write.
-                                    #[allow(clippy::type_complexity)]
-                                    let decoder_hint_pair: Option<(
-                                        f64,
-                                        Option<(f64, chrono::DateTime<chrono::Utc>)>,
-                                    )> = if new_state.is_active() {
+                                    let decoder_hint: Option<ActiveQsoFreq> = if new_state
+                                        .is_active()
+                                    {
                                         // Fetch the QSO's current progress
                                         // once. This is a cheap read-lock
                                         // on the already-updated QSO map;
@@ -4498,14 +4497,17 @@ impl super::ApplicationCoordinator {
                                                 qso_freq_slot_ns.load(Ordering::Relaxed),
                                             )
                                         });
-                                        primary.map(|p| (p, secondary))
+                                        primary.map(|primary_hz| ActiveQsoFreq {
+                                            primary_hz,
+                                            secondary,
+                                        })
                                     } else {
                                         None
                                     };
                                     // Acquire the guard synchronously (no await
                                     // in this scope) and write.
                                     if let Ok(mut guard) = qso_freq_state.write() {
-                                        *guard = decoder_hint_pair;
+                                        *guard = decoder_hint;
                                     }
                                 }
 
@@ -5108,7 +5110,10 @@ impl super::ApplicationCoordinator {
                                             )
                                         });
                                         if let Ok(mut guard) = qso_freq_state.write() {
-                                            *guard = Some((hint_hz, secondary));
+                                            *guard = Some(ActiveQsoFreq {
+                                                primary_hz: hint_hz,
+                                                secondary,
+                                            });
                                         }
                                     }
                                 }
@@ -11254,6 +11259,7 @@ fn lotw_result_state<E: std::fmt::Display>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keep upload configuration, event stream and shared lifecycle state explicit at subscriber startup.
 fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
     lotw_cfg: pancetta_config::network::LotwUploadConfig,
@@ -14556,7 +14562,7 @@ mod respond_to_caller_admission_tests {
     //!    consumed), giving a false pass. `drain_all` below instead
     //!    collects EVERY message observed into one `Vec` regardless of
     //!    order, and both assertions inspect that same complete buffer.
-    use super::super::ApplicationCoordinator;
+    use super::super::{ActiveQsoFreq, ApplicationCoordinator};
     use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage};
     use pancetta_config::Config;
     use pancetta_core::slot::SlotParity;
@@ -16510,7 +16516,10 @@ mod respond_to_caller_admission_tests {
         }
         assert_eq!(
             *coordinator.active_qso_freq_hz.read().unwrap(),
-            Some((CQ_HZ, None)),
+            Some(ActiveQsoFreq {
+                primary_hz: CQ_HZ,
+                secondary: None
+            }),
             "precondition: the decoder is centred on the original CQ offset, \
              with no secondary hint before any relocation has happened"
         );
@@ -16536,7 +16545,7 @@ mod respond_to_caller_admission_tests {
                 .active_qso_freq_hz
                 .read()
                 .unwrap()
-                .is_some_and(|(primary, _)| primary == NEW_HZ)
+                .is_some_and(|hint| hint.primary_hz == NEW_HZ)
             {
                 break;
             }
@@ -16562,7 +16571,10 @@ mod respond_to_caller_admission_tests {
         // value) alongside the frequency — destructure rather than a plain
         // tuple `assert_eq!`.
         match *coordinator.active_qso_freq_hz.read().unwrap() {
-            Some((primary, Some((secondary_hz, expires_at)))) => {
+            Some(ActiveQsoFreq {
+                primary_hz: primary,
+                secondary: Some((secondary_hz, expires_at)),
+            }) => {
                 assert_eq!(primary, NEW_HZ, "primary must be the new offset");
                 assert_eq!(
                     secondary_hz, CQ_HZ,
@@ -16675,7 +16687,10 @@ mod respond_to_caller_admission_tests {
         for _ in 0..30 {
             assert_eq!(
                 *coordinator.active_qso_freq_hz.read().unwrap(),
-                Some((DX_HZ, None)),
+                Some(ActiveQsoFreq {
+                    primary_hz: DX_HZ,
+                    secondary: None
+                }),
                 "the decoder must stay on the DX's transmit offset after OUR \
                  side moves — the switch is TX-only; an established QSO's \
                  stable partner_freq hint never gains a PAN-72 round-8 \
@@ -20242,5 +20257,71 @@ mod completed_tx_purge_tests {
         let snap = registry.lock().unwrap().snapshot();
         let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
         assert_eq!(entry.state(UploadTarget::Lotw), Some(UploadState::Failed));
+    }
+}
+
+/// Integration adapter over the same outcome handlers used by the QSO task.
+#[cfg(feature = "test-harness")]
+#[derive(Default)]
+pub(super) struct HarnessOutcomes {
+    completions: RecentManualCompletions,
+}
+
+#[cfg(feature = "test-harness")]
+impl HarnessOutcomes {
+    pub(super) async fn apply(
+        &self,
+        manager: &pancetta_qso::QsoManager,
+        outcome: &crate::message_bus::QsoMessage,
+    ) {
+        use crate::message_bus::QsoMessage;
+        match outcome {
+            QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced,
+                attempt_id,
+            } => {
+                handle_tx_frame_not_sent(
+                    manager,
+                    &self.completions,
+                    qso_id,
+                    message_text,
+                    replaced.as_ref(),
+                    *attempt_id,
+                )
+                .await
+            }
+            QsoMessage::TxFrameSent {
+                qso_id,
+                message_text,
+                aired,
+                aired_at,
+                attempt_id,
+            } => {
+                handle_tx_frame_sent(
+                    manager,
+                    &self.completions,
+                    qso_id,
+                    message_text,
+                    aired,
+                    *aired_at,
+                    *attempt_id,
+                )
+                .await
+            }
+            QsoMessage::TxFrameScheduled {
+                qso_id,
+                attempt_id,
+                target_slot,
+            } => {
+                if let Ok(id) = qso_id.parse() {
+                    manager
+                        .record_scheduled_tx_slot(id, *attempt_id, *target_slot)
+                        .await;
+                }
+            }
+            _ => {}
+        }
     }
 }

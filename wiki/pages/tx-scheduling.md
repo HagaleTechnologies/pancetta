@@ -179,3 +179,24 @@ target slot (Step 6), set `station.ptt_lead_ms = 2000`. With the default 80 ms
 lead that window is an 80 ms race. Send the frame 4 to 10 s into a slot, so it
 targets the next slot and waits the full lead, and act on the first
 `SetPtt(true)`. `pancetta/src/coordinator/tx/abort_transcripts.rs` does this.
+
+## Replaying playback and stall tests
+
+PAN-325 gives `QsoManager` and the TX worker an injected UTC source, with
+`Utc::now` as the production default. The pan72 stall tests create every manager
+at the same even-slot origin. The pan71 playback tests derive UTC from paused
+Tokio time and use current-thread runtimes. Advance Tokio time to choose a slot;
+changing a test timestamp alone does not move the worker's clock. The arm clock
+remains separate because it models remote authorization, not slot scheduling.
+`scripts/pan325_load_loop.sh` repeats both groups while a build runs in a separate
+target directory, so Cargo's target lock cannot serialize away the load.
+
+## Real-worker integration tests
+
+CoordSim lives in `pancetta/tests/common/mod.rs` and drives the production TX
+worker through the disabled-by-default `test-harness` feature. Run
+`cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration`;
+the default workspace test command skips these targets. These tests use real
+UTC slot scheduling and FT8 playback durations. The injected arm clock controls
+authorization time only. See `pancetta/tests/common/README.md` for shutdown
+ownership and the supersede missing-unkey mutation check.

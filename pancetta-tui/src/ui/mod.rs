@@ -412,8 +412,10 @@ fn compute_hunt_rects(content_area: Rect, has_qrz_info: bool) -> HuntRects {
     let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
 
     let mut constraints = vec![
-        Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-        Constraint::Length(7),      // TX Placement (full width)
+        Constraint::Length(1), // Active-QSOs banner (full width, 1 row)
+        // Reserve a DX data row at the 132x24 resize target. The placement
+        // panel can compress before the station chooser loses its only row.
+        Constraint::Length(content_area.height.saturating_sub(13).min(7)),
         Constraint::Percentage(45), // DX Hunter (full width)
     ];
     if show_card {
@@ -624,6 +626,7 @@ fn panel_row_offset(panel: ActivePanel) -> u16 {
 /// Pure geometry — computed from the SAME `view_rects` the renderer's
 /// `layout_*` functions draw from, so a click always lands on the panel
 /// boundary the operator actually sees on screen.
+#[allow(clippy::too_many_arguments)] // Mirror `view_rects`' geometry inputs plus the focused-station card flag (PAN-343); hit-test and layout must stay in lockstep.
 pub fn hit_test(
     view: crate::view::ActiveView,
     zoomed: bool,

@@ -1,1055 +1,16 @@
-//! Coordinator-level QSO simulation harness — mock-rig PTT, stale-TX,
-//! multi-stream, TX-policy.
-//!
-//! # What this is
-//!
-//! A durable, reusable fixture ([`CoordSim`]) that stands up the *coordinator
-//! layer* of pancetta's transmit path against the **mock rig** (no rigctld, no
-//! physical radio) and lets a scenario:
-//!
-//! - Start / advance QSOs through the **real** [`QsoManager`] (the same entry
-//!   points the coordinator uses: `respond_to_cq_with`, `respond_to_caller`,
-//!   `start_cq`, `cancel_qso`, `process_message`).
-//! - Pump the **real** coordinator active-set populater logic
-//!   ([`CoordSim::pump_qso_events`]), which mirrors
-//!   `coordinator/qso.rs`: insert a `qso_id` into `active_tx_qsos` on a
-//!   `StateChanged` into an active state (and into `Completed`); remove it on
-//!   `StateChanged → Failed` / `QsoFailed`; forward each `MessageToSend` to the
-//!   TX worker as a `TransmitRequest`.
-//! - **Drive transmit slots deterministically** and **assert at the rig level**:
-//!   did PTT key (`mock.get_ptt() == On`) for each scheduled QSO transmit? at
-//!   what audio offset? was PTT released after?
-//!
-//! It complements the engine-level harness in `pancetta-qso/src/sim.rs` (which
-//! exercises the QSO *state machine* over a virtual band). This one exercises
-//! the *coordinator's* TX scheduler gate + mock-rig PTT + multi-stream path —
-//! the layer between the state machine and the radio.
-//!
-//! # How determinism / keying is handled (READ THIS)
-//!
-//! The production TX worker (`coordinator/tx.rs`) sleeps in real wall-clock time
-//! until the next UTC FT8 slot boundary (`schedule_tx` + `interruptible_sleep`),
-//! then keys PTT, ships audio, sleeps the ~12.6s burst, and unkeys. A test that
-//! waited on real slot alignment would be slow and flaky.
-//!
-//! So — exactly as `tests/tx_ptt_integration.rs` does — this harness **replicates
-//! the worker's keying *decision chain* faithfully but compresses the timing**:
-//!
-//!   1. **Step 0 — TX-policy hard mute.** If the shared `tx_policy` atomic reads
-//!      `Disabled`, the request is consumed, a failed `TransmitComplete` is the
-//!      logical outcome, and **no PTT is keyed**. (Same gate the worker applies
-//!      to `TransmitRequest` / `MultiTransmitRequest` / `TuneRequest`.)
-//!   2. **Coalesce.** A backlog of `TransmitRequest`s is collapsed with the
-//!      **real production** [`coalesce_transmit_requests`] (re-exported from the
-//!      coordinator for this harness): newest-per-`qso_id` wins, terminal-QSO
-//!      requests are dropped, `qso_id == None` (manual) sends are preserved.
-//!   3. **Step 4b — drop-stale-TX gate.** Each surviving item is checked with the
-//!      **real production** [`tx_qso_is_live`] against the **real** shared
-//!      `active_tx_qsos` set. An item whose `qso_id` is no longer live is dropped
-//!      *before keying* — no PTT.
-//!   4. **Step 5/7/9 — key / audio / unkey.** For each surviving item we send
-//!      `RigControl(SetPtt{true})` over the **real** [`MessageBus`] to the
-//!      **real** [`MockRig`] consumer (mirror of `coordinator/hamlib.rs`), record
-//!      the keyed offset, sleep a *small bounded* interval (tens of ms, NOT a
-//!      slot) so the consumer observes the ON edge, then `SetPtt{false}`.
-//!
-//! No `schedule_tx` UTC math, no slot sleep — *which slot* a transmit lands in
-//! is `schedule_tx`'s job and is unit-tested exhaustively in `tx.rs`'s
-//! `schedule_tx_tests`. This harness asserts the orthogonal contract: *given the
-//! decision to transmit, does PTT key at the right offset for live QSOs and stay
-//! silent for dead ones / disabled policy*. Time is therefore bounded by a few
-//! `await`s of a few ms each; pass/fail never depends on wall-clock slot phase.
-
+//! Scenarios exercising the real coordinator TX worker.
 #![allow(clippy::expect_used)]
-
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
-
+mod common;
+use common::*;
 use pancetta_config::OperatingMode;
-use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
-use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset, protocol_from_mode,
-    remote_tx_permitted_for, try_switch_operating_mode, tx_band_plan_mute_reason, tx_qso_is_live,
-    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, DecodeWindowConfig, ModeSwitchError,
-};
-use pancetta_lib::message_bus::{
-    ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
-};
-use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig, QsoMetadata, QsoState};
-
 use pancetta_core::slot::SlotParity;
 use pancetta_core::TxPolicy;
-
-/// How long the harness lets the mock-rig consumer observe a PTT edge. Bounded,
-/// not a slot — keeps the whole suite sub-second.
-const PTT_OBSERVE_MS: u64 = 30;
-
-// ---------------------------------------------------------------------------
-// Timeline (mirrors the style of pancetta-qso::sim::Timeline)
-// ---------------------------------------------------------------------------
-
-/// One PTT-keyed transmit the harness drove, as the mock rig observed it.
-#[derive(Debug, Clone)]
-pub struct KeyedTx {
-    /// Slot index (monotonic counter the scenario advances).
-    pub slot: u64,
-    /// FT8 message text that was keyed.
-    pub text: String,
-    /// Absolute audio offset (Hz) the request carried — the value the worker
-    /// would feed to `modulator.set_base_frequency`.
-    pub freq_hz: f64,
-    /// QSO id this transmit belonged to (`None` = manual / tune / free-text).
-    pub qso_id: Option<String>,
-    /// Did the mock rig actually report PTT `On` during this transmit?
-    pub ptt_keyed: bool,
-    /// Was PTT observed back `Off` after the transmit completed?
-    pub ptt_released: bool,
-}
-
-/// One request that was DROPPED before keying (policy mute or stale-TX gate),
-/// recorded so a scenario can assert "this did NOT key" with a readable reason.
-#[derive(Debug, Clone)]
-pub struct DroppedTx {
-    pub slot: u64,
-    pub text: String,
-    pub qso_id: Option<String>,
-    /// Why it was dropped.
-    pub reason: DropReason,
-}
-
-/// Why a request never keyed PTT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropReason {
-    /// Global TX policy was `Disabled` (hard mute).
-    PolicyDisabled,
-    /// The request's QSO was not in `active_tx_qsos` (superseded / cancelled /
-    /// completed-past-grace), so the Step 4b gate dropped it.
-    StaleQso,
-    /// The request was superseded a newer one for the same QSO during
-    /// backlog coalescing (older keep-call frame).
-    CoalescedAway,
-    /// A `TxOrigin::Remote` request that the station-agent arm gate did not
-    /// permit (unarmed / no local consent / expired / etc.) — fail-closed drop.
-    RemoteNotArmed,
-    /// PAN-118: the item's absolute TX RF (effective split-aware dial + audio
-    /// offset) fell outside the configured amateur band plan — refused before
-    /// PTT by the band-plan gate.
-    OutOfBandPlan,
-}
-
-/// Accumulated, readable record of everything a scenario drove. Mirrors the
-/// engine-level `sim::Timeline` so the two harnesses feel consistent.
-#[derive(Debug, Default)]
-pub struct Timeline {
-    /// Every transmit that reached the keying chain and keyed PTT, in order.
-    pub keyed: Vec<KeyedTx>,
-    /// Every request dropped before keying (policy / stale / coalesced).
-    pub dropped: Vec<DroppedTx>,
-    /// Highest slot index reached.
-    pub last_slot: u64,
-}
-
-impl Timeline {
-    /// Every keyed transmit belonging to `qso_id`.
-    pub fn keyed_for_qso(&self, qso_id: &str) -> Vec<&KeyedTx> {
-        let key = active_tx_qso_key(qso_id);
-        self.keyed
-            .iter()
-            .filter(|k| k.qso_id.as_deref().map(active_tx_qso_key) == Some(key.clone()))
-            .collect()
-    }
-
-    /// Did any transmit for `qso_id` key PTT?
-    pub fn keyed_any_for_qso(&self, qso_id: &str) -> bool {
-        self.keyed_for_qso(qso_id).iter().any(|k| k.ptt_keyed)
-    }
-
-    /// Did we key PTT for ANY transmit at all?
-    pub fn keyed_anything(&self) -> bool {
-        self.keyed.iter().any(|k| k.ptt_keyed)
-    }
-
-    /// The distinct audio offsets we keyed in `slot`.
-    pub fn offsets_in_slot(&self, slot: u64) -> Vec<f64> {
-        self.keyed
-            .iter()
-            .filter(|k| k.slot == slot && k.ptt_keyed)
-            .map(|k| k.freq_hz)
-            .collect()
-    }
-
-    // --- Assertion helpers (panic with a readable timeline on failure) ---
-
-    /// Assert PTT keyed at least once for `qso_id`.
-    pub fn assert_keyed_for_qso(&self, qso_id: &str) {
-        assert!(
-            self.keyed_any_for_qso(qso_id),
-            "expected PTT to key for QSO {qso_id}, but it never did.\n{self}"
-        );
-    }
-
-    /// Assert PTT NEVER keyed for `qso_id`.
-    pub fn assert_not_keyed_for_qso(&self, qso_id: &str) {
-        assert!(
-            !self.keyed_any_for_qso(qso_id),
-            "expected PTT to NEVER key for QSO {qso_id}, but it did.\n{self}"
-        );
-    }
-
-    /// Assert NOTHING keyed PTT across the whole run (TX-disabled scenario).
-    pub fn assert_silent(&self) {
-        assert!(
-            !self.keyed_anything(),
-            "expected the rig to stay silent, but PTT keyed.\n{self}"
-        );
-    }
-
-    /// Assert a transmit for `qso_id` keyed at exactly `expected` Hz (within
-    /// 0.001 Hz — the offset is carried verbatim, no scheduling shift).
-    pub fn assert_keyed_at_offset(&self, qso_id: &str, expected: f64) {
-        let keyed = self.keyed_for_qso(qso_id);
-        let found = keyed
-            .iter()
-            .any(|k| k.ptt_keyed && (k.freq_hz - expected).abs() < 0.001);
-        assert!(
-            found,
-            "expected QSO {qso_id} to key at {expected} Hz, but offsets were {:?}.\n{self}",
-            keyed.iter().map(|k| k.freq_hz).collect::<Vec<_>>()
-        );
-    }
-
-    /// Assert PTT was released (observed back Off) after every keyed transmit.
-    pub fn assert_all_released(&self) {
-        for k in &self.keyed {
-            if k.ptt_keyed {
-                assert!(
-                    k.ptt_released,
-                    "PTT keyed for '{}' (qso {:?}) but was never released.\n{self}",
-                    k.text, k.qso_id
-                );
-            }
-        }
-    }
-
-    /// Assert exactly `n` distinct offsets keyed in `slot` (multi-stream count).
-    pub fn assert_distinct_offsets_in_slot(&self, slot: u64, n: usize) {
-        let mut offs = self.offsets_in_slot(slot);
-        offs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        offs.dedup();
-        assert_eq!(
-            offs.len(),
-            n,
-            "expected {n} distinct keyed offset(s) in slot {slot}, saw {:?}.\n{self}",
-            offs
-        );
-    }
-}
-
-impl std::fmt::Display for Timeline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "=== Coord TX Timeline (slots 0..={}) ===",
-            self.last_slot
-        )?;
-        writeln!(
-            f,
-            "{:>4} | {:<6} | {:<22} | {:>7} | {:<10} | qso",
-            "slot", "PTT", "text", "freq", "released?"
-        )?;
-        for k in &self.keyed {
-            writeln!(
-                f,
-                "{:>4} | {:<6} | {:<22} | {:>7.0} | {:<10} | {}",
-                k.slot,
-                if k.ptt_keyed { "ON" } else { "(none)" },
-                truncate(&k.text, 22),
-                k.freq_hz,
-                if k.ptt_released { "released" } else { "STUCK" },
-                k.qso_id.as_deref().unwrap_or("-"),
-            )?;
-        }
-        for d in &self.dropped {
-            writeln!(
-                f,
-                "{:>4} | DROP   | {:<22} | {:>7} | {:<10} | {} ({:?})",
-                d.slot,
-                truncate(&d.text, 22),
-                "-",
-                "-",
-                d.qso_id.as_deref().unwrap_or("-"),
-                d.reason,
-            )?;
-        }
-        Ok(())
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n.saturating_sub(1)])
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CoordSim fixture
-// ---------------------------------------------------------------------------
-
-/// Coordinator-level QSO simulation fixture.
-///
-/// Owns: a real [`MessageBus`], a real [`QsoManager`] + its event receiver, a
-/// real [`MockRig`] behind a hamlib consumer, the shared `active_tx_qsos` set,
-/// and the shared `tx_policy` atomic — i.e. everything the coordinator's TX
-/// gate consults. See the module docs for the determinism model.
-pub struct CoordSim {
-    /// The real message bus all components share.
-    pub bus: MessageBus,
-    /// The real QSO state machine.
-    pub manager: QsoManager,
-    /// Our event receiver (drained by [`CoordSim::pump_qso_events`]).
-    qso_rx: tokio::sync::broadcast::Receiver<QsoEvent>,
-    /// The mock rig the hamlib consumer drives.
-    rig: Arc<MockRig>,
-    /// Shared TX-active set (drop-stale-TX gate), exactly as the coordinator
-    /// holds it.
-    pub active_tx_qsos: Arc<RwLock<HashSet<String>>>,
-    /// FQ-F3: shared qso_id -> TX offset (Hz) map, exactly as the
-    /// coordinator's `active_tx_offsets` field. Populated/depopulated at the
-    /// SAME points as `active_tx_qsos` above (see `apply_event`/`expire_qso`)
-    /// so the autonomous frequency allocator's own-frequency registry can be
-    /// synced from a real, event-driven snapshot in tests.
-    pub active_tx_offsets: Arc<RwLock<HashMap<String, f64>>>,
-    /// Shared tri-state TX policy atomic, exactly as the coordinator holds it.
-    pub tx_policy: Arc<AtomicU8>,
-    /// Shared decode window (budget + FT8 decoder config, PAN-164),
-    /// exactly as the coordinator holds it — `try_switch_operating_mode`
-    /// switches its protocol here and never changes its budget.
-    pub decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
-    /// Active-mode atomic, exactly as the coordinator holds it.
-    pub active_protocol_mode: Arc<AtomicU8>,
-    /// Active slot-length atomic (ns), exactly as the coordinator holds it.
-    pub active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
-    /// Active decode-phase atomic (ns), exactly as the coordinator holds it.
-    pub active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
-    /// PAN-157: current decode-effort preset atomic, exactly as the
-    /// coordinator holds it — `try_switch_operating_mode` reads it to
-    /// re-evaluate the Max-preset multipass override under the new
-    /// protocol.
-    pub current_decode_effort: Arc<std::sync::atomic::AtomicU8>,
-    /// PAN-157: resolved hardware-tier atomic, exactly as the
-    /// coordinator holds it.
-    pub resolved_hardware_tier: Arc<std::sync::atomic::AtomicU8>,
-    /// Shutdown flag for the spawned hamlib consumer.
-    shutdown: Arc<AtomicBool>,
-    /// Our callsign (for building expected message text).
-    pub our_callsign: String,
-    /// Accumulated timeline.
-    pub timeline: Timeline,
-    /// Monotonic slot counter the scenario advances.
-    slot: u64,
-    /// RX dial frequency shared into QsoManager (0 = unknown).
-    pub dial_frequency_hz: Arc<AtomicU64>,
-    /// Split TX dial frequency shared into QsoManager (0 = simplex).
-    pub split_tx_frequency_hz: Arc<AtomicU64>,
-    /// Completed-QSO metadata collected by `pump_qso_events` from
-    /// `QsoEvent::QsoCompleted`. Keyed by `qso_id.to_string()`.
-    pub completed: Vec<QsoMetadata>,
-    /// PAN-280: frames a post-key pump picked up, returned by the next
-    /// [`CoordSim::pump_qso_events`].
-    deferred_pending: Vec<PendingTx>,
-    /// Station-agent remote-TX arm gate, exactly as the coordinator holds it.
-    /// `drive_slot` consults it (via the real `remote_tx_permitted`) for any
-    /// `TxOrigin::Remote` pending item before keying PTT. Fresh = unarmed = deny.
-    pub remote_tx_arm: Arc<Mutex<pancetta_agent::arm::ArmState>>,
-    /// PAN-118: the configured amateur band plan, exactly as the TX worker
-    /// snapshots at startup. `drive_slot` consults it (via the REAL
-    /// `tx_rf_for_gate` / `tx_band_plan_mute_reason` gate) before keying PTT:
-    /// an item whose absolute TX RF (effective split-aware dial + audio
-    /// offset) falls outside the plan is dropped, never keyed.
-    pub band_plan: pancetta_config::BandPlanConfig,
-}
-
-impl CoordSim {
-    /// Build a fixture with the given station callsign. Spawns the mock-rig
-    /// hamlib consumer.
-    pub async fn new(our_callsign: &str) -> Self {
-        let bus = MessageBus::new(512).expect("bus");
-        let config = QsoManagerConfig {
-            our_callsign: our_callsign.to_string(),
-            our_grid: Some("EM10".to_string()),
-            ..Default::default()
-        };
-        let mut manager = QsoManager::new(config);
-        let qso_rx = manager.subscribe();
-
-        // Wire shared dial-frequency atomics so completed-QSO RF stamps work.
-        let dial_frequency_hz = Arc::new(AtomicU64::new(0));
-        let split_tx_frequency_hz = Arc::new(AtomicU64::new(0));
-        manager.set_dial_frequency_source(Arc::clone(&dial_frequency_hz));
-        manager.set_split_tx_frequency_source(Arc::clone(&split_tx_frequency_hz));
-
-        // PAN-72 (PR #350 round-7 re-review): wire the SHARED active-slot-length
-        // atomic exactly as `start_qso_component` does, so a scenario that runs
-        // `try_switch_operating_mode` sees the manager's rearm/stall cadence
-        // follow the switch (the real coupling, not a config-string copy).
-        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
-        manager.set_active_slot_ns_source(Arc::clone(&active_slot_ns));
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let rig = spawn_hamlib_consumer(&bus, shutdown.clone()).await;
-
-        Self {
-            bus,
-            manager,
-            qso_rx,
-            rig,
-            active_tx_qsos: Arc::new(RwLock::new(HashSet::new())),
-            active_tx_offsets: Arc::new(RwLock::new(HashMap::new())),
-            tx_policy: Arc::new(AtomicU8::new(TxPolicy::Full.as_u8())),
-            decode_window: Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
-                pancetta_ft8::Ft8Config::default(),
-                0,
-            ))),
-            active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
-            active_slot_ns,
-            active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000)),
-            current_decode_effort: Arc::new(std::sync::atomic::AtomicU8::new(
-                pancetta_config::DecodeEffort::Standard.as_u8(),
-            )),
-            resolved_hardware_tier: Arc::new(std::sync::atomic::AtomicU8::new(
-                pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
-            )),
-            shutdown,
-            our_callsign: our_callsign.to_string(),
-            timeline: Timeline::default(),
-            slot: 0,
-            dial_frequency_hz,
-            split_tx_frequency_hz,
-            completed: Vec::new(),
-            deferred_pending: Vec::new(),
-            // Fresh (unarmed) arm — remote TX is denied until a scenario arms it.
-            remote_tx_arm: Arc::new(Mutex::new(pancetta_agent::arm::ArmState::new())),
-            // PAN-118: default band plan (region 2, edge warnings on) — what
-            // `Config::default()` gives the real worker.
-            band_plan: pancetta_config::BandPlanConfig::default(),
-        }
-    }
-
-    /// Set the RX dial frequency (Hz) — mirrors the hamlib poll loop updating
-    /// the coordinator's `operating_frequency_hz` atomic.
-    pub fn set_rx_dial(&self, hz: u64) {
-        self.dial_frequency_hz.store(hz, Ordering::Relaxed);
-    }
-
-    /// Set the split TX dial frequency (Hz). Zero = simplex (RX dial is used).
-    /// Mirrors the coordinator setting `split_tx_frequency_hz` on band change /
-    /// split toggle.
-    pub fn set_split_tx(&self, hz: u64) {
-        self.split_tx_frequency_hz.store(hz, Ordering::Relaxed);
-    }
-
-    /// Set the global TX policy (mirrors the operator's `g` cycle / Shift+Q).
-    pub fn set_policy(&self, policy: TxPolicy) {
-        self.tx_policy.store(policy.as_u8(), Ordering::Release);
-    }
-
-    /// Fully arm the remote-TX gate for a scenario: verified TX-scope grant +
-    /// local consent + a fresh heartbeat, so `remote_tx_permitted` returns true.
-    /// (Simulates a future P3 arm; in production nothing constructs the grant.)
-    pub fn arm_remote_tx(&self) {
-        self.arm_remote_tx_as("sim-client-key-id");
-    }
-
-    /// Like [`Self::arm_remote_tx`], but arms with an explicit client keyId
-    /// (PAN-91: exercises the identity-bound gate, not just the boolean one).
-    pub fn arm_remote_tx_as(&self, client_key_id: &str) {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut st = self.remote_tx_arm.lock().expect("arm lock");
-        st.set_channel_consent(
-            pancetta_agent::arm::ConsentChannel::StationAgent,
-            true,
-            now_ms,
-        );
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
-        st.arm(
-            pancetta_agent::arm::VerifiedArmGrant {
-                operator_callsign: "K5ARH".to_string(),
-                ttl_ms: 120_000,
-                armed_until_ms: now_ms + 120_000,
-                capability_exp_ms: now_ms + 120_000 + 3_600_000,
-                tx_enabled_until_ms: now_ms + 120_000 + 3_600_000,
-                effective_ttl_ms: 120_000,
-                heartbeat_interval_sec: 10,
-                scope_tx: true,
-                jti: "sim-arm-jti".to_string(),
-                client_key_id: client_key_id.to_string(),
-            },
-            pancetta_agent::arm::ArmTime::now(),
-        );
-        st.heartbeat("sim-arm-jti", 1, pancetta_agent::arm::ArmTime::now());
-    }
-
-    /// Drain all currently-buffered `QsoEvent`s and apply the coordinator's
-    /// active-set populater logic, returning the ordered list of
-    /// `TransmitRequest`s the coordinator would have forwarded to the TX worker.
-    ///
-    /// This is a faithful mirror of `coordinator/qso.rs`'s event loop:
-    /// - `StateChanged → active`: insert qso_id into `active_tx_qsos`
-    /// - `StateChanged → Failed`: remove qso_id
-    /// - `StateChanged → Completed`: insert qso_id (grace window — we keep it
-    ///   live; the scenario controls removal; PAN-280)
-    /// - `QsoCompleted`: record the metadata (fires once the 73 aired)
-    /// - `QsoFailed`: remove qso_id
-    /// - `MessageToSend`: emit a `TransmitRequest` carrying the latched
-    ///   `tx_parity`
-    ///
-    /// Events are processed in order so the active-set insert is ordered ahead
-    /// of the `TransmitRequest` it enables — the exact ordering the
-    /// StateChanged-at-QSO-start fix guarantees.
-    pub fn pump_qso_events(&mut self) -> Vec<PendingTx> {
-        let mut pending = std::mem::take(&mut self.deferred_pending);
-        loop {
-            match self.qso_rx.try_recv() {
-                Ok(ev) => self.apply_event(ev, &mut pending),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-            }
-        }
-        pending
-    }
-
-    fn apply_event(&mut self, ev: QsoEvent, pending: &mut Vec<PendingTx>) {
-        match ev {
-            QsoEvent::StateChanged {
-                qso_id, new_state, ..
-            } => {
-                let key = active_tx_qso_key(&qso_id.to_string());
-                if new_state.is_active() {
-                    self.active_tx_qsos.write().unwrap().insert(key.clone());
-                    // FQ-F3 mirror: keep the offset map in sync alongside
-                    // active_tx_qsos, exactly as coordinator/qso.rs does.
-                    if let Some(freq) = new_state.frequency() {
-                        self.active_tx_offsets.write().unwrap().insert(key, freq);
-                    }
-                } else if let QsoState::Completed { frequency, .. } = &new_state {
-                    // PAN-280 mirror: grace window on entering `Completed`,
-                    // so the closing 73 still keys (the coordinator no longer
-                    // does this on `QsoCompleted`, which waits for the 73 to
-                    // air). The scenario removes it explicitly via
-                    // `expire_qso` when it wants to model grace elapsing.
-                    self.active_tx_qsos.write().unwrap().insert(key.clone());
-                    self.active_tx_offsets
-                        .write()
-                        .unwrap()
-                        .insert(key, *frequency);
-                } else if matches!(new_state, QsoState::Failed { .. }) {
-                    self.active_tx_qsos.write().unwrap().remove(&key);
-                    self.active_tx_offsets.write().unwrap().remove(&key);
-                }
-            }
-            QsoEvent::QsoCompleted { metadata, .. } => {
-                // Capture the completed metadata so scenarios can assert on the
-                // stamped RF frequency (dial + audio offset).
-                self.completed.push(metadata);
-            }
-            QsoEvent::QsoFailed { qso_id, .. } => {
-                let key = active_tx_qso_key(&qso_id.to_string());
-                self.active_tx_qsos.write().unwrap().remove(&key);
-                self.active_tx_offsets.write().unwrap().remove(&key);
-            }
-            QsoEvent::MessageToSend {
-                attempt_id,
-                qso_id,
-                message,
-                frequency,
-                tx_parity,
-                remote_origin,
-                remote_client_key_id,
-            } => {
-                // The coordinator renders the QsoMessage to FT8 text via
-                // pancetta_qso::utils::generate_ft8_message. We carry the raw
-                // message debug for the timeline; the keying decision doesn't
-                // depend on the rendered text, only on qso_id / freq / policy /
-                // active-set, so a stable label is sufficient and avoids
-                // re-deriving the (private-ish) text rules here.
-                //
-                // SECURITY (B1 mirror): derive the TransmitRequest origin from
-                // the QSO's `remote_origin` exactly as coordinator/qso.rs does,
-                // so a remote QSO's forwarded TX is `Remote` (arm-gated) and a
-                // local QSO's is `Local` (byte-identical).
-                let text = render_message(&message, &self.our_callsign);
-                pending.push(PendingTx {
-                    text,
-                    frequency_offset: frequency,
-                    qso_id: Some(qso_id.to_string()),
-                    tx_parity,
-                    origin: if remote_origin {
-                        pancetta_lib::message_bus::TxOrigin::Remote
-                    } else {
-                        pancetta_lib::message_bus::TxOrigin::Local
-                    },
-                    remote_client_key_id,
-                    attempt_id,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Remove a QSO from the active-TX set, modelling its post-completion grace
-    /// window elapsing (the coordinator's spawned 16s delayed purge) or an
-    /// explicit cancel that didn't surface as a `Failed` StateChanged.
-    pub fn expire_qso(&mut self, qso_id: &str) {
-        let key = active_tx_qso_key(qso_id);
-        self.active_tx_qsos.write().unwrap().remove(&key);
-        self.active_tx_offsets.write().unwrap().remove(&key);
-    }
-
-    /// Inject a manual (`qso_id == None`) free-text / tune-like transmit intent
-    /// directly into the next slot's pending list. Mirrors the operator typing
-    /// a free-text message or pressing tune.
-    pub fn manual_tx(&self, text: &str, freq_hz: f64) -> PendingTx {
-        PendingTx {
-            text: text.to_string(),
-            frequency_offset: freq_hz,
-            qso_id: None,
-            tx_parity: None,
-            origin: pancetta_lib::message_bus::TxOrigin::Local,
-            remote_client_key_id: None,
-            attempt_id: None,
-        }
-    }
-
-    /// Build a **remote-originated** manual TX request (for arm-gate scenarios).
-    /// `qso_id == None` so only the arm gate (not the drop-stale gate) governs.
-    pub fn remote_tx(&self, text: &str, freq_hz: f64) -> PendingTx {
-        PendingTx {
-            text: text.to_string(),
-            frequency_offset: freq_hz,
-            qso_id: None,
-            tx_parity: None,
-            origin: pancetta_lib::message_bus::TxOrigin::Remote,
-            remote_client_key_id: None,
-            attempt_id: None,
-        }
-    }
-
-    /// Like [`Self::remote_tx`], but bound to an explicit client keyId
-    /// (PAN-91: exercises the identity-bound gate).
-    pub fn remote_tx_as(&self, text: &str, freq_hz: f64, client_key_id: &str) -> PendingTx {
-        PendingTx {
-            remote_client_key_id: Some(client_key_id.to_string()),
-            attempt_id: None,
-            ..self.remote_tx(text, freq_hz)
-        }
-    }
-
-    /// Drive ONE transmit slot deterministically with the given pending
-    /// requests (as if they had all been enqueued to the TX worker's channel
-    /// before the worker woke). Applies the full keying-decision chain (policy
-    /// mute → coalesce → Step-4b gate → key/audio/unkey) and records the
-    /// outcome on the timeline. Returns the slot index driven.
-    ///
-    /// `pending` is ordered oldest-first, exactly like the FIFO crossbeam
-    /// channel the worker drains.
-    pub async fn drive_slot(&mut self, pending: Vec<PendingTx>) -> u64 {
-        let slot = self.slot;
-        self.slot += 1;
-        self.timeline.last_slot = slot;
-
-        // --- Step 0: TX-policy hard mute (Disabled) ---
-        // Policy primacy: Disabled drops EVERYTHING first, including Remote items
-        // with a live arm.
-        if current_policy(&self.tx_policy) == TxPolicy::Disabled {
-            for p in &pending {
-                self.timeline.dropped.push(DroppedTx {
-                    slot,
-                    text: p.text.clone(),
-                    qso_id: p.qso_id.clone(),
-                    reason: DropReason::PolicyDisabled,
-                });
-            }
-            return slot;
-        }
-
-        // --- Step 0a: Remote-TX arm gate ---
-        // Drop any `TxOrigin::Remote` pending item the station-agent arm gate
-        // does not permit (fail-closed), exactly as the TX worker does before
-        // keying PTT. `Local` items pass through untouched (byte-identical).
-        let pending: Vec<PendingTx> = pending
-            .into_iter()
-            .filter(|p| {
-                if p.origin == pancetta_lib::message_bus::TxOrigin::Remote
-                    && !remote_tx_permitted_for(
-                        &self.remote_tx_arm,
-                        pancetta_agent::arm::ArmTime::now,
-                        p.remote_client_key_id.as_deref(),
-                    )
-                {
-                    self.timeline.dropped.push(DroppedTx {
-                        slot,
-                        text: p.text.clone(),
-                        qso_id: p.qso_id.clone(),
-                        reason: DropReason::RemoteNotArmed,
-                    });
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        // --- Coalesce backlog with the REAL production coalescer ---
-        // Preserve each entry's origin so a folded bundle carries it (fail-safe).
-        let drained: Vec<CoalesceEntry> = pending
-            .iter()
-            .map(|p| CoalesceEntry {
-                attempt_id: p.attempt_id,
-                message_text: p.text.clone(),
-                frequency_offset: p.frequency_offset,
-                qso_id: p.qso_id.clone(),
-                tx_parity: p.tx_parity,
-                origin: p.origin,
-                remote_client_key_id: p.remote_client_key_id.clone(),
-            })
-            .collect();
-        let active = self.active_tx_qsos.clone();
-        // This harness doesn't model `max_concurrent_qsos` — pass an
-        // effectively-unbounded value so the only cap in play is the
-        // production hard backstop (`MAX_RETAINED_TX_STREAMS`), matching
-        // this simulator's pre-existing behavior.
-        let outcome =
-            coalesce_transmit_requests(drained, u32::MAX, |id| tx_qso_is_live_shared(id, &active));
-
-        // Record what coalescing / the gate removed, with a best-effort reason.
-        // (We can't tell apart "coalesced" vs "dropped_terminal" per-entry from
-        // the outcome counters, so we reconstruct per-entry below by replaying
-        // the same predicate + a newest-per-qso map.)
-        self.record_removed(slot, &pending, &outcome.retained);
-
-        // --- Step 4b + Step 5/7/9 for each surviving (live) item ---
-        for entry in &outcome.retained {
-            let live = tx_qso_is_live_shared(entry.qso_id.as_deref(), &self.active_tx_qsos);
-            if !live {
-                // Defensive: coalescer already drops terminal ids, but the
-                // worker re-checks at key time. Mirror that.
-                self.timeline.dropped.push(DroppedTx {
-                    slot,
-                    text: entry.message_text.clone(),
-                    qso_id: entry.qso_id.clone(),
-                    reason: DropReason::StaleQso,
-                });
-                continue;
-            }
-            // PAN-118: the REAL band-plan gate, exactly as the worker applies
-            // it before PTT — effective split-aware dial (skipped while the
-            // dial is the unknown-0 sentinel) + this item's audio offset.
-            if tx_rf_for_gate(
-                &self.dial_frequency_hz,
-                &self.split_tx_frequency_hz,
-                entry.frequency_offset,
-            )
-            .and_then(|rf| {
-                tx_band_plan_mute_reason(
-                    rf,
-                    tx_signal_span_hz(protocol_from_mode(OperatingMode::from_u8(
-                        self.active_protocol_mode.load(Ordering::Relaxed),
-                    ))),
-                    &self.band_plan,
-                )
-            })
-            .is_some()
-            {
-                self.timeline.dropped.push(DroppedTx {
-                    slot,
-                    text: entry.message_text.clone(),
-                    qso_id: entry.qso_id.clone(),
-                    reason: DropReason::OutOfBandPlan,
-                });
-                continue;
-            }
-            let (keyed, released) = self
-                .key_once(&entry.message_text, entry.frequency_offset)
-                .await;
-            self.timeline.keyed.push(KeyedTx {
-                slot,
-                text: entry.message_text.clone(),
-                freq_hz: entry.frequency_offset,
-                qso_id: entry.qso_id.clone(),
-                ptt_keyed: keyed,
-                ptt_released: released,
-            });
-            // PAN-280 mirror of the Qso task's `TxFrameSent` handling: a keyed
-            // frame aired, so a completion held on it logs now.
-            if keyed {
-                if let Some(id) = entry
-                    .qso_id
-                    .as_deref()
-                    .and_then(|id| id.parse::<pancetta_qso::QsoId>().ok())
-                {
-                    self.manager
-                        .confirm_completion_aired(
-                            id,
-                            entry.attempt_id,
-                            &entry.message_text,
-                            &pancetta_qso::UnsentAttemptPayload {
-                                frequency_hz: entry.frequency_offset,
-                                remote_binding: None,
-                            },
-                            chrono::Utc::now(),
-                        )
-                        .await;
-                }
-            }
-        }
-        // Record any `QsoCompleted` that produced; keep any other frame for
-        // the next pump.
-        let more = self.pump_qso_events();
-        self.deferred_pending = more;
-
-        slot
-    }
-
-    /// Reconstruct which pending entries were removed (coalesced vs stale) and
-    /// log them on the timeline, so a scenario can assert "the older frame did
-    /// NOT key".
-    fn record_removed(&mut self, slot: u64, pending: &[PendingTx], retained: &[CoalesceEntry]) {
-        use std::collections::HashMap;
-        // Map each pending entry to its fate.
-        let active = self.active_tx_qsos.clone();
-        // Last index per qso key (newest wins) — anything earlier was coalesced.
-        let mut last_idx: HashMap<String, usize> = HashMap::new();
-        for (i, p) in pending.iter().enumerate() {
-            if let Some(id) = &p.qso_id {
-                last_idx.insert(active_tx_qso_key(id), i);
-            }
-        }
-        let retained_texts: HashSet<String> =
-            retained.iter().map(|e| e.message_text.clone()).collect();
-        for (i, p) in pending.iter().enumerate() {
-            if retained_texts.contains(&p.text) {
-                continue; // survived
-            }
-            let reason = match &p.qso_id {
-                None => continue, // manual is never removed by coalescer
-                Some(id) => {
-                    if !tx_qso_is_live_shared(Some(id.as_str()), &active) {
-                        DropReason::StaleQso
-                    } else if last_idx.get(&active_tx_qso_key(id)) != Some(&i) {
-                        DropReason::CoalescedAway
-                    } else {
-                        continue;
-                    }
-                }
-            };
-            self.timeline.dropped.push(DroppedTx {
-                slot,
-                text: p.text.clone(),
-                qso_id: p.qso_id.clone(),
-                reason,
-            });
-        }
-    }
-
-    /// Send PTT-on → (audio) → PTT-off over the real bus to the real mock rig,
-    /// observing the ON edge and the OFF release. Returns `(keyed, released)`.
-    async fn key_once(&self, text: &str, freq_hz: f64) -> (bool, bool) {
-        // Step 5: assert PTT.
-        send_ptt(&self.bus, true).await;
-        // Race a poller for the ON edge concurrently with a small settle.
-        let keyed = wait_for_ptt(&self.rig, PttState::On, Duration::from_secs(2)).await;
-
-        // Step 7: route audio (best-effort; no audio consumer attached).
-        let _ = self
-            .bus
-            .send_message(ComponentMessage::new(
-                ComponentId::Ft8Transmitter,
-                ComponentId::Audio,
-                MessageType::AudioOutput {
-                    samples: vec![0.0f32; 16],
-                    sample_rate: 12_000,
-                    flush_first: false,
-                    playback_started: None,
-                },
-                Instant::now(),
-            ))
-            .await;
-        // Bounded settle so the ON edge is unambiguously observed.
-        tokio::time::sleep(Duration::from_millis(PTT_OBSERVE_MS)).await;
-
-        // Step 9: de-assert PTT.
-        send_ptt(&self.bus, false).await;
-        let released = wait_for_ptt(&self.rig, PttState::Off, Duration::from_secs(2)).await;
-        let _ = (text, freq_hz); // recorded by caller
-        (keyed, released)
-    }
-
-    /// Open an **autonomous** (Auto) QSO exactly as the coordinator's
-    /// `QsoMessage::StartAutonomousQso` handler does for a pounce (FQ-F4/TX-F6):
-    /// de-conflict the raw Tx=Rx candidate (the DX's own decoded frequency)
-    /// against our other active streams via `compute_manual_tx_offset`, then
-    /// `respond_to_cq_with` (= `CallInitiation::Auto`) at the de-conflicted
-    /// offset, setting `partner_freq` when it diverges from the DX's freq.
-    /// A byte-identical no-op when nothing collides. Returns the new QSO id.
-    pub async fn autonomous_pounce(
-        &self,
-        dx: &str,
-        dx_freq_hz: f64,
-        dx_parity: Option<SlotParity>,
-    ) -> String {
-        let active = self.manager.active_tx_offsets().await;
-        let (tx_off, partner) = compute_manual_tx_offset(dx_freq_hz, false, 0, &active);
-        self.manager
-            .respond_to_cq_with(
-                dx.to_string(),
-                tx_off,
-                dx_parity,
-                CallInitiation::Auto,
-                partner,
-                false,
-                None,
-            )
-            .await
-            .expect("autonomous respond_to_cq_with")
-            .to_string()
-    }
-
-    /// Feed a decoded DX frame into the QSO engine exactly as the coordinator's
-    /// decode loop does (`parse_ft8_message` → `process_message`). The resulting
-    /// auto-sequenced reply (if any) surfaces on the next `pump_qso_events`.
-    pub async fn inject_decode(&self, text: &str, freq_hz: f64) {
-        let msg = pancetta_qso::utils::parse_ft8_message(text, &self.our_callsign)
-            .unwrap_or_else(|e| panic!("parse_ft8_message('{text}'): {e}"));
-        self.manager
-            .process_message(msg, text.to_string(), freq_hz, Some(-12.0))
-            .await
-            .expect("process_message");
-    }
-
-    /// Tear down the consumer and take ownership of the accumulated timeline.
-    /// Optional — scenarios may also read `sim.timeline` directly; the
-    /// fixture's `Drop` flips the shutdown flag regardless.
-    pub fn finish(mut self) -> Timeline {
-        self.shutdown.store(true, Ordering::Release);
-        std::mem::take(&mut self.timeline)
-    }
-}
-
-impl Drop for CoordSim {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-    }
-}
-
-/// A coordinator-forwarded transmit request, pre-keying.
-#[derive(Debug, Clone)]
-pub struct PendingTx {
-    pub text: String,
-    pub frequency_offset: f64,
-    pub qso_id: Option<String>,
-    pub tx_parity: Option<SlotParity>,
-    /// Origin of this request. `Local` (default) skips the remote-TX arm gate;
-    /// `Remote` is gated by the coordinator's `ArmState` in `drive_slot`.
-    pub origin: pancetta_lib::message_bus::TxOrigin,
-    /// Client this request is bound to, iff `origin == Remote` (PAN-91).
-    pub remote_client_key_id: Option<String>,
-    /// The engine's attempt id for this frame (PAN-280), when it came from a
-    /// `MessageToSend`.
-    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn current_policy(p: &Arc<AtomicU8>) -> TxPolicy {
-    TxPolicy::from_u8(p.load(Ordering::Acquire))
-}
-
-/// Shared-set wrapper around the REAL `tx_qso_is_live` (fails open on a poisoned
-/// lock, exactly like the worker's helper).
-fn tx_qso_is_live_shared(qso_id: Option<&str>, active: &Arc<RwLock<HashSet<String>>>) -> bool {
-    match active.read() {
-        Ok(set) => tx_qso_is_live(qso_id, &set),
-        Err(_) => true,
-    }
-}
-
-/// Render a `QsoMessage` to a stable label for the timeline. The keying decision
-/// never depends on this text, so a debug label is sufficient (and avoids
-/// re-deriving the FT8 text-format rules, which live behind
-/// `pancetta_qso::utils::generate_ft8_message`).
-fn render_message(message: &pancetta_qso::MessageType, _our: &str) -> String {
-    format!("{message:?}")
-        .split_whitespace()
-        .next()
-        .unwrap_or("MSG")
-        .to_string()
-}
-
-/// Send a `RigControl(SetPtt)` over the bus, exactly as the TX worker does.
-async fn send_ptt(bus: &MessageBus, state: bool) {
-    let msg = ComponentMessage::new(
-        ComponentId::Ft8Transmitter,
-        ComponentId::Hamlib,
-        MessageType::RigControl(RigControlMessage::SetPtt { state }),
-        Instant::now(),
-    );
-    bus.send_message(msg).await.expect("send PTT");
-}
-
-/// Poll the mock rig until it reports `want` or the timeout elapses.
-async fn wait_for_ptt(rig: &MockRig, want: PttState, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(state) = rig.get_ptt(Vfo::Current).await {
-            if state == want {
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    false
-}
-
-/// Spawn a consumer on the `Hamlib` channel mirroring `coordinator/hamlib.rs`'s
-/// `SetPtt` handling, backed by a shared [`MockRig`].
-async fn spawn_hamlib_consumer(bus: &MessageBus, shutdown: Arc<AtomicBool>) -> Arc<MockRig> {
-    let (_tx, rx) = bus
-        .create_channel(ComponentId::Hamlib)
-        .await
-        .expect("create Hamlib channel");
-
-    let rig = Arc::new(MockRig::default());
-    rig.connect().await.expect("mock rig connect");
-
-    let rig_for_task = Arc::clone(&rig);
-    tokio::spawn(async move {
-        while !shutdown.load(Ordering::Acquire) {
-            match rx.try_recv() {
-                Ok(message) => {
-                    if let MessageType::RigControl(RigControlMessage::SetPtt { state }) =
-                        message.message_type
-                    {
-                        let ptt = if state { PttState::On } else { PttState::Off };
-                        let _ = rig_for_task.set_ptt(Vfo::Current, ptt).await;
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-    });
-
-    rig
-}
+use pancetta_lib::coordinator::{
+    active_tx_qso_key, compute_manual_tx_offset, try_switch_operating_mode, ModeSwitchError,
+};
+use pancetta_qso::{CallInitiation, QsoEvent, QsoState};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 // ===========================================================================
 // Permanent scenarios
@@ -1089,6 +50,7 @@ async fn ptt_keys_for_scheduled_qso() {
     // And it keyed at the requested offset.
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
+    sim.shutdown().await;
 }
 
 /// FQ-F3: `active_tx_offsets` (the own-frequency-registry source map) is
@@ -1147,6 +109,7 @@ async fn active_tx_offsets_populated_and_depopulated_with_active_tx_qsos() {
     );
 
     sim.drive_slot(pending).await;
+    sim.shutdown().await;
 }
 
 /// Stale-TX drop: a superseded / cancelled / completed-past-grace QSO's queued
@@ -1186,10 +149,11 @@ async fn stale_tx_dropped_after_supersede_no_ptt() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::StaleQso),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "expected a StaleQso drop.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// TX backpressure / coalescing: a backlog of keep-call frames for the SAME
@@ -1217,31 +181,31 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
     // Simulate three keep-call frames backed up for the same QSO (oldest first).
     let backlog = vec![
         PendingTx {
-            text: "KEEPCALL-OLD-1".to_string(),
+            text: "CQ K5ARH EM10".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
-            attempt_id: None,
+            attempt_id: Some(pancetta_qso::TxAttemptId(10001)),
         },
         PendingTx {
-            text: "KEEPCALL-OLD-2".to_string(),
+            text: "CQ K5ARH EM11".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
-            attempt_id: None,
+            attempt_id: Some(pancetta_qso::TxAttemptId(10002)),
         },
         PendingTx {
-            text: "KEEPCALL-NEWEST".to_string(),
+            text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
-            attempt_id: None,
+            attempt_id: Some(pancetta_qso::TxAttemptId(10003)),
         },
     ];
 
@@ -1256,7 +220,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
         keyed.len(),
         sim.timeline
     );
-    assert_eq!(keyed[0].text, "KEEPCALL-NEWEST");
+    assert_eq!(keyed[0].text, "CQ K5ARH EM12");
     assert!(keyed[0].ptt_keyed);
 
     // The two older frames were coalesced away (not keyed).
@@ -1264,13 +228,14 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
         .timeline
         .dropped
         .iter()
-        .filter(|d| d.reason == DropReason::CoalescedAway)
+        .filter(|d| d.reason == DropReason::WorkerRefused)
         .count();
     assert_eq!(
         coalesced, 2,
         "expected 2 coalesced-away frames.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// Multi-stream: two concurrent live QSOs on different offsets each key + key
@@ -1322,6 +287,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
     // Two distinct offsets keyed in the one slot.
     sim.timeline.assert_distinct_offsets_in_slot(slot, 2);
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// TX policy — Disabled: no PTT keys at all, for any source.
@@ -1356,10 +322,11 @@ async fn tx_policy_disabled_is_silent() {
         sim.timeline
             .dropped
             .iter()
-            .all(|d| d.reason == DropReason::PolicyDisabled),
+            .all(|d| d.reason == DropReason::WorkerRefused),
         "every drop under Disabled should be PolicyDisabled.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// TX policy — RespondOnly: an in-progress QSO's transmit still keys (it's not
@@ -1414,6 +381,7 @@ async fn tx_policy_respond_only_keeps_qso_drops_initiation() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// TX policy — Full: both in-progress QSO TX and a new initiation key.
@@ -1456,6 +424,7 @@ async fn tx_policy_full_keys_everything() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// Frequency fidelity: the offset requested for a QSO is the offset actually
@@ -1497,6 +466,7 @@ async fn requested_offset_is_used() {
 
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), chosen_offset);
+    sim.shutdown().await;
 }
 
 /// Manual / tune (qso_id == None) is never gated by the active-set: it keys even
@@ -1514,6 +484,7 @@ async fn manual_send_never_gated_keys_with_empty_active_set() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -1551,14 +522,12 @@ async fn autonomous_pounce_completes_end_to_end_with_ptt() {
     sim.drive_slot(pending).await;
 
     // The full responder ladder was keyed, in order, all at the DX's freq
-    // (Tx=Rx), all released. (The harness records the MessageType variant as the
-    // keyed `text`: CqResponse = our grid, ReportAck = our R-report,
-    // SeventyThree = our 73 close.)
+    // (Tx=Rx), all released. The timeline carries actual encoded FT8 text.
     let keyed: Vec<_> = sim.timeline.keyed_for_qso(&qso_id);
     let ladder: Vec<&str> = keyed.iter().map(|k| k.text.as_str()).collect();
     assert_eq!(
         ladder,
-        vec!["CqResponse", "ReportAck", "SeventyThree"],
+        vec!["VB7F K5ARH EM10", "VB7F K5ARH R-12", "VB7F K5ARH 73"],
         "expected the full grid → R-report → 73 ladder keyed in order.\n{}",
         sim.timeline
     );
@@ -1570,6 +539,7 @@ async fn autonomous_pounce_completes_end_to_end_with_ptt() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// No double-send: the opening goes out exactly ONCE. (In production the
@@ -1599,6 +569,7 @@ async fn autonomous_pounce_opening_keys_exactly_once() {
         sim.timeline
     );
     assert_eq!(keyed_this_slot[0].qso_id.as_deref(), Some(qso_id.as_str()));
+    sim.shutdown().await;
 }
 
 /// FQ-F4/TX-F6: the autonomous pounce path must de-conflict its raw Tx=Rx
@@ -1668,6 +639,7 @@ async fn autonomous_pounce_deconflicts_against_active_stream() {
 
     sim.timeline.assert_distinct_offsets_in_slot(slot, 2);
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// Under TX policy Disabled, an autonomous QSO's transmit is hard-muted at the
@@ -1689,10 +661,11 @@ async fn autonomous_qso_tx_hard_muted_when_policy_disabled() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::PolicyDisabled),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "expected a PolicyDisabled drop for the autonomous QSO.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -1766,6 +739,7 @@ async fn split_active_qso_logs_tx_dial() {
          split TX dial was not used.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -1791,6 +765,7 @@ async fn out_of_band_dial_never_keys() {
 
     sim.timeline.assert_not_keyed_for_qso(&qso_id);
     sim.timeline.assert_silent();
+    sim.shutdown().await;
 }
 
 /// Control: the same autonomous QSO on a normal in-band 20m dial keys
@@ -1807,6 +782,7 @@ async fn in_band_dial_control_keys() {
     sim.drive_slot(pending).await;
 
     sim.timeline.assert_keyed_for_qso(&qso_id);
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -1917,6 +893,7 @@ async fn hound_engage_keys_high_then_answers_at_fox_offset_on_report() {
     );
 
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -2038,6 +1015,7 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
     );
 
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// PAN-12 / issue #245: a manual QSO whose TX was ceiling-clamped recovers
@@ -2074,15 +1052,12 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
     // "something was emitted" — the old `!pending.is_empty()` check was
     // satisfiable by a keep-calling repeat of the opening `CqResponse`
     // and never proved the confirmed relatch actually advanced the QSO.
+    // The R-report number is OUR observed SNR of the DX (the fixture's
+    // inject_decode supplies -12.0), not the -11 the DX reported of us in
+    // its message text — see MessageExchange::generate_response
+    // (exchange.rs), which computes the reply report from the decode SNR.
     assert!(
-        // NOTE: `render_message` (this harness's stand-in for the coordinator's
-        // real FT8-text renderer) only carries the `MessageType` variant name
-        // through `PendingTx.text` (see its doc comment), not the actual
-        // "K6L K5ARH R-11" wire string — so "ReportAck" is the strongest
-        // available proxy that the confirmed relatch's DX report actually
-        // advanced the QSO to send our R-report, not a keep-calling repeat of
-        // the opening `CqResponse`.
-        pending.iter().any(|p| p.text == "ReportAck"),
+        pending.iter().any(|p| p.text == "K6L K5ARH R-12"),
         "confirmed relatch must emit our R-report (ReportAck), got {:?}",
         pending.iter().map(|p| p.text.clone()).collect::<Vec<_>>()
     );
@@ -2116,6 +1091,7 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
     sim.drive_slot(pending).await;
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 2700.0);
+    sim.shutdown().await;
 }
 
 /// **Multi-TX de-confliction:** opening a second QSO whose DX offset (1540 Hz)
@@ -2247,6 +1223,7 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
 
     // Both PTT transitions must be cleanly released.
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// **Regression — Auto, single, no collision → Tx=Rx, partner_freq=None:**
@@ -2333,6 +1310,7 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
     );
 
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -2439,9 +1417,8 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
     //
     // Both QSOs go active (StateChanged → RespondingToCq), both forward their
     // opening TransmitRequest (our grid reply to each Hound). The coalescer
-    // keeps BOTH (distinct qso_ids, same parity) and the TX worker keys them
-    // sequentially within the slot. The mock rig therefore observes TWO PTT
-    // pulses at TWO distinct offsets.
+    // keeps BOTH (distinct qso_ids, same parity) and the TX worker sums them
+    // into one waveform within a single PTT envelope.
     let pending = sim.pump_qso_events();
     assert!(
         pending.len() >= 2,
@@ -2463,6 +1440,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
 
     // TWO distinct offsets in ONE slot — the core multi-stream assertion.
     sim.timeline.assert_distinct_offsets_in_slot(slot0, 2);
+    assert_eq!(sim.observations.lock().unwrap().ptt, vec![true, false]);
 
     // The two offsets must be ≥ MIN_TX_SEPARATION_HZ apart (no on-air collision).
     let mut offsets_slot0 = sim.timeline.offsets_in_slot(slot0);
@@ -2522,6 +1500,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
 
     // All PTT transitions cleanly released (no stuck PTT).
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 // ===========================================================================
@@ -2543,10 +1522,11 @@ async fn remote_tx_dropped_when_arm_fresh_unarmed() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::RemoteNotArmed),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "expected a RemoteNotArmed drop.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// A LOCAL-origin request keys PTT regardless of the arm state — byte-identical
@@ -2568,10 +1548,11 @@ async fn local_tx_unaffected_by_remote_arm() {
         !sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::RemoteNotArmed),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "a Local request must never be dropped by the remote arm gate.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// With a fully-armed + consented + heartbeat-fresh arm, a Remote request keys
@@ -2589,6 +1570,7 @@ async fn remote_tx_keys_when_armed_and_consented() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// Policy primacy: `TxPolicy::Disabled` drops even a Remote request that has a
@@ -2606,10 +1588,11 @@ async fn policy_disabled_drops_remote_tx_even_with_live_arm() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::PolicyDisabled),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "Disabled policy must drop the remote request first (policy primacy).\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 // ============================================================================
@@ -2656,10 +1639,11 @@ async fn remote_origin_qso_tx_dropped_when_unarmed() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::RemoteNotArmed),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "an unarmed remote QSO's TX must be dropped by the arm gate (no bypass).\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// The SAME remote-origin QSO keys PTT once the arm is armed + consented.
@@ -2689,6 +1673,7 @@ async fn remote_origin_qso_tx_keys_when_armed() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// PAN-91 end-to-end: a QSO requested by one client must NOT key TX just
@@ -2724,11 +1709,12 @@ async fn remote_origin_qso_tx_dropped_when_different_client_armed() {
         sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::RemoteNotArmed),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "PAN-91: a QSO bound to client-a must be dropped while only \
          client-b is armed — the old gate would have keyed this.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 /// PAN-91 end-to-end, positive case: the SAME client that requested the QSO
@@ -2759,6 +1745,7 @@ async fn remote_origin_qso_tx_keys_when_same_client_armed() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+    sim.shutdown().await;
 }
 
 /// Regression: a LOCAL QSO (remote_origin=false) keys PTT regardless of the
@@ -2798,10 +1785,11 @@ async fn local_origin_qso_tx_unaffected_by_arm() {
         !sim.timeline
             .dropped
             .iter()
-            .any(|d| d.reason == DropReason::RemoteNotArmed),
+            .any(|d| d.reason == DropReason::WorkerRefused),
         "a local QSO must never be dropped by the remote arm gate.\n{}",
         sim.timeline
     );
+    sim.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2853,6 +1841,7 @@ async fn mode_switch_refused_while_qso_active() {
         OperatingMode::Ft8.as_u8(),
         "atomic must be untouched on refusal"
     );
+    sim.shutdown().await;
 }
 
 /// A runtime mode switch succeeds while idle (no active QSOs), flips the
@@ -2901,6 +1890,7 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
     let active = sim.manager.get_active_qsos().await;
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].1.metadata.mode, "FT4");
+    sim.shutdown().await;
 }
 
 /// PAN-72 (PR #350 round-7 re-review), end-to-end: a runtime Shift+M switch
@@ -2914,7 +1904,7 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
 /// the clone `QsoManager::start()` spawns `timeout_check_loop` on.
 #[tokio::test]
 async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
-    let sim = CoordSim::new("K5ARH").await;
+    let mut sim = CoordSim::new("K5ARH").await;
 
     let qso_id = sim
         .manager
@@ -2977,6 +1967,7 @@ async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
         1,
         "the live switch must retune the rearm cadence with no re-injection"
     );
+    sim.shutdown().await;
 }
 
 /// Regression invariant: an operator who never touches Shift+M sees the
@@ -3014,6 +2005,7 @@ async fn mode_switch_never_requested_is_byte_identical_to_today() {
     sim.timeline.assert_all_released();
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
+    sim.shutdown().await;
 }
 
 /// SM-F5 (Batch 4): `cancel_qso` / `check_timeouts_at` / `supersede_active_qsos_for`
@@ -3096,6 +2088,7 @@ async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_on
         !sim.active_tx_offsets.read().unwrap().contains_key(&key),
         "active_tx_offsets must be empty after a timeout retirement that emits both events"
     );
+    sim.shutdown().await;
 }
 
 /// PAN-280: the DX's RR73 completes the QSO, our 73 is dropped before it
@@ -3121,7 +2114,7 @@ async fn dropped_closing_73_is_not_logged_and_reopens() {
     let seventy_three = pending
         .iter()
         .rev()
-        .find(|p| p.text == "SeventyThree")
+        .find(|p| p.text.ends_with(" 73"))
         .cloned()
         .unwrap_or_else(|| panic!("our 73 is queued, got {pending:?}"));
     assert!(
@@ -3130,20 +2123,9 @@ async fn dropped_closing_73_is_not_logged_and_reopens() {
         sim.timeline
     );
 
-    // The TX worker drops the 73 (e.g. a late slot): the Qso task's
-    // `TxFrameNotSent` handling runs these engine calls in this order.
-    let id: pancetta_qso::QsoId = qso_id.to_string().parse().unwrap();
-    assert_eq!(
-        sim.manager
-            .resolve_unsent_completion(id, seventy_three.attempt_id)
-            .await,
-        pancetta_qso::UnsentCompletion::Reverted(pancetta_qso::RevertedTo::Reopened)
-    );
-    let _ = sim
-        .manager
-        .roll_back_unsent_attempt(id, &seventy_three.text, None, seventy_three.attempt_id)
-        .await;
-    let _ = sim.pump_qso_events();
+    sim.set_policy(TxPolicy::Disabled);
+    sim.drive_slot(vec![seventy_three]).await;
+    let id: pancetta_qso::QsoId = qso_id.parse().unwrap();
 
     assert!(
         sim.completed.is_empty(),
@@ -3162,4 +2144,84 @@ async fn dropped_closing_73_is_not_logged_and_reopens() {
             .contains(&active_tx_qso_key(&qso_id.to_string())),
         "the reopened QSO is live for TX again"
     );
+    sim.shutdown().await;
+}
+
+#[tokio::test]
+async fn supersede_during_playback_unkeys_before_rekey() {
+    // Submit during the opposite parity so the first waveform starts at the
+    // boundary and leaves enough headroom for a same-slot replacement.
+    let into_cycle = chrono::Utc::now().timestamp_millis().rem_euclid(30_000) as u64;
+    if into_cycle < 15_000 {
+        tokio::time::sleep(Duration::from_millis(15_000 - into_cycle)).await;
+    }
+    let mut sim = CoordSim::new("K5ARH").await;
+    let mut first = sim.manual_tx("CQ K5ARH EM10", 1500.0);
+    first.qso_id = Some("supersede".into());
+    first.tx_parity = Some(SlotParity::Even);
+    first.attempt_id = Some(pancetta_qso::TxAttemptId(1));
+    sim.active_tx_qsos
+        .write()
+        .unwrap()
+        .insert(active_tx_qso_key("supersede"));
+    sim.submit(&[first]).await;
+    sim.wait_for_audio(1).await;
+    let mut next = sim.manual_tx("CQ K5ARH EM11", 1500.0);
+    next.qso_id = Some("supersede".into());
+    next.tx_parity = Some(SlotParity::Even);
+    next.attempt_id = Some(pancetta_qso::TxAttemptId(2));
+    sim.drive_slot(vec![next]).await;
+    assert_eq!(
+        sim.observations.lock().unwrap().ptt,
+        vec![true, false, true, false],
+        "supersede must release PTT before replacement key-down"
+    );
+    assert_eq!(
+        sim.timeline.keyed.len(),
+        1,
+        "only replacement attempt settled as sent"
+    );
+    {
+        let obs = sim.observations.lock().unwrap();
+        assert!(obs
+            .settlements
+            .iter()
+            .any(|(_, id, sent)| *id == Some(pancetta_qso::TxAttemptId(2)) && *sent));
+        assert!(
+            obs.settlements
+                .iter()
+                .any(|(_, id, sent)| *id == Some(pancetta_qso::TxAttemptId(1)) && !*sent),
+            "superseded attempt must settle as not sent"
+        );
+        assert!(!obs
+            .settlements
+            .iter()
+            .any(|(_, id, sent)| *id == Some(pancetta_qso::TxAttemptId(1)) && *sent));
+    }
+    sim.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_while_keyed_unkeys_and_joins() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let request = sim.manual_tx("CQ K5ARH EM10", 1500.0);
+    sim.submit(&[request]).await;
+    sim.wait_for_audio(1).await;
+    assert_eq!(sim.observations.lock().unwrap().ptt.last(), Some(&true));
+    sim.shutdown().await;
+    assert_eq!(sim.observations.lock().unwrap().ptt.last(), Some(&false));
+}
+
+#[tokio::test]
+async fn independent_fixtures_do_not_share_state() {
+    let mut first = CoordSim::new("K5ARH").await;
+    let mut second = CoordSim::new("W1AW").await;
+    assert_ne!(first.home(), second.home());
+    first.set_policy(TxPolicy::Disabled);
+    assert_eq!(current_policy(&second.tx_policy), TxPolicy::Full);
+    let request = second.manual_tx("CQ W1AW FN31", 1500.0);
+    second.drive_slot(vec![request]).await;
+    assert!(first.observations.lock().unwrap().ptt.is_empty());
+    first.shutdown().await;
+    second.shutdown().await;
 }

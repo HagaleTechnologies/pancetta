@@ -17,22 +17,9 @@ pub trait BandExt {
 
 impl BandExt for Band {
     fn name(&self) -> &'static str {
-        match self {
-            Band::Band160m => "160m",
-            Band::Band80m => "80m",
-            Band::Band60m => "60m",
-            Band::Band40m => "40m",
-            Band::Band30m => "30m",
-            Band::Band20m => "20m",
-            Band::Band17m => "17m",
-            Band::Band15m => "15m",
-            Band::Band12m => "12m",
-            Band::Band10m => "10m",
-            Band::Band6m => "6m",
-            Band::Band2m => "2m",
-            Band::Band70cm => "70cm",
-            Band::Custom(_, _) => "custom",
-        }
+        // PAN-330: one core vocabulary — hamlib display names are the core
+        // canonical names (`Band::name`), not a second table.
+        Band::name(self)
     }
 }
 
@@ -709,6 +696,43 @@ pub fn render_supported_rigs_markdown() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC3: hamlib band display uses core membership plus the core
+    /// lowercase names (including 2m/70cm where core supports them).
+    #[test]
+    fn band_vocabulary_table() {
+        for (hz, expected) in [
+            (1_800_000u64, Some("160m")),
+            (2_000_000, Some("160m")),
+            (5_357_500, Some("60m")),
+            (5_405_000, Some("60m")),
+            (5_410_000, None),
+            (14_074_000, Some("20m")),
+            (50_313_000, Some("6m")),
+            (144_174_000, Some("2m")),
+            (432_100_000, Some("70cm")),
+            (0, None),
+            (30_000_000, None),
+        ] {
+            let band = Band::from_frequency(hz);
+            assert_eq!(band.map(|b| b.name()), expected, "at {hz} Hz");
+        }
+    }
+
+    /// PAN-330 AC4: hamlib display names are the one core standard-band
+    /// vocabulary.
+    #[test]
+    fn standard_band_names_agree() {
+        for band in Band::all() {
+            assert_eq!(
+                BandExt::name(band),
+                band.name(),
+                "hamlib display name diverged for {}",
+                band.name()
+            );
+        }
+        assert_eq!(BandExt::name(&Band::Custom(5_000_000, 5_100_000)), "custom");
+    }
 
     #[test]
     fn test_band_frequency_detection() {

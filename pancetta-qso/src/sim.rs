@@ -603,13 +603,14 @@ fn first_callsign_of(text: &str) -> Option<String> {
     }
 }
 
-/// A token is callsign-shaped if it is ≥3 chars and contains both a digit and
-/// a letter (so grids like `FN42`, reports like `-12`, and words like `DX`
-/// don't qualify). Compound calls (`EA8/G8BCG`) qualify.
+/// A token is callsign-shaped per the shared core policy
+/// (`pancetta_core::callsign::is_callsign_token`, PAN-330): 3–11 chars of
+/// ASCII alphanumeric plus `/` with a digit and a letter, excluding bare
+/// 4-char grid shapes — so grids like `FN42`, reports like `-12`, and words
+/// like `DX` don't qualify, matching production token extraction.
+/// Compound calls (`EA8/G8BCG`) qualify.
 fn looks_like_callsign(tok: &str) -> bool {
-    tok.len() >= 3
-        && tok.chars().any(|c| c.is_ascii_digit())
-        && tok.chars().any(|c| c.is_ascii_alphabetic())
+    pancetta_core::callsign::is_callsign_token(tok)
 }
 
 /// A compact one-word label for a [`QsoState`], for the timeline display.
@@ -1848,6 +1849,26 @@ pub fn assert_tx_offset_clear_of(chosen_hz: f64, occupied_hz: f64, min_clear_hz:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-330 AC7: simulation token extraction uses the same shared core
+    /// callsign-token policy as production, so grids and reports are
+    /// excluded here too.
+    #[test]
+    fn sim_token_extraction_excludes_grids_and_reports() {
+        assert_eq!(
+            first_callsign_of("DL1ABC K5ARH FN42").as_deref(),
+            Some("DL1ABC")
+        );
+        assert_eq!(
+            first_callsign_of("EA8/K5ARH DL1ABC -10").as_deref(),
+            Some("EA8/K5ARH")
+        );
+        assert_eq!(first_callsign_of("fn42 ab1cd").as_deref(), None); // bare grid first
+        assert_eq!(first_callsign_of("-12 +05").as_deref(), None);
+        assert_eq!(first_callsign_of("DX K5ARH -10").as_deref(), None); // DX: no digit
+        assert_eq!(first_callsign_of("CQ K5ARH FN42").as_deref(), None);
+        assert_eq!(first_callsign_of("/K1ABC DL1ABC R-05").as_deref(), None); // malformed slash form
+    }
 
     #[test]
     fn sim_clock_advances_in_slots_with_alternating_parity() {

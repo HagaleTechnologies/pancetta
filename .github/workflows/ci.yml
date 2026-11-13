@@ -108,7 +108,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       merge_group_notes_only: ${{ steps.merge-group-scope.outputs.notes_only }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       # Only meaningful for push/pull_request (a real base ref to diff
@@ -116,7 +116,7 @@ jobs:
       # those events already force every downstream job to run regardless
       # of this output (see each job's `if:`), so skipping here is safe —
       # `steps.filter.outputs.code` is just empty, not a failure.
-      - uses: dorny/paths-filter@v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         with:
@@ -359,7 +359,7 @@ jobs:
     if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -375,7 +375,7 @@ jobs:
           toolchain: 1.98.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: clippy
@@ -393,7 +393,7 @@ jobs:
     if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
       # toolchain up front instead of letting rustup's override auto-install
@@ -444,10 +444,75 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
+<<<<<<< HEAD
+=======
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
+      # toolchain up front instead of letting rustup's override auto-install
+      # it mid-job (a second, wasted download per run). See
+      # docs/DECISIONS/config-and-platform.md.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.98.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ft8-tests
+
+      - name: Check (default features)
+        run: cargo check -p pancetta-ft8
+
+      - name: Check (no default features)
+        run: cargo check -p pancetta-ft8 --no-default-features
+
+      - name: Check (transmit feature)
+        run: cargo check --features transmit -p pancetta-ft8
+
+      - name: Run FT8 tests (default features, the standalone build)
+        # The configuration manta and other programs build (PAN-176,
+        # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
+        # run in workspace-check's `--features transmit` test step.
+        run: cargo test -p pancetta-ft8
+
+  workspace-check:
+    name: Workspace Check
+    needs: [changes, codex-clean]
+    # See ft8-tests's own comment above for why always() is load-bearing.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
+    runs-on: ubuntu-latest
+    env:
+      # This lane links the whole workspace THREE times (check, examples,
+      # tests). Each test/example binary statically links a large dep tree,
+      # and the workspace ships dozens of example binaries. With full
+      # debuginfo the accumulated target/ exhausted the runner's disk during
+      # linking on a cold cache — `ld` died with SIGBUS (ENOSPC on its
+      # mmap'd output) on 2026-06-13. line-tables-only keeps file:line in
+      # backtraces while dropping ~70-80% of debuginfo size, for both the
+      # dev profile (examples) and the test profile (integration tests).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      # See ft8-tests's own comment above for why this explicit step exists
+      # instead of a richer `if:`.
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+>>>>>>> c63a03623fcaa3eabd906bff7110ef59f3b3db55
       # Reclaim ~25-30 GB of preinstalled tooling the runner ships but this
       # lane never uses. Pairs with the reduced debuginfo above to keep the
       # cold-cache full-workspace build comfortably under the disk ceiling.
@@ -469,7 +534,7 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-check
@@ -488,6 +553,12 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --exclude pancetta-research --features transmit
+
+      - name: Real TX worker integration tests
+        run: cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
+
+      - name: Real TX worker integration clippy
+        run: cargo clippy -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration
 
       # PAN-284: one DXCC entity lookup must stay under 2 µs on the CI host.
       # CI builds no other bench; this one is an acceptance criterion. The rm
@@ -536,7 +607,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -566,7 +637,7 @@ jobs:
           toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: cross-${{ matrix.os }}
@@ -611,8 +682,8 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check bans licenses sources advisories
 

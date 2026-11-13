@@ -1228,3 +1228,28 @@ required VFOs and restore the receive VFO. Unconfirmed split state, rejected mod
 or failed restoration leaves TX inhibited. The coordinator adds an independent
 readiness cause and never changes operator TX policy to recover it. Mock and
 socket tests are container evidence; FTdx10 hardware qualification remains pending.
+
+## Service liveness and field diagnostics (PAN-335, 2026-11-12)
+
+The Linux user service uses Type=notify and a 60-second watchdog. Readiness
+requires owner-published audio, DSP and decoder initialization, live rig-loop
+readiness or disabled rig control, and completed coordinator startup. Task
+spawn success is insufficient. Notification follows completed health passes;
+no independent heartbeat task may hide a stalled monitor. Shutdown suppresses
+further readiness and watchdog notifications and publishes STOPPING after READY.
+
+The unit uses SIGTERM on expiry, KillMode=mixed and a 45-second stop budget so
+the existing PTT-off drain can retain managed rigctld during cleanup. A fully
+wedged process may still need forced termination. Restart reloads autonomous
+enablement from configuration; the emergency halt remains in memory only.
+Real systemd restart and macOS TCC qualification remain pending. The
+[runbook](../RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) records a
+receive-only qualification procedure and the physical-unkey limitation.
+
+Doctor adds separate network, log-disk and microphone-permission results.
+Enabled cqdx and DX-cluster probes share a three-second deadline; failures are
+advisory. Disk queries use the actual log volume and user-available blocks,
+following an existing ancestor without creating a directory. Below 100 MiB
+warns and below 10 MiB fails. Known macOS denial or restriction fails
+independently of capture; unresolved authorization warns. No permission prompt
+is requested. These checks preserve the existing report's failure exit policy.

@@ -1,6 +1,6 @@
 //! Helpers shared by pancetta-dx's network-failure tests.
 
-use crate::DxError;
+use crate::{DxError, DxErrorInner};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 
@@ -199,8 +199,8 @@ pub(crate) fn assert_error_omits(err: &DxError, secrets: &[&str]) {
 /// contains none of `secrets`.
 pub(crate) fn assert_network_error_omits(err: &DxError, secrets: &[&str]) {
     assert!(
-        matches!(err, DxError::Network(_)),
-        "expected DxError::Network, got {err:?}"
+        matches!(err.kind(), DxErrorInner::Network(_)),
+        "expected DxErrorInner::Network, got {err:?}"
     );
     assert_error_omits(err, secrets);
     let all = render_error_chain(err);

@@ -54,6 +54,14 @@ Second gotcha (PAN-90): **a new config struct needs container-level
 fails — every table must accept a partial table. Record/map entry types are the
 only allowlisted exceptions. Config snippets added to `README.md` or top-level
 `docs/*.md` are loaded by `tests/docs_snippets.rs` and must parse with zero warnings.
+PAN-323 adds two more doc-drift guards in the same crate: `tests/config_md_tables.rs`
+checks every `| Key | Type | Default | Notes |` table in `docs/CONFIG.md` against the
+real loader and `Config::default()` (key existence is judged by loader acceptance —
+an `Option` field absent from serialized defaults is still a real key, and `absent`
+in the Default column means no default, never `""`), and
+`tests/architecture_drift.rs` regenerates the coordinator module table in
+`docs/ARCHITECTURE.md` from `ls pancetta/src/coordinator`
+(`PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`).
 
 Queue recovery gotcha (PAN-150): restoring a missing native queue rule does not
 schedule a retry. Rerun the failed handler after restoration. An interrupted
@@ -77,7 +85,7 @@ admit Dependabot PRs to automatic merge. See
 
 Toolchain gotcha (PAN-56): **`rust-toolchain.toml` pins an exact Rust release
 (`1.98.0`, matching the Catalyst runner image), and the `dtolnay/rust-toolchain`
-steps in `ci.yml`, `docs.yml`, `demo-assets.yml` and `release.yml` pass the same
+steps in `ci.yml`, `demo-assets.yml` and `release.yml` pass the same
 version as `toolchain:`.** Bump the channel and all of those inputs in one PR. A missed input still builds with the
 pinned compiler, because rustup's override wins, but that job downloads a second
 toolchain and its rust-cache key churns. See
@@ -102,12 +110,21 @@ the TUI render loop. These settings require restart. See
 [tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).
 
 Microphone diagnosis gotcha (PAN-266): `doctor` queries the running process's
-AVFoundation audio authorization only after a successful silent capture.
+AVFoundation audio authorization independently in its microphone-permission row.
+The audio-level row also uses it after a successful silent capture.
 Silence alone does not prove missing permission. Authorized or unknown status
 keeps the generic FLAT LINE advice; zero captured samples remain a capture error.
 macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
+
+Service readiness gotcha (PAN-335): spawning an audio thread or decoder task
+does not mean initialization succeeded. Owner readiness must follow successful
+stream start or decoder construction and clear on owner exit. READY also waits
+for full startup and the rig loop. The watchdog sends only after completed
+coordinator health passes, so a second heartbeat task would hide the failure
+it is supposed to detect. Receive-only systemd host qualification is still
+pending. See [the service liveness decision](../../docs/DECISIONS/config-and-platform.md#service-liveness-and-field-diagnostics-pan-335-2026-11-12).
 
 Rig-model gotcha (PAN-340): **`rig.model` resolves through one offline
 catalog, and that catalog is not the qualification table.** Acceptance comes
