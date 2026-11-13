@@ -9435,7 +9435,6 @@ mod pan_59_command_tests {
 mod key_effects;
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod decode_log_level_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -9611,7 +9610,10 @@ mod decode_log_level_tests {
                 .all(|(level, _)| *level == tracing::Level::DEBUG),
             "the per-decode record is a DEBUG record: {decode_records:?}"
         );
-=======
+    }
+}
+
+#[cfg(test)]
 mod pan333_terminal_guard {
     use super::*;
     use std::sync::Mutex;
@@ -9683,6 +9685,5 @@ mod pan333_terminal_guard {
         let (mut guard, calls) = guard(true);
         assert!(guard.cleanup().is_err());
         assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
->>>>>>> 271f785b629d38e7f07350848cba3f517343e546
     }
 }
