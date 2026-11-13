@@ -282,7 +282,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
 | `pancetta test-rig` | Test a running rigctld; exits 1 on failure. `--ptt` keys CAT/RTS for 1 s after the band-plan check (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
-| `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
+| `pancetta export [--output log.adi] [--since YYYY-MM-DD] [--band 20m] [--mode FT8]` | Export QSOs directly from `qsos.adi` to ADIF. |
 | `pancetta import-confirmations <file.adi>` | Merge your LoTW report into existing contacts, then restart to apply confirmations. No login or download. |
 | `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
 | `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |

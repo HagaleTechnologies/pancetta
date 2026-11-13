@@ -136,6 +136,7 @@ pub use crate::watchlist::*;
 // Module declarations
 pub mod adif;
 pub mod adif_confirmations;
+pub mod adif_export;
 pub mod adif_import;
 pub mod adif_log_writer;
 pub mod async_database;

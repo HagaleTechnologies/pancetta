@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
+
 - PAN-306: logged and exported ADIF records infer COUNTRY, DXCC, CQZ and ITUZ offline, including prefix and exact-call zone overrides. Stored imported fields take precedence individually; unknown calls gain no inferred fields. Existing logs are not rewritten. Automated coverage only; live qualification pending.
 
 - PAN-310 security: refuse plaintext station-agent relay and pairing URLs outside loopback, including pairing CLI overrides. Loopback plaintext emits an unencrypted-link warning. Supplied endpoints are validated even when the agent is disabled.
