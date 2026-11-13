@@ -1252,3 +1252,21 @@ following an existing ancestor without creating a directory. Below 100 MiB
 warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
+
+## PAN-303: remove configuration without runtime consumers
+
+Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
+`network.rate_limiting`, `network.dx_cluster.alerts`, `ui.keyboard`, and
+`ui.accessibility.sound_feedback`. Existing TOML and JSON configs still load
+with one warning per removed section. Use `[alerts]` for decode alerts and
+the documented TUI keymap for keys. The separate TUI config also drops
+`refresh_rate`, `max_messages`, `show_waterfall`, `time_format`, and
+`frequency_format`; the live renderer already uses its own cadence and format.
+
+The serialized-key consumer test checks leaf-name references outside the
+config crate and tests. It is a lexical floor, not proof that a setting runs.
+Its 204 explicit waivers record existing schema debt and references hidden
+by the conservative cutoff at each source file's first `#[cfg(test)]`.
+The waiver ceiling cannot grow. Remaining settings need separate consumer
+or removal work; optional values absent from defaults and user map entries
+are outside this test's enumeration.

@@ -564,8 +564,8 @@ impl Config {
     /// key order.
     ///
     /// Routed through `toml::Value` (not `toml::to_string_pretty(&cfg)`
-    /// directly): `Config::ui::keyboard::shortcuts` is a
-    /// `HashMap<String, KeyboardShortcut>` (src/ui.rs); serde's std-HashMap
+    /// directly): `Config::network::custom_services` is a
+    /// `HashMap<String, CustomServiceConfig>` (src/network.rs); serde's std-HashMap
     /// `Serialize` impl iterates in the map's own randomized-hasher order, so
     /// serializing the struct straight to TOML text renders that one table's
     /// key order differently on every process run. `toml::map::Map` (backing

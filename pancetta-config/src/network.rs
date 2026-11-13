@@ -16,23 +16,8 @@ pub struct NetworkConfig {
     /// PSKReporter service configuration
     pub psk_reporter: PskReporterConfig,
 
-    /// WSPR configuration
-    pub wspr: WsprConfig,
-
     /// DX cluster configuration
     pub dx_cluster: DxClusterConfig,
-
-    /// Web API configuration
-    pub web_api: WebApiConfig,
-
-    /// Proxy settings
-    pub proxy: ProxyConfig,
-
-    /// SSL/TLS settings
-    pub tls: TlsConfig,
-
-    /// Rate limiting configuration
-    pub rate_limiting: RateLimitingConfig,
 
     /// Retry and timeout settings
     pub reliability: ReliabilityConfig,
@@ -720,66 +705,6 @@ pub struct DistanceFilters {
     pub great_circle: bool,
 }
 
-/// WSPR (Weak Signal Propagation Reporter) configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WsprConfig {
-    /// Enable WSPR integration
-    pub enabled: bool,
-
-    /// WSPR database URL
-    pub database_url: String,
-
-    /// Upload spots
-    pub upload_spots: bool,
-
-    /// Download spots
-    pub download_spots: bool,
-
-    /// Spot filtering
-    pub filtering: WsprFilteringConfig,
-
-    /// Analysis settings
-    pub analysis: WsprAnalysisConfig,
-}
-
-/// WSPR filtering configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WsprFilteringConfig {
-    /// Minimum SNR
-    pub min_snr: f32,
-
-    /// Maximum drift
-    pub max_drift_hz: f32,
-
-    /// Band filters
-    pub bands: Vec<String>,
-
-    /// Geographic filters
-    pub geographic: GeographicFilters,
-
-    /// Time window in hours
-    pub time_window_hours: u32,
-}
-
-/// WSPR analysis configuration
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WsprAnalysisConfig {
-    /// Propagation analysis
-    pub propagation_analysis: bool,
-
-    /// Band comparison
-    pub band_comparison: bool,
-
-    /// Antenna pattern analysis
-    pub antenna_analysis: bool,
-
-    /// Export analysis data
-    pub export_analysis: bool,
-}
-
 /// DX Cluster configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -795,9 +720,6 @@ pub struct DxClusterConfig {
 
     /// Filtering settings
     pub filtering: ClusterFilteringConfig,
-
-    /// Alert settings
-    pub alerts: ClusterAlertConfig,
 }
 
 /// DX cluster server definition
@@ -877,349 +799,6 @@ pub struct ClusterFilteringConfig {
 
     /// Duplicate filtering
     pub duplicate_window_minutes: u32,
-}
-
-/// Cluster alert configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ClusterAlertConfig {
-    /// Enable visual alerts
-    pub visual_alerts: bool,
-
-    /// Enable audio alerts
-    pub audio_alerts: bool,
-
-    /// Alert conditions
-    pub conditions: Vec<AlertCondition>,
-
-    /// Alert sounds
-    pub sounds: AlertSoundConfig,
-}
-
-/// Alert condition definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlertCondition {
-    /// Condition name
-    pub name: String,
-
-    /// Condition expression
-    pub expression: String,
-
-    /// Alert priority
-    pub priority: AlertPriority,
-
-    /// Condition enabled
-    pub enabled: bool,
-}
-
-/// Alert priority levels
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AlertPriority {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-/// Alert sound configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AlertSoundConfig {
-    /// Sound file for low priority
-    pub low_priority_sound: Option<String>,
-
-    /// Sound file for medium priority
-    pub medium_priority_sound: Option<String>,
-
-    /// Sound file for high priority
-    pub high_priority_sound: Option<String>,
-
-    /// Sound file for critical priority
-    pub critical_priority_sound: Option<String>,
-
-    /// Alert volume
-    pub volume: f32,
-}
-
-/// Web API configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WebApiConfig {
-    /// Enable web API server
-    pub enabled: bool,
-
-    /// API server bind address
-    pub bind_address: String,
-
-    /// API server port
-    pub port: u16,
-
-    /// API authentication
-    pub authentication: ApiAuthConfig,
-
-    /// CORS settings
-    pub cors: CorsConfig,
-
-    /// Rate limiting
-    pub rate_limiting: ApiRateLimitingConfig,
-
-    /// API documentation
-    pub documentation: ApiDocumentationConfig,
-}
-
-/// API authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ApiAuthConfig {
-    /// Authentication required
-    pub required: bool,
-
-    /// Authentication method
-    pub method: AuthMethod,
-
-    /// API keys
-    pub api_keys: Vec<ApiKey>,
-
-    /// JWT settings
-    pub jwt: JwtConfig,
-}
-
-/// Authentication methods
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthMethod {
-    None,
-    ApiKey,
-    BasicAuth,
-    Jwt,
-    OAuth2,
-}
-
-/// API key definition
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ApiKey {
-    /// Key name/identifier
-    pub name: String,
-
-    /// API key value (encrypted)
-    pub key_encrypted: String,
-
-    /// Key permissions
-    pub permissions: Vec<String>,
-
-    /// Key expiration
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-
-    /// Key enabled
-    pub enabled: bool,
-}
-
-/// JWT configuration
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct JwtConfig {
-    /// JWT secret key (encrypted)
-    pub secret_encrypted: String,
-
-    /// Token expiration time in hours
-    pub expiration_hours: u32,
-
-    /// Token issuer
-    pub issuer: String,
-
-    /// Token audience
-    pub audience: String,
-}
-
-/// CORS configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CorsConfig {
-    /// Enable CORS
-    pub enabled: bool,
-
-    /// Allowed origins
-    pub allowed_origins: Vec<String>,
-
-    /// Allowed methods
-    pub allowed_methods: Vec<String>,
-
-    /// Allowed headers
-    pub allowed_headers: Vec<String>,
-
-    /// Allow credentials
-    pub allow_credentials: bool,
-
-    /// Max age in seconds
-    pub max_age_seconds: u32,
-}
-
-/// API rate limiting configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ApiRateLimitingConfig {
-    /// Enable rate limiting
-    pub enabled: bool,
-
-    /// Requests per minute
-    pub requests_per_minute: u32,
-
-    /// Burst allowance
-    pub burst_allowance: u32,
-
-    /// Rate limit by IP
-    pub by_ip: bool,
-
-    /// Rate limit by API key
-    pub by_api_key: bool,
-}
-
-/// API documentation configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ApiDocumentationConfig {
-    /// Enable documentation endpoint
-    pub enabled: bool,
-
-    /// Documentation path
-    pub path: String,
-
-    /// Documentation title
-    pub title: String,
-
-    /// Documentation description
-    pub description: String,
-
-    /// API version
-    pub version: String,
-}
-
-/// Proxy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProxyConfig {
-    /// Enable proxy
-    pub enabled: bool,
-
-    /// Proxy type
-    pub proxy_type: ProxyType,
-
-    /// Proxy server
-    pub server: String,
-
-    /// Proxy port
-    pub port: u16,
-
-    /// Proxy authentication
-    pub auth: Option<ProxyAuth>,
-
-    /// Proxy exclusions
-    pub exclusions: Vec<String>,
-}
-
-/// Proxy types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProxyType {
-    Http,
-    Https,
-    Socks4,
-    Socks5,
-}
-
-/// Proxy authentication
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyAuth {
-    /// Username
-    pub username: String,
-
-    /// Proxy password (plaintext on disk — see SECURITY.md).
-    pub password: String,
-}
-
-/// TLS/SSL configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TlsConfig {
-    /// Verify certificates
-    pub verify_certificates: bool,
-
-    /// Certificate bundle path
-    pub ca_bundle_path: Option<String>,
-
-    /// Client certificate
-    pub client_cert: Option<ClientCertConfig>,
-
-    /// TLS version
-    pub min_version: TlsVersion,
-
-    /// Cipher suites
-    pub cipher_suites: Vec<String>,
-}
-
-/// TLS version options
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TlsVersion {
-    Tls10,
-    Tls11,
-    Tls12,
-    Tls13,
-}
-
-/// Client certificate configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientCertConfig {
-    /// Certificate file path
-    pub cert_file: String,
-
-    /// Private key file path
-    pub key_file: String,
-
-    /// Private key password (plaintext on disk — see SECURITY.md).
-    pub key_password: Option<String>,
-}
-
-/// Rate limiting configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RateLimitingConfig {
-    /// Enable rate limiting
-    pub enabled: bool,
-
-    /// Global rate limits
-    pub global: GlobalRateLimit,
-
-    /// Service-specific rate limits
-    pub services: HashMap<String, ServiceRateLimit>,
-}
-
-/// Global rate limiting
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GlobalRateLimit {
-    /// Requests per minute
-    pub requests_per_minute: u32,
-
-    /// Requests per hour
-    pub requests_per_hour: u32,
-
-    /// Requests per day
-    pub requests_per_day: u32,
-}
-
-/// Service-specific rate limiting
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceRateLimit {
-    /// Requests per minute
-    pub requests_per_minute: u32,
-
-    /// Burst allowance
-    pub burst_allowance: u32,
-
-    /// Cooldown period in seconds
-    pub cooldown_seconds: u64,
 }
 
 /// Reliability configuration
@@ -1431,31 +1010,6 @@ impl Default for CqdxConfig {
     }
 }
 
-impl Default for WsprConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            database_url: "http://wsprnet.org/drupal/wsprnet/spotquery".to_string(),
-            upload_spots: false,
-            download_spots: false,
-            filtering: WsprFilteringConfig::default(),
-            analysis: WsprAnalysisConfig::default(),
-        }
-    }
-}
-
-impl Default for WsprFilteringConfig {
-    fn default() -> Self {
-        Self {
-            min_snr: -30.0,
-            max_drift_hz: 3.0,
-            bands: vec!["40m".to_string(), "30m".to_string(), "20m".to_string()],
-            geographic: GeographicFilters::default(),
-            time_window_hours: 24,
-        }
-    }
-}
-
 impl Default for ClusterConnectionConfig {
     fn default() -> Self {
         Self {
@@ -1481,137 +1035,6 @@ impl Default for ClusterFilteringConfig {
     }
 }
 
-impl Default for ClusterAlertConfig {
-    fn default() -> Self {
-        Self {
-            visual_alerts: true,
-            audio_alerts: false,
-            conditions: vec![],
-            sounds: AlertSoundConfig::default(),
-        }
-    }
-}
-
-impl Default for AlertSoundConfig {
-    fn default() -> Self {
-        Self {
-            low_priority_sound: None,
-            medium_priority_sound: None,
-            high_priority_sound: None,
-            critical_priority_sound: None,
-            volume: 0.5,
-        }
-    }
-}
-
-impl Default for WebApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind_address: "127.0.0.1".to_string(),
-            port: 8080,
-            authentication: ApiAuthConfig::default(),
-            cors: CorsConfig::default(),
-            rate_limiting: ApiRateLimitingConfig::default(),
-            documentation: ApiDocumentationConfig::default(),
-        }
-    }
-}
-
-impl Default for ApiAuthConfig {
-    fn default() -> Self {
-        Self {
-            required: true,
-            method: AuthMethod::ApiKey,
-            api_keys: vec![],
-            jwt: JwtConfig::default(),
-        }
-    }
-}
-
-impl Default for JwtConfig {
-    fn default() -> Self {
-        Self {
-            secret_encrypted: String::new(),
-            expiration_hours: 24,
-            issuer: "pancetta".to_string(),
-            audience: "pancetta-api".to_string(),
-        }
-    }
-}
-
-impl Default for CorsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            allowed_origins: vec!["*".to_string()],
-            allowed_methods: vec!["GET".to_string(), "POST".to_string()],
-            allowed_headers: vec!["Content-Type".to_string(), "Authorization".to_string()],
-            allow_credentials: false,
-            max_age_seconds: 3600,
-        }
-    }
-}
-
-impl Default for ApiRateLimitingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            requests_per_minute: 60,
-            burst_allowance: 10,
-            by_ip: true,
-            by_api_key: false,
-        }
-    }
-}
-
-impl Default for ApiDocumentationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            path: "/docs".to_string(),
-            title: "Pancetta API".to_string(),
-            description: "Amateur Radio Software API".to_string(),
-            version: "1.0.0".to_string(),
-        }
-    }
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            proxy_type: ProxyType::Http,
-            server: String::new(),
-            port: 8080,
-            auth: None,
-            exclusions: vec![],
-        }
-    }
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            verify_certificates: true,
-            ca_bundle_path: None,
-            client_cert: None,
-            min_version: TlsVersion::Tls12,
-            cipher_suites: vec![],
-        }
-    }
-}
-
-impl Default for RateLimitingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            global: GlobalRateLimit::default(),
-            services: HashMap::new(),
-        }
-    }
-}
-
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -1620,16 +1043,6 @@ impl Default for ReliabilityConfig {
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             health_check: HealthCheckConfig::default(),
-        }
-    }
-}
-
-impl Default for GlobalRateLimit {
-    fn default() -> Self {
-        Self {
-            requests_per_minute: 300,
-            requests_per_hour: 3600,
-            requests_per_day: 86400,
         }
     }
 }
@@ -1719,22 +1132,6 @@ impl ConfigSection for NetworkConfig {
                     value: self.psk_reporter.max_pending_reports.to_string(),
                 });
             }
-        }
-
-        // Validate web API settings
-        if self.web_api.enabled && self.web_api.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "web_api.port".to_string(),
-                value: self.web_api.port.to_string(),
-            });
-        }
-
-        // Validate rate limiting
-        if self.rate_limiting.enabled && self.rate_limiting.global.requests_per_minute == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "rate_limiting.global.requests_per_minute".to_string(),
-                value: self.rate_limiting.global.requests_per_minute.to_string(),
-            });
         }
 
         // cqdx.io validation
@@ -1928,12 +1325,7 @@ impl ConfigSection for NetworkConfig {
         // Merge service configurations unconditionally so that
         // user configs can disable services enabled by the system config.
         self.psk_reporter = other.psk_reporter;
-        self.wspr = other.wspr;
         self.dx_cluster = other.dx_cluster;
-        self.web_api = other.web_api;
-        self.proxy = other.proxy;
-        self.tls = other.tls;
-        self.rate_limiting = other.rate_limiting;
         self.reliability = other.reliability;
         self.cqdx = other.cqdx;
         self.clublog = other.clublog;
@@ -2008,29 +1400,6 @@ impl std::fmt::Debug for QrzXmlConfig {
             .field("enabled", &self.enabled)
             .field("username", &self.username)
             .field("password", &REDACTED)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for ApiKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApiKey")
-            .field("name", &self.name)
-            .field("key_encrypted", &REDACTED)
-            .field("permissions", &self.permissions)
-            .field("expires_at", &self.expires_at)
-            .field("enabled", &self.enabled)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for JwtConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JwtConfig")
-            .field("secret_encrypted", &REDACTED)
-            .field("expiration_hours", &self.expiration_hours)
-            .field("issuer", &self.issuer)
-            .field("audience", &self.audience)
             .finish()
     }
 }
@@ -2392,32 +1761,6 @@ mod tests {
     }
 
     #[test]
-    fn test_web_api_validation() {
-        let mut config = NetworkConfig::default();
-        config.web_api.enabled = true;
-
-        // Valid configuration
-        assert!(config.validate_section().is_ok());
-
-        // Invalid port
-        config.web_api.port = 0;
-        assert!(config.validate_section().is_err());
-    }
-
-    #[test]
-    fn test_rate_limiting_validation() {
-        let mut config = NetworkConfig::default();
-        config.rate_limiting.enabled = true;
-
-        // Valid configuration
-        assert!(config.validate_section().is_ok());
-
-        // Invalid rate limit
-        config.rate_limiting.global.requests_per_minute = 0;
-        assert!(config.validate_section().is_err());
-    }
-
-    #[test]
     fn test_psk_reporter_filters() {
         let filters = PskReporterFilters::default();
         assert!(filters.enabled_modes.contains(&"FT8".to_string()));
@@ -2565,10 +1908,10 @@ mod tests {
     }
 
     /// Regression for the real-world bug where an operator's `[network.qrz_logbook]`
-    /// (and clublog/lotw/eqsl/qrz_xml/cqdx/tls/rate_limiting/reliability/
+    /// (and clublog/lotw/eqsl/qrz_xml/cqdx/reliability/
     /// remote_gateway/station_agent) settings, correctly present in their config
     /// file, were silently discarded during multi-source merging: `merge_with`
-    /// only ever copied `psk_reporter`/`wspr`/`dx_cluster`/`web_api`/`proxy`
+    /// only ever copied `psk_reporter`/`dx_cluster`
     /// from `other`, so every later-added integration always reverted to its
     /// compiled-in (disabled) default regardless of what the file said.
     #[test]

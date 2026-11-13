@@ -228,14 +228,6 @@ poll_interval_secs = 30
 enabled = false
 servers = []
 
-[network.dx_cluster.alerts]
-audio_alerts = false
-conditions = []
-visual_alerts = true
-
-[network.dx_cluster.alerts.sounds]
-volume = 0.5
-
 [network.dx_cluster.connection]
 auto_connect = false
 keepalive_interval_seconds = 300
@@ -259,13 +251,6 @@ username = ""
 enabled = false
 station_location = ""
 tqsl_path = ""
-
-[network.proxy]
-enabled = false
-exclusions = []
-port = 8080
-proxy_type = "http"
-server = ""
 
 [network.psk_reporter]
 batch_size = 50
@@ -322,16 +307,6 @@ enabled = false
 password = ""
 username = ""
 
-[network.rate_limiting]
-enabled = true
-
-[network.rate_limiting.global]
-requests_per_day = 86400
-requests_per_hour = 3600
-requests_per_minute = 300
-
-[network.rate_limiting.services]
-
 [network.reliability]
 connection_timeout_seconds = 30
 request_timeout_seconds = 60
@@ -366,55 +341,6 @@ enabled = false
 remote_tx_enabled = false
 tx_allow_list = []
 
-[network.tls]
-cipher_suites = []
-min_version = "tls12"
-verify_certificates = true
-
-[network.web_api]
-bind_address = "127.0.0.1"
-enabled = false
-port = 8080
-
-[network.web_api.authentication]
-api_keys = []
-method = "api_key"
-required = true
-
-[network.web_api.authentication.jwt]
-audience = "pancetta-api"
-expiration_hours = 24
-issuer = "pancetta"
-secret_encrypted = ""
-
-[network.web_api.cors]
-allow_credentials = false
-allowed_headers = [
-    "Content-Type",
-    "Authorization",
-]
-allowed_methods = [
-    "GET",
-    "POST",
-]
-allowed_origins = ["*"]
-enabled = true
-max_age_seconds = 3600
-
-[network.web_api.documentation]
-description = "Amateur Radio Software API"
-enabled = true
-path = "/docs"
-title = "Pancetta API"
-version = "1.0.0"
-
-[network.web_api.rate_limiting]
-burst_allowance = 10
-by_api_key = false
-by_ip = true
-enabled = true
-requests_per_minute = 60
-
 [network.wsjtx_udp]
 accept_udp_requests = false
 allow_tx_initiation = false
@@ -424,39 +350,6 @@ enabled = false
 instance_id = "WSJT-X - pancetta"
 multicast_interface = ""
 multicast_ttl = 3
-
-[network.wspr]
-database_url = "http://wsprnet.org/drupal/wsprnet/spotquery"
-download_spots = false
-enabled = false
-upload_spots = false
-
-[network.wspr.analysis]
-antenna_analysis = false
-band_comparison = false
-export_analysis = false
-propagation_analysis = false
-
-[network.wspr.filtering]
-bands = [
-    "40m",
-    "30m",
-    "20m",
-]
-max_drift_hz = 3.0
-min_snr = -30.0
-time_window_hours = 24
-
-[network.wspr.filtering.geographic]
-exclude_cq_zones = []
-exclude_dxcc = []
-exclude_itu_zones = []
-include_cq_zones = []
-include_dxcc = []
-include_itu_zones = []
-
-[network.wspr.filtering.geographic.distance]
-great_circle = true
 
 [rig]
 mode = "FT8"
@@ -656,13 +549,6 @@ disable_parallax = false
 reduce_animations = false
 static_backgrounds = false
 
-[ui.accessibility.sound_feedback]
-alerts = true
-button_clicks = false
-enabled = false
-status_changes = true
-volume = 0.5
-
 [ui.accessibility.visual_indicators]
 change_animation = true
 color_coding = true
@@ -755,25 +641,6 @@ secondary = "#6b7280"
 selected = "#1e40af"
 
 [ui.custom_widgets]
-
-[ui.keyboard]
-conflict_resolution = "warn_user"
-global_shortcuts = false
-show_hints = true
-
-[ui.keyboard.shortcuts.connect]
-action = "rig.connect"
-context = "main_window"
-description = "Connect to rig"
-enabled = true
-keys = "Ctrl+Shift+C"
-
-[ui.keyboard.shortcuts.quit]
-action = "application.quit"
-context = "global"
-description = "Quit application"
-enabled = true
-keys = "Ctrl+Q"
 
 [ui.logging]
 auto_scroll = true

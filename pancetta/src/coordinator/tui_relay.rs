@@ -4141,12 +4141,7 @@ impl super::ApplicationCoordinator {
             },
             ui: pancetta_tui::config::UiConfig {
                 theme: pancetta_tui::Theme::Dark,
-                refresh_rate: 30,
-                max_messages: 100,
-                show_waterfall: true,
                 show_coordinates: true,
-                time_format: pancetta_tui::config::TimeFormat::UTC24,
-                frequency_format: pancetta_tui::config::FrequencyFormat::MHz,
             },
             audio: pancetta_tui::config::AudioConfig {
                 device: Some(tui_config_lock.audio.input_device.clone()),
