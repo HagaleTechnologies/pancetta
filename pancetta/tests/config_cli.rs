@@ -311,6 +311,35 @@ fn generate_creates_missing_parent_directories_owner_only() {
 }
 
 #[test]
+fn doctor_lists_field_checks() {
+    let scratch = Scratch::new();
+    let out = scratch.command().arg("doctor").output().unwrap();
+    let text = stdout(&out);
+    assert!(text.contains("10 checks"), "{text}");
+    let labels = [
+        "config",
+        "system clock",
+        "audio input device",
+        "audio level (2 s)",
+        "ft8_lib decoder",
+        "rig / rigctld",
+        "ft8_lib submodule",
+        "network services",
+        "log disk space",
+        "microphone permission",
+    ];
+    let rows: Vec<_> = text.lines().filter(|line| line.starts_with('[')).collect();
+    assert_eq!(rows.len(), labels.len(), "{text}");
+    for (row, label) in rows.iter().zip(labels) {
+        assert!(row.contains(label), "{row}");
+    }
+    assert!(text.contains("not applicable on this OS") || cfg!(target_os = "macos"));
+    for line in text.lines().filter(|line| line.contains("fix:")) {
+        assert!(line.starts_with("       fix: "));
+    }
+}
+
+#[test]
 fn doctor_missing_config_exits_2() {
     let s = Scratch::new();
     for explicit in [false, true] {
@@ -334,7 +363,7 @@ fn assert_doctor_json(out: &std::process::Output, verdict: &str, code: i32) {
     assert_eq!(report["exit_code"], code);
     assert!(report["config_path"].is_string());
     let checks = report["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 7);
+    assert_eq!(checks.len(), 10);
     for check in checks {
         assert!(check["name"].is_string());
         assert!(["PASS", "WARN", "FAIL"].contains(&check["status"].as_str().unwrap()));

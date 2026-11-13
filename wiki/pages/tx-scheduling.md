@@ -180,6 +180,17 @@ lead that window is an 80 ms race. Send the frame 4 to 10 s into a slot, so it
 targets the next slot and waits the full lead, and act on the first
 `SetPtt(true)`. `pancetta/src/coordinator/tx/abort_transcripts.rs` does this.
 
+## Replaying playback and stall tests
+
+PAN-325 gives `QsoManager` and the TX worker an injected UTC source, with
+`Utc::now` as the production default. The pan72 stall tests create every manager
+at the same even-slot origin. The pan71 playback tests derive UTC from paused
+Tokio time and use current-thread runtimes. Advance Tokio time to choose a slot;
+changing a test timestamp alone does not move the worker's clock. The arm clock
+remains separate because it models remote authorization, not slot scheduling.
+`scripts/pan325_load_loop.sh` repeats both groups while a build runs in a separate
+target directory, so Cargo's target lock cannot serialize away the load.
+
 ## Real-worker integration tests
 
 CoordSim lives in `pancetta/tests/common/mod.rs` and drives the production TX

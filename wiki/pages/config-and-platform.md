@@ -110,12 +110,21 @@ the TUI render loop. These settings require restart. See
 [tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).
 
 Microphone diagnosis gotcha (PAN-266): `doctor` queries the running process's
-AVFoundation audio authorization only after a successful silent capture.
+AVFoundation audio authorization independently in its microphone-permission row.
+The audio-level row also uses it after a successful silent capture.
 Silence alone does not prove missing permission. Authorized or unknown status
 keeps the generic FLAT LINE advice; zero captured samples remain a capture error.
 macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
+
+Service readiness gotcha (PAN-335): spawning an audio thread or decoder task
+does not mean initialization succeeded. Owner readiness must follow successful
+stream start or decoder construction and clear on owner exit. READY also waits
+for full startup and the rig loop. The watchdog sends only after completed
+coordinator health passes, so a second heartbeat task would hide the failure
+it is supposed to detect. Receive-only systemd host qualification is still
+pending. See [the service liveness decision](../../docs/DECISIONS/config-and-platform.md#service-liveness-and-field-diagnostics-pan-335-2026-11-12).
 
 Rig-model gotcha (PAN-340): **`rig.model` resolves through one offline
 catalog, and that catalog is not the qualification table.** Acceptance comes

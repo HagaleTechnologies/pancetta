@@ -99,6 +99,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 
 [dev-dependencies]
+tokio = { version = "1.50", features = ["test-util"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 async-trait = "0.1"
 ratatui = "0.30"
@@ -127,6 +128,9 @@ ft2 = ["pancetta-ft8/ft2"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.5"
 
 [[test]]
 name = "coord_sim"

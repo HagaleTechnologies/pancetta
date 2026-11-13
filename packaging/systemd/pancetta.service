@@ -1,8 +1,8 @@
 # systemd unit for running pancetta as an unattended FT8 station appliance
 # (Linux / MiniPC). This is the SUPPORTED way to keep the station on-air
-# unattended: it restarts pancetta automatically if it ever exits or crashes —
-# including a native abort from the vendored ft8_lib C decoder, which no
-# in-process Rust panic handler can catch.
+# unattended: it restarts pancetta after an exit, crash or stalled health monitor.
+# Readiness waits for pipeline initialization; the watchdog checks health passes.
+# A native abort from ft8_lib is also recovered by restarting the process.
 #
 # Install (user service, recommended — runs as your login user so it sees your
 # ~/.pancetta config and audio/rig devices):
@@ -21,9 +21,18 @@ Description=Pancetta autonomous FT8 station
 Documentation=https://github.com/HagaleTechnologies/pancetta
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# READY follows initialized audio, DSP/decoder and rig, then completed startup.
+TimeoutStartSec=120
+# SIGTERM preserves the normal PTT-off drain; a wedged runtime gets 45 s to stop.
+WatchdogSec=60
+WatchdogSignal=SIGTERM
+TimeoutStopSec=45
 # Adjust to your installed binary path (e.g. /usr/local/bin/pancetta or
 # %h/.cargo/bin/pancetta). %h expands to the user's home directory.
 ExecStart=%h/.cargo/bin/pancetta --headless
@@ -35,8 +44,6 @@ KillMode=mixed
 # backoff. The rate limiter stops a hard crash-loop from hammering the rig.
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=5
 # Lightweight hardening (the station only needs its own files + audio/rig).
 NoNewPrivileges=true
 # Keep the process from being OOM-killed before less-important services.

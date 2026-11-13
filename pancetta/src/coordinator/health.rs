@@ -446,7 +446,10 @@ impl super::ApplicationCoordinator {
         let component_status = self.component_status.clone();
         let shared_summary = self.degraded_summary.clone();
         let audit = self.audit_log();
-        let mut health_interval = interval(Duration::from_secs(5));
+        let service_notify = self.service_notify.clone();
+        let rig_ready = self.hamlib_command_loop_ready.clone();
+        let rig_disabled = !self.config.read().await.rig.interface.enabled;
+        let mut health_interval = interval(service_notify.period());
         // PAN-104: a late tick never triggers a catch-up burst of passes.
         health_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -471,7 +474,13 @@ impl super::ApplicationCoordinator {
                         None => info!("Degraded state cleared"),
                     }
                 }
+                service_notify.completed_pass(
+                    rig_disabled || rig_ready.load(Ordering::Acquire),
+                    &shutdown,
+                    Instant::now(),
+                );
             }
+            service_notify.stopping();
 
             Ok(())
         })
@@ -1111,6 +1120,81 @@ mod supervisor_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn notify_waits_for_pipeline_initialization() {
+        use super::super::service_notify::{Event, ServiceNotify};
+        let mut coordinator = test_coordinator().await;
+        let events = Arc::new(std::sync::Mutex::new(vec![]));
+        let capture = events.clone();
+        coordinator.service_notify = Arc::new(ServiceNotify::with_sender(
+            Some(std::time::Duration::from_millis(20)),
+            Arc::new(move |event| {
+                capture.lock().unwrap().push(event);
+                Ok(())
+            }),
+        ));
+        let notify = coordinator.service_notify.clone();
+        tokio::time::pause();
+        let monitor = coordinator.start_health_monitor().await;
+        tokio::task::yield_now().await;
+        for flag in [&notify.audio, &notify.dsp, &notify.decoder] {
+            flag.store(true, Ordering::Release);
+            tokio::time::advance(std::time::Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
+            assert!(events.lock().unwrap().is_empty());
+        }
+        notify.startup.store(true, Ordering::Release);
+        tokio::time::advance(std::time::Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(events.lock().unwrap().first(), Some(&Event::Ready));
+        notify.audio.store(false, Ordering::Release);
+        tokio::time::advance(std::time::Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == Event::Ready)
+                .count(),
+            1
+        );
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+        monitor.await.unwrap().unwrap();
+        assert_eq!(events.lock().unwrap().last(), Some(&Event::Stopping));
+    }
+    #[tokio::test]
+    async fn stalled_monitor_sends_no_heartbeat() {
+        use super::super::service_notify::ServiceNotify;
+        let mut coordinator = test_coordinator().await;
+        let events = Arc::new(std::sync::Mutex::new(vec![]));
+        let capture = events.clone();
+        coordinator.service_notify = Arc::new(ServiceNotify::with_sender(
+            Some(std::time::Duration::from_millis(20)),
+            Arc::new(move |event| {
+                capture.lock().unwrap().push(event);
+                Ok(())
+            }),
+        ));
+        let notify = coordinator.service_notify.clone();
+        notify.startup.store(true, Ordering::Release);
+        for flag in [&notify.audio, &notify.dsp, &notify.decoder] {
+            flag.store(true, Ordering::Release);
+        }
+        tokio::time::pause();
+        let monitor = coordinator.start_health_monitor().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(35)).await;
+        tokio::task::yield_now().await;
+        monitor.abort();
+        let _ = monitor.await;
+        let count = events.lock().unwrap().len();
+        assert!(count >= 2);
+        tokio::time::advance(std::time::Duration::from_millis(40)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(events.lock().unwrap().len(), count);
     }
 
     /// `TxInhibitGuard`'s OWN Drop semantics in isolation (increments on
