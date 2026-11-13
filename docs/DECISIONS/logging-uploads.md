@@ -131,3 +131,23 @@ lane; record rejection marks its entry; queue refusal, missing cqdx
 payload, ADIF render failure and a closed queue mark targets failed. A
 pending queue write never implies acceptance. The registry never changes
 queue policy; the TUI relay snapshots it on the 2 s health tick.
+
+## Offline ADIF entity fields (PAN-306, unreleased)
+
+The shared `AdifProcessor::qso_to_adif` converter resolves the contacted
+station's callsign through `pancetta_core::dxcc`. COUNTRY uses the existing
+display entity name and DXCC its registry ADIF ID. CQZ and ITUZ use pinned
+cty.dat header defaults with independent prefix and full exact-call overrides.
+The existing entity resolver remains authoritative. A zone candidate from a
+different entity supplies no zones. Unknown, missing or unresolved hash calls
+supply no inferred fields.
+
+Stored metadata tags override inference independently for these four fields,
+case-insensitively. Conversion canonicalizes their keys to uppercase. If several
+case variants exist, the uppercase key wins, otherwise the lexicographically
+first key wins. Other tags and imported type indicators keep their behavior.
+This supplies live appends, exports, ADIF uploads and WSJT-X LoggedADIF through
+one converter. Existing files are not rewritten at startup; old metadata can
+gain missing fields when explicitly exported. No network lookup or schema
+migration is involved. Automated converter and durable-writer tests cover this
+behavior; live upload and on-air qualification remain pending.
