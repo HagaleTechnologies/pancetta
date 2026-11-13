@@ -481,12 +481,17 @@ pub struct StationAgentConfig {
     /// Relay WebSocket URL (e.g. `wss://relay.example/…`) the agent connects to
     /// for remote control. `None` (default) → the component stays inert. Required
     /// when [`enabled`](Self::enabled) is `true`.
+    /// Requires `wss://`; `ws://` is allowed only for localhost or a loopback IP,
+    /// with an unencrypted-link warning. Supplied URLs are checked even when disabled.
     #[serde(default)]
     pub relay_url: Option<String>,
 
     /// Base URL for the pairing HTTP POSTs (device pairing / capability fetch).
     /// `None` (default) → the agent cannot pair. Required when
     /// [`enabled`](Self::enabled) is `true`.
+    ///
+    /// Requires `https://`; `http://` is allowed only for localhost or a loopback IP,
+    /// with an unencrypted-link warning. Checked even when disabled and for CLI overrides.
     ///
     /// This **MUST include the API base path** (e.g. `https://host/api/v1`)
     /// because the pairing client posts *relative* `/pair/*` paths onto it
@@ -524,6 +529,52 @@ pub struct StationAgentConfig {
     /// key in this local list. The operator may populate it after pairing.
     #[serde(default)]
     pub tx_allow_list: Vec<String>,
+}
+
+impl StationAgentConfig {
+    /// Validate a pairing endpoint before identity creation or enrollment.
+    ///
+    /// Plain HTTP is permitted only on loopback and emits a transport warning.
+    pub fn validate_pairing_api_url(value: &str) -> ConfigResult<()> {
+        validate_station_agent_url(value, "pairing_api_url", "https", "http")
+    }
+}
+
+/// Parse before comparing schemes or hosts; never use DNS to grant loopback access.
+fn validate_station_agent_url(
+    value: &str,
+    field: &str,
+    secure: &str,
+    plaintext: &str,
+) -> ConfigResult<()> {
+    let invalid_url = || {
+        ConfigError::Validation(format!(
+            "network.station_agent.{field} must be a valid absolute URL with a host"
+        ))
+    };
+    if value != value.trim() {
+        return Err(invalid_url());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| invalid_url())?;
+    let host = parsed.host().ok_or_else(invalid_url)?;
+    if parsed.scheme() == secure {
+        return Ok(());
+    }
+    let loopback = match host {
+        url::Host::Domain(name) => name == "localhost",
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if parsed.scheme() != plaintext || !loopback {
+        return Err(ConfigError::Validation(format!(
+            "network.station_agent.{field} must use {secure}://; {plaintext}:// is allowed only for loopback hosts"
+        )));
+    }
+    tracing::warn!(
+        target: "config.station_agent",
+        "network.station_agent.{field} uses an unencrypted loopback link; use {secure}:// for encrypted transport"
+    );
+    Ok(())
 }
 
 /// PSKReporter service configuration
@@ -1832,6 +1883,13 @@ impl ConfigSection for NetworkConfig {
                     )));
                 }
             }
+        }
+
+        if let Some(value) = &self.station_agent.relay_url {
+            validate_station_agent_url(value, "relay_url", "wss", "ws")?;
+        }
+        if let Some(value) = &self.station_agent.pairing_api_url {
+            StationAgentConfig::validate_pairing_api_url(value)?;
         }
 
         // An empty `tx_allow_list` is NOT a hard error (the operator may add
