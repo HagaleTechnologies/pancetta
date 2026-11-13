@@ -101,3 +101,15 @@ Single and summed-bundle playback rechecks the same gate about every 50 ms. Deni
 PTT before confirmed audio flush and reports failure after acknowledgment, independently of
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
+
+## Local client TX trust (PAN-309)
+
+Pairing does not write client trust keys. `pancetta trust-client <keyId>
+--key-file <path>` writes `clients/<keyId>.pub`; `untrust-client` removes it.
+TX eligibility is local keys intersected with cqdx owner edges or the current
+static admission list. Cloud polls and static trust refreshes use the same
+atomic publisher and the same mutually exclusive task slot, so teardown
+aborts either mode. Static config removals hold the arm lock through the
+admission publish to prevent a refresh from restoring stale eligibility.
+Release device-key read guards before acquiring the arm lock, since the
+publisher writes keys while holding that lock. Audit writes follow unlock.

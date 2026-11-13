@@ -319,6 +319,8 @@ pub enum DisarmReason {
     /// must retroactively disarm rather than leave the live grant to run out
     /// its TTL.
     AuthorizationRevoked,
+    /// The operator removed the controller's station-local device key.
+    LocalTrustRevoked,
 }
 
 impl DisarmReason {
@@ -332,6 +334,7 @@ impl DisarmReason {
             DisarmReason::HeartbeatLost => "heartbeat-lost",
             DisarmReason::ComponentCrash => "component-crash",
             DisarmReason::AuthorizationRevoked => "authorization-revoked",
+            DisarmReason::LocalTrustRevoked => "local-trust-revoked",
         }
     }
 }
@@ -832,7 +835,8 @@ impl ArmState {
             Some(
                 DisarmReason::OperatorDisarm
                 | DisarmReason::ComponentCrash
-                | DisarmReason::AuthorizationRevoked,
+                | DisarmReason::AuthorizationRevoked
+                | DisarmReason::LocalTrustRevoked,
             ) => {
                 return TxPermit::Denied(DenyReason::NotArmed);
             }

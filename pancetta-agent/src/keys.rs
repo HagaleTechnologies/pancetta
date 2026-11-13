@@ -44,26 +44,26 @@ const AGREEMENT_KEY_FILE: &str = "agreement.key";
 /// full ACL hardening (matching Unix's belt-and-suspenders re-tightening on
 /// every persist) would need an explicit ACL-manipulation dependency and is
 /// tracked as a follow-up, not attempted here.
-mod perms {
+pub(crate) mod perms {
     use std::io;
     use std::path::Path;
 
     /// Tighten `dir`'s permissions to 0700 (owner rwx only) on Unix.
     #[cfg(unix)]
-    pub(super) fn tighten_dir(dir: &Path) -> io::Result<()> {
+    pub(crate) fn tighten_dir(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
     }
 
     #[cfg(not(unix))]
-    pub(super) fn tighten_dir(_dir: &Path) -> io::Result<()> {
+    pub(crate) fn tighten_dir(_dir: &Path) -> io::Result<()> {
         Ok(())
     }
 
     /// Open `path` for writing, created with mode 0600 on Unix (no umask-wide
     /// window between create and chmod). On Windows, plain `OpenOptions`
     /// (relies on the parent directory's inherited ACLs — see the module doc).
-    pub(super) fn create_key_file(path: &Path) -> io::Result<std::fs::File> {
+    pub(crate) fn create_key_file(path: &Path) -> io::Result<std::fs::File> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -78,13 +78,13 @@ mod perms {
     /// re-persist (pre-existing file) case where the create-mode above is a
     /// no-op. No-op on Windows — see the module doc.
     #[cfg(unix)]
-    pub(super) fn tighten_file(path: &Path) -> io::Result<()> {
+    pub(crate) fn tighten_file(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
     }
 
     #[cfg(not(unix))]
-    pub(super) fn tighten_file(_path: &Path) -> io::Result<()> {
+    pub(crate) fn tighten_file(_path: &Path) -> io::Result<()> {
         Ok(())
     }
 }
