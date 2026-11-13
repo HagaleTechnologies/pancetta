@@ -125,9 +125,7 @@ pub struct TuiRunner {
     #[cfg(test)]
     dispatched: Vec<crate::keymap::Action>,
     /// Frame rate limiter
-    last_render: Instant,
-    /// Target FPS
-    target_fps: u32,
+    redraw: RedrawSchedule,
     /// Performance metrics
     metrics: TuiMetrics,
 }
@@ -754,6 +752,93 @@ struct TuiMetrics {
     dropped_frames: u64,
 }
 
+// Monotonic deadlines are supplied by the loop, so delays coalesce clock ticks.
+struct RedrawSchedule {
+    dirty: bool,
+    urgent: bool,
+    last_draw: Option<Instant>,
+    next_tick: Instant,
+}
+
+impl RedrawSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            dirty: true,
+            urgent: true,
+            last_draw: None,
+            next_tick: now + Duration::from_secs(1),
+        }
+    }
+    fn request(&mut self, urgent: bool) {
+        self.dirty = true;
+        self.urgent |= urgent;
+    }
+    fn due(&mut self, now: Instant) -> bool {
+        if now >= self.next_tick {
+            self.request(true);
+            self.next_tick += Duration::from_secs(now.duration_since(self.next_tick).as_secs() + 1);
+        }
+        self.dirty
+            && (self.urgent
+                || self
+                    .last_draw
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(33)))
+    }
+    fn drawn(&mut self, now: Instant) {
+        self.dirty = false;
+        self.urgent = false;
+        self.last_draw = Some(now);
+    }
+    fn wait(&self, now: Instant) -> Duration {
+        let deadline = if self.dirty {
+            if self.urgent {
+                now
+            } else {
+                self.last_draw
+                    .map_or(now, |last| last + Duration::from_millis(33))
+            }
+        } else {
+            self.next_tick
+        };
+        deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(50))
+    }
+}
+
+fn begin_frame(writer: &mut impl Write) -> io::Result<()> {
+    crossterm::queue!(writer, crossterm::terminal::BeginSynchronizedUpdate)
+}
+fn end_frame(writer: &mut impl Write) -> io::Result<()> {
+    let end = crossterm::queue!(writer, crossterm::terminal::EndSynchronizedUpdate);
+    let flush = writer.flush();
+    end.and(flush)
+}
+fn record_terminal_size<B: Backend>(
+    app: &mut App,
+    terminal: &Terminal<B>,
+) -> std::result::Result<(), B::Error> {
+    let size = terminal.size()?;
+    app.terminal_size = (size.width, size.height);
+    Ok(())
+}
+
+// The output owner is borrowed only inside each operation, never across draw.
+fn synchronized_frame<T, R>(
+    output: &mut T,
+    begin: impl FnOnce(&mut T) -> io::Result<()>,
+    draw: impl FnOnce(&mut T) -> io::Result<R>,
+    end: impl FnOnce(&mut T) -> io::Result<()>,
+) -> io::Result<R> {
+    begin(output)?;
+    let drawn = draw(output);
+    let ended = end(output);
+    match drawn {
+        Err(error) => Err(error),
+        Ok(value) => ended.map(|()| value),
+    }
+}
+
 impl TuiRunner {
     /// Create new TUI runner
     pub fn new(
@@ -778,6 +863,12 @@ impl TuiRunner {
         // the alternate screen. clear() resets the back buffer so every cell
         // is written on the next draw.
         terminal.clear()?;
+        record_terminal_size(
+            &mut *app
+                .try_write()
+                .map_err(|_| anyhow::anyhow!("App locked during terminal startup"))?,
+            &terminal,
+        )?;
 
         Ok(Self {
             app,
@@ -791,8 +882,7 @@ impl TuiRunner {
             last_input_ms,
             #[cfg(test)]
             dispatched: Vec::new(),
-            last_render: Instant::now(),
-            target_fps: 30,
+            redraw: RedrawSchedule::new(Instant::now()),
             metrics: TuiMetrics::default(),
         })
     }
@@ -824,8 +914,7 @@ impl TuiRunner {
             shutdown,
             last_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dispatched: Vec::new(),
-            last_render: Instant::now(),
-            target_fps: 30,
+            redraw: RedrawSchedule::new(Instant::now()),
             metrics: TuiMetrics::default(),
         })
     }
@@ -834,105 +923,23 @@ impl TuiRunner {
     pub async fn run(mut self) -> Result<()> {
         info!("Starting TUI main loop");
 
-        let frame_duration = Duration::from_millis(1000 / self.target_fps as u64);
-        let mut event_timeout = Duration::from_millis(50);
-
         loop {
-            // Check shutdown signal
             if self.shutdown.load(Ordering::Relaxed) {
-                info!("TUI shutdown requested");
                 break;
             }
-
-            // Perf (Pass 1 / infra-A6): snapshot the cumulative message count
-            // so the adaptive timeout below can test RECENT activity (this
-            // iteration) rather than lifetime total. The old test
-            // `messages_processed > 0` is monotonic — true forever after the
-            // first message — which pinned the poll timeout at 10ms for the
-            // whole session and defeated the intended 50ms idle cadence.
-            let msgs_before = self.metrics.messages_processed;
-
-            // Process incoming messages (non-blocking)
+            let before = self.metrics.messages_processed;
             self.process_messages().await?;
-
-            // Handle user input (with timeout)
-            if event::poll(event_timeout)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        if !self.handle_key_event(key).await? {
-                            info!("TUI exit: user quit (key={:?})", key.code);
-                            break;
-                        }
-                    }
-                    Event::Mouse(mouse_event) => {
-                        let cmd = {
-                            let mut app = self.app.write().await;
-                            app.handle_mouse_event(mouse_event).await?
-                        };
-                        // Task 19: click-to-park (TxPlacement strip) is the
-                        // one mouse interaction that sends a `TuiCommand` —
-                        // `App` doesn't own `message_tx` (same reason every
-                        // key-event command send lives here, not in
-                        // `app.rs`), so it hands the command back for us to
-                        // send once the write lock is released.
-                        if let Some(cmd) = cmd {
-                            self.message_tx.send(cmd)?;
-                        }
-                    }
-                    Event::FocusLost => {
-                        info!("TUI received FocusLost event");
-                    }
-                    _ => {}
-                }
+            let mut wait = self.redraw.wait(Instant::now());
+            if self.metrics.messages_processed > before {
+                wait = wait.min(Duration::from_millis(10));
             }
-
-            // Render frame if needed (rate limited)
-            if self.last_render.elapsed() >= frame_duration {
-                let render_start = Instant::now();
-
-                // FCC §97.221 presence prompt: if autonomous mode is enabled but
-                // the operator has been idle past the presence window, the
-                // coordinator is suppressing autonomous initiation. Flag it so
-                // the title bar prompts the operator to press a key. Mirrors the
-                // coordinator's OPERATOR_PRESENCE_WINDOW (120 s).
-                {
-                    const PRESENCE_WINDOW_MS: u64 = 120_000;
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let last = self
-                        .last_input_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let stale = last == 0 || now_ms.saturating_sub(last) >= PRESENCE_WINDOW_MS;
-                    let mut app = self.app.write().await;
-                    let auto_on = app
-                        .autonomous_status
-                        .as_ref()
-                        .map(|s| s.enabled)
-                        .unwrap_or(false);
-                    app.autonomous_init_paused = auto_on && stale;
-                }
-
-                self.render_frame().await?;
-
-                let render_time = render_start.elapsed();
-                self.update_metrics(render_time);
-
-                self.last_render = Instant::now();
-            } else {
-                // Small yield to prevent busy waiting
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            if event::poll(wait)? && !self.dispatch_event(event::read()?).await? {
+                break;
             }
-
-            // Adaptive timeout based on RECENT activity (messages processed this
-            // iteration), not lifetime total — so an idle TUI actually falls
-            // back to the 50ms cadence instead of spinning at 10ms forever.
-            event_timeout = if self.metrics.messages_processed > msgs_before {
-                Duration::from_millis(10) // More responsive when active
-            } else {
-                Duration::from_millis(50) // Less CPU when idle
-            };
+            self.iteration(Instant::now(), |runner| {
+                Box::pin(async move { runner.render_frame().await })
+            })
+            .await?;
         }
 
         self.cleanup()?;
@@ -941,6 +948,64 @@ impl TuiRunner {
             self.metrics.frames_rendered, self.metrics.messages_processed
         );
         Ok(())
+    }
+
+    async fn dispatch_event(&mut self, event: Event) -> Result<bool> {
+        match event {
+            Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                self.redraw.request(true);
+                return self.handle_key_event(key).await;
+            }
+            Event::Mouse(mouse)
+                if !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved) =>
+            {
+                let cmd = self.app.write().await.handle_mouse_event(mouse).await?;
+                if let Some(cmd) = cmd {
+                    self.message_tx.send(cmd)?;
+                }
+                self.redraw.request(true);
+            }
+            Event::Resize(width, height) => {
+                self.app.write().await.handle_resize(width, height).await?;
+                self.redraw.request(true);
+            }
+            Event::FocusGained => self.redraw.request(true),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    async fn iteration<F>(&mut self, now: Instant, draw: F) -> Result<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut Self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
+        >,
+    {
+        if !self.redraw.due(now) {
+            return Ok(());
+        }
+        let start = Instant::now();
+        draw(self).await?;
+        self.redraw.drawn(now);
+        self.update_metrics(start.elapsed());
+        Ok(())
+    }
+
+    async fn prepare_frame(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_input_ms.load(Ordering::Relaxed);
+        let mut app = self.app.write().await;
+        app.autonomous_init_paused = app.autonomous_status.as_ref().is_some_and(|s| s.enabled)
+            && (last == 0 || now_ms.saturating_sub(last) >= 120_000);
+        app.prune_status();
+        app.refresh_dx_need(self.dx_need_lookup.as_deref());
+        app.clamp_dx_hunter_selection();
+        app.clamp_callers_selection();
     }
 
     /// Process incoming messages from message bus
@@ -957,6 +1022,7 @@ impl TuiRunner {
                         debug!("TUI process_messages: received DecodedMessage");
                     }
                     self.handle_message(message).await?;
+                    self.redraw.request(false);
                     message_count += 1;
                     self.metrics.messages_processed += 1;
                 }
@@ -2849,73 +2915,92 @@ impl TuiRunner {
 
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
+        self.prepare_frame().await;
         let mut app = self.app.write().await;
-        app.prune_status();
-        app.refresh_dx_need(self.dx_need_lookup.as_deref());
-
         let Some(terminal) = self.terminal.as_mut() else {
             // Headless mode (unit tests) — nothing to render.
             return Ok(());
         };
-        terminal.draw(|f| {
-            // Use the rich ui::draw for the full frame
-            if let Err(e) = crate::ui::draw(f, &app) {
-                // Fallback: render a minimal error message
-                let error_text = format!("Render error: {}", e);
-                let paragraph = Paragraph::new(error_text).style(Style::default().fg(Color::Red));
-                f.render_widget(paragraph, f.area());
-            }
-
-            // Render device selection modal overlay if visible
-            if app.device_selection.visible {
-                TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
-            }
-
-            // Render rig config picker modal overlay if visible (PAN-59)
-            if app.rig_selection.visible {
-                TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
-            }
-
-            // Render help overlay if visible
-            if app.help_visible {
-                TuiRunner::render_help_overlay(f, f.area(), app.help_scroll);
-            }
-
-            // Render operator-stop banner if active. Drawn before the
-            // quit-confirm overlay so the latter sits on top — Q-press
-            // then q-press should still let the operator quit.
-            if app.stopped_by_operator {
-                TuiRunner::render_stopped_by_operator_banner(f, f.area());
-            }
-
-            // Render quit-confirm overlay if visible (drawn last so it sits on top)
-            if app.quit_confirm_visible {
-                TuiRunner::render_quit_confirm_overlay(f, f.area());
-            }
-
-            // Render freq/split/offset modals (out-of-band ack has priority;
-            // then freq modal; then offset modal — only one visible at a time).
-            if app.out_of_band_ack_visible {
-                crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
-            } else if app.freq_modal.visible {
-                crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
-            } else if app.watchlist_modal.visible {
-                crate::ui::render_watchlist_modal(f, f.area(), &app.watchlist_modal);
-            } else if app.offset_modal.visible {
-                crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
-            } else if app.show_diagnostics {
-                crate::ui::render_diagnostics_overlay(f, f.area(), &app);
-            } else if app.show_health {
-                crate::ui::render_health_panel(f, f.area(), &app);
-            } else if app.show_recent_qsos {
-                crate::ui::render_recent_qsos_panel(f, f.area(), &app);
-            } else if app.show_why {
-                crate::ui::why::render_why_overlay(f, f.area(), &mut app);
-            }
-        })?;
+        Self::draw_terminal(terminal, &mut app)?;
 
         self.metrics.frames_rendered += 1;
         Ok(())
+    }
+
+    fn draw_terminal<W: Write>(
+        terminal: &mut Terminal<CrosstermBackend<W>>,
+        app: &mut App,
+    ) -> io::Result<()> {
+        synchronized_frame(
+            terminal,
+            |t| begin_frame(t.backend_mut()),
+            |terminal| {
+                terminal
+                    .draw(|f| {
+                        // Use the rich ui::draw for the full frame
+                        if let Err(e) = crate::ui::draw(f, app) {
+                            // Fallback: render a minimal error message
+                            let error_text = format!("Render error: {}", e);
+                            let paragraph =
+                                Paragraph::new(error_text).style(Style::default().fg(Color::Red));
+                            f.render_widget(paragraph, f.area());
+                        }
+
+                        // Render device selection modal overlay if visible
+                        if app.device_selection.visible {
+                            TuiRunner::render_device_selection_modal(
+                                f,
+                                f.area(),
+                                &app.device_selection,
+                            );
+                        }
+
+                        // Render rig config picker modal overlay if visible (PAN-59)
+                        if app.rig_selection.visible {
+                            TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
+                        }
+
+                        // Render help overlay if visible
+                        if app.help_visible {
+                            TuiRunner::render_help_overlay(f, f.area(), app.help_scroll);
+                        }
+
+                        // Render operator-stop banner if active. Drawn before the
+                        // quit-confirm overlay so the latter sits on top — Q-press
+                        // then q-press should still let the operator quit.
+                        if app.stopped_by_operator {
+                            TuiRunner::render_stopped_by_operator_banner(f, f.area());
+                        }
+
+                        // Render quit-confirm overlay if visible (drawn last so it sits on top)
+                        if app.quit_confirm_visible {
+                            TuiRunner::render_quit_confirm_overlay(f, f.area());
+                        }
+
+                        // Render freq/split/offset modals (out-of-band ack has priority;
+                        // then freq modal; then offset modal — only one visible at a time).
+                        if app.out_of_band_ack_visible {
+                            crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
+                        } else if app.freq_modal.visible {
+                            crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
+                        } else if app.watchlist_modal.visible {
+                            crate::ui::render_watchlist_modal(f, f.area(), &app.watchlist_modal);
+                        } else if app.offset_modal.visible {
+                            crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
+                        } else if app.show_diagnostics {
+                            crate::ui::render_diagnostics_overlay(f, f.area(), app);
+                        } else if app.show_health {
+                            crate::ui::render_health_panel(f, f.area(), app);
+                        } else if app.show_recent_qsos {
+                            crate::ui::render_recent_qsos_panel(f, f.area(), app);
+                        } else if app.show_why {
+                            crate::ui::why::render_why_overlay(f, f.area(), app);
+                        }
+                    })
+                    .map(|_| ())
+            },
+            |t| end_frame(t.backend_mut()),
+        )
     }
 
     /// Render device selection modal as an overlay
@@ -3478,7 +3563,7 @@ impl TuiRunner {
         }
 
         // Check for dropped frames
-        let target_frame_time = 1000.0 / self.target_fps as f64;
+        let target_frame_time = 1000.0 / 30.0;
         if render_ms > target_frame_time {
             self.metrics.dropped_frames += 1;
             debug!("Dropped frame: render took {:.2}ms", render_ms);
@@ -3986,6 +4071,368 @@ mod key_tests {
         }
     }
 
+    fn counted_draw(
+        runner: &mut TuiRunner,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            runner.prepare_frame().await;
+            let app = runner.app.read().await;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
+                app.terminal_size.0,
+                app.terminal_size.1,
+            ))?;
+            terminal.draw(|f| crate::ui::draw(f, &app).unwrap())?;
+            runner.metrics.frames_rendered += 1;
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn pan319_idle_draws_only_initial_and_clock_ticks() {
+        let (mut runner, _, _) = make_runner().await;
+        let start = Instant::now();
+        runner.redraw = RedrawSchedule::new(start);
+        for ms in (0..=10_000).step_by(10) {
+            runner
+                .iteration(start + Duration::from_millis(ms), counted_draw)
+                .await
+                .unwrap();
+            assert_eq!(runner.metrics.frames_rendered, 1 + ms / 1000);
+        }
+        runner
+            .iteration(start + Duration::from_secs(25), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(runner.metrics.frames_rendered, 12, "late ticks coalesce");
+    }
+
+    #[tokio::test]
+    async fn pan319_input_and_messages_request_redraw() {
+        let (mut r, _, _) = make_runner().await;
+        let start = Instant::now();
+        r.redraw = RedrawSchedule::new(start);
+        r.iteration(start, counted_draw).await.unwrap();
+        r.dispatch_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+        r.iteration(start + Duration::from_millis(1), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(r.metrics.frames_rendered, 2);
+        r.dispatch_event(Event::FocusLost).await.unwrap();
+        r.iteration(start + Duration::from_millis(2), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(r.metrics.frames_rendered, 2);
+        r.dispatch_event(Event::FocusGained).await.unwrap();
+        r.iteration(start + Duration::from_millis(3), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(r.metrics.frames_rendered, 3);
+        r.dispatch_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 2,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+        r.iteration(start + Duration::from_millis(4), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(r.metrics.frames_rendered, 4);
+    }
+
+    #[tokio::test]
+    async fn pan319_message_burst_coalesces_without_losing_dirty() {
+        let (mut r, _, _) = make_runner().await;
+        let start = Instant::now();
+        r.redraw = RedrawSchedule::new(start);
+        r.iteration(start, counted_draw).await.unwrap();
+        let (tx, rx) = unbounded();
+        r.message_rx = rx;
+        for _ in 0..25 {
+            tx.send(TuiMessage::WaterfallUpdate { rows: vec![] })
+                .unwrap();
+        }
+        for ms in [1, 2, 3] {
+            r.process_messages().await.unwrap();
+            r.iteration(start + Duration::from_millis(ms), counted_draw)
+                .await
+                .unwrap();
+            assert!(r.redraw.dirty);
+        }
+        assert_eq!(r.metrics.messages_processed, 25);
+        assert_eq!(r.metrics.frames_rendered, 1);
+        r.iteration(start + Duration::from_millis(33), counted_draw)
+            .await
+            .unwrap();
+        assert_eq!(r.metrics.frames_rendered, 2);
+        assert!(!r.redraw.dirty);
+        r.redraw.request(false);
+        let failed = r
+            .iteration(start + Duration::from_millis(66), |_| {
+                Box::pin(async { anyhow::bail!("draw failed") })
+            })
+            .await;
+        assert!(failed.is_err());
+        assert!(r.redraw.dirty);
+    }
+
+    #[tokio::test]
+    async fn pan319_resize_bypasses_redraw_deadlines() {
+        let (mut r, commands, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            a.active_view = crate::view::ActiveView::Hunt;
+            for i in 0..60 {
+                a.add_dx_spot(
+                    format!("W{i}ABC"),
+                    14.074,
+                    None,
+                    "FT8".into(),
+                    -10,
+                    false,
+                    false,
+                    false,
+                    false,
+                );
+            }
+            for row in a.dx_stations.values_mut() {
+                row.source = crate::app::SpotSource::Local;
+                row.spot_rf_hz = None;
+                row.audio_offset_hz = Some(1500);
+            }
+            a.dx_hunter_scroll = 40;
+            a.clamp_dx_hunter_selection();
+        }
+        let target = app.read().await.get_selected_station().unwrap().0;
+        let start = Instant::now();
+        r.redraw = RedrawSchedule::new(start);
+        r.iteration(start, counted_draw).await.unwrap();
+        for (i, (w, h)) in [(132, 24), (0, 0), (1, 1)].into_iter().enumerate() {
+            r.dispatch_event(Event::Resize(w, h)).await.unwrap();
+            assert_eq!(app.read().await.terminal_size, (w, h));
+            if i == 0 {
+                r.dispatch_event(Event::Key(key(' '))).await.unwrap();
+                assert!(
+                    matches!(commands.try_recv(), Ok(TuiCommand::CallStation { callsign, .. }) if callsign == target)
+                );
+            }
+            r.iteration(start + Duration::from_millis(i as u64 + 1), counted_draw)
+                .await
+                .unwrap();
+        }
+        assert_eq!(r.metrics.frames_rendered, 4);
+        assert_eq!(app.read().await.get_selected_station().unwrap().0, target);
+    }
+
+    #[tokio::test]
+    async fn pan319_initial_size_matches_backend() {
+        let (_, _, app) = make_runner().await;
+        let terminal = Terminal::new(ratatui::backend::TestBackend::new(132, 48)).unwrap();
+        record_terminal_size(&mut *app.write().await, &terminal).unwrap();
+        assert_eq!(app.read().await.terminal_size, (132, 48));
+    }
+
+    #[derive(Default)]
+    struct FrameOutput {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_flush: bool,
+        fail_write: bool,
+        flush_offsets: Vec<usize>,
+    }
+    impl Write for FrameOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            if self.fail_write {
+                return Err(io::Error::other("write"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            self.flush_offsets.push(self.bytes.len());
+            if self.fail_flush {
+                Err(io::Error::other("flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingOutput(Arc<std::sync::Mutex<FrameOutput>>);
+    impl Write for RecordingOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    #[tokio::test]
+    async fn pan319_frame_output_is_synchronized() {
+        let (_, _, app) = make_runner().await;
+        for view in [
+            crate::view::ActiveView::Operate,
+            crate::view::ActiveView::Hunt,
+            crate::view::ActiveView::Run,
+            crate::view::ActiveView::Monitor,
+        ] {
+            let mut a = app.write().await;
+            a.active_view = view;
+            a.help_visible = true;
+            let recording = RecordingOutput::default();
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(recording.clone()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 132, 40)),
+                },
+            )
+            .unwrap();
+            TuiRunner::draw_terminal(&mut terminal, &mut a).unwrap();
+            let output = recording.0.lock().unwrap();
+            assert!(output.bytes.starts_with(b"\x1b[?2026h"));
+            assert!(output.bytes.ends_with(b"\x1b[?2026l"));
+            assert!(output.bytes.windows(4).any(|w| w == b"Help"));
+            // Ratatui flushes inside draw as well; the last flush is ours.
+            assert!(output.flushes >= 2);
+            assert_eq!(output.flush_offsets.last(), Some(&output.bytes.len()));
+        }
+    }
+
+    #[test]
+    fn pan319_draw_error_ends_synchronization() {
+        let mut output = FrameOutput {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let err = synchronized_frame(
+            &mut output,
+            begin_frame,
+            |_| Err::<(), _>(io::Error::other("original draw")),
+            end_frame,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "original draw");
+        assert!(output.bytes.ends_with(b"\x1b[?2026l"));
+        assert_eq!(output.flushes, 1);
+        assert_eq!(
+            synchronized_frame(&mut output, begin_frame, |_| Ok(()), end_frame)
+                .unwrap_err()
+                .to_string(),
+            "flush"
+        );
+        let mut output = FrameOutput::default();
+        let err = synchronized_frame(
+            &mut output,
+            begin_frame,
+            |w| {
+                w.fail_write = true;
+                Ok(())
+            },
+            end_frame,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "write");
+        assert_eq!(
+            output.flushes, 1,
+            "flush is attempted even after an end-marker error"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan319_waterfall_prunes_station_maps() {
+        let (mut r, _, app) = make_runner().await;
+        for rows in [vec![], vec![vec![1.0]; 451]] {
+            {
+                let mut a = app.write().await;
+                for call in ["W5ABC", "w6abc", "<W7ABC>"] {
+                    a.add_dx_spot(
+                        call.into(),
+                        14.074,
+                        None,
+                        "FT8".into(),
+                        -10,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                    a.set_station_state(call, "AR");
+                }
+                a.dx_stations.get_mut("W5ABC").unwrap().last_seen -= chrono::Duration::hours(25);
+                a.set_station_state("W8ABC", "AR");
+                a.dx_hunter_scroll = 40;
+            }
+            r.handle_message(TuiMessage::WaterfallUpdate { rows })
+                .await
+                .unwrap();
+            let a = app.read().await;
+            assert!(!a.dx_stations.contains_key("W5ABC"));
+            assert_eq!(a.station_state_for("W5ABC"), None);
+            assert_eq!(a.station_state_for("W8ABC"), None);
+            for call in ["w6abc", "<W7ABC>"] {
+                assert_eq!(a.station_state_for(call), Some("AR"));
+            }
+            assert!(a.waterfall_data.len() <= 450);
+            assert!(a.dx_hunter_scroll < a.displayed_dx_stations().len());
+        }
+    }
+
+    #[tokio::test]
+    async fn pan319_tick_refreshes_time_dependent_state() {
+        let (mut r, _, app) = make_runner().await;
+        let start = Instant::now();
+        r.redraw = RedrawSchedule::new(start);
+        r.iteration(start, counted_draw).await.unwrap();
+        {
+            let mut a = app.write().await;
+            a.add_error_message("sticky readiness".into());
+            a.clear_status_for_test();
+            a.status_test_push(
+                "expired",
+                pancetta_core::DiagnosticLevel::Info,
+                Instant::now() - Duration::from_secs(6),
+            );
+            a.autonomous_status = Some(crate::app::AutonomousStatus {
+                enabled: true,
+                state: "Hunting".into(),
+                slot_parity: None,
+                listen_counter: "0/5".into(),
+                active_qsos: 0,
+                max_qsos: 1,
+                idle_cycles: 0,
+                band_name: "20m".into(),
+                tx_offset_hz: 1500.0,
+            });
+        }
+        r.iteration(start + Duration::from_secs(1), counted_draw)
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert_eq!(a.status_test_len(), 0);
+        assert!(a.autonomous_init_paused);
+        assert_eq!(a.alerts.len(), 1);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(132, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &a).unwrap()).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("sticky readiness"));
+        assert!(!text.contains("expired"));
+        assert!(text.contains(" UTC"));
+        assert_eq!(r.metrics.frames_rendered, 2);
+    }
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
@@ -4059,13 +4506,15 @@ mod key_tests {
                 false,
             );
         }
-        runner.render_frame().await.unwrap();
+        let now = runner.redraw.next_tick;
+        runner.iteration(now, counted_draw).await.unwrap();
         assert_eq!(
             app.read().await.dx_need_for("W5ABC").unwrap().state_needed,
             Some(true)
         );
         provider.0.store(false, Ordering::Relaxed);
-        runner.render_frame().await.unwrap();
+        let now = runner.redraw.next_tick;
+        runner.iteration(now, counted_draw).await.unwrap();
         let app = app.read().await;
         let need = app.dx_need_for("W5ABC").unwrap();
         assert_eq!(need.grid_needed, Some(false));

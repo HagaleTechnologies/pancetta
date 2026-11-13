@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-319: the TUI redraws on changes and a one-second idle tick, handles resize immediately, and wraps complete frames in synchronized output. DX Hunter formats only visible rows and preserves callsign focus. Waterfall updates prune station and state entries older than 24 hours.
+
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
 - PAN-330: `pancetta-core` now owns the shared radio vocabulary. Prefix-portable decodes such as `EA8/K5ARH DL1ABC -10` are marked directed at us by both the TUI and the remote gateway, every frequency classifier uses the core inclusive band edges (5,357,500 Hz is `60m`; at 5,410,000 Hz cqdx and recording classification now return no band; ADIF writes `60M` at 5,405,000 Hz instead of its old `5MHZ` fallback while keeping uppercase labels at the serialization boundary), Maidenhead validity is one core validator (`ZZ99` is rejected wherever semantics matter), committed-exchange payloads and the CQ-modifier and callsign-token policies have single core implementations, and hamlib/config band keys use the core names.
 - Restore the terminal after TUI startup failures and fatal panics, exit non-zero on TUI errors, and log shutdown component errors at ERROR (PAN-333).
@@ -21,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-354: Missing QSO SNR reports show a muted dash; measured reports share one colour scale across panels. Offset controls and held manual placement accept 200–2800 Hz. Placement zoom shows Assigned ownership without a placeholder Quiet column. Callers keeps its hint inside the border, and short QSO panels show complete priority lines.
 
 ### Changed
+
+- PAN-318: the FT8 decode coordinator now overlaps the ft8_lib reference pass with the native AP pass instead of running them sequentially. Both passes start together (two-party barrier, in-worker start timestamps), are joined before the reference-first merge, and each keeps its own panic guard — a panic in either pass preserves the other's results. The reference pass runs on its own long-lived decoder instance, rebuilt in lockstep with the native decoder and re-seeded every window with the native learned-callsign snapshot, so merged decode sets are unchanged (asserted on five off-air fixtures under the Standard 250 ms budget). The waterfall is generated after the joined pair rather than before the native call: `pre_native_ms` no longer charges the waterfall FFT or the ft8_lib pass, and per-window `ft8lib_ms`/`waterfall_ms`/`pre_native_ms` are additionally recorded in bounded internal timing histograms (debug distribution line every 32 windows). A successful FT8 window derives its waterfall from the reference pass's own monitor FFT (owned 0–3000 Hz magnitude grid, converted onto the legacy display geometry — same row partition, time labels and bin axis — with no second spectrogram); the legacy waterfall generator remains as the fallback for non-FT8 protocols, a caught reference panic and the FFI stub build, and the TUI/allocator/remote-gateway fan-out is unchanged for both sources.
 
 - PAN-328: `pancetta-dx::DxError` now stores a private `Box<DxErrorInner>`. Construct variants with `DxErrorInner::Variant(...).into()` and inspect them through `error.kind()`. Display text, source conversions and upload classification remain unchanged.
 

@@ -17,6 +17,7 @@
 use super::ActiveQsoFreq;
 use anyhow::Result;
 use pancetta_ft8::merge::{drop_unresolved_hash_twins, merge_ft8lib_first, MergedDecodes};
+use pancetta_ft8::window_execution::run_overlapped_passes;
 use pancetta_ft8::Ft8Decoder;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,6 +25,218 @@ use std::time::Instant;
 use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+mod timing {
+    //! PAN-318 Phase 1: bounded per-window decode-timing histograms.
+    //!
+    //! `ft8lib_ms`, `waterfall_ms` and `pre_native_ms` were already computed
+    //! and logged per window (the `decode.budget` `window timing` line,
+    //! PAN-165); this module adds bounded distributions over the same three
+    //! values so overlap effects are visible without an unbounded sample
+    //! vector or a new metrics dependency.
+    //!
+    //! Storage is constant: one fixed bucket array plus a total per value, no
+    //! matter how many windows record. Samples are recorded in MICROseconds so
+    //! sub-millisecond work stays meaningful; buckets are labelled in
+    //! milliseconds. A summary line is emitted on the `decode.budget` target
+    //! every [`EMIT_EVERY_WINDOWS`] completed windows (debug level — internal
+    //! diagnostics only, no TUI/health-panel change).
+
+    /// Fixed bucket upper bounds in milliseconds; a sample above the last
+    /// bound lands in the overflow bucket.
+    pub(super) const BUCKET_BOUNDS_MS: [u64; 11] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000];
+
+    /// Emit the distribution line every N completed windows.
+    pub(super) const EMIT_EVERY_WINDOWS: u64 = 32;
+
+    /// One bounded histogram over microsecond samples with millisecond
+    /// bucket bounds.
+    #[derive(Debug)]
+    pub(super) struct TimingHistogram {
+        counts: [u64; BUCKET_BOUNDS_MS.len() + 1],
+        total: u64,
+    }
+
+    impl TimingHistogram {
+        pub(super) const fn new() -> Self {
+            Self {
+                counts: [0; BUCKET_BOUNDS_MS.len() + 1],
+                total: 0,
+            }
+        }
+
+        /// Record one sample, in microseconds.
+        pub(super) fn record_us(&mut self, micros: u64) {
+            let bucket = BUCKET_BOUNDS_MS
+                .iter()
+                .position(|&bound_ms| micros <= bound_ms * 1_000)
+                .unwrap_or(BUCKET_BOUNDS_MS.len());
+            self.counts[bucket] += 1;
+            self.total += 1;
+        }
+
+        /// Total samples recorded (must always equal the bucket sum).
+        pub(super) fn total(&self) -> u64 {
+            self.total
+        }
+
+        /// Samples in bucket `i` (the last is overflow).
+        pub(super) fn bucket(&self, i: usize) -> u64 {
+            self.counts[i.min(self.counts.len() - 1)]
+        }
+
+        /// `<=1ms|<=2ms|...|>2000ms` counts, e.g. `<= 1:3 <= 2:1 ... >2000:0`.
+        pub(super) fn summary(&self) -> String {
+            let mut s = String::new();
+            for (i, &bound) in BUCKET_BOUNDS_MS.iter().enumerate() {
+                if !s.is_empty() {
+                    s.push(' ');
+                }
+                s.push_str(&format!("<= {bound}:{}", self.counts[i]));
+            }
+            s.push_str(&format!(
+                " >{}:{}",
+                BUCKET_BOUNDS_MS[BUCKET_BOUNDS_MS.len() - 1],
+                self.counts[BUCKET_BOUNDS_MS.len()]
+            ));
+            s
+        }
+    }
+
+    /// The three PAN-318 per-window values, each in one bounded histogram.
+    #[derive(Debug)]
+    pub(super) struct WindowTimingHistograms {
+        pub(super) ft8lib_ms: TimingHistogram,
+        pub(super) waterfall_ms: TimingHistogram,
+        pub(super) pre_native_ms: TimingHistogram,
+        windows: u64,
+    }
+
+    impl WindowTimingHistograms {
+        pub(super) const fn new() -> Self {
+            Self {
+                ft8lib_ms: TimingHistogram::new(),
+                waterfall_ms: TimingHistogram::new(),
+                pre_native_ms: TimingHistogram::new(),
+                windows: 0,
+            }
+        }
+
+        /// Record one completed window (microsecond samples; overlap wall
+        /// times, never sums of concurrent work).
+        pub(super) fn record_window_us(
+            &mut self,
+            ft8lib_us: u64,
+            waterfall_us: u64,
+            pre_native_us: u64,
+        ) {
+            self.ft8lib_ms.record_us(ft8lib_us);
+            self.waterfall_ms.record_us(waterfall_us);
+            self.pre_native_ms.record_us(pre_native_us);
+            self.windows += 1;
+        }
+
+        /// True on the window count that should emit the debug distribution
+        /// line (every [`EMIT_EVERY_WINDOWS`] windows).
+        pub(super) fn should_emit(&self) -> bool {
+            self.windows > 0 && self.windows % EMIT_EVERY_WINDOWS == 0
+        }
+
+        /// One debug line covering all three distributions.
+        pub(super) fn summary_line(&self) -> String {
+            format!(
+                "ft8lib_ms[{}] waterfall_ms[{}] pre_native_ms[{}]",
+                self.ft8lib_ms.summary(),
+                self.waterfall_ms.summary(),
+                self.pre_native_ms.summary()
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// AC7: zero and sub-millisecond samples are meaningful (first
+        /// bucket), each boundary lands inclusive of its bound, the value
+        /// just above a bound lands in the next bucket, and oversized
+        /// samples land in the overflow bucket.
+        #[test]
+        fn timing_histogram_boundaries() {
+            let mut h = TimingHistogram::new();
+            let cases: [(u64, usize); 13] = [
+                (0, 0),
+                (999, 0),
+                (1_000, 0), // exactly 1 ms -> <=1ms bucket
+                (1_001, 1),
+                (2_000, 1),
+                (2_001, 2),
+                (5_000, 2),
+                (10_001, 4),
+                (50_000, 5),
+                (250_000, 7),
+                (1_000_000, 9),
+                (2_000_000, 10), // exactly 2 s -> last bounded bucket
+                (2_000_001, 11), // above -> overflow
+            ];
+            for (sample, expected_bucket) in cases {
+                let mut probe = TimingHistogram::new();
+                probe.record_us(sample);
+                assert_eq!(
+                    probe.bucket(expected_bucket),
+                    1,
+                    "sample {sample}us must land in bucket {expected_bucket}"
+                );
+                assert_eq!(probe.total(), 1);
+            }
+            h.record_us(u64::MAX / 2);
+            assert_eq!(h.bucket(BUCKET_BOUNDS_MS.len()), 1, "overflow bucket");
+        }
+
+        /// AC7: every completed window records each value exactly once, the
+        /// cumulative count equals the bucket sum, and storage stays constant
+        /// after many windows (fixed arrays — the sum is computed from the
+        /// same fixed slots after 10k windows as after one).
+        #[test]
+        fn timing_histograms_record_once_and_bound_storage() {
+            let mut h = WindowTimingHistograms::new();
+            for i in 0..10_000u64 {
+                h.record_window_us(i % 3_000, (i % 7) * 250, i % 2_500);
+            }
+            for hist in [&h.ft8lib_ms, &h.waterfall_ms, &h.pre_native_ms] {
+                let sum: u64 = (0..=BUCKET_BOUNDS_MS.len()).map(|i| hist.bucket(i)).sum();
+                assert_eq!(sum, 10_000, "each window recorded exactly once");
+                assert_eq!(sum, hist.total());
+            }
+            // Constant storage: the struct's size does not depend on the
+            // sample count (fixed arrays; no Vec anywhere in the type).
+            assert_eq!(
+                std::mem::size_of::<WindowTimingHistograms>(),
+                3 * std::mem::size_of::<TimingHistogram>() + std::mem::size_of::<u64>()
+            );
+        }
+
+        /// The debug distribution line fires every 32 windows and never on a
+        /// zero-window recorder.
+        #[test]
+        fn distribution_line_every_32_windows() {
+            let mut h = WindowTimingHistograms::new();
+            assert!(!h.should_emit());
+            for i in 1..=64u64 {
+                h.record_window_us(100, 100, 100);
+                assert_eq!(h.should_emit(), i % EMIT_EVERY_WINDOWS == 0);
+            }
+            let line = h.summary_line();
+            assert!(line.contains("ft8lib_ms"));
+            assert!(line.contains("waterfall_ms"));
+            assert!(line.contains("pre_native_ms"));
+            assert!(line.contains("<= 1:"));
+            assert!(line.contains(">2000:"));
+        }
+    }
+}
+
+use timing::WindowTimingHistograms;
 
 /// Cumulative count of decode-window panics caught (and skipped) by the
 /// `catch_unwind` guards in the FT8 hot loop. A non-zero, growing value means
@@ -226,6 +439,98 @@ fn over_deadline_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> u64 {
     budget
         .deadline()
         .map_or(0, |d| at.saturating_duration_since(d).as_millis() as u64)
+}
+
+/// PAN-318: rebuild the native and reference decoders as a PAIR from one
+/// `Ft8Config` publish, seeding both with the station callsign and the
+/// union of both instances' learned callsigns.
+///
+/// Both replacement decoders are constructed and seeded as locals; the
+/// caller's pair is only overwritten after BOTH constructions succeed, so
+/// a failed rebuild leaves the previous pair — and the budget that pair
+/// was published with — atomically paired (the PAN-164 one-read contract
+/// extends to both instances).
+fn rebuild_decoder_pair(
+    cfg: &pancetta_ft8::Ft8Config,
+    station_callsign: &str,
+    native: &mut Ft8Decoder,
+    reference: &mut Ft8Decoder,
+) -> Result<(), pancetta_ft8::Ft8Error> {
+    let mut new_native = Ft8Decoder::new(cfg.clone())?;
+    let mut new_reference = Ft8Decoder::new(cfg.clone())?;
+    let mut learned: Vec<String> = native.learned_callsigns();
+    for call in reference.learned_callsigns() {
+        if !learned.contains(&call) {
+            learned.push(call);
+        }
+    }
+    for decoder in [&mut new_native, &mut new_reference] {
+        decoder.seed_hash_callsign(station_callsign);
+        for call in &learned {
+            decoder.seed_hash_callsign(call);
+        }
+    }
+    *native = new_native;
+    *reference = new_reference;
+    Ok(())
+}
+
+/// PAN-318: mirror the native decoder's learned callsigns into the
+/// reference decoder's message parser before each main pass pair.
+///
+/// The sequential pipeline ran both passes on one parser, so the ft8_lib
+/// pass resolved i3=4 hash callsigns with everything the pipeline had
+/// learned so far — including calls learned during the immediately
+/// preceding scoped call. The overlapped reference pass runs on its own
+/// decoder, so its parser must be re-seeded from the native snapshot
+/// every window to keep resolving exactly the same set.
+fn sync_reference_parser_seeds(native: &Ft8Decoder, reference: &mut Ft8Decoder) {
+    for call in native.learned_callsigns() {
+        reference.seed_hash_callsign(&call);
+    }
+}
+
+/// Submit scoped results before starting the main passes. This runs on the
+/// blocking decoder thread, so it may drive the bus future directly.
+fn forward_scoped_decode(
+    rt: &tokio::runtime::Handle,
+    bus: &crate::message_bus::MessageBus,
+    message: ComponentMessage,
+) {
+    // send_message awaits only the route-table lock and tries the bounded
+    // queue once. It never waits for QSO processing or for queue capacity.
+    if let Err(e) = rt.block_on(bus.send_message(message)) {
+        debug!("Failed to forward scoped fast-path decode to QSO: {}", e);
+    }
+}
+
+/// Receipt-to-entry time includes scoped work and dispatch, even when the
+/// main passes overlap. Keep the receipt anchor rather than a pass-local clock.
+fn pre_native_us(received: Instant, native_entry: Instant) -> u64 {
+    native_entry.duration_since(received).as_micros() as u64
+}
+
+/// PAN-318 AC4/AC6: decide a completed window's waterfall source.
+///
+/// A captured FT8 reference grid converts directly onto the legacy display
+/// grid (same row partition, time labels and 0–3000 Hz bin axis — see
+/// `Ft8LibDisplayGrid::to_waterfall_data`) with no second FFT: on that
+/// path the coordinator never calls `generate_waterfall_data`. Everything
+/// else returns `None` and the caller falls back to the legacy generator,
+/// which it may only run AFTER the native pass has started and joined:
+/// non-FT8 protocols (FT4/FT2 keep the legacy display path), a missing
+/// capture (the FFI stub build), or a caught reference panic (no capture
+/// survives the unwind).
+fn waterfall_from_reference_capture(
+    capture: Option<pancetta_ft8::ft8_lib_ffi::Ft8LibDisplayGrid>,
+    protocol: pancetta_ft8::Protocol,
+    window_len: usize,
+) -> Option<pancetta_ft8::WaterfallData> {
+    let grid = capture?;
+    if !matches!(protocol, pancetta_ft8::Protocol::Ft8) {
+        return None;
+    }
+    Some(grid.to_waterfall_data(window_len))
 }
 
 /// Compute the active protocol's slot parity for a decoded window.
@@ -532,6 +837,19 @@ impl super::ApplicationCoordinator {
         // `DecoderRebuildKey` field changed.
         let initial_window = self.decode_window.read().await.clone();
         let mut decoder = Ft8Decoder::new(initial_window.ft8().clone())?;
+        // PAN-318: a second long-lived decoder dedicated to the ft8_lib
+        // reference pass. `Ft8Decoder` is Send but not Sync (its message
+        // handler) and the native pass needs `&mut self`, so overlapping
+        // the two passes needs two independently-owned instances rather
+        // than one shared behind a lock (which would serialize them
+        // again). Built here, before the first timed window; rebuilt in
+        // lockstep with the native decoder (`rebuild_decoder_pair`) and
+        // re-seeded every window (`sync_reference_parser_seeds`).
+        let mut reference_decoder = Ft8Decoder::new(initial_window.ft8().clone())?;
+        // PAN-318: config snapshot the reference decoder was last built
+        // from — used to reconstruct it if a decode panic ever eats the
+        // instance (kept in lockstep by the rebuild closure below).
+        let mut reference_decoder_cfg = initial_window.ft8().clone();
         let qso_manager_rx = self.qso_manager_watch.subscribe();
         let hound_response = {
             let cfg = self.config.read().await;
@@ -594,6 +912,10 @@ impl super::ApplicationCoordinator {
         // (not just polish) for a compound-callsign QSO to ever advance
         // past our opening call.
         decoder.seed_hash_callsign(&station_callsign);
+        // PAN-318: the reference decoder gets the same station-callsign
+        // seed so its parser (used by the ft8_lib pass for i3=4 hash
+        // resolution) starts identical to the native one.
+        reference_decoder.seed_hash_callsign(&station_callsign);
         // Same Arc<CachedStationLookup> the QSO component's active-QSO
         // ranking and the TUI's display scorer read — an in-memory
         // RwLock-backed snapshot the decoder thread reads via its own
@@ -743,6 +1065,11 @@ impl super::ApplicationCoordinator {
 
             let mut desense = super::desense::DesenseDetector::default();
 
+            // PAN-318: bounded per-window timing distributions
+            // (`ft8lib_ms`/`waterfall_ms`/`pre_native_ms`), internal to
+            // this thread — a debug summary line fires every 32 windows.
+            let mut window_timing_histograms = WindowTimingHistograms::new();
+
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(super::pipeline::DecodeWindow {
@@ -812,7 +1139,6 @@ impl super::ApplicationCoordinator {
                                     cfg.protocol,
                                     cfg.fine_sync_enabled,
                                 );
-                                let mut d = Ft8Decoder::new(cfg)?;
                                 info!(
                                     "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}, fine_sync_enabled={}",
                                     passes, osd, protocol, fine_sync
@@ -822,20 +1148,24 @@ impl super::ApplicationCoordinator {
                                 // re-seed our own callsign or a compound-call
                                 // DX's reply silently stops resolving after
                                 // the next tier/protocol config change.
-                                d.seed_hash_callsign(&station_callsign);
                                 // PAN-27 finding 2: also carry over every
-                                // OTHER caller this decoder instance had
-                                // already learned (the round-2/round-4
-                                // seeding loops below) — otherwise a
-                                // compound operator learned earlier this
-                                // session decodes as unresolved again
-                                // immediately after a rebuild, even though
-                                // the hash had already resolved once.
-                                for call in decoder.learned_callsigns() {
-                                    d.seed_hash_callsign(&call);
+                                // OTHER caller this decoder had already
+                                // learned. PAN-318: both decoders rebuild
+                                // as a pair — a failed construction of
+                                // either leaves the previous pair and the
+                                // budget they were published with
+                                // untouched — and the config snapshot
+                                // tracks the pair that actually exists.
+                                let rebuild = rebuild_decoder_pair(
+                                    &cfg,
+                                    &station_callsign,
+                                    &mut decoder,
+                                    &mut reference_decoder,
+                                );
+                                if rebuild.is_ok() {
+                                    reference_decoder_cfg = cfg.clone();
                                 }
-                                decoder = d;
-                                Ok::<(), pancetta_ft8::Ft8Error>(())
+                                rebuild
                             },
                         );
                         if let DecodeWindowRefresh::RebuildFailed(e) = refresh {
@@ -847,6 +1177,13 @@ impl super::ApplicationCoordinator {
                         // Reapply after rebuilds and manager supervisor restarts.
                         let hound_active = rt
                             .block_on(refresh_hound_receive_context(&mut decoder, &qso_manager_rx));
+                        // PAN-318: the reference decoder shares the same
+                        // per-window Hound policy — its parser is what the
+                        // ft8_lib pass consults.
+                        let _ = rt.block_on(refresh_hound_receive_context(
+                            &mut reference_decoder,
+                            &qso_manager_rx,
+                        ));
                         let fox_response = hound_active.then_some(hound_response);
                         // The protocol the live decoder was built for.
                         let last_protocol = applied_window.rebuild_key.protocol;
@@ -915,6 +1252,7 @@ impl super::ApplicationCoordinator {
 
                         log_window_received(window.len());
 
+<<<<<<< HEAD
                         // PAN-165: covers generation, normalisation and the
                         // channel sends below, all time the native call loses.
                         let waterfall_start = Instant::now();
@@ -1004,6 +1342,17 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         let waterfall_ms = waterfall_start.elapsed().as_millis() as u64;
+=======
+                        // PAN-318: the waterfall is no longer generated in
+                        // the pre-native prefix. It ran first, so its FFT
+                        // (~5-10 ms) plus the ft8_lib pass (~8-15 ms) were
+                        // silently charged against the receipt-anchored
+                        // native budget. It now runs AFTER both main passes
+                        // have been launched and joined (below, after the
+                        // overlapped pair) off the native entry path, using
+                        // the unchanged legacy generator so its rows stay
+                        // byte-identical.
+>>>>>>> 617480a6f0d48a39b27e2f0ef1670ba5bcd41faa
 
                         // hb-091 scoped fast-path: when activeQso is set
                         // and scoped_fast_path is enabled (hb-216 S2: set
@@ -1137,59 +1486,17 @@ impl super::ApplicationCoordinator {
                                     MessageType::DecodedMessage(decoded_msg),
                                     Instant::now(),
                                 );
-                                let bus = message_bus.clone();
-                                rt.spawn(async move {
-                                    if let Err(e) = bus.send_message(qso_msg).await {
-                                        debug!(
-                                            "Failed to forward scoped fast-path decode to QSO: {}",
-                                            e
-                                        );
-                                    }
-                                });
+                                forward_scoped_decode(&rt, &message_bus, qso_msg);
                             }
                         }
 
-                        // Primary decoder: ft8_lib (reference C implementation)
-                        // with full sliding-frame spectrogram — matches WSJT-X sensitivity.
-                        // Protocol-aware (2026-07-06): the vendored C library
-                        // already supports FT4 natively, it was just never
-                        // asked to — `decode_window_ft8lib_protocol` passes
-                        // `last_protocol` (kept in sync with the live config
-                        // above) instead of hardcoding FT8. Measured ~25x
-                        // faster than the native Rust decoder, which matters
-                        // most for FT4: its 7.5s slot leaves far less decode
-                        // margin than FT8's 15s, and decode wall-clock time
-                        // was found to be truncating FT4 transmissions (see
-                        // the coalesce-window scaling fix earlier this week).
-                        //
-                        // Wrapped in catch_unwind so a Rust-side panic on one
-                        // pathological window is logged + skipped (empty result)
-                        // rather than aborting the whole station. Release builds
-                        // use panic="unwind" for this. NOTE: a native abort
-                        // inside the ft8_lib C code cannot unwind — the OS
-                        // supervisor (docs/RUNBOOK.md) is the backstop for that.
-                        let ft8lib_start = Instant::now();
-                        let ft8lib_messages = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
-                                decoder.decode_window_ft8lib_with_context(
-                                    &window,
-                                    last_protocol,
-                                )
-                            }),
-                        )
-                        .unwrap_or_else(|_| {
-                            let n = DECODE_PANIC_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                + 1;
-                            error!(
-                                target: "ft8.decode",
-                                "ft8_lib decode panicked on a window (#{n}) — skipping it; station continues"
-                            );
-                            Vec::new()
-                        });
-                        let ft8lib_ms = ft8lib_start.elapsed().as_millis() as u64;
-
                         // Secondary: our native decoder with AP enhancement.
+                        //
+                        // PAN-318: gather every input the two main passes
+                        // need (AP context, hb-229 partner band-collapse,
+                        // relaxed-sync partner freq) BEFORE launching either
+                        // pass, so both branches decode against one window
+                        // snapshot.
                         //
                         // Task 5 (gap 2/4): `active_qso_ap` now holds the
                         // QSO component's ranked+capped list of ALL
@@ -1277,20 +1584,79 @@ impl super::ApplicationCoordinator {
                                 partner_freq_for_main.unwrap_or(0.0),
                             );
                         }
-                        // Same catch_unwind resilience for the native AP decoder.
-                        // decoder-speed-overhaul Task 12: this is the primary
-                        // decode call site — always runs (unlike the
-                        // conditional scoped fast-path above), so it carries
-                        // the representative per-window budget telemetry.
-                        let native_call_start = Instant::now();
-                        // PAN-165: production's deadline is anchored at window
-                        // receipt, so this is what the native call really has.
-                        let pre_native_ms = native_call_start
-                            .duration_since(window_ready_at)
-                            .as_millis() as u64;
-                        let headroom_at_native = headroom_ms(&decode_budget, native_call_start);
-                        let (native_messages, native_budget_report) = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
+
+                        // PAN-318: keep the reference decoder's parser at
+                        // parity with the native one (everything learned so
+                        // far this session, including any calls the scoped
+                        // call above just learned) so the overlapped ft8_lib
+                        // pass resolves i3=4 hash callsigns exactly as the
+                        // sequential single-parser pipeline did.
+                        sync_reference_parser_seeds(&decoder, &mut reference_decoder);
+
+                        // Primary decoder: ft8_lib (reference C implementation)
+                        // with full sliding-frame spectrogram — matches WSJT-X sensitivity.
+                        // Protocol-aware (2026-07-06): the vendored C library
+                        // already supports FT4 natively, it was just never
+                        // asked to — the pass below passes `last_protocol`
+                        // (kept in sync with the live config above) instead
+                        // of hardcoding FT8. Measured ~25x faster than the
+                        // native Rust decoder, which matters most for FT4:
+                        // its 7.5s slot leaves far less decode margin than
+                        // FT8's 15s, and decode wall-clock time was found to
+                        // be truncating FT4 transmissions (see the
+                        // coalesce-window scaling fix earlier this week).
+                        //
+                        // PAN-318: the ft8_lib pass and the native pass now
+                        // run CONCURRENTLY (`run_overlapped_passes`): a
+                        // two-party barrier releases both branches together,
+                        // each branch timestamps itself immediately before
+                        // its decoder invocation, one catch_unwind guards
+                        // each pass separately (a panic is logged, skipped,
+                        // and the other pass's results survive), and the
+                        // scoped-thread join completes BEFORE the merge
+                        // below. The native branch runs here on the decode
+                        // thread; the reference branch runs on its own
+                        // decoder instance (see `reference_decoder` above),
+                        // moved into the child and returned with its
+                        // results — `Ft8Decoder` is Send but not Sync, so
+                        // exclusive access moves rather than shares. A
+                        // native abort inside the ft8_lib C code cannot
+                        // unwind — the OS supervisor (docs/RUNBOOK.md) is
+                        // the backstop for that.
+                        // window is shared by both branches, so the child
+                        // captures it by reference, not by value.
+                        let window_for_reference = &window;
+                        let reference_worker = reference_decoder;
+                        let outcome = run_overlapped_passes(
+                            move || {
+                                // PAN-318 AC4: on FT8 the reference pass
+                                // also captures the monitor's owned
+                                // 0–3000 Hz magnitude grid — the waterfall
+                                // is derived from the same C FFT work
+                                // after the join, and the legacy
+                                // generator is NOT called on this path.
+                                // FT4/FT2 keep the no-capture entry: their
+                                // waterfall stays on the legacy path.
+                                let (messages, display_grid) =
+                                    if matches!(last_protocol, pancetta_ft8::Protocol::Ft8) {
+                                        let (messages, grid) = reference_worker
+                                            .decode_window_ft8lib_with_context_and_capture(
+                                                window_for_reference,
+                                                last_protocol,
+                                            );
+                                        (messages, grid)
+                                    } else {
+                                        (
+                                            reference_worker.decode_window_ft8lib_with_context(
+                                                window_for_reference,
+                                                last_protocol,
+                                            ),
+                                            None,
+                                        )
+                                    };
+                                (messages, display_grid, reference_worker)
+                            },
+                            || {
                                 decoder.decode_window_with_ap_scoped_partner_budgeted(
                                     &window,
                                     &ap_context,
@@ -1298,20 +1664,93 @@ impl super::ApplicationCoordinator {
                                     partner_freq_for_relaxed_sync,
                                     decode_budget,
                                 )
-                            }),
-                        )
-                        .unwrap_or_else(|_| {
-                            let n = DECODE_PANIC_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                + 1;
-                            error!(
-                                target: "ft8.decode",
-                                "native AP decode panicked on a window (#{n}) — skipping it; station continues"
-                            );
-                            Ok((Vec::new(), pancetta_ft8::DecodeBudgetReport::default()))
-                        })
-                        .unwrap_or_default();
-                        let native_elapsed_ms = native_call_start.elapsed().as_millis() as u64;
+                            },
+                        );
+
+                        // Timing first, from the helper's in-worker
+                        // measurements (&self methods need `outcome` whole):
+                        // branch wall time and start skew are measured inside
+                        // the workers around the decoder calls themselves —
+                        // never a sum of the two branches, which overlap.
+                        let ft8lib_us = outcome.reference_elapsed.as_micros() as u64;
+                        let ft8lib_ms = outcome.reference_elapsed.as_millis() as u64;
+                        let overlap_start_skew_us = outcome.start_skew().as_micros() as u64;
+                        // PAN-165/318: production's deadline is anchored at
+                        // window receipt, so `pre_native_ms` is measured
+                        // from receipt to the ACTUAL native entry (the
+                        // post-barrier in-worker timestamp). It stays
+                        // truthful: it still includes any scoped fast-path
+                        // work that ran first — subtracting that would
+                        // conceal work rather than recover budget.
+                        let pre_native_us =
+                            pre_native_us(window_ready_at, outcome.native_started_at);
+                        let pre_native_ms = (pre_native_us / 1_000) as u64;
+                        let headroom_at_native =
+                            headroom_ms(&decode_budget, outcome.native_started_at);
+                        let native_elapsed_ms = outcome.native_elapsed.as_millis() as u64;
+
+                        // Recover the reference decoder for the next window
+                        // (the child moved it out and returns it with the
+                        // branch result). After a caught panic the instance
+                        // is gone (dropped during unwind): rebuild a fresh
+                        // one from the live config snapshot and reseed it —
+                        // the per-window `sync_reference_parser_seeds` above
+                        // already restores full parser parity.
+                        let (ft8lib_messages, reference_display_grid) = match outcome.reference {
+                            Some((messages, display_grid, worker)) => {
+                                reference_decoder = worker;
+                                (messages, display_grid)
+                            }
+                            None => {
+                                let n = DECODE_PANIC_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                error!(
+                                    target: "ft8.decode",
+                                    "ft8_lib decode panicked on a window (#{n}) — skipping it; station continues"
+                                );
+                                let mut fresh =
+                                    Ft8Decoder::new(reference_decoder_cfg.clone())
+                                        .unwrap_or_else(|e| {
+                                            error!(
+                                                "FT8 reference decoder rebuild after panic failed ({}); falling back to default config",
+                                                e
+                                            );
+                                            Ft8Decoder::new(
+                                                pancetta_ft8::Ft8Config::default(),
+                                            )
+                                            .expect("Ft8Config::default constructs")
+                                        });
+                                fresh.seed_hash_callsign(&station_callsign);
+                                reference_decoder = fresh;
+                                // No capture survived the panic: the
+                                // waterfall falls back to the legacy
+                                // generator below, still only after the
+                                // native pass has run.
+                                (Vec::new(), None)
+                            }
+                        };
+
+                        // Same catch_unwind resilience for the native AP
+                        // decoder (the panic guard lives inside the helper;
+                        // the accounting stays here).
+                        // decoder-speed-overhaul Task 12: this is the primary
+                        // decode call site — always runs (unlike the
+                        // conditional scoped fast-path above), so it carries
+                        // the representative per-window budget telemetry.
+                        let (native_messages, native_budget_report) = match outcome.native {
+                            Some(result) => result.unwrap_or_default(),
+                            None => {
+                                let n = DECODE_PANIC_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                error!(
+                                    target: "ft8.decode",
+                                    "native AP decode panicked on a window (#{n}) — skipping it; station continues"
+                                );
+                                (Vec::new(), pancetta_ft8::DecodeBudgetReport::default())
+                            }
+                        };
                         window_decode_elapsed_ms += native_elapsed_ms;
                         window_decode_budget_exhausted |= native_budget_report.budget_exhausted;
                         debug!(
@@ -1321,6 +1760,122 @@ impl super::ApplicationCoordinator {
                             native_budget_report.budget_exhausted,
                             native_budget_report.stages,
                         );
+
+                        // PAN-318: waterfall generation, moved out of the
+                        // pre-native prefix (see the comment above the
+                        // scoped fast path). Runs after both main passes
+                        // have been launched and joined — on the native
+                        // entry path it costs nothing. AC4: a successful
+                        // FT8 reference pass supplies the waterfall from
+                        // its OWN monitor FFT via
+                        // `waterfall_from_reference_capture` (no
+                        // `generate_waterfall_data` call on that path);
+                        // the legacy generator runs only as the fallback —
+                        // non-FT8 protocols, a caught reference panic, or
+                        // the FFI stub build — never before the native
+                        // pass. The fan-out below (TUI rows, autonomous
+                        // allocator feed, remote gateway `SpectrumRow`
+                        // payloads) is unchanged for both sources: the
+                        // capture route produces the same legacy display
+                        // geometry (0–3000 Hz bins, row count, row time
+                        // offsets) the TUI and gateway already consume.
+                        let waterfall_start = Instant::now();
+                        let waterfall_result = waterfall_from_reference_capture(
+                            reference_display_grid,
+                            last_protocol,
+                            window.len(),
+                        )
+                        .map(Ok)
+                        .unwrap_or_else(|| {
+                            let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
+                            decoder.generate_waterfall_data(&audio_f64)
+                        });
+                        match waterfall_result {
+                            Ok(wf) => {
+                                let range = wf.max_power - wf.min_power;
+                                info!(
+                                    "Waterfall: {}x{} matrix, power range {:.1}..{:.1} dB",
+                                    wf.power_matrix.len(),
+                                    wf.power_matrix.first().map(|r| r.len()).unwrap_or(0),
+                                    wf.min_power,
+                                    wf.max_power,
+                                );
+                                let rows: Vec<Vec<f32>> = if range > 0.0 {
+                                    wf.power_matrix
+                                        .iter()
+                                        .map(|row| {
+                                            row.iter()
+                                                .map(|&p| ((p - wf.min_power) / range) as f32)
+                                                .collect()
+                                        })
+                                        .collect()
+                                } else {
+                                    wf.power_matrix
+                                        .iter()
+                                        .map(|row| vec![0.0f32; row.len()])
+                                        .collect()
+                                };
+                                let _ = waterfall_tx.send(rows.clone());
+                                if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
+                                    let _ = auto_wf_tx.try_send(rows);
+                                }
+
+                                // Additive: also forward the RAW (pre-
+                                // normalization) rows to the read-only remote
+                                // gateway for the `spectrum` serverEvent
+                                // (dispensa Q-0024), gated exactly like the
+                                // DecodedMessage relay below — no clone/send
+                                // when off. The →Tui `waterfall_tx`/
+                                // `self_waterfall_to_auto_tx` sends above
+                                // (0-1 normalized) are untouched.
+                                if display_feed_enabled.load(Ordering::Relaxed) {
+                                    let bin_width_hz = if wf.frequency_bins.len() >= 2 {
+                                        wf.frequency_bins[1] - wf.frequency_bins[0]
+                                    } else {
+                                        0.0
+                                    };
+                                    let audio_bin_start_hz =
+                                        wf.frequency_bins.first().copied().unwrap_or(0.0);
+                                    for (row, &t_offset) in
+                                        wf.power_matrix.iter().zip(wf.time_bins.iter())
+                                    {
+                                        let mags_db: Vec<f32> =
+                                            row.iter().map(|&v| v as f32).collect();
+                                        let timestamp = window_received_utc
+                                            + chrono::Duration::milliseconds(
+                                                (t_offset * 1000.0) as i64,
+                                            );
+                                        let gw_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Decoder,
+                                            ComponentId::RemoteGateway,
+                                            MessageType::SpectrumRow {
+                                                audio_bin_start_hz,
+                                                bin_width_hz,
+                                                mags_db,
+                                                timestamp,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let bus_spectrum = message_bus.clone();
+                                        rt.spawn(async move {
+                                            if let Err(e) =
+                                                bus_spectrum.send_message(gw_msg).await
+                                            {
+                                                debug!(
+                                                    "Failed to forward spectrum row to RemoteGateway: {}",
+                                                    e
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Waterfall generation error: {}", e);
+                            }
+                        }
+                        let waterfall_us = waterfall_start.elapsed().as_micros() as u64;
+                        let waterfall_ms = (waterfall_us / 1_000) as u64;
 
                         // Merge: start with ft8_lib results, add any native-only
                         // decodes (e.g. from AP injection) that ft8_lib missed.
@@ -1401,7 +1956,7 @@ impl super::ApplicationCoordinator {
                         let window_end = Instant::now();
                         debug!(
                             target: "decode.budget",
-                            "window timing: waterfall={}ms scoped={}ms ft8lib={}ms pre_native={}ms headroom_at_native={} native={}ms passes_run={} total={}ms over_deadline={}ms",
+                            "window timing: waterfall={}ms scoped={}ms ft8lib={}ms pre_native={}ms headroom_at_native={} native={}ms passes_run={} total={}ms over_deadline={}ms overlap_skew_us={}",
                             waterfall_ms,
                             window_scoped_ms,
                             ft8lib_ms,
@@ -1411,7 +1966,25 @@ impl super::ApplicationCoordinator {
                             native_budget_report.passes_run,
                             window_end.duration_since(window_ready_at).as_millis(),
                             over_deadline_ms(&decode_budget, window_end),
+                            overlap_start_skew_us,
                         );
+
+                        // PAN-318: bounded distributions over the same three
+                        // values (microsecond samples, so sub-millisecond
+                        // waterfall/pre-native costs stay meaningful);
+                        // emitted as one debug line every 32 windows.
+                        window_timing_histograms.record_window_us(
+                            ft8lib_us,
+                            waterfall_us,
+                            pre_native_us,
+                        );
+                        if window_timing_histograms.should_emit() {
+                            debug!(
+                                target: "decode.budget",
+                                "window timing distributions: {}",
+                                window_timing_histograms.summary_line()
+                            );
+                        }
 
                         health_total_decodes
                             .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
@@ -2326,6 +2899,308 @@ mod cross_time_decode_record_tests {
             cross_time_decode_record(&d, 15_000_000_000).captured_dial_hz,
             0
         );
+    }
+}
+
+/// PAN-318: the paired decoder lifecycle the overlapped hot loop relies on.
+#[cfg(test)]
+mod pan318_overlap_lifecycle_tests {
+    use super::{rebuild_decoder_pair, sync_reference_parser_seeds};
+    use pancetta_ft8::{Ft8Config, Ft8Decoder};
+
+    fn pair() -> (Ft8Decoder, Ft8Decoder) {
+        (
+            Ft8Decoder::new(Ft8Config::default()).expect("native ctor"),
+            Ft8Decoder::new(Ft8Config::default()).expect("reference ctor"),
+        )
+    }
+
+    // A current-thread runtime does not poll detached sends while the
+    // blocking decode worker runs. This makes the old spawn race deterministic.
+    #[test]
+    fn parallel_scoped_delivery_precedes_merge() {
+        use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+        use pancetta_ft8::window_execution::run_overlapped_passes;
+        use std::{sync::Arc, time::Instant};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let bus = Arc::new(MessageBus::new(16).unwrap());
+        let (_, inbox) = rt.block_on(bus.create_channel(ComponentId::Qso)).unwrap();
+        let mut native = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let mut modulator = pancetta_ft8::Ft8Modulator::new_default().unwrap();
+        let symbols = encoder.encode_message("CQ K1DEF FN20", None).unwrap();
+        let mut window = modulator.modulate_symbols(&symbols, 500.0).unwrap();
+        window.resize(pancetta_ft8::WINDOW_SAMPLES, 0.0);
+        let budget = pancetta_ft8::DecodeBudget::until(
+            Instant::now() + std::time::Duration::from_millis(250),
+        );
+        let (scoped, _) = native
+            .decode_window_with_ap_scoped_partner_budgeted(
+                &window,
+                &pancetta_ft8::ApContext::default(),
+                Some(315..=325),
+                None,
+                budget,
+            )
+            .unwrap();
+        let decoded = scoped
+            .into_iter()
+            .find(|m| m.text == "CQ K1DEF FN20")
+            .expect("scoped pass must find the generated CQ");
+        super::forward_scoped_decode(
+            rt.handle(),
+            &bus,
+            ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::Qso,
+                MessageType::DecodedMessage(decoded),
+                Instant::now(),
+            ),
+        );
+        let outcome = run_overlapped_passes(
+            || {
+                assert!(
+                    inbox.try_recv().is_ok(),
+                    "QSO send must finish before main passes"
+                );
+                Vec::new()
+            },
+            Vec::new,
+        );
+        assert!(
+            !outcome.reference_panicked(),
+            "scoped delivery raced the main pair"
+        );
+        let _ = pancetta_ft8::merge::merge_ft8lib_first(
+            outcome.reference.unwrap(),
+            outcome.native.unwrap(),
+        );
+    }
+
+    #[test]
+    fn parallel_scoped_time_is_not_hidden() {
+        use pancetta_ft8::{window_execution::run_overlapped_passes, ApContext, DecodeBudget};
+        use std::time::{Duration, Instant};
+
+        let (mut native, _) = pair();
+        let window = vec![0.0; pancetta_ft8::WINDOW_SAMPLES];
+        // An already spent receipt budget must stay spent after scoped work.
+        let receipt = Instant::now() - Duration::from_millis(300);
+        let deadline = receipt + Duration::from_millis(250);
+        let budget = DecodeBudget::until(deadline);
+        let scoped_started = Instant::now();
+        native
+            .decode_window_with_ap_scoped_partner_budgeted(
+                &window,
+                &ApContext::default(),
+                Some(315..=325),
+                None,
+                budget,
+            )
+            .unwrap();
+        let scoped_finished = Instant::now();
+        let outcome = run_overlapped_passes(
+            || (),
+            || {
+                assert_eq!(budget.deadline(), Some(deadline));
+                assert!(!budget.has_time(), "main pass must not get a fresh budget");
+                native
+                    .decode_window_with_ap_scoped_partner_budgeted(
+                        &window,
+                        &ApContext::default(),
+                        None,
+                        None,
+                        budget,
+                    )
+                    .unwrap()
+            },
+        );
+        assert!(!outcome.native_panicked());
+        let elapsed = super::pre_native_us(receipt, outcome.native_started_at);
+        assert!(elapsed >= 300_000);
+        assert!(elapsed >= scoped_finished.duration_since(scoped_started).as_micros() as u64);
+        assert_eq!(
+            super::headroom_ms(&budget, outcome.native_started_at),
+            Some(0)
+        );
+    }
+
+    /// AC5 (`parallel_rebuild_is_atomic`): a rebuild whose construction
+    /// fails leaves BOTH previous decoders — and the budget they were
+    /// published with — untouched; a successful rebuild swaps both and
+    /// carries the union of learned callsigns plus the station callsign
+    /// into each side of the pair.
+    #[test]
+    fn parallel_rebuild_is_atomic() {
+        let (mut native, mut reference) = pair();
+        native.seed_hash_callsign("K1ABC");
+        reference.seed_hash_callsign("K9XYZ");
+
+        // A config the decoder constructor rejects (wrong sample rate):
+        // the pair must survive whole.
+        let bad = Ft8Config {
+            sample_rate: 48_000,
+            ..Ft8Config::default()
+        };
+        assert!(
+            rebuild_decoder_pair(&bad, "K5ARH", &mut native, &mut reference).is_err(),
+            "constructor must reject the bad sample rate for this test to mean anything"
+        );
+        assert!(native.learned_callsigns().contains(&"K1ABC".to_string()));
+        assert!(reference.learned_callsigns().contains(&"K9XYZ".to_string()));
+
+        let good = Ft8Config {
+            max_decode_passes: 2,
+            ..Ft8Config::default()
+        };
+        rebuild_decoder_pair(&good, "K5ARH", &mut native, &mut reference).expect("good cfg");
+        for decoder in [&native, &reference] {
+            let learned = decoder.learned_callsigns();
+            for call in ["K1ABC", "K9XYZ", "K5ARH"] {
+                assert!(
+                    learned.contains(&call.to_string()),
+                    "rebuilt pair must carry {call}; got {learned:?}"
+                );
+            }
+        }
+    }
+
+    /// AC5 (`parallel_reference_retains_learned_callsigns`): calls the
+    /// native decoder learned (e.g. during the preceding scoped call)
+    /// reach the reference decoder's parser before the next main pair,
+    /// so the overlapped ft8_lib pass resolves the same hash callsigns
+    /// the sequential single-parser pipeline did.
+    #[test]
+    fn parallel_reference_retains_learned_callsigns() {
+        let (mut native, mut reference) = pair();
+        native.seed_hash_callsign("K1DEF");
+        sync_reference_parser_seeds(&native, &mut reference);
+        assert!(reference.learned_callsigns().contains(&"K1DEF".to_string()));
+
+        // Idempotent across windows (the hot loop re-syncs every window).
+        sync_reference_parser_seeds(&native, &mut reference);
+        let native_set: std::collections::HashSet<String> =
+            native.learned_callsigns().into_iter().collect();
+        let reference_set: std::collections::HashSet<String> =
+            reference.learned_callsigns().into_iter().collect();
+        assert!(
+            reference_set.is_superset(&native_set),
+            "reference parser must mirror the native learned set"
+        );
+    }
+
+    /// A real captured grid from a silence window, for the waterfall
+    /// source tests (79 blocks of 1920 samples: silence still runs the
+    /// monitor; nothing decodes, but the display grid is captured).
+    fn captured_grid() -> pancetta_ft8::ft8_lib_ffi::Ft8LibDisplayGrid {
+        let reference = Ft8Decoder::new(Ft8Config::default()).expect("reference ctor");
+        let window = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
+        let (_, grid) = reference
+            .decode_window_ft8lib_with_context_and_capture(&window, pancetta_ft8::Protocol::Ft8);
+        grid.expect("real build captures a display grid")
+    }
+
+    /// AC6 (`parallel_waterfall_fallback`): reference absence or failure
+    /// (a caught panic, the stub build) yields NO captured grid, and the
+    /// fallback still works — the legacy generator produces rows — while
+    /// a captured grid converts without the legacy generator at all (the
+    /// helper takes no decoder; on the Some path there is nothing to
+    /// call `generate_waterfall_data` on).
+    #[test]
+    fn parallel_waterfall_fallback() {
+        use super::waterfall_from_reference_capture;
+        use pancetta_ft8::Protocol;
+
+        // No capture survived (reference panicked / stub build): None, so
+        // the hot loop falls back to the legacy generator — which still
+        // works on the recovered native decoder.
+        assert!(super::waterfall_from_reference_capture(
+            None,
+            Protocol::Ft8,
+            pancetta_ft8::WINDOW_SAMPLES
+        )
+        .is_none());
+        let mut native = Ft8Decoder::new(Ft8Config::default()).expect("native ctor");
+        let silence = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
+        let audio_f64: Vec<f64> = silence.iter().map(|&s| s as f64).collect();
+        let legacy = native
+            .generate_waterfall_data(&audio_f64)
+            .expect("legacy fallback generator still produces rows");
+        assert!(!legacy.power_matrix.is_empty());
+
+        // With a capture the waterfall converts on the display grid
+        // WITHOUT any decoder — structurally, no legacy FFT can run.
+        let wf = waterfall_from_reference_capture(
+            Some(captured_grid()),
+            Protocol::Ft8,
+            pancetta_ft8::WINDOW_SAMPLES,
+        )
+        .expect("captured FT8 grid converts");
+        assert_eq!(wf.power_matrix.len(), legacy.power_matrix.len());
+        assert_eq!(wf.frequency_bins.len(), legacy.frequency_bins.len());
+    }
+
+    /// AC6 (`parallel_non_ft8_uses_legacy_path`): FT4 (and FT2) never use
+    /// the reference capture — even a present grid is ignored, so their
+    /// waterfall stays on the unchanged legacy path.
+    #[test]
+    fn parallel_non_ft8_uses_legacy_path() {
+        use pancetta_ft8::Protocol;
+
+        let grid = Some(captured_grid());
+        assert!(
+            super::waterfall_from_reference_capture(
+                grid,
+                Protocol::Ft4,
+                pancetta_ft8::WINDOW_SAMPLES
+            )
+            .is_none(),
+            "FT4 must keep the legacy waterfall path"
+        );
+        assert!(
+            super::waterfall_from_reference_capture(
+                Some(captured_grid()),
+                Protocol::Ft8,
+                pancetta_ft8::WINDOW_SAMPLES
+            )
+            .is_some(),
+            "FT8 with a capture must use it"
+        );
+    }
+
+    /// AC6 (`parallel_worker_joins_on_shutdown`): no orphaned job outlives
+    /// a window — the scoped-thread join inside `run_overlapped_passes`
+    /// covers a reference branch still running when the native branch (and
+    /// the window loop's interest in it) has finished, so by the time the
+    /// helper returns — the earliest moment shutdown could begin — the
+    /// slow branch's work is complete.
+    #[test]
+    fn parallel_worker_joins_on_shutdown() {
+        use pancetta_ft8::window_execution::run_overlapped_passes;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reference_finished = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&reference_finished);
+        let outcome = run_overlapped_passes(
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                flag.store(true, Ordering::Release);
+                "slow-reference"
+            },
+            || "native-done",
+        );
+        // The helper returned: the join must already have covered the
+        // still-running reference branch (an orphan would leave this
+        // false for a while after return).
+        assert!(
+            reference_finished.load(Ordering::Acquire),
+            "reference branch outlived the window — orphaned work"
+        );
+        assert_eq!(outcome.reference.as_deref(), Some("slow-reference"));
+        assert_eq!(outcome.native.as_deref(), Some("native-done"));
     }
 }
 

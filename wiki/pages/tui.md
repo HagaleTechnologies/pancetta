@@ -128,3 +128,18 @@ creation and active relocation retain distinct bounds. A held endpoint must
 survive manual creation before collision avoidance. Placement Assigned means
 current ownership, not quiet duration. Short single-QSO layouts admit complete
 lines before rendering. See [the PAN-354 decision](../../docs/DECISIONS/tui.md#honest-qso-values-and-operator-offsets-pan-354).
+
+## Redraw and viewport gotchas (PAN-319)
+
+Idle frames run once per second so clock, age, status expiry, display needs and
+presence prompts keep updating without bus traffic. Messages mark the frame dirty
+until a successful draw; input and resize request an urgent draw. Synchronization
+markers surround the entire draw, including overlays, on the backend stream.
+
+DX Hunter selection is a logical index into the complete sorted list. Its shared
+viewport range bounds cell formatting and translates mouse rows back to logical
+indices. Compute click geometry before changing focus. Do not clamp a logical
+index to terminal height. Short Hunt layouts compress TX Placement to keep a
+station row visible at 132x24. Waterfall updates, including empty ones, sweep
+24-hour-old station data and orphan normalized state keys. They do not clear
+persistent watchlist pins or the QRZ cache.
