@@ -152,10 +152,8 @@ gain missing fields when explicitly exported. No network lookup or schema
 migration is involved. Automated converter and durable-writer tests cover this
 behavior; live upload and on-air qualification remain pending.
 
-<<<<<<< HEAD
+PAN-300 verifies actual subprocess execution with fake tqsl, including optional certificate passwords and duplicate exits 8/9. Child output is excluded from errors because it may echo a password. Live-account qualification remains pending.
+
 ### Export (PAN-299)
 
 `pancetta export` reads `qsos.adi` directly without opening the index or taking the writer lock. It converts records through `record_to_qso`, `adif_to_qso`, `qso_to_adif` and `qso_to_record`, preserving export-time entity enrichment and imported type indicators. Filters combine with AND: `--since` is an inclusive UTC date, `--band` matches BAND or falls back to FREQ, `--mode` matches MODE or SUBMODE, and `--callsign` matches a CALL substring. Text comparisons ignore case; unknown bands do not match. Unreadable records are reported and skipped. `--logbook` replaces `--database`; without `--output`, ADIF goes to standard output and status goes to standard error. Records keep logbook order.
-=======
-PAN-300 verifies actual subprocess execution with fake tqsl, including optional certificate passwords and duplicate exits 8/9. Child output is excluded from errors because it may echo a password. Live-account qualification remains pending.
->>>>>>> 2b655fe1aed570a106c8d2c55ae219c5e7237af6

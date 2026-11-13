@@ -954,8 +954,13 @@ async fn export_command(args: ExportArgs) -> Result<()> {
     use std::io::Write;
 
     let paths = LogbookPaths::new();
-    let logbook = args.logbook.unwrap_or(paths.adif);
+    let logbook = args.logbook.unwrap_or_else(|| paths.adif.clone());
     if !logbook.exists() {
+        // Only the default logbook path can be awaiting the qso.db migration,
+        // and only it is created by running pancetta.
+        if logbook != paths.adif {
+            anyhow::bail!("Logbook not found at {}.", logbook.display());
+        }
         if paths.db.exists() {
             return Err(refuse_unmigrated_index(&logbook, &paths.db, "export"));
         }

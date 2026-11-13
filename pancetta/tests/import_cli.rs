@@ -1711,3 +1711,52 @@ fn export_refuses_bad_filters_and_a_missing_logbook() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("run this export again"));
     assert!(!output.exists());
 }
+
+/// A missing `--logbook` path is reported as missing even on a station that
+/// has both `qsos.adi` and `qso.db`: the not-yet-moved refusal is only for
+/// the default logbook path.
+#[test]
+fn export_reports_a_missing_explicit_logbook_as_not_found() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.data_dir()).unwrap();
+    std::fs::write(scratch.adif(), b"<EOH>\n").unwrap();
+    std::fs::write(scratch.db(), b"legacy").unwrap();
+    let missing = scratch.home.path().join("backups").join("typo.adi");
+    let output = scratch.home.path().join("out.adi");
+    let result = scratch
+        .command()
+        .arg("export")
+        .arg("--logbook")
+        .arg(&missing)
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("Logbook not found at {}.", missing.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("run this export again"), "{stderr}");
+    assert!(!stderr.contains("Run pancetta"), "{stderr}");
+    assert!(!output.exists());
+
+    // Naming the default path explicitly still gets the not-yet-moved refusal.
+    std::fs::remove_file(scratch.adif()).unwrap();
+    let result = scratch
+        .command()
+        .arg("export")
+        .arg("--logbook")
+        .arg(scratch.adif())
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("run this export again"), "{stderr}");
+    assert!(!output.exists());
+}
