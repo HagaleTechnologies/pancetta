@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-399: DX Hunter keeps a station's `!` (all-time new entity) after a cqdx spot refresh when the local logbook says it is all-time new. The `!` now follows the Pri score and Why text the row shows, so a later decode or a worked contact moves them together. Band Activity, the station card and everything sent to cqdx or remote clients are unchanged.
+
 - PAN-305: The next contest serial number is saved with a crash-safe atomic write (synced temporary sibling, atomic rename) instead of a truncating `fs::write` whose errors were ignored, so a crash mid-write can no longer leave the serial file empty and reset numbering to 001. A failed save is now returned to the contest-response caller instead of being silently swallowed. This fixes persistence only; the dormant contest-exchange scaffolding is not activated by it.
 - PAN-335: The Linux service waits for pipeline initialization and restarts after missed coordinator health passes. `pancetta doctor` now checks enabled network services, log disk space and microphone permission separately, with a fix for each problem. Real systemd restart and macOS TCC qualification remain pending.
 - PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
