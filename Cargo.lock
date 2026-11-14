@@ -3090,6 +3090,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rustfft",
+ "same-file",
  "sd-notify",
  "serde",
  "serde_json",

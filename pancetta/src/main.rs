@@ -1038,8 +1038,24 @@ async fn export_command(args: ExportArgs) -> Result<()> {
         })
         .context("Failed to generate ADIF")?;
     let destination = if let Some(output) = &args.output {
-        tokio::fs::write(output, &content)
-            .await
+        // Open without truncating, then compare file identities so symlinks
+        // and hard links cannot turn an export into a source-logbook rewrite.
+        let source = same_file::Handle::from_path(&logbook)
+            .with_context(|| format!("Cannot identify your logbook {}", logbook.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(output)
+            .with_context(|| format!("Failed to open {}", output.display()))?;
+        let destination = same_file::Handle::from_file(file.try_clone()?)?;
+        anyhow::ensure!(
+            source != destination,
+            "Output refers to the source logbook {}; choose a different output file.",
+            logbook.display()
+        );
+        file.set_len(0)
+            .and_then(|()| file.write_all(content.as_bytes()))
             .with_context(|| format!("Failed to write {}", output.display()))?;
         output.display().to_string()
     } else {
