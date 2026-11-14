@@ -396,3 +396,188 @@ fn confirmation_help_and_receiving_service_refusal() {
             "--wav applies only to the receiving service",
         ));
 }
+
+fn trust_fixture() -> (Scratch, PathBuf, PathBuf) {
+    let s = Scratch::new();
+    let key = s.cwd.path().join("device.pub");
+    std::fs::write(&key, [0x22; 32]).unwrap();
+    let key_dir = s.cwd.path().join("keys");
+    let config = s.write_config(&format!(
+        "[network.station_agent]\nkey_dir = {:?}\n",
+        key_dir.to_str().unwrap()
+    ));
+    (s, key, config)
+}
+
+#[test]
+fn trust_client_writes_client_pub_with_mode_0600() {
+    let (s, key, config) = trust_fixture();
+    let output = s
+        .command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "k1", "--key-file"])
+        .arg(&key)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(
+        text.lines()
+            .find(|l| l.starts_with("Device-key words:"))
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        14
+    );
+    let dir = s.cwd.path().join("keys/clients");
+    assert_eq!(std::fs::read(dir.join("k1.pub")).unwrap(), [0x22; 32]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("k1.pub"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    // The command accepts both text formats as well as raw bytes.
+    use base64::Engine as _;
+    for engine in [
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        std::fs::write(&key, engine.encode([0xfb; 32])).unwrap();
+        s.command()
+            .arg("--config")
+            .arg(&config)
+            .args(["trust-client", "k2", "--force", "--key-file"])
+            .arg(&key)
+            .assert()
+            .success();
+        assert_eq!(std::fs::read(dir.join("k2.pub")).unwrap(), [0xfb; 32]);
+    }
+}
+#[test]
+fn trust_client_rejects_unsafe_key_id() {
+    let (s, key, config) = trust_fixture();
+    s.command()
+        .arg("--config")
+        .arg(config)
+        .args(["trust-client", "bad/id", "--key-file"])
+        .arg(key)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("outside [A-Za-z0-9_-]"));
+}
+#[test]
+fn trust_client_rejects_non_key_material() {
+    let (s, key, config) = trust_fixture();
+    std::fs::write(&key, "notes, not a public key").unwrap();
+    s.command()
+        .arg("--config")
+        .arg(config)
+        .args(["trust-client", "k1", "--key-file"])
+        .arg(key)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "does not hold a raw 32-byte or base64/base64url",
+        ));
+}
+#[test]
+fn trust_client_force_replaces() {
+    let (s, key, config) = trust_fixture();
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "k1", "--key-file"])
+        .arg(&key)
+        .assert()
+        .success();
+    std::fs::write(&key, [0x33; 32]).unwrap();
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "k1", "--key-file"])
+        .arg(&key)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "already exists; re-run with --force",
+        ));
+    assert_eq!(
+        std::fs::read(s.cwd.path().join("keys/clients/k1.pub")).unwrap(),
+        [0x22; 32]
+    );
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "k1", "--force", "--key-file"])
+        .arg(&key)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(s.cwd.path().join("keys/clients/k1.pub")).unwrap(),
+        [0x33; 32]
+    );
+}
+#[test]
+fn untrust_client_removes_pub_file() {
+    let (s, key, config) = trust_fixture();
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "k1", "--key-file"])
+        .arg(&key)
+        .assert()
+        .success();
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["untrust-client", "k1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed:  clients/k1.pub"));
+    assert!(!s.cwd.path().join("keys/clients/k1.pub").exists());
+}
+#[test]
+fn untrust_client_is_idempotent_when_absent() {
+    let (s, _, config) = trust_fixture();
+    s.command()
+        .arg("--config")
+        .arg(config)
+        .args(["untrust-client", "k1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to remove"));
+}
+
+#[test]
+fn trust_commands_accept_key_ids_starting_with_hyphen() {
+    let (s, key, config) = trust_fixture();
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["trust-client", "-k1", "--key-file"])
+        .arg(&key)
+        .assert()
+        .success();
+    assert!(s.cwd.path().join("keys/clients/-k1.pub").exists());
+    s.command()
+        .arg("--config")
+        .arg(&config)
+        .args(["untrust-client", "-k1"])
+        .assert()
+        .success();
+    assert!(!s.cwd.path().join("keys/clients/-k1.pub").exists());
+}

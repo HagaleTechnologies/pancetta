@@ -1369,6 +1369,33 @@ attenuator_db = 6
 - `[network.station_agent].enabled` set to `false` — the relay session
   and authorization poll stop and remote TX is disarmed, live.
 
+### Station-agent local TX trust
+
+`<key_dir>/clients/<keyId>.pub` is the station-local TX trust root. Each file
+contains a raw 32-byte Ed25519 device public key. `pancetta trust-client <keyId>
+--key-file <path>` creates the `clients/` directory with mode 0700 and its file
+with mode 0600 on Unix. The input can be raw bytes, base64 or base64url text.
+Compare the 12 printed device-key words with the client's own words before it
+transmits. Existing files require `--force` for atomic replacement. Windows
+uses inherited per-user directory ACLs rather than POSIX modes.
+
+`pancetta untrust-client <keyId>` removes the file. Removing an absent file is
+safe. The next local trust refresh disarms that client and the TX
+worker drops queued frames or aborts a keyed frame on its next recheck. It
+remains admitted for read and status; remove its cqdx edge or static
+`tx_allow_list` entry to revoke admission too.
+
+The live `tx_arm_allow_list` is the explicit intersection
+`txArmSet = localTrust ∩ owner edges` in cqdx mode, or
+`txArmSet = localTrust ∩ static tx_allow_list` in static mode. It starts empty
+in cqdx mode until the first successful poll. Both modes reread local keys
+at `[network.cqdx].authorizations_poll_interval_secs` intervals, default 45 s,
+minimum 10 s. Static refreshes read the current admission list, respecting
+live config removals. Cloud mode retains the last successful admission and
+owner-edge sets on fetch failure, but refreshes their intersection with local
+keys every interval, including while a cloud request is stalled. Local
+revocation does not depend on cqdx availability.
+
 **Explicitly restart-required (a diagnostic says so on save):**
 
 - Autonomous `slot_parity`, `needed_means`, `unattended_policy`,

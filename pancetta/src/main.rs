@@ -195,6 +195,25 @@ enum Commands {
     /// comparison against a client (e.g. panino) — read-only, no network
     /// calls. Safe to re-run anytime, including before ever pairing.
     Identity(IdentityArgs),
+    /// Trust a client device key locally for remote TX eligibility
+    TrustClient(TrustClientArgs),
+    /// Remove a client's local TX trust
+    UntrustClient(UntrustClientArgs),
+}
+
+#[derive(Clone, Args)]
+struct TrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
+    #[arg(long)]
+    key_file: PathBuf,
+    #[arg(long)]
+    force: bool,
+}
+#[derive(Clone, Args)]
+struct UntrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
 }
 
 #[derive(Clone, Args)]
@@ -627,6 +646,8 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         },
         Commands::Pair(args) => pair_command(args, cli).await,
         Commands::Identity(args) => identity_command(args, cli).await,
+        Commands::TrustClient(args) => trust_client_command(args, cli).await,
+        Commands::UntrustClient(args) => untrust_client_command(args, cli).await,
     }
 }
 
@@ -698,6 +719,59 @@ async fn identity_command(args: IdentityArgs, cli: &Cli) -> Result<()> {
     }
     println!();
 
+    Ok(())
+}
+
+async fn trust_client_command(args: TrustClientArgs, cli: &Cli) -> Result<()> {
+    use base64::Engine as _;
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    let result = (|| -> Result<[u8; 32]> {
+        pancetta_agent::trust::validate_key_id(&args.key_id)?;
+        let bytes = std::fs::read(&args.key_file)
+            .with_context(|| format!("cannot read {}", args.key_file.display()))?;
+        Ok(pancetta_agent::trust::write_client_device_key(
+            &key_dir,
+            &args.key_id,
+            &bytes,
+            args.force,
+        )?)
+    })();
+    let raw = match result {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    let words = pancetta_agent::fingerprint::key_material_words(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw),
+        12,
+    )?;
+    println!("=== Pancetta Station Trust Client ===\n\nKey dir:  {}\nClient:   {}\nWrote:    clients/{}.pub (mode 0600)\n", key_dir.display(), args.key_id, args.key_id);
+    println!("Device-key words: {}", words.join(" "));
+    println!("Compare these against the client's own device-key words before it transmits.\n");
+    println!("TX arming needs this file AND an owner edge on cqdx (or a tx_allow_list entry\nin static mode). The station picks changes up on its next authorization poll\nor trust refresh (default 45 s).");
+    Ok(())
+}
+
+async fn untrust_client_command(args: UntrustClientArgs, cli: &Cli) -> Result<()> {
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    match pancetta_agent::trust::remove_client_device_key(&key_dir, &args.key_id) {
+        Ok(false) => println!(
+            "No local trust file for {} (nothing to remove).",
+            args.key_id
+        ),
+        Ok(true) => {
+            println!("=== Pancetta Station Untrust Client ===\n\nKey dir:  {}\nClient:   {}\nRemoved:  clients/{}.pub\n", key_dir.display(), args.key_id, args.key_id);
+            println!("The client is disarmed on the next poll or trust refresh and any in-flight\nframe is dropped. It stays connected for read and status until you also\nremove its edge on cqdx (or its tx_allow_list entry).");
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 
