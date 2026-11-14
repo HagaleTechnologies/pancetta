@@ -1760,3 +1760,44 @@ fn export_reports_a_missing_explicit_logbook_as_not_found() {
     assert!(stderr.contains("run this export again"), "{stderr}");
     assert!(!output.exists());
 }
+
+#[test]
+fn export_refuses_output_aliases_of_the_source_logbook() {
+    let scratch = Scratch::new();
+    let original = record("K1ABC", "20261001", "120000", "20m", "", "FT8", "")
+        + &record("W1XYZ", "20261001", "120000", "40m", "", "FT8", "");
+    scratch.seed_logbook(&original, false);
+    let hard_link = scratch.home.path().join("hard-link.adi");
+    std::fs::hard_link(scratch.adif(), &hard_link).unwrap();
+    let mut outputs = vec![scratch.adif(), hard_link];
+    #[cfg(unix)]
+    {
+        let symlink = scratch.home.path().join("symlink.adi");
+        std::os::unix::fs::symlink(scratch.adif(), &symlink).unwrap();
+        outputs.push(symlink);
+    }
+    for output in outputs {
+        let result = scratch
+            .command()
+            .args(["export", "--band", "20m", "--output"])
+            .arg(&output)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(stderr(&result).contains("Output refers to the source logbook"));
+        assert_eq!(std::fs::read(scratch.adif()).unwrap(), original.as_bytes());
+    }
+    // An explicit input path gets the same protection.
+    let backup = scratch.home.path().join("backup.adi");
+    std::fs::rename(scratch.adif(), &backup).unwrap();
+    scratch
+        .command()
+        .args(["export", "--logbook"])
+        .arg(&backup)
+        .arg("--output")
+        .arg(&backup)
+        .assert()
+        .code(1);
+    assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+}
