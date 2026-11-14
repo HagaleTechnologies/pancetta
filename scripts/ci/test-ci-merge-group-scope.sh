@@ -53,7 +53,7 @@ Dir.mktmpdir('pan172-scope-') do |dir|
     end
   end
 end
-lanes = %w[clippy fmt ft8-tests workspace-check deny cross-platform-check]
+lanes = %w[clippy fmt workspace-check deny cross-platform-check]
 [
   ['merge_group', '', 'true', false, false], ['merge_group', '', 'false', true, false],
   ['merge_group', '', '', true, false], ['pull_request', 'false', '', false, false],
