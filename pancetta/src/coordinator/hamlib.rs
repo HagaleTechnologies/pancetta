@@ -9789,6 +9789,68 @@ mod receive_gain_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn pan302_reloaded_presets_apply_on_band_crossing() {
+        use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+        let mut h = super::super::tx::pan115_worker_gate_tests::worker_harness().await;
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        let mut saved = h.coordinator.config.read().await.clone();
+        let mut band = Some(Band::Band10m);
+        for (preamp_db, attenuator_db) in [(10, 6), (20, 12)] {
+            saved.rig.receive_gain_presets = Some(std::collections::HashMap::from([(
+                "20m".into(),
+                pancetta_config::rig::ReceiveGainPreset {
+                    preamp_db,
+                    attenuator_db,
+                },
+            )]));
+            let previous = (
+                rig.get_preamp().await.unwrap(),
+                rig.get_attenuator().await.unwrap(),
+            );
+            h.coordinator
+                .handle_config_reload(Ok((saved.clone(), vec![])))
+                .await;
+            assert_eq!(
+                (
+                    rig.get_preamp().await.unwrap(),
+                    rig.get_attenuator().await.unwrap()
+                ),
+                previous,
+                "save sends no CAT commands"
+            );
+            apply_receive_gain_preset(&rig, &h.coordinator.config, &mut band, 14_074_000).await;
+            assert_eq!(
+                (
+                    rig.get_preamp().await.unwrap(),
+                    rig.get_attenuator().await.unwrap()
+                ),
+                (preamp_db, attenuator_db)
+            );
+            apply_receive_gain_preset(&rig, &h.coordinator.config, &mut band, 28_074_000).await;
+        }
+        for empty in [Some(std::collections::HashMap::new()), None] {
+            saved.rig.receive_gain_presets = empty;
+            h.coordinator
+                .handle_config_reload(Ok((saved.clone(), vec![])))
+                .await;
+            apply_receive_gain_preset(&rig, &h.coordinator.config, &mut band, 14_074_000).await;
+            assert_eq!(
+                (
+                    rig.get_preamp().await.unwrap(),
+                    rig.get_attenuator().await.unwrap()
+                ),
+                (20, 12)
+            );
+            apply_receive_gain_preset(&rig, &h.coordinator.config, &mut band, 28_074_000).await;
+        }
+    }
+
     #[test]
     fn crossing_and_labels() {
         assert!(gain_band_crossing(Some(Band::Band20m), Some(Band::Band10m)));

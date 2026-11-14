@@ -3804,6 +3804,10 @@ impl super::ApplicationCoordinator {
         // the message loop's opens and the event forwarder's queued-call
         // promotion run in different tasks and must not both take one slot.
         let qso_admission = Arc::new(tokio::sync::Mutex::new(()));
+        #[cfg(test)]
+        {
+            self.qso_admission_for_test = Some(qso_admission.clone());
+        }
         // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
         // exact insert/remove points (including the 45s completed-grace
         // window) so the autonomous frequency allocator's own-frequency
@@ -3922,9 +3926,10 @@ impl super::ApplicationCoordinator {
         // PAN-128 PR review: the stall ledger's slot attribution uses the
         // scheduler's current-slot acceptance window — inject the operator's
         // real `tx_late_max_ms` so `keep_call_tx_slot` and `schedule_tx`
-        // decide against the same cap. Snapshot semantics match the TX
-        // worker's own startup read of the same field.
+        // decide against the same cap. Share reload publication with the
+        // TX worker and the manager's internal timeout clones.
         qso_manager.set_tx_late_max_ms(station_tx_late_max_ms);
+        qso_manager.set_tx_late_max_ms_source(self.tx_late_max_ms_live.clone());
         // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
         // only ONE of the two gates a rearmed frame must clear. A QSO with
         // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX
@@ -4056,6 +4061,8 @@ impl super::ApplicationCoordinator {
             // subscriber registers completions into.
             let qso_upload_statuses_for_subscriber = self.qso_upload_statuses.clone();
 
+            let autonomous_cq_attempts = self.autonomous_cq_attempts.clone();
+            let autonomous_config_enabled = self.autonomous_config_enabled.clone();
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -4231,6 +4238,7 @@ impl super::ApplicationCoordinator {
                         pancetta_qso::QsoId,
                     >::new()));
                 let opening_self_cqs_for_events = opening_self_cqs.clone();
+                let autonomous_cq_attempts_for_events = autonomous_cq_attempts.clone();
 
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
@@ -4379,6 +4387,10 @@ impl super::ApplicationCoordinator {
                                         reason, ..
                                     } = &new_state
                                     {
+                                        autonomous_cq_attempts_for_events
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .retain(|(id, _)| id != &qso_id.to_string());
                                         // PAN-280: a pending grace purge must not act
                                         // on a key this immediate purge clears.
                                         tx_grace_for_events.stand_down(&key);
@@ -4633,6 +4645,12 @@ impl super::ApplicationCoordinator {
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.insert(key.clone(), published.clone());
                                         }
+                                        if is_opening_self_cq {
+                                            autonomous_cq_attempts_for_events
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .insert((qso_id.to_string(), attempt_id));
+                                        }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
@@ -4658,6 +4676,10 @@ impl super::ApplicationCoordinator {
                                             queued,
                                         );
                                         if !queued {
+                                            autonomous_cq_attempts_for_events
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.to_string(), attempt_id));
                                             warn!(
                                                 "auto-sequence TX for QSO {qso_id} never reached the TX worker; withdrawing its intent and reporting it unsent"
                                             );
@@ -5681,11 +5703,26 @@ impl super::ApplicationCoordinator {
                                             parity,
                                             cq_attempt_id,
                                         } => {
+                                            // Recheck a queued opening after any reload while it waited.
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                             // PAN-78: the autonomous task gated on its own view of
                                             // the active count before sending this; a manual open
                                             // may have filled the slot since. Re-check capacity and
                                             // parity and open under the shared admission lock.
                                             let _admission = qso_admission.lock().await;
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                             // Phase 5: the autonomous operator decided to open
                                             // a QSO. Create it in the QsoManager as an Auto QSO
                                             // so the engine auto-sequences it to completion; the
@@ -5801,6 +5838,13 @@ impl super::ApplicationCoordinator {
                                                             frequency, tx_off, active.len()
                                                         );
                                                     }
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                                     qso_manager
                                                         .respond_to_cq_with(
                                                             dx.clone(),
@@ -5845,6 +5889,13 @@ impl super::ApplicationCoordinator {
                                                     )
                                                     .await
                                                     {
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                                         if cq_attempt_id.is_some() {
                                                             opening_self_cqs
                                                                 .lock()
@@ -6394,6 +6445,8 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
+                                            autonomous_cq_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.clone(), attempt_id));
                                             handle_tx_frame_not_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, replaced.as_ref(), attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot } => {
@@ -6406,6 +6459,8 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at, attempt_id } => {
+                                            autonomous_cq_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.clone(), attempt_id));
                                             handle_tx_frame_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, &aired, aired_at, attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
@@ -15575,6 +15630,11 @@ mod respond_to_caller_admission_tests {
             cfg.station.callsign = "W1ABC".into();
             cfg.station.grid_square = "FN42".into();
         }
+        // These fixtures explicitly dispatch autonomous openings.
+        coordinator.config.write().await.autonomous.enabled = true;
+        coordinator
+            .autonomous_config_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
         coordinator
     }
 
@@ -18438,11 +18498,57 @@ mod manual_capacity_admission_tests {
         assert_eq!(h.manager.active_qso_count().await, 1);
     }
 
+    #[tokio::test]
+    async fn pan302_queued_open_rechecks_permission_after_admission_wait() {
+        let mut h = harness(2, false).await;
+        let mut saved = h.coordinator.config.read().await.clone();
+        saved.autonomous.enabled = true;
+        h.coordinator
+            .handle_config_reload(Ok((saved.clone(), vec![])))
+            .await;
+        let qso_sender = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await
+            .unwrap()
+            .0;
+        let gate = h.coordinator.qso_admission_for_test.clone().unwrap();
+        let held = gate.lock().await;
+        h.send(QsoMessage::StartAutonomousQso {
+            callsign: Some("K3CCC".into()),
+            frequency: 1800.0,
+            parity: Some(SlotParity::Even),
+            cq_attempt_id: None,
+        })
+        .await;
+        // On this current-thread runtime, taking the opening runs the task
+        // through its permission check to the held admission await.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !qso_sender.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        saved.autonomous.enabled = false;
+        h.coordinator
+            .handle_config_reload(Ok((saved, vec![])))
+            .await;
+        drop(held);
+        let tx = collect_quiet(&h.tx, 300).await;
+        assert!(!any_tx_containing(&tx, "K3CCC"));
+        assert_eq!(h.manager.active_qso_count().await, 0);
+    }
+
     /// Codex P1 on #449: an autonomous open queued before a manual open
     /// filled the last slot is re-checked against the cap when handled.
     #[tokio::test]
     async fn autonomous_open_is_rechecked_against_the_cap() {
         let h = harness(1, false).await;
+        h.coordinator
+            .autonomous_config_enabled
+            .store(true, Ordering::Release);
         h.open_idle_qso_a().await;
 
         // Same parity as A (DX Even ⇒ we TX Odd), so only capacity can refuse.
