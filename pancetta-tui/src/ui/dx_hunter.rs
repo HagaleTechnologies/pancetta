@@ -338,7 +338,10 @@ fn create_dx_row<'a>(
     // (never worked on ANY band) already implies band-needed and a second
     // marker would be redundant noise. 2026-07-18, DX Hunter
     // per-band-needed gap.
-    let (needed, atno) = app.dx_need_flags_shown(&station.call_sign, station.needed, station.atno);
+    // ATNO comes from the displayed score (PAN-399), because a spot merge
+    // overwrites the stored flag with cqdx's verdict.
+    let (needed, atno) =
+        app.dx_need_flags_shown(&station.call_sign, station.needed, station.ranked_atno());
     let call_display = format_call_display(station, atno, needed, is_engaged);
 
     // Staleness check for network-only spots
@@ -1202,6 +1205,69 @@ mod tests {
         // A local 0 dB decode is a real measurement -> "+0", never "---".
         assert_eq!(format_dx_snr(&SpotSource::Local, 0, None), "+0");
         assert_eq!(format_dx_snr(&SpotSource::Both, 12, Some(12)), "+12");
+    }
+
+    #[tokio::test]
+    async fn atno_marker_follows_the_displayed_score_after_a_spot_refresh() {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        let view = crate::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("ZL1ABC".to_string()),
+            grid_square: None,
+            message: "CQ ZL1ABC".into(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: true,
+            atno: true,
+            band_needed: true,
+            priority_score: None,
+            priority_factors: None,
+            is_own_tx: false,
+        };
+
+        app.add_decoded_message(view).await.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "ZL1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "New Zealand".to_string(),
+            needed: false,
+            atno: false,
+        };
+
+        app.merge_spot_groups(&[spot]);
+        app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+            dxcc_needed: Some(true),
+            dxcc_source: Some(pancetta_qso::priority::NeedSource::LocalLogbook),
+            ..Default::default()
+        })));
+        // Keep cross-panel focus styling from overriding the ATNO colour.
+        app.active_panel = ActivePanel::DxHunter;
+        let buf = render_buffer(&app, 220, 12);
+        let output = text(&buf);
+        assert!(output.contains("!ZL1ABC"), "{output}");
+        assert!(!output.contains("▲ZL1ABC"), "{output}");
+        let cell = cell_at_text(&buf, "!ZL1ABC");
+        assert_eq!(cell.fg, atno_style().fg.unwrap());
+        assert!(cell.modifier.contains(atno_style().add_modifier));
     }
 
     #[tokio::test]

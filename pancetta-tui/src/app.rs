@@ -502,7 +502,9 @@ pub struct DxStation {
     /// network-spot rescoring, which only runs while the list is loaded
     /// (cqdx spots wait for it).
     pub needed: bool,
-    /// Entity is an ATNO (all-time new one). Subset of `needed`.
+    /// Last writer's ATNO verdict: policy-selected for a decode, cqdx-only
+    /// for a spot. Feeds network-spot scoring; DX Hunter's marker reads
+    /// `ranked_atno` instead (PAN-399).
     pub atno: bool,
     /// Entity never worked on THIS specific band before, per the local QSO
     /// database — independent of `needed`/`atno` (cqdx's needed set for
@@ -576,6 +578,17 @@ impl DxStation {
             (None, Some(network)) => Some((RankOrigin::NetworkSpot, network)),
             (None, None) => None,
         }
+    }
+
+    /// ATNO as the displayed score saw it: the `atno` factor of the rank
+    /// `rank_basis` picks, so DX Hunter's `!`, Pri and Why come from one scoring
+    /// call. The stored `atno` is whichever source wrote last (a decode's
+    /// policy-selected verdict or a cqdx spot's cqdx-only one) and is used only
+    /// for an unscored row or a rank without factors (PAN-399).
+    pub fn ranked_atno(&self) -> bool {
+        self.rank_basis()
+            .and_then(|(_, rank)| rank.factors)
+            .map_or(self.atno, |factors| factors.atno)
     }
 
     fn refresh_priority_score(&mut self) {
@@ -3036,8 +3049,9 @@ impl App {
     /// is one, wins over the flags stored at decode or spot time, so both
     /// follow a list that loads or changes between decodes, as the Why view
     /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
-    /// too; a newly needed ATNO waits for the next decode. With no verdict
-    /// for the row, the stored flags stand.
+    /// too; a newly needed ATNO's `!` changes with the row's score, at its next
+    /// decode or spot. `atno` is the caller's ATNO input; DX Hunter passes
+    /// `DxStation::ranked_atno` (PAN-399). With no verdict, the inputs stand.
     pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
         match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
             Some(listed) => (listed, atno && listed),
@@ -8298,6 +8312,76 @@ mod tests {
             app.dx_stations.contains_key("JA1ABC"),
             "merge_spot_groups must still insert other stations"
         );
+    }
+
+    #[tokio::test]
+    async fn ranked_atno_follows_the_displayed_rank() {
+        let mut app = fixture_app().await;
+        let mut view = fixture_view("JA1ABC", -10);
+        view.frequency = 14.074;
+        view.needed = true;
+        view.atno = true;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        let local = app.dx_stations["JA1ABC"].local_rank.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".to_string(),
+            needed: false,
+            atno: false,
+        };
+
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        let entry = &app.dx_stations["JA1ABC"];
+        assert!(!entry.atno);
+        assert!(entry.ranked_atno());
+        // No rank, then a precomputed rank with no factors, use the stored flag.
+        let mut fallback = entry.clone();
+        fallback.local_rank = None;
+        fallback.network_rank = None;
+        for stored in [false, true] {
+            fallback.atno = stored;
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = Some(RankedBy {
+                factors: None,
+                ..local
+            });
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = None;
+        }
+        // A higher network score wins even after a decode overwrites the flag.
+        view.atno = false;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        app.merge_spot_groups(&[crate::tui_runner::CqdxSpotInfo {
+            needed: true,
+            atno: true,
+            ..spot
+        }]);
+        app.add_decoded_message(view).await.unwrap();
+        assert!(!app.dx_stations["JA1ABC"].atno);
+        assert!(
+            app.dx_stations["JA1ABC"].network_rank.unwrap().score
+                > app.dx_stations["JA1ABC"].local_rank.unwrap().score
+        );
+        assert!(app.dx_stations["JA1ABC"].ranked_atno());
+        // A local refresh clears a stale stored ATNO when its new rank wins.
+        let mut factors = local.factors.unwrap();
+        factors.atno = false;
+        app.dx_stations.get_mut("JA1ABC").unwrap().network_rank = None;
+        app.dx_stations.get_mut("JA1ABC").unwrap().atno = true;
+        app.refresh_local_rank("JA1ABC", 4000, factors);
+        assert!(!app.dx_stations["JA1ABC"].ranked_atno());
     }
 
     #[tokio::test]
