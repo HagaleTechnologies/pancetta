@@ -500,11 +500,13 @@ min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
 min_multi_slot_score = 0.7 # Higher bar (0–1) for opening a 2nd+ concurrent QSO
 cq_direction = ""          # Directed CQ text ("DX", "NA", …); empty = general CQ
 dry_run = false            # Log autonomous TX decisions without keying the rig
+recent_failure_window_secs = 1800 # Seconds after the latest failed QSO; 0 disables; restart required
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `recent_failure_window_secs` | integer | `1800` | Nonnegative seconds since the latest failed QSO. Recent only while elapsed time is strictly less than this window; expires at the boundary. `0` disables the penalty. Requires restart. |
 | `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
 | `slot_parity` | enum | `"auto"` | Slots alternate even/odd at the active mode's slot length (FT8 15 s, FT4 7.5 s); `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |

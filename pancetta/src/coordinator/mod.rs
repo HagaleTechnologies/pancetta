@@ -2369,6 +2369,8 @@ impl ApplicationCoordinator {
         ));
 
         // Wrap config in Arc<RwLock> for hot-reloading
+        let recent_failure_window =
+            Duration::from_secs(config.autonomous.recent_failure_window_secs);
         let config = Arc::new(RwLock::new(config));
 
         // hb-216 S2: shared FT8 decoder config + scoped-fast-path atomic.
@@ -2530,7 +2532,9 @@ impl ApplicationCoordinator {
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
-                crate::priority_evaluator::CachedStationLookup::new(),
+                crate::priority_evaluator::CachedStationLookup::with_recent_failure_window(
+                    recent_failure_window,
+                ),
             ),
             cqdx_bridge: None,
             waterfall_to_auto_tx: Some(waterfall_to_auto_tx),
@@ -4845,6 +4849,35 @@ mod tests {
         .await;
 
         assert!(coordinator.is_ok());
+    }
+
+    #[tokio::test]
+    async fn recent_failure_window_is_seeded_from_config() {
+        let mut config = Config::default();
+        config.autonomous.recent_failure_window_secs = 0;
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true, // no_audio
+            true, // headless
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
+        )
+        .await;
+
+        let coordinator = coordinator.unwrap();
+        coordinator.cached_lookup.record_failure("DL1ABC");
+        use pancetta_qso::priority::WorkedStationLookup;
+        assert!(!coordinator.cached_lookup.is_recent_failure("DL1ABC"));
     }
 
     /// Regression test for the blank-TX-placement-instrument bug: the FT8
