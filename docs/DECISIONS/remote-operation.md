@@ -148,7 +148,11 @@ all with clean reviews (no Critical/Important findings):
    disarming a displaced controller's live arm first (arms never transfer — the new controller must re-arm through the full grant
    verification); `releaseControl` from the controller clears it (disarms if armed); a
    control-mutating action from `controller == None` implicitly grabs it (so a legacy client that
-   never sends `takeControl` still arms exactly as it always has); the same action from a
+   never sends `takeControl` still arms exactly as it always has), but only from a peer that holds
+   a currently-valid hello capability, checked before the grab: `txArm`, `setFrequency`,
+   `setSplit` and TX requests (`callStation`, `answerCaller`, `startCq`) need `qsy` or higher
+   (PAN-283), and `stopCq` needs any scope (PAN-250); a peer without it is refused with no
+   state change and no frame; the same action from a
    non-controller while someone else holds control is refused with an audited error frame, never
    an implicit grab; controller `down`/session teardown/shutdown clears `controller` and disarms,
    a listener disconnecting disarms nothing.
@@ -329,9 +333,10 @@ on `PeerAuth`, `PeerCtx::grants` and `sweep_expired_peer_auth` rather than add a
 mechanism. PAN-95 already makes `qsy`/`setSplit` check expiry. PAN-96 still owns evicting or
 de-authorizing established peers when an authorization poll revokes them.
 
-Follow-up: implicit control grabs do not yet require a currently-valid `status`+ capability.
-That is an inbound control-rule change left for a separate ticket. Explicit `takeControl` now
-requires a currently-valid `qsy`-or-higher capability (PAN-253, below).
+Follow-up, closed: implicit control grabs now require a currently-valid hello capability.
+Explicit `takeControl` requires `qsy` or higher (PAN-253, below). Implicit grabs through `txArm`,
+`setFrequency`, `setSplit` and TX requests require `qsy` or higher (PAN-283, below), and
+`stopCq` requires any scope (PAN-250, below).
 
 ## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
 
@@ -1083,9 +1088,53 @@ owed, and no frame is sent. It logs a `warn!` like the QSY and split scope
 refusals. `controller_gate` is not consulted first because it can mutate
 ownership. No wire, schema or config change was needed.
 
-Implicit grabs through Arm/QSY/split/StopCq/TX requests, Disarm and
-ReleaseControl keep their existing rules. The local WebSocket gateway does
-not dispatch `takeControl` and is unchanged.
+Disarm and ReleaseControl keep their existing rules. Implicit grabs were
+left alone here; PAN-250 (`StopCq`, any live hello) and PAN-283 (Arm, QSY,
+split and TX requests, `qsy` or higher, below) later put a hello check ahead
+of them. The local WebSocket gateway does not dispatch `takeControl` and is
+unchanged.
+
+## Implicit grabs need a qsy hello (PAN-283, 2026-11-08)
+
+With the controller slot empty, `controller_gate` makes the sender
+controller and owes the PAN-137 cleanup that retires other remote clients'
+QSOs. `Arm`, `Qsy`, `SetSplit` and `TxRequest` reached that gate before any
+capability check: `Qsy` and `SetSplit` checked `qsy` only after the grab, and
+`Arm` and `TxRequest` never checked the hello. A peer with no hello, an
+expired or revoked one, or a status-only one could therefore take control,
+send every other peer a `controlState`, retire other remote operators' QSOs
+and, through `callStation`, open a remote-origin QSO. A peer with no hello
+and a valid arm grant could even end up armed and controller while the
+station could send it nothing. TX itself stayed arm-gated, so the harm was
+control-plane disruption.
+
+`dispatch_action` now calls `refuse_without_control_capability` as the first
+statement of the `Arm`, `Qsy`, `SetSplit`, `TxRequest` and `TakeControl`
+arms. It requires `peer_grants(ctx, peer, "qsy", now)`: admitted, unexpired,
+not revoked, scoped `qsy` or `tx`. `qsy` matches PAN-253's lowest
+control-capable tier; `tx` was not required because a client may hello with a
+short-lived non-TX token and arm with a separate TX-enabled one. All three
+wire TX requests (`callStation`, `answerCaller`, `startCq`) share the
+`TxRequest` arm. For `Qsy` and `SetSplit` the check also runs ahead of the
+PAN-252 activity refusal, so a peer without the tier learns nothing about rig
+or QSO activity, and the late scope check after the gate is gone.
+
+A refusal changes nothing: no frame, no controller change, no owed cleanup,
+no QSO or rig message, no arm. It logs `warn!` on `agent.control` naming the
+verb and the missing `qsy` capability. `txArm` and TX-request refusals are
+also audited `TxDenied` (`arm refused: ...` and `txRequest refused: ...
+(callStation W1XYZ)`). No `error` frame is sent: the PAN-95 outbound gate
+withholds every frame from a peer without a live `status` hello, and a
+status-only peer is refused silently exactly as `takeControl` refuses it.
+Two error frames a status-only peer used to get are therefore gone:
+`another client holds control — takeControl first` (it could not act on it,
+since `takeControl` needs `qsy`) and `setFrequency refused — the rig is
+transmitting`. A peer with a `qsy` or `tx` hello sees no change.
+
+`stopCq` keeps PAN-250's rule: any live hello, so a status-only peer can still
+stop CQ and, with the slot empty, grab control through it. `Heartbeat`,
+`Disarm`, `ReleaseControl` and `Hello` are unchanged. No wire, schema or
+config change was needed.
 
 ## PAN-250: remote stopCq stops calling CQ
 
