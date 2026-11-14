@@ -444,6 +444,8 @@ without waiting for another decode. A list that no longer names the entity
 also clears `!` and the card's `ATNO★`. A newly listed ATNO's `!` and the
 row's score and position in the list change when the station is next decoded
 or spotted; the remote `DecodedView.needed` changes at its next decode.
+DX Hunter takes that ATNO verdict from the displayed rank, as described in
+the PAN-399 section below.
 
 **Strip chips.** `⚠ CQDX NEEDS UNKNOWN` shows while a configured cqdx.io has not
 delivered the needed-entity list: an outage, an empty or invalid token, or a
@@ -567,6 +569,26 @@ grid history adds no marker and triggers no lookup during rendering.
 Call and Grid reserve 12 and 5 cells. Full columns require 77 cells including
 borders, gaps and selection; widths 64–76 omit Grid and distance, and widths
 below 64 also omit DT/DF. Time, SNR, Call and a 20-cell message fit at 51.
+
+## DX Hunter's ! follows the displayed score (PAN-399, 2026-11)
+
+DX Hunter reads `DxStation::ranked_atno()` for its `!` marker. The marker,
+Pri and Why therefore use the same scoring call. An unscored row or a rank
+without factors falls back to the stored ATNO flag. A frame verdict of not
+needed still clears the marker.
+
+A spot merge stores cqdx-only needed and ATNO flags over a decode's
+policy-selected flags. Reading the stored ATNO could remove a local ATNO's
+`!` while Pri and Why still said all-time new. A later decode could also
+overwrite the flag while a higher network ATNO rank remained displayed.
+Re-ranking after a worked contact now clears a stale `!` with its score.
+
+A fresh per-frame ATNO verdict was rejected because it could contradict the
+displayed network rank. In plan cases C3 to C5, local worked-unconfirmed
+history and cqdx ATNO disagree, or local ATNO and network needed disagree.
+The displayed rank decides the ATNO marker in each case. Band Activity and
+the station card keep their decode verdicts. Spot scoring and wire fields
+are unchanged.
 
 ## Redraw cadence and station retention (PAN-319)
 
