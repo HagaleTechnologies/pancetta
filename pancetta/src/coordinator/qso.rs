@@ -3573,6 +3573,7 @@ impl super::ApplicationCoordinator {
         // Stamped into every rendered ADIF record's TX_PWR field (source-of-truth
         // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
         let station_power_watts = config.station.power_watts;
+        let attribution_comment = config.logging.attribution_comment;
         // Snapshot the opt-in QSO-upload settings. Only when at least one is
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
@@ -4098,6 +4099,7 @@ impl super::ApplicationCoordinator {
                     &adif_path,
                     &db_path,
                     station_power_watts,
+                    attribution_comment,
                     &database_settings,
                     &qso_manager,
                     &adif_subscribers,
@@ -4120,6 +4122,7 @@ impl super::ApplicationCoordinator {
                         upload_outbox.clone(),
                         qrz_xml_cfg.clone(),
                         station_power_watts,
+                        attribution_comment,
                         qso_manager.subscribe(),
                         shutdown.clone(),
                         qso_lookup.clone(),
@@ -10332,6 +10335,7 @@ mod auto_73_tests {
             &adif_path,
             &dir.path().join("qso.db"),
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &mgr,
             &adif_subscribers,
@@ -11320,6 +11324,7 @@ fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
     station_power_watts: u32,
+    attribution_comment: bool,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
@@ -11371,8 +11376,9 @@ fn start_qso_upload_subscriber(
     }
 
     tokio::spawn(async move {
-        let processor =
-            pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
+        let processor = pancetta_qso::AdifProcessor::new()
+            .with_station_power_watts(station_power_watts)
+            .with_attribution_comment(attribution_comment);
 
         // PAN-232: with a queue, the subscriber runs until coordinator
         // shutdown asks it to finish (`stop_upload_outbox`, after every QSO
@@ -11589,11 +11595,14 @@ fn start_qso_upload_subscriber(
 /// startup ADIF→index replay (ADIF is the source of truth; the DB is a
 /// cache). Both are fail-soft — a failure to open either is logged and the
 /// other still runs.
+// Startup settings and subscriber handles are passed together.
+#[allow(clippy::too_many_arguments)]
 async fn start_local_qso_log_writers(
     replay: bool,
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
     station_power_watts: u32,
+    attribution_comment: bool,
     database_settings: &pancetta_config::DatabaseConfig,
     qso_manager: &pancetta_qso::QsoManager,
     adif_subscribers: &AdifSubscribers,
@@ -11651,6 +11660,7 @@ async fn start_local_qso_log_writers(
             Ok(mut w) => {
                 info!("ADIF log open at {}", adif_path.display());
                 w.set_station_power_watts(station_power_watts);
+                w.set_attribution_comment(attribution_comment);
                 let w = std::sync::Arc::new(w);
                 adif_subscribers.track(start_adif_subscriber(
                     w.clone(),
@@ -12462,6 +12472,7 @@ mod cqdx_upload_tests {
             Some(handle.clone()),
             Default::default(),
             100,
+            false,
             rx,
             shutdown.clone(),
             Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
@@ -12516,6 +12527,90 @@ mod cqdx_upload_tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn pan298_upload_payloads_follow_attribution_setting() {
+        use super::super::upload_outbox::{
+            self, Delivery, OutboxTiming, OutboxTransport, UploadHealth,
+        };
+        use pancetta_dx::upload_outbox::{RetrySchedule, UploadDestination};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        struct Transport(Arc<Mutex<Vec<(UploadDestination, String)>>>);
+        impl OutboxTransport for Transport {
+            fn destinations(&self) -> Vec<UploadDestination> {
+                vec![UploadDestination::QrzLogbook, UploadDestination::Cqdx]
+            }
+            async fn deliver(&self, destination: UploadDestination, payload: String) -> Delivery {
+                self.0.lock().unwrap().push((destination, payload));
+                Delivery::Accepted { duplicate: false }
+            }
+        }
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let payloads = Arc::new(Mutex::new(Vec::new()));
+            let statuses = super::super::qso_upload_status::UploadStatusRegistry::shared();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let (handle, task) = upload_outbox::start_upload_outbox(
+                dir.path().join("queue.json"),
+                Arc::new(Transport(payloads.clone())),
+                RetrySchedule::new(3, 5, 20, 2.0, 0.0, std::time::Duration::from_millis(100)),
+                OutboxTiming::PRODUCTION,
+                Arc::new(Mutex::new(UploadHealth::default())),
+                None,
+                shutdown.clone(),
+                Some(statuses.clone()),
+            );
+            let (tx, rx) = tokio::sync::broadcast::channel(4);
+            super::start_qso_upload_subscriber(
+                Some(handle.clone()),
+                Default::default(),
+                100,
+                enabled,
+                rx,
+                shutdown.clone(),
+                Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+                None,
+                statuses,
+            );
+            let metadata = metadata_with_call(Some("K1ABC"));
+            tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+                qso_id: metadata.qso_id,
+                metadata,
+                state_history: vec![],
+                messages: vec![],
+            })
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while payloads.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            for (destination, payload) in payloads.lock().unwrap().iter() {
+                if *destination == UploadDestination::QrzLogbook {
+                    let p = pancetta_qso::AdifProcessor::new();
+                    let parsed = p.parse_string(payload).unwrap();
+                    let qso = p.record_to_qso(&parsed.records[0]).unwrap();
+                    assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+                } else {
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert!(json.get("comment").is_none());
+                    assert!(!payload.contains("Using cqdx.io & Pancetta"));
+                }
+            }
+            shutdown.store(true, Ordering::Release);
+            drop(tx);
+            drop(handle);
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn pan344_subscriber_missing_payload_and_closed_worker() {
         use super::super::upload_outbox::{
             self, Delivery, OutboxTiming, OutboxTransport, UploadHealth,
@@ -12557,6 +12652,7 @@ mod cqdx_upload_tests {
                 Some(handle),
                 Default::default(),
                 100,
+                false,
                 rx,
                 shutdown,
                 Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
@@ -13243,6 +13339,7 @@ mod replay_local_log_tests {
                     &root.join("qsos.adi"),
                     &root.join("qso.db"),
                     100,
+                    false,
                     &settings,
                     &manager(),
                     &subscribers,
@@ -13451,6 +13548,37 @@ mod replay_local_log_tests {
         <FREQ:9>14.074000 <BAND:3>20M <EOR>\n";
 
     #[tokio::test]
+    async fn pan298_logged_comment_follows_attribution_setting() {
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let adif = dir.path().join("qsos.adi");
+            let manager = manager();
+            let subscribers = AdifSubscribers::new();
+            let (_writer, logger, seed) = start_local_qso_log_writers(
+                false,
+                &adif,
+                &dir.path().join("qso.db"),
+                100,
+                enabled,
+                &pancetta_config::DatabaseConfig::default(),
+                &manager,
+                &subscribers,
+            )
+            .await;
+            complete_one_qso(&manager).await;
+            assert_eq!(wait_for_adif_record(&adif).await, 1);
+            let p = pancetta_qso::AdifProcessor::new();
+            let text = std::fs::read_to_string(&adif).unwrap();
+            let parsed = p.parse_string(&text).unwrap();
+            let qso = p.record_to_qso(&parsed.records[0]).unwrap();
+            assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+            subscribers.stop(Duration::from_secs(2)).await;
+            drop(logger);
+            seed.expect("seed").close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn live_start_does_not_rebuild_after_a_kill_with_rows_in_the_wal() {
         let dir = tempfile::tempdir().unwrap();
         let killed = tempfile::tempdir().unwrap();
@@ -13463,6 +13591,7 @@ mod replay_local_log_tests {
             &adif,
             &path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &subscribers,
@@ -13613,6 +13742,7 @@ mod replay_local_log_tests {
                 &adif,
                 &path,
                 100,
+                false,
                 &pancetta_config::DatabaseConfig::default(),
                 &manager(),
                 &subscribers,
@@ -13674,6 +13804,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13713,6 +13844,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13755,6 +13887,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13789,6 +13922,7 @@ mod replay_local_log_tests {
             &logged_adif,
             &before_cut.path().join("qso.db"),
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &first_session,
             &adif_subscribers,
@@ -13828,6 +13962,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &restarted,
             &adif_subscribers,
@@ -13881,6 +14016,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13919,6 +14055,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13953,6 +14090,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -13998,6 +14136,7 @@ mod replay_local_log_tests {
             &dir.path().join("qsos.adi"),
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -14030,6 +14169,7 @@ mod replay_local_log_tests {
             &adif_path,
             &db_path,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
@@ -19951,6 +20091,7 @@ mod pan260 {
             &adif,
             &index,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &m,
             &adif_subscribers,
@@ -19987,6 +20128,7 @@ mod pan260 {
             &adif,
             &index,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &first,
             &adif_subscribers,
@@ -20381,6 +20523,7 @@ mod pan50_live_contest {
             &adif,
             &index,
             100,
+            false,
             &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,

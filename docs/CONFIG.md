@@ -664,6 +664,22 @@ without asking for it. See `docs/observability-diagnostics-plan.md`
 
 ---
 
+### `[logging]` — attribution comment in logged contacts
+
+```toml
+[logging]
+attribution_comment = false
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `attribution_comment` | bool | `false` | Append the Pancetta/cqdx software attribution to new ADIF comments. |
+
+This covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads and WSJT-X LoggedADIF.
+Operator notes and the HOUND marker are always preserved. The cqdx.io JSON
+upload and `pancetta export` do not add attribution. Existing records are not
+rewritten. Changes require a restart.
+
 ## `[network]` — external services
 
 QRZ.com, LoTW, eQSL, Clublog, PSKReporter all live under `[network]`.

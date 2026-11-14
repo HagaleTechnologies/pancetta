@@ -67,6 +67,7 @@ pub mod fox;
 pub mod hot_reload;
 pub mod hound;
 pub mod loader;
+pub mod logging;
 pub mod network;
 pub mod rig;
 pub mod station;
@@ -84,6 +85,7 @@ pub use duplicate_check::*;
 pub use fox::*;
 pub use hound::*;
 pub use loader::*;
+pub use logging::*;
 pub use network::*;
 pub use rig::*;
 pub use station::*;
@@ -210,6 +212,10 @@ pub struct Config {
     #[serde(default)]
     pub database: database::DatabaseConfig,
 
+    /// Attribution preferences for new logbook records.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
     /// Contest scoring (PAN-50). Optional startup-only opt-in; absent means
     /// contest scoring is disabled and nothing changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +269,7 @@ impl Default for Config {
             decoder: decoder::DecoderConfig::default(),
             duplicate_checking: duplicate_check::DuplicateCheckingConfig::default(),
             database: database::DatabaseConfig::default(),
+            logging: LoggingConfig::default(),
             contest: None,
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
@@ -380,6 +387,7 @@ impl Config {
         self.decoder.validate_section()?;
         self.duplicate_checking.validate_section()?;
         self.database.validate_section()?;
+        self.logging.validate_section()?;
 
         if let Some(contest) = &self.contest {
             contest.validate_section()?;
@@ -407,6 +415,7 @@ impl Config {
         self.decoder.merge_with(other.decoder);
         self.duplicate_checking.merge_with(other.duplicate_checking);
         self.database.merge_with(other.database);
+        self.logging.merge_with(other.logging);
 
         // [contest] replaces as a unit; an overlay without the section leaves
         // the base's contest untouched (absent ≠ disabled — the explicit
@@ -2227,6 +2236,7 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
+        assert_carries_all::<LoggingConfig>("LoggingConfig", &[], |a, b| a.merge_with(b));
         assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
             a.merge_with(b)
         });

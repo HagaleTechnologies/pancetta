@@ -306,7 +306,7 @@ pub fn freq_hz_to_band(frequency_hz: f64) -> String {
     format!("{:.0}MHZ", frequency_hz / 1_000_000.0)
 }
 
-/// Attribution appended to every logged QSO's COMMENT field, crediting the
+/// Opt-in attribution appended to a logged QSO's COMMENT field, crediting the
 /// software/service stack the station runs on. Two variants so long
 /// operator notes don't force a truncation: the full form (with URLs) is
 /// used when it fits; otherwise the short form; if even that doesn't fit,
@@ -354,6 +354,7 @@ pub struct AdifProcessor {
     /// Station transmit power in watts, stamped into every `TX_PWR` field
     /// this processor renders. `None` omits `TX_PWR` entirely (unconfigured).
     station_power_watts: Option<f64>,
+    attribution_comment: bool,
 }
 
 impl AdifProcessor {
@@ -362,10 +363,22 @@ impl AdifProcessor {
         let mut processor = Self {
             field_definitions: HashMap::new(),
             station_power_watts: None,
+            attribution_comment: false,
         };
 
         processor.initialize_standard_fields();
         processor
+    }
+
+    /// Enable or disable software attribution in rendered comments. Defaults off.
+    pub fn set_attribution_comment(&mut self, enabled: bool) {
+        self.attribution_comment = enabled;
+    }
+
+    /// Builder-style variant of [`set_attribution_comment`](Self::set_attribution_comment).
+    pub fn with_attribution_comment(mut self, enabled: bool) -> Self {
+        self.set_attribution_comment(enabled);
+        self
     }
 
     /// Set the station transmit power (watts) stamped into every `TX_PWR`
@@ -660,8 +673,8 @@ impl AdifProcessor {
         let freq_mhz = metadata.frequency / 1_000_000.0;
 
         // Build the COMMENT field: start from existing notes, append "HOUND"
-        // for Hound QSOs (the human-readable DXpedition marker), then append
-        // the software attribution (full form with URLs if it fits, short
+        // for Hound QSOs (the human-readable DXpedition marker), then optionally append
+        // opt-in software attribution (full form with URLs if it fits, short
         // form otherwise, omitted entirely rather than truncating operator
         // notes). Appending never overwrites existing notes.
         let existing_notes = match &metadata.notes {
@@ -674,7 +687,11 @@ impl AdifProcessor {
             (None, true) => "HOUND".to_string(),
             (None, false) => String::new(),
         };
-        let comment = Some(append_attribution(&base));
+        let comment = if self.attribution_comment {
+            Some(append_attribution(&base))
+        } else {
+            (!base.is_empty()).then_some(base)
+        };
 
         // Build additional_fields from metadata.tags; for Hound QSOs inject
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
@@ -910,7 +927,7 @@ impl AdifProcessor {
             ("STX", number(adif_qso.stx)),
             ("SRX", number(adif_qso.srx)),
             ("NOTES", adif_qso.notes.clone()),
-            // `notes` holds it too, but export appends Pancetta's attribution
+            // `notes` holds it too, but rendering may append Pancetta's attribution
             // to `notes`; the tag writes a third-party comment back as read.
             ("COMMENT", adif_qso.comment.clone()),
             (QSL_SENT_FIELD, adif_qso.qsl_sent.clone()),
@@ -2140,10 +2157,7 @@ ADIF Export for Test Program
         assert_eq!(adif_qso.tx_pwr, None);
     }
 
-    /// A non-Hound QSO with existing notes must preserve them verbatim as a
-    /// prefix of COMMENT (2026-07-06: notes are no longer emitted alone —
-    /// software attribution is appended to every QSO — but the operator's
-    /// own text must never be altered or dropped).
+    /// Operator notes remain intact when attribution is off.
     #[test]
     fn non_hound_qso_adif_notes_unchanged() {
         let processor = AdifProcessor::new();
@@ -2159,11 +2173,11 @@ ADIF Export for Test Program
         );
     }
 
-    /// Every QSO's COMMENT carries the cqdx.io/Pancetta attribution, full
+    /// Opted-in COMMENT carries the cqdx.io/Pancetta attribution, full
     /// form (with URLs) when there's room — the common case (no/short notes).
     #[test]
-    fn every_qso_gets_full_attribution_by_default() {
-        let processor = AdifProcessor::new();
+    fn enabled_processor_writes_full_attribution() {
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let metadata = hound_adif_metadata(false, None);
 
         let adif_qso = processor.qso_to_adif(&metadata, None);
@@ -2176,7 +2190,7 @@ ADIF Export for Test Program
     /// form rather than dropping attribution or truncating operator notes.
     #[test]
     fn long_notes_fall_back_to_short_attribution() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         // Long enough that notes + ATTRIBUTION_FULL exceeds COMMENT_SOFT_MAX_LEN
         // but notes + ATTRIBUTION_SHORT still fits.
         let long_notes = "x".repeat(200);
@@ -2206,7 +2220,7 @@ ADIF Export for Test Program
     /// never truncated to make room for it.
     #[test]
     fn very_long_notes_drop_attribution_entirely() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let very_long_notes = "x".repeat(COMMENT_SOFT_MAX_LEN);
         let metadata = hound_adif_metadata(false, Some(&very_long_notes));
 
@@ -2223,7 +2237,7 @@ ADIF Export for Test Program
     /// attribution, all in one COMMENT field.
     #[test]
     fn hound_qso_comment_includes_attribution_too() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let metadata = hound_adif_metadata(true, Some("Big pile-up!"));
 
         let adif_qso = processor.qso_to_adif(&metadata, None);
@@ -2232,6 +2246,25 @@ ADIF Export for Test Program
         assert!(comment.contains("Big pile-up!"));
         assert!(comment.contains("HOUND"));
         assert!(comment.contains(ATTRIBUTION_FULL));
+    }
+
+    #[test]
+    fn attribution_off_keeps_notes_and_hound_marker() {
+        let processor = AdifProcessor::new();
+        for (hound, notes, expected) in [
+            (false, None, None),
+            (false, Some("Good contact"), Some("Good contact")),
+            (true, None, Some("HOUND")),
+            (true, Some("Big pile-up!"), Some("Big pile-up! HOUND")),
+        ] {
+            assert_eq!(
+                processor
+                    .qso_to_adif(&hound_adif_metadata(hound, notes), None)
+                    .comment
+                    .as_deref(),
+                expected
+            );
+        }
     }
 
     // ── PAN-85: state round-trip through ADIF ───────────────────────────────
