@@ -1253,7 +1253,6 @@ warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
 
-<<<<<<< HEAD
 ## PAN-302: live operational allowlist
 
 Validated reloads patch only changed allowlisted fields. Autonomous decision
@@ -1270,7 +1269,7 @@ must not write CAT on save. Hardware binding, protection, identity and
 stateful autonomous helper settings remain restart-only. See CONFIG.md's
 explicit allowlist; section-wide reload would change values that running
 components still latch.
-=======
+
 ## PAN-303: remove configuration without runtime consumers
 
 Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
@@ -1288,7 +1287,6 @@ by the conservative cutoff at each source file's first `#[cfg(test)]`.
 The waiver ceiling cannot grow. Remaining settings need separate consumer
 or removal work; optional values absent from defaults and user map entries
 are outside this test's enumeration.
->>>>>>> 2b655fe1aed570a106c8d2c55ae219c5e7237af6
 
 ## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
 
