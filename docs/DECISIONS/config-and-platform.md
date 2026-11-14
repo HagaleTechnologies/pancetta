@@ -1253,6 +1253,23 @@ warns and below 10 MiB fails. Known macOS denial or restriction fails
 independently of capture; unresolved authorization warns. No permission prompt
 is requested. These checks preserve the existing report's failure exit policy.
 
+## PAN-302: live operational allowlist
+
+Validated reloads patch only changed allowlisted fields. Autonomous decision
+policy is refreshed without rebuilding the operator, so CQ bookkeeping and
+spectral history survive. File permission is independent of runtime intent:
+a headless station started disabled can later enable through the file, while
+an operator pause survives reload and component restart. The typed readiness
+notice reports config permission without muting manual TX.
+
+The late cap is a last-instant refusal limit, published under the PTT gate;
+lead time and self-parity are captured for each new scheduling attempt.
+Receive presets already read the effective snapshot at band crossings and
+must not write CAT on save. Hardware binding, protection, identity and
+stateful autonomous helper settings remain restart-only. See CONFIG.md's
+explicit allowlist; section-wide reload would change values that running
+components still latch.
+
 ## PAN-303: remove configuration without runtime consumers
 
 Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,

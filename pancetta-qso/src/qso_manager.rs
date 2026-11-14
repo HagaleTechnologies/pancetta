@@ -1936,23 +1936,8 @@ pub struct QsoManager {
     /// 15 s cadence.
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
-    /// The station's configured late-start TX window in milliseconds
-    /// (`[station] tx_late_max_ms`, default 3000), injected by the
-    /// coordinator via [`QsoManager::set_tx_late_max_ms`].
-    ///
-    /// PAN-128 PR review: `keep_call_tx_slot` needs the SAME current-slot
-    /// acceptance window the TX scheduler (`schedule_tx`) decides against,
-    /// so that a rearm inside own slot S's late window and the off-parity
-    /// rearm before S — both scheduled into S — share one ledger key and
-    /// one stall count. A plain value, not an `Arc` atomic: the TX worker
-    /// itself snapshots `tx_late_max_ms` once at startup (config is loaded
-    /// once; the hot-reload apply task is a documented no-op), so a
-    /// construction-time copy has the same fidelity, and `Clone`'s by-value
-    /// copy is exactly what the rearm loop's clone should see.
-    ///
-    /// Defaults to [`DEFAULT_TX_LATE_MAX_MS`], so unit tests and any caller
-    /// that never injects a value keep the documented operator default.
-    tx_late_max_ms: u64,
+    /// Shared late-start limit: worker and timeout clones observe reloads together.
+    tx_late_max_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -2326,7 +2311,7 @@ impl QsoManager {
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
             // Default late-start window: the documented operator default
             // (see the field's doc comment).
-            tx_late_max_ms: DEFAULT_TX_LATE_MAX_MS,
+            tx_late_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_TX_LATE_MAX_MS)),
         }
     }
 
@@ -2455,11 +2440,16 @@ impl QsoManager {
     ///
     /// PAN-128 PR review — see the `tx_late_max_ms` field's doc comment for
     /// why the stall ledger needs the scheduler's own window. Pass the same
-    /// `cfg.station.tx_late_max_ms` the TX worker snapshots at startup; if
-    /// never called, the manager keeps [`DEFAULT_TX_LATE_MAX_MS`] (3000, the
-    /// documented default).
+    /// `cfg.station.tx_late_max_ms` used by the TX worker; if never called,
+    /// the manager keeps [`DEFAULT_TX_LATE_MAX_MS`] (3000, the documented default).
     pub fn set_tx_late_max_ms(&mut self, tx_late_max_ms: u64) {
-        self.tx_late_max_ms = tx_late_max_ms;
+        self.tx_late_max_ms
+            .store(tx_late_max_ms, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Bind the station's live late-start limit before starting background work.
+    pub fn set_tx_late_max_ms_source(&mut self, source: Arc<std::sync::atomic::AtomicU64>) {
+        self.tx_late_max_ms = source;
     }
 
     /// One transmit slot in milliseconds for the live active protocol — the
@@ -9492,7 +9482,8 @@ impl QsoManager {
                 let tx_slot = keep_call_tx_slot(
                     now,
                     slot_millis,
-                    self.tx_late_max_ms,
+                    self.tx_late_max_ms
+                        .load(std::sync::atomic::Ordering::Acquire),
                     progress.metadata.tx_parity,
                 );
                 let counts_toward_stall = !ledger.get(&qso_id).is_some_and(|entry| {
@@ -10141,9 +10132,8 @@ impl Clone for QsoManager {
             // this clone and must observe runtime mode switches (see the
             // field's doc comment).
             active_slot_ns: Arc::clone(&self.active_slot_ns),
-            // Copied by value, matching the TX worker's own startup
-            // snapshot of the same knob (see the field's doc comment).
-            tx_late_max_ms: self.tx_late_max_ms,
+            // Reload publication also reaches the background timeout clone.
+            tx_late_max_ms: self.tx_late_max_ms.clone(),
         }
     }
 }
@@ -10153,6 +10143,43 @@ impl Clone for QsoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan302_qso_late_cap_refreshes_before_slot_acceptance() {
+        let mut manager = QsoManager::new(QsoManagerConfig::default());
+        let live = Arc::new(std::sync::atomic::AtomicU64::new(8000));
+        manager.set_tx_late_max_ms_source(live.clone());
+        let timeout_clone = manager.clone();
+        let now = chrono::DateTime::from_timestamp(2, 0).unwrap();
+        let before = keep_call_tx_slot(
+            now,
+            15_000,
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            Some(pancetta_core::slot::SlotParity::Even),
+        );
+        live.store(1000, std::sync::atomic::Ordering::Release);
+        let after = keep_call_tx_slot(
+            now,
+            15_000,
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            Some(pancetta_core::slot::SlotParity::Even),
+        );
+        assert_ne!(
+            before, after,
+            "the real timeout clone must defer beyond the reduced cap"
+        );
+        manager.set_tx_late_max_ms(8000);
+        assert_eq!(
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            8000
+        );
+    }
     use tokio_test;
 
     #[test]

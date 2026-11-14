@@ -12,7 +12,7 @@
 //! - **Warning** (yellow): stays until resolved or acknowledged with `!`. An
 //!   ack lasts for the current episode only — once the condition clears the
 //!   ack is pruned, so a recurrence shows again.
-//! - **Notice** (cyan): short-lived "waiting on the rig" states.
+//! - **Notice** (cyan): informational states; config permission persists until changed.
 
 use chrono::{DateTime, Utc};
 
@@ -126,6 +126,8 @@ pub enum NeedListHealth {
 /// Coordinator → TUI readiness snapshot (relay, 2 s tick, pushed on change).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StationReadiness {
+    /// File permission only; independent of the operator pause and TX policy.
+    pub autonomous_config_disabled: bool,
     /// Every active TX hard-mute cause, in the gate's priority order. Empty ⇔ gate open.
     pub tx_mute_causes: Vec<TxMuteCause>,
     /// The rig did not confirm a PTT-off (teardown or a live unkey); cleared
@@ -156,6 +158,7 @@ pub enum Severity {
 /// Identity of a readiness condition; acknowledgements are keyed by it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReadinessKey {
+    AutonomousConfigDisabled,
     PttOffUnconfirmed,
     RigRestarting,
     RigLinkLost,
@@ -492,6 +495,14 @@ fn cause_items(
             TxMuteCause::PolicyDisabled => {}
         }
     }
+    if r.autonomous_config_disabled {
+        notices.push(item(
+            ReadinessKey::AutonomousConfigDisabled,
+            Severity::Notice,
+            "AUTO OFF IN CONFIG",
+            "Autonomous CQ and pouncing are disabled by autonomous.enabled=false. Edit pancetta.toml to enable them. Manual TX and direct-caller reply policy are unchanged.",
+        ));
+    }
 }
 
 /// Blockers and Warnings from the pipeline/audio/clock/supervisor state.
@@ -715,6 +726,75 @@ mod tests {
             .filter(ReadinessItem::is_visible)
             .map(|i| i.label)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn pan302_config_disabled_notice_is_persistent_and_not_a_tx_mute() {
+        let mut app = app().await;
+        assert_eq!(verdict(&app), Verdict::Checking);
+        app.station_readiness = Some(StationReadiness {
+            autonomous_config_disabled: true,
+            ..StationReadiness::default()
+        });
+        let notice = readiness_items(&app).remove(0);
+        assert_eq!(notice.label, "AUTO OFF IN CONFIG");
+        assert_eq!(notice.detail, "Autonomous CQ and pouncing are disabled by autonomous.enabled=false. Edit pancetta.toml to enable them. Manual TX and direct-caller reply policy are unchanged.");
+        assert_eq!(notice.severity, Severity::Notice);
+        assert!(!notice.is_acknowledgeable());
+        assert_eq!(app.acknowledge_readiness(), 0);
+        assert_eq!(verdict(&app), Verdict::Ready);
+        app.pipeline_health = Some(health(true, None));
+        app.set_relay_status(
+            "Config reloaded".into(),
+            pancetta_core::DiagnosticLevel::Info,
+        );
+        app.add_decoded_message(crate::app::DecodedMessageView {
+            timestamp: Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".into(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("K1ABC".into()),
+            grid_square: None,
+            message: "CQ K1ABC FN42".into(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            priority_factors: None,
+            is_own_tx: false,
+        })
+        .await
+        .unwrap();
+        assert!(readiness_items(&app)
+            .iter()
+            .any(|i| i.label == notice.label && i.is_visible()));
+        for cause in TxMuteCause::ALL {
+            app.station_readiness.as_mut().unwrap().tx_mute_causes = vec![cause];
+            let disabled = verdict(&app);
+            app.station_readiness
+                .as_mut()
+                .unwrap()
+                .autonomous_config_disabled = false;
+            assert_eq!(verdict(&app), disabled);
+            app.station_readiness
+                .as_mut()
+                .unwrap()
+                .autonomous_config_disabled = true;
+        }
+        app.station_readiness
+            .as_mut()
+            .unwrap()
+            .autonomous_config_disabled = false;
+        assert!(!readiness_items(&app)
+            .iter()
+            .any(|i| i.key == ReadinessKey::AutonomousConfigDisabled));
     }
 
     #[tokio::test]
