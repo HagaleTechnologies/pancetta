@@ -212,6 +212,9 @@ call_min_hz = 1000.0
 response_max_hz = 900.0
 response_min_hz = 300.0
 
+[logging]
+attribution_comment = false
+
 [network.clublog]
 api_key = ""
 callsign = ""
