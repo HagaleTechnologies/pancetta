@@ -626,6 +626,18 @@ pub struct AutonomousConfig {
     pub watchlist_ttl_secs: u64,
 }
 
+/// Decision policy that can change without rebuilding stateful operator helpers.
+#[derive(Debug, Clone)]
+pub struct AutonomousLivePolicy {
+    pub enabled: bool,
+    pub min_dx_score: f64,
+    pub min_multi_slot_score: f64,
+    pub pounce_min_tier: Option<PriorityTier>,
+    pub cq_after_idle_cycles: u32,
+    pub cq_no_response_switch_after: u32,
+    pub cq_direction: String,
+}
+
 impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
@@ -1190,6 +1202,18 @@ impl AutonomousOperator {
             watchlist,
             skip_log: Vec::new(),
         }
+    }
+
+    /// Refresh only decision inputs. CQ compensation, decode history, slot
+    /// management and active contact state keep their existing generations.
+    pub fn update_live_policy(&mut self, policy: AutonomousLivePolicy) {
+        self.config.enabled = policy.enabled;
+        self.config.min_dx_score = policy.min_dx_score;
+        self.config.min_multi_slot_score = policy.min_multi_slot_score;
+        self.config.pounce_min_tier = policy.pounce_min_tier;
+        self.config.cq_after_idle_cycles = policy.cq_after_idle_cycles;
+        self.config.cq_no_response_switch_after = policy.cq_no_response_switch_after;
+        self.config.cq_direction = policy.cq_direction;
     }
 
     /// Drain CQ skips recorded by the most recent decision cycle.
@@ -3231,6 +3255,97 @@ fn simple_jitter() -> f64 {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    fn pan302_policy(config: &AutonomousConfig) -> AutonomousLivePolicy {
+        AutonomousLivePolicy {
+            enabled: config.enabled,
+            min_dx_score: config.min_dx_score,
+            min_multi_slot_score: config.min_multi_slot_score,
+            pounce_min_tier: config.pounce_min_tier,
+            cq_after_idle_cycles: config.cq_after_idle_cycles,
+            cq_no_response_switch_after: config.cq_no_response_switch_after,
+            cq_direction: config.cq_direction.clone(),
+        }
+    }
+
+    #[test]
+    fn pan302_policy_update_preserves_operator_state() {
+        let mut op = tier_pounce_operator(None, 1, &["VP8PJ"]);
+        op.idle_cycles = 9;
+        op.cq_no_response_streak = 3;
+        op.cq_attempt_counter = 42;
+        op.paused = true;
+        op.pending_sequencer_messages.push((
+            "K1XYZ W1ABC -10".into(),
+            1000.0,
+            Some("qso-1".into()),
+        ));
+        let history = op.decode_history.cycles_recorded();
+        let mut next = op.config.clone();
+        next.min_dx_score = 0.8;
+        next.min_multi_slot_score = 0.9;
+        next.cq_direction = "DX".into();
+        op.update_live_policy(pan302_policy(&next));
+        assert_eq!(op.idle_cycles, 9);
+        assert_eq!(op.cq_no_response_streak, 3);
+        assert_eq!(op.cq_attempt_counter, 42);
+        assert!(op.paused);
+        assert_eq!(op.active_qso_count, 1);
+        assert_eq!(op.pending_sequencer_messages.len(), 1);
+        assert_eq!(op.pending_cqs.len(), 1);
+        assert_eq!(op.decode_history.cycles_recorded(), history);
+    }
+
+    #[test]
+    fn pan302_live_policy_fields_affect_decisions() {
+        // Numeric admission independently changes first-slot and extra-slot
+        // decisions. Tier admission overrides either numeric threshold.
+        for (active, tier, threshold, expected) in [
+            (0, None, 0.5, true),
+            (0, None, 0.8, false),
+            (1, None, 0.5, true),
+            (1, None, 0.8, false),
+            (0, Some(PriorityTier::Atno), 0.99, true),
+            (1, Some(PriorityTier::Atno), 0.99, true),
+        ] {
+            let mut op = tier_pounce_operator(None, active, &["VP8PJ"]);
+            let mut next = op.config.clone();
+            next.min_dx_score = threshold;
+            next.min_multi_slot_score = threshold;
+            next.pounce_min_tier = tier;
+            op.update_live_policy(pan302_policy(&next));
+            assert_eq!(
+                pounced_on(&op.decide_at(0), "VP8PJ"),
+                expected,
+                "active={active}, tier={tier:?}, threshold={threshold}"
+            );
+        }
+        // The retained idle counter controls the next self-CQ using the new
+        // delay and direction, without starting a new operator.
+        let mut op = tier_pounce_operator(None, 0, &[]);
+        op.idle_cycles = 8;
+        let mut next = op.config.clone();
+        next.cq_after_idle_cycles = 9;
+        next.cq_direction = "DX".into();
+        op.update_live_policy(pan302_policy(&next));
+        assert!(op.decide_at(0).iter().any(|action| matches!(action,
+            OperatorAction::Transmit { message_text, .. } if message_text.starts_with("CQ DX "))));
+
+        // A new no-response threshold acts on the retained streak. Auto
+        // mode without sufficient history refuses a blind frequency switch.
+        let mut op = tier_pounce_operator(None, 0, &[]);
+        op.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Release,
+        );
+        op.cq_no_response_streak = 3;
+        let mut next = op.config.clone();
+        next.cq_after_idle_cycles = 1;
+        next.cq_no_response_switch_after = 3;
+        op.update_live_policy(pan302_policy(&next));
+        assert!(!pan356_has_transmit(&op.decide_at(0)));
+        assert_eq!(op.cq_no_response_streak, 3);
+    }
 
     #[test]
     fn test_slot_parity_derivation() {
