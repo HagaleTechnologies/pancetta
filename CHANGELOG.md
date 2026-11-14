@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-295: a silent audio-output stall (no callbacks for 2 s, no cpal error) now requests a forced device reopen, retrying every 10 s while the output stays silent, at most three times in a rolling ten minutes. TX stays muted until output callbacks resume; a reopen result alone never unmutes. When the limit is reached the readiness strip shows `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d`. Automated coverage only; hardware qualification pending.
+
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
 
 - PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.

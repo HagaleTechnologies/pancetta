@@ -41,10 +41,13 @@
   stays intentionally `DegradeOnly` — its in-place device-recovery path owns rollback semantics a
   task restart cannot reproduce.
 
-- **Silent audio-output stall does not auto-reopen (PAN-115):** a stall where output callbacks
-  stop without a cpal error mutes TX (`audio output device is dead`) but does not trigger an
-  automatic device reopen; the operator re-selects the device with `d`. A dead managed rigctld is
-  still only respawned by re-applying the rig (`i`) or a Hamlib restart.
+- **Silent audio-output stall recovery is bounded and hardware-unverified (PAN-115, PAN-295):** a
+  stall where output callbacks stop without a cpal error mutes TX and now requests a forced
+  reopen of both streams, retrying every 10 s while silent, at most three times in a rolling ten
+  minutes. TX stays muted until callbacks resume. At the limit the readiness strip shows
+  `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d` and the operator re-selects the device with `d`. Covered
+  by unit tests only; no physical stall has been qualified. A dead managed rigctld is still only
+  respawned by re-applying the rig (`i`) or a Hamlib restart.
 
 - **cqdx `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API** — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
 
