@@ -31,6 +31,8 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
+LoTW outbox retries, optional certificate passwords and duplicate tqsl exits 8/9 are integration-tested with fake tqsl, unreleased; live-account qualification remains pending.
+
 Operator-facing capability state: README.md § Capability status — keep both consistent.
 ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXCC/CQZ/ITUZ with token zone overrides, stored-field precedence and unknown omission, including export-time enrichment. Automated coverage only; live qualification pending.
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
