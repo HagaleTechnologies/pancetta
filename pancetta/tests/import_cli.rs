@@ -572,7 +572,7 @@ fn import_adds_contacts_to_a_new_logbook() {
         .unwrap();
     assert!(export.status.success(), "stderr: {}", stderr(&export));
     assert!(
-        stdout(&export).contains("Found 3 QSO(s) in database"),
+        stdout(&export).contains("Found 3 QSO(s) in logbook"),
         "{}",
         stdout(&export)
     );
@@ -1085,8 +1085,8 @@ fn an_overrunning_length_makes_only_its_record_unreadable() {
     assert_eq!(value(k1abc, "COMMENT"), None);
 }
 
-/// PAN-214 (PR #451 review, Codex): `pancetta export` reads the index, and
-/// writes an imported field's type indicator back as read.
+/// PAN-214 (PR #451 review, Codex): export writes an imported field's
+/// type indicator back as read.
 #[test]
 fn export_keeps_an_imported_type_indicator() {
     let s = Scratch::new();
@@ -1237,8 +1237,7 @@ fn undo_removes_the_import_and_keeps_a_contact_logged_since() {
     );
     assert!(
         out.ends_with(
-            "\nPancetta drops the removed contacts from its search index (which `pancetta \
-             export` reads) and its worked-station history the next time it starts.\n"
+            "\nPancetta drops the removed contacts from its search index and its worked-station history the next time it starts.\n"
         ),
         "{out}"
     );
@@ -1533,4 +1532,272 @@ fn import_and_undo_flags_conflict() {
 
     assert!(!s.adif().exists());
     assert_eq!(receipts(&s), Vec::<String>::new());
+}
+
+fn record(
+    call: &str,
+    date: &str,
+    time_on: &str,
+    band: &str,
+    freq: &str,
+    mode: &str,
+    submode: &str,
+) -> String {
+    [
+        ("CALL", call),
+        ("QSO_DATE", date),
+        ("TIME_ON", time_on),
+        ("BAND", band),
+        ("FREQ", freq),
+        ("MODE", mode),
+        ("SUBMODE", submode),
+    ]
+    .into_iter()
+    .map(|(k, v)| field(k, v))
+    .collect::<String>()
+        + "<EOR>\n"
+}
+
+#[test]
+fn export_reads_the_logbook_without_an_index() {
+    let scratch = Scratch::new();
+    let text = (0..100)
+        .map(|i| {
+            record(
+                &format!("K1A{i:02}"),
+                "20261001",
+                "120000",
+                "20m",
+                "14.074",
+                "FT8",
+                "",
+            )
+        })
+        .collect::<String>();
+    scratch.seed_logbook(&text, false);
+    let result = scratch
+        .command()
+        .arg("export")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = stdout(&result);
+    assert_eq!(out.matches("<EOR>").count(), 100);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Found 100 QSO(s) in logbook"));
+    let parsed = AdifProcessor::new().parse_string(&out).unwrap();
+    assert_eq!(parsed.records[0].fields["COUNTRY"].value, "United States");
+    assert_eq!(parsed.records[0].fields["DXCC"].value, "291");
+    assert!(!scratch.db().exists());
+}
+
+#[test]
+fn export_filters_by_date_band_and_mode() {
+    let scratch = Scratch::new();
+    let mut text = String::new();
+    let mut expected = std::collections::BTreeSet::new();
+    for (i, date) in ["20260930", "20261001", "20261015"].iter().enumerate() {
+        for band in ["20m", "40m"] {
+            for mode in ["FT8", "FT4"] {
+                let call = format!("K{i}{band}{mode}");
+                text += &record(&call, date, "120000", band, "", mode, "");
+                if i > 0 && band == "20m" && mode == "FT8" {
+                    expected.insert(call);
+                }
+            }
+        }
+    }
+    scratch.seed_logbook(&text, false);
+    let output = scratch.home.path().join("out.adi");
+    scratch
+        .command()
+        .args([
+            "export",
+            "--since",
+            "2026-10-01",
+            "--band",
+            "20m",
+            "--mode",
+            "FT8",
+            "--output",
+        ])
+        .arg(&output)
+        .assert()
+        .success();
+    let parsed = AdifProcessor::new()
+        .parse_string(&std::fs::read_to_string(output).unwrap())
+        .unwrap();
+    let calls = parsed
+        .records
+        .iter()
+        .map(|r| r.fields["CALL"].value.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(calls, expected);
+    let backup = scratch.home.path().join("backup.adi");
+    std::fs::rename(scratch.adif(), &backup).unwrap();
+    let empty = scratch.home.path().join("empty.adi");
+    let result = scratch
+        .command()
+        .args(["export", "--logbook"])
+        .arg(&backup)
+        .args(["--band", "6m", "--output"])
+        .arg(&empty)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(stdout(&result).contains("Nothing to export."));
+    assert!(!empty.exists());
+}
+
+#[test]
+fn export_skips_an_unreadable_record() {
+    let scratch = Scratch::new();
+    scratch.seed_logbook(
+        &(record("K1ABC", "20261001", "120000", "20m", "", "FT8", "") + "<CALL:5>W1XYZ<EOR>"),
+        false,
+    );
+    let result = scratch
+        .command()
+        .arg("export")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(stdout(&result).matches("<EOR>").count(), 1);
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("Record 2 (W1XYZ): Missing required field: QSO_DATE; skipped."));
+}
+
+#[test]
+fn export_refuses_bad_filters_and_a_missing_logbook() {
+    let scratch = Scratch::new();
+    let output = scratch.home.path().join("out.adi");
+    for args in [
+        ["--since", "2026-13-01"],
+        ["--since", "20261001"],
+        ["--band", "21m"],
+        ["--database", "qso.db"],
+    ] {
+        scratch
+            .command()
+            .arg("export")
+            .args(args)
+            .arg("--output")
+            .arg(&output)
+            .assert()
+            .code(2);
+        assert!(!output.exists());
+    }
+    let result = scratch
+        .command()
+        .args(["export", "--output"])
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Logbook not found at"));
+    std::fs::create_dir_all(scratch.data_dir()).unwrap();
+    std::fs::write(scratch.db(), b"legacy").unwrap();
+    let result = scratch
+        .command()
+        .args(["export", "--output"])
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&result.stderr).contains("run this export again"));
+    assert!(!output.exists());
+}
+
+/// A missing `--logbook` path is reported as missing even on a station that
+/// has both `qsos.adi` and `qso.db`: the not-yet-moved refusal is only for
+/// the default logbook path.
+#[test]
+fn export_reports_a_missing_explicit_logbook_as_not_found() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.data_dir()).unwrap();
+    std::fs::write(scratch.adif(), b"<EOH>\n").unwrap();
+    std::fs::write(scratch.db(), b"legacy").unwrap();
+    let missing = scratch.home.path().join("backups").join("typo.adi");
+    let output = scratch.home.path().join("out.adi");
+    let result = scratch
+        .command()
+        .arg("export")
+        .arg("--logbook")
+        .arg(&missing)
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("Logbook not found at {}.", missing.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("run this export again"), "{stderr}");
+    assert!(!stderr.contains("Run pancetta"), "{stderr}");
+    assert!(!output.exists());
+
+    // Naming the default path explicitly still gets the not-yet-moved refusal.
+    std::fs::remove_file(scratch.adif()).unwrap();
+    let result = scratch
+        .command()
+        .arg("export")
+        .arg("--logbook")
+        .arg(scratch.adif())
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("run this export again"), "{stderr}");
+    assert!(!output.exists());
+}
+
+#[test]
+fn export_refuses_output_aliases_of_the_source_logbook() {
+    let scratch = Scratch::new();
+    let original = record("K1ABC", "20261001", "120000", "20m", "", "FT8", "")
+        + &record("W1XYZ", "20261001", "120000", "40m", "", "FT8", "");
+    scratch.seed_logbook(&original, false);
+    let hard_link = scratch.home.path().join("hard-link.adi");
+    std::fs::hard_link(scratch.adif(), &hard_link).unwrap();
+    let mut outputs = vec![scratch.adif(), hard_link];
+    #[cfg(unix)]
+    {
+        let symlink = scratch.home.path().join("symlink.adi");
+        std::os::unix::fs::symlink(scratch.adif(), &symlink).unwrap();
+        outputs.push(symlink);
+    }
+    for output in outputs {
+        let result = scratch
+            .command()
+            .args(["export", "--band", "20m", "--output"])
+            .arg(&output)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(stderr(&result).contains("Output refers to the source logbook"));
+        assert_eq!(std::fs::read(scratch.adif()).unwrap(), original.as_bytes());
+    }
+    // An explicit input path gets the same protection.
+    let backup = scratch.home.path().join("backup.adi");
+    std::fs::rename(scratch.adif(), &backup).unwrap();
+    scratch
+        .command()
+        .args(["export", "--logbook"])
+        .arg(&backup)
+        .arg("--output")
+        .arg(&backup)
+        .assert()
+        .code(1);
+    assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
 }

@@ -235,7 +235,8 @@ Each completed QSO is signed with your TQSL certificate (pancetta shells
 out to `tqsl`) and uploaded — no raw ADIF POST. If you'd rather sign
 manually, or don't have `tqsl` installed, point TQSL/WSJT-X's importer at
 `~/.pancetta/qsos.adi` instead. Bulk export with filters:
-`pancetta export --output mylog.adi`.
+`pancetta export --since 2026-10-01 --band 20m --mode FT8 --output mylog.adi`.
+Export reads `qsos.adi` directly; omit `--output` to write ADIF to standard output.
 
 ### …bring in my log from another program?
 

@@ -182,7 +182,7 @@ fn mode_of(q: &AdifQso) -> String {
 /// BAND (upper-case), else the band FREQ falls in; None when unknown, which
 /// matches any band. "0MHZ"-style values (pancetta's fallback for a frequency
 /// outside every band, e.g. logged without CAT) count as unknown.
-fn band_of(q: &AdifQso) -> Option<String> {
+pub(crate) fn band_of(q: &AdifQso) -> Option<String> {
     let band = q.band.trim().to_uppercase();
     let band = if band.is_empty() && q.freq > 0.0 {
         freq_hz_to_band(q.freq * 1_000_000.0)
