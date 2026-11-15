@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-291: while the rig is keyed, the Shift+S station health panel shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `[rig.power_control.protection] max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Set `alc_overdrive_warning = false` to turn it off. Changes require restart. Automated coverage only; real-rig qualification pending.
+
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
 
 - PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.

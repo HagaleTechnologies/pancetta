@@ -380,7 +380,8 @@ once `accept_udp_requests = true`, independent of `allow_tx_initiation`
 2. `Shift+D` in the TUI — retained diagnostics history (why TX was
    dropped, why a QSO failed, rig errors).
 3. `Shift+S` — the station-health panel (one screen: is the station
-   healthy right now?).
+   healthy right now?). While the rig is keyed, its `TX meter:` row
+   shows forward power and ALC read over CAT.
 4. Badges in Station Info: `⚠ TX→system default` (TX audio going to your
    speakers, not the rig) and `⚠ RX→fallback device` (configured input
    device not found).

@@ -145,6 +145,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tx/` | TX worker scheduling, playback and PTT gates. |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
+| `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `util.rs` | Linear resampling for WAV playback. |

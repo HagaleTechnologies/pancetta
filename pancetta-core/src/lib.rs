@@ -39,6 +39,7 @@ pub mod response_step;
 pub mod slot;
 pub mod slot_clock;
 pub mod tx_freq_mode;
+pub mod tx_meter;
 pub mod tx_policy;
 pub mod types;
 

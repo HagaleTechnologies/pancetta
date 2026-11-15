@@ -7,6 +7,7 @@ use crate::error::HamlibError;
 use crate::models::{Band, Mode, RigCapabilities, Vfo};
 use crate::rig::{
     ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigControl, RigStatus,
+    TxMeter, TxMeterLevels,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -16,6 +17,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info, instrument};
+
+/// Fixed transmit meter readings for a mock rig (PAN-291). A `None` field is a
+/// meter the mock does not report.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MockTxMeters {
+    /// ALC on Hamlib's 0..1 scale.
+    pub alc: Option<f32>,
+    /// Forward power in watts.
+    pub forward_power_watts: Option<f32>,
+    /// Forward power as a 0..1 fraction of the rig's maximum.
+    pub forward_power_fraction: Option<f32>,
+}
 
 /// Mock rig configuration
 #[derive(Debug, Clone)]
@@ -47,6 +60,9 @@ pub struct MockRigConfig {
     /// Optional explicit gain simulation: backend steps and original pair.
     /// Invalid original settings leave gain simulation unsupported.
     pub receive_gain: Option<(ReceiveGainCapabilities, ReceiveGain)>,
+    /// Transmit meters the mock reports, returned unclamped (PAN-291). `None`
+    /// reports no meters.
+    pub tx_meters: Option<MockTxMeters>,
 }
 
 impl Default for MockRigConfig {
@@ -65,6 +81,7 @@ impl Default for MockRigConfig {
             split_read_supported: true,
             attenuator_steps: vec![0, 6, 10, 12, 20],
             receive_gain: None,
+            tx_meters: None,
         }
     }
 }
@@ -938,6 +955,30 @@ impl RigControl for MockRig {
         Ok(self.config.simulate_swr)
     }
 
+    async fn tx_meter_levels(&self) -> Result<TxMeterLevels> {
+        let meters = self.config.tx_meters.unwrap_or_default();
+        Ok(TxMeterLevels {
+            alc: meters.alc.is_some(),
+            forward_power_watts: meters.forward_power_watts.is_some(),
+            forward_power_fraction: meters.forward_power_fraction.is_some(),
+        })
+    }
+
+    async fn get_tx_meter(&self, meter: TxMeter) -> Result<f32> {
+        self.simulate_failure("get_tx_meter")?;
+        self.simulate_delay().await;
+        if !self.state.read().connected {
+            return Err(anyhow!("Mock rig not connected"));
+        }
+        let meters = self.config.tx_meters.unwrap_or_default();
+        let value = match meter {
+            TxMeter::Alc => meters.alc,
+            TxMeter::ForwardPowerWatts => meters.forward_power_watts,
+            TxMeter::ForwardPowerFraction => meters.forward_power_fraction,
+        };
+        value.ok_or_else(|| HamlibError::not_supported("get_tx_meter", None, None).into())
+    }
+
     #[instrument(skip(self))]
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()> {
         self.simulate_failure("set_memory_channel")?;
@@ -1084,6 +1125,59 @@ mod tests {
     }
     use super::*;
     use tokio::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_mock_reports_no_tx_meters() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert_eq!(
+            rig.tx_meter_levels().await.unwrap(),
+            TxMeterLevels::default()
+        );
+        for meter in [
+            TxMeter::Alc,
+            TxMeter::ForwardPowerWatts,
+            TxMeter::ForwardPowerFraction,
+        ] {
+            assert!(rig.get_tx_meter(meter).await.is_err(), "{meter:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_mock_returns_its_tx_meters() {
+        let rig = MockRig::new(MockRigConfig {
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            tx_meters: Some(MockTxMeters {
+                alc: Some(0.8),
+                forward_power_watts: Some(48.0),
+                forward_power_fraction: None,
+            }),
+            ..Default::default()
+        });
+        rig.connect().await.unwrap();
+        assert_eq!(
+            rig.tx_meter_levels().await.unwrap(),
+            TxMeterLevels {
+                alc: true,
+                forward_power_watts: true,
+                forward_power_fraction: false,
+            }
+        );
+        assert_eq!(rig.get_tx_meter(TxMeter::Alc).await.unwrap(), 0.8);
+        assert_eq!(
+            rig.get_tx_meter(TxMeter::ForwardPowerWatts).await.unwrap(),
+            48.0
+        );
+        assert!(rig
+            .get_tx_meter(TxMeter::ForwardPowerFraction)
+            .await
+            .is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_connection() {
