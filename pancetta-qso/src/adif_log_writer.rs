@@ -195,9 +195,12 @@ impl AdifLogWriter {
         &self.path
     }
 
-    /// Set the station transmit power (watts) stamped into every `TX_PWR`
-    /// field this writer renders from here on. Pass the operator's
-    /// configured `[station] power_watts`; `0` omits `TX_PWR` entirely.
+    /// Enable or disable software attribution in new ADIF comments. Defaults off.
+    pub fn set_attribution_comment(&mut self, enabled: bool) {
+        self.processor.set_attribution_comment(enabled);
+    }
+
+    /// Set station transmit power; zero omits the TX_PWR field.
     pub fn set_station_power_watts(&mut self, watts: u32) {
         self.processor.set_station_power_watts(watts);
     }
@@ -978,5 +981,26 @@ mod tests {
         assert_eq!(file_syncs() - before, 2, "one sync per record");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("<EOR>").count(), 2);
+    }
+    #[tokio::test]
+    async fn pan298_writer_comment_follows_attribution_setting() {
+        for enabled in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("qsos.adi");
+            let mut writer = AdifLogWriter::open(&path).await.unwrap();
+            if enabled {
+                writer.set_attribution_comment(true);
+            }
+            let mut metadata = fixture_metadata();
+            metadata.notes = None;
+            metadata.hound = false;
+            writer.append(&metadata).await.unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            let parsed = AdifProcessor::new().parse_string(&text).unwrap();
+            let qso = AdifProcessor::new()
+                .record_to_qso(&parsed.records[0])
+                .unwrap();
+            assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+        }
     }
 }

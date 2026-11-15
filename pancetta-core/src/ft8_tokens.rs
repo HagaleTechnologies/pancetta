@@ -8,6 +8,9 @@
 //! decoded CQ-zone modifier but is not directly packable, while `ABCD` packs
 //! but is not a decoded whitelist token. Both facts are pinned by tests
 //! below.
+//!
+//! [`cq_modifier`] reads that decoded modifier out of a CQ line for the
+//! autonomous `CQ DX` / regional-CQ gate (PAN-292).
 
 /// Is `tok` the payload of a committed exchange — the trailing token of a
 /// standard FT8 exchange that commits or acknowledges a contact?
@@ -93,9 +96,43 @@ pub fn is_decoded_cq_modifier(token: &str) -> bool {
     len <= 3 && token.chars().all(|c| c.is_ascii_alphabetic())
 }
 
+/// The CQ modifier of a decoded CQ line, as written: the second token of
+/// `CQ <modifier> <call> …` when [`is_decoded_cq_modifier`] accepts it and a
+/// further token follows. `None` for a plain `CQ <call> …`, a non-CQ line, or
+/// a line with nothing after the modifier (PAN-292).
+pub fn cq_modifier(text: &str) -> Option<&str> {
+    let mut tokens = text.split_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("CQ") {
+        return None;
+    }
+    let modifier = tokens.next()?;
+    tokens.next()?;
+    is_decoded_cq_modifier(modifier).then_some(modifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cq_modifier_extraction_table() {
+        for (text, expected) in [
+            ("CQ DX W1ABC FN42", Some("DX")),
+            ("cq dx w1abc fn42", Some("dx")),
+            ("CQ EU DL1ABC", Some("EU")),
+            ("CQ 123 K9ZZ EM48", Some("123")),
+            ("CQ POTA K5ARH FN42", Some("POTA")),
+            ("CQ W1ABC FN42", None),
+            ("CQ W1ABC/P FN42", None),
+            ("CQ DX", None),
+            ("CQ ABCD K5ARH", None),
+            ("CQDX W1ABC FN42", None),
+            ("W1ABC K5ARH EM10", None),
+            ("", None),
+        ] {
+            assert_eq!(cq_modifier(text), expected, "{text:?}");
+        }
+    }
 
     #[test]
     fn exchange_payload_table() {

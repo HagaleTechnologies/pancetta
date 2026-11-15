@@ -61,9 +61,12 @@ Audio In (USB codec, 48kHz stereo)
 pancetta-audio  (AudioManager, cpal + ringbuf)
   | raw f32 samples via crossbeam channel
   v
-pancetta/src/coordinator/dsp.rs
-  | downmix capture frames to mono; integer subsampling to 12 kHz
+Coordinator DSP worker (coordinator/dsp.rs)  — left channel (channel 0) only
+  | decimate 4:1 -> 12kHz mono: every 4th sample (subsample, the default) or,
+  | with [audio] decimation_antialias_filter = true (48 kHz only), the
+  | pancetta-dsp 31-tap unity-gain FIR anti-alias decimator (PAN-320)
   | FT8 slot-aligned 12.64-second base capture windows, with configured lead-in
+  | (the PAN-393 raw48 capture taps this stage pre-decimation, unfiltered)
   v
 pancetta-ft8  (Ft8Decoder)
   | LDPC decode, OSD, AP injection -> Vec<DecodedMessage>

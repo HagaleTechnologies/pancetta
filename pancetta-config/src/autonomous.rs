@@ -237,6 +237,8 @@ pub enum NeededMeans {
 pub struct AutonomousConfig {
     /// Enable autonomous mode.
     pub enabled: bool,
+    /// Seconds a failed QSO penalises its station. Zero disables; requires restart.
+    pub recent_failure_window_secs: u64,
     /// Local entity need: never worked, or lacking an accepted QSL.
     pub needed_means: NeededMeans,
     /// Allow new direct-call replies without recent console activity.
@@ -295,6 +297,7 @@ impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            recent_failure_window_secs: 1800,
             needed_means: NeededMeans::Unworked,
             unattended_policy: UnattendedPolicy::Off,
             slot_parity: SlotParitySetting::Auto,
@@ -366,6 +369,7 @@ impl ConfigSection for AutonomousConfig {
 
     fn merge_with(&mut self, other: Self) {
         self.enabled = other.enabled;
+        self.recent_failure_window_secs = other.recent_failure_window_secs;
         self.needed_means = other.needed_means;
         self.unattended_policy = other.unattended_policy;
         self.slot_parity = other.slot_parity;
@@ -392,6 +396,28 @@ impl ConfigSection for AutonomousConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_failure_window_config_contract() {
+        let omitted: AutonomousConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.recent_failure_window_secs, 1800);
+        for seconds in [0, 60, 7200] {
+            let parsed: AutonomousConfig =
+                toml::from_str(&format!("recent_failure_window_secs = {seconds}")).unwrap();
+            parsed.validate_section().unwrap();
+            let encoded = toml::to_string(&parsed).unwrap();
+            let decoded: AutonomousConfig = toml::from_str(&encoded).unwrap();
+            let mut merged = AutonomousConfig::default();
+            merged.merge_with(decoded);
+            assert_eq!(merged.recent_failure_window_secs, seconds);
+        }
+        for invalid in ["-1", "1.5", "\"1800\""] {
+            assert!(toml::from_str::<AutonomousConfig>(&format!(
+                "recent_failure_window_secs = {invalid}"
+            ))
+            .is_err());
+        }
+    }
 
     #[test]
     fn needed_means_defaults_roundtrips_and_merges() {

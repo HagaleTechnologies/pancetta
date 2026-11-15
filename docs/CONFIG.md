@@ -119,6 +119,7 @@ active        = true
 | `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
 | `input_channels` | integer | `2` | Most CODECs are 2-channel; Pancetta downmixes to mono. |
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
+| `decimation_antialias_filter` | boolean | `false` | Enable the unity-gain FIR anti-alias filter for 48 kHz to 12 kHz receive decimation. Set false to use the original subsampler. Restart required. Other supported input rates retain their existing path. The shipped default is false until station recordings show a strictly larger merged decode count with the filter ([PAN-320](measurements/PAN-320-decimation.md)). |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
 compression). The defaults are tuned for FT8 and most users won't
@@ -530,11 +531,13 @@ min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
 min_multi_slot_score = 0.7 # Higher bar (0–1) for opening a 2nd+ concurrent QSO
 cq_direction = ""          # Directed CQ text ("DX", "NA", …); empty = general CQ
 dry_run = false            # Log autonomous TX decisions without keying the rig
+recent_failure_window_secs = 1800 # Seconds after the latest failed QSO; 0 disables; restart required
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `recent_failure_window_secs` | integer | `1800` | Nonnegative seconds since the latest failed QSO. Recent only while elapsed time is strictly less than this window; expires at the boundary. `0` disables the penalty. Requires restart. |
 | `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
 | `slot_parity` | enum | `"auto"` | Slots alternate even/odd at the active mode's slot length (FT8 15 s, FT4 7.5 s); `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
@@ -693,6 +696,22 @@ without asking for it. See `docs/observability-diagnostics-plan.md`
 §"Persist the timeline" for the full design rationale.
 
 ---
+
+### `[logging]` — attribution comment in logged contacts
+
+```toml
+[logging]
+attribution_comment = false
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `attribution_comment` | bool | `false` | Append the Pancetta/cqdx software attribution to new ADIF comments. |
+
+This covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads and WSJT-X LoggedADIF.
+Operator notes and the HOUND marker are always preserved. The cqdx.io JSON
+upload and `pancetta export` do not add attribution. Existing records are not
+rewritten. Changes require a restart.
 
 ## `[network]` — external services
 
@@ -1277,10 +1296,29 @@ section. With the old values a WSJT-X Fox never sees your call.
 
 ## Environment variables
 
-A small set of environment variables override config keys:
+The first nine variables override config fields. Numeric loader overrides use
+unsigned integers and ignore parse failures. The remaining variables control
+runtime behavior.
+
+Internal relaunch markers such as `PANCETTA_MACOS_RELAUNCHED`, test/rebless
+variables such as `PANCETTA_REGEN_DOCS`, `PANCETTA_BLESS_KEY_EFFECTS`,
+`PANCETTA_BLESS_TX_ABORT` and `PANCETTA_TX_LOG_CRASH_CHILD`, and benchmark
+instrumentation are not supported operator settings.
 
 | Variable | Effect |
 |---|---|
+| `PANCETTA_CALLSIGN` | `station.callsign` |
+| `PANCETTA_GRID_SQUARE` | `station.grid_square` |
+| `PANCETTA_POWER_WATTS` | `station.power_watts` |
+| `PANCETTA_CAT_PORT` | `rig.interface.port` |
+| `PANCETTA_CAT_BAUD` | `rig.interface.baud_rate` |
+| `PANCETTA_AUDIO_INPUT` | `audio.input_device` |
+| `PANCETTA_AUDIO_OUTPUT` | `audio.output_device` |
+| `PANCETTA_SAMPLE_RATE` | `audio.sample_rate` |
+| `PANCETTA_THEME` | `ui.theme` |
+| `PANCETTA_WORKER_THREADS` | Tokio worker count, default 2 |
+| `PANCETTA_QSO_FILTER_OFF` | `1` disables the in-QSO bandwidth filter |
+| `PANCETTA_SCOPED_FAST_PATH` | `1` forces on, `0` forces off; otherwise the probe decides |
 | `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
 | `PANCETTA_MACOS_RELAUNCH=0` | macOS only. Do not relaunch pancetta as its own microphone-responsible process; macOS then uses the launching app's microphone approval (behavior before PAN-264). |
 | `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
@@ -1288,7 +1326,7 @@ A small set of environment variables override config keys:
 | `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |
 | `RUST_LOG` | Standard `tracing` filter. `info` is recommended; `debug` for triage. |
 
-CLI flags (e.g. `--audio-device`, `--no-rig`, `--no-audio`) take final
+CLI flags (e.g. `--audio-device`, `--no-audio`) take final
 priority over both config and environment.
 
 ---
@@ -1398,6 +1436,33 @@ attenuator_db = 6
   still returns its edge — revoke it there too.
 - `[network.station_agent].enabled` set to `false` — the relay session
   and authorization poll stop and remote TX is disarmed, live.
+
+### Station-agent local TX trust
+
+`<key_dir>/clients/<keyId>.pub` is the station-local TX trust root. Each file
+contains a raw 32-byte Ed25519 device public key.
+`pancetta trust-client <keyId> --key-file <path>` creates the `clients/` directory with mode 0700 and its file
+with mode 0600 on Unix. The input can be raw bytes, base64 or base64url text.
+Compare the 12 printed device-key words with the client's own words before it
+transmits. Existing files require `--force` for atomic replacement. Windows
+uses inherited per-user directory ACLs rather than POSIX modes.
+
+`pancetta untrust-client <keyId>` removes the file. Removing an absent file is
+safe. The next local trust refresh disarms that client and the TX
+worker drops queued frames or aborts a keyed frame on its next recheck. It
+remains admitted for read and status; remove its cqdx edge or static
+`tx_allow_list` entry to revoke admission too.
+
+The live `tx_arm_allow_list` is the explicit intersection
+`txArmSet = localTrust ∩ owner edges` in cqdx mode, or
+`txArmSet = localTrust ∩ static tx_allow_list` in static mode. It starts empty
+in cqdx mode until the first successful poll. Both modes reread local keys
+at `[network.cqdx].authorizations_poll_interval_secs` intervals, default 45 s,
+minimum 10 s. Static refreshes read the current admission list, respecting
+live config removals. Cloud mode retains the last successful admission and
+owner-edge sets on fetch failure, but refreshes their intersection with local
+keys every interval, including while a cloud request is stalled. Local
+revocation does not depend on cqdx availability.
 
 **Explicitly restart-required (a diagnostic says so on save):**
 
@@ -1620,7 +1685,7 @@ not enable autonomous contest operation or change general duplicate admission.
 
 ```toml
 [contest]
-instance_id = "KSQP-2026-K5ARH"
+instance_id = "KSQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "ksqp-ft-2026"
 operator_region = "TX"
@@ -1635,7 +1700,7 @@ For South Carolina fixed digital, use a separate instance and
 
 ```toml
 [contest]
-instance_id = "SCQP-2026-K5ARH"
+instance_id = "SCQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "scqp-digital-fixed-2026"
 operator_region = "SC"

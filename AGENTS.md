@@ -37,6 +37,7 @@ Operator-facing capability state: README.md § Capability status — keep both c
 ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXCC/CQZ/ITUZ with token zone overrides, stored-field precedence and unknown omission, including export-time enrichment. Automated coverage only; live qualification pending.
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
+CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
 
 ## Building and Testing
 
@@ -114,7 +115,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Where Things Live
 
-- `docs/superpowers/specs/` — design specs (authoritative for current behavior)
+- `docs/superpowers/specs/` — design specs
 - `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
@@ -153,3 +154,5 @@ docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
 credenza; edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
 instead of hand-editing this copy.
+
+When sources conflict: code > curated docs > docs/DECISIONS/ > docs/superpowers/specs/ and implementation plans.

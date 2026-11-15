@@ -87,11 +87,31 @@ class GenerationTests(unittest.TestCase):
             with self.subTest(cq=cq, itu=itu), self.assertRaises(ValueError):
                 gen.zone_tables(self.fixture(f'United States: {cq}: {itu}: NA: 0: 0: 0: K:\n K;'), mapping)
 
+    def test_continent_table_keys_mapped_names_and_rejects_bad_input(self):
+        mapping = {'D4': {'name': 'Cape Verde', 'aliases': ['Cabo Verde']}}
+        path = self.fixture('Cabo Verde: 35: 46: AF: 0: 0: 0: D4:\n D4;')
+        self.assertEqual(gen.continent_table(path, mapping), [('Cape Verde', 'AF')])
+        with self.assertRaisesRegex(ValueError, 'Invalid continent'):
+            gen.continent_table(self.fixture('Cabo Verde: 35: 46: XX: 0: 0: 0: D4:\n D4;'), mapping)
+        with self.assertRaisesRegex(ValueError, 'Unsupported continent override'):
+            gen.continent_table(self.fixture('Cabo Verde: 35: 46: AF: 0: 0: 0: D4:\n D4{EU};'), mapping)
+        conflict = {'D4': {'name': 'Cape Verde', 'aliases': ['Cabo Verde']},
+                    'D5': {'name': 'Cape Verde'}}
+        with self.assertRaisesRegex(ValueError, 'Conflicting continents'):
+            gen.continent_table(self.fixture('Cabo Verde: 35: 46: AF: 0: 0: 0: D4:\n D4;\n'
+                                             'Cape Verde: 35: 46: EU: 0: 0: 0: D5:\n D5;'), conflict)
+        with self.assertRaisesRegex(ValueError, 'Unmapped continent entity'):
+            gen.continent_table(self.fixture('Nowhere: 1: 1: AF: 0: 0: 0: Q9:\n Q9;'), mapping)
+
     def test_checked_in_outputs_are_reproducible(self):
         core = Path(__file__).resolve().parents[1]
         expected = gen.generate_supplemental(core)
-        self.assertEqual(set(expected), {'dxcc_registry.rs', 'dxcc_exact.rs', 'dxcc_zones.rs'})
-        defaults, prefixes, exact = gen.zone_tables(core / 'data/cty.dat', __import__('json').loads((core / 'data/dxcc_adif_map.json').read_text())['entities'])
+        self.assertEqual(set(expected), {'dxcc_registry.rs', 'dxcc_exact.rs', 'dxcc_zones.rs',
+                                         'dxcc_continents.rs'})
+        mapping = __import__('json').loads((core / 'data/dxcc_adif_map.json').read_text())['entities']
+        defaults, prefixes, exact = gen.zone_tables(core / 'data/cty.dat', mapping)
+        for name, code in gen.continent_table(core / 'data/cty.dat', mapping):
+            self.assertIn(code, gen.CONTINENT_CODES, name)
         for row in [*defaults, *prefixes, *exact]:
             self.assertTrue(1 <= row[-2] <= 40)
             self.assertTrue(1 <= row[-1] <= 90)

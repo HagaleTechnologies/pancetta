@@ -27,6 +27,7 @@
 pub mod callsign;
 pub mod diagnostic_level;
 pub mod dxcc;
+mod dxcc_continents;
 mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;

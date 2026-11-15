@@ -1159,11 +1159,15 @@ impl ConfigSection for NetworkConfig {
                     "cqdx.io poll interval must be at least 10 seconds".to_string(),
                 ));
             }
-            if self.cqdx.authorizations_poll_interval_secs < 10 {
-                return Err(ConfigError::Validation(
-                    "cqdx.io authorizations poll interval must be at least 10 seconds".to_string(),
-                ));
-            }
+        }
+        // PAN-309: validated even with cqdx disabled, because static mode
+        // (station agent without cqdx) drives its local trust refresh from
+        // this same knob — an unvalidated 0 here would spin the refresh loop
+        // with no delay.
+        if self.cqdx.authorizations_poll_interval_secs < 10 {
+            return Err(ConfigError::Validation(
+                "cqdx.io authorizations poll interval must be at least 10 seconds".to_string(),
+            ));
         }
 
         // ClubLog upload validation — enabling requires the credentials the
@@ -1856,6 +1860,18 @@ mod tests {
         config.cqdx.token = Some("pat_abc123".to_string());
         config.cqdx.authorizations_poll_interval_secs = 45;
         assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_cqdx_validation_authorizations_poll_interval_too_low_without_cqdx() {
+        // PAN-309: static mode (station agent without cqdx) drives its trust
+        // refresh from the same knob, so the 10 s minimum must hold even when
+        // cqdx integration is disabled — otherwise 0 is accepted and the
+        // refresh loop spins with no delay.
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = false;
+        config.cqdx.authorizations_poll_interval_secs = 0;
+        assert!(config.validate_section().is_err());
     }
 
     #[test]
