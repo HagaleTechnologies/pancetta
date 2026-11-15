@@ -1022,11 +1022,11 @@ dependency is mandatory. The hamlib-off build had been broken since at least
 GitHub #270 (20 errors then, 77 by PAN-331) because no CI lane built it, and
 the default and release builds already included hamlib. Repairing it would
 have kept a second build of the TX-safety code (the PAN-115 hard mute takes a
-`pancetta_hamlib::Vfo`) that nothing ships. CI's `workspace-check` job now
-runs `cargo check -p pancetta --no-default-features`, so the station crate
-stays compiled without its default features. Since PAN-334 removed `metrics`
-the crate has no default features, so that build equals the default one until
-a default feature gains cfg sites. The opt-in `ft2` cfg arms are still built
+`pancetta_hamlib::Vfo`) that nothing ships. PAN-321 removed CI's separate station
+`--no-default-features` check because PAN-334 removed `metrics` and the
+crate's default feature list is empty. The examples build covers the same
+configuration today. If station defaults gain features, restore separate
+no-default coverage. The opt-in `ft2` cfg arms are still built
 by no CI lane. Replay mode still starts no Hamlib, so the "no Hamlib route"
 paths remain.
 
@@ -1045,10 +1045,10 @@ feature: a cfg-gated module forces a cfg at every caller, which is how
 `#[cfg_attr(feature = "serde", ...)]` like every other derive in the crate,
 and `transmit` enables `serde`.
 
-CI's `ft8-tests` job runs `cargo test -p pancetta-ft8` with default features
+CI's consolidated `workspace-check` job runs `cargo test -p pancetta-ft8` with default features
 (the standalone build) and checks `--no-default-features`; the `transmit`
-configuration of every pancetta-ft8 test still runs in `workspace-check`'s
-`--features transmit` test step. The default-features test build had been
+configuration of every pancetta-ft8 test still runs in `workspace-tests`'
+`--features transmit` nextest run (PAN-314). The default-features test build had been
 broken by `examples/snr_calibration.rs` (it imports `Ft8Encoder`) without
 anyone noticing, because workspace feature unification turns on
 `pancetta-ft8/transmit` for every workspace build. `scripts/check.sh` now
@@ -1058,8 +1058,8 @@ Not done here: 16 `pancetta-ft8/tests/` files keep their `transmit` cfg
 gates (whole-file or per-test) although the encoder and modulator they use
 are no longer gated. Removing them touches 16 more files, which would take
 this pull request past the 40-file limit. Those tests still run in
-`workspace-check`'s `--features transmit` step, but the default-features
-`ft8-tests` run skips them. The gate removals are in commit `ceff2c0` on the
+`workspace-tests`' `--features transmit` run, but the standalone default-features
+test invocation skips them. The gate removals are in commit `ceff2c0` on the
 PAN-331 branch.
 
 ## Every listed CLI flag does something (PAN-334, 2026-11-09)
@@ -1130,7 +1130,8 @@ the guard, and both JSON sinks.
 - **Hand-written compile-time guard, not `cargo public-api`.**
   `pancetta-ft8/tests/stable_api_guard.rs` coerces each pinned function to
   its fn-pointer type, so drift is an E0308 naming the item, and it runs in
-  the existing `ft8-tests` and `workspace-check` jobs on the pinned 1.98.0.
+  `workspace-check` (PAN-321 folded the old `ft8-tests` runs into it) and
+  `workspace-tests` on the pinned 1.98.0.
   `cargo public-api` needs a nightly toolchain, a tool build and a pinned
   tool-to-nightly pairing, which the PAN-56 single-toolchain rule argues
   against. `readme_lists_every_pinned_item` keeps the guard and the README
@@ -1227,3 +1228,116 @@ required VFOs and restore the receive VFO. Unconfirmed split state, rejected mod
 or failed restoration leaves TX inhibited. The coordinator adds an independent
 readiness cause and never changes operator TX policy to recover it. Mock and
 socket tests are container evidence; FTdx10 hardware qualification remains pending.
+
+## Opt-in FIR decimation, resets and timing (PAN-320)
+
+`[audio] decimation_antialias_filter` (default `false`, restart required,
+not live-applied by the config watcher) swaps the 48 kHz receive path's
+every-fourth-sample subsampling for the `pancetta-dsp` 31-tap unity-gain FIR.
+The FIR runs only at 48 kHz; a `true` flag at any other supported rate logs
+`DSP: decimation_antialias_filter applies only at 48000Hz; using subsample at
+<rate>Hz` and keeps subsampling, because the taps are designed for that one
+rate. The startup line names the selected path (`subsample` or `fir31`).
+
+Two decisions worth remembering:
+
+- **The decimation stage resets with every destructive buffer flush, and
+  only then.** Gain/capture-epoch changes (both sites), dial changes, mode
+  changes and forward clock jumps run `destructive_capture_flush`, which
+  clears the buffer, the waterfall cursor and the stage's history/phase in
+  one action. Ordinary overlap retention between windows does not reset:
+  draining the front of the buffer is not a discontinuity. Clearing the
+  buffer without the stage reset would splice pre-flush filter history onto
+  post-flush audio.
+- **The FIR's group delay is compensated at the window anchor, not the
+  scheduler.** The causal filter's newest output reflects input 15 samples
+  (312.5 µs) in the past, so `boundary_anchored_slice` receives
+  `now − 15/48000 s` as the buffer's effective end; the slot scheduler,
+  the emit trigger and discontinuity detection stay on the real clock.
+
+The shipped default stays `false` until the recorded station A/B (quiet,
+busy, TX-desense raw48 captures) shows the FIR decoding strictly more
+merged messages — a tie keeps subsample regardless of SNR. The pending
+record and the decision rule live in `docs/measurements/PAN-320-decimation.md`.
+
+## Service liveness and field diagnostics (PAN-335, 2026-11-12)
+
+The Linux user service uses Type=notify and a 60-second watchdog. Readiness
+requires owner-published audio, DSP and decoder initialization, live rig-loop
+readiness or disabled rig control, and completed coordinator startup. Task
+spawn success is insufficient. Notification follows completed health passes;
+no independent heartbeat task may hide a stalled monitor. Shutdown suppresses
+further readiness and watchdog notifications and publishes STOPPING after READY.
+
+The unit uses SIGTERM on expiry, KillMode=mixed and a 45-second stop budget so
+the existing PTT-off drain can retain managed rigctld during cleanup. A fully
+wedged process may still need forced termination. Restart reloads autonomous
+enablement from configuration; the emergency halt remains in memory only.
+Real systemd restart and macOS TCC qualification remain pending. The
+[runbook](../RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) records a
+receive-only qualification procedure and the physical-unkey limitation.
+
+Doctor adds separate network, log-disk and microphone-permission results.
+Enabled cqdx and DX-cluster probes share a three-second deadline; failures are
+advisory. Disk queries use the actual log volume and user-available blocks,
+following an existing ancestor without creating a directory. Below 100 MiB
+warns and below 10 MiB fails. Known macOS denial or restriction fails
+independently of capture; unresolved authorization warns. No permission prompt
+is requested. These checks preserve the existing report's failure exit policy.
+
+## PAN-302: live operational allowlist
+
+Validated reloads patch only changed allowlisted fields. Autonomous decision
+policy is refreshed without rebuilding the operator, so CQ bookkeeping and
+spectral history survive. File permission is independent of runtime intent:
+a headless station started disabled can later enable through the file, while
+an operator pause survives reload and component restart. The typed readiness
+notice reports config permission without muting manual TX.
+
+The late cap is a last-instant refusal limit, published under the PTT gate;
+lead time and self-parity are captured for each new scheduling attempt.
+Receive presets already read the effective snapshot at band crossings and
+must not write CAT on save. Hardware binding, protection, identity and
+stateful autonomous helper settings remain restart-only. See CONFIG.md's
+explicit allowlist; section-wide reload would change values that running
+components still latch.
+
+## PAN-303: remove configuration without runtime consumers
+
+Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
+`network.rate_limiting`, `network.dx_cluster.alerts`, `ui.keyboard`, and
+`ui.accessibility.sound_feedback`. Existing TOML and JSON configs still load
+with one warning per removed section. Use `[alerts]` for decode alerts and
+the documented TUI keymap for keys. The separate TUI config also drops
+`refresh_rate`, `max_messages`, `show_waterfall`, `time_format`, and
+`frequency_format`; the live renderer already uses its own cadence and format.
+
+The serialized-key consumer test checks leaf-name references outside the
+config crate and tests. It is a lexical floor, not proof that a setting runs.
+Its 204 explicit waivers record existing schema debt and references hidden
+by the conservative cutoff at each source file's first `#[cfg(test)]`.
+The waiver ceiling cannot grow. Remaining settings need separate consumer
+or removal work; optional values absent from defaults and user map entries
+are outside this test's enumeration.
+
+## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
+
+The release workflow's build job now holds `id-token: write` and
+`attestations: write` alongside `contents: read`. Only the tag-gated
+build-provenance step uses the attestation scopes; workflow-dispatch dry runs
+do not attest. This executes PAN-106's recorded attestation deferral and
+narrows its rule to no build write scope beyond the attestation pair.
+The release job retains `contents: write` for draft creation.
+
+Release CI overrides Cargo profiles with debug=1, strip=none and
+split-debuginfo=off. Post-link splitting produces separate ELF/PE `.debug`
+assets or a macOS dSYM tarball before the binary is packaged.
+`Cargo.toml` and local build profiles stay unchanged. The first tagged run
+must check symbol sizes and native macOS/Windows extraction.
+`SHA256SUMS` lists platform archives only, excluding dSYM tarballs;
+per-archive checksum sidecars remain available.
+
+Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
+receive a release-candidate notice. They require a real, matching CHANGELOG
+section; there is no Unreleased fallback. The operator still publishes the
+draft. macOS signing and notarization remain PAN-265.

@@ -5,6 +5,7 @@ kind: gotcha
 status: current
 maintainer: agent
 sources:
+  - pancetta-tui/src/app.rs
   - pancetta/src/priority_evaluator.rs
   - pancetta/src/priority_evaluator/local_log.rs
   - pancetta-qso/src/async_database.rs
@@ -71,3 +72,13 @@ confirmed, band, mode, rarity and home comparisons. A TA1 QSO therefore
 prevents a false TA2 ATNO. Unknown entity names stay intact. Loaded cqdx
 answers take precedence under the default `unworked` policy. With
 `unconfirmed`, a successfully seeded local log takes precedence.
+
+## DX Hunter's ! reads the displayed rank (PAN-399)
+
+The DX row's stored `atno` is last-writer-wins between a decode's
+policy-selected verdict and a spot's cqdx-only verdict. Read `ranked_atno()`
+for DX Hunter display so its `!` agrees with Pri and Why, including after
+a local rank refresh. Do not add a per-frame ATNO verdict: it can disagree
+with the network rank that produced the displayed score. Rows without rank
+factors fall back to the stored flag. The frame's not-needed verdict still
+clears the marker.

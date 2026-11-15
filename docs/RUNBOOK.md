@@ -27,6 +27,13 @@ toggles autonomous mode live with `a` and pauses/resumes it with
 TX and forces autonomous off). Headless runs have no runtime toggle —
 for a supervised headless station, config is the only switch.
 
+Emergency and SWR halts are held in memory. Restarting the pancetta process,
+including an automatic restart by systemd or launchd, clears them. A headless process starts
+autonomous operation again when `[autonomous].enabled = true`. Before restarting,
+correct the fault and set that option to false if autonomous operation must remain off.
+In the TUI, fix the antenna, press `g` to re-enable TX, and press `a` to resume
+autonomous operation.
+
 ---
 
 ## Unattended operation & process supervision
@@ -104,6 +111,85 @@ interactively for setup, manual operation, and monitoring.
 
 ---
 
+## Linux service readiness and watchdog recovery
+
+Install or upgrade the user service from the repository root. Edit the installed
+`ExecStart` to the current binary before restarting:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp packaging/systemd/pancetta.service ~/.config/systemd/user/
+"${EDITOR:-vi}" ~/.config/systemd/user/pancetta.service
+systemctl --user daemon-reload
+systemctl --user restart pancetta.service
+systemctl --user enable pancetta.service
+loginctl enable-linger "$USER"
+systemctl --user show pancetta.service -p Type -p WatchdogUSec -p WatchdogSignal -p TimeoutStartUSec -p TimeoutStopUSec
+```
+
+The installed settings are `Type=notify`, `NotifyAccess=main`, `WatchdogSec=60`,
+`WatchdogSignal=SIGTERM`, `TimeoutStartSec=120`, `TimeoutStopSec=45`,
+`KillMode=mixed`, `Restart=always` and `RestartSec=2`. Start limits remain five
+starts in 60 seconds. Expected properties are `Type=notify`,
+`WatchdogUSec=1min`, `WatchdogSignal=15`, `TimeoutStartUSec=2min` and
+`TimeoutStopUSec=45s`. Property order can vary by systemd version.
+
+`systemctl start` and `restart` wait for `READY=1` and print nothing on success.
+READY means startup has completed and audio, DSP, decoder and the rig loop have
+initialized. Disabled rig control counts as ready for a receive-only station.
+It does not promise successful RF operation. A slow component can become ready
+later; one that never initializes causes the 120-second startup timeout.
+WAV and replay diagnostics do not advertise station readiness.
+
+Completed coordinator health passes send watchdog notifications. A stalled
+monitor causes expiry after roughly 60 seconds without an accepted heartbeat,
+plus stop and restart delays. The watchdog measures health-pass progress; it
+does not detect every decoder or audio callback deadlock. SIGTERM gives the
+normal unkey drain a chance to run while managed rigctld remains alive. A
+completely wedged runtime can require a force-kill after 45 seconds. Software
+cannot guarantee physical unkey after such a hang. A restart reloads
+`[autonomous].enabled`; an in-memory emergency halt is not persisted.
+
+Real systemd restart and macOS TCC qualification remain pending. To qualify the
+service later, use a receive-only configuration with both
+`[rig.interface].enabled = false` and `[autonomous].enabled = false`. Do not use
+an on-air station for this test:
+
+1. Install and start the unit. Confirm start waits for READY in the journal.
+2. Record `systemctl --user show pancetta.service -p MainPID -p NRestarts`.
+3. Send `kill -SIGSTOP <MainPID>` to that main process only.
+4. Wait for the 60-second watchdog interval, the 45-second forced-stop budget
+   and the restart delay. Check for a new MainPID, increased NRestarts and a
+   watchdog event in `journalctl --user -u pancetta.service`.
+5. Remove any temporary service overrides, reload the units and restore the
+   intended configuration only after the test service is stopped.
+
+## Field diagnostics
+
+`pancetta doctor` runs ten checks and prints a one-line fix for every warning
+or failure. The new `network services` row probes enabled cqdx HTTP and
+DX-cluster TCP endpoints within one three-second deadline. Network failure is
+advisory. Disabled integrations send no probe. With no enabled services, the
+row warns and explains how to enable one. This is not a general Internet test.
+
+`log disk space` checks the volume containing `~/.pancetta/logs`, using its
+nearest existing ancestor if the directory does not yet exist. It does not
+create files. Less than 100 MiB available to this user warns; less than 10 MiB
+fails. Free space on that volume while retaining `qsos.adi` and `qso.db`. A query
+error warns and asks you to inspect the volume with the OS disk tool.
+
+`microphone permission` queries macOS authorization without requesting approval.
+Denied or restricted access fails even if a capture succeeds. Undecided or
+unknown authorization warns with local approval instructions. Other operating
+systems report that this permission check does not apply; audio capture is
+checked separately. Silence alone does not prove a permission problem.
+Disk exhaustion and known microphone denial affect doctor's existing failure
+exit policy. Missing configuration does not suppress these two checks. All
+checks continue so a network outage, full disk and denied microphone each show
+their own fix in one run.
+
+---
+
 ## Phase 5 — first autonomous QSO loop
 
 This is the procedure for the first time you run pancetta with
@@ -116,10 +202,16 @@ operator-supervised.
 
 1. **Build is current.**
    ```bash
-   git fetch origin && git rev-parse HEAD == git rev-parse origin/main
+   git fetch origin && {
+     if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+       echo 'matches origin/main'
+     else
+       echo 'differs from origin/main'
+     fi
+   }
    ```
-   If the local main isn't at `origin/main`, either pull or stash; you
-   want the autonomous run on a known-clean tree.
+   If the revisions differ, inspect the local changes and branch history.
+   A different revision is not necessarily behind. Run on a known-clean tree.
 
 2. **Test suite is green locally.**
    ```bash
@@ -130,7 +222,7 @@ operator-supervised.
 
 3. **Hardware sanity.**
    - Rig powered on, USB cable seated, audio interface visible:
-     `pancetta --list-audio` shows your CODEC.
+     `pancetta test-audio --list` shows your CODEC.
    - `rigctld --list | grep -i ftdx10` confirms the model number
      (`1042` for the FTdx10).
    - Dummy load attached — *don't* go live on antenna for the first
@@ -145,7 +237,7 @@ operator-supervised.
    - `[station].grid_square` is your real grid (4 chars minimum)
    - `[rig.interface].enabled = true`, port and baud match your CAT
      setup (FTdx10 default: model `1042`, baud `38400`)
-   - `[audio]` device names match `--list-audio` output verbatim
+   - `[audio]` device names match `pancetta test-audio --list` output verbatim
    - `[autonomous].enabled = false` for now (we toggle it last)
    - `[autonomous].max_concurrent_qsos = 1` for first run (don't pile
      QSOs on top of each other while you're learning the behavior)
@@ -202,24 +294,25 @@ operator-supervised.
 ### Switch to antenna
 
 - **Pick a clean TX offset:** with the operator's TX parity selected
-  (Auto, Even, or Odd in `[station].tx_self_parity`), press `T` to
-  auto-pick a 25 Hz candidate. The waterfall's occupancy strip (top
-  row) shows the rationale: green/dim = clear, yellow = busy in
+  (Auto, Even, or Odd in `[station].tx_self_parity`), press `t` to
+  auto-pick a 25 Hz candidate. `Shift+T` sends a tune carrier. The waterfall's
+  occupancy strip (top row) shows the rationale: green/dim = clear, yellow = busy in
   opposite parity (won't collide but courtesy concern), red = busy in
   your parity. The TX cursor (`│`) recolors to match the column it's
   on so manual `[`/`]` adjustments give live feedback.
 
 8. **Switch to antenna.** Disconnect dummy load, connect antenna,
-   confirm SWR is sane on a brief tune-up tone. (Don't tune through
-   pancetta — use the rig's tune button.) Pancetta does not currently
-   tune the rig. With `swr_protection` on (the default), pancetta also
-   reads the rig's SWR meter while keyed and halts all TX once keyed
-   time with readings above `max_swr` reaches `swr_trip_delay_ms`
-   (default 5000 ms; `0` trips on the first high reading). Keyed high
-   time adds up across transmissions; a reading at or below `max_swr`
-   resets it, and so does more than two minutes without a high reading.
-   The strip then shows `■ RX ONLY` and
-   `⚠ High SWR …`. Fix the antenna, then press `g`. If the strip shows
+   confirm SWR is sane on a brief tune-up tone. Use the rig's tune button or `Shift+T`
+   for Pancetta's tune carrier. With `swr_protection` on (the default), Pancetta halts
+   all TX after high-SWR keyed time reaches `swr_trip_delay_ms`, default 5000 ms, above
+   `max_swr`, default 3.0. High keyed time accumulates across transmissions; unkeyed
+   time does not count. A reading at or below the limit resets it, as does more
+   than two minutes without a high reading. Zero delay trips on the first high reading. CAT
+   support is required; real-rig trip qualification is pending.
+
+   The strip then shows `■ RX ONLY` and `⚠ High SWR …`. Fix the antenna,
+   press `g` to re-enable TX, then `a` to resume autonomous operation.
+   The halt is held in memory; see the process-restart warning under [Operating modes](#modes-of-operation). If the strip shows
    `⚠ SWR protection is unavailable on this rig`, your rig or Hamlib
    build does not report SWR, so keep watching an external meter.
 

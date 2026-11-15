@@ -368,6 +368,14 @@ mod supervisor {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &oldmask, std::ptr::null_mut());
                 return Err(rc);
             }
+            // Ignore keyboard signals BEFORE spawning. The mask above only covers
+            // this thread: in a re-exec test process libtest's main thread keeps
+            // SIGINT/SIGQUIT unblocked, so a group Ctrl-C landing between
+            // posix_spawn and a later SIG_IGN killed the parent (PAN-314: under
+            // nextest contention the child reached `ready` first). The child
+            // still starts with default dispositions via POSIX_SPAWN_SETSIGDEF.
+            let oldint = libc::signal(libc::SIGINT, libc::SIG_IGN);
+            let oldquit = libc::signal(libc::SIGQUIT, libc::SIG_IGN);
             let mut pid = 0;
             let mut attr = std::mem::zeroed();
             let mut rc = libc::posix_spawnattr_init(&mut attr);
@@ -422,18 +430,24 @@ mod supervisor {
                 libc::posix_spawnattr_destroy(&mut attr);
             }
             if rc != 0 {
+                libc::signal(libc::SIGINT, oldint);
+                libc::signal(libc::SIGQUIT, oldquit);
                 libc::sigaction(libc::SIGTERM, &oldterm, std::ptr::null_mut());
                 libc::sigaction(libc::SIGHUP, &oldhup, std::ptr::null_mut());
                 libc::pthread_sigmask(libc::SIG_SETMASK, &oldmask, std::ptr::null_mut());
                 return Err(rc);
             }
             CHILD.store(pid, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(ms) = std::env::var_os("PANCETTA_TEST_SPAWN_RESUME_DELAY_MS") {
+                // Widens the post-spawn window so the regression test is deterministic.
+                let ms = ms.to_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             let pending = PENDING.swap(0, Ordering::Relaxed);
             if pending != 0 {
                 libc::kill(pid, pending);
             }
-            libc::signal(libc::SIGINT, libc::SIG_IGN);
-            libc::signal(libc::SIGQUIT, libc::SIG_IGN);
             libc::pthread_sigmask(libc::SIG_SETMASK, &oldmask, std::ptr::null_mut());
             let mut status = 0;
             loop {
@@ -562,8 +576,12 @@ mod tests {
                 unsafe {
                     let mut before_term: libc::sigaction = std::mem::zeroed();
                     let mut before_hup: libc::sigaction = std::mem::zeroed();
+                    let mut before_int: libc::sigaction = std::mem::zeroed();
+                    let mut before_quit: libc::sigaction = std::mem::zeroed();
                     libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut before_term);
                     libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut before_hup);
+                    libc::sigaction(libc::SIGINT, std::ptr::null(), &mut before_int);
+                    libc::sigaction(libc::SIGQUIT, std::ptr::null(), &mut before_quit);
                     assert!(spawn_and_supervise(
                         &SpawnSpec::new("/nonexistent/pan264", ["missing"]),
                         None
@@ -574,6 +592,10 @@ mod tests {
                     assert_eq!(before_term.sa_sigaction, after.sa_sigaction);
                     libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut after);
                     assert_eq!(before_hup.sa_sigaction, after.sa_sigaction);
+                    libc::sigaction(libc::SIGINT, std::ptr::null(), &mut after);
+                    assert_eq!(before_int.sa_sigaction, after.sa_sigaction);
+                    libc::sigaction(libc::SIGQUIT, std::ptr::null(), &mut after);
+                    assert_eq!(before_quit.sa_sigaction, after.sa_sigaction);
                     let mut mask = std::mem::zeroed();
                     libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
                     for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
@@ -596,6 +618,9 @@ mod tests {
             .unwrap();
         }
         fn child(script: &str) -> std::process::Child {
+            child_with(script, &[])
+        }
+        fn child_with(script: &str, env: &[(&str, &str)]) -> std::process::Child {
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -604,13 +629,22 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("PANCETTA_TEST_THIN_PARENT_SCRIPT", script)
+                .envs(env.iter().copied())
                 .process_group(0)
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap()
         }
         fn signal_test(sig: i32, group: bool, delay: bool) -> (std::process::ExitStatus, String) {
-            let mut c = child("trap 'kill $s 2>/dev/null; echo got TERM; exit 0' TERM; trap 'kill $s 2>/dev/null; echo got HUP; exit 3' HUP; trap 'kill $s 2>/dev/null; echo got INT; exit 0' INT; sleep 30 & s=$!; echo ready; wait $s");
+            signal_test_with(sig, group, delay, &[])
+        }
+        fn signal_test_with(
+            sig: i32,
+            group: bool,
+            delay: bool,
+            env: &[(&str, &str)],
+        ) -> (std::process::ExitStatus, String) {
+            let mut c = child_with("trap 'kill $s 2>/dev/null; echo got TERM; exit 0' TERM; trap 'kill $s 2>/dev/null; echo got HUP; exit 3' HUP; trap 'kill $s 2>/dev/null; echo got INT; exit 0' INT; sleep 30 & s=$!; echo ready; wait $s", env);
             let mut out = BufReader::new(c.stdout.take().unwrap());
             let mut line = String::new();
             loop {
@@ -681,6 +715,20 @@ mod tests {
         #[test]
         fn thin_parent_lets_group_ctrl_c_reach_child() {
             let (s, o) = signal_test(libc::SIGINT, true, false);
+            assert_eq!(s.code(), Some(0));
+            assert!(o.contains("got INT"));
+        }
+        /// PAN-314: libtest runs this re-exec on a spawned thread, so its main
+        /// thread never sees the supervisor's signal mask. A group Ctrl-C that
+        /// lands right after posix_spawn must still reach only the child.
+        #[test]
+        fn group_ctrl_c_right_after_spawn_reaches_only_the_child() {
+            let (s, o) = signal_test_with(
+                libc::SIGINT,
+                true,
+                false,
+                &[("PANCETTA_TEST_SPAWN_RESUME_DELAY_MS", "300")],
+            );
             assert_eq!(s.code(), Some(0));
             assert!(o.contains("got INT"));
         }

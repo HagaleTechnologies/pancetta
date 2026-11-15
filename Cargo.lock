@@ -2979,7 +2979,12 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rustfft",
+<<<<<<< HEAD
  "rustls",
+=======
+ "same-file",
+ "sd-notify",
+>>>>>>> e2641c29a7f49641aecd35112caac71c3f8990c7
  "serde",
  "serde_json",
  "serialport",
@@ -3055,6 +3060,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -3094,6 +3100,7 @@ version = "0.9.6"
 dependencies = [
  "async-trait",
  "biquad",
+ "criterion",
  "crossbeam-channel",
  "num-complex",
  "parking_lot",
@@ -3198,6 +3205,7 @@ dependencies = [
  "chrono",
  "dirs",
  "lazy_static",
+ "pancetta-config",
  "pancetta-core",
  "pancetta-ft8",
  "proptest",
@@ -3225,6 +3233,7 @@ dependencies = [
  "hound",
  "libc",
  "num-complex",
+ "pancetta-dsp",
  "pancetta-ft8",
  "pancetta-qso",
  "rand 0.10.3",
@@ -4291,6 +4300,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sd-notify"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e4ef7359e694bfaf1dd27a30f9d760b54c00dfae9f19bd0c05a39bc9128fe76"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "security-framework"

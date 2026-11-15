@@ -7,7 +7,7 @@ use crate::{ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 
 /// Database / QSO-log persistence settings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatabaseConfig {
     /// Layer 2 timeline persistence
@@ -27,22 +27,91 @@ pub struct DatabaseConfig {
     /// especially since today's default behavior (no timeline persisted)
     /// is exactly what an absent `[database]` section preserves.
     pub persist_qso_timeline: bool,
+    /// Make a changed ADIF snapshot on live startup.
+    pub adif_backup_enabled: bool,
+    /// Absolute directory, home-relative directory, or path beside qsos.adi.
+    pub adif_backup_directory: String,
+    /// Maximum number of owned ADIF snapshots to keep.
+    pub adif_backup_retain_count: usize,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            persist_qso_timeline: false,
+            adif_backup_enabled: true,
+            adif_backup_directory: "backups".into(),
+            adif_backup_retain_count: 7,
+        }
+    }
 }
 
 impl ConfigSection for DatabaseConfig {
     fn validate_section(&self) -> ConfigResult<()> {
-        // A single bool: nothing to validate.
+        if self.adif_backup_directory.trim().is_empty() {
+            return Err(crate::ConfigError::Validation(
+                "database.adif_backup_directory must not be blank".into(),
+            ));
+        }
+        if self.adif_backup_retain_count == 0 {
+            return Err(crate::ConfigError::Validation(
+                "database.adif_backup_retain_count must be positive".into(),
+            ));
+        }
         Ok(())
     }
 
     fn merge_with(&mut self, other: Self) {
         self.persist_qso_timeline = other.persist_qso_timeline;
+        self.adif_backup_enabled = other.adif_backup_enabled;
+        self.adif_backup_directory = other.adif_backup_directory;
+        self.adif_backup_retain_count = other.adif_backup_retain_count;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adif_backup_defaults() {
+        let c: DatabaseConfig = toml::from_str("").unwrap();
+        assert!(c.adif_backup_enabled);
+        assert_eq!(c.adif_backup_directory, "backups");
+        assert_eq!(c.adif_backup_retain_count, 7);
+    }
+
+    #[test]
+    fn adif_backup_validation() {
+        for (directory, count, field) in [(" ", 7, "directory"), ("backups", 0, "retain_count")] {
+            let c = DatabaseConfig {
+                adif_backup_directory: directory.into(),
+                adif_backup_retain_count: count,
+                ..Default::default()
+            };
+            assert!(c
+                .validate_section()
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("database.adif_backup_{field}")));
+        }
+    }
+
+    #[test]
+    fn merge_with_carries_adif_backup_settings() {
+        let other: DatabaseConfig = toml::from_str(
+            r#"adif_backup_enabled = false
+adif_backup_directory = "/archive"
+adif_backup_retain_count = 3"#,
+        )
+        .unwrap();
+        other.validate_section().unwrap();
+        let mut base = DatabaseConfig::default();
+        base.merge_with(other);
+        assert!(!base.adif_backup_enabled);
+        assert_eq!(base.adif_backup_directory, "/archive");
+        assert_eq!(base.adif_backup_retain_count, 3);
+    }
 
     #[test]
     fn default_is_persistence_off() {
@@ -59,9 +128,11 @@ mod tests {
     fn merge_with_carries_over_persist_qso_timeline() {
         let mut base = DatabaseConfig {
             persist_qso_timeline: false,
+            ..Default::default()
         };
         let override_cfg = DatabaseConfig {
             persist_qso_timeline: true,
+            ..Default::default()
         };
 
         base.merge_with(override_cfg);

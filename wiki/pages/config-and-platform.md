@@ -63,6 +63,26 @@ in the Default column means no default, never `""`), and
 `docs/ARCHITECTURE.md` from `ls pancetta/src/coordinator`
 (`PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test architecture_drift coordinator_module_table_is_current`).
 
+Malformed-config startup boundary (PAN-301): **a discovered `pancetta.toml`
+that exists but does not load — parse error or validation error — is fatal at
+every entry point; only a *missing* discovered file is a normal first run on
+defaults.** Plain `--headless` startup exits 1 naming the file and the TOML
+source line before the coordinator is built, and startup without
+`--headless` does the same whenever stdin is not a terminal. The de-brick
+offer (`Re-run first-time setup?`, default No) requires a terminal on stdin
+and is also off for `--wav`/`--replay`; declining exits 1 and leaves the file
+untouched, accepting enters the first-run wizard, which backs the file up on
+save. `config --validate` prints the parse error and exits 1 without ever
+prompting, terminal stdin included; an explicit `--config` file fails closed
+through a separate branch that does not offer the wizard. Proven by the
+process tests in `pancetta/tests/config_cli.rs`:
+`headless_startup_refuses_broken_config`,
+`nonterminal_syntax_error_never_offers_repair`,
+`interactive_broken_config_offers_repair_and_decline_preserves_file`,
+`interactive_syntax_error_accept_enters_setup`, and
+`terminal_validate_syntax_error_never_offers_repair`.
+
+
 Queue recovery gotcha (PAN-150): restoring a missing native queue rule does not
 schedule a retry. Rerun the failed handler after restoration. An interrupted
 bot-owned pause can repair its missing provenance marker on handoff rerun;
@@ -85,7 +105,7 @@ admit Dependabot PRs to automatic merge. See
 
 Toolchain gotcha (PAN-56): **`rust-toolchain.toml` pins an exact Rust release
 (`1.98.0`, matching the Catalyst runner image), and the `dtolnay/rust-toolchain`
-steps in `ci.yml`, `docs.yml`, `demo-assets.yml` and `release.yml` pass the same
+steps in `ci.yml`, `demo-assets.yml` and `release.yml` pass the same
 version as `toolchain:`.** Bump the channel and all of those inputs in one PR. A missed input still builds with the
 pinned compiler, because rustup's override wins, but that job downloads a second
 toolchain and its rust-cache key churns. See
@@ -110,12 +130,21 @@ the TUI render loop. These settings require restart. See
 [tier alerts and operator watchlist](../../docs/DECISIONS/2026-11-04-tier-alerts-and-watchlist.md).
 
 Microphone diagnosis gotcha (PAN-266): `doctor` queries the running process's
-AVFoundation audio authorization only after a successful silent capture.
+AVFoundation audio authorization independently in its microphone-permission row.
+The audio-level row also uses it after a successful silent capture.
 Silence alone does not prove missing permission. Authorized or unknown status
 keeps the generic FLAT LINE advice; zero captured samples remain a capture error.
 macOS may attribute approval to pancetta or its terminal launcher, so the fix
 names both. The query never requests access or changes privacy settings.
 Native launcher identity and approval recovery still need verification on a Mac.
+
+Service readiness gotcha (PAN-335): spawning an audio thread or decoder task
+does not mean initialization succeeded. Owner readiness must follow successful
+stream start or decoder construction and clear on owner exit. READY also waits
+for full startup and the rig loop. The watchdog sends only after completed
+coordinator health passes, so a second heartbeat task would hide the failure
+it is supposed to detect. Receive-only systemd host qualification is still
+pending. See [the service liveness decision](../../docs/DECISIONS/config-and-platform.md#service-liveness-and-field-diagnostics-pan-335-2026-11-12).
 
 Rig-model gotcha (PAN-340): **`rig.model` resolves through one offline
 catalog, and that catalog is not the qualification table.** Acceptance comes
@@ -136,3 +165,20 @@ re-capturing the data file you must rerun
 `docs/SUPPORTED_RIGS.md`; upstream reuses one macro for two rows
 (RIG_MODEL_FT450 → 1027 and 1046), so curated tables must pin macros only
 the catalog carries once.
+
+
+## What can a PAN-302 reload change?
+
+See `docs/CONFIG.md` for the exact allowlist. Never replace the whole running
+snapshot: rig interface enablement also controls shutdown unkey behavior.
+Do not rebuild the autonomous operator to refresh policy; it owns CQ attempts,
+sequencer state and spectral history. Keep file permission apart from runtime
+intent, and initialize intent once, so reloads and supervisor restarts cannot
+undo an operator pause. Lead/parity belong to new attempts; the late cap must
+also be read at key-time. Receive preset saves take effect on a later band
+crossing and must not write CAT immediately.
+
+PAN-293: recent-failure scoring history stores the latest monotonic timestamp per
+resolved callsign, shared by cloned lookups. Reads and recordings prune entries
+at the window boundary. `[autonomous] recent_failure_window_secs` is seeded at
+startup, defaults to 1800 seconds, and requires restart; zero disables history.

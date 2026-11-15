@@ -17,9 +17,9 @@ QSO logging is an ADIF-first hybrid: `~/.pancetta/qsos.adi` is the durable,
 append-only, vendor-neutral source of truth, and `~/.pancetta/qso.db` is a
 disposable SQLite index rebuilt from it. On completion the coordinator
 uploads each QSO to any enabled online logbook (ClubLog, QRZ, cqdx, LoTW,
-eQSL), all default OFF. ClubLog/QRZ/eQSL/cqdx go through a durable
+eQSL), all default OFF. ClubLog/QRZ/LoTW/eQSL/cqdx go through a durable
 pending-upload queue (`~/.pancetta/upload_outbox.json`, PAN-57) with retries,
-a slow lane and readiness-strip warnings; LoTW keeps a single tqsl attempt. It is shaped this way so the operator's log
+a slow lane and readiness-strip warnings. LoTW stores only ADIF in the queue, never its certificate password or arguments. Older binaries cannot read the new `lotw` destination; drain the queue before downgrading. It is shaped this way so the operator's log
 survives any store corruption and so uploads can never block or fail the QSO
 pipeline. Full digest: `docs/DECISIONS/logging-uploads.md`; cqdx contract:
 `docs/cqdx-api-requirements.md`.
@@ -88,3 +88,20 @@ accepted. Correlate by QSO UUID, never callsign, and treat an explicit
 service response (duplicate included) as the only acceptance; absence is
 unknown, an empty captured target set is disabled, and config changes after
 completion never rewrite a contact's captured denominator.
+
+PAN-300 verifies actual subprocess execution with fake tqsl, including optional
+certificate passwords and duplicate exits 8/9. Child output is excluded from
+errors because it may echo a password. Live-account qualification remains
+pending.
+
+## Startup ADIF snapshots (PAN-304)
+
+After index reconciliation and before opening the ADIF writer or starting its
+subscriber, live startup snapshots changed logbook bytes. Replay and refused
+legacy migration skip this step. The shared logbook lock covers comparison,
+publication and pruning; a one-second timeout skips the snapshot with a warning.
+The default keeps seven snapshots beside the index in `backups/`.
+Only complete generated ADIF names count, separately from SQLite and import
+backups. Retention never rotates or replaces the source `qsos.adi`.
+A temporary owner-only file is synced before no-clobber hard-link publication;
+a failed write or publication never prunes old snapshots.

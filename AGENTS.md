@@ -19,7 +19,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Bit-exact with ft8_lib/WSJT-X |
 | `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
-| `pancetta-config` | Configuration loading, validation; file watch live-applies remote-access consent and revocations only | Production-ready |
+| `pancetta-config` | Configuration loading, validation; file watch live-applies selected autonomous policy, TX timing, receive gain presets and remote-access consent/revocations (operational reload unreleased) | Production-ready |
 | `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic |
 | `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live; eQSL awaiting live-account check; LoTW web-scrape module is unused scaffolding |
 | `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; CAT/PTT on-air validated (FTdx10); opt-in receive overload ATT guard and configured data-mode control are hardware-unverified |
@@ -31,9 +31,13 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
+LoTW outbox retries, optional certificate passwords and duplicate tqsl exits 8/9 are integration-tested with fake tqsl, unreleased; live-account qualification remains pending.
+
 Operator-facing capability state: README.md § Capability status — keep both consistent.
+ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXCC/CQZ/ITUZ with token zone overrides, stored-field precedence and unknown omission, including export-time enrichment. Automated coverage only; live qualification pending.
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
+CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
 
 ## Building and Testing
 
@@ -111,7 +115,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Where Things Live
 
-- `docs/superpowers/specs/` — design specs (authoritative for current behavior)
+- `docs/superpowers/specs/` — design specs
 - `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
@@ -150,3 +154,5 @@ docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
 credenza; edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
 instead of hand-editing this copy.
+
+When sources conflict: code > curated docs > docs/DECISIONS/ > docs/superpowers/specs/ and implementation plans.

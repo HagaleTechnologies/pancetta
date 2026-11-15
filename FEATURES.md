@@ -24,7 +24,7 @@ in `pancetta.toml` (see docs/CONFIG.md) — no code changes required.
 
 ## Priority Scoring Engine
 
-Each decoded CQ is scored against a weighted set of criteria: needed DXCC entity (35%), needed grid square (20%), POTA/SOTA activation (15%), rarity score (10%), signal strength (5%), plus a +0.15 bonus for an all-time new one (ATNO), with duplicate and recent-failure penalties applied on top. A separate 6-tier ranking drives the DX Hunter panel. The weights are fully configurable via `PriorityWeights`, making it straightforward to tune for DX chasing, grid hunting, or contest operating. Scoring is stateless and synchronous — all external state (worked stations, recent failures, DXCC/grid needed sets) is injected via the `WorkedStationLookup` trait, keeping the engine pure and unit-testable. Score breakdowns are emitted per candidate for logging and diagnostics.
+DX Hunter ranks six tiers, highest first: ATNO, per-band DXCC new, special station, per-band grid new, standard, suspect. Its within-tier score excludes bonuses already represented by tiers. Autonomous admission still uses the configurable weighted score and `min_dx_score`. With `pounce_min_tier` configured, autonomous candidates sort by tier, then weighted score; otherwise they sort by weighted score.
 
 ## Multi-Stream TX
 
@@ -32,7 +32,7 @@ The `SmartFrequencyAllocator` scores candidate TX frequencies across seven soft 
 
 ## DSP Pipeline
 
-The live receive path takes the left channel of the incoming 48 kHz audio and subsamples it 48→12 kHz (every fourth sample; FT8 occupies 0–3 kHz, well under the 6 kHz Nyquist limit), then hands 12.64-second windows, cut on slot boundaries, to the decoder. The `pancetta-dsp` crate also contains SINC resampling, biquad bandpass filters, automatic gain control and spectral subtraction, but the live receive path does not use them.
+The live receive path takes the left channel of the incoming 48 kHz audio and decimates it 48→12 kHz. The default is the original every-fourth-sample subsampling; `[audio] decimation_antialias_filter = true` (48 kHz only, restart required) swaps in a unity-gain 31-tap FIR anti-alias filter that suppresses the out-of-band energy subsampling folds into the decode band. The filter's station qualification is pending — the shipped default stays `subsample` until the recorded quiet/busy/TX-desense comparison shows the FIR decoding strictly more messages ([PAN-320 measurement record](docs/measurements/PAN-320-decimation.md)). 12.64-second windows cut on slot boundaries then go to the decoder. The `pancetta-dsp` crate also contains SINC resampling, biquad bandpass filters, automatic gain control and spectral subtraction; none of those run in the live receive path (the FIR decimator is the crate's one live-path component).
 
 ## Slot-Parity-Aware TX Scheduling
 
@@ -40,7 +40,7 @@ FT8 TX honors WSJT-X-style slot parity and supports late-start audio playback up
 
 ## Hardware Integration
 
-Hamlib CAT control is integrated via a TCP client to `rigctld`. The config defaults are a Generic rig at 9600 baud; the maintainer's station runs a Yaesu FTdx10 (Hamlib model 1042) over USB at 38400 baud. Pancetta sets the frequency and split and keys PTT; it never sets the rig mode. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
+Hamlib CAT control is integrated via a TCP client to `rigctld`. The config defaults are a Generic rig at 9600 baud; the maintainer's station runs a Yaesu FTdx10 (Hamlib model 1042) over USB at 38400 baud. Pancetta controls frequency, split and PTT. Optional `[rig] data_mode` sets the CAT mode on connection and after commanded retunes. Omit it for manual mode control. This option is hardware-unverified. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
 
 ## Terminal Interface
 

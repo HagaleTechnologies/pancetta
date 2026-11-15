@@ -2,9 +2,9 @@
 
 Pancetta's configuration lives in a single TOML file at
 `~/.pancetta/pancetta.toml`. The file is loaded at startup. It is also
-watched for changes, but only the remote-access revocations listed under
-[Hot reload](#hot-reload) apply to a running station; every other key
-needs a restart.
+watched for changes. The operational settings and remote-access revocations
+listed under [Hot reload](#hot-reload) apply to a running station; every
+other key needs a restart.
 
 This document covers the keys you'll actually touch, with explanations.
 The complete schema — every section, every key, every default — is
@@ -119,6 +119,7 @@ active        = true
 | `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
 | `input_channels` | integer | `2` | Most CODECs are 2-channel; Pancetta downmixes to mono. |
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
+| `decimation_antialias_filter` | boolean | `false` | Enable the unity-gain FIR anti-alias filter for 48 kHz to 12 kHz receive decimation. Set false to use the original subsampler. Restart required. Other supported input rates retain their existing path. The shipped default is false until station recordings show a strictly larger merged decode count with the filter ([PAN-320](measurements/PAN-320-decimation.md)). |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
 compression). The defaults are tuned for FT8 and most users won't
@@ -500,11 +501,13 @@ min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
 min_multi_slot_score = 0.7 # Higher bar (0–1) for opening a 2nd+ concurrent QSO
 cq_direction = ""          # Directed CQ text ("DX", "NA", …); empty = general CQ
 dry_run = false            # Log autonomous TX decisions without keying the rig
+recent_failure_window_secs = 1800 # Seconds after the latest failed QSO; 0 disables; restart required
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `recent_failure_window_secs` | integer | `1800` | Nonnegative seconds since the latest failed QSO. Recent only while elapsed time is strictly less than this window; expires at the boundary. `0` disables the penalty. Requires restart. |
 | `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
 | `slot_parity` | enum | `"auto"` | Slots alternate even/odd at the active mode's slot length (FT8 15 s, FT4 7.5 s); `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
@@ -628,9 +631,27 @@ Duplicate checking blocks autonomous calls to a callsign worked within the rolli
 ```toml
 [database]
 persist_qso_timeline = false
+adif_backup_enabled = true
+adif_backup_directory = "backups"
+adif_backup_retain_count = 7
 ```
 
-Off by default. When `true`, a completed or failed QSO's full
+On live startup, `adif_backup_enabled` makes a byte-exact snapshot of a changed
+`qsos.adi` before its writer opens. The default directory is
+`~/.pancetta/backups`. Relative directories resolve beside `qsos.adi`;
+absolute directories stay unchanged. `~`, `~/` and `~\` expand to the
+operator's home. Blank directories and zero retention counts are rejected.
+Changes require a restart.
+
+Names use UTC, for example `qsos_adi_20261113_121238_123456.adi`, with a
+six-digit numeric suffix on collision. Retention counts only these ADIF
+snapshots, independently of SQLite backups and import `.bak` copies.
+Unchanged bytes create no copy; reducing retention still prunes old snapshots.
+Replay and refused migration create no snapshot. A missing source is skipped.
+A busy logbook lock is skipped after one second; other backup failures log a
+warning and allow startup to continue. Failed copies never trigger pruning.
+
+`persist_qso_timeline` is off by default. When `true`, a completed or failed QSO's full
 state-transition + message timeline (`QsoProgress.state_history` /
 `.messages` — every rung the QSO climbed and every frame sent/received)
 is persisted so it can be reconstructed offline, keyed by QSO id
@@ -645,6 +666,22 @@ without asking for it. See `docs/observability-diagnostics-plan.md`
 §"Persist the timeline" for the full design rationale.
 
 ---
+
+### `[logging]` — attribution comment in logged contacts
+
+```toml
+[logging]
+attribution_comment = false
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `attribution_comment` | bool | `false` | Append the Pancetta/cqdx software attribution to new ADIF comments. |
+
+This covers `qsos.adi`, ClubLog/QRZ/eQSL/LoTW uploads and WSJT-X LoggedADIF.
+Operator notes and the HOUND marker are always preserved. The cqdx.io JSON
+upload and `pancetta export` do not add attribution. Existing records are not
+rewritten. Changes require a restart.
 
 ## `[network]` — external services
 
@@ -667,6 +704,7 @@ password = ""        # plaintext on disk
 enabled          = false
 tqsl_path        = ""   # path to your installed tqsl binary
 station_location = ""   # must match a "Station Location" name in TQSL
+password         = ""   # optional Callsign Certificate password, plaintext on disk
 
 [network.eqsl]
 enabled      = false
@@ -689,17 +727,28 @@ enabled = true
 See "Customizing PSKReporter" below if you want to see or change the
 other defaults.
 
-LoTW has no username/password/`base_url` fields — unlike the other
+LoTW has no username or `base_url` fields — unlike the other
 integrations, pancetta never talks to LoTW's servers directly. It shells
 out to your locally-installed `tqsl` binary, which signs the QSO record
 with your TQSL certificate and handles the actual upload itself.
+
+The optional password unlocks your TQSL Callsign Certificate. It is stored in
+plaintext in your local config and passed to tqsl with `-p`. Keep the config
+readable only by you. Omit it or leave it empty for a certificate without a
+password. Local users who can inspect process arguments may see it.
+
+LoTW signing uses `-a compliant -d -x -u -l <station_location>`, with the
+optional password and ADIF path passed as separate arguments. Exit codes 8
+and 9 are accepted duplicate outcomes, including records outside the date
+range. Acceptance is a delivery result, not QSL confirmation. Fake-tqsl
+integration tests cover this path; live-account qualification is pending.
 
 ### Per-QSO log upload — ClubLog, QRZ Logbook, LoTW, and eQSL
 
 When a QSO completes, pancetta can upload that single QSO (as one ADIF
 record) straight to your online logbooks. All four integrations are
 **opt-in and default `enabled = false`**. They never block or fail the
-QSO pipeline. ClubLog, QRZ Logbook, eQSL and cqdx.io uploads go through a
+QSO pipeline. ClubLog, QRZ Logbook, LoTW, eQSL and cqdx.io uploads go through a
 durable pending-upload queue (`~/.pancetta/upload_outbox.json`) with
 retries and readiness-strip warnings — see
 [Upload retries and the pending-upload queue](#upload-retries-and-the-pending-upload-queue)
@@ -711,9 +760,8 @@ this file and never logged. Keep the file readable only by you:
 > must be digitally signed with your TQSL certificate, not a raw ADIF
 > POST — so instead of an HTTP client, pancetta shells out to your
 > locally-installed `tqsl` binary per completed QSO (`[network.lotw]`
-> above). If `tqsl` is missing or fails, the upload is skipped after
-> that single attempt: LoTW does not use the retry queue the HTTP
-> services use. `~/.pancetta/qsos.adi` remains
+> above). If `tqsl` is missing or fails, the outbox retains the record
+> and retries with the same backoff as the HTTP services. `~/.pancetta/qsos.adi` remains
 > available if you'd rather point WSJT-X / TQSL at it manually.
 
 ```toml
@@ -803,8 +851,7 @@ Every ClubLog, QRZ Logbook, eQSL and cqdx.io upload for a completed QSO
 is written to `~/.pancetta/upload_outbox.json` **before** its first
 attempt, and leaves it only when the service accepts it (or reports it as
 a duplicate). The queue is sent again at every start, so a service
-outage or a restart no longer loses an upload. LoTW (tqsl) keeps its
-single attempt.
+outage or a restart no longer loses an upload. LoTW (tqsl) uses this same queue.
 
 `[network.reliability.retry]` sets the quick retries:
 
@@ -996,11 +1043,50 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 | `instance_id` | string | `"WSJT-X - pancetta"` | The protocol's `Id` field. Companion apps display and route by it; a second pancetta instance should get a distinct value. Must be non-empty when `enabled = true`. |
 | `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
 | `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `[network.station_agent].remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
-| `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (only the configured destination host is accepted) and this list is unused. |
+| `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (the configured destination host must also pass source-port pinning below) and this list is unused. |
 
 `destination` must parse as a valid `host:port` socket address, and
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
+
+#### WSJT-X UDP admission and Replay (PAN-312)
+
+Unicast uses the route-selected local IPv4 address and an ephemeral port on one
+unconnected socket, including outbound-only configurations. A separate UDP route
+probe sends no application datagram. Route discovery or bind failure disables the
+companion component for this run and drains its bus channel; the station continues.
+There is no wildcard fallback. IPv6 destinations are unsupported. Multicast keeps
+its wildcard bind and configured TTL/interface options.
+
+After decoding and matching the instance Id, inbound admission requires
+`accept_udp_requests = true` and the destination host (unicast) or an explicitly
+listed `allowed_request_hosts` IP (multicast; an empty list refuses all).
+The first valid, correctly targeted datagram from an allowed host pins its source
+address and port and may act immediately, supporting companions without Heartbeats.
+A correctly targeted Heartbeat from that host refreshes its port. Other datagrams
+must match the pin exactly and cannot change it. Wrong Ids and refused hosts never
+learn pins. Pins last until component restart, including across Close and Clear.
+A port change without Heartbeats requires a restart.
+
+HaltTx requires all those admission checks but does not require initiation consent.
+For example, after Heartbeat from `192.168.1.20:2237`, HaltTx from
+`192.168.1.20:40000` is ignored with a Warn diagnostic on `remote.wsjtx`:
+`refused request from 192.168.1.20:40000: HaltTx`.
+The pinned port's HaltTx retains the existing stop behavior.
+
+Replay has one global one-second minimum interval across all peers. An accepted
+burst sends the retained ring in order as `New=false`, then Status. Empty rings and
+failed sends consume the interval too. Requests inside the interval are skipped,
+without replay decodes, post-Replay Status or deferred work; refusals do not extend
+the interval. Equality at one second permits another burst. Pins, Heartbeats and
+band changes do not reset it. A skipped request emits an Info diagnostic:
+`Replay from 192.168.1.20:2237 ignored (rate-limited; minimum interval 1s)`.
+Ordinary timer Status and Heartbeat traffic continues independently. Wrong-source
+or wrong-Id requests do not consume the budget.
+
+These checks reduce exposure; UDP source pinning does not authenticate a sender.
+Forged pinned tuples or allowed Heartbeats remain possible. Disabled defaults,
+wire encodings and downstream Reply consent, policy and arm checks are unchanged.
 
 ### `[network.station_agent]` — remote operation
 
@@ -1012,6 +1098,17 @@ Revocations — `remote_tx_enabled = false`, removing a `tx_allow_list`
 entry, `enabled = false` — apply to a running station when you save;
 every other change to this table needs a restart. See
 [Hot reload](#hot-reload).
+
+Station-agent `relay_url` requires `wss://` and `pairing_api_url` requires
+`https://`. Plain `ws://` and `http://` are allowed only for the exact
+hostname `localhost` or an IP whose `is_loopback()` is true, including
+`127.0.0.2` and `::1`. No DNS lookup grants this exception. Private LAN
+addresses, `0.0.0.0`, and names such as `localhost.attacker.com` do not qualify.
+Each plaintext loopback URL emits one unencrypted-link warning per validation.
+Supplied URLs must be absolute, have a host, and have no surrounding whitespace,
+even when the agent is disabled. Absent URLs remain valid when disabled.
+The `pair --pairing-api-url` override follows the same rule and is checked
+before identity creation or enrollment.
 
 #### The remote-access audit log (`audit_log_path`)
 
@@ -1162,16 +1259,36 @@ section. With the old values a WSJT-X Fox never sees your call.
 > including after restart. The remaining schema keys are listed in
 > `defaults.toml`. Keybindings are not configurable; see
 > [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
-> `[ui.keyboard]` schema is also unused by the runtime.
+> `[ui.keyboard]` section was removed in PAN-303. Old configs still load
+> with one warning naming the removed section.
 
 ---
 
 ## Environment variables
 
-A small set of environment variables override config keys:
+The first nine variables override config fields. Numeric loader overrides use
+unsigned integers and ignore parse failures. The remaining variables control
+runtime behavior.
+
+Internal relaunch markers such as `PANCETTA_MACOS_RELAUNCHED`, test/rebless
+variables such as `PANCETTA_REGEN_DOCS`, `PANCETTA_BLESS_KEY_EFFECTS`,
+`PANCETTA_BLESS_TX_ABORT` and `PANCETTA_TX_LOG_CRASH_CHILD`, and benchmark
+instrumentation are not supported operator settings.
 
 | Variable | Effect |
 |---|---|
+| `PANCETTA_CALLSIGN` | `station.callsign` |
+| `PANCETTA_GRID_SQUARE` | `station.grid_square` |
+| `PANCETTA_POWER_WATTS` | `station.power_watts` |
+| `PANCETTA_CAT_PORT` | `rig.interface.port` |
+| `PANCETTA_CAT_BAUD` | `rig.interface.baud_rate` |
+| `PANCETTA_AUDIO_INPUT` | `audio.input_device` |
+| `PANCETTA_AUDIO_OUTPUT` | `audio.output_device` |
+| `PANCETTA_SAMPLE_RATE` | `audio.sample_rate` |
+| `PANCETTA_THEME` | `ui.theme` |
+| `PANCETTA_WORKER_THREADS` | Tokio worker count, default 2 |
+| `PANCETTA_QSO_FILTER_OFF` | `1` disables the in-QSO bandwidth filter |
+| `PANCETTA_SCOPED_FAST_PATH` | `1` forces on, `0` forces off; otherwise the probe decides |
 | `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
 | `PANCETTA_MACOS_RELAUNCH=0` | macOS only. Do not relaunch pancetta as its own microphone-responsible process; macOS then uses the launching app's microphone approval (behavior before PAN-264). |
 | `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
@@ -1179,7 +1296,7 @@ A small set of environment variables override config keys:
 | `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |
 | `RUST_LOG` | Standard `tracing` filter. `info` is recommended; `debug` for triage. |
 
-CLI flags (e.g. `--audio-device`, `--no-rig`, `--no-audio`) take final
+CLI flags (e.g. `--audio-device`, `--no-audio`) take final
 priority over both config and environment.
 
 ---
@@ -1214,6 +1331,50 @@ Editors that save by removing the file and writing a new one are read
 as a save, not a deletion: while the file is missing, pancetta waits a
 moment longer before reloading.
 
+**Applied live: operational settings (Unreleased)**
+
+- `[autonomous]`: `enabled`, `min_dx_score`, `min_multi_slot_score`,
+  `pounce_min_tier`, `cq_after_idle_cycles`, `cq_no_response_switch_after`,
+  `cq_direction` and `dry_run`. Decisions use the new policy on their next
+  pass, within one FT8 slot under normal watcher operation. A configured
+  `pounce_min_tier` replaces the numeric pounce threshold.
+- `[station]`: `tx_late_max_ms`, `ptt_lead_ms` and `tx_self_parity`. The late
+  cap also applies to queued frames at their final pre-PTT check. Lead and
+  parity changes apply to new scheduling attempts; sleeping or keyed attempts
+  retain their schedule, and active-contact parity takes precedence.
+- `[rig.receive_gain_presets]`: adding, changing, removing or clearing entries
+  applies on the next successful known-band crossing. Saving sends no CAT
+  command. A missing preset leaves the rig controls untouched.
+
+File permission and the operator's pause are separate. Disabling then
+re-enabling `autonomous.enabled` preserves an `a` pause or Shift+Q stop and
+never changes TX policy. Headless startup can enable autonomy through a later
+file edit; interactive startup still needs operator opt-in. Disabling autonomy
+leaves manual TX and the direct-caller reply policy unchanged. The readiness
+strip and Shift+S show `AUTO OFF IN CONFIG` until the file permits autonomy.
+
+For example, these settings can be merged into your existing configuration:
+
+```toml
+[autonomous]
+enabled = false
+min_dx_score = 0.8
+min_multi_slot_score = 0.9
+cq_after_idle_cycles = 10
+cq_no_response_switch_after = 4
+cq_direction = "DX"
+dry_run = false
+
+[station]
+tx_late_max_ms = 2000
+ptt_lead_ms = 120
+tx_self_parity = "even"
+
+[rig.receive_gain_presets.20m]
+preamp_db = 0
+attenuator_db = 6
+```
+
 **Applied live — remote-access revocations (security):**
 
 - `[network.station_agent].remote_tx_enabled` — the station-agent
@@ -1246,8 +1407,41 @@ moment longer before reloading.
 - `[network.station_agent].enabled` set to `false` — the relay session
   and authorization poll stop and remote TX is disarmed, live.
 
+### Station-agent local TX trust
+
+`<key_dir>/clients/<keyId>.pub` is the station-local TX trust root. Each file
+contains a raw 32-byte Ed25519 device public key.
+`pancetta trust-client <keyId> --key-file <path>` creates the `clients/` directory with mode 0700 and its file
+with mode 0600 on Unix. The input can be raw bytes, base64 or base64url text.
+Compare the 12 printed device-key words with the client's own words before it
+transmits. Existing files require `--force` for atomic replacement. Windows
+uses inherited per-user directory ACLs rather than POSIX modes.
+
+`pancetta untrust-client <keyId>` removes the file. Removing an absent file is
+safe. The next local trust refresh disarms that client and the TX
+worker drops queued frames or aborts a keyed frame on its next recheck. It
+remains admitted for read and status; remove its cqdx edge or static
+`tx_allow_list` entry to revoke admission too.
+
+The live `tx_arm_allow_list` is the explicit intersection
+`txArmSet = localTrust ∩ owner edges` in cqdx mode, or
+`txArmSet = localTrust ∩ static tx_allow_list` in static mode. It starts empty
+in cqdx mode until the first successful poll. Both modes reread local keys
+at `[network.cqdx].authorizations_poll_interval_secs` intervals, default 45 s,
+minimum 10 s. Static refreshes read the current admission list, respecting
+live config removals. Cloud mode retains the last successful admission and
+owner-edge sets on fetch failure, but refreshes their intersection with local
+keys every interval, including while a cloud request is stalled. Local
+revocation does not depend on cqdx availability.
+
 **Explicitly restart-required (a diagnostic says so on save):**
 
+- Autonomous `slot_parity`, `needed_means`, `unattended_policy`,
+  `max_concurrent_qsos`, `tx_offset_hz`, `qso_stall_switch_after`, `frequency.*`,
+  `listen_cycle.*`, `band_hopping.*` and `priorities.*`.
+- Station identity and `power_watts` (log metadata), and every rig setting
+  except receive gain presets, including hardware bindings, band plans and
+  protection settings.
 - Adding a `tx_allow_list` entry, `station_agent.enabled = true` on a
   disabled station, and the station agent's `relay_url`,
   `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
@@ -1256,10 +1450,10 @@ moment longer before reloading.
   running gateway still accepts the old token and origins and keeps
   clients that are already connected.
 - Every other key: `[audio]` device names, `[rig.interface]`,
-  `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
+  unlisted `[station]` and `[autonomous]` keys, `[ui]`, upload/logging settings, …
   Nothing outside the live list above is applied to a running process,
   not even to its in-memory copy of the config; restart pancetta to
-  enforce them. Non-security changes are all classified restart-required,
+  enforce them. Changes outside the live allowlist are restart-required,
   but a restart does not activate the unused `[ui]` settings (see
   `[ui]` — TUI behaviour above). (`[station].callsign`,
   `[station].grid_square` and `[autonomous].slot_parity` in particular
@@ -1285,21 +1479,24 @@ To revoke a suspect remote client step by step, see
 All persistent state lives under `~/.pancetta/`.
 
 Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
-Automatic database backups do not cover configuration, the complete logbook or
-external keys. Preserve the whole stopped installation and data directory.
+Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
+These copies do not include contacts logged since the latest startup.
+Preserve the whole stopped installation before upgrading, including configuration
+and external keys.
 
 ### QSO log files
 
 | File | Role | Recoverable? |
 |---|---|---|
-| `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
+| `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | Startup snapshots omit contacts logged since startup. Back this up. |
 | `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or if its contacts differ from the ADIF; writes `qso.db.new` and swaps it in. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
 | `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
 | `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
 | `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
-| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
+| `~/.pancetta/backups/qsos_adi_YYYYMMDD_HHMMSS_microseconds.adi` | Changed startup snapshots of the ADIF source. Seven kept by default, configurable under `[database]`. | Contains contacts only through the latest snapshot. |
+| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only; ADIF snapshots have independent retention. | Yes — same recovery path as `qso.db`. |
 
 Durability: each `qsos.adi` record is one `write_all`, a flush and a
 `sync_all` before the write returns, so a logged QSO survives a pancetta
@@ -1458,7 +1655,7 @@ not enable autonomous contest operation or change general duplicate admission.
 
 ```toml
 [contest]
-instance_id = "KSQP-2026-K5ARH"
+instance_id = "KSQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "ksqp-ft-2026"
 operator_region = "TX"
@@ -1473,7 +1670,7 @@ For South Carolina fixed digital, use a separate instance and
 
 ```toml
 [contest]
-instance_id = "SCQP-2026-K5ARH"
+instance_id = "SCQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "scqp-digital-fixed-2026"
 operator_region = "SC"
