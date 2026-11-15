@@ -28,15 +28,15 @@ raise 'partition' unless run['run'] == "#{base} --partition count:${{ matrix.par
 raise 'build order' unless steps.index(build) < steps.index(run)
 raise 'continue-on-error' if tests['continue-on-error'] || steps.any? { |s| s['continue-on-error'] }
 commands = check_steps.map { |s| s['run'] }.compact
+# PAN-321 removed the workspace and station no-default checks as redundant.
 [
-  'cargo check --workspace --exclude pancetta-research',
-  'cargo check -p pancetta --no-default-features',
+  'cargo check -p pancetta-ft8 --no-default-features',
   'cargo build --workspace --exclude pancetta-research --examples',
   'cargo test --doc --workspace --exclude pancetta-research --features transmit',
   'cargo test -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration',
   'cargo clippy -p pancetta --features test-harness --test coord_sim --test tx_ptt_integration'
 ].each { |cmd| raise cmd unless commands.include?(cmd) }
-raise 'standalone' unless jobs['ft8-tests']['steps'].any? { |s| s['run'] == 'cargo test -p pancetta-ft8' }
+raise 'standalone' unless commands.include?('cargo test -p pancetta-ft8')
 raise 'old workspace run' if commands.include?('cargo test --workspace --exclude pancetta-research --features transmit')
 filters = jobs['changes']['steps'].find { |s| s['id'] == 'filter' }['with']['filters']
 raise 'paths' unless YAML.safe_load(filters).fetch('code').include?('.config/nextest.toml')

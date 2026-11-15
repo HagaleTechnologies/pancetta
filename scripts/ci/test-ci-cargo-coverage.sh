@@ -9,13 +9,18 @@ steps = workspace.fetch('steps')
 commands = steps.filter_map { |s| s['run'] }
 all_commands = jobs.values.flat_map { |j| j.fetch('steps', []).filter_map { |s| s['run'] } }
 standalone = 'cargo test -p pancetta-ft8'
-transmit = 'cargo test --workspace --exclude pancetta-research --features transmit'
+doc = 'cargo test --doc --workspace --exclude pancetta-research --features transmit'
 no_default = 'cargo check -p pancetta-ft8 --no-default-features'
 examples = 'cargo build --workspace --exclude pancetta-research --examples'
-[standalone, transmit, no_default, examples].each do |cmd|
+[standalone, doc, no_default, examples].each do |cmd|
   raise "missing or repeated workspace command: #{cmd}" unless commands.count(cmd) == 1
   raise "repeated workflow command: #{cmd}" unless all_commands.count(cmd) == 1
 end
+# PAN-314 moved the transmit suite to the sharded workspace-tests job; it still runs once.
+transmit = 'cargo nextest run --profile ci --workspace --exclude pancetta-research --features transmit --partition count:${{ matrix.partition }}/4 --no-fail-fast'
+raise 'transmit suite must run once, in workspace-tests' unless all_commands.count(transmit) == 1 &&
+  jobs.fetch('workspace-tests').fetch('steps').any? { |s| s['run'] == transmit }
+raise 'duplicate transmit test run' if all_commands.include?('cargo test --workspace --exclude pancetta-research --features transmit')
 [
   'cargo check -p pancetta-ft8',
   'cargo check --features transmit -p pancetta-ft8',
@@ -23,12 +28,12 @@ end
   'cargo check -p pancetta --no-default-features'
 ].each { |cmd| raise "redundant check: #{cmd}" if all_commands.include?(cmd) }
 raise 'FT8 job still exists' if jobs.key?('ft8-tests')
-raise 'standalone commands must precede examples and workspace tests' unless
+raise 'standalone commands must precede examples and workspace doc tests' unless
   commands.index(no_default) < commands.index(standalone) &&
   commands.index(standalone) < commands.index(examples) &&
-  commands.index(examples) < commands.index(transmit)
+  commands.index(examples) < commands.index(doc)
 cache_jobs = jobs.select { |_, j| j.fetch('steps', []).any? { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') } }
-raise 'wrong cache jobs' unless cache_jobs.keys.sort == %w[clippy cross-platform-check workspace-check]
+raise 'wrong cache jobs' unless cache_jobs.keys.sort == %w[clippy cross-platform-check workspace-check workspace-tests]
 cache_jobs.each do |name, job|
   caches = job['steps'].select { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') }
   raise "#{name}: wrong cache count" unless caches.length == 1
@@ -47,7 +52,7 @@ platform = jobs.fetch('cross-platform-check').fetch('steps')
 }.each do |cmd, condition|
   raise "platform coverage changed: #{cmd}" unless platform.any? { |s| s['run'] == cmd && s['if'] == condition }
 end
-needs = %w[clippy fmt workspace-check cross-platform-check deny codex-clean scan-trailers research-scan-tests]
+needs = %w[clippy fmt workspace-check workspace-tests cross-platform-check deny codex-clean scan-trailers research-scan-tests]
 raise 'aggregator dependencies changed' unless jobs.fetch('ci').fetch('needs').sort == needs.sort
 raise 'aggregator must always run' unless jobs['ci']['if'] == 'always()'
 raise 'aggregator no longer rejects failed/cancelled jobs' unless

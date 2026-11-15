@@ -1047,8 +1047,8 @@ and `transmit` enables `serde`.
 
 CI's consolidated `workspace-check` job runs `cargo test -p pancetta-ft8` with default features
 (the standalone build) and checks `--no-default-features`; the `transmit`
-configuration of every pancetta-ft8 test still runs in `workspace-check`'s
-`--features transmit` test step. The default-features test build had been
+configuration of every pancetta-ft8 test still runs in `workspace-tests`'
+`--features transmit` nextest run (PAN-314). The default-features test build had been
 broken by `examples/snr_calibration.rs` (it imports `Ft8Encoder`) without
 anyone noticing, because workspace feature unification turns on
 `pancetta-ft8/transmit` for every workspace build. `scripts/check.sh` now
@@ -1058,7 +1058,7 @@ Not done here: 16 `pancetta-ft8/tests/` files keep their `transmit` cfg
 gates (whole-file or per-test) although the encoder and modulator they use
 are no longer gated. Removing them touches 16 more files, which would take
 this pull request past the 40-file limit. Those tests still run in
-`workspace-check`'s `--features transmit` step, but the standalone default-features
+`workspace-tests`' `--features transmit` run, but the standalone default-features
 test invocation skips them. The gate removals are in commit `ceff2c0` on the
 PAN-331 branch.
 
@@ -1130,8 +1130,8 @@ the guard, and both JSON sinks.
 - **Hand-written compile-time guard, not `cargo public-api`.**
   `pancetta-ft8/tests/stable_api_guard.rs` coerces each pinned function to
   its fn-pointer type, so drift is an E0308 naming the item, and it runs in
-  `workspace-check` (PAN-321 folded the old `ft8-tests` runs into it) on the
-  pinned 1.98.0.
+  `workspace-check` (PAN-321 folded the old `ft8-tests` runs into it) and
+  `workspace-tests` on the pinned 1.98.0.
   `cargo public-api` needs a nightly toolchain, a tool build and a pinned
   tool-to-nightly pairing, which the PAN-56 single-toolchain rule argues
   against. `readme_lists_every_pinned_item` keeps the guard and the README
