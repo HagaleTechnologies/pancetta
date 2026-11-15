@@ -119,6 +119,7 @@ active        = true
 | `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
 | `input_channels` | integer | `2` | Most CODECs are 2-channel; Pancetta downmixes to mono. |
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
+| `decimation_antialias_filter` | boolean | `false` | Enable the unity-gain FIR anti-alias filter for 48 kHz to 12 kHz receive decimation. Set false to use the original subsampler. Restart required. Other supported input rates retain their existing path. The shipped default is false until station recordings show a strictly larger merged decode count with the filter ([PAN-320](measurements/PAN-320-decimation.md)). |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
 compression). The defaults are tuned for FT8 and most users won't
