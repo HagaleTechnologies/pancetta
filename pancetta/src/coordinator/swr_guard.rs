@@ -439,7 +439,7 @@ pub(crate) async fn act(
     }
 }
 
-async fn to_tui(bus: &MessageBus, message_type: MessageType) {
+pub(super) async fn to_tui(bus: &MessageBus, message_type: MessageType) {
     let _ = bus
         .send_message(ComponentMessage::new(
             ComponentId::Hamlib,
