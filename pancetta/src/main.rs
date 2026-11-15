@@ -4923,3 +4923,6 @@ mod pan333_panic_tests {
         assert_ne!(term.c_lflag & libc::ICANON, 0);
     }
 }
+
+#[cfg(test)]
+mod docs_cli_drift;

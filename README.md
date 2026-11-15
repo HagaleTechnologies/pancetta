@@ -70,10 +70,6 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).
 
-<!-- TODO (maintainer): drop a PSKReporter map capture at assets/pskreporter.png
-     and reference it here as on-air proof. Requires a real pskreporter.info
-     session, so it could not be captured automatically. -->
-
 ## What it looks like
 
 Every capture below — and the GIF further down, and the hero GIF above — was
@@ -369,7 +365,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | TUI QRZ station lookup | Implemented, *Unreleased* | Shift+L looks up the focused callsign with configured XML credentials. Name, QTH, grid and entity appear in the station card; results are cached for the session with a two-second network deadline. Mock-tested; live-account qualification pending | [lookup handler](pancetta/src/coordinator/qrz_lookup.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
-| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
+| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info. Queue bounds and datagram chunking are tested; live delivery is unverified | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
