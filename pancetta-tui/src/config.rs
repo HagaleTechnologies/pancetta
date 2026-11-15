@@ -49,12 +49,7 @@ pub struct StationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     pub theme: Theme,
-    pub refresh_rate: u64,
-    pub max_messages: usize,
-    pub show_waterfall: bool,
     pub show_coordinates: bool,
-    pub time_format: TimeFormat,
-    pub frequency_format: FrequencyFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,21 +91,6 @@ pub enum Theme {
     Light,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum TimeFormat {
-    UTC12,
-    UTC24,
-    Local12,
-    Local24,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum FrequencyFormat {
-    MHz,
-    KHz,
-    Hz,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -127,12 +107,7 @@ impl Default for Config {
             },
             ui: UiConfig {
                 theme: Theme::Dark,
-                refresh_rate: 250,
-                max_messages: 1000,
-                show_waterfall: true,
                 show_coordinates: true,
-                time_format: TimeFormat::UTC24,
-                frequency_format: FrequencyFormat::MHz,
             },
             audio: AudioConfig {
                 device: None,
@@ -370,37 +345,24 @@ impl Theme {
     }
 }
 
-impl TimeFormat {
-    pub fn format_time(&self, time: chrono::DateTime<chrono::Utc>) -> String {
-        match self {
-            TimeFormat::UTC12 => time.format("%I:%M:%S %p UTC").to_string(),
-            TimeFormat::UTC24 => time.format("%H:%M:%S UTC").to_string(),
-            TimeFormat::Local12 => {
-                let local = time.with_timezone(&chrono::Local);
-                local.format("%I:%M:%S %p").to_string()
-            }
-            TimeFormat::Local24 => {
-                let local = time.with_timezone(&chrono::Local);
-                local.format("%H:%M:%S").to_string()
-            }
-        }
-    }
-}
-
-impl FrequencyFormat {
-    pub fn format_frequency(&self, freq: f64) -> String {
-        match self {
-            FrequencyFormat::MHz => format!("{:.3} MHz", freq),
-            FrequencyFormat::KHz => format!("{:.1} kHz", freq * 1000.0),
-            FrequencyFormat::Hz => format!("{:.0} Hz", freq * 1_000_000.0),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn ui_config_serializes_without_inert_fields() {
+        let value = serde_json::to_value(Config::default()).unwrap();
+        for key in [
+            "refresh_rate",
+            "max_messages",
+            "show_waterfall",
+            "time_format",
+            "frequency_format",
+        ] {
+            assert!(value["ui"].get(key).is_none(), "{key}");
+        }
+    }
 
     #[test]
     fn test_config_save_and_load() {
@@ -437,14 +399,5 @@ mod tests {
         assert_eq!(light_theme.background_color(), Color::White);
         assert_eq!(dark_theme.foreground_color(), Color::White);
         assert_eq!(light_theme.foreground_color(), Color::Black);
-    }
-
-    #[test]
-    fn test_frequency_formatting() {
-        let freq = 14.074;
-
-        assert_eq!(FrequencyFormat::MHz.format_frequency(freq), "14.074 MHz");
-        assert_eq!(FrequencyFormat::KHz.format_frequency(freq), "14074.0 kHz");
-        assert_eq!(FrequencyFormat::Hz.format_frequency(freq), "14074000 Hz");
     }
 }

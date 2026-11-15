@@ -19,6 +19,7 @@ name = "pancetta"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 # Local workspace dependencies
 pancetta-core = { path = "../pancetta-core" }
 pancetta-audio = { path = "../pancetta-audio" }
@@ -76,6 +77,7 @@ anyhow = "1.0"
 
 # System utilities
 serialport = "4.9"
+same-file = "1.0"
 libc = "0.2"
 signal-hook = { workspace = true }
 uuid = { version = "1.23", features = ["v4"] }
@@ -110,7 +112,6 @@ predicates = "3.1"
 tracing-test = "0.2"
 # Station-agent integration tests: hand-sign capabilityTokens + txArmGrants,
 # and drive the real AgentSession through a scripted Noise IK handshake.
-base64 = { workspace = true }
 snow = "0.10"
 # Station-agent lock-order tests hold an audit write mid-transaction.
 pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }

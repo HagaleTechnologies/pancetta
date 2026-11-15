@@ -171,7 +171,7 @@ enum Commands {
     },
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
-    /// Export logged QSOs to ADIF
+    /// Export logged QSOs from your logbook (~/.pancetta/qsos.adi) to ADIF
     Export(ExportArgs),
     /// Import contacts from another logger's ADIF (.adi) file into your logbook
     ///
@@ -195,6 +195,25 @@ enum Commands {
     /// comparison against a client (e.g. panino) — read-only, no network
     /// calls. Safe to re-run anytime, including before ever pairing.
     Identity(IdentityArgs),
+    /// Trust a client device key locally for remote TX eligibility
+    TrustClient(TrustClientArgs),
+    /// Remove a client's local TX trust
+    UntrustClient(UntrustClientArgs),
+}
+
+#[derive(Clone, Args)]
+struct TrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
+    #[arg(long)]
+    key_file: PathBuf,
+    #[arg(long)]
+    force: bool,
+}
+#[derive(Clone, Args)]
+struct UntrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
 }
 
 #[derive(Clone, Args)]
@@ -239,17 +258,50 @@ struct PairArgs {
 
 #[derive(Clone, Args)]
 struct ExportArgs {
-    /// Output file path for the ADIF export (.adi)
+    /// File to write the ADIF export to (.adi); standard output when omitted
     #[arg(short, long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
-    /// Override database path (default: ~/.pancetta/qso.db)
+    /// ADIF logbook to read (default: ~/.pancetta/qsos.adi)
     #[arg(long)]
-    database: Option<PathBuf>,
+    logbook: Option<PathBuf>,
 
-    /// Filter by callsign substring (case-insensitive)
+    /// Only QSOs on or after this UTC date (QSO_DATE)
+    #[arg(long, value_name = "YYYY-MM-DD", value_parser = parse_export_date)]
+    since: Option<chrono::NaiveDate>,
+
+    /// Only QSOs on this band, e.g. 20m (BAND, else the band FREQ falls in)
+    #[arg(long, value_parser = parse_export_band)]
+    band: Option<pancetta_core::Band>,
+
+    /// Only QSOs in this mode, e.g. FT8 (MODE or SUBMODE, ignoring case)
+    #[arg(long)]
+    mode: Option<String>,
+
+    /// Only QSOs whose callsign contains this text (ignoring case)
     #[arg(long)]
     callsign: Option<String>,
+}
+
+fn parse_export_date(value: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|e| e.to_string())?;
+    if date.format("%Y-%m-%d").to_string() != value {
+        return Err("use YYYY-MM-DD".into());
+    }
+    Ok(date)
+}
+
+fn parse_export_band(value: &str) -> std::result::Result<pancetta_core::Band, String> {
+    value.to_lowercase().parse().map_err(|_| {
+        format!(
+            "unknown band '{value}'; use one of {}",
+            pancetta_core::Band::all()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 #[derive(Clone, Args)]
@@ -627,6 +679,8 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         },
         Commands::Pair(args) => pair_command(args, cli).await,
         Commands::Identity(args) => identity_command(args, cli).await,
+        Commands::TrustClient(args) => trust_client_command(args, cli).await,
+        Commands::UntrustClient(args) => untrust_client_command(args, cli).await,
     }
 }
 
@@ -701,6 +755,59 @@ async fn identity_command(args: IdentityArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+async fn trust_client_command(args: TrustClientArgs, cli: &Cli) -> Result<()> {
+    use base64::Engine as _;
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    let result = (|| -> Result<[u8; 32]> {
+        pancetta_agent::trust::validate_key_id(&args.key_id)?;
+        let bytes = std::fs::read(&args.key_file)
+            .with_context(|| format!("cannot read {}", args.key_file.display()))?;
+        Ok(pancetta_agent::trust::write_client_device_key(
+            &key_dir,
+            &args.key_id,
+            &bytes,
+            args.force,
+        )?)
+    })();
+    let raw = match result {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    let words = pancetta_agent::fingerprint::key_material_words(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw),
+        12,
+    )?;
+    println!("=== Pancetta Station Trust Client ===\n\nKey dir:  {}\nClient:   {}\nWrote:    clients/{}.pub (mode 0600)\n", key_dir.display(), args.key_id, args.key_id);
+    println!("Device-key words: {}", words.join(" "));
+    println!("Compare these against the client's own device-key words before it transmits.\n");
+    println!("TX arming needs this file AND an owner edge on cqdx (or a tx_allow_list entry\nin static mode). The station picks changes up on its next authorization poll\nor trust refresh (default 45 s).");
+    Ok(())
+}
+
+async fn untrust_client_command(args: UntrustClientArgs, cli: &Cli) -> Result<()> {
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    match pancetta_agent::trust::remove_client_device_key(&key_dir, &args.key_id) {
+        Ok(false) => println!(
+            "No local trust file for {} (nothing to remove).",
+            args.key_id
+        ),
+        Ok(true) => {
+            println!("=== Pancetta Station Untrust Client ===\n\nKey dir:  {}\nClient:   {}\nRemoved:  clients/{}.pub\n", key_dir.display(), args.key_id, args.key_id);
+            println!("The client is disarmed on the next poll or trust refresh and any in-flight\nframe is dropped. It stays connected for read and status until you also\nremove its edge on cqdx (or its tx_allow_list entry).");
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
 /// Run the agent enrollment (pairing) flow against cqdx: `enroll` (POST
 /// `/pair/agent`) → PoP-sign the challenge → `complete` (POST
 /// `/pair/agent/complete`), then persist the resulting `PairedState` (pinned
@@ -732,6 +839,11 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
         );
         std::process::exit(1);
     };
+    // Config-sourced URLs were already validated during load. Recheck only
+    // overrides so loopback warnings are emitted once per field validation.
+    if args.pairing_api_url.is_some() {
+        pancetta_config::StationAgentConfig::validate_pairing_api_url(&pairing_api_url)?;
+    }
     let origin = sa_cfg.pairing_origin.clone();
 
     let key_dir = resolve_key_dir(sa_cfg);
@@ -911,62 +1023,126 @@ async fn import_confirmations_command(args: ImportConfirmationsArgs) -> Result<(
 }
 
 async fn export_command(args: ExportArgs) -> Result<()> {
-    use pancetta_qso::adif::AdifProcessor;
-    use pancetta_qso::async_database::{QsoDatabase, QsoFilter, QueryOptions};
+    use pancetta_qso::adif::{AdifFile, AdifProcessor};
+    use pancetta_qso::adif_export::{plan_export, ExportFilter};
+    use std::io::Write;
 
-    let db_path = args.database.unwrap_or_else(|| LogbookPaths::new().db);
-
-    if !db_path.exists() {
-        eprintln!("QSO database not found at {}", db_path.display());
-        eprintln!("Run pancetta to log some QSOs first.");
-        std::process::exit(1);
+    let paths = LogbookPaths::new();
+    let logbook = args.logbook.unwrap_or_else(|| paths.adif.clone());
+    if !logbook.exists() {
+        // Only the default logbook path can be awaiting the qso.db migration,
+        // and only it is created by running pancetta.
+        if logbook != paths.adif {
+            anyhow::bail!("Logbook not found at {}.", logbook.display());
+        }
+        if paths.db.exists() {
+            return Err(refuse_unmigrated_index(&logbook, &paths.db, "export"));
+        }
+        anyhow::bail!(
+            "Logbook not found at {}.\nRun pancetta to log some QSOs first.",
+            logbook.display()
+        );
     }
-
-    println!("Opening database: {}", db_path.display());
-    let db = QsoDatabase::open(&db_path)
-        .await
-        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-
-    let filter = QsoFilter {
-        callsign_pattern: args.callsign.clone(),
-        ..Default::default()
+    let status = |line: &str| {
+        if args.output.is_some() {
+            println!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
     };
-    let options = QueryOptions::default();
-    let progresses = db
-        .search_qsos(&filter, &options)
+    status(&format!("Reading logbook: {}", logbook.display()));
+    let bytes = tokio::fs::read(&logbook)
         .await
-        .context("Failed to search QSOs")?;
-
-    println!("Found {} QSO(s) in database", progresses.len());
-    if progresses.is_empty() {
-        println!("Nothing to export.");
+        .with_context(|| format!("Cannot read your logbook {}", logbook.display()))?;
+    let processor = AdifProcessor::new();
+    let filter = ExportFilter {
+        since: args.since,
+        band: args.band,
+        mode: args.mode,
+        callsign: args.callsign,
+    };
+    let plan = plan_export(&processor, &processor.parse_bytes(&bytes), &filter);
+    for record in &plan.unreadable {
+        let call = record
+            .call
+            .as_ref()
+            .map(|c| format!(" ({})", printable(c)))
+            .unwrap_or_default();
+        eprintln!(
+            "Record {}{}: {}; skipped.",
+            record.record_number,
+            call,
+            printable(&record.reason)
+        );
+    }
+    let mut found = format!("Found {} QSO(s) in logbook", plan.read);
+    if !filter.is_empty() {
+        let mut filters = Vec::new();
+        if let Some(date) = filter.since {
+            filters.push(format!("--since {date}"));
+        }
+        if let Some(band) = filter.band {
+            filters.push(format!("--band {band}"));
+        }
+        if let Some(mode) = &filter.mode {
+            filters.push(format!("--mode {}", printable(mode)));
+        }
+        if let Some(call) = &filter.callsign {
+            filters.push(format!("--callsign {}", printable(call)));
+        }
+        found += &format!("; {} match {}", plan.records.len(), filters.join(" "));
+    }
+    if !plan.unreadable.is_empty() {
+        found += &format!(
+            "; skipped {} unreadable record{}",
+            plan.unreadable.len(),
+            if plan.unreadable.len() == 1 { "" } else { "s" }
+        );
+    }
+    status(&found);
+    if plan.records.is_empty() {
+        status("Nothing to export.");
         return Ok(());
     }
-
-    let processor = AdifProcessor::new();
-    let mut adif_file = pancetta_qso::adif::AdifFile {
-        header: Default::default(),
-        records: Vec::new(),
-    };
-    for progress in &progresses {
-        let adif_qso =
-            processor.qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
-        let record = processor.qso_to_record(&adif_qso);
-        adif_file.records.push(record);
-    }
+    let count = plan.records.len();
     let content = processor
-        .generate_string(&adif_file)
+        .generate_string(&AdifFile {
+            header: Default::default(),
+            records: plan.records,
+        })
         .context("Failed to generate ADIF")?;
-    tokio::fs::write(&args.output, &content)
-        .await
-        .with_context(|| format!("Failed to write {}", args.output.display()))?;
-
-    println!(
-        "Exported {} QSO(s) to {} ({} bytes)",
-        progresses.len(),
-        args.output.display(),
+    let destination = if let Some(output) = &args.output {
+        // Open without truncating, then compare file identities so symlinks
+        // and hard links cannot turn an export into a source-logbook rewrite.
+        let source = same_file::Handle::from_path(&logbook)
+            .with_context(|| format!("Cannot identify your logbook {}", logbook.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(output)
+            .with_context(|| format!("Failed to open {}", output.display()))?;
+        let destination = same_file::Handle::from_file(file.try_clone()?)?;
+        anyhow::ensure!(
+            source != destination,
+            "Output refers to the source logbook {}; choose a different output file.",
+            logbook.display()
+        );
+        file.set_len(0)
+            .and_then(|()| file.write_all(content.as_bytes()))
+            .with_context(|| format!("Failed to write {}", output.display()))?;
+        output.display().to_string()
+    } else {
+        std::io::stdout()
+            .lock()
+            .write_all(content.as_bytes())
+            .context("Failed to write ADIF to standard output")?;
+        "standard output".into()
+    };
+    status(&format!(
+        "Exported {count} QSO(s) to {destination} ({} bytes)",
         content.len()
-    );
+    ));
     Ok(())
 }
 
@@ -1066,10 +1242,10 @@ fn read_logbook(adif: &Path) -> Result<Option<Vec<u8>>> {
 
 /// The refusal for an index (`qso.db`) without the logbook (`qsos.adi`) it
 /// is built from: startup has not yet moved the log into the logbook.
-fn refuse_unmigrated_index(adif: &Path, db: &Path) -> anyhow::Error {
+fn refuse_unmigrated_index(adif: &Path, db: &Path, verb: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "Pancetta has not yet moved your log from {} into {}. Start Pancetta once so it \
-         can do that, then run this import again.",
+         can do that, then run this {verb} again.",
         db.display(),
         adif.display()
     )
@@ -1107,7 +1283,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
 
     let adif_exists = adif.exists();
     if !adif_exists && db.exists() {
-        return Err(refuse_unmigrated_index(&adif, &db));
+        return Err(refuse_unmigrated_index(&adif, &db, "import"));
     }
 
     let logbook_bytes = if adif_exists {
@@ -1141,7 +1317,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     let current = read_logbook(&adif)?;
     let db_existed = db.exists();
     if current.is_none() && db_existed {
-        return Err(refuse_unmigrated_index(&adif, &db));
+        return Err(refuse_unmigrated_index(&adif, &db, "import"));
     }
     let planned = logbook_bytes.as_deref().unwrap_or_default();
     let now = current.as_deref().unwrap_or_default();
@@ -1592,8 +1768,7 @@ fn format_undo_report(
     let _ = writeln!(out, "  {:<20}{}", "Logged since, kept:", kept);
     out.push('\n');
     out.push_str(
-        "Pancetta drops the removed contacts from its search index (which `pancetta export` \
-         reads) and its worked-station history the next time it starts.\n",
+        "Pancetta drops the removed contacts from its search index and its worked-station history the next time it starts.\n",
     );
     out
 }
@@ -4128,8 +4303,7 @@ mod tests {
                 "  Removed:            2\n",
                 "  Logged since, kept: 1\n",
                 "\n",
-                "Pancetta drops the removed contacts from its search index (which `pancetta \
-                 export` reads) and its worked-station history the next time it starts.\n",
+                "Pancetta drops the removed contacts from its search index and its worked-station history the next time it starts.\n",
             )
         );
         // Undo works while Pancetta runs; it never tells the operator to stop it.

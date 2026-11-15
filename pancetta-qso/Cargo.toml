@@ -13,6 +13,9 @@ publish.workspace = true
 [dependencies]
 # Internal dependencies
 pancetta-core = { path = "../pancetta-core" }
+# PAN-305: crash-safe atomic writer (write_secure_atomic) for contest-serial
+# persistence. No default features: the CLI (clap) is not needed here.
+pancetta-config = { path = "../pancetta-config", default-features = false }
 # FT8 encoder/modulator/decoder — only pulled in for the high-fidelity sim
 # path (encode -> noise/fading -> real decode). Optional; the encoder,
 # modulator and decoder are all in pancetta-ft8's default build, so no

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
+
+- PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
+
+- PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.
+- PAN-306: logged and exported ADIF records infer COUNTRY, DXCC, CQZ and ITUZ offline, including prefix and exact-call zone overrides. Stored imported fields take precedence individually; unknown calls gain no inferred fields. Existing logs are not rewritten. Automated coverage only; live qualification pending.
+
+- PAN-310 security: refuse plaintext station-agent relay and pairing URLs outside loopback, including pairing CLI overrides. Loopback plaintext emits an unencrypted-link warning. Supplied endpoints are validated even when the agent is disabled.
+
 - PAN-319: the TUI redraws on changes and a one-second idle tick, handles resize immediately, and wraps complete frames in synchronized output. DX Hunter formats only visible rows and preserves callsign focus. Waterfall updates prune station and state entries older than 24 hours.
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
@@ -15,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-338: `pancetta doctor` reports ON-AIR READY (0), DECODE-ONLY (1), NOT CONFIGURED (2), or NOT READY (3). Missing configuration takes precedence over other failures. Rig limitations and N0CALL prevent on-air readiness; broken receive prerequisites report NOT READY. `doctor --json` emits one document with the verdict, exit code, config path and all seven checks, including fixes. Doctor does not test PTT or transmit audio.
 
 ### Added
+
+- PAN-320: `[audio] decimation_antialias_filter` (default `false`, restart required) opts the 48 kHz receive path into a unity-gain 31-tap FIR anti-alias decimator in place of every-fourth-sample subsampling, with its passband pinned flat to 4 kHz by tests and its CPU cost CI-budgeted under 5 ms per 15 s window. The FIR applies only at 48 kHz; other supported rates keep subsampling with a startup warning. The stage resets at every destructive DSP buffer flush (gain change, dial change, mode change, forward clock jump) and its 15-sample group delay is compensated in the decode-window anchor. The shipped default stays `subsample` until the recorded station A/B (quiet, busy, TX-desense; see `docs/measurements/PAN-320-decimation.md`) shows the FIR decoding strictly more merged messages; the local `decimation-ab` research binary runs that comparison once the PAN-393 captures exist.
+- PAN-304: Keep rotating, byte-exact startup snapshots of changed `qsos.adi` logbooks. Enabled by default with seven copies; directory and retention are configurable.
 
 - PAN-340: `rig.model` now accepts any Hamlib model — a name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, `"Barrett 950"`), a manufacturer-qualified name, or a numeric Hamlib model ID (`"1045"`), so rigs newer than the bundled catalog still work by number. Case, hyphens and spaces are ignored when matching names; ambiguous names and all-digit model names require the manufacturer-qualified form or the numeric ID. Unknown, malformed or ambiguous values fail config validation with the closest matches and a `rigctl -l` numeric-ID hint, and `pancetta doctor` reports the same message. Selecting more models adds no hardware qualification: only the FTdx10 is radio-qualified. Empty and `Generic` keep their placeholder behavior, and external `rigctld` users with an unknown name must now use its numeric ID.
 - PAN-348: `pancetta import-confirmations <file.adi>` merges LoTW confirmations into uniquely matched contacts with a verified backup and restart rebuild marker. `[autonomous] needed_means = "unconfirmed"` keeps worked but unconfirmed entities needed locally. The default remains `"unworked"`; ATNO and duplicate rules are unchanged.
@@ -32,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PAN-399: DX Hunter keeps a station's `!` (all-time new entity) after a cqdx spot refresh when the local logbook says it is all-time new. The `!` now follows the Pri score and Why text the row shows, so a later decode or a worked contact moves them together. Band Activity, the station card and everything sent to cqdx or remote clients are unchanged.
+
+- PAN-305: The next contest serial number is saved with a crash-safe atomic write (synced temporary sibling, atomic rename) instead of a truncating `fs::write` whose errors were ignored, so a crash mid-write can no longer leave the serial file empty and reset numbering to 001. A failed save is now returned to the contest-response caller instead of being silently swallowed. This fixes persistence only; the dormant contest-exchange scaffolding is not activated by it.
 - PAN-335: The Linux service waits for pipeline initialization and restarts after missed coordinator health passes. `pancetta doctor` now checks enabled network services, log disk space and microphone permission separately, with a fix for each problem. Real systemd restart and macOS TCC qualification remain pending.
 - PAN-355: Replay sessions show a neutral `TX: REPLAY` title-bar chip from the first frame, regardless of the selected TX policy.
 - PAN-349: WSJT-X UDP now sends FT4 decodes and active-contact Status fields, including our report, RX offset and accepted TX message. FT8/FT4 periods are populated while idle too. Verified with packet goldens and local sockets; live GridTracker/JTAlert qualification is pending.

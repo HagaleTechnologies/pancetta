@@ -16,8 +16,7 @@ use pancetta_tui::upload_status::{
     sort_targets, QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget,
 };
 
-/// Map an outbox destination to its display target. LoTW never goes through
-/// the outbox (it is a separate one-shot path), so it has no mapping here.
+/// Map an outbox destination to its display target.
 pub fn upload_target_for_destination(
     destination: pancetta_dx::upload_outbox::UploadDestination,
 ) -> UploadTarget {
@@ -27,6 +26,7 @@ pub fn upload_target_for_destination(
         QrzLogbook => UploadTarget::Qrz,
         Eqsl => UploadTarget::Eqsl,
         Cqdx => UploadTarget::Cqdx,
+        Lotw => UploadTarget::Lotw,
     }
 }
 

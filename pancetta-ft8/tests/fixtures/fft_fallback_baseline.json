@@ -1,0 +1,378 @@
+{
+  "generated_at": "2026-11-13T01:51:46.825Z",
+  "kind": "pan313-fft-fallback-baseline",
+  "recordings": [
+    {
+      "lengths": {
+        "151680": [
+          "I07OGE LC1TVY EI22"
+        ],
+        "162000": [
+          "I07OGE LC1TVY EI22"
+        ],
+        "full": []
+      },
+      "path": "basicft8/170923_082000.wav",
+      "samples": 180000,
+      "sha256": "3b9c19017cc780e88c34fb90dec2e97dc8c40c98475ed33d47dc41e1aad0b9c0"
+    },
+    {
+      "lengths": {
+        "151680": [],
+        "162000": [],
+        "full": []
+      },
+      "path": "basicft8/170923_082015.wav",
+      "samples": 180000,
+      "sha256": "7eaf0eee718538408c1f58d03b31d4c50a8d1d5d327b38d3393ffb1e683fbb9e"
+    },
+    {
+      "lengths": {
+        "151680": [],
+        "162000": [],
+        "full": []
+      },
+      "path": "basicft8/170923_082030.wav",
+      "samples": 180000,
+      "sha256": "6f677f74ca9299b6ff0ecdad15e02312ea163a76c74b119aac0dbed229fdc1ff"
+    },
+    {
+      "lengths": {
+        "151680": [],
+        "162000": [],
+        "full": []
+      },
+      "path": "basicft8/170923_082045.wav",
+      "samples": 180000,
+      "sha256": "00a08e031cd39bd40dd2826c00b8ac61d670195462b5aeb009a74fce7a4f2eb0"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "CQ AD8QW EM98",
+          "CQ AD9DU EN52",
+          "CQ AE6CH CM97",
+          "CQ AG6X DM12",
+          "CQ DX EA8AQV IL28",
+          "CQ KD2YCK FN20",
+          "CQ KG4OJT FM18",
+          "CQ VA3WL FN03",
+          "CQ WA3YUV FM18",
+          "CQ WP4JKT EL95",
+          "K4TTL WA2HIP -16",
+          "KD3ACB KB9DED R-03",
+          "KE8USW K1HC -16",
+          "KG5FLJ K3GC FM29",
+          "KG5FLJ NY6C CM88",
+          "N0KK WA8AHZ 73",
+          "N6IGV AC7WY R+07",
+          "N6IGV V31DL EK57",
+          "N6IGV W0OVX DN98",
+          "N7KJL NV1U -04",
+          "RX0AT KK4TE -02",
+          "SV9TLU K4CUL FM18",
+          "TL8GD W9AV R-18",
+          "VE7LGP KO4LRW +16",
+          "VE7LGP WB8P EM99",
+          "W1HFB W6TOX DM24"
+        ],
+        "162000": [
+          "CQ AD8QW EM98",
+          "CQ AD9DU EN52",
+          "CQ AE6CH CM97",
+          "CQ AG6X DM12",
+          "CQ DX EA8AQV IL28",
+          "CQ KD2YCK FN20",
+          "CQ KG4OJT FM18",
+          "CQ VA3WL FN03",
+          "CQ WA3YUV FM18",
+          "CQ WP4JKT EL95",
+          "K4TTL WA2HIP -16",
+          "KD3ACB KB9DED R-03",
+          "KE8USW K1HC -16",
+          "KG5FLJ K3GC FM29",
+          "KG5FLJ NY6C CM88",
+          "N0KK WA8AHZ 73",
+          "N6IGV AC7WY R+07",
+          "N6IGV V31DL EK57",
+          "N6IGV W0OVX DN98",
+          "N7KJL NV1U -04",
+          "RX0AT KK4TE -02",
+          "SV9TLU K4CUL FM18",
+          "TL8GD W9AV R-18",
+          "VE7LGP KO4LRW +16",
+          "VE7LGP WB8P EM99",
+          "VO1AE KA3KQO FM29",
+          "W1HFB W6TOX DM24"
+        ],
+        "full": [
+          "CQ AD8QW EM98",
+          "CQ AD9DU EN52",
+          "CQ AE6CH CM97",
+          "CQ AG6X DM12",
+          "CQ DX EA8AQV IL28",
+          "CQ KD2YCK FN20",
+          "CQ KG4OJT FM18",
+          "CQ VA3WL FN03",
+          "CQ WA3YUV FM18",
+          "CQ WP4JKT EL95",
+          "K4TTL WA2HIP -16",
+          "KD3ACB KB9DED R-03",
+          "KE8USW K1HC -16",
+          "KG5FLJ K3GC FM29",
+          "KG5FLJ NY6C CM88",
+          "N0KK WA8AHZ 73",
+          "N6IGV AC7WY R+07",
+          "N6IGV V31DL EK57",
+          "N6IGV W0OVX DN98",
+          "N7KJL NV1U -04",
+          "RX0AT KK4TE -02",
+          "SV9TLU K4CUL FM18",
+          "TL8GD W9AV R-18",
+          "VE7LGP KO4LRW +16",
+          "VE7LGP WB8P EM99",
+          "VO1AE KA3KQO FM29",
+          "W1HFB W6TOX DM24"
+        ]
+      },
+      "path": "basicft8/live_now.wav",
+      "samples": 180000,
+      "sha256": "f372884bb881aecc346ef8e3a1ffd43e3bcab9c600ce1d473ac5c502eac9d9cc"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "CQ K1ABC FN42"
+        ],
+        "162000": [
+          "CQ K1ABC FN42"
+        ],
+        "full": [
+          "CQ K1ABC FN42"
+        ]
+      },
+      "path": "generated/ft8_cq.wav",
+      "samples": 180000,
+      "sha256": "0db07614497d2641e743310df71c09213d4fc4004a5bce82fc858cc73c0c152f"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "K1DEF W1ABC -12"
+        ],
+        "162000": [
+          "K1DEF W1ABC -12"
+        ],
+        "full": [
+          "K1DEF W1ABC -12"
+        ]
+      },
+      "path": "generated/ft8_report.wav",
+      "samples": 180000,
+      "sha256": "32e35239667556d792bd1b59970e85b5038a9ea3b3379d2b81c030aa48816d1e"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "K1DEF W1ABC RR73"
+        ],
+        "162000": [
+          "K1DEF W1ABC RR73"
+        ],
+        "full": [
+          "K1DEF W1ABC RR73"
+        ]
+      },
+      "path": "generated/ft8_rr73.wav",
+      "samples": 180000,
+      "sha256": "7c0abdf5016de6c65cf0083a69b90637ea9457cfe930ecdf1b671182d0506d06"
+    },
+    {
+      "lengths": {
+        "151680": [],
+        "162000": [],
+        "full": []
+      },
+      "path": "jtdx/000000_000001.wav",
+      "samples": 180000,
+      "sha256": "3ec2101f875aa84886b2d770f2ff8b0e286439695ac282b3d2e8356761c4f679"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "CQ A41ZZ LL93",
+          "CQ ES6DO KO27",
+          "CQ R9AAB MO04",
+          "CQ RA9CAD LO96",
+          "CQ RD3FC KO95",
+          "CQ RT4S LO36",
+          "CQ UA3QNE LO01",
+          "CQ YD0SCZ OI33",
+          "EA1IPH UN7LAY -16",
+          "EA3HRU R6LCM RR73",
+          "EA7DGC IK8DYE 73",
+          "G3VAO UA3GDJ KO92",
+          "GD3YUM BG4QNE PM01",
+          "GD3YUM YB0BTA OI33",
+          "KA7RLM R7NW R-23",
+          "LB8ZH R2FAQ KO04",
+          "R1BEQ UN7FU 73",
+          "R9AA IK5EEA 73",
+          "UA3AIU UR5GCK -03",
+          "UA6LIK SP3AVS R+00",
+          "UN7LZ RV3DQC -01",
+          "YB3BBF SV2HXX R-20",
+          "YD1GNL R3KAB LN09",
+          "YD1GNL UA8CW MO07",
+          "YD1GNL UN7ZAI MO51"
+        ],
+        "162000": [
+          "CQ A41ZZ LL93",
+          "CQ ES6DO KO27",
+          "CQ R9AAB MO04",
+          "CQ RA9CAD LO96",
+          "CQ RD3FC KO95",
+          "CQ RT4S LO36",
+          "CQ UA3QNE LO01",
+          "CQ YD0SCZ OI33",
+          "EA1IPH UN7LAY -16",
+          "EA3HRU R6LCM RR73",
+          "EA7DGC IK8DYE 73",
+          "G3VAO UA3GDJ KO92",
+          "GD3YUM BG4QNE PM01",
+          "GD3YUM YB0BTA OI33",
+          "KA7RLM R7NW R-23",
+          "LB8ZH R2FAQ KO04",
+          "R1BEQ UN7FU 73",
+          "R9AA IK5EEA 73",
+          "UA3AIU UR5GCK -03",
+          "UA6LIK SP3AVS R+00",
+          "UN7LZ RV3DQC -01",
+          "YB3BBF SV2HXX R-20",
+          "YD1GNL R3KAB LN09",
+          "YD1GNL UA8CW MO07",
+          "YD1GNL UN7ZAI MO51"
+        ],
+        "full": [
+          "CQ A41ZZ LL93",
+          "CQ ES6DO KO27",
+          "CQ R9AAB MO04",
+          "CQ RA9CAD LO96",
+          "CQ RD3FC KO95",
+          "CQ RT4S LO36",
+          "CQ UA3QNE LO01",
+          "CQ YD0SCZ OI33",
+          "EA1IPH UN7LAY -16",
+          "EA3HRU R6LCM RR73",
+          "EA7DGC IK8DYE 73",
+          "G3VAO UA3GDJ KO92",
+          "GD3YUM BG4QNE PM01",
+          "GD3YUM YB0BTA OI33",
+          "IE2JUO ZP1EUJ R HL33",
+          "KA7RLM R7NW R-23",
+          "LB8ZH R2FAQ KO04",
+          "R1BEQ UN7FU 73",
+          "R9AA IK5EEA 73",
+          "UA3AIU UR5GCK -03",
+          "UA6LIK SP3AVS R+00",
+          "UN7LZ RV3DQC -01",
+          "YB3BBF SV2HXX R-20",
+          "YD1GNL R3KAB LN09",
+          "YD1GNL UA8CW MO07",
+          "YD1GNL UN7ZAI MO51"
+        ]
+      },
+      "path": "jtdx/190227_155815.wav",
+      "samples": 180000,
+      "sha256": "4c56900151e345dde9f8290731e52c0c6b5682947208dec697a00b8b413456d7"
+    },
+    {
+      "lengths": {
+        "151680": [],
+        "162000": [],
+        "full": []
+      },
+      "path": "wsjt/170709_135615.wav",
+      "samples": 180000,
+      "sha256": "438cb892df15fe2d84ac50cc3e4bbcb4369c3aa592c9e82399174b22d1968795"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "CQ RU K1BAA DM03",
+          "CQ RU NT2A FN20",
+          "CQ RU W7BOB DN14",
+          "K1JT 9A2JK RR73",
+          "K8RGI W6BQ 73",
+          "N8HRZ W7CD 73",
+          "W1ATV F6DKQ 73",
+          "W3RGA KM6JD RR73"
+        ],
+        "162000": [
+          "CQ RU K1BAA DM03",
+          "CQ RU NT2A FN20",
+          "CQ RU W7BOB DN14",
+          "K1JT 9A2JK RR73",
+          "K8RGI W6BQ 73",
+          "N8HRZ W7CD 73",
+          "W1ATV F6DKQ 73",
+          "W3RGA KM6JD RR73"
+        ],
+        "full": [
+          "CQ RU K1BAA DM03",
+          "CQ RU NT2A FN20",
+          "CQ RU W7BOB DN14",
+          "K1JT 9A2JK RR73",
+          "K8RGI W6BQ 73",
+          "N8HRZ W7CD 73",
+          "W1ATV F6DKQ 73",
+          "W3RGA KM6JD RR73"
+        ]
+      },
+      "path": "wsjt/181201_180245.wav",
+      "samples": 180000,
+      "sha256": "f9140305922701aa27fac712bb91d2a781c63829abcc810a8e65575573a451b0"
+    },
+    {
+      "lengths": {
+        "151680": [
+          "A92EE F5PSR -14",
+          "K1JT EA3AGB -15",
+          "K1JT HA0DU KN07",
+          "N1JFU EA6EE R-07",
+          "W1DIG SV9CVY -14",
+          "W1FC F5BZB -08",
+          "WM3PEN EA6VQ -09",
+          "XE2X HA2NP RR73"
+        ],
+        "162000": [
+          "A92EE F5PSR -14",
+          "K1JT EA3AGB -15",
+          "K1JT HA0DU KN07",
+          "N1JFU EA6EE R-07",
+          "W0RSJ EA3BMU RR73",
+          "W1DIG SV9CVY -14",
+          "W1FC F5BZB -08",
+          "WM3PEN EA6VQ -09",
+          "XE2X HA2NP RR73"
+        ],
+        "full": [
+          "A92EE F5PSR -14",
+          "K1JT EA3AGB -15",
+          "K1JT HA0DU KN07",
+          "N1JFU EA6EE R-07",
+          "W0RSJ EA3BMU RR73",
+          "W1DIG SV9CVY -14",
+          "W1FC F5BZB -08",
+          "WM3PEN EA6VQ -09",
+          "XE2X HA2NP RR73"
+        ]
+      },
+      "path": "wsjt/210703_133430.wav",
+      "samples": 180000,
+      "sha256": "9feb99c275770a6618538026da7decc6b09eb6cf63121e5168fa86dcdf00c2f5"
+    }
+  ],
+  "schema": 1,
+  "source_revision": "2c60caff243122e82b9cc8f235703df2e2b5465a"
+}
