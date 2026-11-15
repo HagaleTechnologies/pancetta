@@ -180,3 +180,33 @@ items are cross-repo: (a) close the read/qsy relay-root gap with a Noise-static 
 adopt the `clientSig` domain-sep tag (interop-locked), (d) fix the `e2e-auth.v1` §4/§6 wording.
 None require action before the current staging round-trip; all are required before any production
 `REMOTE_RIG_ENABLED` flip.
+
+## Status update (2026-11-13)
+
+PAN-309 adds explicit station-local device-key trust through
+`pancetta trust-client <keyId> --key-file <path>` and
+`pancetta untrust-client <keyId>`. The local trust root is
+`<key_dir>/clients/<keyId>.pub`, raw 32-byte Ed25519 keys, mode 0600 in a
+0700 directory on Unix. Compare the printed device-key words before TX.
+
+The earlier "static config, never cloud-synced" description and Q-0018
+no-refresh bullets describe historical behavior. Authorization polls now
+refresh admission from cqdx, including delegated peers, while TX eligibility
+is `txArmSet = localTrust ∩ owner edges`. Static mode uses
+`txArmSet = localTrust ∩ static tx_allow_list`. Cloud data alone cannot grant
+local TX trust. Missing or invalid local keys exclude a client from TX arming.
+
+The earlier "Allow-list not hot-reloaded" limitation is superseded for live
+config removals and authorization refreshes. Static-mode additions still
+require restart. Both refresh paths reread local keys every configured
+`authorizations_poll_interval_secs` interval, default 45 s, minimum 10 s.
+Local trust removal disarms under the arm lock, flags the control-state
+broadcast, and bumps the authorization generation. Its audit detail is
+`disarmed: local-trust-revoked`. Existing TX-worker checks then refuse queued
+remote frames and abort keyed frames on the next recheck. Admission remains
+intact. Failed cloud polls retain the last successful admission and owner-edge
+sets. Their intersection with local keys is refreshed every interval, even
+while a cloud request is stalled, so local revocation does not wait for cqdx.
+
+Pending-key capture from msg1 remains blocked on dispensa Q-0069. The TUI
+trust prompt remains a follow-up. Pairing does not populate client trust files.

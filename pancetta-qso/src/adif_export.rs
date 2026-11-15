@@ -105,6 +105,26 @@ mod tests {
     }
 
     #[test]
+    fn pan298_export_adds_no_attribution() {
+        for comment in ["", "<COMMENT:9>from N1MM"] {
+            let plan = export(
+                &record("K1ABC", "20261001", comment),
+                ExportFilter::default(),
+            );
+            let p = AdifProcessor::new();
+            let qso = p.record_to_qso(&plan.records[0]).unwrap();
+            assert_eq!(
+                qso.comment.as_deref(),
+                if comment.is_empty() {
+                    None
+                } else {
+                    Some("from N1MM")
+                }
+            );
+        }
+    }
+
+    #[test]
     fn since_includes_the_named_day() {
         let text = ["20260930", "20261001", "20261002"]
             .map(|d| record("K1ABC", d, ""))

@@ -18,6 +18,8 @@ pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde", "transmit"] }
 # hb-058 follow-on (Batch 30): batch30_slash_r_full_audit example reuses
 # the production has_high_risk_fp_pattern helper.
 pancetta-qso = { path = "../pancetta-qso" }
+# PAN-320: decimation A/B consumes the production FIR decimator.
+pancetta-dsp = { path = "../pancetta-dsp" }
 # hb-103 (Batch 32): for payload-bit entropy in feature extraction.
 bitvec = "1.0"
 serde = { workspace = true }
@@ -40,6 +42,10 @@ tempfile = "3"                           # slot-cutting helper for Jt9Decoder; n
 # Already transitively present in the workspace via other crates; we pin
 # it directly here so the call sites compile cleanly.
 libc = "0.2"
+
+[[bin]]
+name = "decimation-ab"
+path = "src/bin/decimation_ab.rs"
 
 [[bin]]
 name = "gen-synth"

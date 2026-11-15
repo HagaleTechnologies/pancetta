@@ -70,10 +70,6 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
 PSKReporter spots across North America and Europe).
 
-<!-- TODO (maintainer): drop a PSKReporter map capture at assets/pskreporter.png
-     and reference it here as on-air proof. Requires a real pskreporter.info
-     session, so it could not be captured automatically. -->
-
 ## What it looks like
 
 Every capture below — and the GIF further down, and the hero GIF above — was
@@ -282,6 +278,8 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
 | `pancetta test-rig` | Test a running rigctld; exits 1 on failure. `--ptt` keys CAT/RTS for 1 s after the band-plan check (careful!). |
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
+| `pancetta trust-client <keyId> --key-file <device.pub> [--force]` | Grant station-local TX trust after comparing device-key words. Requires an owner edge or static allow-list entry too. |
+| `pancetta untrust-client <keyId>` | Remove local TX trust; disarms on the next authorization poll or trust refresh. |
 | `pancetta export [--output log.adi] [--since YYYY-MM-DD] [--band 20m] [--mode FT8]` | Export QSOs directly from `qsos.adi` to ADIF. |
 | `pancetta import-confirmations <file.adi>` | Merge your LoTW report into existing contacts, then restart to apply confirmations. No login or download. |
 | `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
@@ -348,6 +346,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 |---|---|---|---|
 | Linux service watchdog and field diagnostics | Implemented, unreleased | READY follows pipeline initialization; missed health passes trigger recovery. Real systemd restart and macOS TCC qualification pending. | `systemd_unit`, `service_notify`, doctor tests; [runbook](docs/RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) |
 | FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity of the shipped pipeline, and of the native decoder alone vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
+| FIR anti-alias receive decimation | Experimental, *Unreleased* | Opt-in at 48 kHz via `[audio] decimation_antialias_filter` (restart required). Unity-gain 31-tap FIR, CPU-budgeted in CI; station qualification on recorded quiet/busy/TX-desense captures is pending, so the shipped default stays subsampling | [measurement record](docs/measurements/PAN-320-decimation.md) |
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | Tier-based pouncing, decode alerts and editable watchlist | Implemented, *Unreleased* | Optional tier admission; bell, ntfy and webhook alerts; persistent pins edited with Shift+W. No live notification-service or on-air qualification | [configuration](docs/CONFIG.md#dx-tiers-alerts-and-watchlist) |
@@ -366,7 +365,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | TUI QRZ station lookup | Implemented, *Unreleased* | Shift+L looks up the focused callsign with configured XML credentials. Name, QTH, grid and entity appear in the station card; results are cached for the session with a two-second network deadline. Mock-tested; live-account qualification pending | [lookup handler](pancetta/src/coordinator/qrz_lookup.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
-| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
+| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info. Queue bounds and datagram chunking are tested; live delivery is unverified | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only. Band, mode, frequency and duplicate filters apply locally (*Unreleased*); `dxcc_filters` is not applied | [cluster client](pancetta-dx/src/cluster.rs) |
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |

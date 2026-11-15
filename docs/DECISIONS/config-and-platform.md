@@ -1022,11 +1022,11 @@ dependency is mandatory. The hamlib-off build had been broken since at least
 GitHub #270 (20 errors then, 77 by PAN-331) because no CI lane built it, and
 the default and release builds already included hamlib. Repairing it would
 have kept a second build of the TX-safety code (the PAN-115 hard mute takes a
-`pancetta_hamlib::Vfo`) that nothing ships. CI's `workspace-check` job now
-runs `cargo check -p pancetta --no-default-features`, so the station crate
-stays compiled without its default features. Since PAN-334 removed `metrics`
-the crate has no default features, so that build equals the default one until
-a default feature gains cfg sites. The opt-in `ft2` cfg arms are still built
+`pancetta_hamlib::Vfo`) that nothing ships. PAN-321 removed CI's separate station
+`--no-default-features` check because PAN-334 removed `metrics` and the
+crate's default feature list is empty. The examples build covers the same
+configuration today. If station defaults gain features, restore separate
+no-default coverage. The opt-in `ft2` cfg arms are still built
 by no CI lane. Replay mode still starts no Hamlib, so the "no Hamlib route"
 paths remain.
 
@@ -1045,10 +1045,10 @@ feature: a cfg-gated module forces a cfg at every caller, which is how
 `#[cfg_attr(feature = "serde", ...)]` like every other derive in the crate,
 and `transmit` enables `serde`.
 
-CI's `ft8-tests` job runs `cargo test -p pancetta-ft8` with default features
+CI's consolidated `workspace-check` job runs `cargo test -p pancetta-ft8` with default features
 (the standalone build) and checks `--no-default-features`; the `transmit`
-configuration of every pancetta-ft8 test still runs in `workspace-check`'s
-`--features transmit` test step. The default-features test build had been
+configuration of every pancetta-ft8 test still runs in `workspace-tests`'
+`--features transmit` nextest run (PAN-314). The default-features test build had been
 broken by `examples/snr_calibration.rs` (it imports `Ft8Encoder`) without
 anyone noticing, because workspace feature unification turns on
 `pancetta-ft8/transmit` for every workspace build. `scripts/check.sh` now
@@ -1058,8 +1058,8 @@ Not done here: 16 `pancetta-ft8/tests/` files keep their `transmit` cfg
 gates (whole-file or per-test) although the encoder and modulator they use
 are no longer gated. Removing them touches 16 more files, which would take
 this pull request past the 40-file limit. Those tests still run in
-`workspace-check`'s `--features transmit` step, but the default-features
-`ft8-tests` run skips them. The gate removals are in commit `ceff2c0` on the
+`workspace-tests`' `--features transmit` run, but the standalone default-features
+test invocation skips them. The gate removals are in commit `ceff2c0` on the
 PAN-331 branch.
 
 ## Every listed CLI flag does something (PAN-334, 2026-11-09)
@@ -1130,7 +1130,8 @@ the guard, and both JSON sinks.
 - **Hand-written compile-time guard, not `cargo public-api`.**
   `pancetta-ft8/tests/stable_api_guard.rs` coerces each pinned function to
   its fn-pointer type, so drift is an E0308 naming the item, and it runs in
-  the existing `ft8-tests` and `workspace-check` jobs on the pinned 1.98.0.
+  `workspace-check` (PAN-321 folded the old `ft8-tests` runs into it) and
+  `workspace-tests` on the pinned 1.98.0.
   `cargo public-api` needs a nightly toolchain, a tool build and a pinned
   tool-to-nightly pairing, which the PAN-56 single-toolchain rule argues
   against. `readme_lists_every_pinned_item` keeps the guard and the README
@@ -1227,6 +1228,37 @@ required VFOs and restore the receive VFO. Unconfirmed split state, rejected mod
 or failed restoration leaves TX inhibited. The coordinator adds an independent
 readiness cause and never changes operator TX policy to recover it. Mock and
 socket tests are container evidence; FTdx10 hardware qualification remains pending.
+
+## Opt-in FIR decimation, resets and timing (PAN-320)
+
+`[audio] decimation_antialias_filter` (default `false`, restart required,
+not live-applied by the config watcher) swaps the 48 kHz receive path's
+every-fourth-sample subsampling for the `pancetta-dsp` 31-tap unity-gain FIR.
+The FIR runs only at 48 kHz; a `true` flag at any other supported rate logs
+`DSP: decimation_antialias_filter applies only at 48000Hz; using subsample at
+<rate>Hz` and keeps subsampling, because the taps are designed for that one
+rate. The startup line names the selected path (`subsample` or `fir31`).
+
+Two decisions worth remembering:
+
+- **The decimation stage resets with every destructive buffer flush, and
+  only then.** Gain/capture-epoch changes (both sites), dial changes, mode
+  changes and forward clock jumps run `destructive_capture_flush`, which
+  clears the buffer, the waterfall cursor and the stage's history/phase in
+  one action. Ordinary overlap retention between windows does not reset:
+  draining the front of the buffer is not a discontinuity. Clearing the
+  buffer without the stage reset would splice pre-flush filter history onto
+  post-flush audio.
+- **The FIR's group delay is compensated at the window anchor, not the
+  scheduler.** The causal filter's newest output reflects input 15 samples
+  (312.5 µs) in the past, so `boundary_anchored_slice` receives
+  `now − 15/48000 s` as the buffer's effective end; the slot scheduler,
+  the emit trigger and discontinuity detection stay on the real clock.
+
+The shipped default stays `false` until the recorded station A/B (quiet,
+busy, TX-desense raw48 captures) shows the FIR decoding strictly more
+merged messages — a tie keeps subsample regardless of SNR. The pending
+record and the decision rule live in `docs/measurements/PAN-320-decimation.md`.
 
 ## Service liveness and field diagnostics (PAN-335, 2026-11-12)
 

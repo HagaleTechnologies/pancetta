@@ -114,7 +114,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Where Things Live
 
-- `docs/superpowers/specs/` — design specs (authoritative for current behavior)
+- `docs/superpowers/specs/` — design specs
 - `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
@@ -153,3 +153,5 @@ docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
 credenza; edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
 instead of hand-editing this copy.
+
+When sources conflict: code > curated docs > docs/DECISIONS/ > docs/superpowers/specs/ and implementation plans.
