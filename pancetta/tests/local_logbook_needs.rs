@@ -398,3 +398,166 @@ async fn unconfirmed_policy_preserves_unknown_and_empty_states() {
         .iter()
         .any(|i| i.label.contains("NEEDS FROM LOCAL LOGBOOK")));
 }
+
+// PAN-399: mirror the bridge's cqdx-only spot verdict, not the local display verdict.
+fn cqdx_spot(
+    call: &str,
+    entity_name: &str,
+    lookup: &CachedStationLookup,
+) -> pancetta_tui::tui_runner::CqdxSpotInfo {
+    let (needed, atno) = lookup.display_needed_atno(call);
+    pancetta_tui::tui_runner::CqdxSpotInfo {
+        dx_call: call.into(),
+        band: "20m".into(),
+        mode: "FT8".into(),
+        frequency_hz: 14_075_500,
+        grid: None,
+        rarity_tier: "rare".into(),
+        reporter_count: 3,
+        best_snr: Some(-12),
+        confidence: 0.9,
+        first_seen: chrono::Utc::now().timestamp(),
+        last_seen: chrono::Utc::now().timestamp(),
+        is_notable: false,
+        notable_type: None,
+        entity_name: entity_name.into(),
+        needed,
+        atno,
+    }
+}
+
+fn assert_mark_agrees(app: &mut App, call: &str) -> (bool, pancetta_qso::priority::PriorityTier) {
+    use pancetta_qso::priority::PriorityTier;
+    let tier = PriorityTier::from_display_u32(app.dx_stations[call].priority_score);
+    let screen = render(app, View::Hunter, 220, 12);
+    let row = row_of(&screen, call);
+    let marked = row.contains(&format!("!{call}"));
+    assert_eq!(marked, tier == PriorityTier::Atno, "{row}");
+    assert_eq!(marked, row.contains("all-time new entity"), "{row}");
+    if marked {
+        assert!(
+            !row.contains(&format!("+{call}")) && !row.contains(&format!("▲{call}")),
+            "{row}"
+        );
+    }
+    (marked, tier)
+}
+
+#[tokio::test]
+async fn local_atno_keeps_its_mark_after_a_cqdx_spot_refresh() {
+    let (_tmp, lookup) = offline_lookup(&four_hundred_qsos()).await;
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "ZL1ABC", 14.074, "FT8").await;
+    let spot = cqdx_spot("ZL1ABC", "New Zealand", &lookup);
+    assert_eq!((spot.needed, spot.atno), (false, false));
+    app.merge_spot_groups(&[spot]);
+    app.refresh_dx_need(Some(&lookup));
+    let row = &app.dx_stations["ZL1ABC"];
+    assert_eq!((row.needed, row.atno), (false, false));
+    assert!(!row.network_rank.unwrap().factors.unwrap().atno);
+    assert!(assert_mark_agrees(&mut app, "ZL1ABC").0);
+    let hunter = render(&mut app, View::Hunter, 220, 12);
+    assert!(row_of(&hunter, "ZL1ABC").contains("all-time new entity (local logbook)"));
+    assert!(render(&mut app, View::BandActivity, 120, 12).contains("!ZL1ABC"));
+    assert!(render(&mut app, View::Card, 130, 6).contains("ATNO★"));
+}
+
+#[tokio::test]
+async fn unconfirmed_local_atno_keeps_its_mark_after_a_cqdx_spot_refresh() {
+    let (_tmp, lookup) = offline_lookup(&four_hundred_qsos()).await;
+    lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+    lookup.update_needed_dxcc(["ZL".into()].into_iter().collect());
+    assert_eq!(lookup.display_needed_atno("ZL1ABC"), (true, false));
+    assert_eq!(lookup.needed_atno_shown("ZL1ABC"), (true, true));
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "ZL1ABC", 14.074, "FT8").await;
+    app.merge_spot_groups(&[cqdx_spot("ZL1ABC", "New Zealand", &lookup)]);
+    app.refresh_dx_need(Some(&lookup));
+    assert!(assert_mark_agrees(&mut app, "ZL1ABC").0);
+    assert!(render(&mut app, View::Hunter, 220, 12).contains("all-time new entity (local logbook)"));
+    assert!(render(&mut app, View::BandActivity, 120, 12).contains("!ZL1ABC"));
+    assert!(render(&mut app, View::Card, 130, 6).contains("ATNO★"));
+}
+
+#[tokio::test]
+async fn atno_mark_agrees_with_the_displayed_score() {
+    use pancetta_qso::priority::PriorityTier;
+    // C3 and C3b: a higher network ATNO rank survives a subsequent local decode.
+    {
+        let (_tmp, lookup) = offline_lookup(&adif(&[("DL1ABC".into(), "FT8", 14.074, "")])).await;
+        lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+        lookup.update_needed_dxcc(["DL".into()].into_iter().collect());
+        lookup.update_needed_atno(["DL".into()].into_iter().collect());
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+        app.merge_spot_groups(&[cqdx_spot("DL1XYZ", "Germany", &lookup)]);
+        app.refresh_dx_need(Some(&lookup));
+        assert!(assert_mark_agrees(&mut app, "DL1XYZ").0);
+        decode(&mut app, &lookup, "DL1XYZ", 14.074, "FT8").await;
+        assert!(assert_mark_agrees(&mut app, "DL1XYZ").0);
+    }
+    // C4 and C5: network-only rows keep the verdict behind their network score.
+    for (call, entity, log, prefix, atno) in [
+        ("ZL1ABC", "New Zealand", four_hundred_qsos(), "ZL", false),
+        (
+            "DL1XYZ",
+            "Germany",
+            adif(&[("DL1ABC".into(), "FT8", 14.074, "")]),
+            "DL",
+            true,
+        ),
+    ] {
+        let (_tmp, lookup) = offline_lookup(&log).await;
+        lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+        lookup.update_needed_dxcc([prefix.into()].into_iter().collect());
+        if atno {
+            lookup.update_needed_atno([prefix.into()].into_iter().collect());
+        }
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.station_info.operating_frequency = 14.074;
+        app.merge_spot_groups(&[cqdx_spot(call, entity, &lookup)]);
+        app.refresh_dx_need(Some(&lookup));
+        let (marked, tier) = assert_mark_agrees(&mut app, call);
+        assert_eq!(marked, atno);
+        assert_eq!(
+            tier,
+            if atno {
+                PriorityTier::Atno
+            } else {
+                PriorityTier::PerBandDxccNew
+            }
+        );
+        if !atno {
+            assert!(render(&mut app, View::Hunter, 220, 12).contains("+ZL1ABC"));
+        }
+    }
+    // C6: agreement under default policy with loaded cqdx lists.
+    {
+        let (_tmp, lookup) = offline_lookup(&four_hundred_qsos()).await;
+        lookup.update_needed_dxcc(["ZL".into()].into_iter().collect());
+        lookup.update_needed_atno(["ZL".into()].into_iter().collect());
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        decode(&mut app, &lookup, "ZL1ABC", 14.074, "FT8").await;
+        app.merge_spot_groups(&[cqdx_spot("ZL1ABC", "New Zealand", &lookup)]);
+        app.refresh_dx_need(Some(&lookup));
+        assert!(assert_mark_agrees(&mut app, "ZL1ABC").0);
+    }
+    // C7: re-ranking after working the station removes the stale ATNO mark.
+    {
+        let (_tmp, lookup) = offline_lookup(&four_hundred_qsos()).await;
+        lookup.set_needed_means(pancetta_config::NeededMeans::Unconfirmed);
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        decode(&mut app, &lookup, "ZL1ABC", 14.074, "FT8").await;
+        lookup.record_worked("ZL1ABC", "20M");
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup.clone()));
+        let explained = scorer.score_tiered_explained("ZL1ABC", None, -10, 14_074_000.0);
+        app.refresh_local_rank(
+            "ZL1ABC",
+            explained.score.as_display_u32(),
+            explained.factors,
+        );
+        app.refresh_dx_need(Some(&lookup));
+        assert!(!assert_mark_agrees(&mut app, "ZL1ABC").0);
+        assert!(render(&mut app, View::Hunter, 220, 12).contains("+▲ZL1ABC"));
+    }
+}

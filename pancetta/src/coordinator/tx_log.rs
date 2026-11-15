@@ -492,6 +492,31 @@ impl TxFrameLog {
         self.writer.as_ref().map(|w| w.path.as_path())
     }
 
+    /// Wait for every previously queued write without advancing a paused
+    /// runtime. The writer is an independent OS thread; virtual deadlines
+    /// cannot prove that it has run. Only call after opening any writer gate.
+    #[cfg(test)]
+    pub(super) fn drain_for_test(&self) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let jobs = writer.jobs.as_ref().expect("writer thread running");
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        assert!(jobs
+            .send(Job {
+                records: Vec::new(),
+                done
+            })
+            .is_ok());
+        // A separate thread may use blocking_recv outside the Tokio runtime.
+        // Joining keeps the test's virtual clock fixed while disk work finishes.
+        std::thread::spawn(move || done_rx.blocking_recv())
+            .join()
+            .expect("barrier thread")
+            .expect("writer acknowledges barrier")
+            .expect("writer barrier succeeds");
+    }
+
     /// Queue `records` as one batch and wait up to `wait` for the writer's
     /// acknowledgement. Never blocks longer than `wait`, never panics; the
     /// outcome is informational (TX behaviour must not depend on it).

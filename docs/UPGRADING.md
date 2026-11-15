@@ -110,6 +110,26 @@ $Actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
 if ($Actual -ne $Expected) { throw 'Archive checksum mismatch' }
 ```
 
+Every release also carries a single `SHA256SUMS` manifest listing all platform
+archives. Download it from the same release. To verify a partial download with
+only your platform's archive present, add `--ignore-missing`:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS        # Linux
+shasum -a 256 -c --ignore-missing SHA256SUMS    # macOS
+```
+
+Each archive also carries a GitHub build-provenance attestation, verifiable
+with the GitHub CLI:
+
+```sh
+gh attestation verify pancetta-vVERSION-x86_64-unknown-linux-gnu.tar.gz --repo HagaleTechnologies/pancetta
+```
+
+For crash triage, every release attaches the split debug symbols for each
+target (`*.debug` for Linux and Windows, `*.dSYM.tar.gz` for macOS), matching
+the stripped binary inside the archive.
+
 A failed checksum stops the upgrade. Checksums detect a mismatched download; they are not code signing. macOS archives remain unnotarized. For a trusted browser download, macOS may require `xattr -d com.apple.quarantine /absolute/path/to/new/pancetta` before launch, as in README. Linux ARM64 requires glibc >= 2.35, such as Raspberry Pi OS Bookworm or newer.
 
 Extract a tar archive with `tar xzf <archive.tar.gz>`, or use Windows Extract All for the ZIP, into a location that does not contain the old version. Keep the original startup working directory and config sources. For an explicit config, run the new executable by its full path with `--config /absolute/path/to/pancetta.toml config --validate`. For layered discovery, run its full path with `config --validate` from the recorded working directory with the recorded environment. An explicit config is suitable only if it reproduces the intended effective configuration.
@@ -133,7 +153,7 @@ This is an operator record, not an automatic migration report.
 
 > Never overwrite your current data directory with an old backup. First stop all writers and make a separate, verified post-upgrade snapshot. Contacts made after the upgrade are absent from the pre-upgrade snapshot.
 
-1. Stop Pancetta, services, imports and all other writers again. Repeat the complete backup procedure with the current installation and changed configs, using a **new** private destination, for example `pancetta-after-upgrade`. Verify it before restoring anything. Preserve original ADIF, database, SQLite sidecars, receipts and backups. Do not substitute `pancetta export`; export regenerates data from the index.
+1. Stop Pancetta, services, imports and all other writers again. Repeat the complete backup procedure with the current installation and changed configs, using a **new** private destination, for example `pancetta-after-upgrade`. Verify it before restoring anything. Preserve original ADIF, database, SQLite sidecars, receipts and backups. Do not substitute `pancetta export`; export regenerates records from the logbook.
 2. Restore the prior version directory from the verified pre-upgrade backup into an unoccupied destination. Move the current data directory aside without deleting it, then copy the pre-upgrade `data` directory back to its original path. Restore every prior config source and external key directory using the inventory. Preserve current external configs in the post-upgrade snapshot before replacing them. Use `cp -Rp` and `diff -r` on POSIX, or `Copy-Item -Recurse -Force` and `Compare-Tree` from the PowerShell recipe, to copy and verify each restored directory. Use `cmp` or SHA-256 to verify restored config files. Refuse occupied restore destinations; never merge a snapshot into live data.
 3. Use the prior startup working directory, environment and arguments so discovery does not change. With no post-upgrade contacts, verified restoration returns the prior binary, config and logbook. Validate before restarting. Retain both snapshots and the moved current directory.
 4. If contacts were made after upgrade, mark reconciliation incomplete. Do not resume logging with the older binary until those contacts are accounted for. Restoring the old binary does not itself make later contacts visible in its index. No automatic reverse migration is promised.

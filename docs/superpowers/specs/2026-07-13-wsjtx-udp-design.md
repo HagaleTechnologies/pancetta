@@ -63,13 +63,53 @@ the datagram passes source filtering AND the Id matches ours:
 | Message | Action |
 |---|---|
 | Reply(4) | match against the retained decode ring; CQ/QRZ ⇒ the remote-initiation path below; non-CQ ⇒ honored for targeting only, never TX (protocol notes §5) |
-| HaltTx(8) | `abort_current_tx.store(true)`; if `!auto_tx_only` also `QsoMessage::CancelAllQsos` + `StopCq`. **Always honored under `accept_udp_requests`** — stopping TX is the safe direction and must not require the initiation consent |
-| Replay(7) | re-emit the retained ring as Decode(2) `New=false`, then a Status |
-| Heartbeat/Clear/Configure/FreeText/Location/HighlightCallsign/SwitchConfiguration/AnnotationInfo | parse, log at debug, ignore in v1 (Configure/FreeText are candidate v2 features) |
+| HaltTx(8) | `abort_current_tx.store(true)`; if `!auto_tx_only` also `QsoMessage::CancelAllQsos` + `StopCq`. **Honored only after master, matching Id, host and port admission** — stopping TX is the safe direction and must not require the initiation consent |
+| Replay(7) | at most once per second globally, re-emit the retained ring as Decode(2) `New=false`, then Status; skip requests inside the interval without deferred work |
+| Heartbeat | after Id and host checks, refresh the peer source-port pin; no response required |
+| Clear/Configure/FreeText/Location/HighlightCallsign/SwitchConfiguration/AnnotationInfo | require the pinned tuple, parse, log at debug, ignore in v1 |
 
 Every honored AND every refused inbound request emits a retained
 `DiagnosticEvent { target: "remote.wsjtx", .. }` so the operator can audit exactly
 what a companion app did or tried to do (Shift+D).
+
+### Pancetta admission policy (PAN-312)
+
+Unicast uses the route-selected local IPv4 address and an ephemeral port on one
+unconnected socket, including outbound-only configurations. A separate UDP route
+probe sends no application datagram. Route discovery or bind failure disables the
+companion component for this run and drains its bus channel; the station continues.
+There is no wildcard fallback. IPv6 destinations are unsupported. Multicast keeps
+its wildcard bind and configured TTL/interface options.
+
+After decoding and matching the instance Id, inbound admission requires
+`accept_udp_requests = true` and the destination host (unicast) or an explicitly
+listed `allowed_request_hosts` IP (multicast; an empty list refuses all).
+The first valid, correctly targeted datagram from an allowed host pins its source
+address and port and may act immediately, supporting companions without Heartbeats.
+A correctly targeted Heartbeat from that host refreshes its port. Other datagrams
+must match the pin exactly and cannot change it. Wrong Ids and refused hosts never
+learn pins. Pins last until component restart, including across Close and Clear.
+A port change without Heartbeats requires a restart.
+
+HaltTx requires all those admission checks but does not require initiation consent.
+For example, after Heartbeat from `192.168.1.20:2237`, HaltTx from
+`192.168.1.20:40000` is ignored with a Warn diagnostic on `remote.wsjtx`:
+`refused request from 192.168.1.20:40000: HaltTx`.
+The pinned port's HaltTx retains the existing stop behavior.
+
+Replay has one global one-second minimum interval across all peers. An accepted
+burst sends the retained ring in order as `New=false`, then Status. Empty rings and
+failed sends consume the interval too. Requests inside the interval are skipped,
+without replay decodes, post-Replay Status or deferred work; refusals do not extend
+the interval. Equality at one second permits another burst. Pins, Heartbeats and
+band changes do not reset it. A skipped request emits an Info diagnostic:
+`Replay from 192.168.1.20:2237 ignored (rate-limited; minimum interval 1s)`.
+Ordinary timer Status and Heartbeat traffic continues independently. Wrong-source
+or wrong-Id requests do not consume the budget.
+
+These checks reduce exposure; UDP source pinning does not authenticate a sender.
+Forged pinned tuples or allowed Heartbeats remain possible. Disabled defaults,
+wire encodings and downstream Reply consent, policy and arm checks are unchanged.
 
 ### Remote QSO initiation (Reply → on-air TX) — the security model
 
@@ -79,7 +119,7 @@ posture as the station-agent remote path. Five gates, ANDed, all fail-closed:
 1. `[network.wsjtx_udp].accept_udp_requests` (master, default false).
 2. `[network.wsjtx_udp].allow_tx_initiation` (default false) — Reply may initiate only
    when this explicit consent knob is set.
-3. Source filtering: unicast destination ⇒ inbound accepted only from that host;
+3. Source filtering plus source-port pinning described below: unicast destination ⇒ inbound accepted only from that host;
    multicast ⇒ inbound accepted only from hosts in
    `[network.wsjtx_udp].allowed_request_hosts` (empty list = refuse all requests, log
    the source so the operator can add it).
@@ -146,8 +186,8 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 - All emit taps are additive-only; `pancetta-tui` behavior stays byte-identical;
   existing bus sends untouched.
 - `enabled = false` (default) ⇒ no socket is ever bound, no bytes emitted.
-- No remote frame as `TxOrigin::Local`; arm gate fails closed; HaltTx is always
-  honored under the master switch (stop-direction asymmetry).
+- No remote frame as `TxOrigin::Local`; arm gate fails closed; HaltTx requires master, matching Id, host and pinned port admission,
+  independently of initiation consent (stop-direction asymmetry).
 - The codec lives in the main crate; `pancetta-protocol` untouched.
 - Golden-vector tests (real captured packets, Apache-2.0-attributed) gate the codec.
 

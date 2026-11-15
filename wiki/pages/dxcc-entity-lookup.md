@@ -7,6 +7,7 @@ maintainer: agent
 sources:
   - pancetta-core/src/dxcc.rs
   - pancetta-core/src/dxcc_table.rs
+  - pancetta-core/src/dxcc_continents.rs
   - pancetta-core/scripts/gen_dxcc_table.py
   - pancetta-tui/src/app.rs
   - pancetta-tui/src/dx_need.rs
@@ -68,3 +69,41 @@ live under pancetta-core/data. Regenerate registry and exact output with
 `python3 pancetta-core/scripts/gen_dxcc_table.py --supplemental`. This leaves
 the base prefix table unchanged.
 Generated headers record the input version and SHA-256.
+
+## Zone data and ADIF enrichment (PAN-306)
+
+`zones_for_callsign` uses the same normalization and selected entity as the
+entity resolver. Full zone exact calls come first, then KG4 header defaults,
+then the longest zone prefix. Mismatching entities fail closed for zones,
+including a mismatching longest prefix; a broader prefix is never substituted.
+Only the existing US safety net without a prefix uses US header defaults.
+
+Regenerate `dxcc_zones.rs` with `python3 pancetta-core/scripts/gen_dxcc_table.py
+--supplemental` and run `python3 -m unittest discover -s pancetta-core/scripts
+-p 'test_gen_dxcc_table.py' -v`. That mode preserves the shipped base prefix
+table. The old supplemental outputs must stay byte-identical for this change.
+The new data retains same-entity exact calls that entity-only generation prunes:
+N2NL/MM needs CQ 7 even though its entity remains United States. K0ABC uses
+4/7 instead of the US header's 5/8. Do not merge contest subdivisions by ADIF ID.
+
+ADIF inference runs in `qso_to_adif`, never the renderer or a TUI frame.
+Imported tags suppress inference per field; historical files stay untouched
+until an explicit export. Tests cover these paths without a rig or account.
+
+## Continent data (PAN-292)
+
+`continent_for_callsign` maps the entity `entity_for_callsign` selects to its
+continent, so it inherits the same normalization, exact-call and KG4 layers.
+The continent is per entity, taken from the cty.dat header (field 3) and keyed
+by the mapped entity name; `continent_of_entity` also answers every registry
+alias (`Cabo Verde` is Africa). An unresolved call returns `None`, and the
+autonomous CQ-modifier gate then never skips.
+
+`dxcc_continents.rs` is regenerated with the same
+`python3 pancetta-core/scripts/gen_dxcc_table.py --supplemental` command and
+leaves the other generated files byte-identical. A per-token `{CC}` continent
+override fails generation on purpose: a per-entity table cannot represent it,
+and silently dropping it could misfile a station. The pinned input has none.
+
+CQ zones are not a continent proxy: zone 40 holds Greenland (North America)
+and Iceland and Svalbard (Europe).

@@ -101,3 +101,38 @@ Single and summed-bundle playback rechecks the same gate about every 50 ms. Deni
 PTT before confirmed audio flush and reports failure after acknowledgment, independently of
 audit or notification delivery. Device and transport scheduling add latency. Test clocks must
 share the arm's `Instant` origin; paused Tokio time alone cannot advance the arm clock.
+
+## Local client TX trust (PAN-309)
+
+Pairing does not write client trust keys. `pancetta trust-client <keyId>
+--key-file <path>` writes `clients/<keyId>.pub`; `untrust-client` removes it.
+TX eligibility is local keys intersected with cqdx owner edges or the current
+static admission list. Cloud polls and static trust refreshes use the same
+atomic publisher and the same mutually exclusive task slot, so teardown
+aborts either mode. Static config removals hold the arm lock through the
+admission publish to prevent a refresh from restoring stale eligibility.
+Release device-key read guards before acquiring the arm lock, since the
+publisher writes keys while holding that lock. Audit writes follow unlock.
+Cloud mode caches full owner edges separately from eligibility and refreshes
+local trust on its own timer, including during failed or stalled requests.
+The refresh reads live admission so it cannot restore a config removal.
+
+## Station-agent endpoint validation (PAN-310)
+
+Supplied relay and pairing URLs are validated even when the agent is disabled.
+The pairing CLI override uses the shared config validator before loading identity
+or enrolling. Validate an override only once, since validating a plaintext
+loopback URL twice would emit duplicate warnings. Secure schemes and the
+loopback exception are specified in `docs/CONFIG.md` under
+`[network.station_agent]`.
+
+## WSJT-X UDP peer pins and Replay (PAN-312)
+
+Unicast binds the routed local IPv4 address, with no wildcard fallback on route
+failure. Multicast retains its wildcard bind and explicit host allowlist. After
+master, host and matching-Id checks, the first valid datagram bootstraps a port
+pin; only an allowed, correctly targeted Heartbeat can refresh it. Companions
+without Heartbeats need a restart after changing ports. Pins are not authentication.
+Replay shares one skip-only one-second budget across all peers, even after a pin
+refresh; empty or failed bursts consume it. Suppressed requests send no Replay
+Status and schedule no deferred burst. See the WSJT-X UDP design spec for policy.

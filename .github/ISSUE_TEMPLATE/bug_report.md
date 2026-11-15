@@ -35,7 +35,7 @@ in use, and any TUI keybinds pressed.
 
 ## Logs
 
-Attach `~/.pancetta/logs/pancetta.log` (or the relevant slice). Trim to
+Attach the relevant `~/.pancetta/logs/pancetta.log.YYYY-MM-DD` or slice. Trim to
 the failing window — multi-megabyte logs are hard to triage.
 
 ## Anything else

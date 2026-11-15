@@ -2752,6 +2752,7 @@ mod pan6_diagnostic_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: Default::default(),
@@ -3127,7 +3128,7 @@ fn recent_qso_outcome(
     let mut brief_timeline = vec![format!(
         "{} started at {}",
         their_call,
-        metadata.start_time.format("%H:%M:%S")
+        metadata.contact_started_at().format("%H:%M:%S")
     )];
     if let Some(sent) = metadata.reports.sent {
         brief_timeline.push(format!("Report sent: {sent:+}"));
@@ -3472,6 +3473,7 @@ mod ap_ranking_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: pancetta_qso::states::SignalReports::default(),
@@ -3571,6 +3573,7 @@ impl super::ApplicationCoordinator {
         // Stamped into every rendered ADIF record's TX_PWR field (source-of-truth
         // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
         let station_power_watts = config.station.power_watts;
+        let attribution_comment = config.logging.attribution_comment;
         // Snapshot the opt-in QSO-upload settings. Only when at least one is
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
@@ -3615,7 +3618,7 @@ impl super::ApplicationCoordinator {
         )
         .to_string();
         // Layer 2 timeline persistence gate — see docs/CONFIG.md `[database]`.
-        let persist_qso_timeline = config.database.persist_qso_timeline;
+        let database_settings = config.database.clone();
         // Task 5 (gap 2/4, docs/ap-decoding-design.md §1): priority weights
         // for ranking ALL currently-active QSOs by `PriorityScorer::
         // evaluate_cq` for the AP context — read once here before `drop`,
@@ -3722,6 +3725,7 @@ impl super::ApplicationCoordinator {
             eqsl_cfg.enabled,
             cqdx_upload_enabled,
             replay_mode,
+            lotw_cfg.enabled,
         );
         if upload_enabled && !outbox_dests.is_empty() && self.upload_outbox.is_none() {
             let clients = super::upload_outbox::build_logbook_clients(
@@ -3730,6 +3734,7 @@ impl super::ApplicationCoordinator {
                 &eqsl_cfg,
                 &cqdx_cfg,
                 &upload_our_callsign,
+                &lotw_cfg,
             );
             let path = pancetta_home(&pancetta_home_override)
                 .join(".pancetta")
@@ -3800,6 +3805,10 @@ impl super::ApplicationCoordinator {
         // the message loop's opens and the event forwarder's queued-call
         // promotion run in different tasks and must not both take one slot.
         let qso_admission = Arc::new(tokio::sync::Mutex::new(()));
+        #[cfg(test)]
+        {
+            self.qso_admission_for_test = Some(qso_admission.clone());
+        }
         // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
         // exact insert/remove points (including the 45s completed-grace
         // window) so the autonomous frequency allocator's own-frequency
@@ -3918,9 +3927,10 @@ impl super::ApplicationCoordinator {
         // PAN-128 PR review: the stall ledger's slot attribution uses the
         // scheduler's current-slot acceptance window — inject the operator's
         // real `tx_late_max_ms` so `keep_call_tx_slot` and `schedule_tx`
-        // decide against the same cap. Snapshot semantics match the TX
-        // worker's own startup read of the same field.
+        // decide against the same cap. Share reload publication with the
+        // TX worker and the manager's internal timeout clones.
         qso_manager.set_tx_late_max_ms(station_tx_late_max_ms);
+        qso_manager.set_tx_late_max_ms_source(self.tx_late_max_ms_live.clone());
         // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
         // only ONE of the two gates a rearmed frame must clear. A QSO with
         // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX
@@ -4052,6 +4062,8 @@ impl super::ApplicationCoordinator {
             // subscriber registers completions into.
             let qso_upload_statuses_for_subscriber = self.qso_upload_statuses.clone();
 
+            let autonomous_cq_attempts = self.autonomous_cq_attempts.clone();
+            let autonomous_config_enabled = self.autonomous_config_enabled.clone();
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -4087,7 +4099,8 @@ impl super::ApplicationCoordinator {
                     &adif_path,
                     &db_path,
                     station_power_watts,
-                    persist_qso_timeline,
+                    attribution_comment,
+                    &database_settings,
                     &qso_manager,
                     &adif_subscribers,
                 )
@@ -4100,16 +4113,16 @@ impl super::ApplicationCoordinator {
                 // (see `upload_enabled`). Fully decoupled from the QSO
                 // pipeline: ClubLog/QRZ/eQSL/cqdx.io uploads are handed to the
                 // durable pending-upload queue (PAN-57), which retries them
-                // and survives restarts; LoTW keeps its single tqsl attempt in
-                // its own task. At shutdown it cancels a QRZ lookup in flight
+                // and survives restarts, including LoTW. At shutdown it cancels
+                // a QRZ lookup in flight
                 // and keeps queuing completions until `stop_upload_outbox`
                 // asks it to finish (PAN-232).
                 if upload_enabled {
                     start_qso_upload_subscriber(
                         upload_outbox.clone(),
-                        lotw_cfg.clone(),
                         qrz_xml_cfg.clone(),
                         station_power_watts,
+                        attribution_comment,
                         qso_manager.subscribe(),
                         shutdown.clone(),
                         qso_lookup.clone(),
@@ -4228,6 +4241,7 @@ impl super::ApplicationCoordinator {
                         pancetta_qso::QsoId,
                     >::new()));
                 let opening_self_cqs_for_events = opening_self_cqs.clone();
+                let autonomous_cq_attempts_for_events = autonomous_cq_attempts.clone();
 
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
@@ -4376,6 +4390,10 @@ impl super::ApplicationCoordinator {
                                         reason, ..
                                     } = &new_state
                                     {
+                                        autonomous_cq_attempts_for_events
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .retain(|(id, _)| id != &qso_id.to_string());
                                         // PAN-280: a pending grace purge must not act
                                         // on a key this immediate purge clears.
                                         tx_grace_for_events.stand_down(&key);
@@ -4630,6 +4648,12 @@ impl super::ApplicationCoordinator {
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.insert(key.clone(), published.clone());
                                         }
+                                        if is_opening_self_cq {
+                                            autonomous_cq_attempts_for_events
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .insert((qso_id.to_string(), attempt_id));
+                                        }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
@@ -4655,6 +4679,10 @@ impl super::ApplicationCoordinator {
                                             queued,
                                         );
                                         if !queued {
+                                            autonomous_cq_attempts_for_events
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.to_string(), attempt_id));
                                             warn!(
                                                 "auto-sequence TX for QSO {qso_id} never reached the TX worker; withdrawing its intent and reporting it unsent"
                                             );
@@ -5678,11 +5706,26 @@ impl super::ApplicationCoordinator {
                                             parity,
                                             cq_attempt_id,
                                         } => {
+                                            // Recheck a queued opening after any reload while it waited.
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                             // PAN-78: the autonomous task gated on its own view of
                                             // the active count before sending this; a manual open
                                             // may have filled the slot since. Re-check capacity and
                                             // parity and open under the shared admission lock.
                                             let _admission = qso_admission.lock().await;
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                             // Phase 5: the autonomous operator decided to open
                                             // a QSO. Create it in the QsoManager as an Auto QSO
                                             // so the engine auto-sequences it to completion; the
@@ -5798,6 +5841,13 @@ impl super::ApplicationCoordinator {
                                                             frequency, tx_off, active.len()
                                                         );
                                                     }
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                                     qso_manager
                                                         .respond_to_cq_with(
                                                             dx.clone(),
@@ -5842,6 +5892,13 @@ impl super::ApplicationCoordinator {
                                                     )
                                                     .await
                                                     {
+                                            if !autonomous_config_enabled.load(Ordering::Acquire) {
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus, &callsign, cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                ).await;
+                                                continue;
+                                            }
                                                         if cq_attempt_id.is_some() {
                                                             opening_self_cqs
                                                                 .lock()
@@ -6391,6 +6448,8 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
+                                            autonomous_cq_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.clone(), attempt_id));
                                             handle_tx_frame_not_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, replaced.as_ref(), attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::TxFrameScheduled { qso_id, attempt_id, target_slot } => {
@@ -6403,6 +6462,8 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at, attempt_id } => {
+                                            autonomous_cq_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .remove(&(qso_id.clone(), attempt_id));
                                             handle_tx_frame_sent(&qso_manager, &recent_manual_completions, &qso_id, &message_text, &aired, aired_at, attempt_id).await;
                                         }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
@@ -7074,6 +7135,7 @@ mod secondary_decoder_hint_tests {
                 frequency: 1900.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: start,
                 end_time: None,
                 reports: SignalReports::default(),
@@ -9081,6 +9143,7 @@ mod snapshot_tests {
                 frequency: 1500.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: start,
                 end_time: None,
                 reports: SignalReports {
@@ -9288,7 +9351,7 @@ mod snapshot_tests {
     #[test]
     fn recent_qso_outcome_completed_carries_callsign_and_reports() {
         let progress = fixture_progress();
-        let metadata = progress.metadata;
+        let mut metadata = progress.metadata;
         let their_call = metadata.their_callsign.clone().expect("fixture has a call");
 
         let outcome = super::recent_qso_outcome(
@@ -9297,6 +9360,26 @@ mod snapshot_tests {
             &metadata,
         );
 
+        assert_eq!(
+            outcome.brief_timeline[0],
+            format!(
+                "JA1ABC started at {}",
+                metadata.start_time.format("%H:%M:%S")
+            )
+        );
+        metadata.first_answer_at = Some(metadata.start_time + chrono::Duration::minutes(4));
+        let answered = super::recent_qso_outcome(
+            &their_call,
+            crate::message_bus::QsoOutcome::Completed,
+            &metadata,
+        );
+        assert_eq!(
+            answered.brief_timeline[0],
+            format!(
+                "JA1ABC started at {}",
+                metadata.first_answer_at.unwrap().format("%H:%M:%S")
+            )
+        );
         assert_eq!(outcome.callsign, "JA1ABC");
         assert!(matches!(
             outcome.outcome,
@@ -10253,6 +10336,7 @@ mod auto_73_tests {
             &dir.path().join("qso.db"),
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &mgr,
             &adif_subscribers,
         )
@@ -10890,7 +10974,7 @@ mod completed_tx_grace_tests {
 /// Decoupled from the QSO pipeline and never blocks it. ClubLog, QRZ
 /// Logbook, eQSL and cqdx.io uploads are handed to the durable pending-upload
 /// queue (`upload_outbox`, PAN-57), which retries them and survives restarts;
-/// LoTW keeps a single tqsl attempt in its own task. Successes log at
+/// LoTW uses this same queue. Successes log at
 /// `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
 /// `"qso.upload"`). Credentials / tokens are never logged.
 /// Whether the opt-in cqdx.io per-QSO logbook upload should run: the
@@ -10953,7 +11037,7 @@ fn cqdx_record_from_metadata(
         mode: metadata.mode.clone(),
         rst_sent: metadata.reports.sent.map(|r| r.to_string()),
         rst_received: metadata.reports.received.map(|r| r.to_string()),
-        start_time: metadata.start_time,
+        start_time: metadata.contact_started_at(),
         end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
     })
 }
@@ -11206,23 +11290,22 @@ async fn upload_subscriber_finish(outbox: Option<&super::upload_outbox::UploadOu
 }
 
 // rationale: the queue handle, one explicit config arg per remaining direct
-// destination (LoTW, QRZ XML) plus the event source + shared handles and the
+// destination (QRZ XML) plus the event source + shared handles and the
 // QRZ XML test endpoint — bundling them into a struct would just move the
 // same fields without improving clarity.
 #[allow(clippy::too_many_arguments)]
 /// PAN-344: the enabled upload targets captured for one completion — the
-/// outbox's runtime-enabled destinations plus LoTW when its client is on,
+/// outbox's runtime-enabled destinations, including LoTW,
 /// each starting Pending ("queued" means upload work has been scheduled,
 /// not accepted). Later config changes never rewrite a contact's captured
 /// set; an empty set means "uploads disabled".
 fn completion_upload_targets(
     destinations: &[pancetta_dx::upload_outbox::UploadDestination],
-    lotw_enabled: bool,
 ) -> Vec<(
     pancetta_tui::upload_status::UploadTarget,
     pancetta_tui::upload_status::TargetUploadStatus,
 )> {
-    use pancetta_tui::upload_status::{sort_targets, TargetUploadStatus, UploadTarget};
+    use pancetta_tui::upload_status::{sort_targets, TargetUploadStatus};
     let mut targets: Vec<_> = destinations
         .iter()
         .map(|d| {
@@ -11232,39 +11315,16 @@ fn completion_upload_targets(
             )
         })
         .collect();
-    if lotw_enabled {
-        targets.push((UploadTarget::Lotw, TargetUploadStatus::pending("queued")));
-    }
     sort_targets(&mut targets);
     targets
-}
-
-/// PAN-344: map one LoTW one-shot result to its registry state and reason.
-/// Logged and Duplicate mean Accepted; an error means Failed — no retry
-/// behaviour is added, matching the existing best-effort single attempt.
-fn lotw_result_state<E: std::fmt::Display>(
-    result: &Result<pancetta_dx::QsoUploadOutcome, E>,
-) -> (pancetta_tui::upload_status::UploadState, String) {
-    use pancetta_tui::upload_status::UploadState;
-    match result {
-        Ok(pancetta_dx::QsoUploadOutcome::Logged) => (UploadState::Accepted, String::new()),
-        Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => (
-            UploadState::Accepted,
-            "duplicate \u{2014} already logged".to_string(),
-        ),
-        Err(_) => (
-            UploadState::Failed,
-            "tqsl failed · check local upload diagnostics".into(),
-        ),
-    }
 }
 
 #[allow(clippy::too_many_arguments)] // Keep upload configuration, event stream and shared lifecycle state explicit at subscriber startup.
 fn start_qso_upload_subscriber(
     outbox: Option<super::upload_outbox::UploadOutboxHandle>,
-    lotw_cfg: pancetta_config::network::LotwUploadConfig,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
     station_power_watts: u32,
+    attribution_comment: bool,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
@@ -11275,19 +11335,6 @@ fn start_qso_upload_subscriber(
 
     // ClubLog, QRZ Logbook, eQSL and cqdx.io clients live in the
     // pending-upload worker (`upload_outbox::build_logbook_clients`).
-
-    // LoTW client. Opt-in: enabled + tqsl_path + station_location (config
-    // validation already rejects enabled-without-creds). Signs + uploads each
-    // QSO by shelling out to the operator's tqsl CLI; a missing/erroring tqsl
-    // is logged best-effort and never takes down the subscriber.
-    let lotw_client = if lotw_cfg.enabled {
-        Some(Arc::new(pancetta_dx::LotwUploadClient::new(
-            lotw_cfg.tqsl_path.clone(),
-            lotw_cfg.station_location.clone(),
-        )))
-    } else {
-        None
-    };
 
     // QRZ paid-XML lookup client (read-side enrichment). Opt-in: enabled +
     // creds (config validation already rejects enabled-without-creds). When
@@ -11320,9 +11367,6 @@ fn start_qso_upload_subscriber(
     let qrz_xml_cache: Arc<Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    if lotw_client.is_some() {
-        info!(target: "qso.upload", "LoTW per-QSO (TQSL-signed) upload enabled");
-    }
     if qrz_xml_client.is_some() {
         info!(
             target: "dx.qrz",
@@ -11332,8 +11376,9 @@ fn start_qso_upload_subscriber(
     }
 
     tokio::spawn(async move {
-        let processor =
-            pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
+        let processor = pancetta_qso::AdifProcessor::new()
+            .with_station_power_watts(station_power_watts)
+            .with_attribution_comment(attribution_comment);
 
         // PAN-232: with a queue, the subscriber runs until coordinator
         // shutdown asks it to finish (`stop_upload_outbox`, after every QSO
@@ -11377,8 +11422,7 @@ fn start_qso_upload_subscriber(
                             .unwrap_or_else(|| "?".to_string());
                         let destinations: &[pancetta_dx::upload_outbox::UploadDestination] =
                             outbox.as_ref().map(|o| o.destinations()).unwrap_or(&[]);
-                        let targets =
-                            completion_upload_targets(destinations, lotw_client.is_some());
+                        let targets = completion_upload_targets(destinations);
                         // Registered even when EMPTY: a confirmed empty
                         // target set is "uploads disabled", never unknown.
                         upload_statuses
@@ -11509,46 +11553,6 @@ fn start_qso_upload_subscriber(
                             }
                         }
                     }
-
-                    // LoTW signs + uploads the same rendered ADIF record by
-                    // shelling out to the operator's tqsl CLI. Best-effort: a
-                    // missing/erroring tqsl never blocks or fails the pipeline.
-                    if let Some(client) = lotw_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        let upload_statuses = upload_statuses.clone();
-                        let lotw_uuid = metadata.qso_id.to_string();
-                        tokio::spawn(async move {
-                            // PAN-344: the LoTW one-shot result feeds the
-                            // registry through the tested mapping helper.
-                            let result = client.upload_adif(&record).await;
-                            match &result {
-                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
-                                    target: "qso.upload",
-                                    "LoTW: signed + uploaded QSO with {}", their
-                                ),
-                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
-                                    target: "qso.upload",
-                                    "LoTW: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "LoTW: upload failed for {}: {}", their, e
-                                ),
-                            }
-                            let (state, reason) = lotw_result_state(&result);
-                            upload_statuses
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .record(
-                                    &lotw_uuid,
-                                    pancetta_tui::upload_status::UploadTarget::Lotw,
-                                    state,
-                                    &reason,
-                                );
-                        });
-                    }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -11591,12 +11595,15 @@ fn start_qso_upload_subscriber(
 /// startup ADIF→index replay (ADIF is the source of truth; the DB is a
 /// cache). Both are fail-soft — a failure to open either is logged and the
 /// other still runs.
+// Startup settings and subscriber handles are passed together.
+#[allow(clippy::too_many_arguments)]
 async fn start_local_qso_log_writers(
     replay: bool,
     adif_path: &std::path::Path,
     db_path: &std::path::Path,
     station_power_watts: u32,
-    persist_qso_timeline: bool,
+    attribution_comment: bool,
+    database_settings: &pancetta_config::DatabaseConfig,
     qso_manager: &pancetta_qso::QsoManager,
     adif_subscribers: &AdifSubscribers,
 ) -> (
@@ -11630,6 +11637,16 @@ async fn start_local_qso_log_writers(
     // missing index look current (never rebuilt) — PAN-127.
     let seed_db = prepare_local_qso_index(adif_path, db_path).await;
 
+    if !matches!(&seed_db, LocalIndex::MigrationRefused { .. }) {
+        if let Err(e) = super::adif_backup::startup(adif_path, database_settings).await {
+            warn!(
+                "Startup ADIF backup failed at {}: {}; continuing",
+                adif_path.display(),
+                e
+            );
+        }
+    }
+
     // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted and
     // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
     // log but proceed with DB-only — every operator should at least get
@@ -11643,6 +11660,7 @@ async fn start_local_qso_log_writers(
             Ok(mut w) => {
                 info!("ADIF log open at {}", adif_path.display());
                 w.set_station_power_watts(station_power_watts);
+                w.set_attribution_comment(attribution_comment);
                 let w = std::sync::Arc::new(w);
                 adif_subscribers.track(start_adif_subscriber(
                     w.clone(),
@@ -11667,7 +11685,7 @@ async fn start_local_qso_log_writers(
     // and inserts into the rebuildable SQLite index.
     let mut logger_config = pancetta_qso::LoggerConfig {
         database_path: db_path.to_path_buf(),
-        persist_qso_timeline,
+        persist_qso_timeline: database_settings.persist_qso_timeline,
         ..Default::default()
     };
     // `~/.pancetta/backups`, never relative to the process cwd.
@@ -12014,6 +12032,7 @@ mod adif_subscriber_tests {
                 frequency: 14_074_000.0,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: now,
                 end_time: Some(now),
                 reports: pancetta_qso::states::SignalReports::default(),
@@ -12330,6 +12349,7 @@ mod cqdx_upload_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
             reports: SignalReports {
@@ -12363,6 +12383,230 @@ mod cqdx_upload_tests {
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
+        }
+    }
+
+    #[test]
+    fn pan300_lotw_target_and_replay_matrix() {
+        use super::super::upload_outbox::outbox_destinations;
+        use pancetta_tui::upload_status::UploadTarget;
+        // LoTW alone, mixed, disabled, all off, and QRZ XML alone.
+        for (http, lotw, xml) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            for replay in [false, true] {
+                let destinations = outbox_destinations(http, http, http, http, replay, lotw);
+                let targets = super::completion_upload_targets(&destinations);
+                assert_eq!(
+                    targets
+                        .iter()
+                        .filter(|(t, _)| *t == UploadTarget::Lotw)
+                        .count(),
+                    usize::from(lotw && !replay)
+                );
+                if replay {
+                    assert!(destinations.is_empty(), "no worker or outbox opened");
+                    assert!(!super::logbook_upload_enabled(
+                        http, http, lotw, http, http, xml, true
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_only_completion_is_queued_once() {
+        use super::super::upload_outbox::{self, LogbookClients, OutboxTiming, UploadHealth};
+        use pancetta_dx::upload_outbox::{OutboxStore, RetrySchedule, UploadDestination};
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex,
+            },
+            time::Duration,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("fake tqsl");
+        let invoked = dir.path().join("invoked");
+        let release = dir.path().join("release");
+        std::fs::write(
+            &binary,
+            format!(
+            "#!/bin/sh\necho attempt >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 0\n",
+            invoked.display(), release.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let clients = LogbookClients {
+            lotw: Some(Arc::new(pancetta_dx::LotwUploadClient::new(
+                binary.to_str().unwrap(),
+                "Home Station",
+            ))),
+            clublog: None,
+            qrz: None,
+            eqsl: None,
+            cqdx: None,
+        };
+        let statuses = super::super::qso_upload_status::UploadStatusRegistry::shared();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let path = dir.path().join("queue.json");
+        let (handle, task) = upload_outbox::start_upload_outbox(
+            path.clone(),
+            Arc::new(clients),
+            RetrySchedule::new(3, 10, 40, 2.0, 0.0, Duration::from_millis(100)),
+            OutboxTiming::PRODUCTION,
+            Arc::new(Mutex::new(UploadHealth::default())),
+            None,
+            shutdown.clone(),
+            Some(statuses.clone()),
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        super::start_qso_upload_subscriber(
+            Some(handle.clone()),
+            Default::default(),
+            100,
+            false,
+            rx,
+            shutdown.clone(),
+            Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+            None,
+            statuses.clone(),
+        );
+        let metadata = metadata_with_call(Some("K1ABC"));
+        let uuid = metadata.qso_id;
+        tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+            qso_id: uuid,
+            metadata,
+            state_history: vec![],
+            messages: vec![],
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !invoked.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (store, quarantine) = OutboxStore::open(path.clone());
+        assert!(quarantine.is_none());
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].qso_id, uuid);
+        assert_eq!(store.entries()[0].destination, UploadDestination::Lotw);
+        assert!(store.entries()[0].payload.contains("K1ABC"));
+        std::fs::write(release, "").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let accepted = statuses.lock().unwrap().snapshot().iter().any(|s| {
+                    s.uuid == uuid.to_string()
+                        && s.state(UploadTarget::Lotw) == Some(UploadState::Accepted)
+                });
+                if accepted && OutboxStore::open(path.clone()).0.entries().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(std::fs::read_to_string(invoked).unwrap().lines().count(), 1);
+        shutdown.store(true, Ordering::Release);
+        drop(tx);
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn pan298_upload_payloads_follow_attribution_setting() {
+        use super::super::upload_outbox::{
+            self, Delivery, OutboxTiming, OutboxTransport, UploadHealth,
+        };
+        use pancetta_dx::upload_outbox::{RetrySchedule, UploadDestination};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        struct Transport(Arc<Mutex<Vec<(UploadDestination, String)>>>);
+        impl OutboxTransport for Transport {
+            fn destinations(&self) -> Vec<UploadDestination> {
+                vec![UploadDestination::QrzLogbook, UploadDestination::Cqdx]
+            }
+            async fn deliver(&self, destination: UploadDestination, payload: String) -> Delivery {
+                self.0.lock().unwrap().push((destination, payload));
+                Delivery::Accepted { duplicate: false }
+            }
+        }
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let payloads = Arc::new(Mutex::new(Vec::new()));
+            let statuses = super::super::qso_upload_status::UploadStatusRegistry::shared();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let (handle, task) = upload_outbox::start_upload_outbox(
+                dir.path().join("queue.json"),
+                Arc::new(Transport(payloads.clone())),
+                RetrySchedule::new(3, 5, 20, 2.0, 0.0, std::time::Duration::from_millis(100)),
+                OutboxTiming::PRODUCTION,
+                Arc::new(Mutex::new(UploadHealth::default())),
+                None,
+                shutdown.clone(),
+                Some(statuses.clone()),
+            );
+            let (tx, rx) = tokio::sync::broadcast::channel(4);
+            super::start_qso_upload_subscriber(
+                Some(handle.clone()),
+                Default::default(),
+                100,
+                enabled,
+                rx,
+                shutdown.clone(),
+                Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+                None,
+                statuses,
+            );
+            let metadata = metadata_with_call(Some("K1ABC"));
+            tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+                qso_id: metadata.qso_id,
+                metadata,
+                state_history: vec![],
+                messages: vec![],
+            })
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while payloads.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            for (destination, payload) in payloads.lock().unwrap().iter() {
+                if *destination == UploadDestination::QrzLogbook {
+                    let p = pancetta_qso::AdifProcessor::new();
+                    let parsed = p.parse_string(payload).unwrap();
+                    let qso = p.record_to_qso(&parsed.records[0]).unwrap();
+                    assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+                } else {
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert!(json.get("comment").is_none());
+                    assert!(!payload.contains("Using cqdx.io & Pancetta"));
+                }
+            }
+            shutdown.store(true, Ordering::Release);
+            drop(tx);
+            drop(handle);
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 
@@ -12407,8 +12651,8 @@ mod cqdx_upload_tests {
             super::start_qso_upload_subscriber(
                 Some(handle),
                 Default::default(),
-                Default::default(),
                 100,
+                false,
                 rx,
                 shutdown,
                 Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
@@ -12457,7 +12701,7 @@ mod cqdx_upload_tests {
     /// both grids, and stringified SNR reports the API expects.
     #[test]
     fn record_maps_metadata_fields() {
-        let md = metadata_with_call(Some("JA1ABC"));
+        let mut md = metadata_with_call(Some("JA1ABC"));
         let rec = cqdx_record_from_metadata(&md).expect("record");
         assert_eq!(rec.callsign, "JA1ABC");
         assert_eq!(rec.frequency, 14_074_000);
@@ -12468,6 +12712,9 @@ mod cqdx_upload_tests {
         assert_eq!(rec.rst_received.as_deref(), Some("-12"));
         assert_eq!(rec.start_time, md.start_time);
         assert_eq!(rec.end_time, md.end_time.unwrap());
+        md.first_answer_at = Some(md.start_time + chrono::Duration::minutes(4));
+        let rec = cqdx_record_from_metadata(&md).expect("answered record");
+        assert_eq!(rec.start_time, md.first_answer_at.unwrap());
     }
 
     /// No contra-callsign → nothing to upload.
@@ -12540,6 +12787,7 @@ mod qrz_enrichment_tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
             reports: SignalReports {
@@ -13052,6 +13300,162 @@ mod replay_local_log_tests {
     };
     use std::time::Duration;
 
+    fn adif_backup_copies(directory: &std::path::Path) -> Vec<Vec<u8>> {
+        if !directory.exists() {
+            return Vec::new();
+        }
+        let mut paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("qsos_adi_")
+            })
+            .collect();
+        paths.sort();
+        paths.iter().map(|p| std::fs::read(p).unwrap()).collect()
+    }
+
+    async fn adif_backup_start(
+        root: &std::path::Path,
+        replay: bool,
+        settings: &pancetta_config::DatabaseConfig,
+    ) -> bool {
+        // A private runtime per simulated station also stops the logger's
+        // detached tasks and closes their database pools between starts.
+        let root = root.to_owned();
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let subscribers = AdifSubscribers::new();
+                let (writer, logger, seed) = start_local_qso_log_writers(
+                    replay,
+                    &root.join("qsos.adi"),
+                    &root.join("qso.db"),
+                    100,
+                    false,
+                    &settings,
+                    &manager(),
+                    &subscribers,
+                )
+                .await;
+                if !replay {
+                    assert!(
+                        logger.is_some(),
+                        "backup failure must not prevent index logger initialization"
+                    );
+                }
+                let opened = writer.is_some();
+                subscribers.stop(Duration::from_secs(2)).await;
+                drop(writer);
+                drop(logger);
+                if let LocalIndex::Ready(db) = seed {
+                    db.close().await;
+                }
+                opened
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_startup_backs_up_changed_adif() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("qsos.adi");
+        let mut expected = Vec::new();
+        for bytes in [TWO_RECORDS.to_owned(), format!("{TWO_RECORDS}\n")] {
+            std::fs::write(&source, bytes.as_bytes()).unwrap();
+            assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+            expected.push(bytes.as_bytes().to_vec());
+            assert_eq!(adif_backup_copies(&dir.path().join("backups")), expected);
+            assert_eq!(std::fs::read(&source).unwrap(), bytes.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_startup_skips_unchanged_adif() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("qsos.adi"), TWO_RECORDS).unwrap();
+        for _ in 0..2 {
+            assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        }
+        assert_eq!(
+            adif_backup_copies(&dir.path().join("backups")),
+            vec![TWO_RECORDS.as_bytes()]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_startup_honors_adif_backup_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = pancetta_config::DatabaseConfig {
+            adif_backup_directory: "custom".into(),
+            adif_backup_retain_count: 1,
+            ..Default::default()
+        };
+        for bytes in [TWO_RECORDS.to_owned(), format!("{TWO_RECORDS}\n")] {
+            std::fs::write(dir.path().join("qsos.adi"), bytes.as_bytes()).unwrap();
+            assert!(adif_backup_start(dir.path(), false, &settings).await);
+            assert_eq!(
+                adif_backup_copies(&dir.path().join("custom")),
+                vec![bytes.as_bytes()]
+            );
+        }
+        assert!(!dir.path().join("backups").exists());
+        settings.adif_backup_enabled = false;
+        settings.adif_backup_directory = "disabled".into();
+        assert!(adif_backup_start(dir.path(), false, &settings).await);
+        assert!(!dir.path().join("disabled").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_adif_backup_skip_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("qsos.adi"), TWO_RECORDS).unwrap();
+        assert!(!adif_backup_start(dir.path(), true, &Default::default()).await);
+        assert!(!dir.path().join("backups").exists());
+        let missing = tempfile::tempdir().unwrap();
+        assert!(adif_backup_start(missing.path(), false, &Default::default()).await);
+        assert!(!missing.path().join("backups").exists());
+        // The migration-refusal test below verifies refusal with a corrupt legacy row.
+    }
+
+    #[tokio::test]
+    async fn startup_adif_backup_failure_is_nonfatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("qsos.adi");
+        std::fs::write(&source, TWO_RECORDS).unwrap();
+        assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        let before = adif_backup_copies(&dir.path().join("backups"));
+        std::fs::write(&source, format!("{TWO_RECORDS}\n")).unwrap();
+        let locked_source = source.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = pancetta_qso::logbook_lock::LogbookLock::open(&locked_source).unwrap();
+            let _held = lock.try_lock().unwrap().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        ready_rx.recv().unwrap();
+        assert!(adif_backup_start(dir.path(), false, &Default::default()).await);
+        holder.join().unwrap();
+        assert_eq!(adif_backup_copies(&dir.path().join("backups")), before);
+        std::fs::write(dir.path().join("blocked"), b"file").unwrap();
+        let settings = pancetta_config::DatabaseConfig {
+            adif_backup_directory: "blocked".into(),
+            ..Default::default()
+        };
+        assert!(adif_backup_start(dir.path(), false, &settings).await);
+        assert_eq!(adif_backup_copies(&dir.path().join("backups")), before);
+    }
+
     /// Minimal manager config: a real callsign (the placeholder guard in
     /// `start_cq` rejects NOCALL/N0CALL) and a grid, everything else default.
     fn manager() -> pancetta_qso::QsoManager {
@@ -13144,6 +13548,37 @@ mod replay_local_log_tests {
         <FREQ:9>14.074000 <BAND:3>20M <EOR>\n";
 
     #[tokio::test]
+    async fn pan298_logged_comment_follows_attribution_setting() {
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let adif = dir.path().join("qsos.adi");
+            let manager = manager();
+            let subscribers = AdifSubscribers::new();
+            let (_writer, logger, seed) = start_local_qso_log_writers(
+                false,
+                &adif,
+                &dir.path().join("qso.db"),
+                100,
+                enabled,
+                &pancetta_config::DatabaseConfig::default(),
+                &manager,
+                &subscribers,
+            )
+            .await;
+            complete_one_qso(&manager).await;
+            assert_eq!(wait_for_adif_record(&adif).await, 1);
+            let p = pancetta_qso::AdifProcessor::new();
+            let text = std::fs::read_to_string(&adif).unwrap();
+            let parsed = p.parse_string(&text).unwrap();
+            let qso = p.record_to_qso(&parsed.records[0]).unwrap();
+            assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+            subscribers.stop(Duration::from_secs(2)).await;
+            drop(logger);
+            seed.expect("seed").close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn live_start_does_not_rebuild_after_a_kill_with_rows_in_the_wal() {
         let dir = tempfile::tempdir().unwrap();
         let killed = tempfile::tempdir().unwrap();
@@ -13151,9 +13586,17 @@ mod replay_local_log_tests {
         let path = dir.path().join("qso.db");
         let manager = manager();
         let subscribers = AdifSubscribers::new();
-        let (_writer, logger, seed) =
-            start_local_qso_log_writers(false, &adif, &path, 100, false, &manager, &subscribers)
-                .await;
+        let (_writer, logger, seed) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &path,
+            100,
+            false,
+            &pancetta_config::DatabaseConfig::default(),
+            &manager,
+            &subscribers,
+        )
+        .await;
         let db = seed.expect("seed");
         complete_one_qso(&manager).await;
         assert_eq!(wait_for_adif_record(&adif).await, 1);
@@ -13300,6 +13743,7 @@ mod replay_local_log_tests {
                 &path,
                 100,
                 false,
+                &pancetta_config::DatabaseConfig::default(),
                 &manager(),
                 &subscribers,
             )
@@ -13313,6 +13757,7 @@ mod replay_local_log_tests {
                 _ => panic!("migration must refuse"),
             }
             assert!(!adif.exists());
+            assert!(!adif.parent().unwrap().join("backups").exists());
             subscribers.stop(Duration::from_secs(2)).await;
             drop(logger);
             let db = pancetta_qso::async_database::QsoDatabase::open(&path)
@@ -13360,6 +13805,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13399,6 +13845,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13441,6 +13888,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13475,6 +13923,7 @@ mod replay_local_log_tests {
             &before_cut.path().join("qso.db"),
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &first_session,
             &adif_subscribers,
         )
@@ -13514,6 +13963,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &restarted,
             &adif_subscribers,
         )
@@ -13567,6 +14017,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13605,6 +14056,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13639,6 +14091,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13684,6 +14137,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13716,6 +14170,7 @@ mod replay_local_log_tests {
             &db_path,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -13818,6 +14273,7 @@ mod replay_history_seed_tests {
                 frequency: FREQ_20M_HZ,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: chrono::Utc::now(),
                 end_time: None,
                 reports: SignalReports::default(),
@@ -15314,6 +15770,11 @@ mod respond_to_caller_admission_tests {
             cfg.station.callsign = "W1ABC".into();
             cfg.station.grid_square = "FN42".into();
         }
+        // These fixtures explicitly dispatch autonomous openings.
+        coordinator.config.write().await.autonomous.enabled = true;
+        coordinator
+            .autonomous_config_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
         coordinator
     }
 
@@ -18177,11 +18638,57 @@ mod manual_capacity_admission_tests {
         assert_eq!(h.manager.active_qso_count().await, 1);
     }
 
+    #[tokio::test]
+    async fn pan302_queued_open_rechecks_permission_after_admission_wait() {
+        let mut h = harness(2, false).await;
+        let mut saved = h.coordinator.config.read().await.clone();
+        saved.autonomous.enabled = true;
+        h.coordinator
+            .handle_config_reload(Ok((saved.clone(), vec![])))
+            .await;
+        let qso_sender = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await
+            .unwrap()
+            .0;
+        let gate = h.coordinator.qso_admission_for_test.clone().unwrap();
+        let held = gate.lock().await;
+        h.send(QsoMessage::StartAutonomousQso {
+            callsign: Some("K3CCC".into()),
+            frequency: 1800.0,
+            parity: Some(SlotParity::Even),
+            cq_attempt_id: None,
+        })
+        .await;
+        // On this current-thread runtime, taking the opening runs the task
+        // through its permission check to the held admission await.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !qso_sender.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        saved.autonomous.enabled = false;
+        h.coordinator
+            .handle_config_reload(Ok((saved, vec![])))
+            .await;
+        drop(held);
+        let tx = collect_quiet(&h.tx, 300).await;
+        assert!(!any_tx_containing(&tx, "K3CCC"));
+        assert_eq!(h.manager.active_qso_count().await, 0);
+    }
+
     /// Codex P1 on #449: an autonomous open queued before a manual open
     /// filled the last slot is re-checked against the cap when handled.
     #[tokio::test]
     async fn autonomous_open_is_rechecked_against_the_cap() {
         let h = harness(1, false).await;
+        h.coordinator
+            .autonomous_config_enabled
+            .store(true, Ordering::Release);
         h.open_idle_qso_a().await;
 
         // Same parity as A (DX Even ⇒ we TX Odd), so only capacity can refuse.
@@ -19579,9 +20086,17 @@ mod pan260 {
         std::fs::write(&adif, [0xff, 0xfe]).unwrap();
         let m = manager();
         let adif_subscribers = AdifSubscribers::new();
-        let (_, _, seed) =
-            start_local_qso_log_writers(false, &adif, &index, 100, false, &m, &adif_subscribers)
-                .await;
+        let (_, _, seed) = start_local_qso_log_writers(
+            false,
+            &adif,
+            &index,
+            100,
+            false,
+            &pancetta_config::DatabaseConfig::default(),
+            &m,
+            &adif_subscribers,
+        )
+        .await;
         assert!(seed.is_none());
         assert!(pancetta_qso::async_database::QsoDatabase::rebuild_marker(&index).exists());
         assert!(
@@ -19614,6 +20129,7 @@ mod pan260 {
             &index,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &first,
             &adif_subscribers,
         )
@@ -20008,6 +20524,7 @@ mod pan50_live_contest {
             &index,
             100,
             false,
+            &pancetta_config::DatabaseConfig::default(),
             &manager,
             &adif_subscribers,
         )
@@ -20150,7 +20667,7 @@ mod completed_tx_purge_tests {
     }
 
     /// PAN-344 AC5: the enabled-target matrix captured at completion.
-    /// Every enabled outbox destination plus an enabled LoTW client is
+    /// Every enabled outbox destination, including LoTW, is
     /// captured, in canonical display order, all Pending; an empty captured
     /// set is "uploads disabled"; a preparation failure marks the whole
     /// captured set Failed so an enabled target can never disappear from
@@ -20161,7 +20678,7 @@ mod completed_tx_purge_tests {
         use pancetta_dx::upload_outbox::UploadDestination::*;
         use pancetta_tui::upload_status::{verdict, UploadState, UploadTarget, UploadVerdict};
 
-        let all = completion_upload_targets(&[ClubLog, QrzLogbook, Eqsl, Cqdx], true);
+        let all = completion_upload_targets(&[ClubLog, QrzLogbook, Eqsl, Cqdx, Lotw]);
         assert_eq!(
             all.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             vec![
@@ -20177,14 +20694,14 @@ mod completed_tx_purge_tests {
             .iter()
             .all(|(_, s)| s.state == UploadState::Pending && s.reason == "queued"));
 
-        let subset = completion_upload_targets(&[QrzLogbook], false);
+        let subset = completion_upload_targets(&[QrzLogbook]);
         assert_eq!(
             subset.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             vec![UploadTarget::Qrz]
         );
 
         // Empty captured set: disabled, never vacuously all-accepted.
-        let none = completion_upload_targets(&[], false);
+        let none = completion_upload_targets(&[]);
         let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
         registry.lock().unwrap().register("u-none", "K1ABC", none);
         let snap = registry.lock().unwrap().snapshot();
@@ -20195,7 +20712,7 @@ mod completed_tx_purge_tests {
         registry.lock().unwrap().register(
             uuid,
             "K1ABC",
-            completion_upload_targets(&[ClubLog, QrzLogbook], true),
+            completion_upload_targets(&[ClubLog, QrzLogbook, Lotw]),
         );
         registry.lock().unwrap().record_all(
             uuid,
@@ -20210,53 +20727,6 @@ mod completed_tx_purge_tests {
             .iter()
             .all(|(_, s)| s.state == UploadState::Failed));
         assert_eq!(verdict(entry), UploadVerdict::NeedsAttention);
-    }
-
-    /// PAN-344 AC5: LoTW's own result is included — Logged and Duplicate
-    /// mean Accepted, an error means Failed, and a registered Lotw target
-    /// transitions accordingly (it stays pending until its own result).
-    #[test]
-    fn pan344_lotw_result_is_included() {
-        use super::{completion_upload_targets, lotw_result_state};
-        use pancetta_tui::upload_status::{UploadState, UploadTarget};
-
-        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
-            pancetta_dx::QsoUploadOutcome::Logged,
-        ));
-        assert_eq!(state, UploadState::Accepted);
-        assert!(reason.is_empty());
-
-        let (state, reason) = lotw_result_state(&Ok::<pancetta_dx::QsoUploadOutcome, String>(
-            pancetta_dx::QsoUploadOutcome::Duplicate,
-        ));
-        assert_eq!(state, UploadState::Accepted);
-        assert!(reason.contains("duplicate"));
-
-        let (state, reason) = lotw_result_state(&Err("tqsl not found".to_string()));
-        assert_eq!(state, UploadState::Failed);
-        assert!(reason.contains("tqsl failed"), "{reason}");
-
-        let registry = super::super::qso_upload_status::UploadStatusRegistry::shared();
-        registry
-            .lock()
-            .unwrap()
-            .register("u-lotw", "K1ABC", completion_upload_targets(&[], true));
-        {
-            let snap = registry.lock().unwrap().snapshot();
-            let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
-            assert_eq!(
-                entry.state(UploadTarget::Lotw),
-                Some(UploadState::Pending),
-                "LoTW stays pending until its own result"
-            );
-        }
-        registry
-            .lock()
-            .unwrap()
-            .record("u-lotw", UploadTarget::Lotw, state, &reason);
-        let snap = registry.lock().unwrap().snapshot();
-        let entry = snap.iter().find(|s| s.uuid == "u-lotw").unwrap();
-        assert_eq!(entry.state(UploadTarget::Lotw), Some(UploadState::Failed));
     }
 }
 

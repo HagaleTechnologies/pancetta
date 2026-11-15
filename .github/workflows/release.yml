@@ -19,8 +19,9 @@ name: Release
 #   - crates.io publishing is OUT of scope ([workspace.package] publish=false).
 #     This workflow ships binaries only.
 #   - Every action is pinned to a full commit SHA (version in the trailing
-#     comment). The workflow token is read-only; only the release job gets
-#     contents: write, and checkouts do not persist credentials.
+#     comment). The workflow token defaults to read-only. The build job gets
+#     id-token/attestations write for tag-gated build-provenance attestations;
+#     the release job gets contents: write. Checkouts do not persist credentials.
 
 on:
   push:
@@ -59,6 +60,10 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write      # Sigstore OIDC
+      attestations: write  # persist attestations to the repo attestation store
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -133,6 +138,9 @@ jobs:
         # operator sets their own `network.clublog.api_key`.
         env:
           CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
         run: cargo build --release -p pancetta --target ${{ matrix.target }}
 
       - name: Smoke test — binary must embed the real C decoder
@@ -162,6 +170,15 @@ jobs:
         # release gate itself robust.
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo test -p pancetta-ft8 --test wav_decode_tests test_cross_validate_against_ft8lib -- --exact
+
+      - name: Split debug symbols (separate asset)
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
+          BIN="target/${{ matrix.target }}/release/pancetta"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          bash scripts/split-debuginfo.sh "$BIN" "pancetta-${REF_SLUG}-${{ matrix.target }}"
 
       - name: Package
         shell: bash
@@ -202,12 +219,24 @@ jobs:
             shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           fi
 
+      - name: Attest build provenance for release archives
+        # Digest-keyed to the repository, so each matrix leg can attest
+        # before draft creation. Dispatch dry runs must not attest.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            pancetta-*.tar.gz
+            pancetta-*.zip
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: |
             pancetta-*.tar.gz*
             pancetta-*.zip*
+            pancetta-*.debug
+            pancetta-*.dSYM.tar.gz
           if-no-files-found: error
 
   release:
@@ -234,12 +263,33 @@ jobs:
       - name: Extract release notes from CHANGELOG
         run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" CHANGELOG.md notes.md
 
+      - name: Generate aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # Symbol tarballs are separate assets, not platform archives.
+          archives=()
+          for archive in pancetta-*.tar.gz pancetta-*.zip; do
+            case "$archive" in *.dSYM.tar.gz) continue ;; esac
+            archives+=("$archive")
+          done
+          LC_ALL=C sha256sum "${archives[@]}" | LC_ALL=C sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          listed=$(grep -c . SHA256SUMS)
+          test "$listed" -eq "${#archives[@]}"
+
       - name: Create draft release (operator publishes)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          prerelease_args=()
+          case "$GITHUB_REF_NAME" in
+            v*-?*) prerelease_args+=(--prerelease) ;;
+          esac
           gh release create "$GITHUB_REF_NAME" dist/* \
             --draft \
-            --verify-tag \
+            --verify-tag "${prerelease_args[@]}" \
             --title "Pancetta $GITHUB_REF_NAME" \
             --notes-file notes.md

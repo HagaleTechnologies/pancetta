@@ -61,9 +61,12 @@ Audio In (USB codec, 48kHz stereo)
 pancetta-audio  (AudioManager, cpal + ringbuf)
   | raw f32 samples via crossbeam channel
   v
-pancetta/src/coordinator/dsp.rs
-  | downmix capture frames to mono; integer subsampling to 12 kHz
+Coordinator DSP worker (coordinator/dsp.rs)  — left channel (channel 0) only
+  | decimate 4:1 -> 12kHz mono: every 4th sample (subsample, the default) or,
+  | with [audio] decimation_antialias_filter = true (48 kHz only), the
+  | pancetta-dsp 31-tap unity-gain FIR anti-alias decimator (PAN-320)
   | FT8 slot-aligned 12.64-second base capture windows, with configured lead-in
+  | (the PAN-393 raw48 capture taps this stage pre-decimation, unfiltered)
   v
 pancetta-ft8  (Ft8Decoder)
   | LDPC decode, OSD, AP injection -> Vec<DecodedMessage>
@@ -103,6 +106,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 <!-- coordinator-modules:start -->
 | File | Role |
 |---|---|
+| `adif_backup.rs` | Changed startup ADIF snapshots and independent retention. |
 | `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
 | `audio.rs` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
@@ -132,6 +136,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `remote_gateway/` | Local read-only WebSocket gateway (Panino). |
 | `replay.rs` | Replay mode: listing recorded WAVs and feeding decode windows. |
 | `restart_budget.rs` | Reconnect/restart backoff and restart budgets. |
+| `service_notify.rs` | systemd READY/WATCHDOG/STOPPING notifications driven by completed health passes (PAN-335). |
 | `session_state.rs` | Session choices (TX-frequency mode, effort preset) restored at startup (PAN-270). |
 | `shutdown.rs` | Graceful shutdown, task join and direct rigctld PTT-off budgets. |
 | `spot_call.rs` | Space on a network spot: QSY to its dial and call (PAN-287). |

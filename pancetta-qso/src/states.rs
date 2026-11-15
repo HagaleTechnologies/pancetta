@@ -475,6 +475,11 @@ pub struct QsoMetadata {
     /// QSO start time
     pub start_time: DateTime<Utc>,
 
+    /// Receive time of the first accepted answer to our CQ, latched once.
+    /// None until answered, and for QSOs created with a known partner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_answer_at: Option<DateTime<Utc>>,
+
     /// QSO end time (if completed)
     pub end_time: Option<DateTime<Utc>>,
 
@@ -950,6 +955,13 @@ pub enum QsoValidation {
     },
 }
 
+impl QsoMetadata {
+    /// Start of the contact for logging and display, falling back to creation time.
+    pub fn contact_started_at(&self) -> DateTime<Utc> {
+        self.first_answer_at.unwrap_or(self.start_time)
+    }
+}
+
 impl QsoState {
     /// Check if the QSO is in a terminal state
     pub fn is_terminal(&self) -> bool {
@@ -1295,6 +1307,7 @@ mod tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: Utc::now(),
             end_time: None,
             reports: SignalReports::default(),

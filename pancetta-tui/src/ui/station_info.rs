@@ -134,10 +134,7 @@ fn render_operating_parameters(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut freq_spans = vec![
         Span::styled("Freq: ", Style::default().fg(app.theme.foreground_color())),
         Span::styled(
-            app.config
-                .ui
-                .frequency_format
-                .format_frequency(station.operating_frequency),
+            format!("{:.3} MHz", station.operating_frequency),
             Style::default()
                 .fg(app.theme.warning_color())
                 .add_modifier(Modifier::BOLD),

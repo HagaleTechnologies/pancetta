@@ -1055,13 +1055,15 @@ impl RigControl for RigctldClient {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
                 .await?;
         }
-        self.send_command_with_retry(&format!("F {}", frequency))
-            .await?;
+        let result = self
+            .send_command_with_retry(&format!("F {}", frequency))
+            .await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -1106,13 +1108,17 @@ impl RigControl for RigctldClient {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
                 .await?;
         }
-        let response = self.send_command_with_retry("f").await?;
-        let frequency = Self::parse_frequency(&response)?;
+        let result = async {
+            let response = self.send_command_with_retry("f").await?;
+            Self::parse_frequency(&response)
+        }
+        .await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        let frequency = result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -1138,12 +1144,13 @@ impl RigControl for RigctldClient {
         // rigctld \set_mode takes only (mode, passband), NOT (vfo, mode, passband)
         let cmd = format!("\\set_mode {} {}", Self::mode_to_string(mode), pb);
 
-        self.send_command_with_retry(&cmd).await?;
+        let result = self.send_command_with_retry(&cmd).await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -2808,5 +2815,200 @@ mod managed_recovery_tests {
         assert!(ready.is_ready());
         client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vfo_restore_tests {
+    use super::*;
+
+    const A_FREQUENCY: u64 = 14_074_000;
+    const B_FREQUENCY: u64 = 7_074_000;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        WriteFrequency,
+        ReadFrequency,
+        WriteMode,
+    }
+
+    impl Operation {
+        fn command(self) -> String {
+            match self {
+                Self::WriteFrequency => format!("F {B_FREQUENCY}"),
+                Self::ReadFrequency => "f".into(),
+                Self::WriteMode => "\\set_mode CW 500".into(),
+            }
+        }
+
+        async fn run(self, client: &RigctldClient, vfo: Vfo) -> Result<()> {
+            match self {
+                Self::WriteFrequency => client.set_frequency(vfo, B_FREQUENCY).await,
+                Self::ReadFrequency => client.get_frequency(vfo).await.map(|_| ()),
+                Self::WriteMode => client.set_mode(vfo, Mode::CW, Some(500)).await,
+            }
+        }
+    }
+
+    // The transcript checks wire order; the stateful replies independently check
+    // which VFO the next current-frequency query actually addresses.
+    async fn exercise(
+        operation: Operation,
+        vfo: Vfo,
+        failure: Option<&'static str>,
+        restore_fails: bool,
+    ) {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        {
+            let mut state = client.state.write().await;
+            state.last_frequency = A_FREQUENCY;
+            state.last_mode = Mode::USB;
+        }
+        let switches = !matches!(vfo, Vfo::A | Vfo::Current);
+        let mut expected = Vec::new();
+        if switches {
+            expected.push(("V VFOB".to_string(), "RPRT 0".to_string()));
+        }
+        let reply = failure.map(str::to_owned).unwrap_or_else(|| {
+            if matches!(operation, Operation::ReadFrequency) {
+                if switches { B_FREQUENCY } else { A_FREQUENCY }.to_string()
+            } else {
+                "RPRT 0".into()
+            }
+        });
+        let attempts = if reply.starts_with("RPRT -") {
+            client.config.retry_count
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            expected.push((operation.command(), reply.clone()));
+        }
+        if switches {
+            for _ in 0..if restore_fails {
+                client.config.retry_count
+            } else {
+                1
+            } {
+                expected.push((
+                    "V VFOA".to_string(),
+                    if restore_fails { "RPRT -2" } else { "RPRT 0" }.to_string(),
+                ));
+            }
+        }
+        expected.push(("f".to_string(), String::new()));
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            let mut selected_b = false;
+            let mut frequencies = [A_FREQUENCY, B_FREQUENCY];
+            for (command, mut reply) in expected {
+                let mut line = String::new();
+                timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(line.trim(), command);
+                if command == "V VFOB" && reply == "RPRT 0" {
+                    selected_b = true;
+                } else if command == "V VFOA" && reply == "RPRT 0" {
+                    selected_b = false;
+                } else if command.starts_with("F ") && reply == "RPRT 0" {
+                    frequencies[usize::from(selected_b)] = B_FREQUENCY;
+                }
+                if reply.is_empty() || (command == "f" && failure.is_none()) {
+                    reply = frequencies[usize::from(selected_b)].to_string();
+                }
+                writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = operation.run(&client, vfo).await;
+        let cached = {
+            let state = client.state.read().await;
+            (state.last_frequency, state.last_mode)
+        };
+        let next_frequency = client.get_frequency(Vfo::Current).await;
+        server_task.await.unwrap();
+        if let Some(failure) = failure {
+            let error = result.unwrap_err().to_string();
+            if failure == "malformed" {
+                assert!(error.contains("Failed to parse frequency"), "{error}");
+            } else {
+                assert!(
+                    error.contains("-1"),
+                    "original operation error lost: {error}"
+                );
+                assert!(
+                    !error.contains("-2"),
+                    "restore error replaced operation error: {error}"
+                );
+            }
+            assert_eq!(cached, (A_FREQUENCY, Mode::USB));
+        } else {
+            result.unwrap();
+            let frequency = match operation {
+                Operation::WriteFrequency => B_FREQUENCY,
+                Operation::ReadFrequency if switches => B_FREQUENCY,
+                _ => A_FREQUENCY,
+            };
+            let mode = if matches!(operation, Operation::WriteMode) {
+                Mode::CW
+            } else {
+                Mode::USB
+            };
+            assert_eq!(cached, (frequency, mode));
+        }
+        let expected_current = if restore_fails
+            || (!switches && matches!(operation, Operation::WriteFrequency) && failure.is_none())
+        {
+            B_FREQUENCY
+        } else {
+            A_FREQUENCY
+        };
+        assert_eq!(next_frequency.unwrap(), expected_current);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_frequency_write_restores_a_before_current_read() {
+        exercise(Operation::WriteFrequency, Vfo::B, Some("RPRT -1"), false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_frequency_read_restores_a() {
+        for reply in ["RPRT -1", "malformed"] {
+            exercise(Operation::ReadFrequency, Vfo::B, Some(reply), false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_mode_write_restores_a() {
+        exercise(Operation::WriteMode, Vfo::B, Some("RPRT -1"), false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_error_survives_failed_restore() {
+        for operation in [
+            Operation::WriteFrequency,
+            Operation::ReadFrequency,
+            Operation::WriteMode,
+        ] {
+            exercise(operation, Vfo::B, Some("RPRT -1"), true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_operations_preserve_vfo_sequences() {
+        for operation in [
+            Operation::WriteFrequency,
+            Operation::ReadFrequency,
+            Operation::WriteMode,
+        ] {
+            for vfo in [Vfo::B, Vfo::A, Vfo::Current] {
+                exercise(operation, vfo, None, false).await;
+            }
+        }
     }
 }

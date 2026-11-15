@@ -1,5 +1,5 @@
 //! PAN-57: the process-wide pending-upload worker for per-QSO logbook uploads
-//! (ClubLog, QRZ Logbook, eQSL, cqdx.io).
+//! (ClubLog, QRZ Logbook, eQSL, cqdx.io, LoTW).
 //!
 //! The QSO upload subscriber hands each completed QSO's uploads to this
 //! worker as a batch. The worker writes them to `~/.pancetta/upload_outbox.json`
@@ -23,8 +23,7 @@
 //! upload subscribers alive, and two writers on one file must never happen.
 //!
 //! State changes are published as [`UploadHealth`] for the readiness strip and
-//! emitted as one Diagnostics row each. LoTW keeps its single tqsl attempt in
-//! the subscriber and never enters the queue.
+//! emitted as one Diagnostics row each. LoTW uses this same queue and retry policy.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -75,6 +74,7 @@ pub(crate) trait OutboxTransport: Send + Sync + 'static {
 
 /// The real logbook clients.
 pub(crate) struct LogbookClients {
+    pub lotw: Option<Arc<pancetta_dx::LotwUploadClient>>,
     pub clublog: Option<Arc<pancetta_dx::ClubLogClient>>,
     pub qrz: Option<Arc<pancetta_dx::QrzLogbookClient>>,
     pub eqsl: Option<Arc<pancetta_dx::EqslClient>>,
@@ -112,6 +112,7 @@ impl OutboxTransport for LogbookClients {
                 UploadDestination::QrzLogbook => self.qrz.is_some(),
                 UploadDestination::Eqsl => self.eqsl.is_some(),
                 UploadDestination::Cqdx => self.cqdx.is_some(),
+                UploadDestination::Lotw => self.lotw.is_some(),
             })
             .collect()
     }
@@ -137,6 +138,15 @@ impl OutboxTransport for LogbookClients {
                     Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => {
                         Delivery::Accepted { duplicate: true }
                     }
+                    Err(e) => failed(&e),
+                },
+                None => missing(),
+            },
+            UploadDestination::Lotw => match &self.lotw {
+                Some(c) => match c.upload_adif(&payload).await {
+                    Ok(outcome) => Delivery::Accepted {
+                        duplicate: outcome == pancetta_dx::QsoUploadOutcome::Duplicate,
+                    },
                     Err(e) => failed(&e),
                 },
                 None => missing(),
@@ -192,6 +202,7 @@ pub(crate) fn build_logbook_clients(
     eqsl_cfg: &pancetta_config::network::EqslConfig,
     cqdx_cfg: &pancetta_config::network::CqdxConfig,
     our_callsign: &str,
+    lotw_cfg: &pancetta_config::network::LotwUploadConfig,
 ) -> LogbookClients {
     let clublog = if clublog_cfg.enabled {
         // Fall back to the QSO's own call when no station call is configured.
@@ -276,6 +287,12 @@ pub(crate) fn build_logbook_clients(
     };
 
     LogbookClients {
+        lotw: lotw_cfg.enabled.then(|| {
+            Arc::new(
+                pancetta_dx::LotwUploadClient::new(&lotw_cfg.tqsl_path, &lotw_cfg.station_location)
+                    .with_password(&lotw_cfg.password),
+            )
+        }),
         clublog,
         qrz,
         eqsl,
@@ -291,6 +308,7 @@ pub(crate) fn outbox_destinations(
     eqsl_enabled: bool,
     cqdx_upload_enabled: bool,
     replay_mode: bool,
+    lotw_enabled: bool,
 ) -> Vec<UploadDestination> {
     if replay_mode {
         return Vec::new();
@@ -302,6 +320,7 @@ pub(crate) fn outbox_destinations(
             UploadDestination::QrzLogbook => qrz_enabled,
             UploadDestination::Eqsl => eqsl_enabled,
             UploadDestination::Cqdx => cqdx_upload_enabled,
+            UploadDestination::Lotw => lotw_enabled,
         })
         .collect()
 }
@@ -1220,6 +1239,283 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
+    // Real transport fixture: only tqsl is fake; persistence, scheduling and
+    // registry updates run through the production worker.
+    #[cfg(unix)]
+    struct LotwRig {
+        path: PathBuf,
+        handle: UploadOutboxHandle,
+        task: tokio::task::JoinHandle<()>,
+        shutdown: Arc<AtomicBool>,
+        statuses: crate::coordinator::qso_upload_status::SharedUploadStatusRegistry,
+    }
+
+    #[cfg(unix)]
+    impl LotwRig {
+        fn start(path: PathBuf, binary: &std::path::Path, enabled: bool) -> Self {
+            let config = pancetta_config::network::LotwUploadConfig {
+                enabled,
+                tqsl_path: binary.to_str().unwrap().into(),
+                station_location: "Home Station".into(),
+                password: "certificate secret".into(),
+            };
+            let clients = build_logbook_clients(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                "K1ABC",
+                &config,
+            );
+            let statuses = crate::coordinator::qso_upload_status::UploadStatusRegistry::shared();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let (handle, task) = start_upload_outbox(
+                path.clone(),
+                Arc::new(clients),
+                RetrySchedule::new(3, 200, 800, 2.0, 0.0, Duration::from_secs(1)),
+                TIMING,
+                Arc::new(Mutex::new(UploadHealth::default())),
+                None,
+                shutdown.clone(),
+                Some(statuses.clone()),
+            );
+            Self {
+                path,
+                handle,
+                task,
+                shutdown,
+                statuses,
+            }
+        }
+        fn entries(&self) -> Vec<pancetta_dx::upload_outbox::OutboxEntry> {
+            OutboxStore::open(self.path.clone()).0.entries().to_vec()
+        }
+        async fn enqueue(&self) -> Uuid {
+            use pancetta_tui::upload_status::{TargetUploadStatus, UploadTarget};
+            let item = upload(UploadDestination::Lotw, "K1ABC");
+            let id = item.qso_id;
+            self.statuses.lock().unwrap().register(
+                &id.to_string(),
+                "K1ABC",
+                vec![(UploadTarget::Lotw, TargetUploadStatus::pending("queued"))],
+            );
+            assert!(self.handle.enqueue(vec![item]).await);
+            id
+        }
+        async fn stop(self) {
+            self.shutdown.store(true, Ordering::Release);
+            drop(self.handle);
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn lotw_script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        // Atomic replacement keeps a retry from observing a partly written script.
+        let pending = path.with_extension("new");
+        std::fs::write(&pending, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(pending, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_is_persisted_before_tqsl() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("fake tqsl");
+        let entered = dir.path().join("entered");
+        let release = dir.path().join("release");
+        lotw_script(
+            &binary,
+            &format!(
+                "touch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 0",
+                entered.display(),
+                release.display()
+            ),
+        );
+        let rig = LotwRig::start(dir.path().join("queue.json"), &binary, true);
+        let id = rig.enqueue().await;
+        wait_until(|| entered.exists()).await;
+        let entries = rig.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].qso_id, id);
+        assert_eq!(entries[0].destination, UploadDestination::Lotw);
+        assert!(entries[0].payload.contains("K1ABC"));
+        assert!(std::fs::read_to_string(&rig.path)
+            .unwrap()
+            .contains("\"lotw\""));
+        std::fs::write(release, "").unwrap();
+        wait_until(|| rig.entries().is_empty()).await;
+        rig.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_missing_executable_retries_then_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tqsl");
+        let rig = LotwRig::start(dir.path().join("queue.json"), &binary, true);
+        rig.enqueue().await;
+        wait_until(|| rig.entries().first().is_some_and(|e| e.attempts == 1)).await;
+        let first = rig.entries()[0].clone();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(rig.entries()[0].attempts, 1);
+        wait_until(|| rig.entries().first().is_some_and(|e| e.attempts == 2)).await;
+        let second = rig.entries()[0].clone();
+        assert!(
+            second.last_attempt_at.unwrap() - first.last_attempt_at.unwrap()
+                >= chrono::Duration::milliseconds(200)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rig.entries()[0].attempts, 2);
+        lotw_script(&binary, "exit 0");
+        wait_until(|| rig.entries().is_empty()).await;
+        // Recovery cannot bypass the second backoff either.
+        let accepted = Utc::now();
+        assert!(accepted - second.last_attempt_at.unwrap() >= chrono::Duration::milliseconds(400));
+        rig.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_restart_and_disabled_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tqsl");
+        let path = dir.path().join("queue.json");
+        let rig = LotwRig::start(path.clone(), &binary, true);
+        rig.enqueue().await;
+        wait_until(|| rig.entries().first().is_some_and(|e| e.attempts > 0)).await;
+        rig.stop().await;
+        let invoked = dir.path().join("invoked");
+        lotw_script(&binary, &format!("touch '{}'\nexit 0", invoked.display()));
+        let disabled = LotwRig::start(path.clone(), &binary, false);
+        let before = std::fs::read(&path).unwrap();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(!invoked.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        disabled.stop().await;
+        let enabled = LotwRig::start(path, &binary, true);
+        wait_until(|| invoked.exists() && enabled.entries().is_empty()).await;
+        enabled.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_duplicate_delivery_updates_status() {
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+        for code in [8, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("tqsl");
+            let count = dir.path().join("count");
+            lotw_script(
+                &binary,
+                &format!("echo attempt >> '{}'\nexit {code}", count.display()),
+            );
+            let rig = LotwRig::start(dir.path().join("queue.json"), &binary, true);
+            let id = rig.enqueue().await;
+            wait_until(|| {
+                status_of(
+                    &rig.statuses.lock().unwrap().snapshot(),
+                    &id,
+                    UploadTarget::Lotw,
+                ) == Some(UploadState::Accepted)
+            })
+            .await;
+            wait_until(|| rig.entries().is_empty()).await;
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+            rig.stop().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_outbox_contains_no_password() {
+        use pancetta_tui::upload_status::{UploadState, UploadTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tqsl");
+        lotw_script(
+            &binary,
+            "echo 'certificate secret'; echo 'certificate secret' >&2; exit 1",
+        );
+        let rig = LotwRig::start(dir.path().join("queue.json"), &binary, true);
+        let id = rig.enqueue().await;
+        wait_until(|| rig.entries().first().is_some_and(|e| e.attempts > 0)).await;
+        let bytes = std::fs::read_to_string(&rig.path).unwrap();
+        assert!(!bytes.contains("certificate secret"));
+        assert!(rig.entries()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("exit status: 1"));
+        let snapshot = rig.statuses.lock().unwrap().snapshot();
+        assert!(!format!("{snapshot:?}").contains("certificate secret"));
+        assert_eq!(
+            status_of(&snapshot, &id, UploadTarget::Lotw),
+            Some(UploadState::Pending)
+        );
+        rig.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pan300_lotw_status_follows_worker() {
+        use pancetta_tui::upload_status::{
+            verdict, TargetUploadStatus, UploadState, UploadTarget, UploadVerdict,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tqsl");
+        lotw_script(&binary, "exit 1");
+        let rig = LotwRig::start(dir.path().join("queue.json"), &binary, true);
+        let item = upload(UploadDestination::Lotw, "K1ABC");
+        let id = item.qso_id;
+        // Capture a second target whose result has not arrived.
+        rig.statuses.lock().unwrap().register(
+            &id.to_string(),
+            "K1ABC",
+            vec![
+                (UploadTarget::Lotw, TargetUploadStatus::pending("queued")),
+                (UploadTarget::Qrz, TargetUploadStatus::pending("queued")),
+            ],
+        );
+        assert!(rig.handle.enqueue(vec![item]).await);
+        wait_until(|| rig.entries().first().is_some_and(|e| e.attempts > 0)).await;
+        assert_eq!(
+            status_of(
+                &rig.statuses.lock().unwrap().snapshot(),
+                &id,
+                UploadTarget::Lotw
+            ),
+            Some(UploadState::Pending)
+        );
+        lotw_script(&binary, "exit 0");
+        wait_until(|| {
+            status_of(
+                &rig.statuses.lock().unwrap().snapshot(),
+                &id,
+                UploadTarget::Lotw,
+            ) == Some(UploadState::Accepted)
+        })
+        .await;
+        let snapshot = rig.statuses.lock().unwrap().snapshot();
+        assert_ne!(verdict(&snapshot[0]), UploadVerdict::AllAccepted);
+        rig.statuses.lock().unwrap().record(
+            &id.to_string(),
+            UploadTarget::Qrz,
+            UploadState::Accepted,
+            "",
+        );
+        assert_eq!(
+            verdict(&rig.statuses.lock().unwrap().snapshot()[0]),
+            UploadVerdict::AllAccepted
+        );
+        wait_until(|| rig.entries().is_empty()).await;
+        rig.stop().await;
+    }
     type Call = (UploadDestination, String, Instant);
 
     #[derive(Default)]
@@ -2421,25 +2717,25 @@ mod tests {
     #[test]
     fn outbox_destinations_follow_the_enable_flags() {
         assert_eq!(
-            outbox_destinations(true, false, true, false, false),
+            outbox_destinations(true, false, true, false, false, false),
             vec![ClubLog, Eqsl]
         );
         assert_eq!(
-            outbox_destinations(false, true, false, false, false),
+            outbox_destinations(false, true, false, false, false, false),
             vec![QrzLogbook]
         );
-        assert!(outbox_destinations(false, false, false, false, false).is_empty());
+        assert!(outbox_destinations(false, false, false, false, false, false).is_empty());
     }
 
     #[test]
     fn replay_never_opens_the_outbox() {
-        assert!(outbox_destinations(true, true, true, true, true).is_empty());
+        assert!(outbox_destinations(true, true, true, true, true, false).is_empty());
     }
 
     #[test]
     fn outbox_destinations_include_cqdx_when_the_token_is_set() {
         assert_eq!(
-            outbox_destinations(false, false, false, true, false),
+            outbox_destinations(false, false, false, true, false, false),
             vec![Cqdx]
         );
     }
@@ -2588,6 +2884,7 @@ mod tests {
             pancetta_cqdx::CqdxClient::new(format!("http://{addr}"), "pat_0123456789abcdef".into())
                 .unwrap();
         let clients = LogbookClients {
+            lotw: None,
             clublog: None,
             qrz: None,
             eqsl: None,
@@ -2628,6 +2925,7 @@ mod tests {
         )
         .unwrap();
         let clients = LogbookClients {
+            lotw: None,
             clublog: None,
             qrz: None,
             eqsl: None,

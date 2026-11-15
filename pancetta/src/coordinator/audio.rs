@@ -275,7 +275,12 @@ impl super::ApplicationCoordinator {
             let last_timestamp = self.last_audio_timestamp.clone();
             let sweep_capture = self.sweep_capture.clone();
 
+            let initialized = self.service_notify.audio.clone();
             let handle = tokio::spawn(async move {
+                let _initialized =
+                    super::service_notify::Initialized::after_start(initialized, || {
+                        Ok::<_, anyhow::Error>(())
+                    })?;
                 let mut phase = 0.0f32;
                 let frequency = 1500.0;
                 let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
@@ -395,6 +400,7 @@ impl super::ApplicationCoordinator {
             self.audio_output_alive.store(false, Ordering::Release);
 
             let sweep_capture_audio = self.sweep_capture.clone();
+            let initialized = self.service_notify.audio.clone();
             std::thread::spawn(move || {
                 // PAN-115: first statement, so every exit (init failure,
                 // `break`, panic) leaves the output marked dead.
@@ -440,12 +446,18 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
-                if let Err(e) = audio_manager.start() {
-                    let msg = format!("Audio stream start failed: {}", e);
-                    error!("{}", msg);
-                    report_audio_error(msg);
-                    return;
-                }
+                let _initialized =
+                    match super::service_notify::Initialized::after_start(initialized, || {
+                        audio_manager.start()
+                    }) {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let msg = format!("Audio stream start failed: {}", e);
+                            error!("{}", msg);
+                            report_audio_error(msg);
+                            return;
+                        }
+                    };
 
                 info!("AudioManager started in dedicated thread");
 
@@ -1155,5 +1167,28 @@ mod raw_diagnostic_capture_tests {
             6,
             "the whole batch was buffered, not truncated"
         );
+    }
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::super::service_notify::Initialized;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    #[test]
+    fn initialization_signal_follows_stream_start() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(Initialized::after_start(flag.clone(), || Err::<(), _>("start failed")).is_err());
+        assert!(!flag.load(Ordering::Acquire));
+        let guard = Initialized::after_start(flag.clone(), || {
+            assert!(!flag.load(Ordering::Acquire));
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(flag.load(Ordering::Acquire));
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

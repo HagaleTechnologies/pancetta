@@ -27,6 +27,7 @@ use tracing::debug;
 
 /// Clones of every coordinator input to a [`StationReadiness`] snapshot.
 pub(crate) struct ReadinessSources {
+    autonomous_config_enabled: Arc<AtomicBool>,
     tx_policy: Arc<AtomicU8>,
     tx_restart_inhibit: Arc<AtomicU32>,
     hamlib_command_loop_ready: Arc<AtomicBool>,
@@ -55,6 +56,7 @@ pub(crate) struct ReadinessSources {
 impl ReadinessSources {
     pub(crate) fn from_coordinator(c: &super::ApplicationCoordinator) -> Self {
         Self {
+            autonomous_config_enabled: c.autonomous_config_enabled.clone(),
             tx_policy: c.tx_policy.clone(),
             tx_restart_inhibit: c.tx_restart_inhibit.clone(),
             hamlib_command_loop_ready: c.hamlib_command_loop_ready.clone(),
@@ -109,6 +111,7 @@ impl ReadinessSources {
         );
         let degraded = compose_degraded(supervisor, self.audit.health().unavailable);
         StationReadiness {
+            autonomous_config_disabled: !self.autonomous_config_enabled.load(Ordering::Acquire),
             tx_mute_causes,
             ptt_off_unconfirmed: self.ptt_off_unconfirmed.load(Ordering::Acquire),
             clock: tui_clock_state(self.clock_skew.status()),
@@ -283,6 +286,7 @@ mod tests {
 
     fn sources() -> ReadinessSources {
         ReadinessSources {
+            autonomous_config_enabled: Arc::new(AtomicBool::new(true)),
             tx_policy: Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8())),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
@@ -308,6 +312,19 @@ mod tests {
             cached_lookup: Arc::new(CachedStationLookup::new()),
             last_tx_mute_causes: RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn pan302_snapshot_tracks_config_permission() {
+        let s = sources();
+        let enabled = s.snapshot(false, false);
+        assert!(!enabled.autonomous_config_disabled);
+        s.autonomous_config_enabled.store(false, Ordering::Release);
+        let disabled = s.snapshot(false, false);
+        assert!(disabled.autonomous_config_disabled);
+        assert_eq!(enabled.tx_mute_causes, disabled.tx_mute_causes);
+        s.autonomous_config_enabled.store(true, Ordering::Release);
+        assert_eq!(enabled, s.snapshot(false, false));
     }
 
     /// An audit log whose writes fail: its parent directory does not exist.
@@ -394,6 +411,7 @@ mod tests {
         assert_eq!(
             s.snapshot(true, true),
             StationReadiness {
+                autonomous_config_disabled: false,
                 tx_mute_causes: vec![TuiTxMuteCause::PolicyDisabled],
                 ptt_off_unconfirmed: true,
                 clock: ClockState::Unreachable,

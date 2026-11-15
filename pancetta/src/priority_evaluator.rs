@@ -8,6 +8,7 @@ use pancetta_qso::priority::{NeedSource, WorkedStationLookup};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod local_log;
 use local_log::LocalLog;
@@ -162,7 +163,8 @@ pub struct CachedStationLookup {
     /// band name, value = set of 4-char uppercase Maidenhead fields.
     worked_grids_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Callsigns where a recent QSO attempt failed.
-    recent_failures: Arc<RwLock<HashSet<String>>>,
+    recent_failures: Arc<RwLock<HashMap<String, Instant>>>,
+    recent_failure_window: Duration,
     /// DXCC entity identities cqdx.io lists as still needed, with whether
     /// cqdx has answered at all (PAN-93). An empty `Loaded` list means
     /// "nothing needed"; anything but `Loaded` means "unknown".
@@ -223,11 +225,18 @@ impl Default for CachedStationLookup {
 
 impl CachedStationLookup {
     pub fn new() -> Self {
+        Self::with_recent_failure_window(Duration::from_secs(
+            pancetta_config::AutonomousConfig::default().recent_failure_window_secs,
+        ))
+    }
+
+    pub fn with_recent_failure_window(recent_failure_window: Duration) -> Self {
         Self {
             worked_on_band: Arc::new(RwLock::new(HashMap::new())),
             worked_dxcc_on_band: Arc::new(RwLock::new(HashMap::new())),
             worked_grids_on_band: Arc::new(RwLock::new(HashMap::new())),
-            recent_failures: Arc::new(RwLock::new(HashSet::new())),
+            recent_failures: Arc::new(RwLock::new(HashMap::new())),
+            recent_failure_window,
             needed_dxcc: Arc::new(RwLock::new(NeedList::default())),
             needed_atno: Arc::new(RwLock::new(EntitySet::default())),
             needed_grids: Arc::new(RwLock::new(NeedList::default())),
@@ -495,10 +504,6 @@ impl CachedStationLookup {
     pub fn state_for(&self, callsign: &str) -> Option<String> {
         let key = resolved_identity(callsign)?;
         self.station_states.read().get(&key).cloned()
-    }
-
-    pub fn update_recent_failures(&self, callsigns: HashSet<String>) {
-        *self.recent_failures.write() = callsigns;
     }
 
     /// Install an all-bands cqdx needed-entity answer fetched now.
@@ -789,14 +794,27 @@ impl CachedStationLookup {
     }
 
     pub fn record_failure(&self, callsign: &str) {
-        // PAN-58 round 1: canonicalize on write so a later resolved-form
-        // lookup (`is_recent_failure`) actually finds it — see
-        // `resolved_identity`'s doc comment. Never record the unresolved
-        // hash-miss placeholder; it isn't a real station identity.
-        let Some(upper) = resolved_identity(callsign) else {
-            return;
-        };
-        self.recent_failures.write().insert(upper);
+        self.record_failure_at(callsign, Instant::now());
+    }
+
+    fn record_failure_at(&self, callsign: &str, now: Instant) {
+        let mut failures = self.recent_failures.write();
+        failures.retain(|_, failed_at| {
+            now.saturating_duration_since(*failed_at) < self.recent_failure_window
+        });
+        if !self.recent_failure_window.is_zero() {
+            if let Some(identity) = resolved_identity(callsign) {
+                failures.insert(identity, now);
+            }
+        }
+    }
+
+    fn is_recent_failure_at(&self, callsign: &str, now: Instant) -> bool {
+        let mut failures = self.recent_failures.write();
+        failures.retain(|_, failed_at| {
+            now.saturating_duration_since(*failed_at) < self.recent_failure_window
+        });
+        resolved_identity(callsign).is_some_and(|identity| failures.contains_key(&identity))
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
@@ -967,12 +985,7 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
-        // PAN-58 round 1 (Codex P2): resolve before the exact-key lookup —
-        // see `resolved_identity`'s doc comment.
-        let Some(upper) = resolved_identity(callsign) else {
-            return false;
-        };
-        self.recent_failures.read().contains(&upper)
+        self.is_recent_failure_at(callsign, Instant::now())
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
@@ -1261,6 +1274,99 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn expired_failure_does_not_penalise_cq_scores() {
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+        let control = CachedStationLookup::new();
+        let expired = CachedStationLookup::new();
+        expired.record_failure_at("DL1ABC", Instant::now() - Duration::from_secs(7200));
+        let fresh = CachedStationLookup::new();
+        fresh.record_failure("DL1ABC");
+        let weights = PriorityWeights {
+            recent_failure_penalty: -0.02,
+            ..PriorityWeights::default()
+        };
+        let scorer = |lookup| PriorityScorer::new(weights.clone(), Box::new(lookup));
+        let control = scorer(control);
+        let expired = scorer(expired);
+        let fresh = scorer(fresh);
+        let normal = |s: &PriorityScorer| s.score_cq_detailed("DL1ABC", None, -10, 14_074_000.0);
+        let explained =
+            |s: &PriorityScorer| s.score_tiered_explained("DL1ABC", None, -10, 14_074_000.0);
+        assert_eq!(normal(&expired).total, normal(&control).total);
+        assert_eq!(normal(&expired).recent_failure_penalty, 0.0);
+        assert_eq!(normal(&fresh).recent_failure_penalty, 1.0);
+        assert!(
+            (normal(&fresh).total - normal(&control).total - weights.recent_failure_penalty).abs()
+                < 1e-12
+        );
+        assert!(normal(&fresh).total < normal(&control).total);
+        assert_eq!(explained(&expired), explained(&control));
+        assert!(!explained(&expired).factors.recent_failure);
+        assert_eq!(
+            explained(&expired)
+                .factors
+                .terms
+                .recent_failure
+                .contribution(),
+            0.0
+        );
+        assert_eq!(
+            explained(&fresh)
+                .factors
+                .terms
+                .recent_failure
+                .contribution(),
+            weights.recent_failure_penalty
+        );
+        assert!(explained(&fresh).factors.recent_failure);
+        assert!(explained(&fresh).score.secondary < explained(&control).score.secondary);
+        for s in [&control, &expired, &fresh] {
+            assert!(normal(s).total > 0.0 && normal(s).total < 1.0);
+            assert!(explained(s).score.secondary > 0.0 && explained(s).score.secondary < 1.0);
+        }
+    }
+
+    #[test]
+    fn recent_failure_expires_at_window_boundary() {
+        let now = Instant::now();
+        for seconds in [1799, 1800, 7200] {
+            let lookup = CachedStationLookup::new();
+            lookup.record_failure_at("DL1ABC", now);
+            assert_eq!(
+                lookup.is_recent_failure_at("DL1ABC", now + Duration::from_secs(seconds)),
+                seconds < 1800
+            );
+            assert_eq!(
+                lookup.recent_failures.read().len(),
+                usize::from(seconds < 1800)
+            );
+        }
+    }
+
+    #[test]
+    fn recent_failure_refreshes_shared_canonical_identity() {
+        let lookup = CachedStationLookup::new();
+        let clone = lookup.clone();
+        let now = Instant::now();
+        lookup.record_failure_at("<dl1abc>", now);
+        assert!(clone.is_recent_failure_at("DL1ABC", now));
+        clone.record_failure_at("DL1ABC", now + Duration::from_secs(1799));
+        assert!(lookup.is_recent_failure_at("<DL1ABC>", now + Duration::from_secs(1800)));
+        assert_eq!(lookup.recent_failures.read().len(), 1);
+        assert!(!lookup.is_recent_failure_at("DL1ABC", now + Duration::from_secs(3599)));
+        lookup.record_failure_at("<...>", now);
+        assert!(lookup.recent_failures.read().is_empty());
+    }
+
+    #[test]
+    fn zero_recent_failure_window_disables_penalty() {
+        let lookup = CachedStationLookup::with_recent_failure_window(Duration::ZERO);
+        lookup.record_failure("DL1ABC");
+        assert!(!lookup.is_recent_failure("DL1ABC"));
+        assert!(lookup.recent_failures.read().is_empty());
+    }
 
     #[tokio::test]
     async fn display_adapter_gates_availability_and_reuses_grid_predicate() {

@@ -820,7 +820,9 @@ async fn flush_qso_cleanup(ctx: &mut ArmContext, bus: &MessageBus) {
 }
 
 /// The outcome of the one-controller-at-a-time gate for a control-mutating
-/// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`).
+/// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`). Every caller checks the
+/// peer's hello capability first (PAN-283: `qsy` for all but `StopCq`, which
+/// needs any live scope), so the gate itself never looks at the capability.
 enum ControllerGate {
     /// The peer may proceed. Carries any `controlState` frames from an implicit
     /// grab (empty when the peer was already the controller).
@@ -831,7 +833,10 @@ enum ControllerGate {
 }
 
 /// Apply rules 3 (implicit grab) + 4 (exclusivity) for a control-mutating
-/// action from `peer`:
+/// action from `peer`. Callers reach it only after the peer's hello capability
+/// check (PAN-283: [`refuse_without_control_capability`] for
+/// `Arm`/`Qsy`/`SetSplit`/`TxRequest`; any live scope for `StopCq`), so an
+/// implicit grab is never made by a peer without a currently-valid hello:
 /// - no controller yet → `peer` implicitly grabs control (+ `controlState`),
 ///   then proceeds;
 /// - `peer` already holds control → proceed with no extra frames;
@@ -843,6 +848,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
             // Rule 3 — implicit grab keeps a single connected client (today's
             // only real-world case, which never sends takeControl) working with
             // zero behavior change. PAN-137 also cleans up other clients' QSOs.
+            // The caller has already checked the hello capability (PAN-283).
             ctx.controller = Some(peer.to_string());
             owe_qso_cleanup(ctx, peer);
             debug!(target: "agent.control", peer = %peer, "implicit control grab (no controller set)");
@@ -869,6 +875,36 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
             }])
         }
     }
+}
+
+/// PAN-283: an action that can take control (`Arm`, `Qsy`, `SetSplit`,
+/// `TxRequest`, `TakeControl`) needs a currently-valid qsy-or-higher hello
+/// capability, checked before any gate or side effect. Returns `None` when the
+/// peer holds one. Otherwise logs `verb`, records an audit `TxDenied` with
+/// `audit_detail` when given, and returns the refusal: no frame (a peer
+/// without a live hello may be sent nothing, PAN-95), no controller change, no
+/// owed cleanup.
+fn refuse_without_control_capability(
+    ctx: &ArmContext,
+    peer: &str,
+    verb: &str,
+    audit_detail: Option<String>,
+    now: ArmTime,
+) -> Option<DispatchOutcome> {
+    if peer_grants(ctx, peer, "qsy", now.unix_ms) {
+        return None;
+    }
+    warn!(target: "agent.control", peer = %peer, verb,
+        "refused — no currently-valid qsy-scoped hello capability for this peer");
+    if let Some(detail) = audit_detail {
+        ctx.audit.record(&AuditEvent {
+            ts_unix_ms: now.unix_ms,
+            kind: AuditKind::TxDenied,
+            operator_callsign: None,
+            detail,
+        });
+    }
+    Some(DispatchOutcome::cont())
 }
 
 async fn remote_qsy_refusal(ctx: &ArmContext, bus: &MessageBus) -> Option<&'static str> {
@@ -913,6 +949,14 @@ fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
 /// mutation, audit writes, and best-effort bus sends. This is the security spine
 /// of the component and is unit-tested directly.
 ///
+/// PAN-283: `Arm`, `Qsy`, `SetSplit`, `TxRequest` and `TakeControl` can take
+/// control, so each first requires a currently-valid `qsy`-or-higher hello
+/// capability ([`refuse_without_control_capability`]); `StopCq` requires a
+/// live hello of any scope. Those checks run before the controller gate and
+/// before any other side effect, so a refused action grabs nothing, sends no
+/// frame and owes no PAN-137 cleanup (`Arm` and `TxRequest` refusals are
+/// audited `TxDenied`).
+///
 /// - `Arm { capability_token, grant }` → verify the capabilityToken as a
 ///   SEPARATE input (against the pinned IdP key) then verify the client-signed
 ///   grant (fail-closed, including the `txEnabledUntil` clock-2 gate + the
@@ -932,7 +976,9 @@ fn qsy_refused(peer: &str, command: &str, reason: &str) -> DispatchOutcome {
 ///   `arm_jti` is a sanity match, NOT a security gate: disarm-any always
 ///   proceeds; a non-empty arm_jti that doesn't match the live arm still
 ///   disarms but logs a `warn!`.
-/// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
+/// - `Qsy` / `SetSplit` → after the capability check, the PAN-252 activity
+///   refusal and the controller gate, a coordinator `RigControlMessage`
+///   (NON-TX rig control).
 /// - `TxRequest(_)` → refused (audited `TxDenied`) while this channel's own
 ///   consent (`remote_tx_enabled`) is off; otherwise audited `TxRequested` +
 ///   routed into the REAL QSO engine via a `remote_origin = true`
@@ -978,8 +1024,19 @@ async fn dispatch_action(
             capability_token,
             grant,
         } => {
+            // PAN-283: arming takes control, so it needs a currently-valid
+            // qsy-or-higher hello capability, checked before any side effect.
+            if let Some(refused) = refuse_without_control_capability(
+                ctx,
+                peer,
+                "arm",
+                Some("arm refused: no currently-valid qsy-scoped hello capability".to_string()),
+                now,
+            ) {
+                return refused;
+            }
             // Rule 3/4: arming is a control-mutating action — gate on the
-            // controller first (implicit grab if unset; refuse a non-controller).
+            // controller next (implicit grab if unset; refuse a non-controller).
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1075,6 +1132,14 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            // PAN-283: the capability check runs first, ahead of the PAN-252
+            // activity refusal, so a peer without the tier grabs nothing and
+            // learns nothing about rig or QSO activity.
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "setFrequency", None, now)
+            {
+                return refused;
+            }
             if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setFrequency", reason);
             }
@@ -1082,10 +1147,6 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "setFrequency refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont_with(grab);
-            }
             let msg = RigControlMessage::SetFrequency {
                 vfo: vfo.clamp(0, u8::MAX as i64) as u8,
                 frequency: frequency_hz.max(0.0) as u64,
@@ -1097,6 +1158,12 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
+            // PAN-283: capability first, as for `Qsy`.
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "setSplit", None, now)
+            {
+                return refused;
+            }
             if let Some(reason) = remote_qsy_refusal(ctx, bus).await {
                 return qsy_refused(peer, "setSplit", reason);
             }
@@ -1104,10 +1171,6 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont_with(grab);
-            }
             let tx_frequency = tx_frequency_hz.max(0.0) as u64;
             info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
             let store = crate::coordinator::forward_split_change(
@@ -1131,6 +1194,28 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(grab)
         }
         ControlAction::TxRequest(kind) => {
+            let detail = match &kind {
+                TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
+                TxKind::AnswerCaller { callsign, step, .. } => {
+                    format!("answerCaller {callsign} step={step}")
+                }
+                TxKind::StartCq { offset_hz } => format!("startCq offset={offset_hz}"),
+            };
+            // PAN-283: a TX request takes control and opens a remote-origin
+            // QSO, so it needs a currently-valid qsy-or-higher hello
+            // capability, checked before the gate: a refused request grabs
+            // nothing, owes no cleanup and creates no QSO.
+            if let Some(refused) = refuse_without_control_capability(
+                ctx,
+                peer,
+                "txRequest",
+                Some(format!(
+                    "txRequest refused: no currently-valid qsy-scoped hello capability ({detail})"
+                )),
+                now,
+            ) {
+                return refused;
+            }
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
@@ -1158,13 +1243,6 @@ async fn dispatch_action(
             // the request is refused (audited `TxDenied`) and no QSO is
             // created. Another channel's consent never satisfies this check.
             // A poisoned arm lock refuses too (fail-closed).
-            let detail = match &kind {
-                TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
-                TxKind::AnswerCaller { callsign, step, .. } => {
-                    format!("answerCaller {callsign} step={step}")
-                }
-                TxKind::StartCq { offset_hz } => format!("startCq offset={offset_hz}"),
-            };
             let (consented, operator_callsign) = match ctx.arm.lock() {
                 Ok(st) => (
                     st.channel_consent(ConsentChannel::StationAgent),
@@ -1275,9 +1353,10 @@ async fn dispatch_action(
             // end its QSOs, so it needs a currently-valid qsy-or-higher hello
             // capability. Checked before any side effect: a refused takeover
             // leaves the controller, its arm and any owed cleanup untouched.
-            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
-                warn!(target: "agent.control", peer = %peer, "takeControl refused — no currently-valid qsy-scoped hello capability for this peer");
-                return DispatchOutcome::cont();
+            if let Some(refused) =
+                refuse_without_control_capability(ctx, peer, "takeControl", None, now)
+            {
+                return refused;
             }
             // An authorized grab always succeeds. If it displaces a DIFFERENT
             // controller, disarm that controller's arm FIRST (arms never
@@ -1582,6 +1661,9 @@ fn verify_and_arm(
     // blocks behind that queued writer too, which itself is waiting on the
     // first read to release — a genuine self-deadlock.
     drop(allow_list);
+    // The trust publisher takes arm before writing keys. Release this read
+    // guard before waiting for arm to keep that lock order consistent.
+    drop(client_keys);
 
     // Arm the shared state (audits Armed, or refuses a no-scope grant).
     let effects = match ctx.arm.lock() {
@@ -1603,6 +1685,14 @@ fn verify_and_arm(
                 return Err(format!(
                     "client {client_key_id} not in station-local TX-arm-allow-list \
                      (revoked by a concurrent authorization refresh)"
+                ));
+            }
+            // Trust may have been replaced while this grant was verified.
+            // The publisher holds arm while replacing keys, so compare the
+            // actual verifying key under arm, not just keyId eligibility.
+            if ctx.client_keys.read().unwrap().get(client_key_id) != Some(&client_vk) {
+                return Err(format!(
+                    "device key for client {client_key_id} changed during arm verification"
                 ));
             }
             // Arming over this channel requires THIS channel's own consent
@@ -1817,11 +1907,8 @@ pub(crate) fn revoke_static_allow_list_entries(
         return false;
     }
     let mut effects = Vec::new();
+    let mut st = arm.lock().unwrap_or_else(|p| p.into_inner());
     let arm_changed = {
-        let mut st = match arm.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let armed_removed = st
             .armed_client_key_id()
             .is_some_and(|cur| removed.iter().any(|r| r == cur));
@@ -1865,6 +1952,7 @@ pub(crate) fn revoke_static_allow_list_entries(
     if changed {
         live.authz_generation.fetch_add(1, Ordering::AcqRel);
     }
+    drop(st);
     apply_arm_effects(audit, &effects);
     changed
 }
@@ -1882,19 +1970,20 @@ pub(crate) fn revoke_static_allow_list_entries(
 /// edge has since become delegated reuse a still-valid enabled token after a
 /// restart, defeating the whole connection-admission/TX-arm split.
 ///
-/// When cqdx auto-populate is NOT going to run, there is no delegation
-/// concept at all in the pure-config path, so `tx_arm_allow_list` clones
-/// `static_tx_allow_list` and (absent a poll task to ever diverge it) stays
-/// permanently equal to it — this is the pre-existing, intended behavior for
-/// non-cqdx-integrated stations, unchanged.
+/// Static mode seeds only locally trusted entries from the configured list.
 fn seed_tx_arm_allow_list(
     static_tx_allow_list: &HashSet<String>,
     cqdx_will_poll: bool,
+    keys: &std::collections::HashMap<String, VerifyingKey>,
 ) -> HashSet<String> {
     if cqdx_will_poll {
         HashSet::new()
     } else {
-        static_tx_allow_list.clone()
+        static_tx_allow_list
+            .iter()
+            .filter(|k| keys.contains_key(*k))
+            .cloned()
+            .collect()
     }
 }
 
@@ -2044,34 +2133,16 @@ impl super::ApplicationCoordinator {
             pinned_idp_keys: paired.idp_keys.clone(),
         };
 
-        // The station-local TX-allow-list + the (client keyId → device key) map.
-        // v1 has no device-key registry beyond the allow-list of keyIds; the
-        // client's device verifying key is not known until pairing extends it.
-        // For P3.4b the client device keys are supplied via the allow-list AND
-        // an (optional) sidecar — absent that, the grant's clientSig cannot be
-        // checked, so an un-registered client fails closed at verify time.
+        // clients/<keyId>.pub is the local trust root, written by pancetta trust-client.
         let tx_allow_list: HashSet<String> = cfg.tx_allow_list.iter().cloned().collect();
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
-        // CQD-11 / dispensa Q-0052 follow-up: the TX-arm-eligible seed must
-        // be FAIL-CLOSED, not fail-open. This condition mirrors the poll-task
-        // spawn gate below EXACTLY (`cqdx_cfg.enabled` + a non-empty token) —
-        // when cqdx auto-populate WILL run, `tx_arm_allow_list` starts EMPTY:
-        // nobody can arm TX until a successful poll proves who's
-        // non-delegated. Cloning the static list here (the original PR #259
-        // approach) lets every statically-listed client arm before the first
-        // poll succeeds — and indefinitely if cqdx stays unreachable,
-        // including reusing a still-valid enabled token after a restart for
-        // a client whose edge has since become delegated. `tx_allow_list`
-        // (connection admission) is UNCHANGED — a delegated guest can still
-        // connect from the first second, just never arm. Only the
-        // cqdx-DISABLED path (no delegation concept at all) clones the
-        // static list, matching pre-existing behavior for non-cqdx-
-        // integrated stations, permanently.
+        // Cloud mode starts fail-closed until the first successful owner-edge poll.
         let cqdx_will_poll =
             cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty());
         let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(seed_tx_arm_allow_list(
             &tx_allow_list,
             cqdx_will_poll,
+            &client_keys,
         )));
         let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
         let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
@@ -2174,6 +2245,32 @@ impl super::ApplicationCoordinator {
                 .await;
             });
             self.station_agent_poll = Some(poll_handle.abort_handle());
+        } else {
+            let live = StationAgentLiveHandles {
+                tx_allow_list: tx_allow_list.clone(),
+                tx_arm_allow_list: tx_arm_allow_list.clone(),
+                client_keys: client_keys.clone(),
+                revocation_pending: revocation_pending.clone(),
+                authz_generation: authz_generation.clone(),
+                stop_requested: stop_requested.clone(),
+            };
+            let refresh_arm = arm.clone();
+            let refresh_audit = audit.clone();
+            let refresh_shutdown = shutdown.clone();
+            let refresh_dir = key_dir.clone();
+            let interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
+            let task = tokio::spawn(async move {
+                local_trust_refresh_loop(
+                    live,
+                    refresh_arm,
+                    refresh_audit,
+                    refresh_dir,
+                    refresh_shutdown,
+                    interval,
+                )
+                .await;
+            });
+            self.station_agent_poll = Some(task.abort_handle());
         }
 
         // PAN-103: live handles for config-edit revocation (see
@@ -2256,8 +2353,8 @@ pub fn default_key_dir() -> std::path::PathBuf {
 
 /// Load client device verifying keys from `key_dir/clients/<keyId>.pub` (raw
 /// 32-byte Ed25519), for each allow-listed keyId. Missing/invalid files are
-/// skipped (that client then fails closed at verify time). Populated by the
-/// pairing CLI (P3.4c); absent it, the map is empty and no client can arm.
+/// skipped (that client then fails closed at verify time). Written by
+/// `pancetta trust-client`; absent local trust, no client can arm.
 fn load_client_device_keys(
     key_dir: &std::path::Path,
     allow: &HashSet<String>,
@@ -2265,13 +2362,10 @@ fn load_client_device_keys(
     let mut out = std::collections::HashMap::new();
     let dir = key_dir.join("clients");
     for kid in allow {
-        // keyIds are base64url (may contain '/','+','=' in padded form, but the
-        // agent keyId form is unpadded base64url — no '/'); guard the filename.
-        let safe: String = kid
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        let path = dir.join(format!("{safe}.pub"));
+        if pancetta_agent::trust::validate_key_id(kid).is_err() {
+            continue;
+        }
+        let path = dir.join(format!("{kid}.pub"));
         if let Ok(bytes) = std::fs::read(&path) {
             if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
                 if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
@@ -2283,6 +2377,98 @@ fn load_client_device_keys(
     out
 }
 
+type ClientKeys = std::collections::HashMap<String, VerifyingKey>;
+type AuthorizationSnapshot = (HashSet<String>, HashSet<String>, ClientKeys);
+
+/// Publish eligibility and disarm under the same lock used at arm time.
+/// Without a fresh cloud snapshot, read current admission under that lock so
+/// a concurrent config removal cannot be restored from a stale snapshot.
+/// Cached owner edges distinguish cloud refresh from static mode.
+fn publish_trust(
+    live: &StationAgentLiveHandles,
+    arm: &Mutex<ArmState>,
+    audit: &AuditLog,
+    cloud: Option<AuthorizationSnapshot>,
+    cached_owners: Option<&HashSet<String>>,
+    key_dir: &std::path::Path,
+) {
+    let mut st = arm.lock().unwrap_or_else(|p| p.into_inner());
+    let is_cloud = cloud.is_some() || cached_owners.is_some();
+    let (admission, candidates, keys) = cloud.unwrap_or_else(|| {
+        let admission = live
+            .tx_allow_list
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let keys = load_client_device_keys(key_dir, &admission);
+        let candidates = cached_owners.cloned().unwrap_or_else(|| admission.clone());
+        (admission, candidates, keys)
+    });
+    let eligible: HashSet<String> = candidates
+        .iter()
+        .filter(|k| keys.contains_key(*k))
+        .cloned()
+        .collect();
+    let mut effects = Vec::new();
+    let current_keys = live.client_keys.read().unwrap_or_else(|p| p.into_inner());
+    if let Some(kid) = st
+        .armed_client_key_id()
+        .filter(|kid| !eligible.contains(*kid) || current_keys.get(*kid) != keys.get(*kid))
+    {
+        let reason = if candidates.contains(kid) {
+            DisarmReason::LocalTrustRevoked
+        } else {
+            DisarmReason::AuthorizationRevoked
+        };
+        effects = st.disarm_with_reason(reason, now_ms());
+        live.revocation_pending.store(true, Ordering::Release);
+    }
+    drop(current_keys);
+    let mut current = live
+        .tx_arm_allow_list
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut changed = *current != eligible;
+    *current = eligible;
+    drop(current);
+    if is_cloud {
+        let mut current = live
+            .tx_allow_list
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        changed |= *current != admission;
+        *current = admission;
+    }
+    let mut current_keys = live.client_keys.write().unwrap_or_else(|p| p.into_inner());
+    changed |= *current_keys != keys;
+    *current_keys = keys;
+    drop(current_keys);
+    if changed {
+        live.authz_generation.fetch_add(1, Ordering::AcqRel);
+    }
+    drop(st);
+    apply_arm_effects(audit, &effects);
+    if is_cloud {
+        info!(target: "agent", "txArmSet = localTrust ∩ owner edges");
+    } else {
+        info!(target: "agent", "txArmSet = localTrust ∩ static tx_allow_list");
+    }
+}
+
+async fn local_trust_refresh_loop(
+    live: StationAgentLiveHandles,
+    arm: Arc<Mutex<ArmState>>,
+    audit: AuditLog,
+    key_dir: std::path::PathBuf,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    interval: Duration,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        publish_trust(&live, &arm, &audit, None, None, &key_dir);
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Periodically refresh the shared `tx_allow_list`/`tx_arm_allow_list`/
 /// `client_keys` from cqdx's live authorization data (dispensa Q-0043
 /// auto-populate; the `tx_arm_allow_list` split is CQD-11 / dispensa Q-0052).
@@ -2291,12 +2477,10 @@ fn load_client_device_keys(
 /// `start_station_agent_component`).
 ///
 /// Fail-safe: any poll failure (network error, non-2xx status including a
-/// 404, malformed JSON) is logged at WARN and the shared state is left
-/// UNTOUCHED — a transient cqdx outage (relevant right now: cqdx.io's
-/// production deploy is currently down) must never spuriously revoke an
-/// already-admitted, connected client. Only a successful poll (a 200 with a
-/// parseable body, even if `authorizations` is genuinely empty) replaces
-/// the shared contents.
+/// 404, malformed JSON) is logged at WARN and retains cloud admission and
+/// owner edges. Local trust is refreshed independently every interval, even
+/// while a request is pending, so an outage cannot postpone local untrust.
+/// Only a successful poll replaces cloud authority; an empty response revokes it.
 ///
 /// Disarm-on-revocation + atomic publish (CQD-11 / dispensa Q-0052
 /// follow-up): `verify_and_arm`'s `tx_arm_allow_list` gate only runs at ARM
@@ -2327,7 +2511,7 @@ fn load_client_device_keys(
 /// bumps `authz_generation` after publishing them. The session loop notices
 /// within one `RECV_TICK` and runs [`reconcile_authorizations`], which evicts
 /// already-connected peers the new lists dropped and admits newly listed ones.
-/// A poll that changes nothing, or fails, bumps nothing.
+/// Local trust changes also bump the generation. A failed poll alone does not.
 #[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
@@ -2354,8 +2538,34 @@ async fn poll_authorizations_loop(
         }
     };
 
+    let live = StationAgentLiveHandles {
+        tx_allow_list,
+        tx_arm_allow_list,
+        client_keys,
+        revocation_pending,
+        authz_generation,
+        stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    // Keep full owner edges, not the locally intersected eligibility set.
+    // Before the first successful response the cloud seed remains fail-closed.
+    let mut owner_edges: Option<HashSet<String>> = None;
+    let mut refresh = tokio::time::interval(interval);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let client = &client;
+    let fetch = |delay| async move {
+        tokio::time::sleep(delay).await;
+        client.fetch_authorizations().await
+    };
+    let mut poll = Box::pin(fetch(Duration::ZERO));
     while !shutdown.load(Ordering::Acquire) {
-        match client.fetch_authorizations().await {
+        tokio::select! {
+        _ = refresh.tick() => {
+            if let Some(owners) = &owner_edges {
+                publish_trust(&live, &arm, &audit, None, Some(owners), &key_dir);
+            }
+        }
+        result = &mut poll => {
+        match result {
             Ok(edges) => {
                 // Connection-admission set: scope-blind, `agentKeyId` only —
                 // a delegated status/qsy guest edge (CQD-4) legitimately
@@ -2378,76 +2588,27 @@ async fn poll_authorizations_loop(
                     .map(|e| e.client_key_id.clone())
                     .collect();
                 let new_keys = load_client_device_keys(&key_dir, &new_allow);
-                let allow_len = new_allow.len();
-                let tx_arm_len = new_tx_arm_allow.len();
-
-                // Disarm-on-revocation + atomic publish: see the fn-level
-                // doc above. Poisoned-lock handling mirrors
-                // `RemoteTxDisarmGuard::drop` — a poisoned arm mutex must
-                // never block publishing the refreshed TX-arm-eligible set.
-                let arm_changed;
-                let mut effects = Vec::new();
-                {
-                    let mut st = match arm.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    let should_disarm = st
-                        .armed_client_key_id()
-                        .is_some_and(|cur| !new_tx_arm_allow.contains(cur));
-                    if should_disarm {
-                        // PAN-104: audited below, after the locks are
-                        // released and the refreshed lists are published.
-                        effects =
-                            st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
-                        // Flag the session loop (a SEPARATE tokio task, so it
-                        // cannot be signaled by directly calling
-                        // control_state_sends/deliver_sends here) to
-                        // broadcast the updated control state on its next
-                        // tick — see the fn-level doc above.
-                        revocation_pending.store(true, Ordering::Release);
-                        warn!(
-                            target: "agent.tx",
-                            "remote TX disarmed: an authorization refresh revoked the \
-                             current controller's TX-arm eligibility"
-                        );
-                    }
-                    // Published WHILE STILL HOLDING `arm`'s lock — this is
-                    // the atomicity guarantee `verify_and_arm`'s re-check
-                    // relies on.
-                    let mut g = tx_arm_allow_list.write().unwrap();
-                    arm_changed = *g != new_tx_arm_allow;
-                    *g = new_tx_arm_allow;
-                }
-
-                let allow_changed = {
-                    let mut g = tx_allow_list.write().unwrap();
-                    let changed = *g != new_allow;
-                    *g = new_allow;
-                    changed
-                };
-                *client_keys.write().unwrap() = new_keys;
-                if arm_changed || allow_changed {
-                    // PAN-96: bumped AFTER publishing, so a session that
-                    // observes the new generation reads the new lists.
-                    authz_generation.fetch_add(1, Ordering::AcqRel);
-                }
-                apply_arm_effects(&audit, &effects);
-                debug!(
-                    target: "agent",
-                    "authorizations poll: refreshed tx_allow_list ({} client(s) admitted for this agent, {} TX-arm-eligible)",
-                    allow_len, tx_arm_len
+                owner_edges = Some(new_tx_arm_allow.clone());
+                publish_trust(
+                    &live,
+                    &arm,
+                    &audit,
+                    Some((new_allow, new_tx_arm_allow, new_keys)),
+                    None,
+                    &key_dir,
                 );
             }
             Err(e) => {
                 warn!(
                     target: "agent",
-                    "authorizations poll failed: {e} — keeping last-known-good tx_allow_list/tx_arm_allow_list, retrying in {:?}",
+                    "authorizations poll failed: {e}; retaining cloud authority and refreshing local trust, retrying in {:?}",
                     interval
                 );
             }
         }
-        tokio::time::sleep(interval).await;
+        poll = Box::pin(fetch(interval));
+        }
+        }
     }
 }
 
@@ -3064,6 +3225,17 @@ mod tests {
         m
     }
 
+    /// PAN-283: give established peer `peer` a verified hello carrying
+    /// `scope`, valid until `NOW + 600_000`. Control actions (`Arm`, `Qsy`,
+    /// `SetSplit`, `TxRequest`, `TakeControl`) need `qsy` or `tx`; the
+    /// `ctx_with` default peer stays unauthorized.
+    fn with_hello(ctx: &mut ArmContext, peer: &str, scope: &str) {
+        ctx.peers.insert(
+            peer.to_string(),
+            PeerCtx::authorized_until(vec![scope.to_string()], NOW + 600_000),
+        );
+    }
+
     fn ctx_with(allow_client: bool, have_device_key: bool) -> ArmContext {
         let mut allow = HashSet::new();
         if allow_client {
@@ -3479,6 +3651,7 @@ mod tests {
     #[tokio::test]
     async fn arm_from_allowlisted_client_permits_tx() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let d = dispatch_action(
@@ -3509,7 +3682,8 @@ mod tests {
     /// the sets directly.
     #[tokio::test]
     async fn owner_edge_is_both_admitted_and_tx_arm_eligible() {
-        let ctx = ctx_with(true, true);
+        let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         assert!(
             ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
             "an owner's client keyId must be in the connection-admission set"
@@ -3527,6 +3701,7 @@ mod tests {
         // `arm_from_allowlisted_client_permits_tx` — kept as an explicit,
         // separately-named CQD-11 regression pin).
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let d = dispatch_action(
@@ -3557,6 +3732,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_edge_is_admitted_but_not_tx_arm_eligible() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         // Simulate the poll having classified CLIENT_KEY_ID as a delegated
         // edge: still connection-admitted (and its device key still loaded —
         // admission doesn't change), but removed from the TX-arm-eligible set.
@@ -4052,6 +4228,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_loss_disarms_after_timeout() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4079,6 +4256,7 @@ mod tests {
         );
         // A heartbeat *before* the deadline slides the window.
         let mut ctx2 = ctx_with(true, true);
+        with_hello(&mut ctx2, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx2, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("arm-jti-1"),
@@ -4114,6 +4292,7 @@ mod tests {
     #[tokio::test]
     async fn stale_seq_heartbeat_does_not_extend_the_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
@@ -4193,6 +4372,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_arm_jti_heartbeat_is_rejected() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4264,6 +4444,7 @@ mod tests {
     #[tokio::test]
     async fn udp_consent_does_not_enable_station_agent_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         // Mirror production seeding for remote_tx_enabled=false +
         // wsjtx_udp.enabled=true + allow_tx_initiation=true.
         with_channel_consent(&ctx, ConsentChannel::StationAgent, false);
@@ -4319,6 +4500,7 @@ mod tests {
     #[tokio::test]
     async fn tx_request_refused_when_station_agent_consent_off() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, false);
         with_channel_consent(&ctx, ConsentChannel::WsjtxUdp, true);
         let bus = MessageBus::new(64).unwrap();
@@ -4361,6 +4543,7 @@ mod tests {
     #[tokio::test]
     async fn arm_and_tx_request_still_work_when_own_consent_on_and_wsjtx_off() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         with_channel_consent(&ctx, ConsentChannel::WsjtxUdp, false);
         let bus = MessageBus::new(64).unwrap();
@@ -4438,6 +4621,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_disarm_clears_arm() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4555,6 +4739,7 @@ mod tests {
     #[tokio::test]
     async fn tx_disarm_with_arm_jti_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4593,6 +4778,7 @@ mod tests {
     #[tokio::test]
     async fn tx_disarm_mismatched_arm_jti_still_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -4637,6 +4823,7 @@ mod tests {
     #[tokio::test]
     async fn tx_request_routes_to_qso_engine_but_never_arms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         // Subscribe to the QSO component's inbox so we can assert the routed msg.
@@ -4692,7 +4879,8 @@ mod tests {
     }
 
     // PAN-137: controller cleanup uses the same ordered inbox as QSO intents.
-    // B holds a qsy hello so its explicit takeover is authorized (PAN-253).
+    // B holds a qsy hello so its explicit takeover is authorized (PAN-253);
+    // A holds one too so its arm and TX requests may take control (PAN-283).
     fn controller_change_ctx() -> ArmContext {
         let mut ctx = ctx_with(true, true);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -4700,10 +4888,8 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
-        ctx.peers.insert(
-            PEER_B.to_string(),
-            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
-        );
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
+        with_hello(&mut ctx, PEER_B, "qsy");
         ctx
     }
 
@@ -4955,14 +5141,15 @@ mod tests {
     #[tokio::test]
     async fn a_controller_stop_cq_reaches_the_qso_engine() {
         let mut ctx = controller_change_ctx();
-        // PAN-250: a stop needs a live hello; status scope is enough.
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        // PAN-250: a stop needs a live hello; status scope is enough. A
+        // arms with its qsy hello (PAN-283), then holds only status.
         ctx.peers.insert(
             CLIENT_KEY_ID.to_string(),
             PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
         );
-        let bus = MessageBus::new(64).unwrap();
-        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
-        grab_a(&mut ctx, &bus).await;
         flush_qso_cleanup(&mut ctx, &bus).await;
         assert_eq!(qso_inbox_tags(&rx).len(), 1);
         let out = dispatch_action(
@@ -5000,11 +5187,6 @@ mod tests {
     #[tokio::test]
     async fn an_undelivered_stop_cq_tells_the_client_to_retry() {
         let mut ctx = controller_change_ctx();
-        // PAN-250: a stop needs a live hello; status scope is enough.
-        ctx.peers.insert(
-            CLIENT_KEY_ID.to_string(),
-            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
-        );
         let bus = MessageBus::new(1).unwrap();
         let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         tx.try_send(ComponentMessage::new(
@@ -5015,6 +5197,12 @@ mod tests {
         ))
         .unwrap();
         grab_a(&mut ctx, &bus).await;
+        // PAN-250: a stop needs a live hello; status scope is enough. A
+        // arms with its qsy hello (PAN-283), then holds only status.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
         let out = dispatch_action(
             ControlAction::StopCq,
             CLIENT_KEY_ID,
@@ -5117,6 +5305,200 @@ mod tests {
             qso_inbox_tags(&rx),
             [format!("changed:{PEER_B}"), "stopCq".to_string()]
         );
+    }
+
+    /// PAN-283: the four actions that implicitly take control. `callStation`
+    /// stands for every `TxRequest` kind (they share one dispatch arm).
+    fn pan283_control_actions() -> [(&'static str, ControlAction); 4] {
+        [
+            ("callStation", call_w1xyz()),
+            (
+                "setFrequency",
+                ControlAction::Qsy {
+                    vfo: 0,
+                    frequency_hz: 14_074_000.0,
+                },
+            ),
+            (
+                "setSplit",
+                ControlAction::SetSplit {
+                    enabled: true,
+                    tx_frequency_hz: 14_075_000.0,
+                },
+            ),
+            ("txArm", arm_action("pan283-arm")),
+        ]
+    }
+
+    fn audit_events(ctx: &ArmContext) -> Vec<AuditEvent> {
+        std::fs::read_to_string(ctx.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .collect()
+    }
+
+    /// PAN-283: with the controller slot empty, a peer without a
+    /// currently-valid qsy-or-higher hello (none, expiring at `now`, expired,
+    /// revoked, or status-only) is refused before the controller gate for
+    /// `callStation`, `setFrequency`, `setSplit` and `txArm`. Nothing is
+    /// sent, control is not taken, no PAN-137 cleanup is owed, no QSO or rig
+    /// message is enqueued and nothing arms. `txArm` and `callStation` record
+    /// a `TxDenied` audit naming the missing capability, never `TxRequested`.
+    #[tokio::test]
+    async fn implicit_grab_needs_a_live_qsy_hello() {
+        let auths: [(&str, Option<(&str, i64)>, bool); 5] = [
+            ("no hello", None, false),
+            ("qsy expires at now", Some(("qsy", NOW)), false),
+            ("qsy expired", Some(("qsy", NOW - 1)), false),
+            ("qsy revoked", Some(("qsy", NOW + 600_000)), true),
+            ("status only", Some(("status", NOW + 600_000)), false),
+        ];
+        for (verb, _) in pan283_control_actions() {
+            for (label, auth, revoke) in auths {
+                let action = pan283_control_actions()
+                    .into_iter()
+                    .find(|(v, _)| *v == verb)
+                    .unwrap()
+                    .1;
+                let mut ctx = controller_change_ctx();
+                let bus = MessageBus::new(64).unwrap();
+                let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                let (_hamlib_tx, hamlib_rx) =
+                    bus.create_channel(ComponentId::Hamlib).await.unwrap();
+                ctx.peers.insert(
+                    CLIENT_KEY_ID.to_string(),
+                    auth.map_or_else(PeerCtx::unauthorized, |(scope, exp)| {
+                        PeerCtx::authorized_until(vec![scope.to_string()], exp)
+                    }),
+                );
+                if revoke {
+                    // `authorized_until`'s fixture jti.
+                    ctx.revoked_jtis.insert("test-jti".to_string());
+                }
+                assert!(ctx.controller.is_none());
+                let out =
+                    dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW))
+                        .await;
+                assert_eq!(out.flow, Dispatch::Continue);
+                assert!(out.sends.is_empty(), "{verb} [{label}]: no frame");
+                assert!(
+                    ctx.controller.is_none(),
+                    "{verb} [{label}]: the controller slot stays empty"
+                );
+                assert!(
+                    ctx.qso_cleanup_owed.is_none(),
+                    "{verb} [{label}]: no controller-change cleanup owed"
+                );
+                assert!(
+                    qso_inbox_tags(&qso_rx).is_empty(),
+                    "{verb} [{label}]: nothing reaches the QSO engine"
+                );
+                assert_eq!(
+                    hamlib_rx.try_iter().count(),
+                    0,
+                    "{verb} [{label}]: nothing reaches the rig"
+                );
+                assert!(
+                    !ctx.arm.lock().unwrap().is_armed(),
+                    "{verb} [{label}]: nothing arms"
+                );
+                let audit = audit_events(&ctx);
+                assert!(
+                    !audit.iter().any(|ev| ev.kind == AuditKind::TxRequested),
+                    "{verb} [{label}]: a refused request is never audited TxRequested"
+                );
+                if verb == "txArm" || verb == "callStation" {
+                    assert!(
+                        audit.iter().any(|ev| ev.kind == AuditKind::TxDenied
+                            && ev.detail.contains("qsy-scoped hello capability")),
+                        "{verb} [{label}]: the refusal is audited TxDenied naming the capability: {audit:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// PAN-283: a status-only peer B cannot disturb controller A. Each of the
+    /// four control actions from B is refused before the controller gate: A
+    /// keeps control and its arm, B gets no `takeControl first` error frame
+    /// (it could not act on one, `takeControl` needs `qsy`), and the owed
+    /// cleanup is unchanged.
+    #[tokio::test]
+    async fn a_status_only_peer_cannot_disturb_another_controller() {
+        for (verb, action) in pan283_control_actions() {
+            let mut ctx = controller_change_ctx();
+            let bus = MessageBus::new(64).unwrap();
+            let (_qso_tx, _qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+            let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+            grab_a(&mut ctx, &bus).await;
+            flush_qso_cleanup(&mut ctx, &bus).await;
+            assert!(ctx.qso_cleanup_owed.is_none());
+            with_hello(&mut ctx, PEER_B, "status");
+            let out = dispatch_action(action, PEER_B, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+            assert!(
+                out.sends.is_empty(),
+                "{verb}: no frame, not even the takeControl-first error"
+            );
+            assert_eq!(
+                ctx.controller.as_deref(),
+                Some(CLIENT_KEY_ID),
+                "{verb}: A keeps control"
+            );
+            assert!(
+                ctx.arm.lock().unwrap().is_armed(),
+                "{verb}: A's arm is untouched"
+            );
+            assert!(ctx.qso_cleanup_owed.is_none(), "{verb}: no cleanup owed");
+            assert_eq!(
+                hamlib_rx.try_iter().count(),
+                0,
+                "{verb}: nothing reaches the rig"
+            );
+        }
+    }
+
+    /// PAN-283 no over-blocking: with a `qsy` or a `tx` hello and an empty
+    /// controller slot, each control action still grabs control implicitly
+    /// and does its work.
+    #[tokio::test]
+    async fn implicit_grab_with_a_qsy_or_tx_hello_still_works() {
+        for scope in ["qsy", "tx"] {
+            for (verb, action) in pan283_control_actions() {
+                let mut ctx = controller_change_ctx();
+                with_hello(&mut ctx, CLIENT_KEY_ID, scope);
+                let bus = MessageBus::new(64).unwrap();
+                let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+                let (_hamlib_tx, hamlib_rx) =
+                    bus.create_channel(ComponentId::Hamlib).await.unwrap();
+                dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+                assert_eq!(
+                    ctx.controller.as_deref(),
+                    Some(CLIENT_KEY_ID),
+                    "{verb} [{scope}]: A takes control"
+                );
+                match verb {
+                    "callStation" => assert_eq!(
+                        qso_inbox_tags(&qso_rx),
+                        [
+                            format!("changed:{CLIENT_KEY_ID}"),
+                            format!("start:W1XYZ:{CLIENT_KEY_ID}")
+                        ],
+                        "{verb} [{scope}]"
+                    ),
+                    "setFrequency" | "setSplit" => assert_eq!(
+                        hamlib_rx.try_iter().count(),
+                        1,
+                        "{verb} [{scope}]: one rig message"
+                    ),
+                    "txArm" => assert!(
+                        ctx.arm.lock().unwrap().is_armed(),
+                        "{verb} [{scope}]: armed"
+                    ),
+                    other => panic!("unexpected verb {other}"),
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -5327,6 +5709,7 @@ mod tests {
     #[tokio::test]
     async fn implicit_grab_on_first_arm_single_client_compat() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         let out = dispatch_action(
@@ -5590,6 +5973,7 @@ mod tests {
         // B (PEER_B) as a SECOND allow-listed, established peer with its OWN
         // device key — a genuinely admitted second client, not a bare claim.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -5605,8 +5989,9 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string(), key(0x33).verifying_key());
-        ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        // B holds a qsy hello (PAN-283) so the arm reaches the sender-binding
+        // check under test.
+        with_hello(&mut ctx, PEER_B, "qsy");
         // Consent ON: nothing but the sender-binding check gates this arm.
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
@@ -5653,6 +6038,7 @@ mod tests {
     /// B's admission is asserted so a later refusal can only be the scope gate.
     async fn armed_a_and_admitted_b(b_auth: PeerCtx, bus: &MessageBus) -> ArmContext {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -5907,6 +6293,7 @@ mod tests {
     #[tokio::test]
     async fn disarm_accepted_from_non_controller() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -5946,6 +6333,7 @@ mod tests {
     #[tokio::test]
     async fn failing_audit_sink_keeps_valid_arms_and_every_disarm_working() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         let (failing_audit, _audit_tmp) = failing_audit_log();
         ctx.audit = failing_audit;
         ctx.peers
@@ -6028,6 +6416,7 @@ mod tests {
     #[tokio::test]
     async fn release_control_clears_and_disarms() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -6089,6 +6478,7 @@ mod tests {
         {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
+            with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
             with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
             let bus = MessageBus::new(64).unwrap();
             // Pre-arm: implicit grab makes CLIENT_KEY_ID the controller.
@@ -6129,6 +6519,7 @@ mod tests {
         {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
+            with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
             // B must be allow-listed so MultiPeerSession admits it.
             ctx.tx_allow_list
                 .write()
@@ -6483,6 +6874,25 @@ mod tests {
         let mut ctx = ctx_with_agent(&agent_kid, true, true);
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
+        // PAN-283: the client hellos with its capability token before arming,
+        // so it holds the qsy capability arming needs to take control.
+        let ControlAction::Arm {
+            capability_token, ..
+        } = &action
+        else {
+            unreachable!("asserted above");
+        };
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(capability_token.clone()),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            agent_session_id,
+            at(NOW),
+        )
+        .await;
         let d = dispatch_action(
             action,
             CLIENT_KEY_ID,
@@ -7757,6 +8167,7 @@ mod tests {
     #[tokio::test]
     async fn controller_capability_expiry_disarms_and_releases_control() {
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -7800,6 +8211,7 @@ mod tests {
 
         // A non-controller expiring disarms nothing.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("expiry-arm-jti-2"),
@@ -8250,6 +8662,423 @@ mod tests {
         assert!(station_agent_active(&cfg, &cqdx_cfg));
     }
 
+    fn trust_live(ctx: &ArmContext) -> StationAgentLiveHandles {
+        StationAgentLiveHandles {
+            tx_allow_list: ctx.tx_allow_list.clone(),
+            tx_arm_allow_list: ctx.tx_arm_allow_list.clone(),
+            client_keys: ctx.client_keys.clone(),
+            revocation_pending: ctx.revocation_pending.clone(),
+            authz_generation: ctx.authz_generation.clone(),
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn load_client_device_keys_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let allow = HashSet::from([
+            "k1".into(),
+            "missing".into(),
+            "malformed".into(),
+            "bad/k1".into(),
+        ]);
+        assert!(load_client_device_keys(dir.path(), &allow).is_empty());
+        let raw = client_key().verifying_key().to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), "k1", &raw, false).unwrap();
+        pancetta_agent::trust::write_client_device_key(dir.path(), "outside", &raw, false).unwrap();
+        std::fs::write(dir.path().join("clients/malformed.pub"), b"bad").unwrap();
+        let keys = load_client_device_keys(dir.path(), &allow);
+        assert_eq!(
+            keys.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from(["k1".into()])
+        );
+        assert_eq!(keys["k1"].to_bytes(), raw);
+        assert!(seed_tx_arm_allow_list(&allow, true, &keys).is_empty());
+        assert_eq!(
+            seed_tx_arm_allow_list(&allow, false, &keys),
+            HashSet::from(["k1".into()])
+        );
+    }
+
+    async fn exercise_trust_refresh(cloud: bool, outage: u8) {
+        let dir = tempfile::tempdir().unwrap();
+        let admission = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
+        let ctx = fresh_ctx("agent_this", admission.clone());
+        let live = trust_live(&ctx);
+        let raw = client_key().verifying_key().to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &raw, false)
+            .unwrap();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interval = Duration::from_millis(10);
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let outage_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server;
+        let task = if cloud {
+            let mode = mode.clone();
+            let outage_seen = outage_seen.clone();
+            let app = axum::Router::new().route("/api/v1/authorizations", axum::routing::get(move || {
+                let mode = mode.clone();
+                let outage_seen = outage_seen.clone();
+                async move {
+                use axum::response::IntoResponse;
+                let mode = mode.load(Ordering::Acquire);
+                if mode != 0 {
+                    outage_seen.store(true, Ordering::Release);
+                    if mode == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                axum::Json(serde_json::json!({"authorizations": [
+                    {"id":"a", "agentKeyId":"agent_this", "clientKeyId":CLIENT_KEY_ID, "scopes":["status","tx"], "createdAt":1786752000, "role":"owner"},
+                    {"id":"b", "agentKeyId":"agent_this", "clientKeyId":PEER_B, "scopes":["status","tx"], "createdAt":1786752000, "role":"owner"}
+                ]})).into_response()
+            }}));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            server = Some(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let cfg = pancetta_config::network::CqdxConfig {
+                enabled: true,
+                base_url: format!("http://{addr}"),
+                token: Some("pat_test_token_0000000000000".into()),
+                ..Default::default()
+            };
+            tokio::spawn(poll_authorizations_loop(
+                cfg,
+                "agent_this".into(),
+                dir.path().into(),
+                live.tx_allow_list.clone(),
+                live.tx_arm_allow_list.clone(),
+                live.client_keys.clone(),
+                ctx.arm.clone(),
+                ctx.audit.clone(),
+                live.revocation_pending.clone(),
+                shutdown.clone(),
+                interval,
+                live.authz_generation.clone(),
+            ))
+        } else {
+            server = None;
+            tokio::spawn(local_trust_refresh_loop(
+                live.clone(),
+                ctx.arm.clone(),
+                ctx.audit.clone(),
+                dir.path().into(),
+                shutdown.clone(),
+                interval,
+            ))
+        };
+        // Bound all waits; observe the published generation rather than assuming scheduling.
+        let wait_set = |expected: HashSet<String>| {
+            let set = live.tx_arm_allow_list.clone();
+            let arm = ctx.arm.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let matches = {
+                            let _guard = arm.lock().unwrap();
+                            *set.read().unwrap() == expected
+                        };
+                        if matches {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        wait_set(HashSet::from([CLIENT_KEY_ID.to_string()])).await;
+        assert_eq!(*live.tx_allow_list.read().unwrap(), admission);
+        assert!(live.authz_generation.load(Ordering::Acquire) > 0);
+        {
+            let mut st = ctx.arm.lock().unwrap();
+            st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+            st.arm(
+                pancetta_agent::arm::VerifiedArmGrant {
+                    operator_callsign: "K5ARH".into(),
+                    ttl_ms: 3_600_000,
+                    armed_until_ms: NOW + 3_600_000,
+                    capability_exp_ms: NOW + 7_200_000,
+                    tx_enabled_until_ms: NOW + 7_200_000,
+                    effective_ttl_ms: 3_600_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "local-trust-test".into(),
+                    client_key_id: CLIENT_KEY_ID.into(),
+                },
+                at(NOW),
+            );
+        }
+        assert!(crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        if outage != 0 {
+            mode.store(outage, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !outage_seen.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let generation = live.authz_generation.load(Ordering::Acquire);
+        pancetta_agent::trust::remove_client_device_key(dir.path(), CLIENT_KEY_ID).unwrap();
+        wait_set(HashSet::new()).await;
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        assert!(live.revocation_pending.load(Ordering::Acquire));
+        assert!(live.authz_generation.load(Ordering::Acquire) > generation);
+        assert_eq!(*live.tx_allow_list.read().unwrap(), admission);
+        // Audit is emitted after the eligibility publish; wait for the writer too.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(ctx.audit.path())
+                    .unwrap_or_default()
+                    .contains("disarmed: local-trust-revoked")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A still-trusted peer can arm after local revocation of the first peer.
+        pancetta_agent::trust::write_client_device_key(dir.path(), PEER_B, &raw, false).unwrap();
+        wait_set(HashSet::from([PEER_B.to_string()])).await;
+        {
+            let mut st = ctx.arm.lock().unwrap();
+            st.arm(
+                pancetta_agent::arm::VerifiedArmGrant {
+                    operator_callsign: "K5ARH".into(),
+                    ttl_ms: 3_600_000,
+                    armed_until_ms: NOW + 3_600_000,
+                    capability_exp_ms: NOW + 7_200_000,
+                    tx_enabled_until_ms: NOW + 7_200_000,
+                    effective_ttl_ms: 3_600_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "still-trusted".into(),
+                    client_key_id: PEER_B.into(),
+                },
+                at(NOW),
+            );
+        }
+        assert!(crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(PEER_B)
+        ));
+        if !cloud {
+            revoke_static_allow_list_entries(&live, &ctx.arm, &ctx.audit, &[PEER_B.into()], NOW);
+            pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &raw, false)
+                .unwrap();
+            wait_set(HashSet::from([CLIENT_KEY_ID.into()])).await;
+            assert!(!live.tx_allow_list.read().unwrap().contains(PEER_B));
+        }
+        shutdown.store(true, Ordering::Release);
+        if outage == 2 {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            server.unwrap().abort();
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(server) = server {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_disarms_local_untrust_during_cloud_errors() {
+        exercise_trust_refresh(true, 1).await;
+    }
+
+    #[tokio::test]
+    async fn poll_disarms_local_untrust_during_stalled_cloud_request() {
+        exercise_trust_refresh(true, 2).await;
+    }
+
+    #[tokio::test]
+    async fn poll_intersects_tx_arm_set_with_local_trust() {
+        exercise_trust_refresh(true, 0).await;
+    }
+    #[tokio::test]
+    async fn static_trust_refresh_intersects_with_static_allow_list() {
+        exercise_trust_refresh(false, 0).await;
+    }
+    #[tokio::test]
+    async fn poll_disarms_when_local_trust_file_is_removed() {
+        exercise_trust_refresh(true, 0).await;
+    }
+    #[tokio::test]
+    async fn static_trust_refresh_disarms_when_local_trust_file_is_removed() {
+        exercise_trust_refresh(false, 0).await;
+    }
+    #[tokio::test]
+    async fn local_untrust_audit_records_local_trust_revoked() {
+        exercise_trust_refresh(true, 0).await;
+    }
+    #[tokio::test]
+    async fn local_untrust_drops_remote_tx_permission() {
+        exercise_trust_refresh(false, 0).await;
+    }
+
+    #[test]
+    fn trust_key_replacement_during_verification_refuses_arm() {
+        let mut ctx = ctx_with(true, true);
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        let arm = ctx.arm.clone();
+        let keys = ctx.client_keys.clone();
+        let eligible = ctx.tx_arm_allow_list.clone();
+        let arm_guard = arm.lock().unwrap();
+        // Pause verification at its initial key lookup. Its eligibility read
+        // lock tells us it reached that lookup, without timing assumptions.
+        let keys_guard = keys.write().unwrap();
+        let worker = std::thread::spawn(move || {
+            verify_and_arm(
+                &valid_token(),
+                &signed_grant("rotate-during-verify"),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                "sess-1",
+                at(NOW),
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while eligible.try_write().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "verification did not start"
+            );
+            std::thread::yield_now();
+        }
+        drop(keys_guard);
+        // Once verification releases eligibility, it can only be waiting on
+        // arm, which we hold. Publish a replacement key under that same lock.
+        loop {
+            if eligible.try_write().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "verification did not finish"
+            );
+            std::thread::yield_now();
+        }
+        keys.write().unwrap().insert(
+            CLIENT_KEY_ID.into(),
+            ed25519_dalek::SigningKey::from_bytes(&[99; 32]).verifying_key(),
+        );
+        drop(arm_guard);
+        let result = worker.join().unwrap();
+        assert!(
+            result.is_err(),
+            "verification using replaced key must not arm"
+        );
+        assert!(arm.lock().unwrap().armed_client_key_id().is_none());
+    }
+
+    #[test]
+    fn trust_key_replacement_disarms_existing_grant() {
+        let mut ctx = ctx_with(true, true);
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        verify_and_arm(
+            &valid_token(),
+            &signed_grant("rotate-key"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            "sess-1",
+            at(NOW),
+        )
+        .unwrap();
+        let live = trust_live(&ctx);
+        let dir = tempfile::tempdir().unwrap();
+        let old_key = client_key().verifying_key().to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &old_key, false)
+            .unwrap();
+        // An unchanged refresh preserves a valid arm.
+        publish_trust(&live, &ctx.arm, &ctx.audit, None, None, dir.path());
+        assert!(ctx.arm.lock().unwrap().armed_client_key_id().is_some());
+        let new_key = ed25519_dalek::SigningKey::from_bytes(&[99; 32])
+            .verifying_key()
+            .to_bytes();
+        pancetta_agent::trust::write_client_device_key(dir.path(), CLIENT_KEY_ID, &new_key, true)
+            .unwrap();
+        publish_trust(&live, &ctx.arm, &ctx.audit, None, None, dir.path());
+        assert!(ctx
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(
+            ctx.arm.lock().unwrap().armed_client_key_id().is_none(),
+            "replacing trust material must disarm the old key's grant"
+        );
+        assert!(live.revocation_pending.load(Ordering::Acquire));
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+    }
+
+    #[test]
+    fn tx_arm_set_is_local_trust_intersect_owner_edges() {
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Writer(writer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let admission = HashSet::from(["k1".to_string(), "k2".to_string()]);
+        let ctx = fresh_ctx("agent", admission.clone());
+        let keys = std::collections::HashMap::from([("k1".into(), client_key().verifying_key())]);
+        let dir = tempfile::tempdir().unwrap();
+        publish_trust(
+            &trust_live(&ctx),
+            &ctx.arm,
+            &ctx.audit,
+            Some((admission.clone(), admission.clone(), keys)),
+            None,
+            dir.path(),
+        );
+        assert_eq!(
+            *ctx.tx_arm_allow_list.read().unwrap(),
+            HashSet::from(["k1".into()])
+        );
+        assert_eq!(*ctx.tx_allow_list.read().unwrap(), admission);
+        assert!(String::from_utf8(buffer.lock().unwrap().clone())
+            .unwrap()
+            .contains("txArmSet = localTrust ∩ owner edges"));
+    }
+
     // --- seed_tx_arm_allow_list: CQD-11 / Q-0052 follow-up (fail-closed seed) ---
 
     /// PR #259 shipped the split with a fail-open seed: with cqdx
@@ -8263,7 +9092,7 @@ mod tests {
     #[test]
     fn cqdx_enabled_seeds_tx_arm_allow_list_empty_regardless_of_static_list() {
         let static_list = HashSet::from(["some_client_key".to_string()]);
-        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ true);
+        let seeded = seed_tx_arm_allow_list(&static_list, true, &std::collections::HashMap::new());
         assert!(
             seeded.is_empty(),
             "cqdx-enabled must seed tx_arm_allow_list EMPTY (fail-closed) even when the \
@@ -8272,19 +9101,16 @@ mod tests {
     }
 
     /// Companion: `tx_allow_list` (connection admission) itself is NOT
-    /// affected by this fail-closed seed — it stays seeded from the static
-    /// config list (unchanged, out of scope for this fix), so a delegated
-    /// guest can still connect from the first second, just never arm. When
-    /// cqdx is disabled entirely, `tx_arm_allow_list` must still equal the
-    /// static list — no delegation concept exists in the pure-config path.
+    /// affected by this fail-closed seed. Static TX eligibility additionally
+    /// requires a valid local trust file; absent files seed an empty set.
     #[test]
     fn cqdx_disabled_seeds_tx_arm_allow_list_from_static_list() {
         let static_list = HashSet::from(["some_client_key".to_string()]);
-        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ false);
+        let seeded = seed_tx_arm_allow_list(&static_list, false, &std::collections::HashMap::new());
         assert_eq!(
-            seeded, static_list,
-            "cqdx-disabled must seed tx_arm_allow_list identically to the static list — \
-             no delegation concept exists in the pure-config path"
+            seeded,
+            HashSet::new(),
+            "cqdx-disabled must exclude entries with no local trust file"
         );
     }
 
@@ -9897,6 +10723,8 @@ mod tests {
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let addr = authorizations_mock(body.clone(), served.clone()).await;
         let ctx = fresh_ctx(AGENT_KEY_ID, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        // No local files: the initial TX-arm intersection is empty too.
+        ctx.tx_arm_allow_list.write().unwrap().clear();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = spawn_poll_for(&ctx, format!("http://{addr}"), shutdown.clone());
         let generation = ctx.authz_generation.clone();
@@ -10899,7 +11727,14 @@ mod tests {
     /// sending client (PAN-95: a peer receives nothing until this verifies).
     fn pan97_hello() -> Pan97Frame {
         Box::new(|c: &Pan97Client| {
-            hello_frame_bytes(&injected_clock_token(&c.agent_kid, &c.kid, &["status"]))
+            // PAN-283: the arming client needs a qsy hello to take control;
+            // listeners stay status-only.
+            let scopes: &[&str] = if c.kid == CLIENT_KEY_ID {
+                &["status", "qsy"]
+            } else {
+                &["status"]
+            };
+            hello_frame_bytes(&injected_clock_token(&c.agent_kid, &c.kid, scopes))
         })
     }
 
@@ -11055,6 +11890,7 @@ mod tests {
     async fn arm_response_reflects_arm_accepted_after_dispatch_sample() {
         let bus = MessageBus::new(64).unwrap();
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.controller = Some(CLIENT_KEY_ID.to_string());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         ctx.clock = fixed_clock(NOW + 1);
@@ -11084,6 +11920,7 @@ mod tests {
     async fn sweep_uses_clock_sampled_under_arm_lock() {
         let bus = MessageBus::new(64).unwrap();
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
         dispatch_action(
             arm_action("arm-jti-1"),
@@ -11123,6 +11960,7 @@ mod tests {
         // admitted (PAN-96 refuses every action from a non-admitted peer,
         // heartbeats included — refusing can only shorten an arm).
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.tx_allow_list
             .write()
             .unwrap()
@@ -11168,6 +12006,7 @@ mod tests {
 
         // Housekeeping first, then the late heartbeat.
         let mut ctx = ctx_with(true, true);
+        with_hello(&mut ctx, CLIENT_KEY_ID, "qsy");
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
@@ -11553,7 +12392,15 @@ mod tests {
             1,
             "arm-jti-2 must not arm on a capability that expired during the stall"
         );
-        assert_eq!(audit_count(&ctx, "arm rejected: capability"), 1);
+        // PAN-283: the hello expired with the token, so arm-jti-2 is refused
+        // by the qsy hello check before its token is even verified.
+        assert_eq!(
+            audit_count(
+                &ctx,
+                "arm refused: no currently-valid qsy-scoped hello capability"
+            ),
+            1
+        );
     }
 
     /// Housekeeping likewise checks capability expiry after its own sends: a

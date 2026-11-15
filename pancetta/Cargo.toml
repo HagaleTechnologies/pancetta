@@ -20,6 +20,7 @@ name = "pancetta"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 # Local workspace dependencies
 pancetta-core = { path = "../pancetta-core" }
 pancetta-audio = { path = "../pancetta-audio" }
@@ -75,6 +76,7 @@ anyhow = "1.0"
 
 # System utilities
 serialport = "4.9"
+same-file = "1.0"
 libc = "0.2"
 signal-hook = { workspace = true }
 uuid = { version = "1.23", features = ["v4"] }
@@ -98,9 +100,14 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 
 [dev-dependencies]
+<<<<<<< HEAD
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+=======
+tokio = { version = "1.50", features = ["test-util"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+>>>>>>> e2641c29a7f49641aecd35112caac71c3f8990c7
 async-trait = "0.1"
 ratatui = "0.30"
 tempfile = "3.27"
@@ -110,7 +117,6 @@ predicates = "3.1"
 tracing-test = "0.2"
 # Station-agent integration tests: hand-sign capabilityTokens + txArmGrants,
 # and drive the real AgentSession through a scripted Noise IK handshake.
-base64 = { workspace = true }
 snow = "0.10"
 # Station-agent lock-order tests hold an audit write mid-transaction.
 pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
@@ -128,6 +134,9 @@ ft2 = ["pancetta-ft8/ft2"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.5"
 
 [[test]]
 name = "coord_sim"

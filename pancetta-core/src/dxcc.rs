@@ -18,6 +18,10 @@
 //! table does not cover. Unmatched prefixes return `None` (the column shows
 //! "---"): we never emit a GUESS that could mislabel a station. Where the TUI
 //! has cqdx's authoritative `entity_name`, that still takes precedence.
+//!
+//! [`continent_for_callsign`] maps the same resolved entity to its cty.dat
+//! continent (generated `dxcc_continents::CONTINENTS`), so the autonomous
+//! operator can honour `CQ DX` and regional CQ modifiers offline (PAN-292).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -63,6 +67,87 @@ pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
 
 static EXACT_INDEX: LazyLock<HashMap<&'static str, &'static str>> =
     LazyLock::new(|| crate::dxcc_exact::EXACT_TABLE.iter().copied().collect());
+
+/// CQ and ITU zones for the entity selected by [`entity_for_callsign`].
+/// Full-call overrides precede KG4 rules and prefix overrides. Conflicting
+/// entity and zone tables fail closed instead of borrowing another entity's zones.
+pub fn zones_for_callsign(call: &str) -> Option<(u8, u8)> {
+    let entity = entity_for_callsign(call)?;
+    let normalized = call.trim().to_uppercase();
+    let c = crate::callsign::resolve_hash_render(&normalized)?;
+    ZONES.lookup(c, entity, EXACT_INDEX.contains_key(c))
+}
+
+type ZoneRow = (&'static str, &'static str, u8, u8);
+
+struct ZoneIndex {
+    defaults: HashMap<&'static str, (u8, u8)>,
+    prefixes: HashMap<&'static str, (&'static str, u8, u8)>,
+    exact: HashMap<&'static str, Vec<(&'static str, u8, u8)>>,
+    max_len: usize,
+}
+
+impl ZoneIndex {
+    fn new(defaults: &[(&'static str, u8, u8)], prefixes: &[ZoneRow], exact: &[ZoneRow]) -> Self {
+        let mut by_exact: HashMap<_, Vec<_>> = HashMap::new();
+        for &(call, entity, cq, itu) in exact {
+            by_exact.entry(call).or_default().push((entity, cq, itu));
+        }
+        Self {
+            defaults: defaults
+                .iter()
+                .map(|&(entity, cq, itu)| (entity, (cq, itu)))
+                .collect(),
+            prefixes: prefixes
+                .iter()
+                .map(|&(prefix, entity, cq, itu)| (prefix, (entity, cq, itu)))
+                .collect(),
+            exact: by_exact,
+            max_len: prefixes
+                .iter()
+                .map(|(prefix, _, _, _)| prefix.len())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn lookup(&self, c: &str, selected: &str, entity_exact: bool) -> Option<(u8, u8)> {
+        if let Some(rows) = self.exact.get(c) {
+            // Multiple source entities can name one exact call. Only the entity
+            // selected by the existing resolver may supply its zones.
+            return rows
+                .iter()
+                .find_map(|&(entity, cq, itu)| (entity == selected).then_some((cq, itu)));
+        }
+        // An old entity exception without matching zone evidence cannot safely
+        // inherit zones from a prefix or from the KG4 length rule.
+        if entity_exact {
+            return None;
+        }
+        if sub_entity_rule(c).is_some() {
+            return self.defaults.get(selected).copied();
+        }
+        for len in (1..=c.len().min(self.max_len)).rev() {
+            if let Some(&(entity, cq, itu)) =
+                c.get(..len).and_then(|prefix| self.prefixes.get(prefix))
+            {
+                return (entity == selected).then_some((cq, itu));
+            }
+        }
+        if us_safety_net(c) == Some(selected) {
+            return self.defaults.get(selected).copied();
+        }
+        None
+    }
+}
+
+static ZONES: LazyLock<ZoneIndex> = LazyLock::new(|| {
+    ZoneIndex::new(
+        crate::dxcc_zones::ZONE_DEFAULTS,
+        crate::dxcc_zones::ZONE_PREFIXES,
+        crate::dxcc_zones::ZONE_EXACT,
+    )
+});
 
 struct EntityIndex {
     by_name: HashMap<&'static str, (u16, &'static str)>,
@@ -115,6 +200,79 @@ pub fn canonical_entity(name: &str) -> &str {
         .by_name
         .get(name)
         .map_or(name, |&(_, canonical)| canonical)
+}
+
+/// A cty.dat continent, as named by a `CQ NA`/`SA`/`EU`/`AS`/`AF`/`OC` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Continent {
+    /// `AF`
+    Africa,
+    /// `AS`
+    Asia,
+    /// `EU`
+    Europe,
+    /// `NA`
+    NorthAmerica,
+    /// `OC`
+    Oceania,
+    /// `SA`
+    SouthAmerica,
+}
+
+impl Continent {
+    /// Parse a two-letter continent code, ASCII case-insensitively. Anything
+    /// else (including `DX`) is `None`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        if code.len() != 2 {
+            return None;
+        }
+        match code.to_ascii_uppercase().as_str() {
+            "AF" => Some(Self::Africa),
+            "AS" => Some(Self::Asia),
+            "EU" => Some(Self::Europe),
+            "NA" => Some(Self::NorthAmerica),
+            "OC" => Some(Self::Oceania),
+            "SA" => Some(Self::SouthAmerica),
+            _ => None,
+        }
+    }
+
+    /// The uppercase two-letter code, as written in cty.dat and in a CQ.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Africa => "AF",
+            Self::Asia => "AS",
+            Self::Europe => "EU",
+            Self::NorthAmerica => "NA",
+            Self::Oceania => "OC",
+            Self::SouthAmerica => "SA",
+        }
+    }
+}
+
+/// Entity name (and every registry alias) to its cty.dat continent.
+static CONTINENTS: LazyLock<HashMap<&'static str, Continent>> = LazyLock::new(|| {
+    let mut by_name: HashMap<&'static str, Continent> = crate::dxcc_continents::CONTINENTS
+        .iter()
+        .filter_map(|&(name, code)| Continent::from_code(code).map(|c| (name, c)))
+        .collect();
+    for &(alias, name) in crate::dxcc_registry::NAME_ALIASES {
+        if let Some(&continent) = by_name.get(name) {
+            by_name.insert(alias, continent);
+        }
+    }
+    by_name
+});
+
+/// The continent of a known cty entity name or alias; `None` for an unknown name.
+pub fn continent_of_entity(name: &str) -> Option<Continent> {
+    CONTINENTS.get(name).copied()
+}
+
+/// The continent of the entity [`entity_for_callsign`] selects. Returns `None`
+/// for a call that does not resolve to an entity; it never guesses (PAN-292).
+pub fn continent_for_callsign(call: &str) -> Option<Continent> {
+    entity_for_callsign(call).and_then(continent_of_entity)
 }
 
 struct SubEntityRule {
@@ -259,6 +417,145 @@ pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_CONTINENTS: [Continent; 6] = [
+        Continent::Africa,
+        Continent::Asia,
+        Continent::Europe,
+        Continent::NorthAmerica,
+        Continent::Oceania,
+        Continent::SouthAmerica,
+    ];
+
+    #[test]
+    fn continent_code_round_trips() {
+        for c in ALL_CONTINENTS {
+            assert_eq!(Continent::from_code(c.code()), Some(c), "{c:?}");
+            assert_eq!(c.code(), c.code().to_ascii_uppercase());
+        }
+        assert_eq!(Continent::from_code("eu"), Some(Continent::Europe));
+        for code in ["DX", "", "NAA", "N", " NA"] {
+            assert_eq!(Continent::from_code(code), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn continent_for_callsign_table() {
+        use Continent::*;
+        for (call, expected) in [
+            ("W1ABC", Some(NorthAmerica)),
+            ("K5ARH/P", Some(NorthAmerica)),
+            ("<W1ABC>", Some(NorthAmerica)),
+            ("OX3XR", Some(NorthAmerica)),
+            ("KL7ABC", Some(NorthAmerica)),
+            ("KG4AB", Some(NorthAmerica)),
+            ("DL1ABC", Some(Europe)),
+            ("TF3AO", Some(Europe)),
+            ("JW5E", Some(Europe)),
+            ("EA8/K5ARH", Some(Africa)),
+            ("D44AC", Some(Africa)),
+            ("KH6ABC", Some(Oceania)),
+            ("5B4AHJ", Some(Asia)),
+            ("<...>", None),
+            ("Q1ABC", None),
+            ("", None),
+        ] {
+            assert_eq!(continent_for_callsign(call), expected, "{call:?}");
+        }
+    }
+
+    #[test]
+    fn continent_of_entity_covers_every_resolvable_entity() {
+        let rule_names = SUB_ENTITY_RULES
+            .iter()
+            .flat_map(|rule| [rule.short_entity, rule.other_entity]);
+        for name in PREFIX_TABLE
+            .iter()
+            .chain(crate::dxcc_exact::EXACT_TABLE)
+            .map(|&(_, name)| name)
+            .chain(rule_names)
+            .chain(["United States"])
+        {
+            assert!(continent_of_entity(name).is_some(), "no continent: {name}");
+        }
+        assert_eq!(
+            continent_of_entity("Antarctica"),
+            Some(Continent::SouthAmerica)
+        );
+        assert_eq!(continent_of_entity("Cabo Verde"), Some(Continent::Africa));
+        assert_eq!(continent_of_entity("Atlantis"), None);
+    }
+
+    #[test]
+    fn every_generated_continent_row_parses() {
+        let rows = crate::dxcc_continents::CONTINENTS;
+        assert_eq!(rows.len(), 346);
+        for &(name, code) in rows {
+            assert!(Continent::from_code(code).is_some(), "{name}: {code}");
+        }
+    }
+
+    #[test]
+    fn zones_follow_header_prefix_exact_and_kg4_precedence() {
+        for (call, expected) in [
+            ("DL1ABC", (14, 28)),
+            ("K0ABC", (4, 7)),
+            ("N2NL/MM", (7, 8)),
+            ("KG4AB", (8, 11)),
+            ("KG4ABC", (5, 8)),
+            ("KG4BKW", (27, 64)),
+            ("3Y0J", (38, 67)),
+        ] {
+            assert_eq!(zones_for_callsign(call), Some(expected), "{call}");
+        }
+        let fixture = ZoneIndex::new(
+            &[("Guantanamo Bay", 8, 11), ("United States", 5, 8)],
+            &[("KG4", "Guantanamo Bay", 8, 11)],
+            &[("KG4AB", "United States", 4, 7)],
+        );
+        // Inject an entity exact override that wins over the KG4 rule.
+        assert_eq!(fixture.lookup("KG4AB", "United States", true), Some((4, 7)));
+        // Full calls only; an exact row does not cover portable suffixes.
+        assert_eq!(
+            fixture.lookup("KG4AB/P", "Guantanamo Bay", false),
+            Some((8, 11))
+        );
+    }
+
+    #[test]
+    fn zones_normalize_calls_and_fail_closed() {
+        for call in ["dl1abc", " DL1ABC ", "<DL1ABC>", "DL1ABC/P"] {
+            assert_eq!(zones_for_callsign(call), Some((14, 28)), "{call}");
+        }
+        assert_eq!(zones_for_callsign("EA8/G8BCG"), Some((33, 36)));
+        assert_eq!(zones_for_callsign("AHA"), Some((5, 8)));
+        assert_eq!(zones_for_callsign("KG4ÉÉ"), Some((5, 8)));
+        for call in ["", "  ", "QQ1XYZ", "<...>", "É1ABC", "💡"] {
+            assert_eq!(zones_for_callsign(call), None, "{call}");
+        }
+    }
+
+    #[test]
+    fn zones_do_not_cross_entity_boundaries() {
+        let fixture = ZoneIndex::new(
+            &[("United States", 5, 8)],
+            &[("K", "United States", 5, 8), ("K0", "Other", 4, 7)],
+            &[
+                ("K1ABC", "Other", 1, 2),
+                ("K2ABC", "Other", 3, 4),
+                ("K2ABC", "United States", 4, 7),
+            ],
+        );
+        assert_eq!(fixture.lookup("K0ABC", "United States", false), None);
+        assert_eq!(fixture.lookup("K1ABC", "United States", true), None);
+        assert_eq!(fixture.lookup("K2ABC", "United States", true), Some((4, 7)));
+        // An entity-only exact exception without zone evidence must not guess.
+        assert_eq!(fixture.lookup("K3ABC", "United States", true), None);
+        assert_eq!(
+            fixture.lookup("K4ABC", "United States", false),
+            Some((5, 8))
+        );
+    }
 
     #[test]
     fn entity_registry_is_complete_and_ids_are_valid() {

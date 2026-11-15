@@ -26,9 +26,15 @@
 pub mod callsign;
 pub mod diagnostic_level;
 pub mod dxcc;
+mod dxcc_continents;
 mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;
+<<<<<<< HEAD
+=======
+mod dxcc_zones;
+pub mod error;
+>>>>>>> e2641c29a7f49641aecd35112caac71c3f8990c7
 pub mod freq_bin;
 pub mod ft8_tokens;
 pub mod gridsquare;
@@ -86,3 +92,5 @@ mod tests {
         let _err = PancettaError::Other("test".to_string());
     }
 }
+
+pub mod time;

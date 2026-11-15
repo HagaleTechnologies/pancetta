@@ -148,6 +148,26 @@ pub(super) fn visible_columns(width: u16) -> Vec<DxHunterColumn> {
         .collect()
 }
 
+/// The same logical range drives formatting, highlighting and click translation.
+pub(crate) fn viewport(
+    area: Rect,
+    selected: usize,
+    active: bool,
+    len: usize,
+) -> std::ops::Range<usize> {
+    let capacity = area.height.saturating_sub(3) as usize;
+    let selected = selected.min(len.saturating_sub(1));
+    let start = if active && capacity > 0 {
+        selected.saturating_sub(capacity - 1)
+    } else {
+        0
+    };
+    start..start.saturating_add(capacity).min(len)
+}
+
+#[cfg(test)]
+thread_local! { static FORMATTED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::DxHunter);
     let block = create_panel_block("DX Hunter", is_active, app);
@@ -168,22 +188,21 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
-    // Single source of truth for ordering — the SAME list (and comparator)
-    // that `App::get_selected_station` indexes with `dx_hunter_scroll`, so
-    // the highlighted row is always the Space call-target. Do NOT re-sort
-    // or `.skip()` here: let `TableState` own the viewport offset from the
-    // selected index, so the cursor and the chooser can never disagree.
+    // Selection remains a logical index into this complete sorted list.
+    // Only the shared viewport is formatted, with a relative TableState index.
     let dx_list: Vec<&DxStation> = app.displayed_dx_stations();
-
-    // Convert ALL stations to rows; TableState scrolls the viewport to keep
-    // the selected row visible.
-    let mut rows: Vec<Row> = dx_list
+    let range = viewport(area, app.dx_hunter_scroll, is_active, dx_list.len());
+    let mut rows: Vec<Row> = dx_list[range.clone()]
         .iter()
-        .map(|station| create_dx_row(station, app, &columns, now))
+        .map(|station| {
+            #[cfg(test)]
+            FORMATTED_ROWS.with(|count| count.set(count.get() + 1));
+            create_dx_row(station, app, &columns, now)
+        })
         .collect();
 
     // If no DX stations, show placeholder
-    if rows.is_empty() {
+    if dx_list.is_empty() {
         rows.push(Row::new(columns.iter().map(|c| {
             let text = match c {
                 DxHunterColumn::Call => "No DX",
@@ -211,13 +230,10 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
         )
         .highlight_symbol(HIGHLIGHT_SYMBOL);
 
-    // The selected index is `dx_hunter_scroll` into the displayed list.
-    // `TableState` clamps the viewport so the selection stays on screen,
-    // so we no longer hand-roll a skip offset.
     let mut table_state = TableState::default();
-    if is_active && !dx_list.is_empty() {
+    if is_active && !range.is_empty() {
         let sel = app.dx_hunter_scroll.min(dx_list.len().saturating_sub(1));
-        table_state.select(Some(sel));
+        table_state.select(Some(sel - range.start));
     }
 
     f.render_stateful_widget(table, area, &mut table_state);
@@ -322,7 +338,10 @@ fn create_dx_row<'a>(
     // (never worked on ANY band) already implies band-needed and a second
     // marker would be redundant noise. 2026-07-18, DX Hunter
     // per-band-needed gap.
-    let (needed, atno) = app.dx_need_flags_shown(&station.call_sign, station.needed, station.atno);
+    // ATNO comes from the displayed score (PAN-399), because a spot merge
+    // overwrites the stored flag with cqdx's verdict.
+    let (needed, atno) =
+        app.dx_need_flags_shown(&station.call_sign, station.needed, station.ranked_atno());
     let call_display = format_call_display(station, atno, needed, is_engaged);
 
     // Staleness check for network-only spots
@@ -1189,6 +1208,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atno_marker_follows_the_displayed_score_after_a_spot_refresh() {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        let view = crate::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("ZL1ABC".to_string()),
+            grid_square: None,
+            message: "CQ ZL1ABC".into(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: true,
+            atno: true,
+            band_needed: true,
+            priority_score: None,
+            priority_factors: None,
+            is_own_tx: false,
+        };
+
+        app.add_decoded_message(view).await.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "ZL1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "New Zealand".to_string(),
+            needed: false,
+            atno: false,
+        };
+
+        app.merge_spot_groups(&[spot]);
+        app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+            dxcc_needed: Some(true),
+            dxcc_source: Some(pancetta_qso::priority::NeedSource::LocalLogbook),
+            ..Default::default()
+        })));
+        // Keep cross-panel focus styling from overriding the ATNO colour.
+        app.active_panel = ActivePanel::DxHunter;
+        let buf = render_buffer(&app, 220, 12);
+        let output = text(&buf);
+        assert!(output.contains("!ZL1ABC"), "{output}");
+        assert!(!output.contains("▲ZL1ABC"), "{output}");
+        let cell = cell_at_text(&buf, "!ZL1ABC");
+        assert_eq!(cell.fg, atno_style().fg.unwrap());
+        assert!(cell.modifier.contains(atno_style().add_modifier));
+    }
+
+    #[tokio::test]
     async fn needed_marker_follows_this_frames_cqdx_verdict() {
         // PAN-93: a row stored before cqdx answered gains `+` once the list
         // loads, and loses `+`/`!` once the list says not needed, without
@@ -1355,6 +1437,92 @@ mod tests {
         s.offline_entity = Some("Sentinel");
         s.entity_name = Some("Nippon (cqdx)".into());
         assert_eq!(entity_cell_text(&s, None), "Nippon (cqdx)");
+    }
+
+    async fn pan319_ranked_app(len: usize) -> App {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        app.active_panel = ActivePanel::DxHunter;
+        app.active_view = crate::view::ActiveView::Hunt;
+        for i in 0..len {
+            let call = format!("W{i}ABC");
+            let mut station = make_test_station(&call);
+            station.priority_score = (len - i) as u32;
+            app.dx_stations.insert(call, station);
+        }
+        app
+    }
+
+    #[tokio::test]
+    async fn pan319_formats_only_visible_rows() {
+        for len in [60, 150] {
+            let mut app = pan319_ranked_app(len).await;
+            for selected in [0, 40, len - 1] {
+                app.dx_hunter_scroll = selected;
+                FORMATTED_ROWS.with(|n| n.set(0));
+                let buffer = render_buffer(&app, 132, 10);
+                assert_eq!(FORMATTED_ROWS.with(|n| n.get()), 7);
+                assert!(text(&buffer).contains(&app.displayed_dx_stations()[selected].call_sign));
+            }
+            FORMATTED_ROWS.with(|n| n.set(0));
+            render_buffer(&app, 132, 2);
+            assert_eq!(FORMATTED_ROWS.with(|n| n.get()), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pan319_viewport_preserves_order_and_selection() {
+        let mut app = pan319_ranked_app(60).await;
+        for selected in [0, 40, 59] {
+            app.dx_hunter_scroll = selected;
+            let ordered = app.displayed_dx_stations();
+            let range = viewport(Rect::new(0, 0, 132, 10), selected, true, ordered.len());
+            let buffer = render_buffer(&app, 132, 10);
+            let output = text(&buffer);
+            let mut previous = 0;
+            for station in &ordered[range.clone()] {
+                let position = output.find(&station.call_sign).unwrap();
+                assert!(position >= previous);
+                previous = position;
+            }
+            let target = &ordered[selected].call_sign;
+            assert!(cell_at_text(&buffer, target)
+                .modifier
+                .contains(Modifier::REVERSED));
+            assert_eq!(app.get_selected_station().unwrap().0, *target);
+            assert!(output.contains(&format!("{}/60", selected + 1)));
+        }
+        app.active_panel = ActivePanel::BandActivity;
+        assert_eq!(viewport(Rect::new(0, 0, 132, 10), 40, false, 60), 0..7);
+        let output = text(&render_buffer(&app, 132, 10));
+        assert!(output.contains(&app.displayed_dx_stations()[0].call_sign));
+    }
+
+    #[tokio::test]
+    async fn pan319_resize_keeps_selected_station_visible() {
+        let mut app = pan319_ranked_app(60).await;
+        app.dx_hunter_scroll = 40;
+        app.clamp_dx_hunter_selection();
+        let target = app.get_selected_station().unwrap().0;
+        for (width, height) in [(132, 80), (132, 24), (0, 0), (1, 1), (132, 24)] {
+            app.handle_resize(width, height).await.unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| crate::ui::draw(f, &app).unwrap())
+                .unwrap();
+            if height >= 24 {
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    text(buffer).contains(&target),
+                    "{width}x{height}: {}",
+                    text(buffer)
+                );
+                assert!(cell_at_text(buffer, &target)
+                    .modifier
+                    .contains(Modifier::REVERSED));
+            }
+            assert_eq!(app.get_selected_station().unwrap().0, target);
+        }
     }
 
     fn make_test_station(call: &str) -> crate::app::DxStation {
