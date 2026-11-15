@@ -211,6 +211,19 @@ pub(crate) struct RelayedDecode {
     pub(crate) dial_hz: u64,
 }
 
+/// PAN-316 (review H-28): the headless decode-drain record, DEBUG-only
+/// so the default `pancetta=info,warn` filter writes no per-decode lines
+/// in headless mode either — the ticket's promise must not depend on TUI
+/// mode. Called from the headless drain loop; kept as one emitter so the
+/// filter behaviour is drivable from tests through the production
+/// formatting.
+fn log_headless_decoded(msg: &pancetta_ft8::DecodedMessage) {
+    debug!(
+        "Decoded: {} (SNR: {:.0}, freq: {:.1} Hz)",
+        msg.text, msg.snr_db, msg.frequency_offset
+    );
+}
+
 type TerminalReceivers = (
     crossbeam_channel::Receiver<RelayedDecode>,
     crossbeam_channel::Receiver<Vec<Vec<f32>>>,
@@ -435,11 +448,7 @@ impl super::ApplicationCoordinator {
                     // Drain decoded messages
                     match ft8_to_tui_rx.try_recv() {
                         Ok(relayed) => {
-                            let msg = &relayed.message;
-                            info!(
-                                "Decoded: {} (SNR: {:.0}, freq: {:.1} Hz)",
-                                msg.text, msg.snr_db, msg.frequency_offset
-                            );
+                            log_headless_decoded(&relayed.message);
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {}
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
@@ -752,5 +761,66 @@ mod gain_sweep_tx_overlap_tests {
             Some("transmission overlapped capture")
         );
         assert!(complete[0].noise_dbfs_per_hz.is_none());
+    }
+}
+
+#[cfg(test)]
+mod headless_log_level_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn decoded_fixture(text: &str) -> pancetta_ft8::DecodedMessage {
+        let ft8 = pancetta_ft8::Ft8Message {
+            from_callsign: Some("K1ABC".into()),
+            to_callsign: None,
+            ..Default::default()
+        };
+        let mut message = pancetta_ft8::DecodedMessage::new(ft8, -8.0, 0.0, 412.0, 0.4);
+        message.text = text.to_string();
+        message
+    }
+
+    /// Drive the production headless drain emitter exactly as the drain
+    /// loop does, under the given env filter.
+    fn drain_forty(logs: LogBuffer, filter: &str) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..40 {
+                log_headless_decoded(&decoded_fixture(&format!("CQ K1ABC FN4{i}")));
+            }
+        });
+    }
+
+    #[test]
+    fn headless_decode_log_respects_filter() {
+        let quiet = LogBuffer::default();
+        drain_forty(quiet.clone(), "pancetta=info,warn");
+        let text = String::from_utf8(quiet.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("Decoded:"),
+            "forty headless decodes must write no per-decode line at the default filter: {text}"
+        );
+        assert!(text.is_empty(), "nothing at all should be written: {text}");
+
+        let verbose = LogBuffer::default();
+        drain_forty(verbose.clone(), "pancetta=debug,warn");
+        let text = String::from_utf8(verbose.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("Decoded:").count(), 40);
     }
 }

@@ -4,6 +4,7 @@
 //! ([`DoctorCheck`] entries in [`build_checks`]) so adding one is a
 //! one-liner for later phases.
 
+use crate::mic_access::{microphone_authorization, MicrophoneAuthorization};
 use pancetta_config::Config;
 use pancetta_lib::clock_skew::{
     clock_fix_hint, sntp_clock_offset, CLOCK_SKEW_FAIL_S, CLOCK_SKEW_WARN_S, NTP_SERVER,
@@ -91,6 +92,9 @@ pub fn build_checks() -> Vec<DoctorCheck> {
         check_decoder(),
         check_rigctld(),
         check_submodule(),
+        check_network(),
+        check_disk(),
+        check_microphone(),
     ]
 }
 
@@ -423,45 +427,6 @@ fn capture_rms(cfg: &Config, dur: Duration) -> anyhow::Result<(f32, f32)> {
     Ok(((sum_sq / n as f64).sqrt() as f32, peak))
 }
 
-// Known authorization is diagnostic evidence only when captured audio is silent.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-enum MicrophoneAuthorization {
-    Authorized,
-    Denied,
-    NotDetermined,
-    Restricted,
-    Unknown,
-}
-
-/// Read the current process's authorization without requesting access or changing it.
-#[cfg(target_os = "macos")]
-fn microphone_authorization() -> MicrophoneAuthorization {
-    use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
-
-    // SAFETY: AVMediaTypeAudio is an immutable framework constant. This query
-    // accepts the audio media type, needs no device instance or main thread,
-    // and only reads authorization for the calling process.
-    let status = unsafe {
-        let Some(audio) = AVMediaTypeAudio else {
-            return MicrophoneAuthorization::Unknown;
-        };
-        AVCaptureDevice::authorizationStatusForMediaType(audio)
-    };
-    match status {
-        AVAuthorizationStatus::Authorized => MicrophoneAuthorization::Authorized,
-        AVAuthorizationStatus::Denied => MicrophoneAuthorization::Denied,
-        AVAuthorizationStatus::NotDetermined => MicrophoneAuthorization::NotDetermined,
-        AVAuthorizationStatus::Restricted => MicrophoneAuthorization::Restricted,
-        _ => MicrophoneAuthorization::Unknown,
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn microphone_authorization() -> MicrophoneAuthorization {
-    MicrophoneAuthorization::Unknown
-}
-
 fn audio_level_outcome(
     result: anyhow::Result<(f32, f32)>,
     authorization: MicrophoneAuthorization,
@@ -700,10 +665,611 @@ pub(crate) fn check_submodule() -> DoctorCheck {
     }
 }
 
+const MIB: u64 = 1024 * 1024;
+
+fn log_directory() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta/logs")
+}
+
+fn existing_ancestor(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let mut current = path;
+    loop {
+        match std::fs::metadata(current) {
+            Ok(_) => return Ok(current.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                current = current.parent().ok_or(e)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn available_log_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let ancestor = existing_ancestor(path)?;
+    let name = std::ffi::CString::new(ancestor.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: name is NUL-terminated and stats is writable for the entire syscall.
+    if unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statvfs initialized stats on success.
+    let stats = unsafe { stats.assume_init() };
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+fn disk_outcome(path: &std::path::Path, result: std::io::Result<u64>) -> CheckOutcome {
+    match result {
+        Ok(bytes) => {
+            let status = if bytes < 10 * MIB {
+                CheckStatus::Fail
+            } else if bytes < 100 * MIB {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Pass
+            };
+            CheckOutcome {
+                status,
+                detail: format!("{}: {} MiB available", path.display(), bytes / MIB),
+                fix: (status != CheckStatus::Pass).then(|| {
+                    format!(
+                        "free space on the volume containing {}; keep qsos.adi and qso.db",
+                        path.display()
+                    )
+                }),
+            }
+        }
+        Err(e) => CheckOutcome {
+            status: CheckStatus::Warn,
+            detail: format!("could not inspect {}: {e}", path.display()),
+            fix: Some(format!(
+                "check access to {} and inspect its volume with the OS disk tool",
+                path.display()
+            )),
+        },
+    }
+}
+
+fn check_disk() -> DoctorCheck {
+    DoctorCheck {
+        name: "log disk space",
+        role: CheckRole::Receive,
+        run: Box::new(|_| {
+            #[cfg(unix)]
+            {
+                let path = log_directory();
+                disk_outcome(&path, available_log_bytes(&path))
+            }
+            #[cfg(not(unix))]
+            {
+                CheckOutcome {
+                    status: CheckStatus::Warn,
+                    detail: "disk-space query unavailable on this OS".into(),
+                    fix: Some(
+                        "inspect the volume containing the station logs with the OS disk tool"
+                            .into(),
+                    ),
+                }
+            }
+        }),
+    }
+}
+
+fn permission_outcome(is_macos: bool, state: MicrophoneAuthorization) -> CheckOutcome {
+    use MicrophoneAuthorization::*;
+    if !is_macos {
+        return CheckOutcome {
+            status: CheckStatus::Pass,
+            detail: "not applicable on this OS; audio capture is checked separately".into(),
+            fix: None,
+        };
+    }
+    let (status, detail, fix) = match state {
+        Authorized => (CheckStatus::Pass, "access authorized on this Mac", None),
+        Denied => (CheckStatus::Fail, "access denied on this Mac", Some("open System Settings > Privacy & Security > Microphone; enable pancetta or its terminal app, restart that app and re-run `pancetta doctor`")),
+        Restricted => (CheckStatus::Fail, "access restricted on this Mac", Some("ask the Mac's administrator to allow microphone access for pancetta or its terminal app")),
+        NotDetermined => (CheckStatus::Warn, "approval not yet requested on this Mac", Some("run `pancetta test-audio` locally at the Mac and allow microphone access, then re-run `pancetta doctor`")),
+        Unknown => (CheckStatus::Warn, "authorization could not be queried on this Mac", Some("run `pancetta test-audio` locally and check System Settings > Privacy & Security > Microphone")),
+    };
+    CheckOutcome {
+        status,
+        detail: detail.into(),
+        fix: fix.map(str::to_owned),
+    }
+}
+
+fn check_microphone() -> DoctorCheck {
+    DoctorCheck {
+        name: "microphone permission",
+        role: CheckRole::Receive,
+        run: Box::new(|_| {
+            permission_outcome(cfg!(target_os = "macos"), microphone_authorization())
+        }),
+    }
+}
+
+type Reachability = (String, Result<(), String>);
+
+fn network_outcome(results: Vec<Reachability>) -> CheckOutcome {
+    if results.is_empty() {
+        return CheckOutcome {
+            status: CheckStatus::Warn,
+            detail: "no network services enabled".into(),
+            fix: Some(
+                "enable [network.cqdx] or [network.dx_cluster] if online services are wanted"
+                    .into(),
+            ),
+        };
+    }
+    let failed: Vec<_> = results
+        .into_iter()
+        .filter_map(|(endpoint, result)| result.err().map(|reason| (endpoint, reason)))
+        .collect();
+    if failed.is_empty() {
+        return CheckOutcome {
+            status: CheckStatus::Pass,
+            detail: "all enabled services reachable".into(),
+            fix: None,
+        };
+    }
+    CheckOutcome {
+        status: CheckStatus::Warn,
+        detail: failed
+            .iter()
+            .map(|(endpoint, reason)| format!("{endpoint} unreachable ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        fix: Some(format!(
+            "check DNS, routing and firewall access to {}",
+            failed
+                .iter()
+                .map(|(endpoint, _)| endpoint.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn transport_reason(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "DNS, connection or TLS failed"
+    } else {
+        "HTTP transport failed"
+    }
+    .into()
+}
+
+async fn cqdx_probe(base: String) -> Reachability {
+    let Ok(mut url) = reqwest::Url::parse(&base) else {
+        return ("cqdx endpoint".into(), Err("invalid URL".into()));
+    };
+    let endpoint = format!(
+        "{}:{}",
+        url.host_str().unwrap_or("invalid host"),
+        url.port_or_known_default().unwrap_or(0)
+    );
+    if !matches!(url.scheme(), "http" | "https") {
+        return (endpoint, Err("unsupported URL scheme".into()));
+    }
+    // This public endpoint needs no credentials, path/query secrets or redirects.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path(&format!(
+        "{}/api/v1/entities",
+        url.path().trim_end_matches('/')
+    ));
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return (endpoint, Err("HTTP client unavailable".into())),
+    };
+    // A 401 also proves reachability: the endpoint answered and doctor sends
+    // no credentials to take that answer further (PAN-406).
+    let result = match client.get(url).send().await {
+        Ok(response) if response.status().is_success() || response.status().as_u16() == 401 => {
+            Ok(())
+        }
+        Ok(response) => Err(format!("HTTP {}", response.status().as_u16())),
+        Err(error) => Err(transport_reason(&error)),
+    };
+    (endpoint, result)
+}
+
+async fn cluster_probe(servers: Vec<(String, u16)>) -> Reachability {
+    if servers.is_empty() {
+        return ("DX cluster".into(), Err("no servers configured".into()));
+    }
+    let mut attempts = tokio::task::JoinSet::new();
+    for (host, port) in servers {
+        attempts.spawn(async move {
+            let endpoint = format!("{}:{port}", safe_host(&host));
+            let result: Result<(), String> = tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .map(|_| ())
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::ConnectionRefused => "connection refused".into(),
+                    std::io::ErrorKind::TimedOut => "timed out".into(),
+                    _ => "DNS or connection failed".into(),
+                });
+            (endpoint, result)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(Ok((endpoint, result))) = attempts.join_next().await {
+        if result.is_ok() {
+            return ("DX cluster".into(), Ok(()));
+        }
+        if failures.len() < 3 {
+            failures.push(format!("{endpoint}: {}", result.unwrap_err()));
+        }
+    }
+    ("DX cluster".into(), Err(failures.join(", ")))
+}
+
+fn safe_host(host: &str) -> String {
+    host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        .take(253)
+        .collect()
+}
+
+async fn network_probe(cfg: Config, deadline: Duration) -> Vec<Reachability> {
+    let mut probes = tokio::task::JoinSet::new();
+    let mut pending = Vec::new();
+    if cfg.network.cqdx.enabled {
+        let base = cfg.network.cqdx.base_url;
+        let label = reqwest::Url::parse(&base)
+            .ok()
+            .map(|u| {
+                format!(
+                    "{}:{}",
+                    u.host_str().unwrap_or("invalid host"),
+                    u.port_or_known_default().unwrap_or(0)
+                )
+            })
+            .unwrap_or_else(|| "cqdx endpoint".into());
+        pending.push(label);
+        probes.spawn(cqdx_probe(base));
+    }
+    if cfg.network.dx_cluster.enabled {
+        pending.push("DX cluster".into());
+        probes.spawn(cluster_probe(
+            cfg.network
+                .dx_cluster
+                .servers
+                .into_iter()
+                .map(|s| (s.hostname, s.port))
+                .collect(),
+        ));
+    }
+    collect_network_probes(probes, pending, deadline).await
+}
+
+// All enabled integrations share this deadline, including blocking resolver
+// work awaited by their asynchronous connect/send futures.
+async fn collect_network_probes(
+    mut probes: tokio::task::JoinSet<Reachability>,
+    mut pending: Vec<String>,
+    deadline: Duration,
+) -> Vec<Reachability> {
+    let mut results = Vec::new();
+    let end = tokio::time::Instant::now() + deadline;
+    while !pending.is_empty() {
+        match tokio::time::timeout_at(end, probes.join_next()).await {
+            Ok(Some(Ok((label, result)))) => {
+                if let Some(index) = pending.iter().position(|p| *p == label) {
+                    pending.remove(index);
+                }
+                results.push((label, result));
+            }
+            _ => {
+                results.extend(
+                    pending
+                        .drain(..)
+                        .map(|label| (label, Err("timed out".into()))),
+                );
+                break;
+            }
+        }
+    }
+    results
+}
+
+fn check_network() -> DoctorCheck {
+    DoctorCheck {
+        name: "network services",
+        role: CheckRole::Advisory,
+        run: Box::new(|ctx| {
+            let Some(cfg) = ctx.config.clone() else {
+                return not_configured();
+            };
+            // Doctor runs inside async main. Own a separate runtime and abandon any
+            // resolver's blocking work after the shared deadline instead of joining it.
+            match std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| ())?;
+                let result = runtime.block_on(network_probe(cfg, Duration::from_secs(3)));
+                runtime.shutdown_background();
+                Ok::<_, ()>(network_outcome(result))
+            })
+            .join()
+            {
+                Ok(Ok(outcome)) => outcome,
+                _ => network_outcome(vec![(
+                    "network probe".into(),
+                    Err("worker unavailable".into()),
+                )]),
+            }
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    async fn http_fixture(status: u16, stall: bool) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.starts_with("GET /api/v1/entities "));
+            assert!(!request.to_lowercase().contains("authorization:"));
+            if stall {
+                std::future::pending::<()>().await;
+            }
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn network_probe_matrix() {
+        for (status, expected) in [
+            (200, CheckStatus::Pass),
+            // A 401 proves the endpoint answered; doctor sends no credentials.
+            (401, CheckStatus::Pass),
+            (302, CheckStatus::Warn),
+            (503, CheckStatus::Warn),
+        ] {
+            let (url, task) = http_fixture(status, false).await;
+            let mut cfg = Config::default();
+            cfg.network.cqdx.enabled = true;
+            cfg.network.cqdx.base_url =
+                url.replace("http://", "http://secret:password@") + "?token=secret";
+            cfg.network.cqdx.token = Some("secret".into());
+            let outcome = network_outcome(network_probe(cfg, Duration::from_secs(1)).await);
+            assert_eq!(outcome.status, expected);
+            assert!(!outcome.detail.contains("secret"));
+            task.await.unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(cluster_probe(vec![("127.0.0.1".into(), port)])
+            .await
+            .1
+            .is_ok());
+        let refused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_port = refused_listener.local_addr().unwrap().port();
+        drop(refused_listener);
+        assert!(cluster_probe(vec![
+            ("127.0.0.1".into(), refused_port),
+            ("127.0.0.1".into(), port)
+        ])
+        .await
+        .1
+        .is_ok());
+        drop(listener);
+        let refused = cluster_probe(vec![("127.0.0.1".into(), port)]).await;
+        assert!(refused.1.unwrap_err().contains("connection refused"));
+        // Invalid DNS/transport results are advisory and retain no raw URL errors.
+        let outcome = network_outcome(vec![(
+            "invalid.example:443".into(),
+            Err("DNS or connection failed".into()),
+        )]);
+        assert_eq!(outcome.status, CheckStatus::Warn);
+        let disabled = network_probe(Config::default(), Duration::from_secs(1)).await;
+        assert!(disabled.is_empty());
+        assert_eq!(
+            network_outcome(disabled).detail,
+            "no network services enabled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_probe_deadline() {
+        let mut probes = tokio::task::JoinSet::new();
+        // Simulate a resolver that never completes. This future follows the same
+        // collector path as reqwest/Tokio DNS, with no public DNS dependency.
+        probes.spawn(async {
+            std::future::pending::<()>().await;
+            ("dns.example:443".into(), Ok(()))
+        });
+        probes.spawn(async {
+            (
+                "refused.example:7300".into(),
+                Err("connection refused".into()),
+            )
+        });
+        let start = tokio::time::Instant::now();
+        let result = collect_network_probes(
+            probes,
+            vec!["dns.example:443".into(), "refused.example:7300".into()],
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert_eq!(result.len(), 2);
+        assert!(result
+            .iter()
+            .any(|(endpoint, outcome)| endpoint == "dns.example:443"
+                && outcome.as_ref().map_err(String::as_str) == Err("timed out")));
+        assert!(result
+            .iter()
+            .any(|(endpoint, outcome)| endpoint == "refused.example:7300"
+                && outcome.as_ref().map_err(String::as_str) == Err("connection refused")));
+        assert_eq!(network_outcome(result).status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn disk_space_thresholds() {
+        let p = std::path::Path::new("/logs");
+        for (bytes, status) in [
+            (0, CheckStatus::Fail),
+            (10 * MIB - 1, CheckStatus::Fail),
+            (10 * MIB, CheckStatus::Warn),
+            (100 * MIB - 1, CheckStatus::Warn),
+            (100 * MIB, CheckStatus::Pass),
+        ] {
+            assert_eq!(disk_outcome(p, Ok(bytes)).status, status);
+        }
+    }
+
+    #[test]
+    fn disk_ancestor_and_error_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-created/logs");
+        assert_eq!(existing_ancestor(&missing).unwrap(), dir.path());
+        assert!(!missing.exists());
+        let outcome = disk_outcome(
+            &missing,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!(outcome.status, CheckStatus::Warn);
+        assert!(outcome.detail.contains("could not inspect"));
+        assert!(!outcome.detail.contains("0 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_probe_reads_temp_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(available_log_bytes(dir.path()).unwrap() > 0);
+        assert!(available_log_bytes(&dir.path().join("missing/logs")).unwrap() > 0);
+        assert_eq!(
+            existing_ancestor(&dir.path().join("missing/logs")).unwrap(),
+            dir.path()
+        );
+    }
+
+    #[test]
+    fn microphone_permission_matrix() {
+        use MicrophoneAuthorization::*;
+        for (state, status, text) in [
+            (Authorized, CheckStatus::Pass, "access authorized"),
+            (Denied, CheckStatus::Fail, "access denied"),
+            (Restricted, CheckStatus::Fail, "access restricted"),
+            (
+                NotDetermined,
+                CheckStatus::Warn,
+                "approval not yet requested",
+            ),
+            (
+                Unknown,
+                CheckStatus::Warn,
+                "authorization could not be queried",
+            ),
+        ] {
+            let outcome = permission_outcome(true, state);
+            assert_eq!(outcome.status, status);
+            assert!(outcome.detail.starts_with(text));
+            assert_eq!(outcome.fix.is_none(), status == CheckStatus::Pass);
+        }
+        assert_eq!(permission_outcome(false, Denied).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn permission_is_independent_of_capture() {
+        for result in [Ok((0.01, 0.02)), Err(anyhow::anyhow!("capture failed"))] {
+            let _ = audio_level_outcome(result, MicrophoneAuthorization::Denied);
+            assert_eq!(
+                permission_outcome(true, MicrophoneAuthorization::Denied).status,
+                CheckStatus::Fail
+            );
+        }
+    }
+
+    #[test]
+    fn new_checks_gate_only_hard_failures() {
+        let checks = build_checks();
+        assert_eq!(checks.len(), 10);
+        assert_eq!(checks[7].name, "network services");
+        assert_eq!(checks[8].name, "log disk space");
+        assert_eq!(checks[9].name, "microphone permission");
+        // Network is advisory; disk and microphone are receive prerequisites.
+        assert!(checks[7].role == CheckRole::Advisory);
+        assert!(checks[8].role == CheckRole::Receive);
+        assert!(checks[9].role == CheckRole::Receive);
+        let ctx = fixture_ctx();
+        let mut statuses = [CheckStatus::Pass; 10];
+        statuses[7] = CheckStatus::Fail;
+        assert_eq!(
+            fixture_report(&ctx, statuses).verdict,
+            Verdict::OnAirReady,
+            "a network failure stays advisory"
+        );
+        for index in [8, 9] {
+            let mut statuses = [CheckStatus::Pass; 10];
+            statuses[index] = CheckStatus::Fail;
+            let report = fixture_report(&ctx, statuses);
+            assert_eq!(report.verdict, Verdict::NotReady, "check {index} is hard");
+            assert_eq!(report.exit_code, 3);
+        }
+    }
+
+    #[test]
+    fn field_failures_render_together() {
+        let ctx = build_ctx(Some(PathBuf::from("/nonexistent/pancetta.toml")));
+        let mut checks = build_checks();
+        checks[7].run =
+            Box::new(|_| network_outcome(vec![("cqdx.io:443".into(), Err("timed out".into()))]));
+        checks[8].run = Box::new(|_| disk_outcome(std::path::Path::new("/logs"), Ok(0)));
+        checks[9].run = Box::new(|_| permission_outcome(true, MicrophoneAuthorization::Denied));
+        let results: Vec<_> = checks
+            .into_iter()
+            .map(|check| {
+                let outcome = (check.run)(&ctx);
+                (check, outcome)
+            })
+            .collect();
+        let report = DoctorReport::from_results(&ctx, results);
+        let text = report.text();
+        for label in [
+            "network services",
+            "log disk space",
+            "microphone permission",
+        ] {
+            assert!(text.contains(label));
+        }
+        assert!(text.contains("fix: check DNS, routing and firewall access to cqdx.io:443"));
+        assert!(text
+            .contains("fix: free space on the volume containing /logs; keep qsos.adi and qso.db"));
+        assert!(text.contains("fix: open System Settings > Privacy & Security > Microphone"));
+        let fresh = build_checks();
+        assert!(!(fresh[8].run)(&ctx).detail.contains("not configured"));
+        assert!(!(fresh[9].run)(&ctx).detail.contains("not configured"));
+    }
 
     fn fixture_ctx() -> DoctorCtx {
         let mut config = Config::default();
@@ -716,7 +1282,7 @@ mod tests {
         }
     }
 
-    fn fixture_report(ctx: &DoctorCtx, statuses: [CheckStatus; 7]) -> DoctorReport {
+    fn fixture_report(ctx: &DoctorCtx, statuses: [CheckStatus; 10]) -> DoctorReport {
         let checks = build_checks()
             .into_iter()
             .zip(statuses)
@@ -758,30 +1324,44 @@ mod tests {
         use CheckStatus::*;
         let ctx = fixture_ctx();
         let cases = [
-            ([Pass; 7], Verdict::OnAirReady),
+            ([Pass; 10], Verdict::OnAirReady),
             (
-                [Pass, Warn, Warn, Pass, Fail, Pass, Fail],
+                [Pass, Warn, Warn, Pass, Fail, Pass, Fail, Pass, Pass, Pass],
                 Verdict::OnAirReady,
             ),
             (
-                [Pass, Fail, Pass, Pass, Pass, Fail, Pass],
+                [Pass, Fail, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Fail, Pass, Pass, Pass, Pass, Fail, Pass],
+                [Fail, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Fail, Pass, Pass, Fail, Pass],
+                [Pass, Pass, Fail, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Pass, Fail, Pass, Fail, Pass],
+                [Pass, Pass, Pass, Fail, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::NotReady,
             ),
             (
-                [Pass, Pass, Pass, Pass, Pass, Fail, Pass],
+                [Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass],
                 Verdict::DecodeOnly,
+            ),
+            // PAN-335: network is advisory, disk and microphone are receive
+            // prerequisites.
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass],
+                Verdict::OnAirReady,
+            ),
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail, Pass],
+                Verdict::NotReady,
+            ),
+            (
+                [Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Pass, Fail],
+                Verdict::NotReady,
             ),
         ];
         for (statuses, expected) in cases {
@@ -789,13 +1369,13 @@ mod tests {
         }
         let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
         assert_eq!(
-            fixture_report(&missing, [Fail; 7]).verdict,
+            fixture_report(&missing, [Fail; 10]).verdict,
             Verdict::NotConfigured
         );
         let mut invalid = fixture_ctx();
         invalid.config_error = Some("invalid".into());
         assert_eq!(
-            fixture_report(&invalid, [Pass; 7]).verdict,
+            fixture_report(&invalid, [Pass; 10]).verdict,
             Verdict::NotReady
         );
     }
@@ -805,13 +1385,13 @@ mod tests {
         let mut ctx = fixture_ctx();
         ctx.config.as_mut().unwrap().rig.interface.enabled = false;
         assert_eq!(
-            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            fixture_report(&ctx, [CheckStatus::Pass; 10]).verdict,
             Verdict::DecodeOnly
         );
         ctx.config.as_mut().unwrap().rig.interface.enabled = true;
         ctx.config.as_mut().unwrap().station.callsign = "N0CALL".into();
         assert_eq!(
-            fixture_report(&ctx, [CheckStatus::Pass; 7]).verdict,
+            fixture_report(&ctx, [CheckStatus::Pass; 10]).verdict,
             Verdict::DecodeOnly
         );
     }
@@ -872,13 +1452,13 @@ mod tests {
         let ctx = fixture_ctx();
         let missing = build_ctx(Some("/nonexistent/pan338.toml".into()));
         let fixtures = [
-            (fixture_report(&missing, [Pass; 7]), "NOT CONFIGURED", 2,
+            (fixture_report(&missing, [Pass; 10]), "NOT CONFIGURED", 2,
                 "Result: NOT CONFIGURED. Run `pancetta setup`, then re-run `pancetta doctor`."),
-            (fixture_report(&ctx, [Pass, Pass, Pass, Pass, Pass, Fail, Pass]), "DECODE-ONLY", 1,
+            (fixture_report(&ctx, [Pass, Pass, Pass, Pass, Pass, Fail, Pass, Pass, Pass, Pass]), "DECODE-ONLY", 1,
                 "Result: DECODE-ONLY. Receive checks passed; fix the transmit prerequisites above to go on-air."),
-            (fixture_report(&ctx, [Pass; 7]), "ON-AIR READY", 0,
+            (fixture_report(&ctx, [Pass; 10]), "ON-AIR READY", 0,
                 "Result: ON-AIR READY. Doctor prerequisites passed; PTT and transmit audio are not tested."),
-            (fixture_report(&ctx, [Pass, Pass, Pass, Fail, Pass, Fail, Pass]), "NOT READY", 3,
+            (fixture_report(&ctx, [Pass, Pass, Pass, Fail, Pass, Fail, Pass, Pass, Pass, Pass]), "NOT READY", 3,
                 "Result: NOT READY. Fix the failed receive or configuration checks above, then re-run `pancetta doctor`."),
         ];
         let names = [
@@ -889,6 +1469,9 @@ mod tests {
             "ft8_lib decoder",
             "rig / rigctld",
             "ft8_lib submodule",
+            "network services",
+            "log disk space",
+            "microphone permission",
         ];
         for (report, label, code, result_line) in fixtures {
             let text = report.text();
@@ -912,7 +1495,7 @@ mod tests {
                 )));
             }
         }
-        let mut report = fixture_report(&ctx, [Pass; 7]);
+        let mut report = fixture_report(&ctx, [Pass; 10]);
         report.checks[0].fix = None;
         assert!(serde_json::to_value(&report).unwrap()["checks"][0]["fix"].is_null());
     }

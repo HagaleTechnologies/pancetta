@@ -195,9 +195,12 @@ impl AdifLogWriter {
         &self.path
     }
 
-    /// Set the station transmit power (watts) stamped into every `TX_PWR`
-    /// field this writer renders from here on. Pass the operator's
-    /// configured `[station] power_watts`; `0` omits `TX_PWR` entirely.
+    /// Enable or disable software attribution in new ADIF comments. Defaults off.
+    pub fn set_attribution_comment(&mut self, enabled: bool) {
+        self.processor.set_attribution_comment(enabled);
+    }
+
+    /// Set station transmit power; zero omits the TX_PWR field.
     pub fn set_station_power_watts(&mut self, watts: u32) {
         self.processor.set_station_power_watts(watts);
     }
@@ -495,6 +498,7 @@ mod tests {
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: chrono::Utc::now(),
             end_time: Some(chrono::Utc::now()),
             reports: SignalReports {
@@ -528,6 +532,41 @@ mod tests {
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_completed_german_qso_includes_entity_fields() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let writer = AdifLogWriter::open(&path).await.unwrap();
+        writer.append(&metadata_with("DL1ABC")).await.unwrap();
+        let raw = tokio::fs::read_to_string(path).await.unwrap();
+        let parsed = AdifProcessor::new().parse_string(&raw).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        for (key, value) in [
+            ("COUNTRY", "Fed. Rep. of Germany"),
+            ("DXCC", "230"),
+            ("CQZ", "14"),
+            ("ITUZ", "28"),
+        ] {
+            assert_eq!(parsed.records[0].fields[key].value, value);
+            assert_eq!(raw.matches(&format!("<{key}:")).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_unknown_qso_omits_entity_fields() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let writer = AdifLogWriter::open(&path).await.unwrap();
+        writer.append(&metadata_with("QQ1XYZ")).await.unwrap();
+        let raw = tokio::fs::read_to_string(path).await.unwrap();
+        let parsed = AdifProcessor::new().parse_string(&raw).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        for key in ["COUNTRY", "DXCC", "CQZ", "ITUZ"] {
+            assert!(!parsed.records[0].fields.contains_key(key));
+            assert_eq!(raw.matches(&format!("<{key}:")).count(), 0);
         }
     }
 
@@ -942,5 +981,26 @@ mod tests {
         assert_eq!(file_syncs() - before, 2, "one sync per record");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("<EOR>").count(), 2);
+    }
+    #[tokio::test]
+    async fn pan298_writer_comment_follows_attribution_setting() {
+        for enabled in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("qsos.adi");
+            let mut writer = AdifLogWriter::open(&path).await.unwrap();
+            if enabled {
+                writer.set_attribution_comment(true);
+            }
+            let mut metadata = fixture_metadata();
+            metadata.notes = None;
+            metadata.hound = false;
+            writer.append(&metadata).await.unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            let parsed = AdifProcessor::new().parse_string(&text).unwrap();
+            let qso = AdifProcessor::new()
+                .record_to_qso(&parsed.records[0])
+                .unwrap();
+            assert_eq!(qso.comment.as_deref(), enabled.then_some("Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta"));
+        }
     }
 }

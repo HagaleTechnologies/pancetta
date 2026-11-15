@@ -17,7 +17,6 @@ on:
   workflow_run:
     workflows:
       - CI
-      - Docs
       - Release
       - Semgrep
       - Research Scan Shepherd

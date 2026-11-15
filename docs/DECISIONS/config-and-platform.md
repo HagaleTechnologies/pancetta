@@ -1227,3 +1227,85 @@ required VFOs and restore the receive VFO. Unconfirmed split state, rejected mod
 or failed restoration leaves TX inhibited. The coordinator adds an independent
 readiness cause and never changes operator TX policy to recover it. Mock and
 socket tests are container evidence; FTdx10 hardware qualification remains pending.
+
+## Service liveness and field diagnostics (PAN-335, 2026-11-12)
+
+The Linux user service uses Type=notify and a 60-second watchdog. Readiness
+requires owner-published audio, DSP and decoder initialization, live rig-loop
+readiness or disabled rig control, and completed coordinator startup. Task
+spawn success is insufficient. Notification follows completed health passes;
+no independent heartbeat task may hide a stalled monitor. Shutdown suppresses
+further readiness and watchdog notifications and publishes STOPPING after READY.
+
+The unit uses SIGTERM on expiry, KillMode=mixed and a 45-second stop budget so
+the existing PTT-off drain can retain managed rigctld during cleanup. A fully
+wedged process may still need forced termination. Restart reloads autonomous
+enablement from configuration; the emergency halt remains in memory only.
+Real systemd restart and macOS TCC qualification remain pending. The
+[runbook](../RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) records a
+receive-only qualification procedure and the physical-unkey limitation.
+
+Doctor adds separate network, log-disk and microphone-permission results.
+Enabled cqdx and DX-cluster probes share a three-second deadline; failures are
+advisory. Disk queries use the actual log volume and user-available blocks,
+following an existing ancestor without creating a directory. Below 100 MiB
+warns and below 10 MiB fails. Known macOS denial or restriction fails
+independently of capture; unresolved authorization warns. No permission prompt
+is requested. These checks preserve the existing report's failure exit policy.
+
+## PAN-302: live operational allowlist
+
+Validated reloads patch only changed allowlisted fields. Autonomous decision
+policy is refreshed without rebuilding the operator, so CQ bookkeeping and
+spectral history survive. File permission is independent of runtime intent:
+a headless station started disabled can later enable through the file, while
+an operator pause survives reload and component restart. The typed readiness
+notice reports config permission without muting manual TX.
+
+The late cap is a last-instant refusal limit, published under the PTT gate;
+lead time and self-parity are captured for each new scheduling attempt.
+Receive presets already read the effective snapshot at band crossings and
+must not write CAT on save. Hardware binding, protection, identity and
+stateful autonomous helper settings remain restart-only. See CONFIG.md's
+explicit allowlist; section-wide reload would change values that running
+components still latch.
+
+## PAN-303: remove configuration without runtime consumers
+
+Removed `network.wspr`, `network.web_api`, `network.proxy`, `network.tls`,
+`network.rate_limiting`, `network.dx_cluster.alerts`, `ui.keyboard`, and
+`ui.accessibility.sound_feedback`. Existing TOML and JSON configs still load
+with one warning per removed section. Use `[alerts]` for decode alerts and
+the documented TUI keymap for keys. The separate TUI config also drops
+`refresh_rate`, `max_messages`, `show_waterfall`, `time_format`, and
+`frequency_format`; the live renderer already uses its own cadence and format.
+
+The serialized-key consumer test checks leaf-name references outside the
+config crate and tests. It is a lexical floor, not proof that a setting runs.
+Its 204 explicit waivers record existing schema debt and references hidden
+by the conservative cutoff at each source file's first `#[cfg(test)]`.
+The waiver ceiling cannot grow. Remaining settings need separate consumer
+or removal work; optional values absent from defaults and user map entries
+are outside this test's enumeration.
+
+## Release build provenance and pre-release marking (PAN-308, 2026-11-13)
+
+The release workflow's build job now holds `id-token: write` and
+`attestations: write` alongside `contents: read`. Only the tag-gated
+build-provenance step uses the attestation scopes; workflow-dispatch dry runs
+do not attest. This executes PAN-106's recorded attestation deferral and
+narrows its rule to no build write scope beyond the attestation pair.
+The release job retains `contents: write` for draft creation.
+
+Release CI overrides Cargo profiles with debug=1, strip=none and
+split-debuginfo=off. Post-link splitting produces separate ELF/PE `.debug`
+assets or a macOS dSYM tarball before the binary is packaged.
+`Cargo.toml` and local build profiles stay unchanged. The first tagged run
+must check symbol sizes and native macOS/Windows extraction.
+`SHA256SUMS` lists platform archives only, excluding dSYM tarballs;
+per-archive checksum sidecars remain available.
+
+Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
+receive a release-candidate notice. They require a real, matching CHANGELOG
+section; there is no Unreleased fallback. The operator still publishes the
+draft. macOS signing and notarization remain PAN-265.

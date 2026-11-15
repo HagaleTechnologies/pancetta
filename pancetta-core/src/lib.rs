@@ -30,6 +30,7 @@ pub mod dxcc;
 mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;
+mod dxcc_zones;
 pub mod error;
 pub mod freq_bin;
 pub mod ft8_tokens;
@@ -94,3 +95,5 @@ mod tests {
         let _err = PancettaError::Other("test".to_string());
     }
 }
+
+pub mod time;

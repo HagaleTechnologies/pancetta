@@ -11,3 +11,10 @@ An outer timeout alone cannot help a slow rig. Shutdown uses 3000 ms per reply
 and a 6 s overall direct budget concurrently with the drain.
 
 See [the PAN-277 decision](../../docs/DECISIONS/tx-scheduling.md#shutdown-unkeys-through-the-hamlib-loop-pan-277-2026-11-10).
+
+The systemd watchdog uses SIGTERM and a 45-second stop timeout (PAN-335).
+KillMode=mixed leaves managed rigctld alive during the normal drain. A stopped
+or fully wedged process cannot run that drain, so force-kill may still leave
+physical PTT asserted. A restart also reloads autonomous.enabled from config;
+an in-memory TX halt does not survive. Qualify the watchdog only with rig
+control and autonomous TX disabled, as the [runbook](../../docs/RUNBOOK.md#linux-service-readiness-and-watchdog-recovery) describes.

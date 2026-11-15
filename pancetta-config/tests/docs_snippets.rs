@@ -209,3 +209,18 @@ fn inline_assignment_matcher() {
     assert_eq!(parse_inline_assignment("[Foo] x = 1"), None);
     assert_eq!(parse_inline_assignment("enabled = true"), None);
 }
+
+#[test]
+fn pan302_live_reload_examples_parse() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/CONFIG.md");
+    let (snippets, _) = extract(&path, &known_sections());
+    let snippet = snippets
+        .iter()
+        .find(|s| {
+            s.text.contains("min_dx_score = 0.8")
+                && s.text.contains("[rig.receive_gain_presets.20m]")
+        })
+        .expect("live reload example");
+    let dir = tempfile::tempdir().unwrap();
+    assert!(load_failure(snippet, dir.path()).is_none());
+}

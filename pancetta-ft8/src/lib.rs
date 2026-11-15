@@ -170,6 +170,13 @@ pub mod syndrome;
 pub mod ft8_lib_ffi;
 pub use ft8_lib_ffi::{ft8lib_is_available, Ft8LibSeed, Ft8LibSeedSet};
 
+// PAN-318: two-pass overlap execution plumbing shared by the live
+// coordinator and the qualification tests. Internal application/research
+// helper, doc-hidden, NOT part of the stable API (see the module's docs
+// and tests/stable_api_guard.rs, which pins none of it).
+#[doc(hidden)]
+pub mod window_execution;
+
 // Benchmark harness for decoder comparison
 #[cfg(feature = "benchmark")]
 pub mod benchmark;

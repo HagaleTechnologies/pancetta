@@ -14,7 +14,15 @@ if ! grep -q '[^[:space:]]' "$scratch"; then
   echo "CHANGELOG.md has no section for ${VERSION}" >&2
   exit 1
 fi
-cat "$scratch" > "$OUTPUT"
+case "$VERSION" in
+  *-*)
+    {
+      printf '**Pre-release:** %s is a release candidate, published as a GitHub pre-release. It may change or be withdrawn before %s ships.\n\n' "$VERSION" "${VERSION%%-*}"
+      cat "$scratch"
+    } > "$OUTPUT"
+    ;;
+  *) cat "$scratch" > "$OUTPUT" ;;
+esac
 {
   printf "\n---\nTagged at \`%s\`.\n\n" "${GITHUB_SHA:?tagged source SHA required}"
   cat <<'NOTES'

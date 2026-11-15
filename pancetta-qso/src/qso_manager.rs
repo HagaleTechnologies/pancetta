@@ -1711,6 +1711,7 @@ fn watchdog_state_identity(state: &QsoState, now: DateTime<Utc>) -> Option<Watch
 
 /// QSO manager implementation
 pub struct QsoManager {
+    utc_clock: pancetta_core::time::UtcClock,
     /// Configuration
     config: QsoManagerConfig,
 
@@ -1935,23 +1936,8 @@ pub struct QsoManager {
     /// 15 s cadence.
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
-    /// The station's configured late-start TX window in milliseconds
-    /// (`[station] tx_late_max_ms`, default 3000), injected by the
-    /// coordinator via [`QsoManager::set_tx_late_max_ms`].
-    ///
-    /// PAN-128 PR review: `keep_call_tx_slot` needs the SAME current-slot
-    /// acceptance window the TX scheduler (`schedule_tx`) decides against,
-    /// so that a rearm inside own slot S's late window and the off-parity
-    /// rearm before S — both scheduled into S — share one ledger key and
-    /// one stall count. A plain value, not an `Arc` atomic: the TX worker
-    /// itself snapshots `tx_late_max_ms` once at startup (config is loaded
-    /// once; the hot-reload apply task is a documented no-op), so a
-    /// construction-time copy has the same fidelity, and `Clone`'s by-value
-    /// copy is exactly what the rearm loop's clone should see.
-    ///
-    /// Defaults to [`DEFAULT_TX_LATE_MAX_MS`], so unit tests and any caller
-    /// that never injects a value keep the documented operator default.
-    tx_late_max_ms: u64,
+    /// Shared late-start limit: worker and timeout clones observe reloads together.
+    tx_late_max_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -2228,7 +2214,7 @@ impl QsoManager {
         within: std::time::Duration,
     ) -> bool {
         let qsos = self.qsos.read().await;
-        let now = chrono::Utc::now();
+        let now = self.now_utc();
         let window_secs = within.as_secs() as i64;
         let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
         qsos.values().any(|p| {
@@ -2253,7 +2239,21 @@ impl QsoManager {
         })
     }
 
-    /// Create a new QSO manager
+    fn now_utc(&self) -> DateTime<Utc> {
+        (self.utc_clock)()
+    }
+
+    #[cfg(test)]
+    pub fn with_clock_for_test(
+        config: QsoManagerConfig,
+        clock: pancetta_core::time::UtcClock,
+    ) -> Self {
+        let mut manager = Self::new(config);
+        manager.utc_clock = clock;
+        manager
+    }
+
+    /// Create a new QSO manager using the system UTC clock.
     pub fn new(config: QsoManagerConfig) -> Self {
         let (event_sender, _) = broadcast::channel(1000);
         let next_serial = config
@@ -2263,6 +2263,7 @@ impl QsoManager {
             .unwrap_or(1);
 
         Self {
+            utc_clock: pancetta_core::time::system_utc_clock(),
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
             watchdog_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2310,7 +2311,7 @@ impl QsoManager {
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
             // Default late-start window: the documented operator default
             // (see the field's doc comment).
-            tx_late_max_ms: DEFAULT_TX_LATE_MAX_MS,
+            tx_late_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_TX_LATE_MAX_MS)),
         }
     }
 
@@ -2439,11 +2440,16 @@ impl QsoManager {
     ///
     /// PAN-128 PR review — see the `tx_late_max_ms` field's doc comment for
     /// why the stall ledger needs the scheduler's own window. Pass the same
-    /// `cfg.station.tx_late_max_ms` the TX worker snapshots at startup; if
-    /// never called, the manager keeps [`DEFAULT_TX_LATE_MAX_MS`] (3000, the
-    /// documented default).
+    /// `cfg.station.tx_late_max_ms` used by the TX worker; if never called,
+    /// the manager keeps [`DEFAULT_TX_LATE_MAX_MS`] (3000, the documented default).
     pub fn set_tx_late_max_ms(&mut self, tx_late_max_ms: u64) {
-        self.tx_late_max_ms = tx_late_max_ms;
+        self.tx_late_max_ms
+            .store(tx_late_max_ms, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Bind the station's live late-start limit before starting background work.
+    pub fn set_tx_late_max_ms_source(&mut self, source: Arc<std::sync::atomic::AtomicU64>) {
+        self.tx_late_max_ms = source;
     }
 
     /// One transmit slot in milliseconds for the live active protocol — the
@@ -2621,7 +2627,7 @@ impl QsoManager {
                 ),
             });
         }
-        let now = Utc::now();
+        let now = self.now_utc();
         // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
         // QSO creation when the caller has no fixed preference (`None`, the
         // Auto-config default) — see `latch_cq_parity_if_none` doc.
@@ -2640,6 +2646,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -2755,7 +2762,7 @@ impl QsoManager {
             });
         }
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = self.now_utc();
         // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
         // QSO creation when the caller has no fixed preference (`None`, the
         // Auto-config default) — see `latch_cq_parity_if_none` doc.
@@ -2780,6 +2787,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3243,7 +3251,7 @@ impl QsoManager {
             .await;
 
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = self.now_utc();
         // When `dx_parity` is `None` (e.g. answering a DX-cluster/DX-Hunter
         // spot that has never actually been decoded live, so there is no
         // observed slot parity to oppose), fall back to the same "nearest
@@ -3272,6 +3280,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3645,7 +3654,7 @@ impl QsoManager {
         // `qsos` -> `qsos_by_callsign` order. A clock-based arm expiry right
         // after the check is still caught only by the TX worker at key time.
         let qso_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = self.now_utc();
         // See the matching comment in `respond_to_cq_with`: a `None`
         // `dx_parity` (no observed decode for this caller yet) falls back to
         // the "nearest next slot" latch and is marked provisional so the
@@ -3724,6 +3733,7 @@ impl QsoManager {
             frequency,
             completed_rf_frequency_hz: None,
             mode: self.config.active_mode.clone(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3845,7 +3855,7 @@ impl QsoManager {
                 .cloned()
                 .unwrap_or_default();
             let superseded =
-                Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, Utc::now());
+                Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, self.now_utc());
             qsos.insert(qso_id, progress);
             let attempt_id = self.next_attempt_id();
             // PAN-280: an open at the close holds its QsoCompleted until the
@@ -3911,7 +3921,7 @@ impl QsoManager {
     /// Two-strike confirm-before-relatch at the current time. See
     /// [`Self::maybe_confirm_frequency_drift_at`].
     async fn maybe_confirm_frequency_drift(&self, message_type: &MessageType, frequency: f64) {
-        self.maybe_confirm_frequency_drift_at(message_type, frequency, Utc::now())
+        self.maybe_confirm_frequency_drift_at(message_type, frequency, self.now_utc())
             .await;
     }
 
@@ -4220,7 +4230,7 @@ impl QsoManager {
         signal_strength: Option<f32>,
         observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
-        let timestamp = Utc::now();
+        let timestamp = self.now_utc();
 
         // PAN-49: an otherwise-unclassifiable decode may be a contest ack
         // (e.g. "R"+grid) that `MessageExchange::parse_message` has no
@@ -4370,7 +4380,7 @@ impl QsoManager {
             let old_state = progress.state.clone();
             progress.state = QsoState::Failed {
                 reason: QsoFailureReason::UserCancelled,
-                failed_at: Utc::now(),
+                failed_at: self.now_utc(),
                 last_state: Box::new(old_state.clone()),
             };
             // Capture metadata before it's consumed below (Batch 4, SM-F5).
@@ -4432,7 +4442,7 @@ impl QsoManager {
             let old_state = progress.state.clone();
             progress.state = QsoState::Failed {
                 reason: reason.clone(),
-                failed_at: Utc::now(),
+                failed_at: self.now_utc(),
                 last_state: Box::new(old_state.clone()),
             };
             let metadata = progress.metadata.clone();
@@ -4493,7 +4503,7 @@ impl QsoManager {
             let reason = QsoFailureReason::ControlTransferred;
             progress.state = QsoState::Failed {
                 reason: reason.clone(),
-                failed_at: Utc::now(),
+                failed_at: self.now_utc(),
                 last_state: Box::new(old_state.clone()),
             };
             self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
@@ -4596,7 +4606,7 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> ManualCallOutcome {
-        let now = Utc::now();
+        let now = self.now_utc();
         let (message, frequency, attempt_id) = {
             let mut qsos = self.qsos.write().await;
             let Some(progress) = qsos.get_mut(&qso_id) else {
@@ -4803,8 +4813,14 @@ impl QsoManager {
         replaced: Option<&UnsentAttemptPayload>,
         attempt_id: Option<TxAttemptId>,
     ) -> UnsentAttemptRollback {
-        self.roll_back_replaced_attempt_at(qso_id, message_text, replaced, attempt_id, Utc::now())
-            .await
+        self.roll_back_replaced_attempt_at(
+            qso_id,
+            message_text,
+            replaced,
+            attempt_id,
+            self.now_utc(),
+        )
+        .await
     }
 
     /// Deterministic-clock rollback. Matches newest text first, within four slots.
@@ -5184,7 +5200,7 @@ impl QsoManager {
     /// re-pressing Space/resend near a slot boundary can't produce a
     /// same-text emission the rearm/coalescer machinery doesn't know about.
     pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
-        let now = Utc::now();
+        let now = self.now_utc();
         let emit = {
             let mut qsos = self.qsos.write().await;
             let progress = qsos
@@ -5350,7 +5366,7 @@ impl QsoManager {
         qso_id: QsoId,
         attempt_id: Option<TxAttemptId>,
     ) -> UnsentCompletion {
-        self.resolve_unsent_completion_at(qso_id, attempt_id, Utc::now())
+        self.resolve_unsent_completion_at(qso_id, attempt_id, self.now_utc())
             .await
     }
 
@@ -5759,7 +5775,8 @@ impl QsoManager {
         });
         if let Some(emitted_at) = pending_trigger_at {
             return Err(
-                if stall_trigger_hold_expired(emitted_at, Utc::now(), self.rearm_slot_millis()) {
+                if stall_trigger_hold_expired(emitted_at, self.now_utc(), self.rearm_slot_millis())
+                {
                     QsoManagerError::OffsetActionTriggerOutcomeExpired { qso_id }
                 } else {
                     QsoManagerError::OffsetActionTriggerOutcomePending { qso_id }
@@ -5840,7 +5857,7 @@ impl QsoManager {
         // `PreSwitchOffset::operator_forced`.
         progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
             offset_hz: old_off,
-            left_at: Utc::now(),
+            left_at: self.now_utc(),
             operator_forced: origin.is_operator_forced(),
         });
         // Mirror the Hound QSY block's state write (see `process_message_for_
@@ -5994,7 +6011,7 @@ impl QsoManager {
                 _ => None,
             };
             message.map(|message| {
-                let now = Utc::now();
+                let now = self.now_utc();
                 // Double-send guard (Fix A, step 4; extended round 14):
                 // bump call_count/last_call_at exactly as
                 // `rearm_manual_calls_at` would after a normal resend, so
@@ -6434,7 +6451,7 @@ impl QsoManager {
         // MessageToSend below carry the same id; `reply_sent_at` is the one
         // timestamp of its `Sent` record, so a revert can find that record.
         let mut reply_attempt_id: Option<TxAttemptId> = None;
-        let reply_sent_at = Utc::now();
+        let reply_sent_at = self.now_utc();
         if new_state != old_state {
             // PAN-280: what a dropped closing reply puts back.
             let pre_close_reports = progress.metadata.reports.clone();
@@ -6448,6 +6465,9 @@ impl QsoManager {
             if progress.metadata.their_callsign.is_none() {
                 if let Some(call) = new_state.their_callsign() {
                     progress.metadata.their_callsign = Some(call.to_string());
+                    if progress.metadata.first_answer_at.is_none() {
+                        progress.metadata.first_answer_at = Some(message.timestamp);
+                    }
                 }
             }
 
@@ -6463,7 +6483,7 @@ impl QsoManager {
                     sent: Some(*our_report),
                     received: Some(*their_report),
                 };
-                progress.metadata.end_time = Some(Utc::now());
+                progress.metadata.end_time = Some(self.now_utc());
                 // Prefer the grid carried in the Completed state (CQer path
                 // threads it through WaitingForConfirmation); otherwise keep
                 // whatever was latched from the opening CqResponse above.
@@ -7225,7 +7245,7 @@ impl QsoManager {
                 Ok(QsoState::WaitingForReport {
                     their_callsign: responding_station.clone(),
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                     their_grid: grid.clone(),
                     our_report,
                 })
@@ -7274,7 +7294,7 @@ impl QsoManager {
                 Ok(QsoState::WaitingForReport {
                     their_callsign: from_station.clone(),
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                     their_grid: None,
                     our_report,
                 })
@@ -7324,14 +7344,14 @@ impl QsoManager {
                 let our_report = signal_strength
                     .map(|snr| (snr.round() as i8).clamp(-30, 50))
                     .unwrap_or(-15);
-                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: -15,
                     our_report,
                     frequency: *frequency,
                     grid_square: None,
-                    completed_at: Utc::now(),
+                    completed_at: self.now_utc(),
                     duration_seconds: duration,
                 })
             }
@@ -7443,7 +7463,7 @@ impl QsoManager {
                     our_report,
                     frequency: *frequency,
                     grid_square: their_grid.clone(),
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7501,7 +7521,7 @@ impl QsoManager {
                     their_report: None,
                     our_report,
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7540,7 +7560,7 @@ impl QsoManager {
                     their_report: Some(*report),
                     our_report,
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7585,7 +7605,7 @@ impl QsoManager {
                     our_report,
                     frequency: *frequency,
                     grid_square: None,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7657,7 +7677,7 @@ impl QsoManager {
                     our_report,
                     frequency: *frequency,
                     grid_square: Some(grid.clone()),
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7709,7 +7729,7 @@ impl QsoManager {
                     our_report,
                     frequency: *frequency,
                     grid_square: None,
-                    completed_at: Utc::now(),
+                    completed_at: self.now_utc(),
                     duration_seconds: 0,
                 })
             }
@@ -7748,7 +7768,7 @@ impl QsoManager {
                     our_report: *our_report,
                     frequency: *frequency,
                     grid_square: None,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7789,14 +7809,14 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: their_report.unwrap_or(-15),
                     our_report: *our_report,
                     frequency: *frequency,
                     grid_square: None,
-                    completed_at: Utc::now(),
+                    completed_at: self.now_utc(),
                     duration_seconds: duration,
                 })
             }
@@ -7833,14 +7853,14 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
+                let duration = (self.now_utc() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: *their_report,
                     our_report: *our_report,
                     frequency: *frequency,
                     grid_square: grid_square.clone(),
-                    completed_at: Utc::now(),
+                    completed_at: self.now_utc(),
                     duration_seconds: duration,
                 })
             }
@@ -7860,7 +7880,7 @@ impl QsoManager {
             // reply emitter answers a ReportAck for this (state, msg) pair).
             // Latch the newest report value the DX sent.
             //
-            // SM-F6 safety note: this arm resets `started_at: Utc::now()` on
+            // SM-F6 safety note: this arm resets `started_at: self.now_utc()` on
             // every fire, which would let a repeatedly-regressing QSO reset
             // its own timeout clock indefinitely. Deliberately left
             // Manual-only (not extended to Auto) rather than adding a bounded
@@ -7912,7 +7932,7 @@ impl QsoManager {
                     their_report: Some(*report),
                     our_report,
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -7984,7 +8004,7 @@ impl QsoManager {
             // CqResponse directed appropriately for this QSO.
             //
             // SM-F6 safety note: like REGRESSION 1, this arm resets
-            // `started_at: Utc::now()` on every fire. Deliberately left
+            // `started_at: self.now_utc()` on every fire. Deliberately left
             // Manual-only for the same reason as REGRESSION 1 — it operates
             // on WaitingForConfirmation, which is outside SM-F6's scope and
             // already carries a uniform `confirmation_timeout` bound for both
@@ -8026,7 +8046,7 @@ impl QsoManager {
                 Ok(QsoState::RespondingToCq {
                     target_callsign: their_callsign.clone(),
                     frequency: *frequency,
-                    started_at: Utc::now(),
+                    started_at: self.now_utc(),
                 })
             }
 
@@ -8091,7 +8111,7 @@ impl QsoManager {
             // with the true RF frequency (dial + offset) at completion time
             // (see `process_message_for_qso`), so `frequency` must be
             // adjusted the same way here for a fair comparison.
-            let now = Utc::now();
+            let now = self.now_utc();
             let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
             let sender_has_other_active_or_recent_partner =
                 message_type.sender_callsign().is_some_and(|sender| {
@@ -8235,8 +8255,12 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             matches_baseline(match_frequency)
-                || live_pre_switch_offset_at(metadata, Utc::now(), self.pre_switch_offset_grace())
-                    .is_some_and(|pre| matches_baseline(pre.offset_hz))
+                || live_pre_switch_offset_at(
+                    metadata,
+                    self.now_utc(),
+                    self.pre_switch_offset_grace(),
+                )
+                .is_some_and(|pre| matches_baseline(pre.offset_hz))
         });
         if !within_frequency_gate {
             return Relevance {
@@ -8518,8 +8542,12 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             if !matches_baseline(match_freq)
-                && !live_pre_switch_offset_at(metadata, Utc::now(), self.pre_switch_offset_grace())
-                    .is_some_and(|pre| matches_baseline(pre.offset_hz))
+                && !live_pre_switch_offset_at(
+                    metadata,
+                    self.now_utc(),
+                    self.pre_switch_offset_grace(),
+                )
+                .is_some_and(|pre| matches_baseline(pre.offset_hz))
             {
                 return false;
             }
@@ -8533,7 +8561,7 @@ impl QsoManager {
         callsign: &str,
         frequency: f64,
     ) -> Result<bool, QsoManagerError> {
-        self.check_duplicate_at(callsign, frequency, Utc::now())
+        self.check_duplicate_at(callsign, frequency, self.now_utc())
             .await
     }
 
@@ -8676,7 +8704,7 @@ impl QsoManager {
         frequency: f64,
         within: chrono::Duration,
     ) -> Option<QsoId> {
-        self.find_recently_completed_manual_qso_for_at(callsign, frequency, within, Utc::now())
+        self.find_recently_completed_manual_qso_for_at(callsign, frequency, within, self.now_utc())
             .await
     }
 
@@ -8754,7 +8782,7 @@ impl QsoManager {
         remote_client_key_id: Option<String>,
     ) -> Result<ManualCallOutcome, QsoManagerError> {
         use pancetta_core::ResponseStep;
-        let now = Utc::now();
+        let now = self.now_utc();
 
         let (new_state, message): (QsoState, MessageType) = match step {
             ResponseStep::Grid => {
@@ -8980,7 +9008,7 @@ impl QsoManager {
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
-            Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, Utc::now())
+            Self::supersede_active_locked(&mut qsos, &candidate_ids, &new_band, self.now_utc())
         };
         self.emit_superseded(callsign, &new_band, superseded).await;
     }
@@ -9118,7 +9146,7 @@ impl QsoManager {
             qso_id,
             old_state,
             new_state,
-            timestamp: Utc::now(),
+            timestamp: self.now_utc(),
         })
         .await;
     }
@@ -9149,13 +9177,13 @@ impl QsoManager {
     }
 
     async fn timeout_check_loop(&self) {
-        let mut detector = pancetta_core::slot_clock::ClockStepDetector::new(Utc::now());
+        let mut detector = pancetta_core::slot_clock::ClockStepDetector::new(self.now_utc());
         let mut last_mono = std::time::Instant::now();
         let mut interval_timer = interval(TokioDuration::from_secs(5));
         loop {
             interval_timer.tick().await;
             self.watchdog_pass_at(
-                Utc::now(),
+                self.now_utc(),
                 std::time::Instant::now(),
                 &mut detector,
                 &mut last_mono,
@@ -9454,7 +9482,8 @@ impl QsoManager {
                 let tx_slot = keep_call_tx_slot(
                     now,
                     slot_millis,
-                    self.tx_late_max_ms,
+                    self.tx_late_max_ms
+                        .load(std::sync::atomic::Ordering::Acquire),
                     progress.metadata.tx_parity,
                 );
                 let counts_toward_stall = !ledger.get(&qso_id).is_some_and(|entry| {
@@ -9646,7 +9675,7 @@ impl QsoManager {
     /// already durably written it by the time this runs.
     async fn cleanup_completed_qsos(&self) {
         let mut qsos = self.qsos.write().await;
-        let cutoff_time = Utc::now() - Duration::hours(1); // Keep completed QSOs for 1 hour
+        let cutoff_time = self.now_utc() - Duration::hours(1); // Keep completed QSOs for 1 hour
 
         let to_remove: Vec<QsoId> = qsos
             .iter()
@@ -10076,6 +10105,7 @@ impl QsoManager {
 impl Clone for QsoManager {
     fn clone(&self) -> Self {
         Self {
+            utc_clock: self.utc_clock.clone(),
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
             watchdog_anchors: Arc::clone(&self.watchdog_anchors),
@@ -10102,9 +10132,8 @@ impl Clone for QsoManager {
             // this clone and must observe runtime mode switches (see the
             // field's doc comment).
             active_slot_ns: Arc::clone(&self.active_slot_ns),
-            // Copied by value, matching the TX worker's own startup
-            // snapshot of the same knob (see the field's doc comment).
-            tx_late_max_ms: self.tx_late_max_ms,
+            // Reload publication also reaches the background timeout clone.
+            tx_late_max_ms: self.tx_late_max_ms.clone(),
         }
     }
 }
@@ -10114,6 +10143,43 @@ impl Clone for QsoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan302_qso_late_cap_refreshes_before_slot_acceptance() {
+        let mut manager = QsoManager::new(QsoManagerConfig::default());
+        let live = Arc::new(std::sync::atomic::AtomicU64::new(8000));
+        manager.set_tx_late_max_ms_source(live.clone());
+        let timeout_clone = manager.clone();
+        let now = chrono::DateTime::from_timestamp(2, 0).unwrap();
+        let before = keep_call_tx_slot(
+            now,
+            15_000,
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            Some(pancetta_core::slot::SlotParity::Even),
+        );
+        live.store(1000, std::sync::atomic::Ordering::Release);
+        let after = keep_call_tx_slot(
+            now,
+            15_000,
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            Some(pancetta_core::slot::SlotParity::Even),
+        );
+        assert_ne!(
+            before, after,
+            "the real timeout clone must defer beyond the reduced cap"
+        );
+        manager.set_tx_late_max_ms(8000);
+        assert_eq!(
+            timeout_clone
+                .tx_late_max_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            8000
+        );
+    }
     use tokio_test;
 
     #[test]
@@ -15623,6 +15689,7 @@ mod tests {
                 frequency: freq,
                 completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
+                first_answer_at: None,
                 start_time: now,
                 end_time: None,
                 reports: SignalReports::default(),
@@ -16195,6 +16262,7 @@ mod sender_verification_tests {
             frequency: their_freq,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -21035,6 +21103,301 @@ mod pan72_stall_detection_tests {
     //! we're on some other (previously-switched) offset.
     use super::*;
 
+    fn clocked_manager(config: QsoManagerConfig) -> QsoManager {
+        QsoManager::with_clock_for_test(config, PinnedClock::new().source())
+    }
+
+    #[derive(Clone)]
+    struct PinnedClock(Arc<std::sync::Mutex<DateTime<Utc>>>);
+    impl PinnedClock {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(
+                pancetta_core::time::slot_grid_origin(),
+            )))
+        }
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+        fn source(&self) -> pancetta_core::time::UtcClock {
+            let clock = self.clone();
+            Arc::new(move || clock.now())
+        }
+    }
+
+    async fn time_on_answer(manager: &QsoManager, bare: bool, to: &str) {
+        let message = if bare {
+            MessageType::SignalReport {
+                to_station: to.into(),
+                from_station: DX.into(),
+                report: -10,
+            }
+        } else {
+            MessageType::CqResponse {
+                calling_station: to.into(),
+                responding_station: DX.into(),
+                grid: Some("FN31".into()),
+            }
+        };
+        manager
+            .process_message(message, format!("{to} {DX} FN31"), FREQ, Some(-10.0))
+            .await
+            .unwrap();
+    }
+
+    async fn check_completed_time_on(bare: bool) {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        let created = clock.now();
+        clock.advance(Duration::minutes(4));
+        let answered = clock.now();
+        time_on_answer(&manager, bare, OUR).await;
+        clock.advance(Duration::seconds(30));
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -12,
+                },
+                format!("{OUR} {DX} R-12"),
+                FREQ,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        clock.advance(Duration::seconds(30));
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{OUR} {DX} 73"),
+                FREQ,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::Completed { .. }));
+        assert_eq!(qso.metadata.start_time, created);
+        assert_eq!(qso.metadata.first_answer_at, Some(answered));
+        assert_eq!(
+            crate::adif::AdifProcessor::new()
+                .qso_to_adif(&qso.metadata, None)
+                .qso_date,
+            answered
+        );
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_is_first_answer_not_cq_start() {
+        check_completed_time_on(false).await;
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_bare_report_answer() {
+        check_completed_time_on(true).await;
+    }
+
+    #[tokio::test]
+    async fn cqer_time_on_rejected_and_repeated_answers() {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        clock.advance(Duration::minutes(4));
+        time_on_answer(&manager, false, "W9XYZ").await;
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::CallingCq { .. }));
+        assert_eq!(qso.metadata.first_answer_at, None);
+        time_on_answer(&manager, false, OUR).await;
+        let answered = clock.now();
+        clock.advance(Duration::seconds(30));
+        time_on_answer(&manager, false, OUR).await;
+        assert_eq!(
+            manager.get_qso(id).await.unwrap().metadata.first_answer_at,
+            Some(answered)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_cq_time_on_rolls_over_utc_midnight() {
+        let clock = PinnedClock::new();
+        clock.advance(Duration::hours(23) + Duration::minutes(58));
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        let created = clock.now();
+        clock.advance(Duration::minutes(4));
+        time_on_answer(&manager, false, OUR).await;
+        let metadata = manager.get_qso(id).await.unwrap().metadata;
+        assert_eq!(metadata.start_time, created);
+        assert_eq!(metadata.first_answer_at, Some(clock.now()));
+        let adif = crate::adif::AdifProcessor::new().qso_to_adif(&metadata, None);
+        assert_eq!(adif.qso_date, clock.now());
+        assert_ne!(adif.qso_date.date_naive(), created.date_naive());
+    }
+
+    #[tokio::test]
+    async fn manual_cq_contest_time_survives_adif_and_index_round_trip() {
+        use crate::contest::{
+            ledger,
+            scoring::{ContestPeriod, ContestScoringContext, KSQP_FT_2026},
+        };
+        let clock = PinnedClock::new();
+        let created = clock.now();
+        let context = ContestScoringContext::new(
+            "PAN-307-test",
+            "us-state-qso-party",
+            KSQP_FT_2026,
+            "TX",
+            vec![ContestPeriod {
+                start: created,
+                end: created + Duration::hours(1),
+            }],
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.contest_scoring = Some(context.clone());
+        let manager = QsoManager::with_clock_for_test(config, clock.source());
+        let id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        clock.advance(Duration::minutes(4) + Duration::milliseconds(123));
+        let answered = clock.now();
+        time_on_answer(&manager, false, OUR).await;
+        for message in [
+            MessageType::ReportAck {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+                report: -12,
+            },
+            MessageType::SeventyThree {
+                to_station: OUR.into(),
+                from_station: DX.into(),
+            },
+        ] {
+            clock.advance(Duration::seconds(30));
+            manager
+                .process_message(message, format!("{OUR} {DX}"), FREQ, Some(-11.0))
+                .await
+                .unwrap();
+        }
+        let qso = manager.get_qso(id).await.unwrap();
+        assert!(matches!(qso.state, QsoState::Completed { .. }));
+        assert_eq!(qso.metadata.start_time, created);
+        let db = crate::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        db.insert_qso(&qso).await.unwrap();
+        let indexed = db.contest_ledger(&context, OUR).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qsos.adi");
+        db.export_to_adif(&path).await.unwrap();
+        let processor = crate::adif::AdifProcessor::new();
+        let file = processor
+            .parse_string(&std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        let record = processor.record_to_qso(&file.records[0]).unwrap();
+        let imported = processor.adif_to_qso(&record);
+        let durable = ledger::fact(&imported, &context, OUR).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].start, answered);
+        assert_eq!(durable, indexed[0]);
+        assert_eq!(
+            ledger::decode(&record.additional_fields)
+                .unwrap()
+                .unwrap()
+                .contact_start,
+            Some(answered)
+        );
+    }
+
+    #[tokio::test]
+    async fn responding_qso_time_on_unchanged() {
+        let clock = PinnedClock::new();
+        let manager = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        clock.advance(Duration::seconds(30));
+        time_on_answer(&manager, true, OUR).await;
+        let metadata = manager.get_qso(id).await.unwrap().metadata;
+        assert_eq!(metadata.first_answer_at, None);
+        assert_eq!(
+            crate::adif::AdifProcessor::new()
+                .qso_to_adif(&metadata, None)
+                .qso_date,
+            metadata.start_time
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_reads_the_injected_clock() {
+        let clock = PinnedClock::new();
+        let first = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = first
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        let a = first.get_qso(id).await.unwrap().metadata;
+        clock.advance(Duration::seconds(30));
+        let second = QsoManager::with_clock_for_test(test_config(), clock.source());
+        let id = second
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        let b = second.get_qso(id).await.unwrap().metadata;
+        assert_eq!((b.start_time - a.start_time).num_milliseconds(), 30_000);
+        assert_eq!(a.tx_parity, b.tx_parity);
+        assert_eq!(b.start_time, clock.now());
+    }
+
+    #[tokio::test]
+    async fn stall_module_is_replay_deterministic() {
+        async fn replay() -> (Vec<String>, DateTime<Utc>, Option<DateTime<Utc>>) {
+            let mut config = test_config();
+            config.timeouts.qso_stall_switch_after = 2;
+            let manager = manager_auto(config);
+            let mut rx = manager.subscribe();
+            let id = manager
+                .respond_to_cq_manual(DX.into(), FREQ, None)
+                .await
+                .unwrap();
+            let opened = manager.get_qso(id).await.unwrap().metadata.start_time;
+            stall_on_two_own_parity_slots(&manager, id, opened).await;
+            confirm_last_frame_aired(&manager, id, FREQ).await;
+            let events = drain(&mut rx);
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })));
+            // UUIDs identify independent contacts; compare all event payloads after normalizing that identity.
+            let events = events
+                .iter()
+                .map(|e| format!("{e:?}").replace(&id.to_string(), "QSO"))
+                .collect();
+            let metadata = manager.get_qso(id).await.unwrap().metadata;
+            (events, metadata.start_time, metadata.last_call_at)
+        }
+        assert_eq!(replay().await, replay().await);
+    }
+
     const OUR: &str = "K5ARH";
     const DX: &str = "K9ZZ";
     const FREQ: f64 = 1500.0;
@@ -21055,7 +21418,7 @@ mod pan72_stall_detection_tests {
 
     /// Manager in Auto TX-freq mode (autonomous offset actions enabled).
     fn manager_auto(config: QsoManagerConfig) -> QsoManager {
-        let mut m = QsoManager::new(config);
+        let mut m = clocked_manager(config);
         m.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_core::TxFreqMode::Auto.as_u8(),
         )));
@@ -21125,7 +21488,7 @@ mod pan72_stall_detection_tests {
             .get(&qso_id)
             .and_then(|entry| entry.pending_stall_trigger.as_ref())
             .and_then(|trigger| trigger.tx_slot)
-            .map_or(Utc::now() + Duration::days(1), |slot| {
+            .map_or(manager.now_utc() + Duration::days(1), |slot| {
                 slot + Duration::seconds(13)
             })
     }
@@ -21900,7 +22263,7 @@ mod pan72_stall_detection_tests {
     /// byte-identical FT8 behavior.
     #[test]
     fn the_default_slot_source_is_exactly_the_ft8_slot() {
-        let manager = QsoManager::new(test_config());
+        let manager = clocked_manager(test_config());
         assert_eq!(manager.rearm_slot_millis(), 15_000);
     }
 
@@ -21930,7 +22293,7 @@ mod pan72_stall_detection_tests {
     /// behavior.
     #[test]
     fn the_default_pre_switch_offset_grace_is_unchanged() {
-        let manager = QsoManager::new(test_config());
+        let manager = clocked_manager(test_config());
         assert_eq!(
             manager.pre_switch_offset_grace(),
             Duration::milliseconds(30_000)
@@ -22865,7 +23228,7 @@ mod pan72_stall_detection_tests {
 
         let mut rx = manager.subscribe();
         manager
-            .rearm_manual_calls_at(Utc::now() + Duration::seconds(60))
+            .rearm_manual_calls_at(manager.now_utc() + Duration::seconds(60))
             .await;
         let sent_at: Vec<f64> = drain(&mut rx)
             .into_iter()
@@ -22980,7 +23343,7 @@ mod pan72_stall_detection_tests {
     async fn hold_mode_never_emits_tx_offset_action_needed() {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
-        let manager = QsoManager::new(config); // default Hold
+        let manager = clocked_manager(config); // default Hold
         let mut rx = manager.subscribe();
         let qso_id = manager
             .respond_to_cq_manual(DX.into(), FREQ, None)
@@ -23099,7 +23462,7 @@ mod pan72_stall_detection_tests {
             from_station: DX.into(),
             report: -11,
         };
-        let t0 = Utc::now();
+        let t0 = manager.now_utc();
         manager
             .maybe_confirm_frequency_drift_at(&report, FREQ, t0)
             .await;
@@ -23605,7 +23968,7 @@ mod pan72_stall_detection_tests {
 
         progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
             offset_hz: FREQ,
-            left_at: Utc::now() - manager.pre_switch_offset_grace() - Duration::seconds(1),
+            left_at: manager.now_utc() - manager.pre_switch_offset_grace() - Duration::seconds(1),
             operator_forced: true,
         });
         assert!(
@@ -24094,7 +24457,7 @@ mod pan72_stall_detection_tests {
     /// `answered_frame_offset_hz`'s window for any test that finishes within
     /// one slot.
     fn reply_window_now() -> (pancetta_core::slot::SlotParity, DateTime<Utc>) {
-        let now = Utc::now();
+        let now = pancetta_core::time::slot_grid_origin();
         (
             pancetta_core::slot::SlotParity::of_with_period(now, DEFAULT_SLOT_NS),
             now - Duration::seconds(2),
@@ -24443,7 +24806,13 @@ mod pan72_stall_detection_tests {
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
             .unwrap();
-        report_aired(&manager, qso_id, FREQ, Utc::now() - Duration::seconds(32)).await;
+        report_aired(
+            &manager,
+            qso_id,
+            FREQ,
+            manager.now_utc() - Duration::seconds(32),
+        )
+        .await;
         let nudged = FREQ + 400.0;
         manager
             .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
@@ -24684,7 +25053,7 @@ mod pan72_stall_detection_tests {
             )
             .await
             .unwrap();
-        let now = Utc::now();
+        let now = manager.now_utc();
         let first_call_at = now - Duration::minutes(2);
         {
             let mut qsos = manager.qsos.write().await;
@@ -25942,7 +26311,7 @@ mod pan72_stall_detection_tests {
 
         let slot_ms = slot_ns / 1_000_000;
         let anchor = next_slot_with_parity_with_period(
-            Utc::now() + Duration::seconds(120),
+            manager.now_utc() + Duration::seconds(120),
             dx_parity,
             slot_ns,
         );
@@ -26256,7 +26625,7 @@ mod pan72_stall_detection_tests {
             .get_mut(&qso_id)
             .and_then(|entry| entry.pending_stall_trigger.as_mut())
             .expect("the raise recorded a trigger")
-            .emitted_at = Utc::now() - Duration::milliseconds(5 * slot_millis);
+            .emitted_at = manager.now_utc() - Duration::milliseconds(5 * slot_millis);
 
         let result = manager
             .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
@@ -26279,7 +26648,7 @@ mod pan72_stall_detection_tests {
 
     #[test]
     fn pan182_stall_trigger_hold_expires_at_four_slots() {
-        let emitted_at = Utc::now();
+        let emitted_at = pancetta_core::time::slot_grid_origin();
         let slot = 15_000;
         assert!(!stall_trigger_hold_expired(
             emitted_at,
@@ -26834,7 +27203,7 @@ mod pan72_stall_detection_tests {
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
             .unwrap();
-        let aired_at = Utc::now();
+        let aired_at = manager.now_utc();
         let released = manager
             .confirm_stall_trigger_aired(
                 qso_id,
@@ -26874,7 +27243,7 @@ mod pan72_stall_detection_tests {
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
             .unwrap();
-        let later_aired_at = Utc::now();
+        let later_aired_at = manager.now_utc();
         let earlier_aired_at = later_aired_at - Duration::seconds(10);
         let payload = UnsentAttemptPayload {
             frequency_hz: FREQ,
@@ -26907,7 +27276,7 @@ mod pan72_stall_detection_tests {
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
             .unwrap();
-        let aired_at = Utc::now();
+        let aired_at = manager.now_utc();
         manager
             .confirm_stall_trigger_aired(
                 qso_id,
@@ -26951,7 +27320,7 @@ mod pan72_stall_detection_tests {
                     frequency_hz: FREQ,
                     remote_binding: Some((false, None)),
                 },
-                Utc::now(),
+                manager.now_utc(),
             )
             .await;
         assert_eq!(
@@ -27163,6 +27532,7 @@ mod has_active_or_recent_qso_tests {
             frequency: 1500.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -27403,6 +27773,7 @@ mod hound_tests {
             frequency: 600.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),

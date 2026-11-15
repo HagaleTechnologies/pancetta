@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
@@ -1593,6 +1594,46 @@ fn consume_rolled_back_attempt_tombstone(
     }
 }
 
+/// PAN-302: how long a dispatched self-CQ message id stays recognizable to
+/// the TX worker's pre-PTT permission recheck. One slot settles in ~15 s;
+/// two minutes covers slot deferrals and worker requeues while keeping the
+/// marker set bounded (self-CQs dispatch at most once per slot).
+pub(super) const AUTONOMOUS_SELF_CQ_DISPATCH_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// PAN-302: mark a self-CQ TX message the autonomous engine is about to
+/// dispatch, so the TX worker's final pre-PTT permission recheck can tell an
+/// engine-dispatched self-CQ from a request another bus participant
+/// synthesized with `source == Autonomous` (PAN-277's shutdown fixture sends
+/// exactly the self-CQ shape). Prunes expired entries on insert.
+pub(super) fn mark_autonomous_self_cq_dispatch(
+    dispatches: &Arc<std::sync::Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>>,
+    message_id: u64,
+) {
+    if let Ok(mut dispatches) = dispatches.lock() {
+        let now = std::time::Instant::now();
+        dispatches.retain(|(_, marked_at)| {
+            now.duration_since(*marked_at) < AUTONOMOUS_SELF_CQ_DISPATCH_RETENTION
+        });
+        dispatches.push_back((message_id, now));
+    }
+}
+
+/// PAN-302: whether `message_id` is a self-CQ dispatch the autonomous engine
+/// sent within the retention window (see [`mark_autonomous_self_cq_dispatch`]).
+pub(super) fn is_marked_autonomous_self_cq_dispatch(
+    dispatches: &Arc<std::sync::Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>>,
+    message_id: u64,
+) -> bool {
+    match dispatches.lock() {
+        Ok(dispatches) => dispatches.iter().any(|(id, _)| *id == message_id),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .iter()
+            .any(|(id, _)| *id == message_id),
+    }
+}
+
 pub(crate) fn self_cq_suppressed(
     self_cq_emitted: bool,
     runtime_gate_open: bool,
@@ -1879,6 +1920,21 @@ pub(crate) fn skip_record_diagnostic(record: &pancetta_qso::CqSkipRecord) -> Gat
     }
 }
 
+/// Convert the exact live allowlist for both construction and reload consumption.
+fn live_autonomous_policy(
+    config: &pancetta_config::autonomous::AutonomousConfig,
+) -> pancetta_qso::autonomous::AutonomousLivePolicy {
+    pancetta_qso::autonomous::AutonomousLivePolicy {
+        enabled: config.enabled,
+        min_dx_score: config.min_dx_score,
+        min_multi_slot_score: config.min_multi_slot_score,
+        pounce_min_tier: config.pounce_min_tier.map(super::alerts::priority_tier),
+        cq_after_idle_cycles: config.cq_after_idle_cycles,
+        cq_no_response_switch_after: config.cq_no_response_switch_after,
+        cq_direction: config.cq_direction.clone(),
+    }
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_autonomous_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_autonomous");
@@ -1888,20 +1944,8 @@ impl super::ApplicationCoordinator {
         let auto_config_enabled = config.autonomous.enabled;
         let unattended_policy = config.autonomous.unattended_policy;
 
-        // hb-161 + 2026-07-29 follow-up: seed the runtime gate. An
-        // interactive (TUI) launch always starts CLOSED regardless of
-        // config — the operator must press `a` to arm, the same
-        // safety-driver posture as Shift+Q's disarm. Auto-arming straight
-        // from config is reserved for `--headless` (`docs/RUNBOOK.md`:
-        // "for a supervised headless station, config is the only
-        // switch" — there is no TUI to press `a` in, so config must be
-        // able to arm it directly there). If the operator launched with
-        // autonomous=false in config, the gate is already `false` either
-        // way and any `a`-press is a no-op (idempotent — the desired
-        // safety-driver property).
-        let seed_armed = auto_config_enabled && self.headless;
-        self.autonomous_enabled_runtime
-            .store(seed_armed, Ordering::Release);
+        // Runtime intent is initialized once by the coordinator. Restarting
+        // this component must preserve an operator pause or emergency stop.
 
         // FQ-F9: `auto_config_enabled` no longer early-returns into a
         // no-op drain task. The slot-tick loop below always runs — it
@@ -1983,6 +2027,7 @@ impl super::ApplicationCoordinator {
             watchlist_ttl_secs: config.watchlist.ttl_secs,
         };
 
+        let initial_live_policy = live_autonomous_policy(&config.autonomous);
         let dry_run = config.autonomous.dry_run;
         // FQ-F9: only banner the DRY RUN mode when autonomous is actually
         // engaged — a manual-only operator (autonomous.enabled = false)
@@ -2044,6 +2089,11 @@ impl super::ApplicationCoordinator {
         let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
         ));
+
+        operator
+            .lock()
+            .await
+            .update_live_policy(initial_live_policy);
 
         // Share the operator's Hold/Auto TX-frequency mode so the smart-freq
         // allocator and collision-listen jitter respect it (Hold → pinned
@@ -2250,6 +2300,9 @@ impl super::ApplicationCoordinator {
         // sources_not_defaults` (qso.rs) for the regression test.
         let qso_manager_watch = self.qso_manager_watch.subscribe();
         let watchlist_config = self.config.clone();
+        let live_config = self.config.clone();
+        let config_permission = self.autonomous_config_enabled.clone();
+        let self_cq_dispatches = self.autonomous_self_cq_dispatches.clone();
         let headless_persist = if self.headless && self.config_write_is_toml {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
             let path = self.config_path.clone();
@@ -2476,6 +2529,12 @@ impl super::ApplicationCoordinator {
                                 op.update_live_spots(&spot_freqs);
                             }
 
+                            // Tier admission chooses the scorer's RF-dial context
+                            // while feeding, so refresh before scoring as well as
+                            // immediately before the later decision.
+                            op.update_live_policy(live_autonomous_policy(
+                                &live_config.read().await.autonomous,
+                            ));
                             op.feed_decoded_messages_on_dial_at(
                                 &slot_messages,
                                 evaluator.as_ref(),
@@ -2777,7 +2836,12 @@ impl super::ApplicationCoordinator {
                             // active-QSO/own-frequency sync, auto-repark)
                             // already ran unconditionally so the
                             // TX-placement instrument stays live regardless.
-                            if !auto_config_enabled {
+                            let live_policy = {
+                                let config = live_config.read().await;
+                                live_autonomous_policy(&config.autonomous)
+                            };
+                            op.update_live_policy(live_policy);
+                            if !config_permission.load(Ordering::Acquire) {
                                 // Nothing further needed from the operator
                                 // lock this tick; drop it promptly rather
                                 // than holding it through `decide()`/dispatch.
@@ -3026,8 +3090,10 @@ impl super::ApplicationCoordinator {
                             // gate → tri-state TX policy → opening→QSO-start
                             // split). All the decision logic is the pure
                             // `plan_slot_transmissions`; here we only do I/O.
+                            let dry_run = live_config.read().await.autonomous.dry_run;
                             let runtime_gate_open =
-                                autonomous_runtime_gate.load(Ordering::Acquire);
+                                autonomous_runtime_gate.load(Ordering::Acquire)
+                                && config_permission.load(Ordering::Acquire);
                             let policy = pancetta_core::TxPolicy::from_u8(
                                 tx_policy.load(Ordering::Acquire),
                             );
@@ -3141,6 +3207,18 @@ impl super::ApplicationCoordinator {
                             // emits the opening TX + StateChanged). Sent INSTEAD
                             // OF a raw TransmitRequest — no double-send.
                             for start in plan.qso_starts {
+                                // Diagnostics and previous dispatches may have awaited.
+                                // Refresh before each new autonomous admission.
+                                let live_dry_run = live_config.read().await.autonomous.dry_run;
+                                if live_dry_run
+                                    || !config_permission.load(Ordering::Acquire)
+                                    || !autonomous_runtime_gate.load(Ordering::Acquire)
+                                {
+                                    if let Some(id) = start.cq_attempt_id {
+                                        operator.lock().await.restore_cq_state_for_attempt(id);
+                                    }
+                                    continue;
+                                }
                                 let cq_attempt_id = start.cq_attempt_id;
                                 let msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
@@ -3187,6 +3265,12 @@ impl super::ApplicationCoordinator {
                             }
 
                             let mut tx_items = plan.tx_items;
+                            let dry_run = live_config.read().await.autonomous.dry_run;
+                            if !config_permission.load(Ordering::Acquire)
+                                || !autonomous_runtime_gate.load(Ordering::Acquire)
+                            {
+                                tx_items.retain(|(item, _)| item.qso_id.is_some());
+                            }
 
                             // Bundle collected TX items into a single message.
                             if tx_items.len() == 1 {
@@ -3201,6 +3285,9 @@ impl super::ApplicationCoordinator {
                                         tx_parity
                                     );
                                 } else {
+                                    // PAN-302: capture the self-CQ shape
+                                    // before the constructor moves the item.
+                                    let is_self_cq = item.qso_id.is_none();
                                     let msg = ComponentMessage::new(
                                         ComponentId::Autonomous,
                                         ComponentId::Ft8Transmitter,
@@ -3214,6 +3301,14 @@ impl super::ApplicationCoordinator {
                                         },
                                         Instant::now(),
                                     );
+                                    // PAN-302: mark before send so the TX worker's
+                                    // pre-PTT recheck never races the marker insert.
+                                    if is_self_cq {
+                                        mark_autonomous_self_cq_dispatch(
+                                            &self_cq_dispatches,
+                                            msg.id,
+                                        );
+                                    }
                                     if let Err(e) = message_bus.send_message(msg).await {
                                         warn!("Failed to send TransmitRequest: {}", e);
                                     }
@@ -3300,6 +3395,13 @@ impl super::ApplicationCoordinator {
                                 // its own (disagreeing) parity — via the same single-TX
                                 // path used for the `tx_items.len() == 1` case above.
                                 for (item, p) in excluded {
+                                    let dry_run = live_config.read().await.autonomous.dry_run;
+                                    if item.qso_id.is_none()
+                                        && (!config_permission.load(Ordering::Acquire)
+                                            || !autonomous_runtime_gate.load(Ordering::Acquire))
+                                    {
+                                        continue;
+                                    }
                                     if dry_run {
                                         info!(
                                             target: "autonomous.dry_run",
@@ -3311,6 +3413,9 @@ impl super::ApplicationCoordinator {
                                             p
                                         );
                                     } else {
+                                        // PAN-302: capture the self-CQ shape
+                                        // before the constructor moves the item.
+                                        let is_self_cq = item.qso_id.is_none();
                                         let msg = ComponentMessage::new(
                                             ComponentId::Autonomous,
                                             ComponentId::Ft8Transmitter,
@@ -3324,6 +3429,14 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
+                                        // PAN-302: mark before send (see the
+                                        // single-item path above).
+                                        if is_self_cq {
+                                            mark_autonomous_self_cq_dispatch(
+                                                &self_cq_dispatches,
+                                                msg.id,
+                                            );
+                                        }
                                         if let Err(e) = message_bus.send_message(msg).await {
                                             warn!(
                                                 "Failed to send TransmitRequest for parity-excluded item: {}",
@@ -3333,7 +3446,16 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
 
-                                let items: Vec<_> = bundled.into_iter().map(|(it, _)| it).collect();
+                                let mut items: Vec<_> = bundled.into_iter().map(|(it, _)| it).collect();
+                                let dry_run = live_config.read().await.autonomous.dry_run;
+                                if !config_permission.load(Ordering::Acquire)
+                                    || !autonomous_runtime_gate.load(Ordering::Acquire)
+                                {
+                                    items.retain(|item| item.qso_id.is_some());
+                                }
+                                if items.is_empty() {
+                                    continue;
+                                }
                                 if dry_run {
                                     info!(
                                         target: "autonomous.dry_run",
@@ -3352,6 +3474,10 @@ impl super::ApplicationCoordinator {
                                     }
                                 } else {
                                     info!("Bundling {} TX items into MultiTransmitRequest", items.len());
+                                    // PAN-302: mark before send when the bundle
+                                    // carries a self-CQ (qso_id: None) item.
+                                    let bundle_carries_self_cq =
+                                        items.iter().any(|item| item.qso_id.is_none());
                                     let msg = ComponentMessage::new(
                                         ComponentId::Autonomous,
                                         ComponentId::Ft8Transmitter,
@@ -3363,6 +3489,12 @@ impl super::ApplicationCoordinator {
                                         },
                                         Instant::now(),
                                     );
+                                    if bundle_carries_self_cq {
+                                        mark_autonomous_self_cq_dispatch(
+                                            &self_cq_dispatches,
+                                            msg.id,
+                                        );
+                                    }
                                     if let Err(e) = message_bus.send_message(msg).await {
                                         warn!("Failed to send MultiTransmitRequest: {}", e);
                                     }
@@ -7100,6 +7232,385 @@ mod fq_f9_placement_feed_when_disabled_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    async fn pan302_ready_coordinator(enabled: bool) -> ApplicationCoordinator {
+        let c = build_coordinator(enabled, true).await;
+        {
+            let mut config = c.config.write().await;
+            config.station.callsign = "W1ABC".into();
+            config.station.grid_square = "FN42".into();
+            config.autonomous.slot_parity = pancetta_config::SlotParitySetting::Even;
+            config.autonomous.cq_after_idle_cycles = 1;
+            config.autonomous.listen_cycle.initial_interval = 100;
+            // Neutral rarity is .5, so these weights score -4 dB at .6,
+            // and +8 dB at .9 without a network service or a mock scorer.
+            let weights = &mut config.autonomous.priorities;
+            weights.needed_dxcc = 0.0;
+            weights.needed_grid = 0.0;
+            weights.pota_sota = 0.0;
+            weights.rarity = 0.2;
+            weights.signal_strength = 0.85;
+            weights.atno_bonus = 0.0;
+        }
+        c.last_operator_input_ms.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            Ordering::Release,
+        );
+        c
+    }
+
+    async fn pan302_wait_for_even_tx_slot() {
+        let now = chrono::Utc::now();
+        let mut next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
+            == pancetta_qso::SlotParity::Odd
+        {
+            next += chrono::Duration::seconds(15);
+        }
+        tokio::time::sleep(
+            pancetta_core::slot::duration_until(next, now) + Duration::from_millis(2500),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pan302_file_disable_stops_new_calls_within_one_slot() {
+        let mut c = pan302_ready_coordinator(true).await;
+        let (_, qso) = c
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .unwrap();
+        let (_, tx) = c
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_autonomous_component().await.unwrap();
+        pan302_wait_for_even_tx_slot().await;
+        assert!(drain(&qso).iter().any(|m| matches!(
+            m.message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::StartAutonomousQso { .. })
+        )));
+        drain(&tui);
+        let mut saved = c.config.read().await.clone();
+        saved.autonomous.enabled = false;
+        c.handle_config_reload(Ok((saved, vec![]))).await;
+        c.waterfall_to_auto_tx
+            .as_ref()
+            .unwrap()
+            .send(vec![vec![0.001; 100]])
+            .unwrap();
+        c.message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::Autonomous,
+                MessageType::DecodedMessage(cq_decoded_message()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        wait_for_next_slot_tick().await;
+        assert!(drain(&qso).is_empty());
+        assert!(drain(&tx).is_empty());
+        let messages = drain(&tui);
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m.message_type, MessageType::TxPlacementUpdate { .. })));
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))));
+        assert!(c.autonomous_enabled_runtime.load(Ordering::Acquire));
+        assert_eq!(
+            c.tx_policy.load(Ordering::Acquire),
+            pancetta_core::TxPolicy::Full.as_u8(),
+            "file disable preserves manual TX policy"
+        );
+        c.shutdown_signal.store(true, Ordering::Release);
+
+        // Exercise real manual QSO admission and observe its opening frame.
+        let home = tempfile::tempdir().unwrap();
+        let mut manual = pan302_ready_coordinator(true).await;
+        manual.pancetta_home_override = Some(home.path().to_path_buf());
+        manual.replay_path = Some(home.path().join("capture"));
+        let (_, manual_tx) = manual
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, _manual_tui) = manual
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        manual.start_qso_component().await.unwrap();
+        let mut saved = manual.config.read().await.clone();
+        saved.autonomous.enabled = false;
+        manual.handle_config_reload(Ok((saved, vec![]))).await;
+        manual
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Qso,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
+                    callsign: "K1XYZ".into(),
+                    frequency: 1500,
+                    dx_parity: Some(SlotParity::Even),
+                    remote_origin: false,
+                    remote_client_key_id: None,
+                    dx_offset_unknown: false,
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if drain(&manual_tx).iter().any(|m| matches!(&m.message_type,
+                    MessageType::TransmitRequest { message_text, .. } if message_text.contains("K1XYZ"))) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("manual QSO must emit its opening frame after file disable");
+        manual.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn pan302_reload_changes_next_pounce_decision() {
+        // Feed the CQ in the RX slot immediately before the chosen Even
+        // TX slot. An earlier Odd tick consumes its decode batch as usual.
+        let now = chrono::Utc::now();
+        let next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
+            == pancetta_qso::SlotParity::Odd
+        {
+            tokio::time::sleep(
+                pancetta_core::slot::duration_until(next, now) + Duration::from_millis(500),
+            )
+            .await;
+        }
+        let mut fixtures = Vec::new();
+        for (threshold, snr, expected) in [(0.5, -4.0, true), (0.8, -4.0, false), (0.8, 8.0, true)]
+        {
+            let mut c = pan302_ready_coordinator(true).await;
+            c.config.write().await.autonomous.cq_after_idle_cycles = 1000;
+            c.config.write().await.autonomous.min_dx_score = 0.5;
+            let (_, qso) = c
+                .message_bus
+                .create_channel(ComponentId::Qso)
+                .await
+                .unwrap();
+            let (_, tui) = c
+                .message_bus
+                .create_channel(ComponentId::Tui)
+                .await
+                .unwrap();
+            let weights: pancetta_qso::PriorityWeights = toml::from_str(
+                &toml::to_string(&c.config.read().await.autonomous.priorities).unwrap(),
+            )
+            .unwrap();
+            let scorer =
+                pancetta_qso::PriorityScorer::new(weights, Box::new((*c.cached_lookup).clone()));
+            let expected_score = if snr < 0.0 { 0.6 } else { 0.9 };
+            assert!(
+                (scorer
+                    .score_cq_detailed("W1AW", Some("FN31"), snr as i8, 1500.0)
+                    .total
+                    - expected_score)
+                    .abs()
+                    < 1e-9
+            );
+            c.start_autonomous_component().await.unwrap();
+            let mut saved = c.config.read().await.clone();
+            saved.autonomous.min_dx_score = threshold;
+            c.handle_config_reload(Ok((saved, vec![]))).await;
+            let mut decoded = cq_decoded_message();
+            decoded.snr_db = snr;
+            // Unknown parity leaves the existing fixed TX-slot policy in charge.
+            decoded.slot_parity = None;
+            c.message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Decoder,
+                    ComponentId::Autonomous,
+                    MessageType::DecodedMessage(decoded),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            fixtures.push((c, qso, tui, expected, threshold, snr));
+        }
+        pan302_wait_for_even_tx_slot().await;
+        for (c, qso, tui, expected, threshold, snr) in fixtures {
+            assert!(drain(&tui)
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))));
+            let starts = drain(&qso);
+            assert_eq!(starts.iter().any(|m| matches!(&m.message_type,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartAutonomousQso { callsign: Some(call), .. }) if call == "W1AW")), expected, "threshold={threshold}, snr={snr}, bus={starts:?}");
+            c.shutdown_signal.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn pan302_reload_preserves_operator_intent() {
+        let mut c = pan302_ready_coordinator(false).await;
+        let (_, starts) = c
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .unwrap();
+        let (_, _tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_autonomous_component().await.unwrap();
+        assert!(
+            c.autonomous_enabled_runtime.load(Ordering::Acquire),
+            "headless intent starts independently of file permission"
+        );
+        let mut saved = c.config.read().await.clone();
+        saved.autonomous.enabled = true;
+        c.handle_config_reload(Ok((saved.clone(), vec![]))).await;
+        assert!(c.autonomous_config_enabled.load(Ordering::Acquire));
+        assert!(c.autonomous_enabled_runtime.load(Ordering::Acquire));
+        pan302_wait_for_even_tx_slot().await;
+        assert!(
+            drain(&starts).iter().any(|m| matches!(
+                m.message_type,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartAutonomousQso { .. })
+            )),
+            "startup-disabled headless station starts calls after a valid enable"
+        );
+        c.autonomous_enabled_runtime.store(false, Ordering::Release);
+        c.tx_policy
+            .store(pancetta_core::TxPolicy::Disabled.as_u8(), Ordering::Release);
+        for enabled in [false, true, false, true] {
+            saved.autonomous.enabled = enabled;
+            c.handle_config_reload(Ok((saved.clone(), vec![]))).await;
+            assert_eq!(c.autonomous_config_enabled.load(Ordering::Acquire), enabled);
+            assert!(!c.autonomous_enabled_runtime.load(Ordering::Acquire));
+            assert_eq!(
+                c.tx_policy.load(Ordering::Acquire),
+                pancetta_core::TxPolicy::Disabled.as_u8()
+            );
+        }
+        c.shutdown_signal.store(true, Ordering::Release);
+        let mut restarted = build_coordinator(true, true).await;
+        restarted
+            .autonomous_enabled_runtime
+            .store(false, Ordering::Release);
+        restarted.start_autonomous_component().await.unwrap();
+        assert!(
+            !restarted.autonomous_enabled_runtime.load(Ordering::Acquire),
+            "component start never rearms a paused gate"
+        );
+        restarted.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn pan302_file_disable_blocks_multitx_dispatch_and_preserves_pending() {
+        let mut c = pan302_ready_coordinator(true).await;
+        let (_, tx) = c
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, _tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_autonomous_component().await.unwrap();
+        let operator = c.autonomous_operator_watch.borrow().clone().unwrap();
+        {
+            let mut op = operator.lock().await;
+            op.add_pending_sequencer_message(
+                "K1XYZ W1ABC -10".into(),
+                1000.0,
+                Some("existing-a".into()),
+            );
+            op.add_pending_sequencer_message(
+                "K2ABC W1ABC -12".into(),
+                1800.0,
+                Some("existing-b".into()),
+            );
+        }
+        pan302_wait_for_even_tx_slot().await;
+        assert!(
+            drain(&tx).iter().any(|m| matches!(&m.message_type,
+            MessageType::MultiTransmitRequest { items, .. } if items.len() == 2)),
+            "enabled control reaches real bundle dispatch"
+        );
+        let mut saved = c.config.read().await.clone();
+        saved.autonomous.enabled = false;
+        c.handle_config_reload(Ok((saved.clone(), vec![]))).await;
+        {
+            let mut op = operator.lock().await;
+            op.add_pending_sequencer_message(
+                "K1XYZ W1ABC R-10".into(),
+                1000.0,
+                Some("existing-a".into()),
+            );
+            op.add_pending_sequencer_message(
+                "K2ABC W1ABC R-12".into(),
+                1800.0,
+                Some("existing-b".into()),
+            );
+        }
+        wait_for_next_slot_tick().await;
+        assert!(drain(&tx).is_empty());
+        saved.autonomous.enabled = true;
+        c.handle_config_reload(Ok((saved, vec![]))).await;
+        pan302_wait_for_even_tx_slot().await;
+        assert!(
+            drain(&tx).iter().any(|m| matches!(&m.message_type,
+            MessageType::MultiTransmitRequest { items, .. } if items.len() == 2)),
+            "reload preserves pending sequencer messages"
+        );
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn pan302_dry_run_refreshes_before_dispatch() {
+        let mut c = pan302_ready_coordinator(true).await;
+        let (_, qso) = c
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .unwrap();
+        let (_, tx) = c
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_autonomous_component().await.unwrap();
+        let mut saved = c.config.read().await.clone();
+        saved.autonomous.dry_run = true;
+        c.handle_config_reload(Ok((saved, vec![]))).await;
+        pan302_wait_for_even_tx_slot().await;
+        assert!(
+            drain(&tui)
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))),
+            "decisions continue during dry-run"
+        );
+        assert!(drain(&qso).is_empty());
+        assert!(drain(&tx).is_empty());
+        c.shutdown_signal.store(true, Ordering::Release);
+    }
 
     /// A synthetic decoded CQ — enough to exercise
     /// `feed_decoded_messages`'s decode-history accumulation. Content is

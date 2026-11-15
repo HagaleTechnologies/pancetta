@@ -412,8 +412,10 @@ fn compute_hunt_rects(content_area: Rect, has_qrz_info: bool) -> HuntRects {
     let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
 
     let mut constraints = vec![
-        Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-        Constraint::Length(7),      // TX Placement (full width)
+        Constraint::Length(1), // Active-QSOs banner (full width, 1 row)
+        // Reserve a DX data row at the 132x24 resize target. The placement
+        // panel can compress before the station chooser loses its only row.
+        Constraint::Length(content_area.height.saturating_sub(13).min(7)),
         Constraint::Percentage(45), // DX Hunter (full width)
     ];
     if show_card {

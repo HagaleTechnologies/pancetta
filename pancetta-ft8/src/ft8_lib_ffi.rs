@@ -581,6 +581,369 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
         offset += block_size;
     }
 
+    // SAFETY: the processed waterfall is owned by guard and stays live and
+    // unmutated for the whole call; min_bin/symbol_period are its own monitor's.
+    unsafe { decode_candidates_from_waterfall(&mon.wf, mon.min_bin, mon.symbol_period, parser) }
+}
+
+/// Owned 0–3000 Hz magnitude grid captured from one reference-pass monitor
+/// (PAN-318 AC4). The bytes are copied out of the C monitor's `uint8_t`
+/// waterfall before it is freed — no C pointer leaves the call — in the
+/// original `[block][time_sub][freq_sub][bin]` layout. A cell's dB value is
+/// `mag * 0.5 - 120` (same `WF_ELEM_MAG_INT` quantization as the decode
+/// path); frequency is `(min_bin + bin + freq_sub/freq_osr) / symbol_period`.
+///
+/// Declared outside any `cfg` so the real and stub builds share one type;
+/// the stub build can never produce an instance (its capture entry returns
+/// `None`).
+#[derive(Debug, Clone)]
+pub struct Ft8LibDisplayGrid {
+    /// `[block][time_sub][freq_sub][bin]` magnitudes, `block_stride` bytes
+    /// per block, `num_bins` per (freq_sub, block) row.
+    pub mag: Vec<u8>,
+    /// Number of processed blocks (one per `block_size` input samples).
+    pub num_blocks: usize,
+    /// Bins per freq-subrow (481 for the 0–3000 Hz FT8 monitor).
+    pub num_bins: usize,
+    pub time_osr: usize,
+    pub freq_osr: usize,
+    /// Monitor `min_bin` (0: the capture monitor spans DC up).
+    pub min_bin: usize,
+    /// FT8: 0.16 s; FT4: 1/12000*576 s. Sets the frequency grid.
+    pub symbol_period: f32,
+    pub sample_rate: usize,
+    /// Samples per block (FT8: 1920).
+    pub block_size: usize,
+}
+
+impl Ft8LibDisplayGrid {
+    /// Convert the captured grid onto the legacy display grid
+    /// (`WaterfallData`) without a second FFT, reproducing
+    /// `Ft8Decoder::generate_waterfall_data`'s geometry for
+    /// `audio_len` samples: 4096-point FFT partitions averaged into 4
+    /// target rows plus any trailing partial row, 0–3000 Hz at
+    /// `sample_rate/4096` Hz per bin, per-row time labels from the same
+    /// `(fft_idx - frames/2) * hop / sr` formula.
+    ///
+    /// Powers: quantized dB → linear, averaged over the monitor sub-frames
+    /// whose analysis-frame centers fall in each legacy row's span
+    /// (startup zero-padding excluded), linearly interpolated in power on
+    /// the frequency axis `(min_bin + bin + freq_sub/freq_osr) /
+    /// symbol_period`, then rescaled to the legacy PSD convention. The C
+    /// window carries the FFT's `2/nfft` gain and the legacy one-sided PSD
+    /// doubles positive frequencies, giving a coherent-gain ratio of
+    /// `nfft²/2` for both tones and noise (Hann sums ≈ N/2 and squares ≈
+    /// 3N/8 for either window length). The result is approximate — window
+    /// shapes and lengths differ — and must not be read as calibrated RF
+    /// power.
+    pub fn to_waterfall_data(&self, audio_len: usize) -> crate::decoder::WaterfallData {
+        self.to_waterfall_data_with(audio_len, 4096, 4, 3000.0)
+    }
+
+    /// Geometry-parameterized core, so the pin against the legacy
+    /// generator's constants is one place. `fft_size`/`target_rows`/`f_max`
+    /// are `generate_waterfall_data`'s (4096, 4, 3000 Hz).
+    fn to_waterfall_data_with(
+        &self,
+        audio_len: usize,
+        fft_size: usize,
+        target_rows: usize,
+        f_max_hz: f64,
+    ) -> crate::decoder::WaterfallData {
+        let empty = || crate::decoder::WaterfallData {
+            time_bins: Vec::new(),
+            frequency_bins: Vec::new(),
+            power_matrix: Vec::new(),
+            min_power: 0.0,
+            max_power: 0.0,
+        };
+        if self.num_blocks == 0 || self.num_bins == 0 || self.sample_rate == 0 {
+            return empty();
+        }
+
+        // ---- legacy row partition arithmetic (generate_waterfall_data) ----
+        let window_size = fft_size.min(audio_len);
+        if window_size == 0 || audio_len < window_size {
+            return empty();
+        }
+        let hop = fft_size / 4; // legacy hop: window/4 (fft/4 for full windows)
+        let num_ffts = (audio_len - window_size) / hop + 1;
+        let ffts_per_row = (num_ffts / target_rows).max(1);
+        let freq_resolution = self.sample_rate as f64 / fft_size as f64;
+        let bin_end = ((f_max_hz / freq_resolution).floor() as usize).min(fft_size / 2);
+        let display_bins = bin_end + 1; // bin_start = 0, endpoint included
+
+        // One span per emitted legacy row: the row's time label and the
+        // centers of the first/last legacy FFT windows it averages (FFT i
+        // covers [i*hop, i*hop+window), centered at (i*hop + window/2)/sr).
+        let fft_center = |i: usize| (i * hop + window_size / 2) as f64 / self.sample_rate as f64;
+        struct RowSpan {
+            label_s: f64,
+            first_center_s: f64,
+            last_center_s: f64,
+        }
+        let mut rows: Vec<RowSpan> = Vec::new();
+        let mut row_first = 0usize;
+        let mut count = 0usize;
+        for fft_idx in 0..num_ffts {
+            count += 1;
+            if count >= ffts_per_row || fft_idx == num_ffts - 1 {
+                rows.push(RowSpan {
+                    label_s: (fft_idx as f64 - count as f64 / 2.0) * hop as f64
+                        / self.sample_rate as f64,
+                    first_center_s: fft_center(row_first),
+                    last_center_s: fft_center(fft_idx),
+                });
+                row_first = fft_idx + 1;
+                count = 0;
+            }
+        }
+        if rows.is_empty() {
+            return empty();
+        }
+
+        // Row boundaries at span midpoints; rows keep the legacy label.
+        let mut bounds: Vec<f64> = Vec::with_capacity(rows.len() + 1);
+        bounds.push(f64::NEG_INFINITY);
+        for pair in rows.windows(2) {
+            bounds.push((pair[0].last_center_s + pair[1].first_center_s) / 2.0);
+        }
+        bounds.push(f64::INFINITY);
+
+        // ---- monitor sub-frame geometry ----
+        // Sub-frame (b, ts) analyzed the trailing nfft samples ending at
+        // sample e = b*block_size + (ts+1)*block_size/time_osr (the C
+        // rolling buffer), so its center is e - nfft/2. Frames with
+        // e < nfft averaged in zero-padding from the calloc'd buffer and
+        // are excluded.
+        let nfft = self.block_size * self.freq_osr;
+        let subblock = self.block_size / self.time_osr.max(1);
+        let axis_len = self.num_bins * self.freq_osr; // sub-bin power axis
+        let axis_step_hz = 1.0 / (self.symbol_period as f64 * self.freq_osr as f64); // 3.125 Hz (FT8)
+        let block_stride = self.time_osr * self.freq_osr * self.num_bins;
+
+        // The C window folds the 2/nfft FFT gain into its coefficients and
+        // the legacy one-sided PSD doubles positive-frequency power; see
+        // the method doc.
+        let psd_scale = (nfft as f64) * (nfft as f64) / 2.0;
+
+        let floor_db = -120.0; // quantized grid floor (mag = 0)
+        let mut power_matrix: Vec<Vec<f64>> = Vec::with_capacity(rows.len());
+        let mut time_bins: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut min_power = f64::MAX;
+        let mut max_power = f64::MIN;
+
+        // Per-row accumulators: a row's image is the average of ITS OWN
+        // assigned frames only, never the whole window's.
+        let mut accum = vec![0.0f64; rows.len() * axis_len];
+        let mut counts = vec![0usize; rows.len()];
+
+        for b in 0..self.num_blocks {
+            for ts in 0..self.time_osr {
+                let end_sample = b * self.block_size + (ts + 1) * subblock;
+                if end_sample < nfft {
+                    continue; // startup zero-padding
+                }
+                let center_s = (end_sample - nfft / 2) as f64 / self.sample_rate as f64;
+                // Nearest legacy row by span boundaries.
+                let row = match bounds.partition_point(|&x| x <= center_s) {
+                    0 => 0,
+                    idx => idx - 1,
+                };
+                let base = b * block_stride + ts * self.freq_osr * self.num_bins;
+                let row_acc = &mut accum[row * axis_len..(row + 1) * axis_len];
+                for bin in 0..self.num_bins {
+                    for fs in 0..self.freq_osr {
+                        let cell = base + fs * self.num_bins + bin;
+                        // SAFETY-free indexing: mag is an owned Vec of
+                        // num_blocks * block_stride bytes, cell is in range.
+                        let db = f64::from(self.mag[cell]) * 0.5 - 120.0;
+                        row_acc[bin * self.freq_osr + fs] += 10f64.powf(db / 10.0);
+                    }
+                }
+                counts[row] += 1;
+            }
+        }
+
+        for (row_idx, span) in rows.iter().enumerate() {
+            time_bins.push(span.label_s);
+            if counts[row_idx] == 0 {
+                // No monitor frame covered this row (audio much shorter
+                // than a block): emit the floor, keeping values finite.
+                power_matrix.push(vec![floor_db; display_bins]);
+                min_power = min_power.min(floor_db);
+                max_power = max_power.max(floor_db);
+                continue;
+            }
+            let n = counts[row_idx] as f64;
+            let row_acc = &accum[row_idx * axis_len..(row_idx + 1) * axis_len];
+            let mut row = Vec::with_capacity(display_bins);
+            for i in 0..display_bins {
+                let f_hz = i as f64 * freq_resolution;
+                let pos = f_hz / axis_step_hz;
+                let lo = pos.floor();
+                let power = if lo >= (axis_len - 1) as f64 {
+                    row_acc[axis_len - 1]
+                } else {
+                    let frac = pos - lo;
+                    let lo = lo as usize;
+                    row_acc[lo] * (1.0 - frac) + row_acc[lo + 1] * frac
+                } / n;
+                let db = 10.0 * (power * psd_scale + 1e-12).log10();
+                min_power = min_power.min(db);
+                max_power = max_power.max(db);
+                row.push(db);
+            }
+            power_matrix.push(row);
+        }
+
+        crate::decoder::WaterfallData {
+            time_bins,
+            frequency_bins: (0..=bin_end).map(|i| i as f64 * freq_resolution).collect(),
+            power_matrix,
+            min_power,
+            max_power,
+        }
+    }
+}
+
+/// PAN-318 AC4 capture entry: decode with the reference pipeline AND return
+/// the monitor's owned 0–3000 Hz display grid, so one C FFT supplies both
+/// the decode band and the waterfall.
+///
+/// The monitor spans 0–3000 Hz (display coverage); candidate search and
+/// decoding run against an OWNED copy of the original 100–3000 Hz bins in
+/// the original `[block][time_sub][freq_sub][bin]` layout with the original
+/// min-bin offset, dimensions and strides — the expanded monitor must not
+/// widen candidate selection or change candidate priority, so the returned
+/// messages are byte-identical to
+/// [`ft8lib_decode_audio_protocol_with_parser`]'s.
+///
+/// FT8-only concern of the caller (the coordinator); the C monitor itself
+/// is protocol-aware, so the entry accepts the same protocols as the
+/// no-capture one.
+#[cfg(not(ft8lib_stub))]
+pub fn ft8lib_decode_audio_protocol_with_parser_and_capture(
+    samples: &[f32],
+    protocol: ftx_protocol_t,
+    parser: Option<&crate::message::MessageParser>,
+) -> (
+    Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)>,
+    Option<Ft8LibDisplayGrid>,
+) {
+    let cfg = monitor_config_t {
+        f_min: 0.0, // display spans DC up; the decode band is an owned view below
+        f_max: 3000.0,
+        sample_rate: 12000,
+        time_osr: 2,
+        freq_osr: 2,
+        protocol,
+    };
+
+    let mut guard = MonitorGuard::new(&cfg);
+    let mon = &mut guard.0;
+
+    // Feed audio in block_size chunks
+    let block_size = mon.block_size as usize;
+    let mut offset = 0;
+    while offset + block_size <= samples.len() {
+        // SAFETY: mon is exclusively owned by guard; the loop guarantees block_size
+        // live f32 samples, consumed synchronously without retaining the input.
+        unsafe { monitor_process(mon, samples[offset..].as_ptr()) };
+        offset += block_size;
+    }
+
+    // Owned decode-band view: copy ONLY the original 100–3000 Hz bins,
+    // keeping the original layout/min-bin/dimensions/strides so the
+    // candidate search sees exactly the grid the no-capture monitor had.
+    // Same formulas monitor_init uses (f_min/f_max * symbol_period).
+    let symbol_period = mon.symbol_period;
+    let decode_min_bin = (100.0f32 * symbol_period) as i32; // FT8: 16
+    let decode_max_bin = (3000.0f32 * symbol_period) as i32 + 1; // FT8: 481
+    let decode_bins = (decode_max_bin - decode_min_bin) as usize;
+    let num_blocks = mon.wf.num_blocks as usize;
+    let full_bins = mon.wf.num_bins as usize;
+    let time_osr = mon.wf.time_osr as usize;
+    let freq_osr = mon.wf.freq_osr as usize;
+    let full_stride = mon.wf.block_stride as usize;
+    let view_stride = time_osr * freq_osr * decode_bins;
+    let mut view = vec![0u8; num_blocks * view_stride];
+    for b in 0..num_blocks {
+        for ts in 0..time_osr {
+            for fs in 0..freq_osr {
+                let src =
+                    b * full_stride + (ts * freq_osr + fs) * full_bins + decode_min_bin as usize;
+                let dst = b * view_stride + (ts * freq_osr + fs) * decode_bins;
+                // SAFETY: the monitor's mag allocation holds
+                // max_blocks * full_stride initialized bytes (processed
+                // blocks are initialized by monitor_process); src and the
+                // decode_bins-length read stay inside it for every
+                // in-range block/subrow.
+                view[dst..dst + decode_bins].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(mon.wf.mag.add(src), decode_bins)
+                });
+            }
+        }
+    }
+    let view_wf = ftx_waterfall_t {
+        max_blocks: num_blocks as i32,
+        num_blocks: num_blocks as i32,
+        num_bins: decode_bins as i32,
+        time_osr: mon.wf.time_osr,
+        freq_osr: mon.wf.freq_osr,
+        _pad0: 0,
+        mag: view.as_mut_ptr(),
+        block_stride: view_stride as i32,
+        protocol,
+    };
+
+    // SAFETY: view_wf points into the owned, initialized `view` buffer,
+    // unmutated for the whole call; min_bin/symbol_period match the C
+    // formulas above.
+    let messages = unsafe {
+        decode_candidates_from_waterfall(&view_wf, decode_min_bin, symbol_period, parser)
+    };
+
+    // Owned display copy of the full 0–3000 Hz grid, taken before the
+    // guard drops: no C pointer leaves the call.
+    // SAFETY: processed blocks occupy num_blocks * full_stride initialized
+    // bytes of the monitor-owned allocation.
+    let mag = unsafe { std::slice::from_raw_parts(mon.wf.mag, num_blocks * full_stride).to_vec() };
+    let grid = Ft8LibDisplayGrid {
+        mag,
+        num_blocks,
+        num_bins: full_bins,
+        time_osr,
+        freq_osr,
+        min_bin: mon.min_bin as usize, // 0 for the display monitor
+        symbol_period,
+        sample_rate: 12000,
+        block_size,
+    };
+
+    (messages, Some(grid))
+}
+
+/// Candidate search + decode over an already-processed waterfall view.
+///
+/// `wf` must describe a live, processed waterfall in the C mag layout
+/// `[block][time_sub][freq_sub][bin]`; `min_bin`/`symbol_period` are the
+/// monitor scalars that interpret its coordinates (frequency mapping
+/// `(min_bin + freq_offset + freq_sub/freq_osr) / symbol_period`). Shared
+/// by the no-capture entry (which passes the monitor's own waterfall) and
+/// the PAN-318 capture entry (which passes an owned decode-band view with
+/// identical geometry), so the two decode byte-identically.
+///
+/// # Safety
+/// `wf` must point into a live initialized magnitude buffer that stays
+/// unmutated for the duration of this call.
+#[cfg(not(ft8lib_stub))]
+unsafe fn decode_candidates_from_waterfall(
+    wf: &ftx_waterfall_t,
+    min_bin: i32,
+    symbol_period: f32,
+    parser: Option<&crate::message::MessageParser>,
+) -> Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)> {
     // Find candidates
     let num_candidates = 50;
     let mut candidates = vec![
@@ -595,10 +958,10 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
     ];
 
     let n_found =
-        // SAFETY: guard owns the processed waterfall; the exclusive heap has
-        // num_candidates writable entries. C bounds its writes and returned count by
-        // that capacity.
-        unsafe { ftx_find_candidates(&mon.wf, num_candidates as i32, candidates.as_mut_ptr(), 0) };
+        // SAFETY: wf points into a live processed magnitude buffer owned by the
+        // caller; the exclusive heap has num_candidates writable entries. C bounds
+        // its writes and returned count by that capacity.
+        unsafe { ftx_find_candidates(wf, num_candidates as i32, candidates.as_mut_ptr(), 0) };
 
     // Decode each candidate
     let mut messages = Vec::new();
@@ -614,10 +977,10 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
         let mut status: ftx_decode_status_t = unsafe { std::mem::zeroed() };
 
         let ok =
-            // SAFETY: The waterfall is live under guard, candidate came from its
-            // search, and msg/status are exclusive C-layout output buffers; C
-            // retains no pointers.
-            unsafe { ftx_decode_candidate(&mon.wf, &candidates[i], 25, &mut msg, &mut status) };
+            // SAFETY: wf points into a live processed magnitude buffer, candidate
+            // came from its search, and msg/status are exclusive C-layout output
+            // buffers; C retains no pointers.
+            unsafe { ftx_decode_candidate(wf, &candidates[i], 25, &mut msg, &mut status) };
 
         if ok {
             let mut text_buf = [0u8; 35];
@@ -676,21 +1039,22 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
                 //   freq_hz  = (min_bin + freq_offset + freq_sub/freq_osr) / symbol_period
                 //   time_sec = (time_offset + time_sub/time_osr) * symbol_period
                 let cand = &candidates[i];
-                let freq_hz = (mon.min_bin as f32
+                let freq_hz = (min_bin as f32
                     + cand.freq_offset as f32
-                    + cand.freq_sub as f32 / mon.wf.freq_osr as f32)
-                    / mon.symbol_period;
+                    + cand.freq_sub as f32 / wf.freq_osr as f32)
+                    / symbol_period;
                 let time_sec = (cand.time_offset as f32
-                    + cand.time_sub as f32 / mon.wf.time_osr as f32)
-                    * mon.symbol_period;
+                    + cand.time_sub as f32 / wf.time_osr as f32)
+                    * symbol_period;
 
                 // Real SNR from the waterfall at the decoded position; fall
                 // back to the native estimator's -24 dB floor when the
                 // candidate position is out of the waterfall's range.
-                // SAFETY: guard still owns the processed waterfall, unchanged since search;
-                // cand came from that search and no C mutation occurs during SNR reads.
+                // SAFETY: wf points into the processed magnitude buffer the
+                // candidate came from, unchanged since search; no C mutation
+                // occurs during SNR reads.
                 let snr_db =
-                    unsafe { estimate_snr_from_waterfall(&mon.wf, cand) }.unwrap_or(-24.0) as f32;
+                    unsafe { estimate_snr_from_waterfall(wf, cand) }.unwrap_or(-24.0) as f32;
 
                 // Deduplicate
                 if !messages.iter().any(
@@ -997,6 +1361,200 @@ mod tests {
     }
 }
 
+/// PAN-318 AC4 FFI unit tests: the capture entry reuses ONE monitor FFT
+/// for both the decode band and the display grid, and the expanded
+/// 0–3000 Hz monitor does not change the reference decode.
+#[cfg(all(test, not(ft8lib_stub)))]
+mod display_capture_tests {
+    use super::*;
+
+    /// The PAN-318 qualification fixture (12 kHz mono vendor WAV,
+    /// truncated to the production window length exactly as the
+    /// coordinator shapes windows).
+    fn production_window(name: &str) -> Vec<f32> {
+        let path = format!(
+            "{}/vendor/ft8_lib/test/wav/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let reader = hound::WavReader::open(&path).unwrap_or_else(|e| {
+            panic!("fixture {path} must be present (vendored ft8_lib test WAV): {e}")
+        });
+        assert_eq!(reader.spec().sample_rate, 12000, "fixture must be 12 kHz");
+        assert_eq!(reader.spec().channels, 1, "fixture must be mono");
+        let mut samples: Vec<f32> = reader
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        samples.truncate(crate::WINDOW_SAMPLES);
+        samples
+    }
+
+    type DecodeTuple = (String, f32, f32, i32, f32, Option<crate::Ft8Message>);
+
+    fn sorted(mut v: Vec<DecodeTuple>) -> Vec<(String, f32, f32, i32, f32)> {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.into_iter()
+            .map(|(t, f, dt, e, s, _)| (t, f, dt, e, s))
+            .collect()
+    }
+
+    /// AC4 `display_capture_reuses_monitor`: the capture route decodes the
+    /// SAME messages as the plain no-capture route on a real off-air
+    /// fixture — one monitor FFT supplied both the owned decode-band view
+    /// and the display grid — and it costs exactly one C monitor (no
+    /// second FFT pass hidden behind the capture).
+    #[test]
+    fn display_capture_reuses_monitor() {
+        let samples = production_window("191111_110200.wav");
+        let before = MONITOR_RELEASES.get();
+
+        let plain = ft8lib_decode_audio_protocol_with_parser(
+            &samples,
+            ftx_protocol_t::FTX_PROTOCOL_FT8,
+            None,
+        );
+        assert_eq!(MONITOR_RELEASES.get(), before + 1);
+
+        let (captured, grid) = ft8lib_decode_audio_protocol_with_parser_and_capture(
+            &samples,
+            ftx_protocol_t::FTX_PROTOCOL_FT8,
+            None,
+        );
+        assert_eq!(
+            MONITOR_RELEASES.get(),
+            before + 2,
+            "the capture entry must reuse ONE monitor, not add a second FFT pass"
+        );
+
+        assert!(!plain.is_empty(), "fixture must decode for this to bite");
+        assert_eq!(
+            sorted(captured.clone()),
+            sorted(plain),
+            "capture route messages must be byte-identical (text/freq/time/errors/snr)"
+        );
+
+        // The grid is owned Rust memory usable after the monitor was freed.
+        let grid = grid.expect("real build returns a display grid");
+        assert!(grid.num_blocks > 0);
+        let wf = grid.to_waterfall_data(samples.len());
+        assert!(!wf.power_matrix.is_empty());
+        assert!(wf
+            .power_matrix
+            .iter()
+            .all(|r| r.iter().all(|v| v.is_finite())));
+    }
+
+    /// AC4 `display_capture_preserves_decode_band`: the expanded 0–3000 Hz
+    /// monitor does not widen candidate selection — the owned view keeps
+    /// the original 100–3000 Hz decode band (every decoded frequency
+    /// stays inside it, no candidate appears in the 0–100 Hz display-only
+    /// region) and the display grid itself spans 0–3000 Hz.
+    #[test]
+    fn display_capture_preserves_decode_band() {
+        let samples = production_window("websdr_test2.wav");
+        let (captured, grid) = ft8lib_decode_audio_protocol_with_parser_and_capture(
+            &samples,
+            ftx_protocol_t::FTX_PROTOCOL_FT8,
+            None,
+        );
+        assert!(!captured.is_empty(), "fixture must decode for this to bite");
+        for (text, freq_hz, ..) in &captured {
+            assert!(
+                *freq_hz >= 100.0 && *freq_hz <= 3000.0,
+                "decode {text} at {freq_hz} Hz escaped the original 100-3000 Hz band"
+            );
+        }
+
+        let grid = grid.expect("real build returns a display grid");
+        // FT8 display-monitor geometry: min_bin 0, 481 bins (0–3000.25 Hz),
+        // 3.125 Hz sub-bin axis, block_size 1920.
+        assert_eq!(grid.min_bin, 0);
+        assert_eq!(grid.num_bins, 481);
+        assert_eq!(grid.freq_osr, 2);
+        assert_eq!(grid.block_size, 1920);
+        assert_eq!(
+            grid.mag.len(),
+            grid.num_blocks * grid.time_osr * grid.freq_osr * grid.num_bins,
+            "owned grid must hold the full [block][time_sub][freq_sub][bin] layout"
+        );
+
+        let wf = grid.to_waterfall_data(samples.len());
+        let bin_width = wf.frequency_bins[1] - wf.frequency_bins[0];
+        assert!(
+            wf.frequency_bins.first() == Some(&0.0)
+                && (wf.frequency_bins.last().unwrap() - 3000.0).abs() < bin_width,
+            "display must cover 0-3000 Hz, got {:?}..{:?}",
+            wf.frequency_bins.first(),
+            wf.frequency_bins.last()
+        );
+    }
+
+    /// AC4 tone placement: pure tones near the band edges and center land
+    /// on the right display frequency (no missing low-frequency coverage,
+    /// no endpoint mistakes), and silence renders finite uniform rows.
+    #[test]
+    fn display_capture_tone_placement_and_silence() {
+        let tone = |freq_hz: f32| {
+            let samples: Vec<f32> = (0..crate::WINDOW_SAMPLES)
+                .map(|i| 0.25 * (2.0 * std::f32::consts::PI * freq_hz * i as f32 / 12000.0).sin())
+                .collect();
+            let (_, grid) = ft8lib_decode_audio_protocol_with_parser_and_capture(
+                &samples,
+                ftx_protocol_t::FTX_PROTOCOL_FT8,
+                None,
+            );
+            let grid = grid.expect("real build returns a display grid");
+            let wf = grid.to_waterfall_data(samples.len());
+            let bin_width = wf.frequency_bins[1] - wf.frequency_bins[0];
+            // Peak bin of the loudest row must sit within one source
+            // frequency step (3.125 Hz) + one display bin (2.93 Hz) of the
+            // tone; 10 Hz covers both with margin.
+            let loudest = wf
+                .power_matrix
+                .iter()
+                .max_by(|a, b| {
+                    a.iter()
+                        .cloned()
+                        .fold(f64::MIN, f64::max)
+                        .total_cmp(&b.iter().cloned().fold(f64::MIN, f64::max))
+                })
+                .expect("rows exist");
+            let peak_freq = wf.frequency_bins[loudest
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i)
+                .expect("bins exist")];
+            assert!(
+                (peak_freq - freq_hz as f64).abs() <= 10.0,
+                "tone at {freq_hz} Hz placed at {peak_freq} Hz"
+            );
+        };
+        for freq_hz in [50.0f32, 1500.0, 2990.0] {
+            tone(freq_hz);
+        }
+
+        // Silence: finite, uniform rows (the quantized floor is flat).
+        let silence = vec![0.0f32; crate::WINDOW_SAMPLES];
+        let (_, grid) = ft8lib_decode_audio_protocol_with_parser_and_capture(
+            &silence,
+            ftx_protocol_t::FTX_PROTOCOL_FT8,
+            None,
+        );
+        let wf = grid.expect("grid").to_waterfall_data(silence.len());
+        assert!(!wf.power_matrix.is_empty());
+        for row in &wf.power_matrix {
+            assert!(row.iter().all(|v| v.is_finite()));
+            let spread = row.iter().cloned().fold(f64::MIN, f64::max)
+                - row.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                spread <= 1e-6,
+                "silence must be uniform, spread {spread} dB"
+            );
+        }
+    }
+}
+
 /// PAN-7: the real and stub `ft8lib_find_candidate_seeds` must keep identical
 /// signatures. No CI job ever type-checks the stub arm — all four compiling
 /// jobs use `submodules: recursive` — so this coercion into a typed fn pointer,
@@ -1026,4 +1584,45 @@ pub fn ft8lib_decode_audio_protocol_with_parser(
     _parser: Option<&crate::message::MessageParser>,
 ) -> Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)> {
     Vec::new()
+}
+
+/// Stub: no C monitor exists to capture, so the display grid is `None`
+/// (the caller falls back to the legacy waterfall generator).
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_decode_audio_protocol_with_parser_and_capture(
+    _samples: &[f32],
+    _protocol: ftx_protocol_t,
+    _parser: Option<&crate::message::MessageParser>,
+) -> (
+    Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)>,
+    Option<Ft8LibDisplayGrid>,
+) {
+    (Vec::new(), None)
+}
+
+/// The real and stub capture entries must keep identical signatures (same
+/// rationale as [`seed_signature_tests`]): no CI job type-checks the stub
+/// arm, so this coercion is the mechanical guard.
+#[cfg(test)]
+mod capture_signature_tests {
+    use super::*;
+
+    #[test]
+    fn capture_helper_signature_is_cfg_invariant() {
+        let f: fn(
+            &[f32],
+            ftx_protocol_t,
+            Option<&crate::message::MessageParser>,
+        ) -> (
+            Vec<(String, f32, f32, i32, f32, Option<crate::Ft8Message>)>,
+            Option<Ft8LibDisplayGrid>,
+        ) = ft8lib_decode_audio_protocol_with_parser_and_capture;
+
+        // Empty audio: the real build processes zero blocks and returns an
+        // empty-but-present grid; the stub returns None. Both return no
+        // messages and must not panic — that is the shared contract.
+        let (messages, grid) = f(&[], ftx_protocol_t::FTX_PROTOCOL_FT8, None);
+        assert!(messages.is_empty());
+        assert!(grid.as_ref().map_or(true, |g| g.num_blocks == 0));
+    }
 }

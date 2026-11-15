@@ -502,7 +502,9 @@ pub struct DxStation {
     /// network-spot rescoring, which only runs while the list is loaded
     /// (cqdx spots wait for it).
     pub needed: bool,
-    /// Entity is an ATNO (all-time new one). Subset of `needed`.
+    /// Last writer's ATNO verdict: policy-selected for a decode, cqdx-only
+    /// for a spot. Feeds network-spot scoring; DX Hunter's marker reads
+    /// `ranked_atno` instead (PAN-399).
     pub atno: bool,
     /// Entity never worked on THIS specific band before, per the local QSO
     /// database — independent of `needed`/`atno` (cqdx's needed set for
@@ -576,6 +578,17 @@ impl DxStation {
             (None, Some(network)) => Some((RankOrigin::NetworkSpot, network)),
             (None, None) => None,
         }
+    }
+
+    /// ATNO as the displayed score saw it: the `atno` factor of the rank
+    /// `rank_basis` picks, so DX Hunter's `!`, Pri and Why come from one scoring
+    /// call. The stored `atno` is whichever source wrote last (a decode's
+    /// policy-selected verdict or a cqdx spot's cqdx-only one) and is used only
+    /// for an unscored row or a rank without factors (PAN-399).
+    pub fn ranked_atno(&self) -> bool {
+        self.rank_basis()
+            .and_then(|(_, rank)| rank.factors)
+            .map_or(self.atno, |factors| factors.atno)
     }
 
     fn refresh_priority_score(&mut self) {
@@ -2287,6 +2300,26 @@ impl App {
             crate::ui::station_card::focused_qrz_info(self).is_some(),
         )?;
 
+        // Compute from the pre-click focus and geometry, before changing panels.
+        let dx_start = crate::ui::view_rects(
+            self.active_view,
+            self.zoomed,
+            self.active_panel,
+            content_area,
+            crate::ui::station_card::focused_qrz_info(self).is_some(),
+        )
+        .into_iter()
+        .find(|(p, _)| *p == ActivePanel::DxHunter)
+        .map(|(_, area)| {
+            crate::ui::dx_hunter::viewport(
+                area,
+                self.dx_hunter_scroll,
+                self.active_panel == ActivePanel::DxHunter,
+                self.displayed_dx_stations().len(),
+            )
+            .start
+        })
+        .unwrap_or(0);
         if panel != ActivePanel::TxPlacement {
             self.active_panel = panel;
             let row = row as usize;
@@ -2301,7 +2334,7 @@ impl App {
                 ActivePanel::DxHunter => {
                     let len = self.displayed_dx_stations().len();
                     if len > 0 {
-                        self.dx_hunter_scroll = row.min(len - 1);
+                        self.dx_hunter_scroll = (dx_start + row).min(len - 1);
                         self.repin_dx_hunter();
                     }
                 }
@@ -2428,6 +2461,7 @@ impl App {
 
     pub async fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
         self.terminal_size = (width, height);
+        self.clamp_dx_hunter_selection();
         debug!("Terminal resized to {}x{}", width, height);
         Ok(())
     }
@@ -2921,7 +2955,11 @@ impl App {
     }
 
     fn cleanup_old_data(&mut self) {
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
+        self.cleanup_old_data_at(Utc::now());
+    }
+
+    fn cleanup_old_data_at(&mut self, now: chrono::DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::hours(24);
 
         // Remove old messages
         while let Some(front) = self.decoded_messages.front() {
@@ -2936,27 +2974,15 @@ impl App {
         self.dx_stations
             .retain(|_, station| station.last_seen > cutoff);
 
-        // Keep the state map in lockstep with the station window: an entry
-        // survives only while its station is still listed (PAN-85). Note that
-        // `dx_states` is keyed by `station_state_key` (uppercase, hash-render
-        // resolved) while `dx_stations` is keyed by the callsign exactly as it
-        // was received, so the membership test must put each station key
-        // through the same normalization — a plain `contains_key` would drop
-        // every state for a station spotted lower-case or hash-rendered.
-        //
-        // This bounds `dx_states` exactly as much as `cleanup_old_data` bounds
-        // `dx_stations` — no more: the function currently has no production
-        // caller, so neither map is pruned on a live station today.
-        let Self {
-            dx_states,
-            dx_stations,
-            ..
-        } = self;
-        dx_states.retain(|call, _| {
-            dx_stations
-                .keys()
-                .any(|k| station_state_key(k).is_some_and(|key| key == *call))
-        });
+        let live_keys: HashSet<String> = self
+            .dx_stations
+            .keys()
+            .filter_map(|call| station_state_key(call))
+            .collect();
+        self.dx_states.retain(|call, _| live_keys.contains(call));
+        self.clamp_band_activity_selection();
+        self.clamp_dx_hunter_selection();
+        self.clamp_callers_selection();
     }
 
     /// Record a station's US state/territory (PAN-85), validating first. An
@@ -3023,8 +3049,9 @@ impl App {
     /// is one, wins over the flags stored at decode or spot time, so both
     /// follow a list that loads or changes between decodes, as the Why view
     /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
-    /// too; a newly needed ATNO waits for the next decode. With no verdict
-    /// for the row, the stored flags stand.
+    /// too; a newly needed ATNO's `!` changes with the row's score, at its next
+    /// decode or spot. `atno` is the caller's ATNO input; DX Hunter passes
+    /// `DxStation::ranked_atno` (PAN-399). With no verdict, the inputs stand.
     pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
         match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
             Some(listed) => (listed, atno && listed),
@@ -4009,6 +4036,7 @@ impl App {
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
     pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
+        self.cleanup_old_data();
         // 15 rows per 15s FT8 cycle (1 row/sec) × 30 cycles = ~7.5 minutes of history
         const MAX_WATERFALL_ROWS: usize = 450;
         self.waterfall_data.extend(rows);
@@ -6712,6 +6740,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pan319_cleanup_boundary_and_selection() {
+        let mut app = fixture_app().await;
+        let now = Utc::now();
+        for (call, age) in [
+            ("W5ABC", chrono::Duration::hours(24)),
+            (
+                "W6ABC",
+                chrono::Duration::hours(24) - chrono::Duration::nanoseconds(1),
+            ),
+            ("W7ABC", chrono::Duration::zero()),
+        ] {
+            app.add_decoded_message(fixture_view(call, -10))
+                .await
+                .unwrap();
+            app.dx_stations.get_mut(call).unwrap().last_seen = now - age;
+            app.set_station_state(call, "AR");
+        }
+        app.dx_hunter_scroll = 40;
+        app.cleanup_old_data_at(now);
+        assert!(!app.dx_stations.contains_key("W5ABC"));
+        assert!(app.dx_stations.contains_key("W6ABC"));
+        assert_eq!(app.station_state_for("W5ABC"), None);
+        assert_eq!(app.station_state_for("W6ABC"), Some("AR"));
+        assert_eq!(app.dx_hunter_scroll, 0);
+        assert_eq!(app.dx_hunter_pinned_call.as_deref(), Some("W7ABC"));
+    }
+
+    #[tokio::test]
+    async fn pan319_cleanup_preserves_band_activity_call_target() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        let now = Utc::now();
+        let mut expired = fixture_view_directed("K1OLD", -10);
+        expired.timestamp = now - chrono::Duration::hours(25);
+        app.add_decoded_message(expired).await.unwrap();
+        app.add_decoded_message(fixture_view("K2AAA", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K3BBB", -6))
+            .await
+            .unwrap();
+        // Directed messages sort first: [K1OLD, K3BBB, K2AAA].
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now);
+
+        assert_eq!(app.decoded_messages.len(), 2);
+        assert_eq!(app.band_activity_scroll, 0);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        // When the selected call also expires, adopt the surviving row.
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        app.decoded_messages.front_mut().unwrap().timestamp = now - chrono::Duration::hours(25);
+        app.cleanup_old_data_at(now);
+        assert_eq!(app.band_activity_pinned_call.as_deref(), Some("K3BBB"));
+        assert_eq!(app.get_selected_station().unwrap().0, "K3BBB");
+
+        app.cleanup_old_data_at(now + chrono::Duration::hours(25));
+        assert_eq!(app.band_activity_scroll, 0);
+        assert!(app.band_activity_pinned_call.is_none());
+        assert!(app.get_selected_station().is_none());
+    }
+
+    #[tokio::test]
+    async fn pan319_resized_dx_click_targets_visible_station() {
+        let mut app = fixture_app().await;
+        app.active_view = crate::view::ActiveView::Hunt;
+        app.active_panel = ActivePanel::DxHunter;
+        for i in 0..60 {
+            app.add_decoded_message(fixture_view(&format!("W{i}ABC"), -10))
+                .await
+                .unwrap();
+        }
+        app.dx_hunter_scroll = 40;
+        app.clamp_dx_hunter_selection();
+        app.handle_resize(132, 24).await.unwrap();
+        let focused = app.get_selected_station().unwrap().0;
+        app.qrz_stations.insert(
+            focused,
+            QrzStationInfo {
+                name: Some("Test Operator".into()),
+                qth: None,
+                country: None,
+                state: None,
+                grid: None,
+            },
+        );
+        for (zoomed, height, contest) in [(false, 24, false), (true, 24, false), (false, 48, true)]
+        {
+            app.handle_resize(132, height).await.unwrap();
+            app.contest_score =
+                contest.then(|| pancetta_qso::contest::ledger::ContestScoreUpdate {
+                    generation: 1,
+                    instance_id: "test".into(),
+                    rules_id: "test".into(),
+                    display_name: "Test".into(),
+                    outside_period: false,
+                    state: pancetta_qso::contest::ledger::ContestScoreState::Loading,
+                });
+            app.zoomed = zoomed;
+            let content = crate::contest_score::content(
+                crate::ui::content_area(Rect::new(0, 0, 132, height)),
+                app.contest_score.as_ref(),
+            );
+            let rect = crate::ui::view_rects(
+                app.active_view,
+                app.zoomed,
+                app.active_panel,
+                content,
+                crate::ui::station_card::focused_qrz_info(&app).is_some(),
+            )
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::DxHunter)
+            .unwrap()
+            .1;
+            let start = crate::ui::dx_hunter::viewport(rect, app.dx_hunter_scroll, true, 60).start;
+            let expected = app.displayed_dx_stations()[start].call_sign.clone();
+            app.handle_left_click(rect.x + 2, rect.y + 2);
+            assert_eq!(app.get_selected_station().unwrap().0, expected);
+            assert_eq!(
+                app.dx_hunter_pinned_call.as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cleanup_drops_states_for_expired_stations() {
         let mut app = fixture_app().await;
         app.set_station_state("W5ABC", "AR");
@@ -8153,6 +8312,76 @@ mod tests {
             app.dx_stations.contains_key("JA1ABC"),
             "merge_spot_groups must still insert other stations"
         );
+    }
+
+    #[tokio::test]
+    async fn ranked_atno_follows_the_displayed_rank() {
+        let mut app = fixture_app().await;
+        let mut view = fixture_view("JA1ABC", -10);
+        view.frequency = 14.074;
+        view.needed = true;
+        view.atno = true;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        let local = app.dx_stations["JA1ABC"].local_rank.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".to_string(),
+            needed: false,
+            atno: false,
+        };
+
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        let entry = &app.dx_stations["JA1ABC"];
+        assert!(!entry.atno);
+        assert!(entry.ranked_atno());
+        // No rank, then a precomputed rank with no factors, use the stored flag.
+        let mut fallback = entry.clone();
+        fallback.local_rank = None;
+        fallback.network_rank = None;
+        for stored in [false, true] {
+            fallback.atno = stored;
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = Some(RankedBy {
+                factors: None,
+                ..local
+            });
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = None;
+        }
+        // A higher network score wins even after a decode overwrites the flag.
+        view.atno = false;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        app.merge_spot_groups(&[crate::tui_runner::CqdxSpotInfo {
+            needed: true,
+            atno: true,
+            ..spot
+        }]);
+        app.add_decoded_message(view).await.unwrap();
+        assert!(!app.dx_stations["JA1ABC"].atno);
+        assert!(
+            app.dx_stations["JA1ABC"].network_rank.unwrap().score
+                > app.dx_stations["JA1ABC"].local_rank.unwrap().score
+        );
+        assert!(app.dx_stations["JA1ABC"].ranked_atno());
+        // A local refresh clears a stale stored ATNO when its new rank wins.
+        let mut factors = local.factors.unwrap();
+        factors.atno = false;
+        app.dx_stations.get_mut("JA1ABC").unwrap().network_rank = None;
+        app.dx_stations.get_mut("JA1ABC").unwrap().atno = true;
+        app.refresh_local_rank("JA1ABC", 4000, factors);
+        assert!(!app.dx_stations["JA1ABC"].ranked_atno());
     }
 
     #[tokio::test]
