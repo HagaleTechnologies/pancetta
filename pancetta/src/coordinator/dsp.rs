@@ -88,7 +88,59 @@ pub(crate) fn unsupported_input_rate_message(rate: u32) -> String {
 #[allow(clippy::large_enum_variant)]
 enum DecimationStage {
     Subsample { counter: usize, factor: usize },
-    Fir31(pancetta_dsp::decimation::DecimationFilter),
+    Fir31(pancetta_dsp::decimation::DecimationFilter, PreFilterPeaks),
+}
+
+/// Pre-filter peak per FIR output sample, for the receive-overload guard
+/// (Codex P1 on #654).
+///
+/// The guard must judge the audio the codec actually captured, but the FIR
+/// suppresses out-of-band energy: a near-full-scale 9 kHz tone overloads
+/// the input yet comes out ~47 dB down. So beside each FIR output `k` we
+/// record `max |x|` over the four input samples it consumed (absolute
+/// indices `4k..=4k+3`, the same grouping the filter uses for its newest
+/// input), or NaN if any of them was non-finite. `peaks` stays index-aligned
+/// with the caller's capture buffer: both grow only through
+/// [`DecimationStage::process`], and every other buffer mutation is a full
+/// clear or a front drain, so the buffer's tail always matches the tail of
+/// `peaks` and [`PreFilterPeaks::align`] restores the alignment by
+/// trimming the front.
+#[derive(Default)]
+struct PreFilterPeaks {
+    phase: usize,
+    acc: f32,
+    peaks: Vec<f32>,
+}
+
+impl PreFilterPeaks {
+    fn push_inputs(&mut self, mono: &[f32]) {
+        for &x in mono {
+            let a = if x.is_finite() { x.abs() } else { f32::NAN };
+            // NaN is sticky for the group so the guard still sees it.
+            self.acc = if self.acc.is_nan() || a.is_nan() {
+                f32::NAN
+            } else {
+                self.acc.max(a)
+            };
+            self.phase += 1;
+            if self.phase == 4 {
+                self.peaks.push(self.acc);
+                self.phase = 0;
+                self.acc = 0.0;
+            }
+        }
+    }
+
+    fn align(&mut self, buffer_len: usize) {
+        if self.peaks.len() > buffer_len {
+            let cut = self.peaks.len() - buffer_len;
+            self.peaks.drain(..cut);
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl DecimationStage {
@@ -96,7 +148,10 @@ impl DecimationStage {
     /// with a rate [`dsp_supports_input_rate`] accepts.
     fn new(input_rate: u32, antialias_filter: bool) -> Self {
         if antialias_filter && input_rate == 48_000 {
-            Self::Fir31(pancetta_dsp::decimation::DecimationFilter::new())
+            Self::Fir31(
+                pancetta_dsp::decimation::DecimationFilter::new(),
+                PreFilterPeaks::default(),
+            )
         } else {
             let factor = (input_rate / DSP_TARGET_SAMPLE_RATE_HZ) as usize;
             Self::Subsample { counter: 0, factor }
@@ -117,7 +172,13 @@ impl DecimationStage {
                     }
                 }
             }
-            Self::Fir31(fir) => fir.process(mono, out),
+            Self::Fir31(fir, pre) => {
+                fir.process(mono, out);
+                pre.push_inputs(mono);
+                // `out` is the capture buffer; keep `peaks` aligned to it
+                // (and bounded) on every batch.
+                pre.align(out.len());
+            }
         }
     }
 
@@ -128,7 +189,10 @@ impl DecimationStage {
     fn reset(&mut self) {
         match self {
             Self::Subsample { counter, .. } => *counter = 0,
-            Self::Fir31(fir) => fir.reset(),
+            Self::Fir31(fir, pre) => {
+                fir.reset();
+                pre.reset();
+            }
         }
     }
 
@@ -136,13 +200,45 @@ impl DecimationStage {
     fn label(&self) -> &'static str {
         match self {
             Self::Subsample { .. } => "subsample",
-            Self::Fir31(_) => "fir31",
+            Self::Fir31(..) => "fir31",
         }
     }
 
     /// Whether the FIR path is active (window-anchor compensation applies).
     fn is_fir31(&self) -> bool {
-        matches!(self, Self::Fir31(_))
+        matches!(self, Self::Fir31(..))
+    }
+
+    /// Peak (dBFS) the receive-overload guard measures for `window`,
+    /// which is `buffer[start..start + window.len()]` of a capture buffer
+    /// of `buffer_len` samples.
+    ///
+    /// Subsample: the window itself, exactly as before. FIR: the larger of
+    /// the window's peak and the pre-filter input peak over the same
+    /// samples, so anti-alias filtering can never hide an overload from
+    /// the ATT protection. A non-finite sample on either side yields
+    /// `None`, as [`raw_peak_dbfs`](super::receive_overload::raw_peak_dbfs)
+    /// does.
+    fn overload_peak_dbfs(
+        &mut self,
+        buffer_len: usize,
+        window: &[f32],
+        start: usize,
+    ) -> Option<f64> {
+        use super::receive_overload::raw_peak_dbfs;
+        let filtered = raw_peak_dbfs(window);
+        let Self::Fir31(_, pre) = self else {
+            return filtered;
+        };
+        pre.align(buffer_len);
+        let end = start + window.len();
+        if pre.peaks.len() != buffer_len || end > buffer_len {
+            // Alignment invariant broken (not expected): fall back to the
+            // filtered peak rather than mis-attributing samples.
+            return filtered;
+        }
+        let pre_peak = raw_peak_dbfs(&pre.peaks[start..end])?;
+        filtered.map(|f| f.max(pre_peak))
     }
 }
 
@@ -1350,7 +1446,7 @@ impl super::ApplicationCoordinator {
                             let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
                             if overload_enabled {
                                 use super::receive_overload::{
-                                    raw_peak_dbfs, Identity, Measurement, WindowValidity,
+                                    Identity, Measurement, WindowValidity,
                                 };
                                 let capture_start = slot_boundary.timestamp_millis()
                                     - (window_lead_secs * 1000.0) as i64;
@@ -1379,7 +1475,14 @@ impl super::ApplicationCoordinator {
                                         capture_epoch: overload_capture_epoch
                                             .load(Ordering::Acquire),
                                     },
-                                    peak_dbfs: raw_peak_dbfs(&window),
+                                    // Pre-filter peak on the FIR path (Codex
+                                    // P1 on #654); the window itself on the
+                                    // subsample path, unchanged.
+                                    peak_dbfs: decimate_stage.overload_peak_dbfs(
+                                        ft8_buffer.len(),
+                                        &window,
+                                        start,
+                                    ),
                                     validity,
                                 };
                                 if overload_tx.try_send(measurement).is_err() {
@@ -3289,7 +3392,7 @@ mod decimation_stage_tests {
         // `true` uses the FIR only at 48 kHz; every other supported rate
         // keeps the subsample path (and the caller logs the warning).
         let fir = DecimationStage::new(48_000, true);
-        assert!(matches!(fir, DecimationStage::Fir31(_)));
+        assert!(matches!(fir, DecimationStage::Fir31(..)));
         assert_eq!(fir.label(), "fir31");
         assert!(fir.is_fir31());
         for rate in [12_000u32, 24_000, 96_000, 192_000] {
@@ -3371,6 +3474,86 @@ mod decimation_stage_tests {
             buf,
             vec![3.0, 7.0],
             "overlap drain must not reset the phase"
+        );
+    }
+
+    /// Codex P1 on #654: with the FIR on, the receive-overload guard must
+    /// measure the *pre-filter* peak of the same capture window. A
+    /// near-full-scale out-of-band tone (9 kHz at 48 kHz) is suppressed by
+    /// the FIR, so measuring the filtered buffer would let it slip under
+    /// the guard's −1 dBFS threshold while it is overloading the codec.
+    /// The subsample path stays byte-identical: it measures the window.
+    #[test]
+    fn overload_guard_sees_pre_filter_peaks() {
+        use super::super::receive_overload::raw_peak_dbfs;
+        const GUARD_DBFS: f64 = -1.0;
+        let tone = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| 0.99 * (2.0 * std::f32::consts::PI * 9_000.0 * i as f32 / 48_000.0).sin())
+                .collect()
+        };
+        let input = tone(48_000 * 2);
+
+        // FIR arm, fed in uneven batches like the live worker.
+        let mut fir = DecimationStage::new(48_000, true);
+        let mut buf = Vec::new();
+        for chunk in input.chunks(509) {
+            fir.process(chunk, &mut buf);
+        }
+        assert_eq!(buf.len(), 24_000);
+        let start = 2_000;
+        let filtered = raw_peak_dbfs(&buf[start..]).unwrap();
+        assert!(
+            filtered < GUARD_DBFS,
+            "premise: the FIR suppresses the 9 kHz tone below the guard ({filtered} dBFS)"
+        );
+        let window = buf[start..].to_vec();
+        let guard = fir.overload_peak_dbfs(buf.len(), &window, start).unwrap();
+        assert!(
+            guard >= GUARD_DBFS,
+            "guard must see the pre-filter peak: got {guard} dBFS"
+        );
+
+        // Overlap retention (front drain) keeps the measurement aligned.
+        buf.drain(..buf.len() - 1_000);
+        for chunk in input[..48_000].chunks(511) {
+            fir.process(chunk, &mut buf);
+        }
+        let window = buf.clone();
+        let guard = fir.overload_peak_dbfs(buf.len(), &window, 0).unwrap();
+        assert!(guard >= GUARD_DBFS, "after drain: {guard} dBFS");
+
+        // A destructive flush drops the pre-filter history with the buffer:
+        // quiet audio afterwards must not report the old hot peak.
+        let mut wf = buf.len();
+        destructive_capture_flush(&mut buf, &mut wf, &mut fir);
+        fir.process(&vec![0.01f32; 4_800], &mut buf);
+        let window = buf.clone();
+        let quiet = fir.overload_peak_dbfs(buf.len(), &window, 0).unwrap();
+        assert!(
+            quiet < -30.0,
+            "post-flush peak must be the new audio: {quiet} dBFS"
+        );
+
+        // A non-finite input sample still invalidates the measurement.
+        let mut fir = DecimationStage::new(48_000, true);
+        let mut buf = Vec::new();
+        let mut bad = vec![0.1f32; 400];
+        bad[201] = f32::NAN;
+        fir.process(&bad, &mut buf);
+        let window = buf.clone();
+        assert_eq!(fir.overload_peak_dbfs(buf.len(), &window, 0), None);
+
+        // Subsample arm: exactly the historical measurement of the window.
+        let mut sub = DecimationStage::new(48_000, false);
+        let mut buf = Vec::new();
+        for chunk in input.chunks(509) {
+            sub.process(chunk, &mut buf);
+        }
+        let window = buf[start..].to_vec();
+        assert_eq!(
+            sub.overload_peak_dbfs(buf.len(), &window, start),
+            raw_peak_dbfs(&window)
         );
     }
 
