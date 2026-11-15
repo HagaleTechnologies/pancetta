@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
 
+- PAN-292: autonomous pouncing honours CQ modifiers. It no longer calls a `CQ DX` from a station on our own continent, or a `CQ NA`, `SA`, `EU`, `AS`, `AF` or `OC` aimed at another continent, and the Diagnostics overlay shows `Skipped CQ from W1ABC — CQ DX excludes us`. Continents come from the offline cty.dat entity data and our station callsign. A callsign that does not resolve is answered as before. Other modifiers, manual calls and spot calls are unchanged.
+
 - PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.
 - PAN-306: logged and exported ADIF records infer COUNTRY, DXCC, CQZ and ITUZ offline, including prefix and exact-call zone overrides. Stored imported fields take precedence individually; unknown calls gain no inferred fields. Existing logs are not rewritten. Automated coverage only; live qualification pending.
 
