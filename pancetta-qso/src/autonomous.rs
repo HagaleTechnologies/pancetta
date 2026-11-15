@@ -487,6 +487,9 @@ pub enum OperatorAction {
 
 /// Why the autonomous operator did not act on a decoded CQ this slot.
 /// Bookkeeping only: this never influences the returned actions.
+///
+/// `CqExcludesUs` (PAN-292): the CQ's `DX` or continent modifier excludes our
+/// continent; `modifier` is the canonical uppercase code.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
     AtCapacity { active: u32, cap: u32 },
@@ -496,6 +499,7 @@ pub enum SkipReason {
     CallsignContinuity { dx_score: f64 },
     ContentScore { score: f64, threshold: f64 },
     FrequencyClash,
+    CqExcludesUs { modifier: &'static str },
 }
 
 /// A CQ candidate rejected by an autonomous selection filter.
@@ -624,6 +628,18 @@ pub struct AutonomousConfig {
     /// `Atno` CQ heard-but-not-pounced-on stays remembered before being
     /// dropped as presumed moved on. Default: 150 s (~2.5 min).
     pub watchlist_ttl_secs: u64,
+}
+
+/// Decision policy that can change without rebuilding stateful operator helpers.
+#[derive(Debug, Clone)]
+pub struct AutonomousLivePolicy {
+    pub enabled: bool,
+    pub min_dx_score: f64,
+    pub min_multi_slot_score: f64,
+    pub pounce_min_tier: Option<PriorityTier>,
+    pub cq_after_idle_cycles: u32,
+    pub cq_no_response_switch_after: u32,
+    pub cq_direction: String,
 }
 
 impl Default for AutonomousConfig {
@@ -1132,6 +1148,10 @@ pub struct AutonomousOperator {
     watchlist: DxWatchlist,
     /// Rejections recorded during the most recent decision cycle.
     skip_log: Vec<CqSkipRecord>,
+    /// Our continent, resolved once from `our_callsign` (PAN-292). `None`
+    /// when the callsign does not resolve; the CQ-modifier gate then never
+    /// skips.
+    our_continent: Option<pancetta_core::dxcc::Continent>,
 }
 
 impl AutonomousOperator {
@@ -1147,6 +1167,7 @@ impl AutonomousOperator {
         let watchlist =
             DxWatchlist::new(chrono::Duration::seconds(config.watchlist_ttl_secs as i64));
         let exchange = MessageExchange::new(our_callsign.clone());
+        let our_continent = pancetta_core::dxcc::continent_for_callsign(&our_callsign);
 
         Self {
             config,
@@ -1189,7 +1210,20 @@ impl AutonomousOperator {
             )),
             watchlist,
             skip_log: Vec::new(),
+            our_continent,
         }
+    }
+
+    /// Refresh only decision inputs. CQ compensation, decode history, slot
+    /// management and active contact state keep their existing generations.
+    pub fn update_live_policy(&mut self, policy: AutonomousLivePolicy) {
+        self.config.enabled = policy.enabled;
+        self.config.min_dx_score = policy.min_dx_score;
+        self.config.min_multi_slot_score = policy.min_multi_slot_score;
+        self.config.pounce_min_tier = policy.pounce_min_tier;
+        self.config.cq_after_idle_cycles = policy.cq_after_idle_cycles;
+        self.config.cq_no_response_switch_after = policy.cq_no_response_switch_after;
+        self.config.cq_direction = policy.cq_direction;
     }
 
     /// Drain CQ skips recorded by the most recent decision cycle.
@@ -2557,6 +2591,23 @@ impl AutonomousOperator {
                             Some(min_tier) => cq.tier >= min_tier,
                             None => cq.dx_score >= threshold,
                         })
+                        // PAN-292: honour `CQ DX` and `CQ NA`/`SA`/`EU`/`AS`/
+                        // `AF`/`OC`. A content gate, so it runs before the
+                        // stateful gates and keeps the reported reason stable.
+                        .filter(|cq| {
+                            let excluded = cq_modifier_excludes_us(
+                                &cq.message_text,
+                                &cq.callsign,
+                                self.our_continent,
+                            );
+                            if let Some(modifier) = excluded {
+                                slot_skips.borrow_mut().push(CqSkipRecord {
+                                    callsign: Some(cq.callsign.clone()),
+                                    reason: SkipReason::CqExcludesUs { modifier },
+                                });
+                            }
+                            excluded.is_none()
+                        })
                         .filter(|cq| {
                             let recent = self.is_recently_responded_to(&cq.callsign, now);
                             if recent {
@@ -3137,6 +3188,25 @@ pub fn is_cq_message(text: &str) -> bool {
     upper.starts_with("CQ ")
 }
 
+/// PAN-292: the canonical modifier when a decoded CQ excludes our continent.
+/// `DX` excludes a caller on our continent; a continent code excludes every
+/// other continent. Unknown continents and other modifiers never exclude.
+fn cq_modifier_excludes_us(
+    text: &str,
+    caller: &str,
+    ours: Option<pancetta_core::dxcc::Continent>,
+) -> Option<&'static str> {
+    use pancetta_core::dxcc::{continent_for_callsign, Continent};
+    let modifier = pancetta_core::ft8_tokens::cq_modifier(text)?;
+    let ours = ours?;
+    if modifier.eq_ignore_ascii_case("DX") {
+        let theirs = continent_for_callsign(caller)?;
+        return (theirs == ours).then_some("DX");
+    }
+    let wanted = Continent::from_code(modifier)?;
+    (wanted != ours).then_some(wanted.code())
+}
+
 /// Returns `true` if `tok` looks like a report / RR73 / RRR / 73 payload —
 /// the trailing token of a standard FT8 exchange (vs. a grid in a reply).
 ///
@@ -3231,6 +3301,97 @@ fn simple_jitter() -> f64 {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    fn pan302_policy(config: &AutonomousConfig) -> AutonomousLivePolicy {
+        AutonomousLivePolicy {
+            enabled: config.enabled,
+            min_dx_score: config.min_dx_score,
+            min_multi_slot_score: config.min_multi_slot_score,
+            pounce_min_tier: config.pounce_min_tier,
+            cq_after_idle_cycles: config.cq_after_idle_cycles,
+            cq_no_response_switch_after: config.cq_no_response_switch_after,
+            cq_direction: config.cq_direction.clone(),
+        }
+    }
+
+    #[test]
+    fn pan302_policy_update_preserves_operator_state() {
+        let mut op = tier_pounce_operator(None, 1, &["VP8PJ"]);
+        op.idle_cycles = 9;
+        op.cq_no_response_streak = 3;
+        op.cq_attempt_counter = 42;
+        op.paused = true;
+        op.pending_sequencer_messages.push((
+            "K1XYZ W1ABC -10".into(),
+            1000.0,
+            Some("qso-1".into()),
+        ));
+        let history = op.decode_history.cycles_recorded();
+        let mut next = op.config.clone();
+        next.min_dx_score = 0.8;
+        next.min_multi_slot_score = 0.9;
+        next.cq_direction = "DX".into();
+        op.update_live_policy(pan302_policy(&next));
+        assert_eq!(op.idle_cycles, 9);
+        assert_eq!(op.cq_no_response_streak, 3);
+        assert_eq!(op.cq_attempt_counter, 42);
+        assert!(op.paused);
+        assert_eq!(op.active_qso_count, 1);
+        assert_eq!(op.pending_sequencer_messages.len(), 1);
+        assert_eq!(op.pending_cqs.len(), 1);
+        assert_eq!(op.decode_history.cycles_recorded(), history);
+    }
+
+    #[test]
+    fn pan302_live_policy_fields_affect_decisions() {
+        // Numeric admission independently changes first-slot and extra-slot
+        // decisions. Tier admission overrides either numeric threshold.
+        for (active, tier, threshold, expected) in [
+            (0, None, 0.5, true),
+            (0, None, 0.8, false),
+            (1, None, 0.5, true),
+            (1, None, 0.8, false),
+            (0, Some(PriorityTier::Atno), 0.99, true),
+            (1, Some(PriorityTier::Atno), 0.99, true),
+        ] {
+            let mut op = tier_pounce_operator(None, active, &["VP8PJ"]);
+            let mut next = op.config.clone();
+            next.min_dx_score = threshold;
+            next.min_multi_slot_score = threshold;
+            next.pounce_min_tier = tier;
+            op.update_live_policy(pan302_policy(&next));
+            assert_eq!(
+                pounced_on(&op.decide_at(0), "VP8PJ"),
+                expected,
+                "active={active}, tier={tier:?}, threshold={threshold}"
+            );
+        }
+        // The retained idle counter controls the next self-CQ using the new
+        // delay and direction, without starting a new operator.
+        let mut op = tier_pounce_operator(None, 0, &[]);
+        op.idle_cycles = 8;
+        let mut next = op.config.clone();
+        next.cq_after_idle_cycles = 9;
+        next.cq_direction = "DX".into();
+        op.update_live_policy(pan302_policy(&next));
+        assert!(op.decide_at(0).iter().any(|action| matches!(action,
+            OperatorAction::Transmit { message_text, .. } if message_text.starts_with("CQ DX "))));
+
+        // A new no-response threshold acts on the retained streak. Auto
+        // mode without sufficient history refuses a blind frequency switch.
+        let mut op = tier_pounce_operator(None, 0, &[]);
+        op.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Release,
+        );
+        op.cq_no_response_streak = 3;
+        let mut next = op.config.clone();
+        next.cq_after_idle_cycles = 1;
+        next.cq_no_response_switch_after = 3;
+        op.update_live_policy(pan302_policy(&next));
+        assert!(!pan356_has_transmit(&op.decide_at(0)));
+        assert_eq!(op.cq_no_response_streak, 3);
+    }
 
     #[test]
     fn test_slot_parity_derivation() {
@@ -7185,6 +7346,316 @@ mod tests {
 
     fn pounced_on(actions: &[OperatorAction], call: &str) -> bool {
         actions.iter().any(|a| matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.starts_with(call)))
+    }
+
+    // -----------------------------------------------------------------
+    // PAN-292: CQ DX and regional CQ modifiers. Our station is K5ARH
+    // (United States, North America) unless a test names another call.
+    // -----------------------------------------------------------------
+
+    fn pan292_messages(cqs: &[(&str, &str, f64)]) -> Vec<DecodedMessageInfo> {
+        cqs.iter()
+            .map(|&(call, text, frequency_hz)| DecodedMessageInfo {
+                callsign: Some(call.into()),
+                frequency_hz,
+                snr: -5,
+                message_text: text.into(),
+                slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+                captured_dial_hz: None,
+            })
+            .collect()
+    }
+
+    /// `test_decision_engine_respond_to_cq`'s operator: `NullDxEvaluator`
+    /// scores every CQ 0.5, above `min_dx_score = 0.3`.
+    fn pan292_operator(our_call: &str, cqs: &[(&str, &str, f64)]) -> AutonomousOperator {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+        let mut op = AutonomousOperator::new(config, our_call.into(), Some("EM10".into()));
+        op.feed_decoded_messages_at(
+            &pan292_messages(cqs),
+            &NullDxEvaluator,
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        op
+    }
+
+    /// One decision cycle at an Even slot: the `Transmit` texts and the
+    /// cycle's skip log.
+    fn pan292_decide(op: &mut AutonomousOperator) -> (Vec<String>, Vec<CqSkipRecord>) {
+        let transmits = op
+            .decide_at(0)
+            .into_iter()
+            .filter_map(|a| match a {
+                OperatorAction::Transmit { message_text, .. } => Some(message_text),
+                _ => None,
+            })
+            .collect();
+        (transmits, op.take_skip_log())
+    }
+
+    fn pan292_excluded(skips: &[CqSkipRecord]) -> Vec<(Option<String>, &'static str)> {
+        skips
+            .iter()
+            .filter_map(|r| match r.reason {
+                SkipReason::CqExcludesUs { modifier } => Some((r.callsign.clone(), modifier)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pan292_same_continent_cq_dx_is_not_answered() {
+        for (caller, text) in [
+            ("W1ABC", "CQ DX W1ABC FN42"),
+            ("W1ABC", "CQ dx W1ABC FN42"),
+            ("OX3XR", "CQ DX OX3XR GP60"),
+            ("<W1ABC>", "CQ DX <W1ABC> FN42"),
+        ] {
+            let mut op = pan292_operator("K5ARH", &[(caller, text, 1500.0)]);
+            assert_eq!(op.pending_cqs.len(), 1, "{text}: admitted as a candidate");
+            let (transmits, skips) = pan292_decide(&mut op);
+            assert!(transmits.is_empty(), "{text}: {transmits:?}");
+            assert!(
+                skips.contains(&CqSkipRecord {
+                    callsign: Some(caller.into()),
+                    reason: SkipReason::CqExcludesUs { modifier: "DX" },
+                }),
+                "{text}: {skips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pan292_regional_cq_for_another_continent_is_not_answered() {
+        for (written, code) in [
+            ("EU", "EU"),
+            ("AF", "AF"),
+            ("AS", "AS"),
+            ("OC", "OC"),
+            ("SA", "SA"),
+            ("eu", "EU"),
+        ] {
+            let text = format!("CQ {written} DL1ABC JO31");
+            let mut op = pan292_operator("K5ARH", &[("DL1ABC", &text, 1500.0)]);
+            let (transmits, skips) = pan292_decide(&mut op);
+            assert!(transmits.is_empty(), "{text}: {transmits:?}");
+            assert_eq!(
+                pan292_excluded(&skips),
+                vec![(Some("DL1ABC".to_string()), code)],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pan292_regional_cq_for_our_continent_and_cross_continent_cq_dx_are_answered() {
+        for (our_call, caller, text, expected) in [
+            ("K5ARH", "DL1ABC", "CQ NA DL1ABC JO31", "DL1ABC K5ARH EM10"),
+            ("K5ARH", "DL1ABC", "CQ na DL1ABC JO31", "DL1ABC K5ARH EM10"),
+            ("K5ARH", "DL1ABC", "CQ DX DL1ABC JO31", "DL1ABC K5ARH EM10"),
+            ("DL1ABC", "W1ABC", "CQ DX W1ABC FN42", "W1ABC DL1ABC EM10"),
+        ] {
+            let mut op = pan292_operator(our_call, &[(caller, text, 1500.0)]);
+            let (transmits, skips) = pan292_decide(&mut op);
+            assert_eq!(
+                transmits,
+                vec![expected.to_string()],
+                "{our_call} hears {text}"
+            );
+            assert!(
+                pan292_excluded(&skips).is_empty(),
+                "{our_call} hears {text}: {skips:?}"
+            );
+        }
+    }
+
+    /// `tier_pounce_operator` with our call K5ARH and caller-chosen texts.
+    fn pan292_tier_operator(cqs: &[(&str, &str, f64)]) -> AutonomousOperator {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.max_concurrent_qsos = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.pounce_min_tier = Some(PriorityTier::Atno);
+        let mut op = AutonomousOperator::new(config, "K5ARH".into(), Some("EM10".into()));
+        op.feed_decoded_messages_at(
+            &pan292_messages(cqs),
+            &PounceTierEvaluator,
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        op
+    }
+
+    #[test]
+    fn pan292_tier_gate_and_modifier_gate_compose() {
+        // Tier Atno, aimed at our continent: answered.
+        let mut op = pan292_tier_operator(&[("VP8PJ", "CQ NA VP8PJ PM95", 1500.0)]);
+        let actions = op.decide_at(0);
+        assert!(pounced_on(&actions, "VP8PJ"), "{actions:?}");
+        assert!(pan292_excluded(&op.take_skip_log()).is_empty());
+
+        // Tier Atno, aimed at Europe: the modifier gate skips it, and the
+        // tier gate (which it passed) records nothing.
+        let mut op = pan292_tier_operator(&[("VP8PJ", "CQ EU VP8PJ PM95", 1500.0)]);
+        let actions = op.decide_at(0);
+        assert!(!pounced_on(&actions, "VP8PJ"), "{actions:?}");
+        assert_eq!(
+            op.take_skip_log(),
+            vec![CqSkipRecord {
+                callsign: Some("VP8PJ".into()),
+                reason: SkipReason::CqExcludesUs { modifier: "EU" },
+            }]
+        );
+
+        // Below the pounce tier: the tier gate runs first, so the modifier
+        // gate never sees it.
+        let mut op = pan292_tier_operator(&[("T88AA", "CQ EU T88AA PM95", 1500.0)]);
+        let actions = op.decide_at(0);
+        assert!(!pounced_on(&actions, "T88AA"), "{actions:?}");
+        assert_eq!(
+            op.take_skip_log(),
+            vec![CqSkipRecord {
+                callsign: Some("T88AA".into()),
+                reason: SkipReason::BelowPounceTier,
+            }]
+        );
+    }
+
+    #[test]
+    fn pan292_excluded_cq_falls_through_to_the_next_candidate() {
+        let mut op = pan292_operator(
+            "K5ARH",
+            &[
+                ("W1ABC", "CQ DX W1ABC FN42", 1500.0),
+                ("JA1ABC", "CQ JA1ABC PM95", 1800.0),
+            ],
+        );
+        assert_eq!(
+            op.pending_cqs[0].callsign, "W1ABC",
+            "excluded CQ ranks first"
+        );
+        let (transmits, skips) = pan292_decide(&mut op);
+        assert_eq!(transmits, vec!["JA1ABC K5ARH EM10".to_string()]);
+        assert_eq!(
+            pan292_excluded(&skips),
+            vec![(Some("W1ABC".to_string()), "DX")]
+        );
+    }
+
+    #[test]
+    fn pan292_unknown_continents_and_other_modifiers_fail_open() {
+        assert_eq!(
+            pan292_operator("K5ARH", &[]).our_continent,
+            Some(pancetta_core::dxcc::Continent::NorthAmerica)
+        );
+        assert_eq!(pan292_operator("Q1ABC", &[]).our_continent, None);
+        for (our_call, caller, text, expected) in [
+            // Caller's continent unknown: a CQ DX cannot be shown to exclude us.
+            ("K5ARH", "Q1ABC", "CQ DX Q1ABC FN42", "Q1ABC K5ARH EM10"),
+            // Our continent unknown: neither rule can be applied.
+            ("Q1ABC", "W1ABC", "CQ DX W1ABC FN42", "W1ABC Q1ABC EM10"),
+            ("Q1ABC", "DL1ABC", "CQ EU DL1ABC JO31", "DL1ABC Q1ABC EM10"),
+            // Modifiers other than DX and the six continent codes.
+            ("K5ARH", "W1ABC", "CQ POTA W1ABC FN42", "W1ABC K5ARH EM10"),
+            ("K5ARH", "W1ABC", "CQ QRP W1ABC FN42", "W1ABC K5ARH EM10"),
+            ("K5ARH", "W1ABC", "CQ TEST W1ABC FN42", "W1ABC K5ARH EM10"),
+            ("K5ARH", "K9ZZ", "CQ 123 K9ZZ EM48", "K9ZZ K5ARH EM10"),
+            ("K5ARH", "JA1ABC", "CQ JA JA1ABC PM95", "JA1ABC K5ARH EM10"),
+            // No modifier at all.
+            ("K5ARH", "DL1ABC", "CQ DL1ABC JO31", "DL1ABC K5ARH EM10"),
+        ] {
+            let mut op = pan292_operator(our_call, &[(caller, text, 1500.0)]);
+            let (transmits, skips) = pan292_decide(&mut op);
+            assert_eq!(
+                transmits,
+                vec![expected.to_string()],
+                "{our_call} hears {text}"
+            );
+            assert!(
+                pan292_excluded(&skips).is_empty(),
+                "{our_call} hears {text}: {skips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pan292_cq_modifier_excludes_us_table() {
+        use pancetta_core::dxcc::Continent::*;
+        let na = Some(NorthAmerica);
+        for (text, caller, ours, expected) in [
+            // CQ DX: excluded only when both continents are known and equal.
+            ("CQ DX W1ABC FN42", "W1ABC", na, Some("DX")),
+            ("cq dx w1abc fn42", "w1abc", na, Some("DX")),
+            ("CQ DX OX3XR GP60", "OX3XR", na, Some("DX")),
+            ("CQ DX <W1ABC> FN42", "<W1ABC>", na, Some("DX")),
+            ("CQ DX JW5E JQ68", "JW5E", Some(Europe), Some("DX")),
+            ("CQ DX DL1ABC JO31", "DL1ABC", na, None),
+            ("CQ DX KH6ABC BL01", "KH6ABC", na, None),
+            ("CQ DX W1ABC FN42", "W1ABC", Some(Europe), None),
+            ("CQ DX Q1ABC FN42", "Q1ABC", na, None),
+            ("CQ DX <...> FN42", "<...>", na, None),
+            ("CQ DX W1ABC FN42", "W1ABC", None, None),
+            // A continent code excludes every other continent, whatever the
+            // caller's own continent; the code comes back canonical.
+            ("CQ EU DL1ABC JO31", "DL1ABC", na, Some("EU")),
+            ("CQ eu DL1ABC JO31", "DL1ABC", na, Some("EU")),
+            ("CQ AF DL1ABC JO31", "DL1ABC", na, Some("AF")),
+            ("CQ AS DL1ABC JO31", "DL1ABC", na, Some("AS")),
+            ("CQ OC DL1ABC JO31", "DL1ABC", na, Some("OC")),
+            ("CQ SA DL1ABC JO31", "DL1ABC", na, Some("SA")),
+            ("CQ NA W1ABC FN42", "W1ABC", Some(Europe), Some("NA")),
+            ("CQ NA DL1ABC JO31", "DL1ABC", na, None),
+            ("CQ EU W1ABC FN42", "W1ABC", Some(Europe), None),
+            ("CQ EU Q1ABC FN42", "Q1ABC", Some(Europe), None),
+            ("CQ EU DL1ABC JO31", "DL1ABC", None, None),
+            // Other modifiers and plain CQs never exclude.
+            ("CQ POTA W1ABC FN42", "W1ABC", na, None),
+            ("CQ QRP W1ABC FN42", "W1ABC", na, None),
+            ("CQ TEST W1ABC FN42", "W1ABC", na, None),
+            ("CQ 123 K9ZZ EM48", "K9ZZ", na, None),
+            ("CQ JA JA1ABC PM95", "JA1ABC", na, None),
+            ("CQ DL1ABC JO31", "DL1ABC", na, None),
+            ("CQ W1ABC FN42", "W1ABC", na, None),
+            ("CQ DX", "W1ABC", na, None),
+        ] {
+            assert_eq!(
+                cq_modifier_excludes_us(text, caller, ours),
+                expected,
+                "{text} from {caller}, ours {ours:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pan292_gate_leaves_directed_replies_alone() {
+        let mut op = pan292_operator("K5ARH", &[]);
+        op.cq_no_response_streak = 3;
+        op.feed_decoded_messages_at(
+            &pan292_messages(&[
+                ("W1ABC", "CQ DX W1ABC FN42", 1500.0),
+                ("W1ABC", "K5ARH W1ABC -10", 1800.0),
+            ]),
+            &NullDxEvaluator,
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        assert!(op.is_directed_response("K5ARH W1ABC -10"));
+        assert_eq!(
+            op.cq_no_response_streak, 0,
+            "a directed reply still resets the no-response streak"
+        );
+        let (transmits, skips) = pan292_decide(&mut op);
+        assert!(transmits.is_empty(), "{transmits:?}");
+        assert_eq!(
+            pan292_excluded(&skips),
+            vec![(Some("W1ABC".to_string()), "DX")]
+        );
     }
 
     #[test]

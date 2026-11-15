@@ -171,7 +171,7 @@ enum Commands {
     },
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
-    /// Export logged QSOs to ADIF
+    /// Export logged QSOs from your logbook (~/.pancetta/qsos.adi) to ADIF
     Export(ExportArgs),
     /// Import contacts from another logger's ADIF (.adi) file into your logbook
     ///
@@ -195,6 +195,25 @@ enum Commands {
     /// comparison against a client (e.g. panino) — read-only, no network
     /// calls. Safe to re-run anytime, including before ever pairing.
     Identity(IdentityArgs),
+    /// Trust a client device key locally for remote TX eligibility
+    TrustClient(TrustClientArgs),
+    /// Remove a client's local TX trust
+    UntrustClient(UntrustClientArgs),
+}
+
+#[derive(Clone, Args)]
+struct TrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
+    #[arg(long)]
+    key_file: PathBuf,
+    #[arg(long)]
+    force: bool,
+}
+#[derive(Clone, Args)]
+struct UntrustClientArgs {
+    #[arg(allow_hyphen_values = true)]
+    key_id: String,
 }
 
 #[derive(Clone, Args)]
@@ -239,17 +258,50 @@ struct PairArgs {
 
 #[derive(Clone, Args)]
 struct ExportArgs {
-    /// Output file path for the ADIF export (.adi)
+    /// File to write the ADIF export to (.adi); standard output when omitted
     #[arg(short, long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
-    /// Override database path (default: ~/.pancetta/qso.db)
+    /// ADIF logbook to read (default: ~/.pancetta/qsos.adi)
     #[arg(long)]
-    database: Option<PathBuf>,
+    logbook: Option<PathBuf>,
 
-    /// Filter by callsign substring (case-insensitive)
+    /// Only QSOs on or after this UTC date (QSO_DATE)
+    #[arg(long, value_name = "YYYY-MM-DD", value_parser = parse_export_date)]
+    since: Option<chrono::NaiveDate>,
+
+    /// Only QSOs on this band, e.g. 20m (BAND, else the band FREQ falls in)
+    #[arg(long, value_parser = parse_export_band)]
+    band: Option<pancetta_core::Band>,
+
+    /// Only QSOs in this mode, e.g. FT8 (MODE or SUBMODE, ignoring case)
+    #[arg(long)]
+    mode: Option<String>,
+
+    /// Only QSOs whose callsign contains this text (ignoring case)
     #[arg(long)]
     callsign: Option<String>,
+}
+
+fn parse_export_date(value: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|e| e.to_string())?;
+    if date.format("%Y-%m-%d").to_string() != value {
+        return Err("use YYYY-MM-DD".into());
+    }
+    Ok(date)
+}
+
+fn parse_export_band(value: &str) -> std::result::Result<pancetta_core::Band, String> {
+    value.to_lowercase().parse().map_err(|_| {
+        format!(
+            "unknown band '{value}'; use one of {}",
+            pancetta_core::Band::all()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 #[derive(Clone, Args)]
@@ -627,6 +679,8 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         },
         Commands::Pair(args) => pair_command(args, cli).await,
         Commands::Identity(args) => identity_command(args, cli).await,
+        Commands::TrustClient(args) => trust_client_command(args, cli).await,
+        Commands::UntrustClient(args) => untrust_client_command(args, cli).await,
     }
 }
 
@@ -701,6 +755,59 @@ async fn identity_command(args: IdentityArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+async fn trust_client_command(args: TrustClientArgs, cli: &Cli) -> Result<()> {
+    use base64::Engine as _;
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    let result = (|| -> Result<[u8; 32]> {
+        pancetta_agent::trust::validate_key_id(&args.key_id)?;
+        let bytes = std::fs::read(&args.key_file)
+            .with_context(|| format!("cannot read {}", args.key_file.display()))?;
+        Ok(pancetta_agent::trust::write_client_device_key(
+            &key_dir,
+            &args.key_id,
+            &bytes,
+            args.force,
+        )?)
+    })();
+    let raw = match result {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    let words = pancetta_agent::fingerprint::key_material_words(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw),
+        12,
+    )?;
+    println!("=== Pancetta Station Trust Client ===\n\nKey dir:  {}\nClient:   {}\nWrote:    clients/{}.pub (mode 0600)\n", key_dir.display(), args.key_id, args.key_id);
+    println!("Device-key words: {}", words.join(" "));
+    println!("Compare these against the client's own device-key words before it transmits.\n");
+    println!("TX arming needs this file AND an owner edge on cqdx (or a tx_allow_list entry\nin static mode). The station picks changes up on its next authorization poll\nor trust refresh (default 45 s).");
+    Ok(())
+}
+
+async fn untrust_client_command(args: UntrustClientArgs, cli: &Cli) -> Result<()> {
+    let config = load_configuration(cli).await?;
+    let key_dir = resolve_key_dir(&config.network.station_agent);
+    match pancetta_agent::trust::remove_client_device_key(&key_dir, &args.key_id) {
+        Ok(false) => println!(
+            "No local trust file for {} (nothing to remove).",
+            args.key_id
+        ),
+        Ok(true) => {
+            println!("=== Pancetta Station Untrust Client ===\n\nKey dir:  {}\nClient:   {}\nRemoved:  clients/{}.pub\n", key_dir.display(), args.key_id, args.key_id);
+            println!("The client is disarmed on the next poll or trust refresh and any in-flight\nframe is dropped. It stays connected for read and status until you also\nremove its edge on cqdx (or its tx_allow_list entry).");
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
 /// Run the agent enrollment (pairing) flow against cqdx: `enroll` (POST
 /// `/pair/agent`) → PoP-sign the challenge → `complete` (POST
 /// `/pair/agent/complete`), then persist the resulting `PairedState` (pinned
@@ -732,6 +839,11 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
         );
         std::process::exit(1);
     };
+    // Config-sourced URLs were already validated during load. Recheck only
+    // overrides so loopback warnings are emitted once per field validation.
+    if args.pairing_api_url.is_some() {
+        pancetta_config::StationAgentConfig::validate_pairing_api_url(&pairing_api_url)?;
+    }
     let origin = sa_cfg.pairing_origin.clone();
 
     let key_dir = resolve_key_dir(sa_cfg);
@@ -911,62 +1023,126 @@ async fn import_confirmations_command(args: ImportConfirmationsArgs) -> Result<(
 }
 
 async fn export_command(args: ExportArgs) -> Result<()> {
-    use pancetta_qso::adif::AdifProcessor;
-    use pancetta_qso::async_database::{QsoDatabase, QsoFilter, QueryOptions};
+    use pancetta_qso::adif::{AdifFile, AdifProcessor};
+    use pancetta_qso::adif_export::{plan_export, ExportFilter};
+    use std::io::Write;
 
-    let db_path = args.database.unwrap_or_else(|| LogbookPaths::new().db);
-
-    if !db_path.exists() {
-        eprintln!("QSO database not found at {}", db_path.display());
-        eprintln!("Run pancetta to log some QSOs first.");
-        std::process::exit(1);
+    let paths = LogbookPaths::new();
+    let logbook = args.logbook.unwrap_or_else(|| paths.adif.clone());
+    if !logbook.exists() {
+        // Only the default logbook path can be awaiting the qso.db migration,
+        // and only it is created by running pancetta.
+        if logbook != paths.adif {
+            anyhow::bail!("Logbook not found at {}.", logbook.display());
+        }
+        if paths.db.exists() {
+            return Err(refuse_unmigrated_index(&logbook, &paths.db, "export"));
+        }
+        anyhow::bail!(
+            "Logbook not found at {}.\nRun pancetta to log some QSOs first.",
+            logbook.display()
+        );
     }
-
-    println!("Opening database: {}", db_path.display());
-    let db = QsoDatabase::open(&db_path)
-        .await
-        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-
-    let filter = QsoFilter {
-        callsign_pattern: args.callsign.clone(),
-        ..Default::default()
+    let status = |line: &str| {
+        if args.output.is_some() {
+            println!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
     };
-    let options = QueryOptions::default();
-    let progresses = db
-        .search_qsos(&filter, &options)
+    status(&format!("Reading logbook: {}", logbook.display()));
+    let bytes = tokio::fs::read(&logbook)
         .await
-        .context("Failed to search QSOs")?;
-
-    println!("Found {} QSO(s) in database", progresses.len());
-    if progresses.is_empty() {
-        println!("Nothing to export.");
+        .with_context(|| format!("Cannot read your logbook {}", logbook.display()))?;
+    let processor = AdifProcessor::new();
+    let filter = ExportFilter {
+        since: args.since,
+        band: args.band,
+        mode: args.mode,
+        callsign: args.callsign,
+    };
+    let plan = plan_export(&processor, &processor.parse_bytes(&bytes), &filter);
+    for record in &plan.unreadable {
+        let call = record
+            .call
+            .as_ref()
+            .map(|c| format!(" ({})", printable(c)))
+            .unwrap_or_default();
+        eprintln!(
+            "Record {}{}: {}; skipped.",
+            record.record_number,
+            call,
+            printable(&record.reason)
+        );
+    }
+    let mut found = format!("Found {} QSO(s) in logbook", plan.read);
+    if !filter.is_empty() {
+        let mut filters = Vec::new();
+        if let Some(date) = filter.since {
+            filters.push(format!("--since {date}"));
+        }
+        if let Some(band) = filter.band {
+            filters.push(format!("--band {band}"));
+        }
+        if let Some(mode) = &filter.mode {
+            filters.push(format!("--mode {}", printable(mode)));
+        }
+        if let Some(call) = &filter.callsign {
+            filters.push(format!("--callsign {}", printable(call)));
+        }
+        found += &format!("; {} match {}", plan.records.len(), filters.join(" "));
+    }
+    if !plan.unreadable.is_empty() {
+        found += &format!(
+            "; skipped {} unreadable record{}",
+            plan.unreadable.len(),
+            if plan.unreadable.len() == 1 { "" } else { "s" }
+        );
+    }
+    status(&found);
+    if plan.records.is_empty() {
+        status("Nothing to export.");
         return Ok(());
     }
-
-    let processor = AdifProcessor::new();
-    let mut adif_file = pancetta_qso::adif::AdifFile {
-        header: Default::default(),
-        records: Vec::new(),
-    };
-    for progress in &progresses {
-        let adif_qso =
-            processor.qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
-        let record = processor.qso_to_record(&adif_qso);
-        adif_file.records.push(record);
-    }
+    let count = plan.records.len();
     let content = processor
-        .generate_string(&adif_file)
+        .generate_string(&AdifFile {
+            header: Default::default(),
+            records: plan.records,
+        })
         .context("Failed to generate ADIF")?;
-    tokio::fs::write(&args.output, &content)
-        .await
-        .with_context(|| format!("Failed to write {}", args.output.display()))?;
-
-    println!(
-        "Exported {} QSO(s) to {} ({} bytes)",
-        progresses.len(),
-        args.output.display(),
+    let destination = if let Some(output) = &args.output {
+        // Open without truncating, then compare file identities so symlinks
+        // and hard links cannot turn an export into a source-logbook rewrite.
+        let source = same_file::Handle::from_path(&logbook)
+            .with_context(|| format!("Cannot identify your logbook {}", logbook.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(output)
+            .with_context(|| format!("Failed to open {}", output.display()))?;
+        let destination = same_file::Handle::from_file(file.try_clone()?)?;
+        anyhow::ensure!(
+            source != destination,
+            "Output refers to the source logbook {}; choose a different output file.",
+            logbook.display()
+        );
+        file.set_len(0)
+            .and_then(|()| file.write_all(content.as_bytes()))
+            .with_context(|| format!("Failed to write {}", output.display()))?;
+        output.display().to_string()
+    } else {
+        std::io::stdout()
+            .lock()
+            .write_all(content.as_bytes())
+            .context("Failed to write ADIF to standard output")?;
+        "standard output".into()
+    };
+    status(&format!(
+        "Exported {count} QSO(s) to {destination} ({} bytes)",
         content.len()
-    );
+    ));
     Ok(())
 }
 
@@ -1066,10 +1242,10 @@ fn read_logbook(adif: &Path) -> Result<Option<Vec<u8>>> {
 
 /// The refusal for an index (`qso.db`) without the logbook (`qsos.adi`) it
 /// is built from: startup has not yet moved the log into the logbook.
-fn refuse_unmigrated_index(adif: &Path, db: &Path) -> anyhow::Error {
+fn refuse_unmigrated_index(adif: &Path, db: &Path, verb: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "Pancetta has not yet moved your log from {} into {}. Start Pancetta once so it \
-         can do that, then run this import again.",
+         can do that, then run this {verb} again.",
         db.display(),
         adif.display()
     )
@@ -1107,7 +1283,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
 
     let adif_exists = adif.exists();
     if !adif_exists && db.exists() {
-        return Err(refuse_unmigrated_index(&adif, &db));
+        return Err(refuse_unmigrated_index(&adif, &db, "import"));
     }
 
     let logbook_bytes = if adif_exists {
@@ -1141,7 +1317,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     let current = read_logbook(&adif)?;
     let db_existed = db.exists();
     if current.is_none() && db_existed {
-        return Err(refuse_unmigrated_index(&adif, &db));
+        return Err(refuse_unmigrated_index(&adif, &db, "import"));
     }
     let planned = logbook_bytes.as_deref().unwrap_or_default();
     let now = current.as_deref().unwrap_or_default();
@@ -1592,8 +1768,7 @@ fn format_undo_report(
     let _ = writeln!(out, "  {:<20}{}", "Logged since, kept:", kept);
     out.push('\n');
     out.push_str(
-        "Pancetta drops the removed contacts from its search index (which `pancetta export` \
-         reads) and its worked-station history the next time it starts.\n",
+        "Pancetta drops the removed contacts from its search index and its worked-station history the next time it starts.\n",
     );
     out
 }
@@ -3299,6 +3474,19 @@ mod test_rig_tests {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Restore only when this panic is on the process-exit path: the
+        // main thread's unwind is the only one that takes the process
+        // down, so the terminal must be back before the diagnostic is
+        // printed. Panics on every other thread are survived by design —
+        // the FT8 decode loop catches them (`catch_unwind` in
+        // `coordinator/ft8.rs`, a `spawn_blocking` thread) and the
+        // supervisor restarts panicked component tasks — while the TUI
+        // keeps running on its relay thread; restoring there would drop
+        // the alternate screen and raw mode mid-session with
+        // `TERMINAL_OWNED` left permanently false.
+        if std::thread::current().name() == Some("main") {
+            pancetta_tui::tui_runner::restore_terminal();
+        }
         let n = pancetta_lib::coordinator::record_panic();
         let location = info
             .location()
@@ -4115,8 +4303,7 @@ mod tests {
                 "  Removed:            2\n",
                 "  Logged since, kept: 1\n",
                 "\n",
-                "Pancetta drops the removed contacts from its search index (which `pancetta \
-                 export` reads) and its worked-station history the next time it starts.\n",
+                "Pancetta drops the removed contacts from its search index and its worked-station history the next time it starts.\n",
             )
         );
         // Undo works while Pancetta runs; it never tells the operator to stop it.
@@ -4515,3 +4702,227 @@ mod microphone_command_tests {
         assert!(opens_microphone(&doctor, true));
     }
 }
+
+#[cfg(all(test, unix))]
+mod pan333_panic_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn isolated(mode: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pan333_panic_tests::pan333_hook_child",
+                "--nocapture",
+            ])
+            .env("PAN333_HOOK_CHILD", mode)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn pan333_headless_restore_is_noop() {
+        let output = isolated("headless");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(!output.stderr.contains(&0x1b));
+    }
+
+    #[test]
+    fn pan333_panic_restores_before_diagnostic() {
+        let output = isolated("active");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Validate round 1 finding (`main.rs` panic hook): a panic on a
+    /// non-main thread is caught or supervised and the process keeps
+    /// running the TUI; the hook must not restore the terminal under it.
+    #[test]
+    fn pan333_worker_panic_keeps_terminal_for_running_tui() {
+        let output = isolated("worker");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn pan333_hook_child() {
+        let Ok(mode) = std::env::var("PAN333_HOOK_CHILD") else {
+            return;
+        };
+        if mode == "headless" {
+            pancetta_tui::tui_runner::restore_terminal();
+            return;
+        }
+        // SAFETY: openpty receives writable fd slots and a valid winsize; null
+        // name/termios pointers request defaults. Success is checked before using
+        // the fds, which become uniquely owned Files. dup saves stdin/stdout before
+        // dup2 redirects them in this isolated child process.
+        let (mut master, slave, saved_stdout, saved_stdin) = unsafe {
+            let (mut master, mut slave) = (0, 0);
+            let mut size = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                0
+            );
+            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
+            let saved = libc::dup(1);
+            assert!(saved >= 0);
+            let saved_stdin = libc::dup(0);
+            assert!(saved_stdin >= 0);
+            assert_eq!(libc::dup2(slave, 0), 0);
+            assert_eq!(libc::dup2(slave, 1), 1);
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+                saved,
+                saved_stdin,
+            )
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut output = Vec::new();
+            let mut scan = 0;
+            loop {
+                let mut buf = [0; 4096];
+                match master.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        output.extend_from_slice(&buf[..n]);
+                        while let Some(i) = output[scan..].windows(4).position(|s| s == b"\x1b[6n")
+                        {
+                            scan += i + 4;
+                            master.write_all(b"\x1b[1;1R").unwrap();
+                        }
+                    }
+                    _ if reader_stop.load(Ordering::Acquire) => break,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(15));
+            }
+            (output, master)
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runner = rt.block_on(async {
+            let config = pancetta_tui::Config::default();
+            let app = Arc::new(tokio::sync::RwLock::new(
+                pancetta_tui::App::new(config.clone(), None).await.unwrap(),
+            ));
+            let (_tx, rx) = crossbeam_channel::unbounded();
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            pancetta_tui::tui_runner::TuiRunner::new(
+                app,
+                config,
+                rx,
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+            .unwrap()
+        });
+        let before = pancetta_lib::coordinator::panic_count();
+        // The captured default hook proves chaining happens after restoration.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            std::io::stdout()
+                .write_all(b"PAN333_DEFAULT_DIAGNOSTIC")
+                .unwrap();
+            default_hook(info);
+        }));
+        install_panic_hook();
+        if mode == "worker" {
+            // A non-main-thread panic that the process survives: the hook
+            // must count it but leave the terminal to the running TUI.
+            std::thread::Builder::new()
+                .name("pan333-worker".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("worker panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+            // Raw mode must still be active: the hook skipped restoration,
+            // so the TUI keeps its alternate screen and input handling.
+            // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
+            let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+            // SAFETY: slave owns an open PTY fd and term is writable for the call.
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+            assert_eq!(
+                term.c_lflag & libc::ICANON,
+                0,
+                "hook restored the terminal under the still-running TUI"
+            );
+        } else {
+            // The hook restores only on the process-exit path, so the panic
+            // must come from a thread named like the main thread; libtest
+            // runs this test on a thread named after the test itself.
+            std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn(|| {
+                    assert!(std::panic::catch_unwind(|| panic!("simulated panic")).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(pancetta_lib::coordinator::panic_count(), before + 1);
+        }
+        drop(runner);
+        std::io::stdout().flush().unwrap();
+        // SAFETY: saved_stdout and saved_stdin are live dup-owned fds. Restore
+        // their standard descriptors before closing each saved fd exactly once.
+        unsafe {
+            libc::dup2(saved_stdout, 1);
+            libc::close(saved_stdout);
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+        }
+        stop.store(true, Ordering::Release);
+        let (output, _master) = reader.join().unwrap();
+        let output = String::from_utf8_lossy(&output).into_owned();
+        let diagnostic = output.find("PAN333_DEFAULT_DIAGNOSTIC").unwrap();
+        if mode == "worker" {
+            // The hook restored nothing during the panic: the alternate
+            // screen is left only by the runner's own teardown (drop),
+            // which still owns the terminal, so it comes after the
+            // diagnostic instead of before it.
+            assert!(diagnostic < output.find("\x1b[?1049l").unwrap(), "{output}");
+        } else {
+            assert!(output.find("\x1b[?1049l").unwrap() < diagnostic, "{output}");
+            assert!(output.find("\x1b[?25h").unwrap() < diagnostic, "{output}");
+        }
+        // SAFETY: termios contains integer fields and arrays, all valid when zeroed.
+        let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: slave owns an open PTY fd and term is writable for the call.
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+        assert_ne!(term.c_lflag & libc::ICANON, 0);
+    }
+}
+
+#[cfg(test)]
+mod docs_cli_drift;

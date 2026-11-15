@@ -69,7 +69,10 @@ impl WorkerHarness {
         let autonomous = Arc::new(bus.durable_inbox(ComponentId::Autonomous).await.unwrap());
         let tui = bus.get_or_create_channel(ComponentId::Tui).await.unwrap().1;
         coordinator
-            .start_transmitter_component_with_clock(arm_clock)
+            .start_transmitter_component_with_clock(
+                arm_clock,
+                pancetta_core::time::system_utc_clock(),
+            )
             .await
             .unwrap();
         Self {

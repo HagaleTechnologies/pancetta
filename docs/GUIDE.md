@@ -235,7 +235,8 @@ Each completed QSO is signed with your TQSL certificate (pancetta shells
 out to `tqsl`) and uploaded — no raw ADIF POST. If you'd rather sign
 manually, or don't have `tqsl` installed, point TQSL/WSJT-X's importer at
 `~/.pancetta/qsos.adi` instead. Bulk export with filters:
-`pancetta export --output mylog.adi`.
+`pancetta export --since 2026-10-01 --band 20m --mode FT8 --output mylog.adi`.
+Export reads `qsos.adi` directly; omit `--output` to write ADIF to standard output.
 
 ### …bring in my log from another program?
 
@@ -280,10 +281,10 @@ waits for it to finish.
 - `=` / `-` step the band up/down (CAT moves the dial; active QSOs are
   torn down safely — turning the rig's physical dial does the same).
 - `Shift+F` for any arbitrary dial frequency, including split.
-- `Shift+M` cycles the station operating mode: **FT8 → FT4 → FT8**.
-  Builds with the experimental `ft2` cargo feature also include FT2:
-  **FT8 → FT4 → FT2 → FT8**. Switching can be refused while a QSO is
-  in flight. Finish or press `k` to cancel the QSO first.
+- `Shift+M` cycles FT8 → FT4 → FT8 in release builds. FT2 is experimental
+  and available only in custom builds with the `ft2` feature;
+  it is not a qualified on-air capability. See [Capability status](../README.md#capability-status).
+  Switching can be refused while a QSO is in flight. Finish or press `k` to cancel the QSO first.
 - `e` cycles decode effort (Eco → Standard → Deep → Max → Auto) if you're
   CPU-bound.
 
