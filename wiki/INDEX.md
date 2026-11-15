@@ -26,4 +26,5 @@
 - [What can invalidate a receive-gain experiment?](pages/receive-gain-sweep.md) — source-slot gain epochs, coordinator-owned restoration and conservative TX-parity skips.
 - [What will bite you about macOS microphone approval?](pages/macos-microphone-approval.md)
 
+- [What will bite you about silent audio-output recovery?](pages/audio-output-recovery.md) — PAN-295: the watchdog's dead latch survives a reopen, so retries run on the policy's own clock; a reopen result never unmutes; the 3-per-10-min budget survives recovery and manual picks.
 - [What will bite you about shutdown PTT-off?](pages/shutdown-ptt-off.md) — PAN-277: enqueue versus unkey, drain ordering, and direct-client timeouts.

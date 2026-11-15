@@ -36,6 +36,8 @@ pub(crate) struct ReadinessSources {
     hamlib_command_in_flight: Arc<AtomicU32>,
     rig_conn_state: Arc<AtomicU8>,
     audio_output_alive: Arc<AtomicBool>,
+    /// PAN-295: display-only; the output reopen budget is spent.
+    audio_output_reopen_exhausted: Arc<AtomicBool>,
     receive_gain: Arc<super::receive_overload::GainSafety>,
     data_mode: pancetta_hamlib::DataModeReadiness,
     ptt_off_unconfirmed: Arc<AtomicBool>,
@@ -65,6 +67,7 @@ impl ReadinessSources {
             hamlib_command_in_flight: c.hamlib_command_in_flight.clone(),
             rig_conn_state: c.rig_conn_state.clone(),
             audio_output_alive: c.audio_output_alive.clone(),
+            audio_output_reopen_exhausted: c.audio_output_reopen_exhausted.clone(),
             receive_gain: c.message_bus.receive_gain.clone(),
             data_mode: c.message_bus.data_mode.clone(),
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
@@ -113,6 +116,9 @@ impl ReadinessSources {
         StationReadiness {
             autonomous_config_disabled: !self.autonomous_config_enabled.load(Ordering::Acquire),
             tx_mute_causes,
+            audio_output_reopen_exhausted: self
+                .audio_output_reopen_exhausted
+                .load(Ordering::Acquire),
             ptt_off_unconfirmed: self.ptt_off_unconfirmed.load(Ordering::Acquire),
             clock: tui_clock_state(self.clock_skew.status()),
             degraded,
@@ -295,6 +301,7 @@ mod tests {
             hamlib_command_in_flight: Arc::new(AtomicU32::new(0)),
             rig_conn_state: Arc::new(AtomicU8::new(RigConnState::Connected.as_u8())),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
+            audio_output_reopen_exhausted: Arc::new(AtomicBool::new(false)),
             receive_gain: {
                 let gain = super::super::receive_overload::GainSafety::default();
                 gain.confirmed_off(0);
@@ -413,6 +420,7 @@ mod tests {
             StationReadiness {
                 autonomous_config_disabled: false,
                 tx_mute_causes: vec![TuiTxMuteCause::PolicyDisabled],
+                audio_output_reopen_exhausted: false,
                 ptt_off_unconfirmed: true,
                 clock: ClockState::Unreachable,
                 degraded: Some("dx_cluster: telnet closed".into()),
@@ -669,6 +677,76 @@ mod tests {
                 TuiTxMuteCause::PolicyDisabled,
             ]
         );
+    }
+
+    #[test]
+    fn pan295_exhaustion_tracks_audio_readiness() {
+        let s = sources();
+        let mut publisher = ReadinessPublisher::default();
+        let healthy = s.snapshot(false, false);
+        assert!(!healthy.audio_output_reopen_exhausted);
+        assert!(healthy.tx_mute_causes.is_empty());
+        publisher.observe(&healthy);
+
+        // Dead, recovery still allowed: the plain audio blocker only.
+        s.audio_output_alive.store(false, Ordering::Release);
+        let dead = s.snapshot(false, false);
+        assert_eq!(dead.tx_mute_causes, vec![TuiTxMuteCause::AudioOutputDead]);
+        assert!(!dead.audio_output_reopen_exhausted);
+        assert_eq!(publisher.observe(&dead), (true, false));
+
+        // Budget spent: same mute causes, but the snapshot changes and is pushed.
+        s.audio_output_reopen_exhausted
+            .store(true, Ordering::Release);
+        let limited = s.snapshot(false, false);
+        assert_eq!(limited.tx_mute_causes, dead.tx_mute_causes);
+        assert!(limited.audio_output_reopen_exhausted);
+        assert_eq!(publisher.observe(&limited), (true, false));
+        assert_eq!(publisher.observe(&s.snapshot(false, false)), (false, false));
+
+        // Expiry clears the limit; the dead blocker stays until progress.
+        s.audio_output_reopen_exhausted
+            .store(false, Ordering::Release);
+        let expired = s.snapshot(false, false);
+        assert_eq!(expired, dead);
+        assert_eq!(publisher.observe(&expired), (true, false));
+
+        // Callback progress clears both.
+        s.audio_output_alive.store(true, Ordering::Release);
+        assert_eq!(s.snapshot(false, false), healthy);
+    }
+
+    #[tokio::test]
+    async fn pan295_inactive_audio_modes_do_not_show_exhaustion() {
+        let mut c = crate::coordinator::ApplicationCoordinator::new(
+            pancetta_config::Config::default(),
+            None,
+            true, // no_audio
+            true, // headless
+            None,
+            None,
+            None,
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            std::env::temp_dir().join("pancetta-pan295-readiness.toml"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let (to_dsp, _dsp_rx) = crossbeam_channel::unbounded();
+        let (_tx_audio, tx_audio_rx) = crossbeam_channel::unbounded();
+        c.start_audio_pipeline(to_dsp, tx_audio_rx, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(c.audio_output_alive.load(Ordering::Acquire));
+        assert!(!c.audio_output_reopen_exhausted.load(Ordering::Acquire));
+        let snap = ReadinessSources::from_coordinator(&c).snapshot(false, false);
+        assert!(!snap.audio_output_reopen_exhausted);
+        assert!(!snap
+            .tx_mute_causes
+            .contains(&TuiTxMuteCause::AudioOutputDead));
     }
 
     #[test]
