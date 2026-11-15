@@ -177,6 +177,7 @@ Callers priority: Call, Msg, SNR, Flags, Age, Freq (32 → Call/Msg/SNR; 40 → 
 
 Footer: the key hints use the same `fit_bar`; `?:Help` and `q:Quit` are pinned and
 `Space:Call/Reply` shrinks to `Space:Call` first, which is exactly what 80 columns needs.
+PAN-388 replaced the fixed hint list with per-panel hints and a pinned view name; the fit rules above still apply.
 
 `?` overlay: the body scrolls by rendered line (↑/↓, PgUp/PgDn by a page, Home/End), clamped in
 the key handler against the real terminal size (80×24 when there is none, as in unit tests) and
@@ -479,6 +480,20 @@ and say nothing about any one station. The strip chip and the Why text carry
 - **Key-effect golden.** `pancetta-tui/tests/fixtures/key_effects.golden` records what every key does (status line, commands sent, App fields changed) in five modifier sets across 36 scenarios: the main view on every panel, zoomed, stopped and TX-disabled, every dialog on a rich fixture, and six empty-dialog cases. The rich fixture includes audio devices, diagnostic events and recent QSOs. It was blessed from the pre-refactor handler at `7053b62` (the harness, `tui_runner/key_effects.rs`, uses only APIs that exist there, so it can be dropped onto that commit to re-check), and the new handler reproduces it byte for byte. Any change to what a key does fails `key_effects_match_golden` until it is re-blessed on purpose with `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`. The variable is separate from `PANCETTA_REGEN_DOCS`, so regenerating docs never re-blesses key behaviour.
 
 Follow-up candidates, all existing behaviour this refactor keeps exactly: the undocumented `,` `.` `_` aliases; the guard inconsistencies (`G`, `W`, `w` guarded though they cannot key TX; `P`, `M`, `t`, `e`, `F` unguarded); BackTab not clearing zoom while Tab does; Shift+Q matching `Char('Q')` with Caps Lock; compose Enter accepting any modifier; and a command palette built on the structured table.
+
+## Context footer (PAN-388, 2026-11)
+
+`pancetta-tui/src/keymap/hints.rs`, `pancetta-tui/src/ui/mod.rs` (`footer_line`), `pancetta-tui/src/presentation.rs` (`view_name`): the bottom hint row used to be one fixed list, so DX Hunter showed Band Activity's keys and TX Placement advertised `Space:Call` where Space has no station to act on. The row now shows the active view's name, the focused panel's hints, then `v:View`, `?:Help` and `q:Quit`, fitted by `bar_fit` as before (PAN-88).
+
+- **Hint table.** Each `FooterHint` holds the key text, label, optional compact label, `bar_fit` admit and upgrade ranks, and `binds`: the `(KeyCode, KeyModifiers, Action)` each named key must resolve to in the main view. `panel_hints` is an exhaustive `match`, so a new panel cannot compile without a hint set. The table lives beside the keymap rather than as a `KeyBinding` field, because the single `kb` constructor feeds the 47-row, 10-essential and doc-drift guards, and because the row's `action` text is help prose, not something to parse.
+- **Hint sets (admit rank).** Band Activity: `Space:Call/Reply` (1, compact `Space:Call`, upgrade 8), `Arrows:TX` (3), `=/-:Band` (5), `g:TX-policy` (2), `d:Audio` (4). DX Hunter: `Space:Call` (1), `Enter:Details` (2), `W:Watchlist` (3), `L:Lookup` (4), `H:Hound` (6). Callers: `Enter:Reply` (1), `Left/Right:Step` (2), `Space:Call/Reply` (3). QSO Status: `Up/Down:Select` (1), `r:Resend` (2), `k:Abort` (3). TX Placement: `Left/Right:Pick` (1), `Enter:Park` (2), and no Space hint. Every row ends with `v:View` (9), `?:Help` (0) and `q:Quit` (0).
+- **View name.** The leftmost segment is pinned at its compact form (`Operate`, `Hunt`, `Run`, `Monitor`) and upgrades to `Operate view` and so on at rank 7 (`VIEW_UPGRADE_RANK`). It is bold in the theme foreground. The title-bar chip is unchanged, so Operate still has no title chip. `v:Operate` was rejected because `key:label` would read as "press v for Operate" while `v` cycles to Hunt.
+- **Width trades.** Shifted letters show as bare capitals (`W`, `L`, `H`), the ticket's own wording; the `?` overlay and `docs/KEYBINDINGS.md` keep `Shift+W`. With `Shift+` spelled out the 80-column DX Hunter row needs 91 columns and `L:Lookup` would drop. At 80 columns Band Activity drops `=/-:Band`, already its lowest-ranked hint, to make room for the view name.
+- **Enter on DX Hunter opens Why.** The Enter row's `NeitherPanel(Callers, TxPlacement)` compose-hint chord became three `Panel` chords: DX Hunter resolves to `Action::OpenWhy`, Band Activity and QSO Status keep `ComposeHint`. No new `Action` or `When` variant; `OpenWhy` cannot key the transmitter. The key-effect golden changed in exactly the two `*/dx | Enter` lines.
+- **Inputs.** The footer reads only `app.active_view` and `app.active_panel`, the same panel `KeyContext::from_app` gives `resolve`. It ignores open dialogs, as the fixed row did; each dialog keeps its own footer inside its frame.
+- **Tests.** `every_footer_hint_resolves_to_its_action` checks every bind through `keymap::resolve` on all five panels, zoomed and unzoomed, with and without the stop banner. `footer_hint_key_text_names_its_keys` checks the key text names each bound key (Band Activity's legacy `Arrows` is exempt). `footer_pins_view_help_and_quit_at_every_width` renders widths 80 to 200 for every view and panel.
+
+Out of scope: footers for dialogs and overlays; the command palette; jump keys `1` to `5` focusing a panel the active view does not draw (Monitor then shows DX Hunter's hints for an off-screen panel); Enter closing the Why overlay; moving TX Placement's and QSO Status's inline key hints into the footer.
 
 ## Per-target upload state in Recent QSOs (PAN-344, 2026-11-11)
 

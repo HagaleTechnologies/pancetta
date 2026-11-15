@@ -1150,6 +1150,52 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
+/// PAN-388: the hint row. The active view's name (pinned, compact first),
+/// then the focused panel's hints from `keymap::hints`, then `v:View`,
+/// `?:Help` and `q:Quit`, priority-fitted by `bar_fit` (PAN-88), so a narrow
+/// terminal drops whole hints instead of cutting `q:Quit` mid-word.
+fn footer_line(app: &App, width: u16) -> Line<'static> {
+    let key_hint = |k: &'static str| {
+        Span::styled(
+            k,
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let view_style = Style::default()
+        .fg(app.theme.foreground_color())
+        .add_modifier(Modifier::BOLD);
+    let mut segs = vec![BarSegment::with_compact(
+        " | ",
+        vec![Span::styled(
+            crate::presentation::view_message(app.active_view),
+            view_style,
+        )],
+        vec![Span::styled(
+            crate::presentation::view_name(app.active_view),
+            view_style,
+        )],
+        0,
+        crate::keymap::hints::VIEW_UPGRADE_RANK,
+    )];
+    for h in crate::keymap::hints::footer_hints(app.active_panel) {
+        let full = vec![key_hint(h.key), Span::raw(h.label)];
+        segs.push(match h.compact_label {
+            Some(c) => BarSegment::with_compact(
+                " | ",
+                full,
+                vec![key_hint(h.key), Span::raw(c)],
+                h.admit,
+                h.upgrade,
+            ),
+            None => BarSegment::new(" | ", full, h.admit),
+        });
+    }
+    let forms = bar_fit::fit_bar(&segs, width as usize);
+    Line::from(bar_fit::bar_spans(segs, &forms))
+}
+
 fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let messages_count = app.decoded_messages.len();
     let dx_count = app.dx_stations.len();
@@ -1298,42 +1344,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let status_line = Line::from(status_spans);
 
-    // Always-visible key hints. These MUST match the real bindings in
-    // tui_runner.rs (the help-overlay is the only other on-screen keymap):
-    // band is `=`/`-` (not `+`), quit is `q` (not Ctrl+Q), `?` opens full help,
-    // `d` opens the audio-device picker (the common "reclaim my output" action).
-    let key_hint = |k: &'static str| {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    // PAN-88: the hints priority-fit the row (same `bar_fit` policy as the
-    // title bar) so a narrow terminal drops whole hints instead of cutting
-    // `q:Quit` mid-word. `?:Help` and `q:Quit` are pinned; `Space:Call/Reply`
-    // shrinks to `Space:Call` before anything drops.
-    let hint = |k: &'static str, label: &'static str, admit: u8| {
-        BarSegment::new(" | ", vec![key_hint(k), Span::raw(label)], admit)
-    };
-    let hint_segs = vec![
-        BarSegment::with_compact(
-            " | ",
-            vec![key_hint("Space"), Span::raw(":Call/Reply")],
-            vec![key_hint("Space"), Span::raw(":Call")],
-            1,
-            8,
-        ),
-        hint("Arrows", ":TX", 3),
-        hint("=/-", ":Band", 5),
-        hint("g", ":TX-policy", 2),
-        hint("d", ":Audio", 4),
-        hint("?", ":Help", 0),
-        hint("q", ":Quit", 0),
-    ];
-    let hint_forms = bar_fit::fit_bar(&hint_segs, area.width as usize);
-    let help_line = Line::from(bar_fit::bar_spans(hint_segs, &hint_forms));
+    let help_line = footer_line(app, area.width);
 
     // Split status bar into two lines (Task 20c: the third row — a purely
     // decorative "─" border with no information — was dropped, along with
@@ -4548,7 +4559,7 @@ mod view_render_tests {
         let buf = render_app(&app, 80, 24);
         assert_eq!(
             row_text(&buf, 23).trim_end(),
-            "Space:Call | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+            "Operate view | Space:Call | Arrows:TX | g:TX-policy | d:Audio | ?:Help | q:Quit"
         );
     }
 
@@ -4558,12 +4569,175 @@ mod view_render_tests {
         let buf = render_app(&app, 100, 30);
         assert_eq!(
             row_text(&buf, 29).trim_end(),
-            "Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+            "Operate view | Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
         );
-        let cell = &buf[(0, 29)];
+        let view = &buf[(0, 29)];
+        assert_eq!(view.symbol(), "O");
+        assert_eq!(view.fg, app.theme.foreground_color());
+        assert!(view.modifier.contains(Modifier::BOLD));
+        let cell = &buf[(15, 29)];
         assert_eq!(cell.symbol(), "S");
         assert_eq!(cell.fg, app.theme.accent_color());
         assert!(cell.modifier.contains(Modifier::BOLD));
+        // The title bar still has no view chip in Operate.
+        assert!(!row_text(&buf, 0).contains("OPERATE"));
+    }
+
+    /// Band Activity's footer tokens that must not appear on DX Hunter.
+    const BAND_ACTIVITY_TOKENS: [&str; 4] = ["Arrows:TX", "=/-:Band", "g:TX-policy", "d:Audio"];
+
+    /// PAN-388 scenario 1: DX Hunter's footer lists its own actions.
+    #[tokio::test]
+    async fn footer_dx_hunter_lists_its_actions_not_band_activitys() {
+        let mut app = default_app().await;
+        app.active_view = crate::view::ActiveView::Operate;
+        app.active_panel = ActivePanel::DxHunter;
+        for (w, h, expected) in [
+            (
+                80,
+                24,
+                "Operate | Space:Call | Enter:Details | W:Watchlist | L:Lookup | ?:Help | q:Quit",
+            ),
+            (
+                100,
+                30,
+                "Operate view | Space:Call | Enter:Details | W:Watchlist | L:Lookup | H:Hound | ?:Help | q:Quit",
+            ),
+            (
+                132,
+                40,
+                "Operate view | Space:Call | Enter:Details | W:Watchlist | L:Lookup | H:Hound | v:View | ?:Help | q:Quit",
+            ),
+        ] {
+            let buf = render_app(&app, w, h);
+            let row = row_text(&buf, h - 1);
+            let row = row.trim_end();
+            assert_eq!(row, expected, "{w}x{h}");
+            for token in BAND_ACTIVITY_TOKENS {
+                assert!(!row.contains(token), "{w}x{h}: {token} in {row}");
+            }
+        }
+    }
+
+    /// PAN-388: every view, panel and width keeps the view name, `?:Help`
+    /// and `q:Quit`, and never overflows the row.
+    #[tokio::test]
+    async fn footer_pins_view_help_and_quit_at_every_width() {
+        use crate::view::ActiveView;
+        let mut app = default_app().await;
+        let mut renders = 0;
+        for view in [
+            ActiveView::Operate,
+            ActiveView::Hunt,
+            ActiveView::Run,
+            ActiveView::Monitor,
+        ] {
+            for panel in [
+                ActivePanel::BandActivity,
+                ActivePanel::QsoStatus,
+                ActivePanel::Callers,
+                ActivePanel::DxHunter,
+                ActivePanel::TxPlacement,
+            ] {
+                app.active_view = view;
+                app.active_panel = panel;
+                for w in 80..=200u16 {
+                    let buf = render_app(&app, w, 24);
+                    let row = row_text(&buf, 23);
+                    let row = row.trim_end();
+                    let ctx = format!("{view:?}/{panel:?} at {w}: {row}");
+                    assert!(
+                        row.starts_with(crate::presentation::view_name(view)),
+                        "{ctx}"
+                    );
+                    assert!(row.ends_with("?:Help | q:Quit"), "{ctx}");
+                    assert!(row.chars().count() <= w as usize, "{ctx}");
+                    if panel == ActivePanel::DxHunter {
+                        for token in ["Space:Call", "Enter:Details", "W:Watchlist", "L:Lookup"] {
+                            assert!(row.contains(token), "{ctx}: missing {token}");
+                        }
+                        for token in BAND_ACTIVITY_TOKENS {
+                            assert!(!row.contains(token), "{ctx}: {token}");
+                        }
+                    }
+                    renders += 1;
+                }
+            }
+        }
+        assert_eq!(renders, 2420);
+    }
+
+    /// PAN-388 scenario 2: the footer names the current view.
+    #[tokio::test]
+    async fn footer_names_every_view() {
+        use crate::view::ActiveView;
+        let mut app = default_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        for (view, name) in [
+            (ActiveView::Operate, "Operate view | "),
+            (ActiveView::Hunt, "Hunt view | "),
+            (ActiveView::Run, "Run view | "),
+            (ActiveView::Monitor, "Monitor view | "),
+        ] {
+            app.active_view = view;
+            let buf = render_app(&app, 100, 30);
+            let row = row_text(&buf, 29);
+            assert!(row.starts_with(name), "{view:?}: {row}");
+        }
+    }
+
+    /// PAN-388: the other Operate panels show their own hints.
+    #[tokio::test]
+    async fn footer_strips_per_panel() {
+        let mut app = default_app().await;
+        app.active_view = crate::view::ActiveView::Operate;
+        for (panel, w, h, expected) in [
+            (
+                ActivePanel::QsoStatus,
+                80,
+                24,
+                "Operate view | Up/Down:Select | r:Resend | k:Abort | v:View | ?:Help | q:Quit",
+            ),
+            (
+                ActivePanel::Callers,
+                80,
+                24,
+                "Operate | Enter:Reply | Left/Right:Step | Space:Call/Reply | ?:Help | q:Quit",
+            ),
+            (
+                ActivePanel::TxPlacement,
+                80,
+                24,
+                "Operate view | Left/Right:Pick | Enter:Park | v:View | ?:Help | q:Quit",
+            ),
+            (
+                ActivePanel::QsoStatus,
+                100,
+                30,
+                "Operate view | Up/Down:Select | r:Resend | k:Abort | v:View | ?:Help | q:Quit",
+            ),
+            (
+                ActivePanel::Callers,
+                100,
+                30,
+                "Operate view | Enter:Reply | Left/Right:Step | Space:Call/Reply | v:View | ?:Help | q:Quit",
+            ),
+            (
+                ActivePanel::TxPlacement,
+                100,
+                30,
+                "Operate view | Left/Right:Pick | Enter:Park | v:View | ?:Help | q:Quit",
+            ),
+        ] {
+            app.active_panel = panel;
+            let buf = render_app(&app, w, h);
+            let row = row_text(&buf, h - 1);
+            let row = row.trim_end();
+            assert_eq!(row, expected, "{panel:?} at {w}x{h}");
+            if panel == ActivePanel::TxPlacement {
+                assert!(!row.contains("Space:"), "{row}");
+            }
+        }
     }
 }
 
