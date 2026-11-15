@@ -19,7 +19,8 @@ Each token may carry modifiers that must be stripped before use:
   (NN)  – CQ-zone override
   [NN]  – ITU-zone override
   <lat/lon> – lat/lon override
-  {CC}  – continent override
+  {CC}  – continent override (fails `--supplemental` generation: the continent
+          table is per entity and cannot represent a per-prefix continent; PAN-292)
   ~tz~  – time-zone offset
 Leading `=` means an EXACT-CALLSIGN entry (e.g. =9M2/PG5M) — skip these.
 Leading `*` on the PRIMARY prefix means "non-DXCC contest subdivision" — keep the prefix but
@@ -302,6 +303,42 @@ def zone_tables(path, mapping):
             sorted((token, name, *pair) for (token, name), pair in exact.items()))
 
 
+CONTINENT_CODES = ('AF', 'AS', 'EU', 'NA', 'OC', 'SA')
+
+
+def continent_table(path, mapping):
+    """Map every mapped entity name to its cty.dat header continent (field 3).
+
+    The table is per entity, so a per-token `{CC}` continent override cannot
+    be represented: it fails generation instead of being silently dropped.
+    """
+    from pathlib import Path
+    continents = {}
+    for record in Path(path).read_text(encoding='latin1').split(';'):
+        lines = record.strip().splitlines()
+        if not lines:
+            continue
+        fields = lines[0].split(':')
+        if len(fields) < 8:
+            raise ValueError('Malformed cty.dat header')
+        primary = fields[7].strip().upper().lstrip('*')
+        row = mapping.get(primary)
+        if row is None or (fields[0].strip() != row['name'] and
+                           fields[0].strip() not in row.get('aliases', [])):
+            raise ValueError(f'Unmapped continent entity: {primary}')
+        code = fields[3].strip().upper()
+        if code not in CONTINENT_CODES:
+            raise ValueError(f'Invalid continent: {code}')
+        for token in ' '.join(lines[1:]).split(','):
+            if re.search(r'\{[^}]*\}', token):
+                raise ValueError(f'Unsupported continent override: {token.strip()}')
+        name = row['name']
+        if name in continents and continents[name] != code:
+            raise ValueError(f'Conflicting continents: {name}')
+        continents[name] = code
+    return sorted(continents.items())
+
+
 def generate_supplemental(core):
     import hashlib
     import json
@@ -338,7 +375,11 @@ def generate_supplemental(core):
             zones += '    (' + ', '.join(lit(value) if isinstance(value, str) else str(value)
                                          for value in row) + '),\n'
         zones += '];\n'
-    return {'dxcc_registry.rs': reg, 'dxcc_exact.rs': ex, 'dxcc_zones.rs': zones}
+    cont = header + '#[rustfmt::skip]\npub(crate) static CONTINENTS: &[(&str, &str)] = &[\n'
+    cont += ''.join(f'    ({lit(name)}, {lit(code)}),\n'
+                    for name, code in continent_table(source, mapping)) + '];\n'
+    return {'dxcc_registry.rs': reg, 'dxcc_exact.rs': ex, 'dxcc_zones.rs': zones,
+            'dxcc_continents.rs': cont}
 
 
 def main():

@@ -18,6 +18,10 @@
 //! table does not cover. Unmatched prefixes return `None` (the column shows
 //! "---"): we never emit a GUESS that could mislabel a station. Where the TUI
 //! has cqdx's authoritative `entity_name`, that still takes precedence.
+//!
+//! [`continent_for_callsign`] maps the same resolved entity to its cty.dat
+//! continent (generated `dxcc_continents::CONTINENTS`), so the autonomous
+//! operator can honour `CQ DX` and regional CQ modifiers offline (PAN-292).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -198,6 +202,79 @@ pub fn canonical_entity(name: &str) -> &str {
         .map_or(name, |&(_, canonical)| canonical)
 }
 
+/// A cty.dat continent, as named by a `CQ NA`/`SA`/`EU`/`AS`/`AF`/`OC` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Continent {
+    /// `AF`
+    Africa,
+    /// `AS`
+    Asia,
+    /// `EU`
+    Europe,
+    /// `NA`
+    NorthAmerica,
+    /// `OC`
+    Oceania,
+    /// `SA`
+    SouthAmerica,
+}
+
+impl Continent {
+    /// Parse a two-letter continent code, ASCII case-insensitively. Anything
+    /// else (including `DX`) is `None`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        if code.len() != 2 {
+            return None;
+        }
+        match code.to_ascii_uppercase().as_str() {
+            "AF" => Some(Self::Africa),
+            "AS" => Some(Self::Asia),
+            "EU" => Some(Self::Europe),
+            "NA" => Some(Self::NorthAmerica),
+            "OC" => Some(Self::Oceania),
+            "SA" => Some(Self::SouthAmerica),
+            _ => None,
+        }
+    }
+
+    /// The uppercase two-letter code, as written in cty.dat and in a CQ.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Africa => "AF",
+            Self::Asia => "AS",
+            Self::Europe => "EU",
+            Self::NorthAmerica => "NA",
+            Self::Oceania => "OC",
+            Self::SouthAmerica => "SA",
+        }
+    }
+}
+
+/// Entity name (and every registry alias) to its cty.dat continent.
+static CONTINENTS: LazyLock<HashMap<&'static str, Continent>> = LazyLock::new(|| {
+    let mut by_name: HashMap<&'static str, Continent> = crate::dxcc_continents::CONTINENTS
+        .iter()
+        .filter_map(|&(name, code)| Continent::from_code(code).map(|c| (name, c)))
+        .collect();
+    for &(alias, name) in crate::dxcc_registry::NAME_ALIASES {
+        if let Some(&continent) = by_name.get(name) {
+            by_name.insert(alias, continent);
+        }
+    }
+    by_name
+});
+
+/// The continent of a known cty entity name or alias; `None` for an unknown name.
+pub fn continent_of_entity(name: &str) -> Option<Continent> {
+    CONTINENTS.get(name).copied()
+}
+
+/// The continent of the entity [`entity_for_callsign`] selects. Returns `None`
+/// for a call that does not resolve to an entity; it never guesses (PAN-292).
+pub fn continent_for_callsign(call: &str) -> Option<Continent> {
+    entity_for_callsign(call).and_then(continent_of_entity)
+}
+
 struct SubEntityRule {
     prefix: &'static str,
     short_entity: &'static str,
@@ -340,6 +417,83 @@ pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_CONTINENTS: [Continent; 6] = [
+        Continent::Africa,
+        Continent::Asia,
+        Continent::Europe,
+        Continent::NorthAmerica,
+        Continent::Oceania,
+        Continent::SouthAmerica,
+    ];
+
+    #[test]
+    fn continent_code_round_trips() {
+        for c in ALL_CONTINENTS {
+            assert_eq!(Continent::from_code(c.code()), Some(c), "{c:?}");
+            assert_eq!(c.code(), c.code().to_ascii_uppercase());
+        }
+        assert_eq!(Continent::from_code("eu"), Some(Continent::Europe));
+        for code in ["DX", "", "NAA", "N", " NA"] {
+            assert_eq!(Continent::from_code(code), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn continent_for_callsign_table() {
+        use Continent::*;
+        for (call, expected) in [
+            ("W1ABC", Some(NorthAmerica)),
+            ("K5ARH/P", Some(NorthAmerica)),
+            ("<W1ABC>", Some(NorthAmerica)),
+            ("OX3XR", Some(NorthAmerica)),
+            ("KL7ABC", Some(NorthAmerica)),
+            ("KG4AB", Some(NorthAmerica)),
+            ("DL1ABC", Some(Europe)),
+            ("TF3AO", Some(Europe)),
+            ("JW5E", Some(Europe)),
+            ("EA8/K5ARH", Some(Africa)),
+            ("D44AC", Some(Africa)),
+            ("KH6ABC", Some(Oceania)),
+            ("5B4AHJ", Some(Asia)),
+            ("<...>", None),
+            ("Q1ABC", None),
+            ("", None),
+        ] {
+            assert_eq!(continent_for_callsign(call), expected, "{call:?}");
+        }
+    }
+
+    #[test]
+    fn continent_of_entity_covers_every_resolvable_entity() {
+        let rule_names = SUB_ENTITY_RULES
+            .iter()
+            .flat_map(|rule| [rule.short_entity, rule.other_entity]);
+        for name in PREFIX_TABLE
+            .iter()
+            .chain(crate::dxcc_exact::EXACT_TABLE)
+            .map(|&(_, name)| name)
+            .chain(rule_names)
+            .chain(["United States"])
+        {
+            assert!(continent_of_entity(name).is_some(), "no continent: {name}");
+        }
+        assert_eq!(
+            continent_of_entity("Antarctica"),
+            Some(Continent::SouthAmerica)
+        );
+        assert_eq!(continent_of_entity("Cabo Verde"), Some(Continent::Africa));
+        assert_eq!(continent_of_entity("Atlantis"), None);
+    }
+
+    #[test]
+    fn every_generated_continent_row_parses() {
+        let rows = crate::dxcc_continents::CONTINENTS;
+        assert_eq!(rows.len(), 346);
+        for &(name, code) in rows {
+            assert!(Continent::from_code(code).is_some(), "{name}: {code}");
+        }
+    }
 
     #[test]
     fn zones_follow_header_prefix_exact_and_kg4_precedence() {
