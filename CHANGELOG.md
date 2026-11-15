@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
 
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.

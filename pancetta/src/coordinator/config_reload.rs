@@ -1366,6 +1366,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recent_failure_window_reload_requires_restart() {
+        let (mut c, _audit) = test_coordinator(base()).await;
+        let old = c.config.read().await.clone();
+        let mut saved = old.clone();
+        saved.autonomous.recent_failure_window_secs = 0;
+        let plan = ReloadApplyPlan::decide(&old, &saved, true);
+        assert!(plan
+            .restart_required_keys
+            .iter()
+            .any(|k| k == "autonomous.recent_failure_window_secs"));
+        c.handle_config_reload(Ok((saved, vec![]))).await;
+        assert_eq!(
+            c.config.read().await.autonomous.recent_failure_window_secs,
+            old.autonomous.recent_failure_window_secs
+        );
+        use pancetta_qso::priority::WorkedStationLookup;
+        c.cached_lookup.record_failure("DL1ABC");
+        assert!(c.cached_lookup.is_recent_failure("DL1ABC"));
+    }
+
     #[test]
     fn pan302_live_key_classification_is_explicit() {
         for key in [
@@ -1389,6 +1410,7 @@ mod tests {
             "autonomous.slot_parity",
             "autonomous.unattended_policy",
             "autonomous.needed_means",
+            "autonomous.recent_failure_window_secs",
             "autonomous.max_concurrent_qsos",
             "autonomous.tx_offset_hz",
             "autonomous.frequency.enabled",
