@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-388: the TUI footer shows the keys for the focused panel and names the current view. DX Hunter shows `Space:Call`, `Enter:Details`, `W:Watchlist` and `L:Lookup`; TX Placement no longer shows `Space:Call`. Enter on DX Hunter opens the Why overlay. At 80 columns Band Activity's footer drops `=/-:Band` to fit the view name.
 - PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
 

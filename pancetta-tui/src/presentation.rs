@@ -20,6 +20,16 @@ pub(crate) fn view_message(view: ActiveView) -> &'static str {
     }
 }
 
+/// Short view name for the footer (PAN-388): `view_message` without " view".
+pub(crate) fn view_name(view: ActiveView) -> &'static str {
+    match view {
+        ActiveView::Operate => "Operate",
+        ActiveView::Hunt => "Hunt",
+        ActiveView::Run => "Run",
+        ActiveView::Monitor => "Monitor",
+    }
+}
+
 pub(crate) fn reply_label(step: ResponseStep) -> &'static str {
     match step {
         ResponseStep::Grid => "grid",
@@ -58,6 +68,19 @@ pub(crate) fn rarity_label(tier: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_name_is_view_message_without_suffix() {
+        for view in [
+            ActiveView::Operate,
+            ActiveView::Hunt,
+            ActiveView::Run,
+            ActiveView::Monitor,
+        ] {
+            assert_eq!(view_message(view), format!("{} view", view_name(view)));
+        }
+    }
+
     #[test]
     fn pan353_rendered_text_vocabulary_is_exhaustive() {
         use RigConnDisplay::*;

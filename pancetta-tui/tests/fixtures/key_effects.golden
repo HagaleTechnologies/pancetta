@@ -231,7 +231,7 @@ empty/dx | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 empty/dx | Char('w') | none,shift | show_why: false -> true
 empty/dx | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/dx | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
-empty/dx | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
+empty/dx | Enter | none,shift,ctrl,alt,ctrl+shift | show_why: false -> true
 empty/dx | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> Callers
 empty/dx | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> QsoStatus
 empty/dx | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
@@ -528,7 +528,7 @@ rich/dx | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta
 rich/dx | Char('w') | none,shift | show_why: false -> true
 rich/dx | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/dx | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
-rich/dx | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
+rich/dx | Enter | none,shift,ctrl,alt,ctrl+shift | show_why: false -> true
 rich/dx | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> Callers
 rich/dx | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> QsoStatus
 rich/dx | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
