@@ -68,6 +68,11 @@ fn tokens(snippet: &str) -> Result<Vec<String>, String> {
     for arg in &mut args {
         if arg == "<file>" {
             *arg = "example.adi".into();
+        } else if arg == "<keyId>" {
+            // keyIds are unpadded base64url; any [A-Za-z0-9_-] token parses.
+            *arg = "dGVzdC1rZXk".into();
+        } else if arg == "<path>" {
+            *arg = "device.pub".into();
         } else if arg.contains(['<', '>']) {
             return Err("unknown placeholder".into());
         }

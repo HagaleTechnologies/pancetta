@@ -1407,8 +1407,8 @@ attenuator_db = 6
 ### Station-agent local TX trust
 
 `<key_dir>/clients/<keyId>.pub` is the station-local TX trust root. Each file
-contains a raw 32-byte Ed25519 device public key. `pancetta trust-client <keyId>
---key-file <path>` creates the `clients/` directory with mode 0700 and its file
+contains a raw 32-byte Ed25519 device public key.
+`pancetta trust-client <keyId> --key-file <path>` creates the `clients/` directory with mode 0700 and its file
 with mode 0600 on Unix. The input can be raw bytes, base64 or base64url text.
 Compare the 12 printed device-key words with the client's own words before it
 transmits. Existing files require `--force` for atomic replacement. Windows
