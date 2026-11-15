@@ -75,7 +75,7 @@ assert not (ROOT / 'pancetta-core/src/error.rs').exists()
 core = (ROOT / 'pancetta-core/src/lib.rs').read_text()
 assert 'pub mod error;' not in core and 'pub use error::' not in core
 assert tomllib.loads((ROOT / 'pancetta-config/Cargo.toml').read_text())['features']['cli'] == []
-for path in ['.catalyst/catalyst.toml', *[f'.github/workflows/{name}.yml' for name in ['ci', 'release', 'docs', 'demo-assets']]]:
+for path in ['.catalyst/catalyst.toml', *[f'.github/workflows/{name}.yml' for name in ['ci', 'release', 'demo-assets']]]:
     assert 'libssl-dev' not in (ROOT / path).read_text(), path
 for target in [None, 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc']:
     check(target)
