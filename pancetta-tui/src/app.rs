@@ -1321,6 +1321,10 @@ impl RigSelectionState {
     }
 }
 
+/// One press of `{`/`}` steps the waterfall display gain by this many dB
+/// (PAN-389).
+pub const WATERFALL_GAIN_STEP_DB: f32 = 1.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivePanel {
     BandActivity,
@@ -1334,6 +1338,10 @@ pub enum ActivePanel {
     /// `Tab`/`Shift+Tab`. Has no "focused callsign" concept (see
     /// `focused_callsign`).
     TxPlacement,
+    /// The Monitor-view waterfall (PAN-389). Monitor-only, with no row cursor
+    /// and no "focused callsign"; focusing it enables the gain (`{`/`}`) and
+    /// palette (`b`/`B`) keys.
+    Waterfall,
 }
 
 impl ActivePanel {
@@ -1342,7 +1350,8 @@ impl ActivePanel {
     /// column where a view has two columns) — so Tab always moves focus to
     /// the next panel actually drawn on screen, and never lands on a panel
     /// the current view doesn't render (Hunt has no Callers row; Run has
-    /// neither Band Activity nor DX Hunter; Monitor has only Band Activity).
+    /// neither Band Activity nor DX Hunter; Monitor has the waterfall and
+    /// Band Activity).
     /// `StationInfo` has no variant here — it was demoted to a non-navigable
     /// station card + status-bar spans in Task 18.
     ///
@@ -1373,7 +1382,7 @@ impl ActivePanel {
                 ActivePanel::Callers,
                 ActivePanel::QsoStatus,
             ],
-            ActiveView::Monitor => &[ActivePanel::BandActivity],
+            ActiveView::Monitor => &[ActivePanel::Waterfall, ActivePanel::BandActivity],
         }
     }
 }
@@ -1664,6 +1673,14 @@ pub struct App {
     pub autonomous_init_paused: bool,
     pub color_capability: ColorCapability,
     pub waterfall_data: Vec<Vec<f32>>,
+    /// Waterfall colour palette (PAN-389), seeded from `config.ui.waterfall`
+    /// and changed live by `b`/`B` with the waterfall focused. Display only.
+    pub waterfall_palette: pancetta_config::ui::WaterfallPalette,
+    /// Waterfall display gain in dB (PAN-389), seeded from
+    /// `config.ui.waterfall` and stepped live by `{`/`}`. Applied at render
+    /// time only: it never changes `waterfall_data`, which the TX allocator
+    /// and `t` key read.
+    pub waterfall_gain_db: f32,
 
     // Autonomous operator
     pub autonomous_status: Option<AutonomousStatus>,
@@ -1987,6 +2004,8 @@ impl App {
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
             waterfall_data: Vec::new(),
+            waterfall_palette: config.ui.waterfall.palette,
+            waterfall_gain_db: config.ui.waterfall.gain_db,
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
             rig_selection: RigSelectionState::new(),
@@ -2357,6 +2376,8 @@ impl App {
                         self.repin_qso_selection();
                     }
                 }
+                // The waterfall has no row cursor: a click only focuses it.
+                ActivePanel::Waterfall => {}
                 ActivePanel::TxPlacement => unreachable!("excluded by the guard above"),
             }
             return None;
@@ -3639,6 +3660,59 @@ impl App {
             .selected(std::time::Instant::now())
             .map(|e| (e.text.as_str(), e.level))
     }
+    /// Step the waterfall display gain by `step_db` (PAN-389), clamped to
+    /// the config's ±12 dB range, and set the status line. Returns the new
+    /// gain only when it changed, so a press at a limit sends no command.
+    pub fn adjust_waterfall_gain(&mut self, step_db: f32) -> Option<f32> {
+        use pancetta_config::ui::{format_gain_db, WATERFALL_GAIN_DB_MAX, WATERFALL_GAIN_DB_MIN};
+        let old = self.waterfall_gain_db;
+        let new = (old + step_db).clamp(WATERFALL_GAIN_DB_MIN, WATERFALL_GAIN_DB_MAX);
+        let changed = (new - old).abs() > f32::EPSILON;
+        let limit = if !changed && step_db > 0.0 {
+            " (maximum)"
+        } else if !changed && step_db < 0.0 {
+            " (minimum)"
+        } else {
+            ""
+        };
+        if changed {
+            self.waterfall_gain_db = new;
+        }
+        self.set_local_status(
+            format!(
+                "Waterfall gain {}{limit}",
+                format_gain_db(self.waterfall_gain_db)
+            ),
+            pancetta_core::DiagnosticLevel::Info,
+        );
+        changed.then_some(new)
+    }
+
+    /// Cycle the waterfall palette forward (`b`) or back (`B`) (PAN-389) and
+    /// set the status line; on a 16-colour terminal the line says the palette
+    /// only shows on 256-colour terminals. Returns the new palette.
+    pub fn cycle_waterfall_palette(
+        &mut self,
+        forward: bool,
+    ) -> pancetta_config::ui::WaterfallPalette {
+        let palette = if forward {
+            self.waterfall_palette.next()
+        } else {
+            self.waterfall_palette.prev()
+        };
+        self.waterfall_palette = palette;
+        let suffix = if self.color_capability == ColorCapability::Basic {
+            " (shown on 256-colour terminals only)"
+        } else {
+            ""
+        };
+        self.set_local_status(
+            format!("Waterfall palette: {}{suffix}", palette.as_str()),
+            pancetta_core::DiagnosticLevel::Info,
+        );
+        palette
+    }
+
     pub fn set_local_status(&mut self, text: String, level: pancetta_core::DiagnosticLevel) {
         self.statuses.push(
             text,
@@ -4642,6 +4716,8 @@ impl App {
             // its own selection cursor is `placement_cursor` (a slice index,
             // not a callsign).
             ActivePanel::TxPlacement => None,
+            // The waterfall has no station selection either (PAN-389).
+            ActivePanel::Waterfall => None,
         }
     }
 
@@ -7105,6 +7181,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PAN-389: Monitor's Tab order is the on-screen top-to-bottom order,
+    /// the waterfall above Band Activity.
+    #[test]
+    fn monitor_tab_order_is_waterfall_then_band_activity() {
+        assert_eq!(
+            ActivePanel::tab_order(crate::view::ActiveView::Monitor),
+            &[ActivePanel::Waterfall, ActivePanel::BandActivity]
+        );
+    }
+
+    /// PAN-389: the TUI seeds the waterfall palette and gain from
+    /// `config.ui.waterfall`.
+    #[tokio::test]
+    async fn app_seeds_waterfall_settings_from_config() {
+        let mut config = Config::default();
+        config.ui.waterfall = pancetta_config::ui::WaterfallDisplayConfig {
+            palette: pancetta_config::ui::WaterfallPalette::Viridis,
+            gain_db: 6.0,
+        };
+        let app = App::new(config, None).await.unwrap();
+        assert_eq!(
+            app.waterfall_palette,
+            pancetta_config::ui::WaterfallPalette::Viridis
+        );
+        assert_eq!(app.waterfall_gain_db, 6.0);
     }
 
     /// Operate's Tab order is the on-screen top-to-bottom, left-then-right
@@ -11318,6 +11421,24 @@ mod tests {
             Some("K1AAA"),
             "click must pin via the SAME pin_band_activity_selection Up/Down uses"
         );
+    }
+
+    /// PAN-389: a left click inside the Monitor waterfall focuses it and
+    /// sends nothing.
+    #[tokio::test]
+    async fn click_on_monitor_waterfall_focuses_it() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_view = crate::view::ActiveView::Monitor;
+        app.active_panel = ActivePanel::BandActivity;
+
+        let rect = operate_panel_rect(&app, ActivePanel::Waterfall);
+        let x = rect.x + rect.width / 2;
+        let y = rect.y + rect.height / 2;
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(cmd.is_none(), "click-to-focus never sends a TuiCommand");
+        assert_eq!(app.active_panel, ActivePanel::Waterfall);
     }
 
     #[tokio::test]

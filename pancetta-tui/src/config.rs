@@ -50,6 +50,10 @@ pub struct StationConfig {
 pub struct UiConfig {
     pub theme: Theme,
     pub show_coordinates: bool,
+    /// Waterfall palette and display gain (`[ui.waterfall]`, PAN-389). The
+    /// coordinator passes the session-resolved effective values.
+    #[serde(default)]
+    pub waterfall: pancetta_config::ui::WaterfallDisplayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +112,7 @@ impl Default for Config {
             ui: UiConfig {
                 theme: Theme::Dark,
                 show_coordinates: true,
+                waterfall: pancetta_config::ui::WaterfallDisplayConfig::default(),
             },
             audio: AudioConfig {
                 device: None,
@@ -388,6 +393,24 @@ mod tests {
         let saved = fs::read_to_string(temp_file.path()).unwrap();
         assert!(!saved.contains("replay"));
         assert!(!Config::load(temp_file.path()).unwrap().replay);
+    }
+
+    /// PAN-389: the TUI config defaults the waterfall to classic / 0 dB and
+    /// still deserialises a config written before `ui.waterfall` existed.
+    #[test]
+    fn ui_config_defaults_waterfall_and_accepts_missing_table() {
+        use pancetta_config::ui::{WaterfallDisplayConfig, WaterfallPalette};
+        let config = Config::default();
+        assert_eq!(config.ui.waterfall, WaterfallDisplayConfig::default());
+        assert_eq!(config.ui.waterfall.palette, WaterfallPalette::Classic);
+        assert_eq!(config.ui.waterfall.gain_db, 0.0);
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        let ui = value["ui"].as_object_mut().unwrap();
+        assert!(ui.remove("waterfall").is_some());
+        let loaded: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.ui.waterfall.palette, WaterfallPalette::Classic);
+        assert_eq!(loaded.ui.waterfall.gain_db, 0.0);
     }
 
     #[test]

@@ -34,10 +34,35 @@
 //! as config (including its `budget_ms` override) until the next live `e`. Per-field records (not one
 //! whole-file timestamp) mean an `f` press never refreshes the effort
 //! baseline and cannot mask a later config edit.
+//!
+//! ## Waterfall palette and gain (PAN-389)
+//!
+//! The TUI's live waterfall palette (`b` / `B`) and display gain (`{` / `}`)
+//! persist through the same seam with four optional keys, each pair a choice
+//! plus the `[ui.waterfall]` config value the station was running when it was
+//! made:
+//!
+//! ```json
+//! {"tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO","waterfall_palette":"classic","waterfall_palette_config_at_save":"viridis","waterfall_gain_db":8.0,"waterfall_gain_db_config_at_save":6.0}
+//! ```
+//!
+//! The keys are omitted until the operator changes that setting live, so a
+//! record without waterfall choices is byte-for-byte the PAN-270 format. The
+//! same per-field "config edit is newer" rule applies to each pair: when the
+//! config value differs from its `*_config_at_save` baseline (palettes
+//! exactly, gains beyond 0.001 dB), the config value applies, that saved
+//! choice is dropped and the file is rewritten. A bad waterfall value (wrong
+//! type, unknown palette, out-of-range gain, missing baseline) drops only that
+//! pair with a warning; it never makes the whole file [`SessionLoad::Ignored`],
+//! so the saved TX mode and decode effort still restore.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pancetta_config::ui::{
+    format_gain_db, WaterfallDisplayConfig, WaterfallPalette, WATERFALL_GAIN_DB_MAX,
+    WATERFALL_GAIN_DB_MIN,
+};
 use pancetta_config::DecodeEffort;
 use pancetta_core::TxFreqMode;
 use tracing::warn;
@@ -51,20 +76,47 @@ pub(crate) struct EffortChoice {
     pub(crate) config_at_save: DecodeEffort,
 }
 
-/// The canonical session record. `None` fields mean "never chosen" and are
-/// omitted from the on-disk file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The saved waterfall palette choice (PAN-389): the operator's last live
+/// palette plus the `[ui.waterfall] palette` the station was running when it
+/// was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WaterfallPaletteChoice {
+    pub(crate) choice: WaterfallPalette,
+    pub(crate) config_at_save: WaterfallPalette,
+}
+
+/// The saved waterfall gain choice (PAN-389): the operator's last live gain
+/// in dB plus the `[ui.waterfall] gain_db` the station was running when it
+/// was made.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WaterfallGainChoice {
+    pub(crate) choice: f32,
+    pub(crate) config_at_save: f32,
+}
+
+/// Gain baselines compare with this tolerance (dB). The f32 → JSON → f32
+/// round trip is exact for the values seen in practice; this is belt and
+/// braces.
+const WATERFALL_GAIN_BASELINE_TOLERANCE_DB: f32 = 0.001;
+
+/// The canonical session record. `None` fields mean "never chosen".
+/// `Eq` is not derived because the waterfall gain is an `f32`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SessionRecord {
     /// Last live TX-frequency mode choice (`f` toggle / `o` set-clear).
     pub(crate) tx_freq_mode: Option<TxFreqMode>,
     /// Last live decode-effort choice (`e` cycle) with its config baseline.
     pub(crate) decode_effort: Option<EffortChoice>,
+    /// Last live waterfall palette choice (`b` / `B`, PAN-389).
+    pub(crate) waterfall_palette: Option<WaterfallPaletteChoice>,
+    /// Last live waterfall gain choice (`{` / `}`, PAN-389).
+    pub(crate) waterfall_gain_db: Option<WaterfallGainChoice>,
 }
 
 /// Result of reading the session file. [`SessionLoad::Missing`] (a first run)
 /// is distinct from [`SessionLoad::Ignored`] (unreadable/corrupt/unknown —
 /// the ticket's fifth scenario warns only for this one).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SessionLoad {
     /// No file: a first run, nothing to restore, no warning, no rewrite.
     Missing,
@@ -77,7 +129,7 @@ pub(crate) enum SessionLoad {
 
 /// The resolved startup state: the effective values to seed the coordinator
 /// with, what to report, and the canonical record from here on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StartupChoices {
     /// Effective TX-frequency mode (restored choice, else Hold).
     pub(crate) tx_freq_mode: TxFreqMode,
@@ -90,6 +142,16 @@ pub(crate) struct StartupChoices {
     pub(crate) restored_decode_effort: Option<DecodeEffort>,
     /// The saved effort a newer config edit superseded (for the status line).
     pub(crate) superseded_saved_effort: Option<DecodeEffort>,
+    /// Effective waterfall palette and gain (PAN-389): each a kept saved
+    /// choice, else the config value.
+    pub(crate) waterfall: WaterfallDisplayConfig,
+    /// The restored waterfall palette, if a saved choice applied.
+    pub(crate) restored_waterfall_palette: Option<WaterfallPalette>,
+    /// The restored waterfall gain (dB), if a saved choice applied.
+    pub(crate) restored_waterfall_gain_db: Option<f32>,
+    /// A newer config edit superseded a saved waterfall palette or gain, so
+    /// the file must be rewritten without it.
+    pub(crate) superseded_saved_waterfall: bool,
     /// Why the saved choices were ignored, when they were.
     pub(crate) ignored_reason: Option<String>,
     /// The canonical record from here on (the supersede case already folds
@@ -109,14 +171,34 @@ pub(crate) struct SessionReport {
     pub(crate) error: Option<String>,
 }
 
+impl StartupChoices {
+    /// Whether the session file must be rewritten at startup: a newer config
+    /// edit superseded a saved effort or a saved waterfall choice.
+    pub(crate) fn needs_rewrite(&self) -> bool {
+        self.superseded_saved_effort.is_some() || self.superseded_saved_waterfall
+    }
+}
+
 /// One live mutation to persist: exactly the field the keystroke changed, so
 /// a mode-only press never refreshes the effort record's config baseline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SessionChoiceUpdate {
     TxFreqMode(TxFreqMode),
     DecodeEffort {
         choice: DecodeEffort,
         config_at_save: DecodeEffort,
+    },
+    /// A live waterfall palette change (PAN-389); the baseline is the
+    /// running `[ui.waterfall] palette`.
+    WaterfallPalette {
+        choice: WaterfallPalette,
+        config_at_save: WaterfallPalette,
+    },
+    /// A live waterfall gain change in dB (PAN-389); the baseline is the
+    /// running `[ui.waterfall] gain_db`.
+    WaterfallGain {
+        choice: f32,
+        config_at_save: f32,
     },
 }
 
@@ -140,6 +222,85 @@ fn parse_decode_effort(label: &str) -> Option<DecodeEffort> {
         "MAX" => Some(DecodeEffort::Max),
         "AUTO" => Some(DecodeEffort::Auto),
         _ => None,
+    }
+}
+
+/// Lenient parse of the saved waterfall palette pair (PAN-389). Absent or
+/// null means "never chosen"; anything malformed drops only this pair.
+fn parse_waterfall_palette(
+    value: &serde_json::Value,
+    path: &Path,
+) -> Option<WaterfallPaletteChoice> {
+    let field = "waterfall_palette";
+    let raw = value.get(field).filter(|v| !v.is_null())?;
+    let parse = |v: Option<&serde_json::Value>, name: &str| -> Result<WaterfallPalette, String> {
+        let v = v
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| format!("missing {name}"))?;
+        let label = v
+            .as_str()
+            .ok_or_else(|| format!("{name} must be a string"))?;
+        WaterfallPalette::from_label(label).ok_or_else(|| format!("unknown {name} {label:?}"))
+    };
+    let result = parse(Some(raw), field).and_then(|choice| {
+        parse(
+            value.get("waterfall_palette_config_at_save"),
+            "waterfall_palette_config_at_save",
+        )
+        .map(|config_at_save| WaterfallPaletteChoice {
+            choice,
+            config_at_save,
+        })
+    });
+    match result {
+        Ok(choice) => Some(choice),
+        Err(reason) => {
+            warn!(
+                "Session: ignoring saved waterfall {field} ({reason}) in {}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Lenient parse of the saved waterfall gain pair (PAN-389). Absent or null
+/// means "never chosen"; a non-number, non-finite or out-of-range value, or a
+/// missing baseline, drops only this pair.
+fn parse_waterfall_gain(value: &serde_json::Value, path: &Path) -> Option<WaterfallGainChoice> {
+    let field = "waterfall_gain_db";
+    let raw = value.get(field).filter(|v| !v.is_null())?;
+    let parse = |v: Option<&serde_json::Value>, name: &str| -> Result<f32, String> {
+        let v = v
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| format!("missing {name}"))?;
+        let db = v
+            .as_f64()
+            .ok_or_else(|| format!("{name} must be a number"))? as f32;
+        if !db.is_finite() || !(WATERFALL_GAIN_DB_MIN..=WATERFALL_GAIN_DB_MAX).contains(&db) {
+            return Err(format!("{name} {db} is outside -12..12 dB"));
+        }
+        Ok(db)
+    };
+    let result = parse(Some(raw), field).and_then(|choice| {
+        parse(
+            value.get("waterfall_gain_db_config_at_save"),
+            "waterfall_gain_db_config_at_save",
+        )
+        .map(|config_at_save| WaterfallGainChoice {
+            choice,
+            config_at_save,
+        })
+    });
+    match result {
+        Ok(choice) => Some(choice),
+        Err(reason) => {
+            warn!(
+                "Session: ignoring saved waterfall {field} ({reason}) in {}",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -248,6 +409,10 @@ pub(crate) fn load(path: &Path) -> SessionLoad {
             }
         }
     }
+    // PAN-389: waterfall pairs parse leniently and in isolation, so a bad
+    // display preference can never discard the saved TX mode and effort.
+    record.waterfall_palette = parse_waterfall_palette(&value, path);
+    record.waterfall_gain_db = parse_waterfall_gain(&value, path);
     SessionLoad::Record(record)
 }
 
@@ -255,7 +420,13 @@ pub(crate) fn load(path: &Path) -> SessionLoad {
 /// `[decoder].effort` value currently in effect (the shared snapshot, not the
 /// file on disk — `decoder.effort` never hot-applies, so the snapshot is
 /// exactly the value the station was running at save time too).
-pub(crate) fn resolve(config_effort: DecodeEffort, load: SessionLoad) -> StartupChoices {
+/// `config_waterfall` is the config `[ui.waterfall]` table in effect
+/// (restart-required, so likewise the running value).
+pub(crate) fn resolve(
+    config_effort: DecodeEffort,
+    config_waterfall: &WaterfallDisplayConfig,
+    load: SessionLoad,
+) -> StartupChoices {
     match load {
         SessionLoad::Missing | SessionLoad::Ignored(_) => StartupChoices {
             tx_freq_mode: TxFreqMode::default(),
@@ -263,6 +434,10 @@ pub(crate) fn resolve(config_effort: DecodeEffort, load: SessionLoad) -> Startup
             restored_tx_freq_mode: None,
             restored_decode_effort: None,
             superseded_saved_effort: None,
+            waterfall: *config_waterfall,
+            restored_waterfall_palette: None,
+            restored_waterfall_gain_db: None,
+            superseded_saved_waterfall: false,
             ignored_reason: match &load {
                 SessionLoad::Ignored(reason) => Some(reason.clone()),
                 _ => None,
@@ -284,16 +459,44 @@ pub(crate) fn resolve(config_effort: DecodeEffort, load: SessionLoad) -> Startup
                 }
                 Some(choice) => (choice.choice, Some(choice.choice), None, Some(choice)),
             };
+            // PAN-389: the same per-field "config edit is newer" rule for the
+            // waterfall palette and gain.
+            let mut superseded_waterfall = false;
+            let (palette, restored_palette, kept_palette) = match record.waterfall_palette {
+                None => (config_waterfall.palette, None, None),
+                Some(choice) if choice.config_at_save != config_waterfall.palette => {
+                    superseded_waterfall = true;
+                    (config_waterfall.palette, None, None)
+                }
+                Some(choice) => (choice.choice, Some(choice.choice), Some(choice)),
+            };
+            let (gain_db, restored_gain, kept_gain) = match record.waterfall_gain_db {
+                None => (config_waterfall.gain_db, None, None),
+                Some(choice)
+                    if (choice.config_at_save - config_waterfall.gain_db).abs()
+                        > WATERFALL_GAIN_BASELINE_TOLERANCE_DB =>
+                {
+                    superseded_waterfall = true;
+                    (config_waterfall.gain_db, None, None)
+                }
+                Some(choice) => (choice.choice, Some(choice.choice), Some(choice)),
+            };
             StartupChoices {
                 tx_freq_mode: restored_tx_freq_mode.unwrap_or_default(),
                 decode_effort: effort,
                 restored_tx_freq_mode,
                 restored_decode_effort: restored,
                 superseded_saved_effort: superseded,
+                waterfall: WaterfallDisplayConfig { palette, gain_db },
+                restored_waterfall_palette: restored_palette,
+                restored_waterfall_gain_db: restored_gain,
+                superseded_saved_waterfall: superseded_waterfall,
                 ignored_reason: None,
                 record: SessionRecord {
                     tx_freq_mode: record.tx_freq_mode,
                     decode_effort: canonical,
+                    waterfall_palette: kept_palette,
+                    waterfall_gain_db: kept_gain,
                 },
             }
         }
@@ -319,11 +522,17 @@ pub(crate) fn startup_report(choices: &StartupChoices) -> SessionReport {
     if let Some(effort) = choices.restored_decode_effort {
         restored.push(format!("decode effort {}", effort.label()));
     }
+    if let Some(palette) = choices.restored_waterfall_palette {
+        restored.push(format!("waterfall palette {}", palette.as_str()));
+    }
+    if let Some(gain_db) = choices.restored_waterfall_gain_db {
+        restored.push(format!("waterfall gain {}", format_gain_db(gain_db)));
+    }
     if !restored.is_empty() {
         return SessionReport {
             status: Some(format!(
                 "Session: restored {} from the last session",
-                restored.join(" and ")
+                join_list(&restored)
             )),
             error: None,
         };
@@ -341,14 +550,33 @@ pub(crate) fn startup_report(choices: &StartupChoices) -> SessionReport {
     SessionReport::default()
 }
 
+/// Join items as `A`, `A and B`, or `A, B and C` (PAN-389: two items keep
+/// the PAN-270 wording exactly).
+fn join_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
 /// On-disk serialization shape. Field order is the documented flat format
-/// (`tx_freq_mode` first); `None` choices serialize as `null`, which
-/// [`load`] reads back as absent.
+/// (`tx_freq_mode` first); `None` PAN-270 choices serialize as `null`, which
+/// [`load`] reads back as absent. The PAN-389 waterfall keys are omitted when
+/// unset, so a record without them is byte-for-byte the PAN-270 format.
 #[derive(serde::Serialize)]
 struct SessionRecordOnDisk<'a> {
     tx_freq_mode: Option<&'a str>,
     decode_effort: Option<&'a str>,
     decode_effort_config_at_save: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waterfall_palette: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waterfall_palette_config_at_save: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waterfall_gain_db: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waterfall_gain_db_config_at_save: Option<f32>,
 }
 
 /// Atomically write the record: create the parent directory, write a tmp
@@ -361,6 +589,12 @@ pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
         tx_freq_mode: record.tx_freq_mode.map(|m| m.label()),
         decode_effort: record.decode_effort.map(|c| c.choice.label()),
         decode_effort_config_at_save: record.decode_effort.map(|c| c.config_at_save.label()),
+        waterfall_palette: record.waterfall_palette.map(|c| c.choice.as_str()),
+        waterfall_palette_config_at_save: record
+            .waterfall_palette
+            .map(|c| c.config_at_save.as_str()),
+        waterfall_gain_db: record.waterfall_gain_db.map(|c| c.choice),
+        waterfall_gain_db_config_at_save: record.waterfall_gain_db.map(|c| c.config_at_save),
     };
     let text = serde_json::to_string(&on_disk)?;
     let tmp = path.with_extension("json.tmp");
@@ -397,6 +631,30 @@ pub(crate) fn persist_session_choice(
                 config_at_save,
             });
         }
+        SessionChoiceUpdate::WaterfallPalette {
+            choice,
+            config_at_save,
+        } => {
+            guard.waterfall_palette = Some(WaterfallPaletteChoice {
+                choice,
+                config_at_save,
+            });
+        }
+        SessionChoiceUpdate::WaterfallGain {
+            choice,
+            config_at_save,
+        } => {
+            // A non-finite gain is never stored (and nothing is rewritten);
+            // an out-of-range one is clamped to the accepted ±12 dB.
+            if !choice.is_finite() {
+                warn!("Session: ignoring non-finite waterfall gain {choice}");
+                return;
+            }
+            guard.waterfall_gain_db = Some(WaterfallGainChoice {
+                choice: choice.clamp(WATERFALL_GAIN_DB_MIN, WATERFALL_GAIN_DB_MAX),
+                config_at_save,
+            });
+        }
     }
     let Some(path) = path else { return };
     if let Err(e) = save(path, &guard) {
@@ -404,6 +662,25 @@ pub(crate) fn persist_session_choice(
             "Session: failed to save session choices to {}: {e}",
             path.display()
         );
+    }
+}
+
+/// The effective waterfall palette and gain (PAN-389): each a kept saved
+/// choice in `record`, else the config value. After [`resolve`] the record
+/// holds only choices whose baselines matched the running config.
+pub(crate) fn effective_waterfall(
+    record: &SessionRecord,
+    config: &WaterfallDisplayConfig,
+) -> WaterfallDisplayConfig {
+    WaterfallDisplayConfig {
+        palette: record
+            .waterfall_palette
+            .map(|c| c.choice)
+            .unwrap_or(config.palette),
+        gain_db: record
+            .waterfall_gain_db
+            .map(|c| c.choice)
+            .unwrap_or(config.gain_db),
     }
 }
 
@@ -432,9 +709,44 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             }),
+            ..Default::default()
         };
         save(&path, &record).unwrap();
         assert_eq!(load(&path), SessionLoad::Record(record));
+
+        // PAN-389: a full record with both waterfall pairs round trips too.
+        let full = SessionRecord {
+            tx_freq_mode: Some(TxFreqMode::Auto),
+            decode_effort: Some(EffortChoice {
+                choice: DecodeEffort::Max,
+                config_at_save: DecodeEffort::Auto,
+            }),
+            waterfall_palette: Some(WaterfallPaletteChoice {
+                choice: WaterfallPalette::Classic,
+                config_at_save: WaterfallPalette::Viridis,
+            }),
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: 8.0,
+                config_at_save: 6.0,
+            }),
+        };
+        save(&path, &full).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO","waterfall_palette":"classic","waterfall_palette_config_at_save":"viridis","waterfall_gain_db":8.0,"waterfall_gain_db_config_at_save":6.0}"#
+        );
+        assert_eq!(load(&path), SessionLoad::Record(full));
+        for gain in [6.0f32, 2.5, -0.1, 0.1, 11.9] {
+            let record = SessionRecord {
+                waterfall_gain_db: Some(WaterfallGainChoice {
+                    choice: gain,
+                    config_at_save: gain,
+                }),
+                ..Default::default()
+            };
+            save(&path, &record).unwrap();
+            assert_eq!(load(&path), SessionLoad::Record(record), "gain {gain}");
+        }
         drop(dir);
     }
 
@@ -555,7 +867,11 @@ mod tests {
                 matches!(loaded, SessionLoad::Ignored(_)),
                 "{value}: {loaded:?}"
             );
-            let choices = resolve(DecodeEffort::Deep, loaded);
+            let choices = resolve(
+                DecodeEffort::Deep,
+                &WaterfallDisplayConfig::default(),
+                loaded,
+            );
             assert_eq!(choices.tx_freq_mode, TxFreqMode::Hold, "{value}");
             assert_eq!(choices.decode_effort, DecodeEffort::Deep, "{value}");
             let report = startup_report(&choices);
@@ -576,7 +892,11 @@ mod tests {
     fn resolve_first_run_uses_defaults_and_writes_nothing() {
         // Ticket scenario 4: no saved session → Hold + config effort, nothing
         // restored.
-        let choices = resolve(DecodeEffort::Auto, SessionLoad::Missing);
+        let choices = resolve(
+            DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Missing,
+        );
         assert_eq!(choices.tx_freq_mode, TxFreqMode::Hold);
         assert_eq!(choices.decode_effort, DecodeEffort::Auto);
         assert_eq!(choices.restored_tx_freq_mode, None);
@@ -595,8 +915,13 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             }),
+            ..Default::default()
         };
-        let choices = resolve(DecodeEffort::Auto, SessionLoad::Record(record));
+        let choices = resolve(
+            DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Record(record),
+        );
         assert_eq!(choices.tx_freq_mode, TxFreqMode::Auto);
         assert_eq!(choices.decode_effort, DecodeEffort::Max);
         assert_eq!(choices.restored_tx_freq_mode, Some(TxFreqMode::Auto));
@@ -622,8 +947,13 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             }),
+            ..Default::default()
         };
-        let choices = resolve(DecodeEffort::Deep, SessionLoad::Record(record));
+        let choices = resolve(
+            DecodeEffort::Deep,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Record(record),
+        );
         assert_eq!(choices.decode_effort, DecodeEffort::Deep);
         assert_eq!(choices.restored_decode_effort, None);
         assert_eq!(choices.superseded_saved_effort, Some(DecodeEffort::Max));
@@ -640,15 +970,21 @@ mod tests {
         // the effort as config-derived, or startup drops `budget_ms`.
         let first = resolve(
             DecodeEffort::Deep,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Record(SessionRecord {
                 tx_freq_mode: None,
                 decode_effort: Some(EffortChoice {
                     choice: DecodeEffort::Max,
                     config_at_save: DecodeEffort::Auto,
                 }),
+                ..Default::default()
             }),
         );
-        let second = resolve(DecodeEffort::Deep, SessionLoad::Record(first.record));
+        let second = resolve(
+            DecodeEffort::Deep,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Record(first.record),
+        );
         assert_eq!(second.decode_effort, DecodeEffort::Deep);
         assert_eq!(
             second.restored_decode_effort, None,
@@ -665,8 +1001,13 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             }),
+            ..Default::default()
         };
-        let choices = resolve(DecodeEffort::Auto, SessionLoad::Record(record));
+        let choices = resolve(
+            DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Record(record),
+        );
         assert_eq!(choices.tx_freq_mode, TxFreqMode::Hold);
         assert_eq!(choices.restored_tx_freq_mode, Some(TxFreqMode::Hold));
         assert_eq!(choices.restored_decode_effort, Some(DecodeEffort::Max));
@@ -679,6 +1020,7 @@ mod tests {
         // config effort, startup completes, the caller warns.
         let choices = resolve(
             DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Ignored("some path: malformed JSON".to_string()),
         );
         assert_eq!(choices.tx_freq_mode, TxFreqMode::Hold);
@@ -699,6 +1041,7 @@ mod tests {
                     choice: DecodeEffort::Max,
                     config_at_save: DecodeEffort::Auto,
                 }),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -726,6 +1069,7 @@ mod tests {
             &SessionRecord {
                 tx_freq_mode: Some(TxFreqMode::Hold),
                 decode_effort: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -758,12 +1102,14 @@ mod tests {
         // Ticket scenario 3: the startup status names both restored values.
         let choices = resolve(
             DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Record(SessionRecord {
                 tx_freq_mode: Some(TxFreqMode::Auto),
                 decode_effort: Some(EffortChoice {
                     choice: DecodeEffort::Max,
                     config_at_save: DecodeEffort::Auto,
                 }),
+                ..Default::default()
             }),
         );
         let report = startup_report(&choices);
@@ -778,12 +1124,14 @@ mod tests {
     fn startup_report_effort_only_and_mode_only_variants() {
         let effort_only = resolve(
             DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Record(SessionRecord {
                 tx_freq_mode: None,
                 decode_effort: Some(EffortChoice {
                     choice: DecodeEffort::Max,
                     config_at_save: DecodeEffort::Auto,
                 }),
+                ..Default::default()
             }),
         );
         assert_eq!(
@@ -792,9 +1140,11 @@ mod tests {
         );
         let mode_only = resolve(
             DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Record(SessionRecord {
                 tx_freq_mode: Some(TxFreqMode::Auto),
                 decode_effort: None,
+                ..Default::default()
             }),
         );
         assert_eq!(
@@ -807,12 +1157,14 @@ mod tests {
     fn startup_report_names_the_superseding_config() {
         let choices = resolve(
             DecodeEffort::Deep,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Record(SessionRecord {
                 tx_freq_mode: None,
                 decode_effort: Some(EffortChoice {
                     choice: DecodeEffort::Max,
                     config_at_save: DecodeEffort::Auto,
                 }),
+                ..Default::default()
             }),
         );
         assert_eq!(
@@ -823,10 +1175,15 @@ mod tests {
 
     #[test]
     fn startup_report_on_a_first_run_and_an_ignored_file() {
-        let first_run = resolve(DecodeEffort::Auto, SessionLoad::Missing);
+        let first_run = resolve(
+            DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
+            SessionLoad::Missing,
+        );
         assert!(startup_report(&first_run) == SessionReport::default());
         let ignored = resolve(
             DecodeEffort::Auto,
+            &WaterfallDisplayConfig::default(),
             SessionLoad::Ignored("x: bad".to_string()),
         );
         let report = startup_report(&ignored);
@@ -926,6 +1283,7 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             }),
+            ..Default::default()
         });
         persist_session_choice(
             &record,
@@ -988,6 +1346,468 @@ mod tests {
                 choice: DecodeEffort::Max,
                 config_at_save: DecodeEffort::Auto,
             })
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-389: waterfall palette and gain
+    // ------------------------------------------------------------------
+
+    fn viridis_six() -> WaterfallDisplayConfig {
+        WaterfallDisplayConfig {
+            palette: WaterfallPalette::Viridis,
+            gain_db: 6.0,
+        }
+    }
+
+    fn effort_max_auto() -> Option<EffortChoice> {
+        Some(EffortChoice {
+            choice: DecodeEffort::Max,
+            config_at_save: DecodeEffort::Auto,
+        })
+    }
+
+    #[test]
+    fn persist_a_waterfall_gain_records_the_choice_and_the_running_config() {
+        let (dir, path) = session_file("");
+        std::fs::remove_file(&path).unwrap();
+        let record = shared_record(SessionRecord::default());
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallGain {
+                choice: 7.0,
+                config_at_save: 6.0,
+            },
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""waterfall_gain_db":7.0,"waterfall_gain_db_config_at_save":6.0"#),
+            "{text}"
+        );
+        assert_eq!(
+            read_record(&path).waterfall_gain_db,
+            Some(WaterfallGainChoice {
+                choice: 7.0,
+                config_at_save: 6.0,
+            })
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn persist_a_waterfall_palette_records_the_choice_and_the_running_config() {
+        let (dir, path) = session_file("");
+        std::fs::remove_file(&path).unwrap();
+        let record = shared_record(SessionRecord::default());
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallPalette {
+                choice: WaterfallPalette::Thermal,
+                config_at_save: WaterfallPalette::Viridis,
+            },
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(
+                r#""waterfall_palette":"thermal","waterfall_palette_config_at_save":"viridis""#
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            read_record(&path).waterfall_palette,
+            Some(WaterfallPaletteChoice {
+                choice: WaterfallPalette::Thermal,
+                config_at_save: WaterfallPalette::Viridis,
+            })
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn waterfall_persists_leave_the_other_records_untouched() {
+        let (dir, path) = session_file("");
+        std::fs::remove_file(&path).unwrap();
+        let palette = Some(WaterfallPaletteChoice {
+            choice: WaterfallPalette::Spectrum,
+            config_at_save: WaterfallPalette::Classic,
+        });
+        let gain = Some(WaterfallGainChoice {
+            choice: -3.0,
+            config_at_save: 0.0,
+        });
+        let start = SessionRecord {
+            tx_freq_mode: Some(TxFreqMode::Auto),
+            decode_effort: effort_max_auto(),
+            waterfall_palette: palette,
+            waterfall_gain_db: gain,
+        };
+        let record = shared_record(start.clone());
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallGain {
+                choice: 4.0,
+                config_at_save: 0.0,
+            },
+        );
+        let saved = read_record(&path);
+        assert_eq!(saved.tx_freq_mode, start.tx_freq_mode);
+        assert_eq!(saved.decode_effort, start.decode_effort);
+        assert_eq!(
+            saved.waterfall_palette, palette,
+            "a gain persist keeps the palette"
+        );
+        assert_eq!(saved.waterfall_gain_db.map(|g| g.choice), Some(4.0));
+
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallPalette {
+                choice: WaterfallPalette::Viridis,
+                config_at_save: WaterfallPalette::Classic,
+            },
+        );
+        let saved = read_record(&path);
+        assert_eq!(saved.tx_freq_mode, start.tx_freq_mode);
+        assert_eq!(saved.decode_effort, start.decode_effort);
+        assert_eq!(
+            saved.waterfall_gain_db,
+            Some(WaterfallGainChoice {
+                choice: 4.0,
+                config_at_save: 0.0,
+            }),
+            "a palette persist keeps the gain"
+        );
+        assert_eq!(
+            saved.waterfall_palette.map(|p| p.choice),
+            Some(WaterfallPalette::Viridis)
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn persist_waterfall_gain_ignores_non_finite_and_clamps() {
+        let (dir, path) = session_file("");
+        std::fs::remove_file(&path).unwrap();
+        let record = shared_record(SessionRecord::default());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            persist_session_choice(
+                &record,
+                &Some(path.clone()),
+                SessionChoiceUpdate::WaterfallGain {
+                    choice: bad,
+                    config_at_save: 0.0,
+                },
+            );
+            assert_eq!(record.lock().unwrap().waterfall_gain_db, None, "{bad}");
+            assert!(!path.exists(), "{bad}: nothing may be written");
+        }
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallGain {
+                choice: 40.0,
+                config_at_save: 0.0,
+            },
+        );
+        assert_eq!(
+            read_record(&path).waterfall_gain_db.map(|g| g.choice),
+            Some(12.0)
+        );
+        persist_session_choice(
+            &record,
+            &Some(path.clone()),
+            SessionChoiceUpdate::WaterfallGain {
+                choice: -40.0,
+                config_at_save: 0.0,
+            },
+        );
+        assert_eq!(
+            read_record(&path).waterfall_gain_db.map(|g| g.choice),
+            Some(-12.0)
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_restores_saved_waterfall_choices_when_baselines_match() {
+        let record = SessionRecord {
+            waterfall_palette: Some(WaterfallPaletteChoice {
+                choice: WaterfallPalette::Classic,
+                config_at_save: WaterfallPalette::Viridis,
+            }),
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: 8.0,
+                config_at_save: 6.0,
+            }),
+            ..Default::default()
+        };
+        let choices = resolve(
+            DecodeEffort::Auto,
+            &viridis_six(),
+            SessionLoad::Record(record.clone()),
+        );
+        assert_eq!(
+            choices.waterfall,
+            WaterfallDisplayConfig {
+                palette: WaterfallPalette::Classic,
+                gain_db: 8.0,
+            }
+        );
+        assert_eq!(
+            choices.restored_waterfall_palette,
+            Some(WaterfallPalette::Classic)
+        );
+        assert_eq!(choices.restored_waterfall_gain_db, Some(8.0));
+        assert!(!choices.superseded_saved_waterfall);
+        assert!(!choices.needs_rewrite());
+        assert_eq!(choices.record, record);
+    }
+
+    #[test]
+    fn resolve_lets_a_newer_config_waterfall_value_win_per_field() {
+        let palette = Some(WaterfallPaletteChoice {
+            choice: WaterfallPalette::Classic,
+            config_at_save: WaterfallPalette::Viridis,
+        });
+        let record = SessionRecord {
+            waterfall_palette: palette,
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: 8.0,
+                config_at_save: 6.0,
+            }),
+            ..Default::default()
+        };
+        let config = WaterfallDisplayConfig {
+            palette: WaterfallPalette::Viridis,
+            gain_db: 3.0,
+        };
+        let choices = resolve(DecodeEffort::Auto, &config, SessionLoad::Record(record));
+        assert_eq!(choices.waterfall.gain_db, 3.0, "the newer config gain wins");
+        assert_eq!(
+            choices.waterfall.palette,
+            WaterfallPalette::Classic,
+            "the matching palette record is still restored"
+        );
+        assert_eq!(choices.restored_waterfall_gain_db, None);
+        assert_eq!(
+            choices.restored_waterfall_palette,
+            Some(WaterfallPalette::Classic)
+        );
+        assert!(choices.superseded_saved_waterfall);
+        assert!(choices.needs_rewrite());
+        assert_eq!(choices.record.waterfall_gain_db, None);
+        assert_eq!(choices.record.waterfall_palette, palette);
+
+        // A second restart keeps the config gain, now as config.
+        let second = resolve(
+            DecodeEffort::Auto,
+            &config,
+            SessionLoad::Record(choices.record),
+        );
+        assert_eq!(second.waterfall.gain_db, 3.0);
+        assert_eq!(second.restored_waterfall_gain_db, None);
+        assert!(!second.needs_rewrite());
+
+        // A palette baseline mismatch supersedes the palette alone.
+        let record = SessionRecord {
+            waterfall_palette: palette,
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: 8.0,
+                config_at_save: 6.0,
+            }),
+            ..Default::default()
+        };
+        let config = WaterfallDisplayConfig {
+            palette: WaterfallPalette::Thermal,
+            gain_db: 6.0,
+        };
+        let choices = resolve(DecodeEffort::Auto, &config, SessionLoad::Record(record));
+        assert_eq!(choices.waterfall.palette, WaterfallPalette::Thermal);
+        assert_eq!(choices.waterfall.gain_db, 8.0);
+        assert_eq!(choices.record.waterfall_palette, None);
+        assert!(choices.needs_rewrite());
+    }
+
+    #[test]
+    fn effective_waterfall_prefers_a_kept_saved_choice_over_config() {
+        let record = SessionRecord {
+            waterfall_palette: Some(WaterfallPaletteChoice {
+                choice: WaterfallPalette::Thermal,
+                config_at_save: WaterfallPalette::Viridis,
+            }),
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: -2.0,
+                config_at_save: 6.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_waterfall(&record, &viridis_six()),
+            WaterfallDisplayConfig {
+                palette: WaterfallPalette::Thermal,
+                gain_db: -2.0,
+            }
+        );
+        // One saved field, the other from config.
+        let gain_only = SessionRecord {
+            waterfall_gain_db: Some(WaterfallGainChoice {
+                choice: -2.0,
+                config_at_save: 6.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_waterfall(&gain_only, &viridis_six()),
+            WaterfallDisplayConfig {
+                palette: WaterfallPalette::Viridis,
+                gain_db: -2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn effective_waterfall_without_saved_choices_is_the_config() {
+        let record = SessionRecord {
+            tx_freq_mode: Some(TxFreqMode::Auto),
+            decode_effort: effort_max_auto(),
+            ..Default::default()
+        };
+        assert_eq!(effective_waterfall(&record, &viridis_six()), viridis_six());
+        let choices = resolve(DecodeEffort::Auto, &viridis_six(), SessionLoad::Missing);
+        assert_eq!(choices.waterfall, viridis_six());
+        assert_eq!(
+            effective_waterfall(&choices.record, &viridis_six()),
+            choices.waterfall
+        );
+    }
+
+    #[test]
+    fn startup_report_names_restored_waterfall_choices() {
+        let waterfall_only = resolve(
+            DecodeEffort::Auto,
+            &viridis_six(),
+            SessionLoad::Record(SessionRecord {
+                waterfall_palette: Some(WaterfallPaletteChoice {
+                    choice: WaterfallPalette::Viridis,
+                    config_at_save: WaterfallPalette::Viridis,
+                }),
+                waterfall_gain_db: Some(WaterfallGainChoice {
+                    choice: 6.0,
+                    config_at_save: 6.0,
+                }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            startup_report(&waterfall_only).status.as_deref(),
+            Some("Session: restored waterfall palette viridis and waterfall gain +6 dB from the last session")
+        );
+        let all_four = resolve(
+            DecodeEffort::Auto,
+            &viridis_six(),
+            SessionLoad::Record(SessionRecord {
+                tx_freq_mode: Some(TxFreqMode::Auto),
+                decode_effort: effort_max_auto(),
+                waterfall_palette: Some(WaterfallPaletteChoice {
+                    choice: WaterfallPalette::Viridis,
+                    config_at_save: WaterfallPalette::Viridis,
+                }),
+                waterfall_gain_db: Some(WaterfallGainChoice {
+                    choice: 6.0,
+                    config_at_save: 6.0,
+                }),
+            }),
+        );
+        assert_eq!(
+            startup_report(&all_four).status.as_deref(),
+            Some("Session: restored TX frequency mode AUTO, decode effort MAX, waterfall palette viridis and waterfall gain +6 dB from the last session")
+        );
+    }
+
+    #[test]
+    fn a_bad_waterfall_record_is_dropped_without_ignoring_the_file() {
+        let base =
+            r#""tx_freq_mode":"AUTO","decode_effort":"MAX","decode_effort_config_at_save":"AUTO""#;
+        let good_palette =
+            r#""waterfall_palette":"thermal","waterfall_palette_config_at_save":"classic""#;
+        let good_gain = r#""waterfall_gain_db":3.0,"waterfall_gain_db_config_at_save":0.0"#;
+        // (extra JSON, palette expected kept, gain expected kept)
+        let cases = [
+            (
+                format!(
+                    r#"{base},"waterfall_palette":"inferno","waterfall_palette_config_at_save":"classic",{good_gain}"#
+                ),
+                false,
+                true,
+            ),
+            (
+                format!(
+                    r#"{base},{good_palette},"waterfall_gain_db":"loud","waterfall_gain_db_config_at_save":0.0"#
+                ),
+                true,
+                false,
+            ),
+            (
+                format!(
+                    r#"{base},{good_palette},"waterfall_gain_db":40.0,"waterfall_gain_db_config_at_save":0.0"#
+                ),
+                true,
+                false,
+            ),
+            (
+                format!(r#"{base},{good_palette},"waterfall_gain_db":3.0"#),
+                true,
+                false,
+            ),
+            (
+                format!(r#"{base},"waterfall_palette":"thermal",{good_gain}"#),
+                false,
+                true,
+            ),
+            (
+                format!(
+                    r#"{base},"waterfall_palette":7,"waterfall_palette_config_at_save":"classic",{good_gain}"#
+                ),
+                false,
+                true,
+            ),
+        ];
+        for (body, palette_kept, gain_kept) in cases {
+            let json = format!("{{{body}}}");
+            let (_dir, path) = session_file(&json);
+            let record = match load(&path) {
+                SessionLoad::Record(record) => record,
+                other => {
+                    panic!("{json}: a bad waterfall value must not ignore the file: {other:?}")
+                }
+            };
+            assert_eq!(record.tx_freq_mode, Some(TxFreqMode::Auto), "{json}");
+            assert_eq!(record.decode_effort, effort_max_auto(), "{json}");
+            assert_eq!(record.waterfall_palette.is_some(), palette_kept, "{json}");
+            assert_eq!(record.waterfall_gain_db.is_some(), gain_kept, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_record_without_waterfall_choices_saves_the_pan270_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".pancetta").join("session_state.json");
+        save(
+            &path,
+            &SessionRecord {
+                tx_freq_mode: Some(TxFreqMode::Auto),
+                decode_effort: None,
+                waterfall_palette: None,
+                waterfall_gain_db: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"tx_freq_mode":"AUTO","decode_effort":null,"decode_effort_config_at_save":null}"#
         );
     }
 }

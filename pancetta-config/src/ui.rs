@@ -49,9 +49,111 @@ pub struct UiConfig {
     /// Waterfall and spectrum display settings
     pub spectrum: SpectrumDisplayConfig,
 
+    /// `[ui.waterfall]`: the Monitor-view waterfall palette and display gain
+    /// (PAN-389). This is the live table the TUI reads; it is distinct from
+    /// the inert `[ui.spectrum.waterfall]` schema.
+    pub waterfall: WaterfallDisplayConfig,
+
     /// Custom UI components
     #[serde(default)]
     pub custom_widgets: HashMap<String, WidgetConfig>,
+}
+
+/// Lowest accepted `[ui.waterfall] gain_db` (PAN-389).
+pub const WATERFALL_GAIN_DB_MIN: f32 = -12.0;
+
+/// Highest accepted `[ui.waterfall] gain_db` (PAN-389).
+pub const WATERFALL_GAIN_DB_MAX: f32 = 12.0;
+
+/// Colour palette for the TUI waterfall (`[ui.waterfall] palette`, PAN-389).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaterfallPalette {
+    /// Grayscale ramp, the historical look (default).
+    #[default]
+    Classic,
+    /// Four blue steps.
+    Spectrum,
+    /// Three-step heat ramp.
+    Thermal,
+    /// Perceptually uniform viridis ramp.
+    Viridis,
+}
+
+impl WaterfallPalette {
+    /// Every palette, in cycle order.
+    pub const ALL: [WaterfallPalette; 4] = [
+        WaterfallPalette::Classic,
+        WaterfallPalette::Spectrum,
+        WaterfallPalette::Thermal,
+        WaterfallPalette::Viridis,
+    ];
+
+    /// The config / session-file label (`classic`, `spectrum`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaterfallPalette::Classic => "classic",
+            WaterfallPalette::Spectrum => "spectrum",
+            WaterfallPalette::Thermal => "thermal",
+            WaterfallPalette::Viridis => "viridis",
+        }
+    }
+
+    /// Parse a label written by [`as_str`](Self::as_str).
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == label)
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|p| *p == self)
+            .unwrap_or_default()
+    }
+
+    /// The next palette in cycle order, wrapping.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    /// The previous palette in cycle order, wrapping.
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// `[ui.waterfall]`: palette and display gain for the TUI waterfall (PAN-389).
+///
+/// Gain is applied at render time only: positive values brighten, showing the
+/// noise floor `gain_db` dB higher on the waterfall's 12 dB colour scale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaterfallDisplayConfig {
+    /// Colour palette (`classic`, `spectrum`, `thermal`, `viridis`).
+    pub palette: WaterfallPalette,
+
+    /// Display gain in dB, from -12.0 to 12.0. Positive brightens.
+    pub gain_db: f32,
+}
+
+impl Default for WaterfallDisplayConfig {
+    fn default() -> Self {
+        Self {
+            palette: WaterfallPalette::Classic,
+            gain_db: 0.0,
+        }
+    }
+}
+
+/// Format a waterfall gain for display: `0 dB`, `+6 dB`, `-3 dB`, `+2.5 dB`.
+pub fn format_gain_db(db: f32) -> String {
+    if db.abs() < 0.05 {
+        "0 dB".to_string()
+    } else if (db - db.round()).abs() < 0.05 {
+        format!("{:+.0} dB", db.round())
+    } else {
+        format!("{db:+.1} dB")
+    }
 }
 
 /// Window management configuration
@@ -1363,6 +1465,7 @@ impl Default for UiConfig {
             status_bar: StatusBarConfig::default(),
             logging: LoggingDisplayConfig::default(),
             spectrum: SpectrumDisplayConfig::default(),
+            waterfall: WaterfallDisplayConfig::default(),
             custom_widgets: HashMap::new(),
         }
     }
@@ -1923,6 +2026,15 @@ impl ConfigSection for UiConfig {
             });
         }
 
+        // PAN-389: the waterfall display gain must be finite and within ±12 dB.
+        let gain = self.waterfall.gain_db;
+        if !gain.is_finite() || !(WATERFALL_GAIN_DB_MIN..=WATERFALL_GAIN_DB_MAX).contains(&gain) {
+            return Err(ConfigError::InvalidValue {
+                field: "ui.waterfall.gain_db".to_string(),
+                value: gain.to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -1952,6 +2064,7 @@ impl ConfigSection for UiConfig {
         self.status_bar = other.status_bar;
         self.logging = other.logging;
         self.spectrum = other.spectrum;
+        self.waterfall = other.waterfall;
 
         // Merge custom widgets
         self.custom_widgets.extend(other.custom_widgets);
@@ -2011,5 +2124,46 @@ mod tests {
         assert_eq!(config.colors.primary.base, "#3b82f6");
         assert_eq!(config.colors.status.connected, "#10b981");
         assert_eq!(config.colors.status.transmitting, "#ef4444");
+    }
+
+    #[test]
+    fn waterfall_palette_cycles_in_both_directions() {
+        let mut p = WaterfallPalette::Classic;
+        let mut forward = Vec::new();
+        for _ in 0..4 {
+            p = p.next();
+            forward.push(p);
+        }
+        assert_eq!(
+            forward,
+            vec![
+                WaterfallPalette::Spectrum,
+                WaterfallPalette::Thermal,
+                WaterfallPalette::Viridis,
+                WaterfallPalette::Classic,
+            ]
+        );
+        assert_eq!(WaterfallPalette::Classic.prev(), WaterfallPalette::Viridis);
+        for p in WaterfallPalette::ALL {
+            assert_eq!(p.next().prev(), p);
+        }
+    }
+
+    #[test]
+    fn waterfall_palette_labels_round_trip() {
+        for p in WaterfallPalette::ALL {
+            assert_eq!(WaterfallPalette::from_label(p.as_str()), Some(p));
+        }
+        assert_eq!(WaterfallPalette::from_label("inferno"), None);
+    }
+
+    #[test]
+    fn format_gain_db_labels() {
+        assert_eq!(format_gain_db(0.0), "0 dB");
+        assert_eq!(format_gain_db(-0.0), "0 dB");
+        assert_eq!(format_gain_db(6.0), "+6 dB");
+        assert_eq!(format_gain_db(-3.0), "-3 dB");
+        assert_eq!(format_gain_db(2.5), "+2.5 dB");
+        assert_eq!(format_gain_db(12.0), "+12 dB");
     }
 }

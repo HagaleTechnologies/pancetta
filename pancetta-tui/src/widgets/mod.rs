@@ -6,6 +6,7 @@ use ratatui::{
 };
 
 use crate::app::ColorCapability;
+pub use pancetta_config::ui::WaterfallPalette;
 
 /// Color a column of the occupancy strip by recent decode activity.
 /// Red = decode within ±37.5 Hz in YOUR TX parity in the last 60s.
@@ -63,7 +64,12 @@ pub(crate) fn occupancy_color(
 pub struct Waterfall<'a> {
     block: Option<Block<'a>>,
     data: &'a [Vec<f32>],
-    color_scheme: WaterfallColorScheme,
+    /// Colour palette (`[ui.waterfall] palette`, PAN-389). Ignored on
+    /// 16-colour terminals, which encode intensity in density glyphs.
+    palette: WaterfallPalette,
+    /// Display gain in dB (`[ui.waterfall] gain_db`, PAN-389). Added at render
+    /// time on the [`WATERFALL_DB_SPAN`] scale; positive brightens.
+    gain_db: f32,
     /// Audio frequency range covered by the data bins (Hz)
     freq_range: (f64, f64),
     /// TX frequency offset (Hz) — shown as a green vertical marker
@@ -86,19 +92,24 @@ pub struct Waterfall<'a> {
     tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
-#[derive(Clone, Copy)]
-pub enum WaterfallColorScheme {
-    Classic,
-    Spectrum,
-    Thermal,
-}
+/// The dB span the waterfall's 0..1 colour scale covers (PAN-389).
+///
+/// Must equal `NOISE_FLOOR_DB_SCALE` in `pancetta/src/coordinator/dsp.rs`,
+/// which normalises the live rows (signal above the per-bin median over this
+/// many dB); a test there pins the two together so "6 dB = 0.5" cannot drift.
+pub const WATERFALL_DB_SPAN: f32 = 12.0;
+
+/// Viridis as an 11-step ramp of xterm-256 indices with strictly rising
+/// luminance, indexed by `(intensity * 10).round()` (PAN-389).
+const VIRIDIS_256: [u8; 11] = [53, 54, 60, 61, 30, 31, 36, 71, 113, 148, 220];
 
 impl<'a> Waterfall<'a> {
     pub fn new(data: &'a [Vec<f32>]) -> Self {
         Self {
             block: None,
             data,
-            color_scheme: WaterfallColorScheme::Classic,
+            palette: WaterfallPalette::Classic,
+            gain_db: 0.0,
             freq_range: (0.0, 3000.0),
             tx_offset: None,
             signal_freqs: Vec::new(),
@@ -115,8 +126,15 @@ impl<'a> Waterfall<'a> {
         self
     }
 
-    pub fn color_scheme(mut self, scheme: WaterfallColorScheme) -> Self {
-        self.color_scheme = scheme;
+    /// Set the colour palette (PAN-389).
+    pub fn palette(mut self, palette: WaterfallPalette) -> Self {
+        self.palette = palette;
+        self
+    }
+
+    /// Set the display gain in dB (PAN-389). Positive brightens.
+    pub fn gain_db(mut self, gain_db: f32) -> Self {
+        self.gain_db = gain_db;
         self
     }
 
@@ -209,8 +227,8 @@ impl<'a> Waterfall<'a> {
             };
         }
 
-        match self.color_scheme {
-            WaterfallColorScheme::Classic => {
+        match self.palette {
+            WaterfallPalette::Classic => {
                 // Luminance-based: dark = quiet, bright = loud.
                 // Colorblind-safe — relies on brightness, not hue.
                 // Uses 256-color grayscale ramp (232–255) for smooth gradient.
@@ -218,7 +236,7 @@ impl<'a> Waterfall<'a> {
                 let idx = 232 + (clamped * 23.0) as u8;
                 Color::Indexed(idx)
             }
-            WaterfallColorScheme::Spectrum => {
+            WaterfallPalette::Spectrum => {
                 // Blue-to-white luminance ramp (colorblind-safe)
                 // Uses 256-color: dark blue → blue → cyan → white
                 if clamped < 0.25 {
@@ -231,7 +249,7 @@ impl<'a> Waterfall<'a> {
                     Color::Indexed(255) // white
                 }
             }
-            WaterfallColorScheme::Thermal => {
+            WaterfallPalette::Thermal => {
                 // Black → dark → bright (pure luminance)
                 if clamped < 0.33 {
                     Color::Black
@@ -240,6 +258,11 @@ impl<'a> Waterfall<'a> {
                 } else {
                     Color::White
                 }
+            }
+            WaterfallPalette::Viridis => {
+                // Perceptually uniform purple → teal → yellow ramp.
+                let step = (clamped * 10.0).round() as usize;
+                Color::Indexed(VIRIDIS_256[step.min(VIRIDIS_256.len() - 1)])
             }
         }
     }
@@ -301,9 +324,12 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                         }
                     }
 
-                    let color = self.get_color_for_intensity(intensity);
+                    // PAN-389: display gain, applied once per output cell
+                    // (equivalent to per-sample because the map is monotone).
+                    let shown = (intensity + self.gain_db / WATERFALL_DB_SPAN).clamp(0.0, 1.0);
+                    let color = self.get_color_for_intensity(shown);
                     let glyph = if self.color_capability == ColorCapability::Basic {
-                        Self::glyph_for_intensity_basic(intensity)
+                        Self::glyph_for_intensity_basic(shown)
                     } else {
                         '█'
                     };
@@ -753,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_waterfall_color_intensity() {
-        let waterfall = Waterfall::new(&[]).color_scheme(WaterfallColorScheme::Classic);
+        let waterfall = Waterfall::new(&[]).palette(WaterfallPalette::Classic);
 
         assert!(matches!(
             waterfall.get_color_for_intensity(0.1),
@@ -767,6 +793,103 @@ mod tests {
             waterfall.get_color_for_intensity(0.9),
             Color::Indexed(_)
         ));
+    }
+
+    /// Render a waterfall of uniform `value` rows and return the first data
+    /// cell (row 1; row 0 is the occupancy strip).
+    fn data_cell(
+        value: f32,
+        palette: Option<WaterfallPalette>,
+        gain_db: Option<f32>,
+        capability: ColorCapability,
+    ) -> (String, Color) {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let data: Vec<Vec<f32>> = vec![vec![value; 16]; 4];
+        let area = Rect::new(0, 0, 16, 6);
+        let mut buf = Buffer::empty(area);
+        let mut w = Waterfall::new(&data).color_capability(capability);
+        if let Some(p) = palette {
+            w = w.palette(p);
+        }
+        if let Some(g) = gain_db {
+            w = w.gain_db(g);
+        }
+        w.render(area, &mut buf);
+        let cell = &buf[(3, 1)];
+        (cell.symbol().to_string(), cell.fg)
+    }
+
+    fn fg(value: f32, palette: Option<WaterfallPalette>, gain_db: Option<f32>) -> Color {
+        data_cell(value, palette, gain_db, ColorCapability::TwoFiftySix).1
+    }
+
+    #[test]
+    fn default_render_is_classic_with_zero_gain() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let data: Vec<Vec<f32>> = (0..8)
+            .map(|r| (0..32).map(|b| ((r * 32 + b) % 11) as f32 / 10.0).collect())
+            .collect();
+        let area = Rect::new(0, 0, 32, 8);
+        let mut default_buf = Buffer::empty(area);
+        Waterfall::new(&data).render(area, &mut default_buf);
+        let mut explicit_buf = Buffer::empty(area);
+        Waterfall::new(&data)
+            .palette(WaterfallPalette::Classic)
+            .gain_db(0.0)
+            .render(area, &mut explicit_buf);
+        assert_eq!(default_buf, explicit_buf);
+
+        let expected = [232u8, 234, 236, 238, 241, 243, 245, 248, 250, 252, 255];
+        for (i, idx) in expected.iter().enumerate() {
+            let v = i as f32 / 10.0;
+            assert_eq!(fg(v, None, None), Color::Indexed(*idx), "intensity {v}");
+        }
+    }
+
+    #[test]
+    fn gain_raises_the_floor_by_gain_over_twelve_db() {
+        let classic = Some(WaterfallPalette::Classic);
+        assert_eq!(fg(0.0, classic, Some(6.0)), Color::Indexed(243));
+        assert_eq!(fg(0.5, classic, None), Color::Indexed(243));
+        assert_eq!(fg(0.25, classic, Some(6.0)), Color::Indexed(249));
+        assert_eq!(fg(0.75, classic, Some(6.0)), Color::Indexed(255));
+        assert_eq!(fg(0.5, classic, Some(-6.0)), Color::Indexed(232));
+    }
+
+    #[test]
+    fn viridis_palette_maps_to_its_256_colour_ramp() {
+        let viridis = Some(WaterfallPalette::Viridis);
+        assert_eq!(fg(0.0, viridis, None), Color::Indexed(53));
+        assert_eq!(fg(0.5, viridis, None), Color::Indexed(31));
+        assert_eq!(fg(1.0, viridis, None), Color::Indexed(220));
+        for i in 0..=20 {
+            let v = i as f32 / 20.0;
+            match fg(v, viridis, None) {
+                Color::Indexed(idx) => {
+                    assert!(VIRIDIS_256.contains(&idx), "{v} -> {idx}")
+                }
+                other => panic!("{v} -> {other:?}"),
+            }
+        }
+        assert_eq!(fg(0.0, viridis, Some(6.0)), Color::Indexed(31));
+    }
+
+    #[test]
+    fn basic_terminal_applies_gain_and_ignores_palette() {
+        let (glyph, color) = data_cell(0.0, None, Some(6.0), ColorCapability::Basic);
+        assert_eq!(glyph, "▒");
+        assert_eq!(color, Color::Cyan);
+        for p in WaterfallPalette::ALL {
+            for v in [0.0, 0.2, 0.5, 0.9] {
+                assert_eq!(
+                    data_cell(v, Some(p), Some(6.0), ColorCapability::Basic),
+                    data_cell(v, None, Some(6.0), ColorCapability::Basic),
+                    "palette {p:?} at {v}"
+                );
+            }
+        }
     }
 
     #[test]

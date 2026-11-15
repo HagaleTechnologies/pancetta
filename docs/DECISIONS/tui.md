@@ -607,3 +607,52 @@ computed from the panel rectangle after contest, QRZ-card and zoom layout.
 At short Hunt sizes, TX Placement compresses to leave DX Hunter a data row.
 Waterfall updates prune stations at the strict 24-hour cutoff and retain state
 entries only for normalized surviving callsigns. Watchlist pins remain stored.
+
+## Waterfall palette and gain (PAN-389, 2026-11)
+
+`[ui.waterfall]` sets `palette` (`classic`, `spectrum`, `thermal`, `viridis`)
+and `gain_db` (-12 to 12 dB, default 0). The default draws exactly the
+earlier grayscale ramp.
+
+Gain is an additive offset on the waterfall's 12 dB colour scale, and
+positive brightens: display intensity is `(v + gain_db / 12).clamp(0, 1)`.
+In dB a gain is an addition, and adding gain raises the noise floor, so
+`gain_db = 6` shows the floor at half scale. The research proposed the
+opposite sign; it was rejected because a "gain" that darkens contradicts the
+name. The widget's `WATERFALL_DB_SPAN` is pinned to the DSP's
+`NOISE_FLOOR_DB_SCALE` by a test.
+
+The same offset applies to every row. The live DSP rows (one per second,
+signal above the per-bin median over 12 dB) and the per-decode-window rows
+(min/max stretched) share one display, so the dB meaning is exact for live
+rows and approximate for window rows. Normalising the two producers was left
+out because it touches the autonomous allocator feed and the remote gateway.
+
+Gain and palette are applied at render time only, once per output cell after
+the max over bins and compressed rows. That equals applying them per sample
+because the map is monotone. `App::waterfall_data`, which the TX allocator
+and the `t` key read, never changes (single-scorer invariant). A change
+re-colours the whole history on the next frame.
+
+The waterfall is a focusable panel (`ActivePanel::Waterfall`) in the Monitor
+view only. The Monitor Tab order is waterfall, then Band Activity, following
+the on-screen top-to-bottom rule. A left click focuses it, and `z` zooms it.
+
+While it is focused, `{`/`}` step the gain by 1 dB and `b`/`B` cycle the
+palette. All chords refuse Ctrl and Alt, so Ctrl+B (the tmux prefix) stays
+unbound. The same keys in any other panel resolve to a hint action, following
+the `HoundFocusHint` precedent, so a press explains itself instead of doing
+nothing. No new action starts TX.
+
+Live changes persist through the PAN-270 session-state seam. The TUI applies
+the change at once and sends the absolute new value; the coordinator, the
+only writer of `session_state.json`, persists it with the running config value
+as a per-field baseline and sends no echo. The decode effort needs an echo
+because the coordinator owns the decoder budget; the waterfall is rendered
+only by the TUI. At the next start a saved value whose baseline differs from
+the config is dropped, because the config edit is newer. Palette and gain are
+compared separately (gains within 0.001 dB). The new on-disk keys are skipped
+when absent, so a file without waterfall choices keeps the PAN-270 format, and
+a bad waterfall field is dropped on its own rather than discarding the saved
+TX mode and decode effort. The first frame gets its values from the TUI config
+the coordinator builds after the startup resolve, so the TUI reads no file.

@@ -2140,7 +2140,11 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
-        assert_carries_all::<ui::UiConfig>("UiConfig", &[], |a, b| a.merge_with(b));
+        assert_carries_all::<ui::UiConfig>(
+            "UiConfig",
+            &[("waterfall", json!({"palette": "viridis", "gain_db": 7.5}))],
+            |a, b| a.merge_with(b),
+        );
 
         assert_carries_all::<rig::RigConfig>(
             "RigConfig",

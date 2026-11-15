@@ -216,6 +216,8 @@ fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
         // renderer, bigger" (Task 13) — it swaps to a full-screen top-10
         // ranked table with columns the compact 5-row instrument can't fit.
         ActivePanel::TxPlacement => render_placement_zoom(f, area, app)?,
+        // PAN-389: the Monitor waterfall zooms to the whole content area.
+        ActivePanel::Waterfall => render_waterfall(f, area, app),
     }
     Ok(())
 }
@@ -576,7 +578,10 @@ pub fn view_rects(
         }
         crate::view::ActiveView::Monitor => {
             let r = compute_monitor_rects(area);
-            vec![(ActivePanel::BandActivity, r.band_activity)]
+            vec![
+                (ActivePanel::Waterfall, r.waterfall),
+                (ActivePanel::BandActivity, r.band_activity),
+            ]
         }
         crate::view::ActiveView::Hunt => {
             let r = compute_hunt_rects(area, has_qrz_info);
@@ -605,10 +610,11 @@ pub fn view_rects(
 /// row (verified against each panel's `Table::new(...).header(...)`
 /// construction). TxPlacement is not a table — it's a fixed 5-row
 /// instrument with a border but no header row, so row 0 (right after the
-/// border) IS the first real row (the openness strip).
+/// border) IS the first real row (the openness strip). The waterfall
+/// (PAN-389) has a border and no header, and a click only focuses it.
 fn panel_row_offset(panel: ActivePanel) -> u16 {
     match panel {
-        ActivePanel::TxPlacement => 1,
+        ActivePanel::TxPlacement | ActivePanel::Waterfall => 1,
         ActivePanel::BandActivity
         | ActivePanel::QsoStatus
         | ActivePanel::Callers
@@ -1389,32 +1395,52 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     // cursor and its label should follow the LIVE TX frequency, not the manual
     // waterfall offset (the 1350→2300 visual bug). Fall back to the operator's
     // manual offset only when idle.
-    let (cursor_offset, title) = match &app.tx_now_sending {
-        Some(item) => (
-            item.freq_hz,
-            format!(" Waterfall [/]: TX {:.0} Hz (LIVE) ", item.freq_hz),
-        ),
+    let (cursor_offset, tx_label) = match &app.tx_now_sending {
+        Some(item) => (item.freq_hz, format!("TX {:.0} Hz (LIVE)", item.freq_hz)),
         None => (
             app.tx_frequency_offset,
-            format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset),
+            format!("TX {:.0} Hz", app.tx_frequency_offset),
         ),
     };
-    let waterfall_block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default().fg(app.theme.accent_color()),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border_color()));
+    let focused = app.active_panel == ActivePanel::Waterfall;
+    let title = waterfall_title(
+        &tx_label,
+        app.waterfall_palette,
+        app.waterfall_gain_db,
+        focused,
+    );
+    let waterfall_block = create_panel_block(&title, focused, app);
 
     let waterfall = Waterfall::new(&app.waterfall_data)
         .block(waterfall_block)
+        .palette(app.waterfall_palette)
+        .gain_db(app.waterfall_gain_db)
         .tx_offset(cursor_offset)
         .signal_freqs(signal_freqs)
         .color_capability(app.color_capability)
         .decoded_for_occupancy(&decoded_for_occupancy)
         .tx_parity(tx_parity);
     f.render_widget(waterfall, area);
+}
+
+/// The waterfall panel title (PAN-389): TX cursor label, palette and gain,
+/// plus a key hint while the panel is focused.
+fn waterfall_title(
+    tx_label: &str,
+    palette: pancetta_config::ui::WaterfallPalette,
+    gain_db: f32,
+    focused: bool,
+) -> String {
+    let hint = if focused {
+        " · { } gain · b B palette"
+    } else {
+        ""
+    };
+    format!(
+        " Waterfall: {tx_label} · {} · gain {}{hint} ",
+        palette.as_str(),
+        pancetta_config::ui::format_gain_db(gain_db)
+    )
 }
 
 /// Create a styled block for panels
@@ -3097,6 +3123,143 @@ mod view_render_tests {
         assert!(!buffer_contains(&buf, "DX Hunter"));
     }
 
+    // ---- PAN-389: waterfall palette, gain and focus ----------------------
+
+    /// A Monitor-view app whose waterfall holds `rows` uniform 0.0 rows.
+    async fn monitor_app(
+        waterfall: pancetta_config::ui::WaterfallDisplayConfig,
+    ) -> crate::app::App {
+        let mut config = crate::config::Config::default();
+        config.ui.waterfall = waterfall;
+        let mut app = crate::app::App::new(config, None).await.unwrap();
+        app.active_view = crate::view::ActiveView::Monitor;
+        app.active_panel = crate::app::ActivePanel::BandActivity;
+        app.color_capability = crate::app::ColorCapability::TwoFiftySix;
+        app.waterfall_data = vec![vec![0.0; 64]; 60];
+        app
+    }
+
+    fn draw_app(app: &crate::app::App) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, app).unwrap()).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The waterfall panel rect `draw` lays out for `app` at 120x40.
+    fn waterfall_rect(app: &crate::app::App) -> Rect {
+        view_rects(
+            app.active_view,
+            app.zoomed,
+            app.active_panel,
+            content_area(Rect::new(0, 0, 120, 40)),
+            false,
+        )
+        .into_iter()
+        .find(|(p, _)| *p == crate::app::ActivePanel::Waterfall)
+        .map(|(_, r)| r)
+        .expect("waterfall rect")
+    }
+
+    /// A data cell well left of the TX cursor (row 0 inside the border is
+    /// the occupancy strip, so the first data row is two below the top).
+    fn floor_cell(buf: &ratatui::buffer::Buffer, rect: Rect) -> ratatui::style::Color {
+        buf[(rect.x + 5, rect.y + 2)].fg
+    }
+
+    fn wf(
+        palette: pancetta_config::ui::WaterfallPalette,
+        gain_db: f32,
+    ) -> pancetta_config::ui::WaterfallDisplayConfig {
+        pancetta_config::ui::WaterfallDisplayConfig { palette, gain_db }
+    }
+
+    #[tokio::test]
+    async fn monitor_waterfall_uses_configured_palette_and_gain() {
+        let app = monitor_app(wf(pancetta_config::ui::WaterfallPalette::Viridis, 6.0)).await;
+        let buf = draw_app(&app);
+        let rect = waterfall_rect(&app);
+        let title = row_text(&buf, rect.y);
+        assert!(
+            title.contains("Waterfall: TX 1500 Hz · viridis · gain +6 dB"),
+            "{title}"
+        );
+        assert!(!title.contains("[/]"), "{title}");
+        assert_eq!(floor_cell(&buf, rect), ratatui::style::Color::Indexed(31));
+    }
+
+    #[tokio::test]
+    async fn waterfall_title_shows_key_hint_only_when_focused() {
+        let mut app = monitor_app(Default::default()).await;
+        let rect = waterfall_rect(&app);
+        let unfocused = row_text(&draw_app(&app), rect.y);
+        assert!(
+            unfocused.contains(" Waterfall: TX 1500 Hz · classic · gain 0 dB "),
+            "{unfocused}"
+        );
+        assert!(!unfocused.contains("{ } gain"), "{unfocused}");
+
+        app.active_panel = crate::app::ActivePanel::Waterfall;
+        let focused = row_text(&draw_app(&app), rect.y);
+        assert!(
+            focused
+                .contains(" Waterfall: TX 1500 Hz · classic · gain 0 dB · { } gain · b B palette "),
+            "{focused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn focused_waterfall_border_is_highlighted() {
+        let mut app = monitor_app(Default::default()).await;
+        let rect = waterfall_rect(&app);
+
+        let buf = draw_app(&app);
+        let corner = &buf[(rect.x, rect.y)];
+        assert_eq!(corner.fg, app.theme.border_color());
+        assert!(!corner.modifier.contains(Modifier::BOLD));
+
+        app.active_panel = crate::app::ActivePanel::Waterfall;
+        let buf = draw_app(&app);
+        let corner = &buf[(rect.x, rect.y)];
+        assert_eq!(corner.fg, app.theme.selected_color());
+        assert!(corner.modifier.contains(Modifier::BOLD));
+    }
+
+    #[tokio::test]
+    async fn zoomed_waterfall_fills_content_area() {
+        let mut app = monitor_app(Default::default()).await;
+        app.active_panel = crate::app::ActivePanel::Waterfall;
+        app.zoomed = true;
+        let buf = draw_app(&app);
+        let zoom_rect = compute_zoom_rects(content_area(Rect::new(0, 0, 120, 40))).1;
+        assert_eq!(waterfall_rect(&app), zoom_rect);
+        assert!(
+            row_text(&buf, zoom_rect.y).contains("Waterfall: TX"),
+            "the zoomed panel's title row is the waterfall's"
+        );
+        assert!(!buffer_contains(&buf, "Band Activity"));
+        // Bottom border of the zoomed block is the content area's last row.
+        assert_eq!(
+            buf[(zoom_rect.x, zoom_rect.y + zoom_rect.height - 1)].symbol(),
+            "└"
+        );
+    }
+
+    #[tokio::test]
+    async fn gain_key_press_moves_the_rendered_floor() {
+        let mut app = monitor_app(Default::default()).await;
+        app.active_panel = crate::app::ActivePanel::Waterfall;
+        let rect = waterfall_rect(&app);
+        assert_eq!(
+            floor_cell(&draw_app(&app), rect),
+            ratatui::style::Color::Indexed(232)
+        );
+        assert_eq!(app.adjust_waterfall_gain(1.0), Some(1.0));
+        assert_eq!(
+            floor_cell(&draw_app(&app), rect),
+            ratatui::style::Color::Indexed(233)
+        );
+    }
+
     #[tokio::test]
     async fn zoom_renders_only_the_focused_panel() {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
@@ -4720,8 +4883,10 @@ mod hit_test_tests {
         );
     }
 
+    /// PAN-389: Monitor's waterfall is a navigable panel above Band
+    /// Activity.
     #[test]
-    fn view_rects_monitor_returns_only_band_activity() {
+    fn view_rects_monitor_returns_waterfall_and_band_activity() {
         let area = Rect::new(0, 0, 120, 40);
         let rects = view_rects(
             ActiveView::Monitor,
@@ -4730,8 +4895,11 @@ mod hit_test_tests {
             area,
             false,
         );
-        assert_eq!(rects.len(), 1);
-        assert_eq!(rects[0].0, ActivePanel::BandActivity);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].0, ActivePanel::Waterfall);
+        assert_eq!(rects[1].0, ActivePanel::BandActivity);
+        assert!(rects[0].1.y < rects[1].1.y, "waterfall sits above");
+        assert_no_overlaps(&rects);
     }
 
     #[test]

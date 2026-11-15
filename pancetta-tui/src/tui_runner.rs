@@ -505,6 +505,11 @@ pub enum TuiMessage {
 }
 
 /// Commands sent from TUI
+/// Status line for `{ } b B` while the waterfall is not the focused,
+/// on-screen panel (PAN-389).
+const WATERFALL_FOCUS_HINT: &str =
+    "Focus the waterfall (Monitor view, Tab) to change its gain or palette";
+
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     /// Add or remove an operator watchlist pin.
@@ -688,6 +693,16 @@ pub enum TuiCommand {
     /// since only the coordinator knows the resolved hardware tier `Auto`
     /// needs to pick the right budget.
     CycleDecodeEffort,
+    /// Operator pressed `{` or `}` with the waterfall focused (PAN-389). The
+    /// TUI has already applied the new absolute gain; the coordinator only
+    /// persists it to the session file and sends no echo.
+    SetWaterfallGain { gain_db: f32 },
+    /// Operator pressed `b` or `B` with the waterfall focused (PAN-389). The
+    /// TUI has already applied the new palette; the coordinator only persists
+    /// it to the session file and sends no echo.
+    SetWaterfallPalette {
+        palette: pancetta_config::ui::WaterfallPalette,
+    },
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
@@ -2632,6 +2647,57 @@ impl TuiRunner {
             // Shift+M this can never be refused (no active-QSO gate).
             Action::CycleDecodeEffort => {
                 self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
+            }
+            // PAN-389: focus can be left on the waterfall after a view switch
+            // (`active_panel` is not reset), but the waterfall is drawn only in
+            // the Monitor view. Off screen, the keys explain themselves and
+            // never change or persist an invisible gain or palette.
+            Action::WaterfallGainDown
+            | Action::WaterfallGainUp
+            | Action::CycleWaterfallPaletteForward
+            | Action::CycleWaterfallPaletteBack
+                if app.active_view != crate::view::ActiveView::Monitor =>
+            {
+                app.set_local_status(
+                    WATERFALL_FOCUS_HINT.to_string(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
+            }
+            // PAN-389: `{`/`}` step the waterfall display gain while the
+            // waterfall is focused. The TUI applies the new value at once and
+            // sends the absolute gain for the coordinator to persist; a press
+            // at the ±12 dB limit changes nothing and sends nothing.
+            Action::WaterfallGainDown => {
+                if let Some(gain_db) =
+                    app.adjust_waterfall_gain(-crate::app::WATERFALL_GAIN_STEP_DB)
+                {
+                    self.message_tx
+                        .send(TuiCommand::SetWaterfallGain { gain_db })?;
+                }
+            }
+            Action::WaterfallGainUp => {
+                if let Some(gain_db) = app.adjust_waterfall_gain(crate::app::WATERFALL_GAIN_STEP_DB)
+                {
+                    self.message_tx
+                        .send(TuiCommand::SetWaterfallGain { gain_db })?;
+                }
+            }
+            // PAN-389: `b`/`B` cycle the waterfall palette while focused.
+            Action::CycleWaterfallPaletteForward => {
+                let palette = app.cycle_waterfall_palette(true);
+                self.message_tx
+                    .send(TuiCommand::SetWaterfallPalette { palette })?;
+            }
+            Action::CycleWaterfallPaletteBack => {
+                let palette = app.cycle_waterfall_palette(false);
+                self.message_tx
+                    .send(TuiCommand::SetWaterfallPalette { palette })?;
+            }
+            Action::WaterfallFocusHint => {
+                app.set_local_status(
+                    WATERFALL_FOCUS_HINT.to_string(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
             }
 
             // === Activity views (Phase 2 TUI redesign) ===
@@ -6543,6 +6609,233 @@ mod key_tests {
             effort_before,
             "no optimistic local flip — wait for the coordinator's DecodeEffortUpdate echo"
         );
+    }
+
+    // ---- PAN-389: waterfall gain and palette keys --------------------------
+
+    /// Focus the Monitor waterfall on a fresh runner's app.
+    async fn focus_waterfall(app: &Arc<RwLock<App>>) {
+        let mut a = app.write().await;
+        a.active_view = crate::view::ActiveView::Monitor;
+        a.active_panel = crate::app::ActivePanel::Waterfall;
+        a.color_capability = crate::app::ColorCapability::TwoFiftySix;
+    }
+
+    #[tokio::test]
+    async fn waterfall_gain_keys_step_one_db_and_emit_set_waterfall_gain() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_waterfall(&app).await;
+        assert_eq!(app.read().await.waterfall_gain_db, 0.0);
+
+        r.handle_key_event(key('}')).await.unwrap();
+        assert_eq!(app.read().await.waterfall_gain_db, 1.0);
+        assert_eq!(app.read().await.status_message(), "Waterfall gain +1 dB");
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::SetWaterfallGain { gain_db }) if gain_db == 1.0)
+        );
+        assert!(cmd_rx.try_recv().is_err(), "exactly one command per press");
+
+        r.handle_key_event(key('{')).await.unwrap();
+        assert_eq!(app.read().await.waterfall_gain_db, 0.0);
+        assert_eq!(app.read().await.status_message(), "Waterfall gain 0 dB");
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::SetWaterfallGain { gain_db }) if gain_db == 0.0)
+        );
+
+        for _ in 0..3 {
+            r.handle_key_event(key('{')).await.unwrap();
+        }
+        assert_eq!(app.read().await.waterfall_gain_db, -3.0);
+        assert_eq!(app.read().await.status_message(), "Waterfall gain -3 dB");
+
+        app.write().await.waterfall_gain_db = 6.0;
+        r.handle_key_event(key_shift('}')).await.unwrap();
+        assert_eq!(app.read().await.status_message(), "Waterfall gain +7 dB");
+    }
+
+    #[tokio::test]
+    async fn waterfall_gain_keys_clamp_at_twelve_db_without_a_command() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_waterfall(&app).await;
+
+        app.write().await.waterfall_gain_db = 12.0;
+        r.handle_key_event(key('}')).await.unwrap();
+        assert_eq!(app.read().await.waterfall_gain_db, 12.0);
+        assert_eq!(
+            app.read().await.status_message(),
+            "Waterfall gain +12 dB (maximum)"
+        );
+        assert!(cmd_rx.try_recv().is_err(), "no command at the maximum");
+
+        app.write().await.waterfall_gain_db = -12.0;
+        r.handle_key_event(key('{')).await.unwrap();
+        assert_eq!(app.read().await.waterfall_gain_db, -12.0);
+        assert_eq!(
+            app.read().await.status_message(),
+            "Waterfall gain -12 dB (minimum)"
+        );
+        assert!(cmd_rx.try_recv().is_err(), "no command at the minimum");
+    }
+
+    #[tokio::test]
+    async fn waterfall_palette_keys_cycle_and_emit_set_waterfall_palette() {
+        use pancetta_config::ui::WaterfallPalette;
+        let (mut r, cmd_rx, app) = make_runner().await;
+        focus_waterfall(&app).await;
+
+        let expected = [
+            (WaterfallPalette::Spectrum, "spectrum"),
+            (WaterfallPalette::Thermal, "thermal"),
+            (WaterfallPalette::Viridis, "viridis"),
+            (WaterfallPalette::Classic, "classic"),
+        ];
+        for (palette, name) in expected {
+            r.handle_key_event(key('b')).await.unwrap();
+            assert_eq!(app.read().await.waterfall_palette, palette);
+            assert_eq!(
+                app.read().await.status_message(),
+                format!("Waterfall palette: {name}")
+            );
+            assert!(matches!(
+                cmd_rx.try_recv(),
+                Ok(TuiCommand::SetWaterfallPalette { palette: p }) if p == palette
+            ));
+        }
+
+        r.handle_key_event(key_shift('B')).await.unwrap();
+        assert_eq!(
+            app.read().await.waterfall_palette,
+            WaterfallPalette::Viridis
+        );
+        assert_eq!(
+            app.read().await.status_message(),
+            "Waterfall palette: viridis"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::SetWaterfallPalette {
+                palette: WaterfallPalette::Viridis
+            })
+        ));
+
+        // 16-colour terminal: the palette changes but is not shown.
+        app.write().await.color_capability = crate::app::ColorCapability::Basic;
+        r.handle_key_event(key('b')).await.unwrap();
+        assert_eq!(
+            app.read().await.waterfall_palette,
+            WaterfallPalette::Classic
+        );
+        assert_eq!(
+            app.read().await.status_message(),
+            "Waterfall palette: classic (shown on 256-colour terminals only)"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::SetWaterfallPalette {
+                palette: WaterfallPalette::Classic
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn waterfall_keys_outside_the_waterfall_panel_only_hint() {
+        use crate::app::ActivePanel;
+        const HINT: &str = "Focus the waterfall (Monitor view, Tab) to change its gain or palette";
+        for panel in [
+            ActivePanel::BandActivity,
+            ActivePanel::QsoStatus,
+            ActivePanel::Callers,
+            ActivePanel::DxHunter,
+            ActivePanel::TxPlacement,
+        ] {
+            for ev in [key('{'), key('}'), key('b'), key_shift('B')] {
+                let (mut r, cmd_rx, app) = make_runner().await;
+                app.write().await.active_panel = panel;
+                let (palette, gain) = {
+                    let a = app.read().await;
+                    (a.waterfall_palette, a.waterfall_gain_db)
+                };
+                r.handle_key_event(ev).await.unwrap();
+                let a = app.read().await;
+                assert_eq!(a.status_message(), HINT, "{panel:?} {ev:?}");
+                assert_eq!(a.waterfall_palette, palette, "{panel:?} {ev:?}");
+                assert_eq!(a.waterfall_gain_db, gain, "{panel:?} {ev:?}");
+                assert!(cmd_rx.try_recv().is_err(), "{panel:?} {ev:?}: no command");
+            }
+        }
+
+        // Ctrl+} and Alt+b do nothing at all, focused or not.
+        for focused in [false, true] {
+            for ev in [
+                KeyEvent::new(KeyCode::Char('}'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            ] {
+                let (mut r, cmd_rx, app) = make_runner().await;
+                if focused {
+                    focus_waterfall(&app).await;
+                }
+                let before = app.read().await.status_message();
+                r.handle_key_event(ev).await.unwrap();
+                let a = app.read().await;
+                assert_eq!(a.status_message(), before, "{ev:?} focused={focused}");
+                assert_eq!(a.waterfall_gain_db, 0.0);
+                assert_eq!(
+                    a.waterfall_palette,
+                    pancetta_config::ui::WaterfallPalette::Classic
+                );
+                assert!(cmd_rx.try_recv().is_err(), "{ev:?} focused={focused}");
+            }
+        }
+    }
+
+    /// PAN-389 review fix: focus left on the waterfall after a view switch
+    /// must not change or persist the gain or palette of a waterfall that is
+    /// not on screen; the keys only show the hint.
+    #[tokio::test]
+    async fn waterfall_keys_off_screen_after_a_view_switch_only_hint() {
+        for view in [
+            crate::view::ActiveView::Operate,
+            crate::view::ActiveView::Hunt,
+            crate::view::ActiveView::Run,
+        ] {
+            for ev in [key('{'), key('}'), key('b'), key_shift('B')] {
+                let (mut r, cmd_rx, app) = make_runner().await;
+                focus_waterfall(&app).await;
+                app.write().await.active_view = view;
+                r.handle_key_event(ev).await.unwrap();
+                let a = app.read().await;
+                assert_eq!(
+                    a.status_message(),
+                    "Focus the waterfall (Monitor view, Tab) to change its gain or palette",
+                    "{view:?} {ev:?}"
+                );
+                assert_eq!(a.waterfall_gain_db, 0.0, "{view:?} {ev:?}");
+                assert_eq!(
+                    a.waterfall_palette,
+                    pancetta_config::ui::WaterfallPalette::Classic,
+                    "{view:?} {ev:?}"
+                );
+                assert!(cmd_rx.try_recv().is_err(), "{view:?} {ev:?}: no command");
+            }
+        }
+    }
+
+    /// AC19: gain and palette are display-only; the data the TX allocator
+    /// and `t` key read never changes.
+    #[tokio::test]
+    async fn waterfall_gain_never_changes_waterfall_data() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        focus_waterfall(&app).await;
+        let rows: Vec<Vec<f32>> = (0..10)
+            .map(|i| (0..32).map(|b| ((i * 7 + b) % 10) as f32 / 10.0).collect())
+            .collect();
+        app.write().await.waterfall_data = rows.clone();
+        r.handle_key_event(key('}')).await.unwrap();
+        r.handle_key_event(key('}')).await.unwrap();
+        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(key('{')).await.unwrap();
+        assert_eq!(app.read().await.waterfall_gain_db, 1.0);
+        assert_eq!(app.read().await.waterfall_data, rows);
     }
 
     /// `DecodeEffortUpdate` (coordinator echo) is the ONLY thing that ever

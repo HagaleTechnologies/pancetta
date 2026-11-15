@@ -1253,14 +1253,57 @@ section. With the old values a WSJT-X Fox never sees your call.
 
 ## `[ui]` — TUI behaviour
 
-> The `[ui]` settings are accepted by the configuration schema but do not
-> currently change the TUI. The coordinator constructs its TUI settings with
+> `[ui.waterfall]` (below) is the one `[ui]` table that changes the TUI.
+> The other `[ui]` settings are accepted by the configuration schema but do
+> not currently change it. The coordinator constructs its TUI settings with
 > the built-in dark theme. Setting `theme` to `"light"` has no effect,
 > including after restart. The remaining schema keys are listed in
 > `defaults.toml`. Keybindings are not configurable; see
 > [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
 > `[ui.keyboard]` section was removed in PAN-303. Old configs still load
 > with one warning naming the removed section.
+
+### `[ui.waterfall]` — waterfall palette and gain
+
+```toml
+[ui.waterfall]
+palette = "viridis"   # classic (default) | spectrum | thermal | viridis
+gain_db = 6           # -12.0 to 12.0 dB, default 0.0; positive brightens
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `palette` | string | `"classic"` | One of classic, spectrum, thermal, viridis. 16-colour terminals ignore it. |
+| `gain_db` | float | `0.0` | -12.0 to 12.0. Positive brightens: the noise floor shows `gain_db` dB higher on the 12 dB colour scale. |
+
+An unknown palette fails the config load, and the error lists the four valid
+names. A gain that is out of range or not a finite number fails startup with
+`Invalid configuration value: ui.waterfall.gain_db = …`. The default
+(`classic`, `0.0`) draws exactly the colours of earlier releases.
+
+The palette has no effect on 16-colour terminals, which show intensity with
+density glyphs. Gain still applies there.
+
+**Live keys.** In the Monitor view, Tab focuses the waterfall panel (a left
+click on it does too). While it is focused, `{` and `}` step the gain down and
+up by 1 dB, and `b` and `B` cycle the palette forward and back. The title shows
+the current palette and gain. The same keys in any other panel only show a hint.
+
+**Persistence.** A live change is saved in `~/.pancetta/session_state.json`,
+like the decode effort (PAN-270), and restored at the next start. The file also
+records the config value that was running when you made the change. If the
+config value differs at the next start, the config edit is newer: it applies,
+and that saved choice is dropped. The palette and the gain are compared
+separately, so editing one keeps the other's saved choice.
+
+**Restart required.** Edits to `[ui.waterfall]` in `pancetta.toml` take effect
+at the next restart, like every other `[ui]` key.
+
+**What a dB means.** Gain is applied when the waterfall is drawn and never
+changes the data the TX allocator reads. The live rows (one per second) scale
+signal above the per-bin noise median over 12 dB, so on them the dB value is
+exact. The rows drawn once per decode window are stretched between that
+window's minimum and maximum, so on them it is approximate.
 
 ---
 
@@ -1454,8 +1497,8 @@ revocation does not depend on cqdx availability.
   Nothing outside the live list above is applied to a running process,
   not even to its in-memory copy of the config; restart pancetta to
   enforce them. Changes outside the live allowlist are restart-required,
-  but a restart does not activate the unused `[ui]` settings (see
-  `[ui]` — TUI behaviour above). (`[station].callsign`,
+  but a restart does not activate the unused `[ui]` settings other
+  than `[ui.waterfall]` (see `[ui]` — TUI behaviour above). (`[station].callsign`,
   `[station].grid_square` and `[autonomous].slot_parity` in particular
   can never change under an in-progress QSO.)
 
