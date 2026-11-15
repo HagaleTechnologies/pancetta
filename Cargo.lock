@@ -2979,12 +2979,9 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rustfft",
-<<<<<<< HEAD
  "rustls",
-=======
  "same-file",
  "sd-notify",
->>>>>>> e2641c29a7f49641aecd35112caac71c3f8990c7
  "serde",
  "serde_json",
  "serialport",

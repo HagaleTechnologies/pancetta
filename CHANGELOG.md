@@ -7,9 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 - PAN-315: use rustls for HTTPS and WSS, remove SQLite TLS and unused dependencies, replace validator with equivalent station bound checks, align WebSocket and system utility versions, declare Rust 1.98, and enforce dependency hygiene in Supply Chain. The sha2 0.11 migration remains follow-up work.
-=======
 - PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
 
@@ -23,7 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PAN-310 security: refuse plaintext station-agent relay and pairing URLs outside loopback, including pairing CLI overrides. Loopback plaintext emits an unencrypted-link warning. Supplied endpoints are validated even when the agent is disabled.
 
 - PAN-319: the TUI redraws on changes and a one-second idle tick, handles resize immediately, and wraps complete frames in synchronized output. DX Hunter formats only visible rows and preserves callsign focus. Waterfall updates prune station and state entries older than 24 hours.
->>>>>>> e2641c29a7f49641aecd35112caac71c3f8990c7
 
 - PAN-351: transient TUI feedback now has severity and expiry. Routine updates preserve errors; Info, Warn and Error expire after 5, 15 and 30 seconds.
 - PAN-330: `pancetta-core` now owns the shared radio vocabulary. Prefix-portable decodes such as `EA8/K5ARH DL1ABC -10` are marked directed at us by both the TUI and the remote gateway, every frequency classifier uses the core inclusive band edges (5,357,500 Hz is `60m`; at 5,410,000 Hz cqdx and recording classification now return no band; ADIF writes `60M` at 5,405,000 Hz instead of its old `5MHZ` fallback while keeping uppercase labels at the serialization boundary), Maidenhead validity is one core validator (`ZZ99` is rejected wherever semantics matter), committed-exchange payloads and the CQ-modifier and callsign-token policies have single core implementations, and hamlib/config band keys use the core names.
