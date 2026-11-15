@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-290: a poisoned false-positive filter lock no longer stops FT8 decoding; each window decodes with the filter bypassed and logs a warning, and the autonomous TX-side gate keeps its stored filter.
+
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
 
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
