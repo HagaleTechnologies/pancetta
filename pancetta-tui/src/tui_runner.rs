@@ -220,6 +220,7 @@ pub enum TuiMessage {
     /// PAN-89: station readiness snapshot — coordinator relay, 2 s tick,
     /// pushed on change. Drives the readiness strip's verdict and items.
     StationReadiness(crate::readiness::StationReadiness),
+    TxSelfParityUpdate(pancetta_config::TxSelfParity),
     ContestScore(pancetta_qso::contest::ledger::ContestScoreUpdate),
     /// Session lookup result for the requested callsign, independent of current focus.
     QrzLookupUpdate {
@@ -1153,6 +1154,9 @@ impl TuiRunner {
                 {
                     app.contest_score = Some(update);
                 }
+            }
+            TuiMessage::TxSelfParityUpdate(parity) => {
+                app.config.station.tx_self_parity = parity;
             }
             TuiMessage::StationReadiness(readiness) => {
                 app.station_readiness = Some(readiness);
@@ -4908,6 +4912,38 @@ mod key_tests {
             clock,
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn pan302_live_self_parity_updates_display_and_placement_parity() {
+        use pancetta_config::TxSelfParity;
+        use pancetta_core::slot::SlotParity;
+        let (mut runner, _cmd_rx, app) = make_runner().await;
+        for (saved, expected) in [
+            (TxSelfParity::Even, Some(SlotParity::Even)),
+            (TxSelfParity::Odd, Some(SlotParity::Odd)),
+            (TxSelfParity::Auto, None),
+        ] {
+            runner
+                .handle_message(TuiMessage::TxSelfParityUpdate(saved))
+                .await
+                .unwrap();
+            assert_eq!(app.read().await.resolve_tx_parity(), expected);
+        }
+        // An active contact's parity still wins over the new preference.
+        {
+            let mut app = app.write().await;
+            let mut contact = banner("W1AW", "pan302");
+            contact.tx_parity = Some(SlotParity::Even);
+            app.active_qsos.push(contact);
+        }
+        runner
+            .handle_message(TuiMessage::TxSelfParityUpdate(TxSelfParity::Odd))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.resolve_tx_parity(), Some(SlotParity::Even));
+        app.write().await.active_qsos.clear();
+        assert_eq!(app.read().await.resolve_tx_parity(), Some(SlotParity::Odd));
     }
 
     #[tokio::test]

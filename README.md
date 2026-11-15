@@ -178,7 +178,9 @@ current status.
 Upgrading an existing station? Stop Pancetta and all logbook writers, then
 complete the verified backup in [Upgrade and rollback](docs/UPGRADING.md)
 before replacing or starting a binary. Keep the prior version directory.
-Automatic database backups do not include your complete logbook or configuration.
+Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
+These copies do not include contacts logged since the latest startup.
+Preserve the whole stopped installation before upgrading.
 
 **Prebuilt binaries.** No Rust toolchain needed. Starting with the first
 tagged release after this note was added, every
@@ -282,7 +284,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta trust-client <keyId> --key-file <device.pub> [--force]` | Grant station-local TX trust after comparing device-key words. Requires an owner edge or static allow-list entry too. |
 | `pancetta untrust-client <keyId>` | Remove local TX trust; disarms on the next authorization poll or trust refresh. |
-| `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
+| `pancetta export [--output log.adi] [--since YYYY-MM-DD] [--band 20m] [--mode FT8]` | Export QSOs directly from `qsos.adi` to ADIF. |
 | `pancetta import-confirmations <file.adi>` | Merge your LoTW report into existing contacts, then restart to apply confirmations. No login or download. |
 | `pancetta import <file.adi>` | Add contacts from another logger's ADIF file; skips ones already logged and backs up your log first (`--dry-run` to preview). `pancetta import --undo <receipt>` removes exactly what an import added. |
 | `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |
@@ -324,6 +326,8 @@ rules still apply. Remote clients retain cqdx-only verdicts.
 
 ## Capability status
 
+Startup ADIF snapshots are implemented, unreleased. Directory and retention are configurable.
+
 Contest scoring is opt-in for Kansas FT4/FT8 2026 and SC fixed digital 2026.
 The TUI shows local claimed score, multipliers, contest dupes and hourly rate
 from durable evidence. SC grid-only contacts remain pending. See
@@ -357,10 +361,10 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Receive overload attenuator guard | Experimental, *Unreleased* | Opt-in live FT8 only; uses rig-supported ATT steps; no automatic restoration. Hardware qualification pending | [configuration](docs/CONFIG.md#rigreceive_overload_guard-receive-overload-protection) |
 | SWR protection | Integration-tested, *Unreleased* | Halts all TX after high-SWR keyed time reaches `swr_trip_delay_ms` (default 5000 ms; `0` trips on the first high reading) above `max_swr` (default 3.0). High keyed time accumulates across transmissions; unkeyed time does not count. A reading at or below the limit resets it, as does more than two minutes without a high reading. CAT support is required; real-rig trip qualification is pending | [SWR guard](pancetta/src/coordinator/swr_guard.rs) |
 | Measured receive-gain sweep | Experimental, *Unreleased* | Opt-in headless FT8 experiment; no live rig qualification. Requires supported PREAMP/ATT controls and sufficient shared-station evidence | [measurement and inference](pancetta/src/coordinator/gain_sweep.rs), [operator guide](docs/receive-gain-sweep.md) |
-| Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
-| ClubLog, QRZ Logbook upload | Integration-tested, *Unreleased* | Opt-in. Local mock server only; no live-account run recorded. ClubLog, QRZ Logbook, eQSL and cqdx.io uploads use a persistent outbox (`~/.pancetta/upload_outbox.json`, unreleased): transient failures retry on `[network.reliability.retry]`, then every five minutes; login rejection pauses a destination for the session; record rejection holds that entry until restart; startup drains pending entries. LoTW remains a single TQSL attempt outside the outbox. Local ADIF remains the durable log | [upload clients](pancetta-dx/src/qso_upload.rs), [upload outbox](pancetta/src/coordinator/upload_outbox.rs) |
+| Config changes while running | Implemented, *Unreleased* | Selected autonomous policy, TX timing and receive gain presets apply live, alongside remote-access consent and revocations; hardware bindings and other keys need restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
+| ClubLog, QRZ Logbook upload | Integration-tested, *Unreleased* | Opt-in. Local mock server only; no live-account run recorded. ClubLog, QRZ Logbook, LoTW, eQSL and cqdx.io uploads use a persistent outbox (`~/.pancetta/upload_outbox.json`, unreleased): transient failures retry on `[network.reliability.retry]`, then every five minutes; login rejection pauses a destination for the session; record rejection holds that entry until restart; startup drains pending entries. Local ADIF remains the durable log | [upload clients](pancetta-dx/src/qso_upload.rs), [upload outbox](pancetta/src/coordinator/upload_outbox.rs) |
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
-| LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| LoTW upload (through TQSL) | Integration-tested, *Unreleased* | Durable outbox retries; fake tqsl verifies actual argv, optional certificate password and duplicate exits 8/9. Needs installed tqsl, certificate and station location; live-account qualification pending | [subprocess tests](pancetta-dx/tests/lotw_upload.rs) |
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | TUI QRZ station lookup | Implemented, *Unreleased* | Shift+L looks up the focused callsign with configured XML credentials. Name, QTH, grid and entity appear in the station card; results are cached for the session with a two-second network deadline. Mock-tested; live-account qualification pending | [lookup handler](pancetta/src/coordinator/qrz_lookup.rs) |
 | Per-target upload state in Recent QSOs | Implemented, *Unreleased* | Row glyphs per enabled target (QRZ/ClubLog/eQSL/cqdx.io/LoTW), selected-contact detail card and a typed completion toast. No live three-service qualification run recorded | [upload status registry](pancetta/src/coordinator/qso_upload_status.rs) |
@@ -369,7 +373,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | Space-to-call on cluster/cqdx spots (QSY + offset) | Implemented, *Unreleased* | PAN-287: QSYs to the spot's FT8/FT4 dial and calls at the derived offset; the rig mode follows `rig.data_mode` when set (PAN-276); cqdx spots do not reach DX Hunter yet. No on-air qualification | [spot call](pancetta/src/coordinator/spot_call.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only; FT8/FT4 Decode, Replay and active-QSO Status | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
 | Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
-| ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
+| ADIF export / import | Integration-tested; import and entity enrichment *Unreleased* | Offline COUNTRY/DXCC/CQZ/ITUZ inference uses prefix and exact-call zone overrides. Stored fields take precedence individually; unresolved calls gain no inferred fields. Old rows can gain fields on export; existing files are not rewritten. Automated coverage; live qualification pending. Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | macOS microphone access over ssh, tmux and launchd | Implemented, *Unreleased* | One approval at the Mac per installed binary. Uses private macOS calls and falls back to the launcher's approval when they are missing. Not yet verified on a Mac | [responsibility relaunch](pancetta/src/responsibility.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station; compile-checked for `x86_64-pc-windows-gnu` on every code PR). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 

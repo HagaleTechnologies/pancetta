@@ -39,9 +39,9 @@
 //!   digitally signed with the operator's TQSL certificate. This client shells
 //!   out (`tokio::process::Command`) to the operator's installed `tqsl` CLI,
 //!   which signs the temp ADIF and uploads the resulting `.tq8` to LoTW. The
-//!   invocation was verified live (TQSL 2.8.6) against a real certificate —
-//!   see the `-x`/`--batch` note on [`LotwClient::build_args`]. A missing/
-//!   failing/hanging `tqsl` never panics — it maps to a failed
+//!   invocation is tested with fake tqsl, including duplicate exits 8/9 and
+//!   optional certificate passwords. Live-account qualification is pending.
+//!   A missing/failing/hanging `tqsl` never panics — it maps to a failed
 //!   [`QsoUploadOutcome`] (a bounded timeout kills a hung invocation).
 //!
 //! **Failure classes (PAN-57).** The ClubLog, QRZ Logbook and eQSL clients
@@ -544,6 +544,7 @@ pub struct LotwClient {
     tqsl_path: String,
     /// The TQSL "Station Location" name the operator configured in TQSL.
     station_location: String,
+    password: String,
 }
 
 impl LotwClient {
@@ -553,39 +554,33 @@ impl LotwClient {
         Self {
             tqsl_path: tqsl_path.into(),
             station_location: station_location.into(),
+            password: String::new(),
         }
     }
 
-    /// Build the `tqsl` command-line arguments for signing + uploading
-    /// `adif_path`.
-    ///
-    // Verified live against TQSL 2.8.6 (`tqsl --help`) with a real
-    // certificate:
-    //   tqsl -a all -d -x -u -l "<station_location>" <input.adi>
-    // where:
-    //   -a all    automatically handle duplicate QSOs without prompting
-    //   -d        suppress the date-range dialog (NOT "all dialogs" — that
-    //             was this comment's prior, incorrect claim)
-    //   -x        --batch: exit after processing instead of starting the
-    //             normal interactive GUI. This is the flag that was missing:
-    //             without it, tqsl does exactly what --help documents —
-    //             starts normally (its GUI) and never exits, so windows pile
-    //             up one per QSO. Confirmed fixed by running sign-only
-    //             (no -u) with -x: process exited 0 in ~0.2s, no window.
-    //   -u        upload after signing (independent switch from -x per
-    //             `tqsl --help`; combined they sign, upload, then exit)
-    //   -l NAME   use the named TQSL Station Location
+    /// Supply an optional Callsign Certificate password.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = password.into();
+        self
+    }
+
+    // Use compliant signing, suppress date prompts, upload and exit in batch mode.
+    // Never log these arguments: -p may contain a certificate password.
     fn build_args(&self, adif_path: &str) -> Vec<String> {
-        vec![
-            "-a".to_string(),
-            "all".to_string(),
-            "-d".to_string(),
-            "-x".to_string(),
-            "-u".to_string(),
-            "-l".to_string(),
+        let mut args = vec![
+            "-a".into(),
+            "compliant".into(),
+            "-d".into(),
+            "-x".into(),
+            "-u".into(),
+            "-l".into(),
             self.station_location.clone(),
-            adif_path.to_string(),
-        ]
+        ];
+        if !self.password.is_empty() {
+            args.extend(["-p".into(), self.password.clone()]);
+        }
+        args.push(adif_path.into());
+        args
     }
 
     /// Write `adif_record` to a temp file, invoke `tqsl` to sign + upload it,
@@ -734,8 +729,10 @@ impl LotwClient {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         // tqsl exit code 0 = success. A combined-output mention of "duplicate"
-        // is treated as a non-fatal duplicate (we pass -a all, but surface it).
-        if output.status.success() {
+        // is treated as a non-fatal duplicate (we pass -a compliant, but surface it).
+        if matches!(output.status.code(), Some(8 | 9)) {
+            Ok(QsoUploadOutcome::Duplicate)
+        } else if output.status.success() {
             let combined = format!("{} {}", stdout, stderr).to_lowercase();
             if combined.contains("duplicate") {
                 Ok(QsoUploadOutcome::Duplicate)
@@ -744,9 +741,8 @@ impl LotwClient {
             }
         } else {
             Err(DxError::from(DxErrorInner::ExternalService(format!(
-                "LoTW: tqsl exited with {} — {}",
-                output.status,
-                stderr.trim()
+                "LoTW: tqsl exited with {}",
+                output.status
             ))))
         }
     }
@@ -956,7 +952,7 @@ mod tests {
             args,
             vec![
                 "-a".to_string(),
-                "all".to_string(),
+                "compliant".to_string(),
                 "-d".to_string(),
                 "-x".to_string(),
                 "-u".to_string(),

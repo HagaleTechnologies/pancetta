@@ -255,6 +255,7 @@ fn no_help_screen_lists_a_removed_flag_or_subcommand() {
 #[test]
 fn removed_flags_and_subcommands_fail_at_parse_time() {
     for args in [
+        vec!["export", "--database", "qso.db"],
         vec![
             "run",
             "--callsign",

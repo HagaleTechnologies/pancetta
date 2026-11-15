@@ -110,6 +110,7 @@ impl super::ApplicationCoordinator {
         // Stamped into QSOLogged's TxPower field the same way qso.rs stamps
         // it into every rendered ADIF record's TX_PWR.
         let station_power_watts = config.station.power_watts;
+        let attribution_comment = config.logging.attribution_comment;
         drop(config);
 
         let socket = match open_socket(&cfg) {
@@ -219,8 +220,9 @@ impl super::ApplicationCoordinator {
             // source-of-truth writer and the per-QSO upload subscriber do
             // (`qso.rs`'s `start_adif_subscriber` / `start_qso_upload_subscriber`)
             // — no second ADIF-formatting implementation.
-            let adif_processor =
-                pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
+            let adif_processor = pancetta_qso::AdifProcessor::new()
+                .with_station_power_watts(station_power_watts)
+                .with_attribution_comment(attribution_comment);
 
             let mut heartbeat_timer = interval(HEARTBEAT_INTERVAL);
             let mut status_timer = interval(STATUS_SAMPLE_INTERVAL);
@@ -1243,7 +1245,7 @@ pub(crate) fn qso_to_msgs(
     adif_record: String,
 ) -> (OutMsg, OutMsg) {
     let date_time_off = qdatetime_of(m.end_time.unwrap_or(m.start_time));
-    let date_time_on = qdatetime_of(m.start_time);
+    let date_time_on = qdatetime_of(m.contact_started_at());
 
     let qso_logged = OutMsg::QsoLogged {
         date_time_off,
@@ -2247,7 +2249,7 @@ mod qso_logged_tests {
     /// (`qso.rs`'s `metadata_with_call`): every `QsoMetadata` field named
     /// explicitly so new fields fail to compile here instead of silently
     /// defaulting.
-    fn metadata() -> QsoMetadata {
+    pub(super) fn metadata() -> QsoMetadata {
         let start = Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 40).unwrap();
         let end = Utc
             .with_ymd_and_hms(2020, 10, 30, 12, 34, 56)
@@ -2261,6 +2263,7 @@ mod qso_logged_tests {
             frequency: 14_074_200.4,
             completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
+            first_answer_at: None,
             start_time: start,
             end_time: Some(end),
             reports: SignalReports {
@@ -2313,6 +2316,23 @@ mod qso_logged_tests {
         assert_eq!(unix_to_jdn(midnight), 2_459_153);
         assert_eq!(unix_to_jdn(noon), 2_459_153);
         assert_eq!(unix_to_jdn(just_before_midnight), 2_459_153);
+    }
+
+    #[test]
+    fn qso_to_msgs_uses_first_answer_time() {
+        let mut m = metadata();
+        m.first_answer_at = Some(m.start_time + chrono::Duration::seconds(5));
+        let (logged, _) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            date_time_on,
+            date_time_off,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(date_time_on, qdatetime_of(m.first_answer_at.unwrap()));
+        assert_eq!(date_time_off, qdatetime_of(m.end_time.unwrap()));
     }
 
     #[test]
@@ -2687,6 +2707,44 @@ mod replay_gate_tests {
             !wait_for_datagram(&listener).await,
             "--replay must not broadcast replayed decodes to companion apps"
         );
+    }
+
+    #[tokio::test]
+    async fn pan298_logged_adif_follows_attribution_setting() {
+        for enabled in [false, true] {
+            let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut config = Config::default();
+            config.network.wsjtx_udp.enabled = true;
+            config.network.wsjtx_udp.destination = listener.local_addr().unwrap().to_string();
+            config.logging.attribution_comment = enabled;
+            let mut c = wsjtx_coordinator(config).await;
+            let (tx, rx) = tokio::sync::broadcast::channel(4);
+            c.wsjtx_qso_events_rx = Some(rx);
+            c.start_wsjtx_udp_component().await.unwrap();
+            let metadata = super::qso_logged_tests::metadata();
+            tx.send(pancetta_qso::QsoEvent::QsoCompleted {
+                qso_id: metadata.qso_id,
+                metadata,
+                state_history: vec![],
+                messages: vec![],
+            })
+            .unwrap();
+            let text = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut buf = [0; 8192];
+                loop {
+                    let (n, _) = listener.recv_from(&mut buf).await.unwrap();
+                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if text.contains("<programid:8>pancetta") {
+                        break text;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(text.contains("Using cqdx.io & Pancetta"), enabled);
+            c.shutdown_signal
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     // --- PAN-103: gate 2 (`allow_tx_initiation`) must follow the channel's

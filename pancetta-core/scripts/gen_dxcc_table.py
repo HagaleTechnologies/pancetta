@@ -233,6 +233,75 @@ def supplemental_tables(records, mapping, valid_ids, base):
     return sorted((primary, *value) for primary, value in registry.items()), retained
 
 
+def zone_tables(path, mapping):
+    """Build defaults, winning prefixes and unpruned exact-call zone rows.
+
+    Entity-only outputs deliberately discard same-entity exact calls. Zones
+    cannot use that pruning: such calls can still override either zone.
+    """
+    from pathlib import Path
+    defaults, primaries, aliases, exact = {}, {}, {}, {}
+    token_pairs = {}
+
+    def checked_zone(value, maximum):
+        text = str(value).strip()
+        if not re.fullmatch(r'[0-9]+', text) or not 1 <= int(text) <= maximum:
+            raise ValueError(f'Invalid zone: {value}')
+        return int(text)
+
+    def insert_unique(table, key, value):
+        if key in table and table[key] != value:
+            raise ValueError(f'Conflicting zones: {key}')
+        table[key] = value
+
+    for record in Path(path).read_text(encoding='latin1').split(';'):
+        lines = record.strip().splitlines()
+        if not lines:
+            continue
+        fields = lines[0].split(':')
+        if len(fields) < 8:
+            raise ValueError('Malformed cty.dat header')
+        primary = fields[7].strip().upper().lstrip('*')
+        row = mapping.get(primary)
+        if row is None or (fields[0].strip() != row['name'] and
+                           fields[0].strip() not in row.get('aliases', [])):
+            raise ValueError(f'Unmapped zone entity: {primary}')
+        name = row['name']
+        default = (checked_zone(fields[1], 40), checked_zone(fields[2], 90))
+        insert_unique(defaults, name, default)
+        explicit = {}
+        for raw_token in ' '.join(lines[1:]).split(','):
+            token = raw_token.strip().upper()
+            if not token:
+                continue
+            cq_matches = re.findall(r'\(([^)]*)\)', token)
+            itu_matches = re.findall(r'\[([^]]*)\]', token)
+            bare = strip_modifiers(token)
+            if any(c in bare for c in '()[]') or len(cq_matches) > 1 or len(itu_matches) > 1:
+                raise ValueError(f'Malformed zone modifiers: {token}')
+            pair = (checked_zone(cq_matches[0], 40) if cq_matches else default[0],
+                    checked_zone(itu_matches[0], 90) if itu_matches else default[1])
+            is_exact = bare.startswith('=')
+            bare = bare.lstrip('=')
+            if not bare:
+                raise ValueError(f'Empty zone token: {token}')
+            insert_unique(token_pairs, (name, is_exact, bare), pair)
+            if is_exact:
+                insert_unique(exact, (bare, name), pair)
+            elif '/' not in primary and '/' not in bare:
+                explicit[bare] = pair
+        # A virtual slash primary must never become a general prefix. Its
+        # exact-call rows and entity default are still retained above.
+        if '/' not in primary:
+            primaries.setdefault(primary, (name, *explicit.get(primary, default)))
+            for token, pair in explicit.items():
+                aliases.setdefault(token, (name, *pair))
+    prefixes = {**aliases, **primaries}
+    return (sorted((name, *pair) for name, pair in defaults.items()),
+            sorted((token, *value) for token, value in prefixes.items()),
+            sorted((token, name, *pair) for (token, name), pair in exact.items()))
+
+
 def generate_supplemental(core):
     import hashlib
     import json
@@ -259,7 +328,17 @@ def generate_supplemental(core):
     reg += ''.join(f'    ({lit(alias)}, {lit(name)}),\n' for alias, name in aliases) + '];\n'
     ex = header + '#[rustfmt::skip]\npub(crate) static EXACT_TABLE: &[(&str, &str)] = &[\n'
     ex += ''.join(f'    ({lit(call)}, {lit(name)}),\n' for call, name in exact) + '];\n'
-    return {'dxcc_registry.rs': reg, 'dxcc_exact.rs': ex}
+    defaults, prefixes, zone_exact = zone_tables(source, mapping)
+    zones = header
+    for symbol, rows, shape in [('ZONE_DEFAULTS', defaults, '(&str, u8, u8)'),
+                                ('ZONE_PREFIXES', prefixes, '(&str, &str, u8, u8)'),
+                                ('ZONE_EXACT', zone_exact, '(&str, &str, u8, u8)')]:
+        zones += f'#[rustfmt::skip]\npub(crate) static {symbol}: &[{shape}] = &[\n'
+        for row in rows:
+            zones += '    (' + ', '.join(lit(value) if isinstance(value, str) else str(value)
+                                         for value in row) + '),\n'
+        zones += '];\n'
+    return {'dxcc_registry.rs': reg, 'dxcc_exact.rs': ex, 'dxcc_zones.rs': zones}
 
 
 def main():

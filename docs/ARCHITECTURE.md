@@ -103,6 +103,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 <!-- coordinator-modules:start -->
 | File | Role |
 |---|---|
+| `adif_backup.rs` | Changed startup ADIF snapshots and independent retention. |
 | `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
 | `audio.rs` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |

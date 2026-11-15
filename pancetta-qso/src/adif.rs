@@ -306,7 +306,7 @@ pub fn freq_hz_to_band(frequency_hz: f64) -> String {
     format!("{:.0}MHZ", frequency_hz / 1_000_000.0)
 }
 
-/// Attribution appended to every logged QSO's COMMENT field, crediting the
+/// Opt-in attribution appended to a logged QSO's COMMENT field, crediting the
 /// software/service stack the station runs on. Two variants so long
 /// operator notes don't force a truncation: the full form (with URLs) is
 /// used when it fits; otherwise the short form; if even that doesn't fit,
@@ -354,6 +354,7 @@ pub struct AdifProcessor {
     /// Station transmit power in watts, stamped into every `TX_PWR` field
     /// this processor renders. `None` omits `TX_PWR` entirely (unconfigured).
     station_power_watts: Option<f64>,
+    attribution_comment: bool,
 }
 
 impl AdifProcessor {
@@ -362,10 +363,22 @@ impl AdifProcessor {
         let mut processor = Self {
             field_definitions: HashMap::new(),
             station_power_watts: None,
+            attribution_comment: false,
         };
 
         processor.initialize_standard_fields();
         processor
+    }
+
+    /// Enable or disable software attribution in rendered comments. Defaults off.
+    pub fn set_attribution_comment(&mut self, enabled: bool) {
+        self.attribution_comment = enabled;
+    }
+
+    /// Builder-style variant of [`set_attribution_comment`](Self::set_attribution_comment).
+    pub fn with_attribution_comment(mut self, enabled: bool) -> Self {
+        self.set_attribution_comment(enabled);
+        self
     }
 
     /// Set the station transmit power (watts) stamped into every `TX_PWR`
@@ -660,8 +673,8 @@ impl AdifProcessor {
         let freq_mhz = metadata.frequency / 1_000_000.0;
 
         // Build the COMMENT field: start from existing notes, append "HOUND"
-        // for Hound QSOs (the human-readable DXpedition marker), then append
-        // the software attribution (full form with URLs if it fits, short
+        // for Hound QSOs (the human-readable DXpedition marker), then optionally append
+        // opt-in software attribution (full form with URLs if it fits, short
         // form otherwise, omitted entirely rather than truncating operator
         // notes). Appending never overwrites existing notes.
         let existing_notes = match &metadata.notes {
@@ -674,20 +687,54 @@ impl AdifProcessor {
             (None, true) => "HOUND".to_string(),
             (None, false) => String::new(),
         };
-        let comment = Some(append_attribution(&base));
+        let comment = if self.attribution_comment {
+            Some(append_attribution(&base))
+        } else {
+            (!base.is_empty()).then_some(base)
+        };
 
         // Build additional_fields from metadata.tags; for Hound QSOs inject
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
-        if let Ok(Some(mut logged)) = crate::contest::ledger::decode(&additional_fields) {
+        // Imported values are authoritative per field. Canonicalize only these
+        // keys so mixed-case tags cannot compete with inferred typed fields.
+        for field in ["COUNTRY", "DXCC", "CQZ", "ITUZ"] {
+            let mut keys: Vec<_> = additional_fields
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case(field))
+                .cloned()
+                .collect();
+            keys.sort();
+            let winner = keys
+                .iter()
+                .find(|key| key.as_str() == field)
+                .or_else(|| keys.first());
+            if let Some(value) = winner.and_then(|key| additional_fields.get(key)).cloned() {
+                for key in keys {
+                    additional_fields.remove(&key);
+                }
+                additional_fields.insert(field.to_owned(), value);
+            }
+        }
+        let their_call = metadata.their_callsign.as_deref().unwrap_or_default();
+        let country = pancetta_core::dxcc::entity_for_callsign(their_call);
+        let dxcc = country.and_then(pancetta_core::dxcc::entity_id_of_name);
+        let zones = pancetta_core::dxcc::zones_for_callsign(their_call);
+
+        if let Ok(Some(mut logged)) = crate::contest::ledger::contact_context(metadata) {
             let evidence = crate::contest::ledger::resolved_evidence(
                 &logged,
                 &additional_fields,
                 metadata.their_state.as_deref(),
             );
-            if evidence.source.as_deref() != Some("conflict") {
+            let evidence_conflicts = evidence.source.as_deref() == Some("conflict");
+            if !evidence_conflicts {
                 logged.evidence = evidence;
+            }
+            // Preserve conflicting imported context byte-for-byte. A live CQ
+            // answer still needs its corrected contact_start persisted.
+            if !evidence_conflicts || metadata.first_answer_at.is_some() {
                 if let Ok(json) = serde_json::to_string(&logged) {
                     additional_fields.insert(crate::contest::ledger::CONTEXT.into(), json);
                 }
@@ -710,7 +757,7 @@ impl AdifProcessor {
         }
 
         AdifQso {
-            qso_date: metadata.start_time,
+            qso_date: metadata.contact_started_at(),
             qso_date_off: metadata.end_time,
             call: metadata.their_callsign.clone().unwrap_or_default(),
             mode: metadata.mode.clone(),
@@ -727,10 +774,16 @@ impl AdifProcessor {
             operator: None, // Could be added to metadata
             my_gridsquare: metadata.grids.ours.clone(),
             gridsquare: metadata.grids.theirs.clone(),
-            country: None, // Would need callsign lookup
-            dxcc: None,    // Would need callsign lookup
-            cqz: None,     // Would need callsign lookup
-            ituz: None,    // Would need callsign lookup
+            country: country
+                .filter(|_| !additional_fields.contains_key("COUNTRY"))
+                .map(str::to_owned),
+            dxcc: dxcc.filter(|_| !additional_fields.contains_key("DXCC")),
+            cqz: zones
+                .map(|(cq, _)| cq)
+                .filter(|_| !additional_fields.contains_key("CQZ")),
+            ituz: zones
+                .map(|(_, itu)| itu)
+                .filter(|_| !additional_fields.contains_key("ITUZ")),
             state: metadata.their_state.clone(),
             // A row persisted before PAN-52 has no `adif_contest_id` key;
             // deserialization restores its imported CONTEST_ID
@@ -775,6 +828,7 @@ impl AdifProcessor {
                 .submode
                 .clone()
                 .unwrap_or_else(|| adif_qso.mode.clone()),
+            first_answer_at: None,
             start_time: adif_qso.qso_date,
             end_time: adif_qso.qso_date_off,
             reports: SignalReports {
@@ -873,7 +927,7 @@ impl AdifProcessor {
             ("STX", number(adif_qso.stx)),
             ("SRX", number(adif_qso.srx)),
             ("NOTES", adif_qso.notes.clone()),
-            // `notes` holds it too, but export appends Pancetta's attribution
+            // `notes` holds it too, but rendering may append Pancetta's attribution
             // to `notes`; the tag writes a third-party comment back as read.
             ("COMMENT", adif_qso.comment.clone()),
             (QSL_SENT_FIELD, adif_qso.qsl_sent.clone()),
@@ -1750,6 +1804,176 @@ ADIF Export for Test Program
     // ── Hound ADIF rendering ─────────────────────────────────────────────────
 
     /// Build a minimal QsoMetadata for ADIF rendering tests.
+    fn entity_metadata(call: Option<&str>) -> QsoMetadata {
+        let mut metadata = hound_adif_metadata(false, None);
+        metadata.their_callsign = call.map(str::to_owned);
+        metadata
+    }
+
+    fn assert_entity_record(processor: &AdifProcessor, qso: &AdifQso, expected: [Option<&str>; 4]) {
+        let raw = processor.generate_record(qso).unwrap();
+        let parsed = processor.parse_string(&raw).unwrap();
+        for (key, value) in ["COUNTRY", "DXCC", "CQZ", "ITUZ"].into_iter().zip(expected) {
+            assert_eq!(
+                parsed.records[0].fields.get(key).map(|f| f.value.as_str()),
+                value,
+                "{key}"
+            );
+            assert_eq!(
+                raw.matches(&format!("<{key}:")).count(),
+                usize::from(value.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_calls_have_no_inferred_entity_fields() {
+        let p = AdifProcessor::new();
+        for call in [None, Some(""), Some("  "), Some("<...>"), Some("QQ1XYZ")] {
+            let q = p.qso_to_adif(&entity_metadata(call), None);
+            assert_eq!(
+                (&q.country, q.dxcc, q.cqz, q.ituz),
+                (&None, None, None, None)
+            );
+            assert_entity_record(&p, &q, [None; 4]);
+        }
+    }
+
+    #[test]
+    fn generated_records_use_token_zone_overrides() {
+        let p = AdifProcessor::new();
+        for (call, cq, itu) in [("K0ABC", 4, 7), ("N2NL/MM", 7, 8)] {
+            let q = p.qso_to_adif(&entity_metadata(Some(call)), None);
+            assert_eq!((q.dxcc, q.cqz, q.ituz), (Some(291), Some(cq), Some(itu)));
+            assert_entity_record(
+                &p,
+                &q,
+                [
+                    Some("United States"),
+                    Some("291"),
+                    Some(&cq.to_string()),
+                    Some(&itu.to_string()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn generated_entity_fields_round_trip() {
+        let p = AdifProcessor::new();
+        let first = p.qso_to_adif(&entity_metadata(Some("DL1ABC")), None);
+        assert_eq!(
+            (first.country.as_deref(), first.dxcc, first.cqz, first.ituz),
+            (Some("Fed. Rep. of Germany"), Some(230), Some(14), Some(28))
+        );
+        let raw = p.generate_record(&first).unwrap();
+        let parsed = p.parse_string(&raw).unwrap();
+        let imported = p.record_to_qso(&parsed.records[0]).unwrap();
+        let metadata = p.adif_to_qso(&imported);
+        let exported = p.qso_to_adif(&metadata, None);
+        assert_entity_record(
+            &p,
+            &exported,
+            [
+                Some("Fed. Rep. of Germany"),
+                Some("230"),
+                Some("14"),
+                Some("28"),
+            ],
+        );
+    }
+
+    #[test]
+    fn imported_entity_fields_survive_reexport() {
+        let p = AdifProcessor::new();
+        let parsed = p.parse_string("<CALL:6>DL1ABC <QSO_DATE:8>20261113 <TIME_ON:6>110000 <MODE:3>FT8 <FREQ:6>14.074 <COUNTRY:6>Stored <DXCC:3>291 <CQZ:1>4 <ITUZ:1>7 <APP_TEST:3:S>abc <EOR>").unwrap();
+        let imported = p.record_to_qso(&parsed.records[0]).unwrap();
+        assert_eq!(
+            (
+                imported.country.as_deref(),
+                imported.dxcc,
+                imported.cqz,
+                imported.ituz
+            ),
+            (Some("Stored"), Some(291), Some(4), Some(7))
+        );
+        let metadata = p.adif_to_qso(&imported);
+        let q = p.qso_to_adif(&metadata, None);
+        assert_eq!(
+            (&q.country, q.dxcc, q.cqz, q.ituz),
+            (&None, None, None, None)
+        );
+        assert_entity_record(&p, &q, [Some("Stored"), Some("291"), Some("4"), Some("7")]);
+        let raw = p.generate_record(&q).unwrap();
+        assert!(raw.contains("<APP_TEST:3:S>abc"));
+    }
+
+    #[test]
+    fn partial_entity_tags_preserve_supplied_values() {
+        let p = AdifProcessor::new();
+        for (key, value) in [
+            ("cOuNtRy", "Stored"),
+            ("DxCc", "291"),
+            ("cqz", "4"),
+            ("ItUz", "7"),
+        ] {
+            let mut metadata = entity_metadata(Some("DL1ABC"));
+            metadata.tags.insert(key.into(), value.into());
+            let q = p.qso_to_adif(&metadata, None);
+            let mut expected = [
+                Some("Fed. Rep. of Germany"),
+                Some("230"),
+                Some("14"),
+                Some("28"),
+            ];
+            let index = ["COUNTRY", "DXCC", "CQZ", "ITUZ"]
+                .iter()
+                .position(|k| k.eq_ignore_ascii_case(key))
+                .unwrap();
+            expected[index] = Some(value);
+            assert_entity_record(&p, &q, expected);
+            match index {
+                0 => assert!(q.country.is_none()),
+                1 => assert!(q.dxcc.is_none()),
+                2 => assert!(q.cqz.is_none()),
+                _ => assert!(q.ituz.is_none()),
+            }
+        }
+        let mut metadata = entity_metadata(Some("DL1ABC"));
+        metadata.tags.extend([
+            ("COUNTRY".into(), "Upper".into()),
+            ("country".into(), "Lower".into()),
+        ]);
+        assert_entity_record(
+            &p,
+            &p.qso_to_adif(&metadata, None),
+            [Some("Upper"), Some("230"), Some("14"), Some("28")],
+        );
+        metadata.tags.remove("COUNTRY");
+        metadata.tags.insert("Country".into(), "First".into());
+        assert_entity_record(
+            &p,
+            &p.qso_to_adif(&metadata, None),
+            [Some("First"), Some("230"), Some("14"), Some("28")],
+        );
+    }
+
+    #[test]
+    fn stored_entity_tags_survive_unknown_calls() {
+        let p = AdifProcessor::new();
+        let mut metadata = entity_metadata(Some("QQ1XYZ"));
+        metadata.tags.extend([
+            ("country".into(), "Stored".into()),
+            ("DXCC".into(), "230".into()),
+        ]);
+        let q = p.qso_to_adif(&metadata, None);
+        assert_eq!(
+            (&q.country, q.dxcc, q.cqz, q.ituz),
+            (&None, None, None, None)
+        );
+        assert_entity_record(&p, &q, [Some("Stored"), Some("230"), None, None]);
+    }
+
     fn hound_adif_metadata(hound: bool, notes: Option<&str>) -> crate::states::QsoMetadata {
         use crate::states::{CallInitiation, GridSquares, QsoRole, SignalReports};
         use chrono::Utc;
@@ -1762,6 +1986,7 @@ ADIF Export for Test Program
             frequency: 14_074_000.0,
             completed_rf_frequency_hz: None,
             mode: "FT8".into(),
+            first_answer_at: None,
             start_time: Utc::now(),
             end_time: None,
             reports: SignalReports {
@@ -1932,10 +2157,7 @@ ADIF Export for Test Program
         assert_eq!(adif_qso.tx_pwr, None);
     }
 
-    /// A non-Hound QSO with existing notes must preserve them verbatim as a
-    /// prefix of COMMENT (2026-07-06: notes are no longer emitted alone —
-    /// software attribution is appended to every QSO — but the operator's
-    /// own text must never be altered or dropped).
+    /// Operator notes remain intact when attribution is off.
     #[test]
     fn non_hound_qso_adif_notes_unchanged() {
         let processor = AdifProcessor::new();
@@ -1951,11 +2173,11 @@ ADIF Export for Test Program
         );
     }
 
-    /// Every QSO's COMMENT carries the cqdx.io/Pancetta attribution, full
+    /// Opted-in COMMENT carries the cqdx.io/Pancetta attribution, full
     /// form (with URLs) when there's room — the common case (no/short notes).
     #[test]
-    fn every_qso_gets_full_attribution_by_default() {
-        let processor = AdifProcessor::new();
+    fn enabled_processor_writes_full_attribution() {
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let metadata = hound_adif_metadata(false, None);
 
         let adif_qso = processor.qso_to_adif(&metadata, None);
@@ -1968,7 +2190,7 @@ ADIF Export for Test Program
     /// form rather than dropping attribution or truncating operator notes.
     #[test]
     fn long_notes_fall_back_to_short_attribution() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         // Long enough that notes + ATTRIBUTION_FULL exceeds COMMENT_SOFT_MAX_LEN
         // but notes + ATTRIBUTION_SHORT still fits.
         let long_notes = "x".repeat(200);
@@ -1998,7 +2220,7 @@ ADIF Export for Test Program
     /// never truncated to make room for it.
     #[test]
     fn very_long_notes_drop_attribution_entirely() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let very_long_notes = "x".repeat(COMMENT_SOFT_MAX_LEN);
         let metadata = hound_adif_metadata(false, Some(&very_long_notes));
 
@@ -2015,7 +2237,7 @@ ADIF Export for Test Program
     /// attribution, all in one COMMENT field.
     #[test]
     fn hound_qso_comment_includes_attribution_too() {
-        let processor = AdifProcessor::new();
+        let processor = AdifProcessor::new().with_attribution_comment(true);
         let metadata = hound_adif_metadata(true, Some("Big pile-up!"));
 
         let adif_qso = processor.qso_to_adif(&metadata, None);
@@ -2024,6 +2246,25 @@ ADIF Export for Test Program
         assert!(comment.contains("Big pile-up!"));
         assert!(comment.contains("HOUND"));
         assert!(comment.contains(ATTRIBUTION_FULL));
+    }
+
+    #[test]
+    fn attribution_off_keeps_notes_and_hound_marker() {
+        let processor = AdifProcessor::new();
+        for (hound, notes, expected) in [
+            (false, None, None),
+            (false, Some("Good contact"), Some("Good contact")),
+            (true, None, Some("HOUND")),
+            (true, Some("Big pile-up!"), Some("Big pile-up! HOUND")),
+        ] {
+            assert_eq!(
+                processor
+                    .qso_to_adif(&hound_adif_metadata(hound, notes), None)
+                    .comment
+                    .as_deref(),
+                expected
+            );
+        }
     }
 
     // ── PAN-85: state round-trip through ADIF ───────────────────────────────
