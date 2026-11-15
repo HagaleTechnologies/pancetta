@@ -16,7 +16,7 @@ check_steps = check.fetch('steps')
 check_steps.take(5).each_with_index { |step, i| raise "setup #{i}" unless steps[i] == step }
 toolchain = ->(ss) { ss.find { |s| s['uses'].to_s.start_with?('dtolnay/rust-toolchain@') } }
 raise 'toolchain' unless toolchain.call(steps) == toolchain.call(check_steps)
-cache = steps.find { |s| s['uses'] == 'Swatinem/rust-cache@v2' }
+cache = steps.find { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') }
 raise 'cache' unless cache.fetch('with').fetch('key') == 'workspace-tests'
 install = steps.find { |s| s['name'] == 'Install nextest' }.fetch('run')
 raise 'pinned prebuilt' unless install.include?('cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz') && install.include?('cargo nextest --version')
@@ -73,6 +73,16 @@ assert ci["overrides"] == [
     {
         "filter": "package(=pancetta-ft8) & binary(=wav_decode_tests) & test(=test_decode_within_realtime_budget)",
         "test-group": "real-time-budget",
+        "retries": 1,
+    },
+    {
+        "filter": "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))",
+        "threads-required": "num-cpus",
+        "retries": 1,
+    },
+    {
+        "filter": "package(=pancetta) & binary(=tui_lifecycle) & test(=pan333_normal_quit_restores_terminal_and_exits_zero)",
+        "threads-required": "num-cpus",
         "retries": 1,
     },
     {"filter": "package(=pancetta-hamlib)", "test-group": "hamlib"},

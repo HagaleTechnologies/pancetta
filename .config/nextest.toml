@@ -1,4 +1,4 @@
-# Only the known wall-clock decoder budget gets a retry in CI.
+# Only the known wall-clock decoder budgets get a retry in CI.
 [profile.ci]
 retries = 0
 flaky-result = "pass"
@@ -13,6 +13,28 @@ max-threads = 1
 [[profile.ci.overrides]]
 filter = "package(=pancetta-ft8) & binary(=wav_decode_tests) & test(=test_decode_within_realtime_budget)"
 test-group = "real-time-budget"
+retries = 1
+
+# Wall-clock decode results: these tests run alone on the runner.
+# `pan318_overlap_tests` decodes under the 250 ms Standard budget and
+# compares overlapped vs sequential entry timings by design. `station_max_preset_decodes_like_the_station`
+# passes no DecodeBudget, but `decode_window` still applies its legacy
+# call-anchored 2 s BudgetTracker (`decoder.rs`, `BudgetTracker::new`),
+# so under CPU contention pass 0 overruns 2 s, pass 1 is skipped and
+# CQ UW5EJX/MM is lost. Under nextest's cross-binary parallelism both
+# fail (station_max 12/12, overlap 5/12 of concurrent copies locally);
+# alone they pass.
+[[profile.ci.overrides]]
+filter = "package(=pancetta-ft8) & (binary(=pan318_overlap_tests) | (binary(=encode_split_test) & test(=station_max_preset_decodes_like_the_station)))"
+threads-required = "num-cpus"
+retries = 1
+
+# Replays WAVs through the real binary on a PTY and requires exit within
+# 10 s of the confirmed quit; under partition-wide CPU contention the
+# replay decode overruns that window (PAN-314 validate, partition 1).
+[[profile.ci.overrides]]
+filter = "package(=pancetta) & binary(=tui_lifecycle) & test(=pan333_normal_quit_restores_terminal_and_exits_zero)"
+threads-required = "num-cpus"
 retries = 1
 
 [[profile.ci.overrides]]
