@@ -6,40 +6,33 @@
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use validator::Validate;
 
 /// Station configuration settings
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: any field omitted from a partial config file
 // falls back to this struct's `Default` impl rather than failing to
 // deserialize (which previously reverted the WHOLE config to defaults).
 #[serde(default)]
 pub struct StationConfig {
-    /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P")
-    #[validate(length(min = 3, max = 20))]
+    /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P"); 3 to 20 characters
     pub callsign: String,
 
-    /// Maidenhead grid square locator (e.g., "FN31pr", "JO65cx")
-    #[validate(length(min = 4, max = 8))]
+    /// Maidenhead grid square locator (e.g., "FN31pr", "JO65cx"); 4 to 8 characters
     pub grid_square: String,
 
-    /// Transmitter power in watts
-    #[validate(range(min = 1, max = 1500))]
+    /// Transmitter power in watts (1 to 1500)
     pub power_watts: u32,
 
     /// QTH (location) description
     pub qth: String,
 
-    /// DXCC entity code (ITU country code)
-    #[validate(range(min = 1, max = 999))]
+    /// DXCC entity code (ITU country code, 1 to 999)
     pub dxcc_entity: u16,
 
-    /// ITU zone number
-    #[validate(range(min = 1, max = 90))]
+    /// ITU zone number (1 to 90)
     pub itu_zone: u8,
 
-    /// CQ zone number
-    #[validate(range(min = 1, max = 40))]
+    /// CQ zone number (1 to 40)
     pub cq_zone: u8,
 
     /// Station coordinates for accurate distance calculations
@@ -195,10 +188,14 @@ impl Default for StationConfig {
 
 impl ConfigSection for StationConfig {
     fn validate_section(&self) -> ConfigResult<()> {
-        // Perform validation using the validator crate
-        use validator::Validate;
-        Validate::validate(self)
-            .map_err(|e| ConfigError::Validation(format!("Station validation failed: {}", e)))?;
+        // Bounds first, all reported together, then the semantic checks.
+        let bound_errors = self.bound_errors();
+        if !bound_errors.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "Station validation failed: {}",
+                bound_errors.join("\n")
+            )));
+        }
 
         // Additional custom validation
         self.validate_callsign()?;
@@ -273,6 +270,69 @@ impl ConfigSection for StationConfig {
 }
 
 impl StationConfig {
+    /// Inclusive length and range bounds, one diagnostic per failing field.
+    ///
+    /// PAN-315: these replace the validator 0.21 derive attributes and keep
+    /// its `field: Validation error: code [params]` text, with `min`, `max`
+    /// and `value` rendered as debug-formatted JSON values. Lengths count
+    /// Unicode characters, as validator did.
+    fn bound_errors(&self) -> Vec<String> {
+        use serde_json::Value;
+        let mut errors = Vec::new();
+        let mut check =
+            |field: &str, code: &str, measured: u64, min: u64, max: u64, value: Value| {
+                if measured < min || measured > max {
+                    let params = HashMap::from([
+                        ("min", Value::from(min)),
+                        ("max", Value::from(max)),
+                        ("value", value),
+                    ]);
+                    errors.push(format!("{field}: Validation error: {code} [{params:?}]"));
+                }
+            };
+        let callsign = self.callsign.as_str();
+        check(
+            "callsign",
+            "length",
+            callsign.chars().count() as u64,
+            3,
+            20,
+            Value::from(callsign),
+        );
+        let grid = self.grid_square.as_str();
+        check(
+            "grid_square",
+            "length",
+            grid.chars().count() as u64,
+            4,
+            8,
+            Value::from(grid),
+        );
+        let power = self.power_watts;
+        check(
+            "power_watts",
+            "range",
+            power.into(),
+            1,
+            1500,
+            Value::from(power),
+        );
+        let dxcc = self.dxcc_entity;
+        check(
+            "dxcc_entity",
+            "range",
+            dxcc.into(),
+            1,
+            999,
+            Value::from(dxcc),
+        );
+        let itu = self.itu_zone;
+        check("itu_zone", "range", itu.into(), 1, 90, Value::from(itu));
+        let cq = self.cq_zone;
+        check("cq_zone", "range", cq.into(), 1, 40, Value::from(cq));
+        errors
+    }
+
     /// Validate the callsign format and characters
     fn validate_callsign(&self) -> ConfigResult<()> {
         let callsign = &self.callsign;
@@ -617,5 +677,208 @@ mod tests {
         assert_eq!(cfg.tx_late_max_ms, 3000);
         assert_eq!(cfg.tx_self_parity, TxSelfParity::Auto);
         assert_eq!(cfg.ptt_lead_ms, 80);
+    }
+
+    /// PAN-315 AC5: the six bounds validator 0.21 enforced through derive
+    /// attributes keep their inclusive limits. Each row varies one field
+    /// against the valid default. Callsign length counts Unicode characters.
+    #[test]
+    fn station_derived_constraints_boundary_table() {
+        type Edit = fn(&mut StationConfig);
+        let rows: &[(&str, Edit, bool)] = &[
+            ("callsign 3 chars", |c| c.callsign = "K1A".into(), true),
+            ("callsign 2 chars", |c| c.callsign = "K1".into(), false),
+            ("callsign empty", |c| c.callsign = String::new(), false),
+            (
+                "callsign 20 chars",
+                |c| c.callsign = format!("K1{}", "A".repeat(18)),
+                true,
+            ),
+            (
+                "callsign 21 chars",
+                |c| c.callsign = format!("K1{}", "A".repeat(19)),
+                false,
+            ),
+            (
+                "callsign 64 chars",
+                |c| c.callsign = format!("K1{}", "A".repeat(62)),
+                false,
+            ),
+            // 20 characters but 38 bytes: the limit counts characters.
+            (
+                "callsign 20 unicode chars",
+                |c| c.callsign = format!("K1{}", "Ä".repeat(18)),
+                true,
+            ),
+            (
+                "callsign 21 unicode chars",
+                |c| c.callsign = format!("K1{}", "Ä".repeat(19)),
+                false,
+            ),
+            ("grid 4 chars", |c| c.grid_square = "FN42".into(), true),
+            ("grid 8 chars", |c| c.grid_square = "FN42ab12".into(), true),
+            ("grid 3 chars", |c| c.grid_square = "FN4".into(), false),
+            (
+                "grid 9 chars",
+                |c| c.grid_square = "FN42ab12x".into(),
+                false,
+            ),
+            ("power 1 W", |c| c.power_watts = 1, true),
+            ("power 1500 W", |c| c.power_watts = 1500, true),
+            ("power 0 W", |c| c.power_watts = 0, false),
+            ("power 1501 W", |c| c.power_watts = 1501, false),
+            ("dxcc 1", |c| c.dxcc_entity = 1, true),
+            ("dxcc 999", |c| c.dxcc_entity = 999, true),
+            ("dxcc 0", |c| c.dxcc_entity = 0, false),
+            ("dxcc 1000", |c| c.dxcc_entity = 1000, false),
+            ("itu 1", |c| c.itu_zone = 1, true),
+            ("itu 90", |c| c.itu_zone = 90, true),
+            ("itu 0", |c| c.itu_zone = 0, false),
+            ("itu 91", |c| c.itu_zone = 91, false),
+            ("cq 1", |c| c.cq_zone = 1, true),
+            ("cq 40", |c| c.cq_zone = 40, true),
+            ("cq 0", |c| c.cq_zone = 0, false),
+            ("cq 41", |c| c.cq_zone = 41, false),
+            // Existing semantic checks still run after the bounds pass.
+            (
+                "callsign without digit",
+                |c| c.callsign = "KAAA".into(),
+                false,
+            ),
+            ("grid outside A-R", |c| c.grid_square = "ZZ99".into(), false),
+            (
+                "latitude out of range",
+                |c| {
+                    c.coordinates = Some(Coordinates {
+                        latitude: 91.0,
+                        longitude: 0.0,
+                        elevation_meters: None,
+                    })
+                },
+                false,
+            ),
+            (
+                "antenna azimuth 360",
+                |c| c.antennas[0].azimuth_degrees = Some(360),
+                false,
+            ),
+        ];
+        for (label, edit, valid) in rows {
+            let mut cfg = StationConfig::default();
+            edit(&mut cfg);
+            assert_eq!(cfg.validate_section().is_ok(), *valid, "{label}");
+        }
+    }
+
+    /// Split a station diagnostic into per-field `(field, code, params)`
+    /// rows. validator stored fields and parameters in hash maps, so their
+    /// order was never stable; compare them as sets.
+    fn normalized_station_errors(message: &str) -> Vec<(String, String, Vec<String>)> {
+        let body = message
+            .strip_prefix("Validation error: Station validation failed: ")
+            .unwrap_or_else(|| panic!("missing station prefix: {message}"));
+        let mut rows: Vec<_> = body
+            .lines()
+            .map(|line| {
+                let (field, rest) = line.split_once(": Validation error: ").unwrap();
+                let (code, params) = rest.split_once(" [{").unwrap();
+                let mut params: Vec<String> = params
+                    .strip_suffix("}]")
+                    .unwrap()
+                    .split(", ")
+                    .map(str::to_string)
+                    .collect();
+                params.sort();
+                (field.to_string(), code.to_string(), params)
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn row(field: &str, code: &str, params: &[&str]) -> (String, String, Vec<String>) {
+        let mut params: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+        params.sort();
+        (field.to_string(), code.to_string(), params)
+    }
+
+    /// PAN-315 AC5: diagnostics keep validator 0.21's grammar, the
+    /// `Station validation failed:` prefix and its debug-rendered
+    /// min/max/value parameters.
+    #[test]
+    fn station_derived_diagnostics_compatible() {
+        let mut cfg = StationConfig::default();
+        cfg.callsign = "K1".into();
+        let message = cfg.validate_section().unwrap_err().to_string();
+        assert_eq!(
+            normalized_station_errors(&message),
+            vec![row(
+                "callsign",
+                "length",
+                &[
+                    r#""min": Number(3)"#,
+                    r#""max": Number(20)"#,
+                    r#""value": String("K1")"#
+                ],
+            )]
+        );
+
+        let mut cfg = StationConfig::default();
+        cfg.grid_square = "FN4".into();
+        cfg.power_watts = 1501;
+        cfg.dxcc_entity = 0;
+        cfg.itu_zone = 91;
+        cfg.cq_zone = 0;
+        let message = cfg.validate_section().unwrap_err().to_string();
+        assert_eq!(
+            normalized_station_errors(&message),
+            vec![
+                row(
+                    "cq_zone",
+                    "range",
+                    &[
+                        r#""min": Number(1)"#,
+                        r#""max": Number(40)"#,
+                        r#""value": Number(0)"#
+                    ]
+                ),
+                row(
+                    "dxcc_entity",
+                    "range",
+                    &[
+                        r#""min": Number(1)"#,
+                        r#""max": Number(999)"#,
+                        r#""value": Number(0)"#
+                    ]
+                ),
+                row(
+                    "grid_square",
+                    "length",
+                    &[
+                        r#""min": Number(4)"#,
+                        r#""max": Number(8)"#,
+                        r#""value": String("FN4")"#
+                    ]
+                ),
+                row(
+                    "itu_zone",
+                    "range",
+                    &[
+                        r#""min": Number(1)"#,
+                        r#""max": Number(90)"#,
+                        r#""value": Number(91)"#
+                    ]
+                ),
+                row(
+                    "power_watts",
+                    "range",
+                    &[
+                        r#""min": Number(1)"#,
+                        r#""max": Number(1500)"#,
+                        r#""value": Number(1501)"#
+                    ]
+                ),
+            ]
+        );
     }
 }

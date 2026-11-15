@@ -948,6 +948,21 @@ jobs:
           PY
           python3 /tmp/action-pins.py "$BASE" "$HEAD"
 
+  machete:
+    name: Unused dependencies and dependency policy
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      - run: cargo install --locked cargo-machete --version 0.9.2
+      - run: cargo machete
+      - run: python3 scripts/ci/test-dependency-policy.py
+      - run: bash scripts/ci/test-ci-machete.sh
+
   # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
   # required status check. NEVER rename this job. Runs with if: always() so a
   # failed/cancelled upstream job FAILS this check instead of skipping it (a
@@ -955,7 +970,7 @@ jobs:
   supply-chain:
     name: Supply Chain
     if: always()
-    needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins]
+    needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins, machete]
     runs-on: ubuntu-latest
     steps:
       - name: Gate
@@ -966,11 +981,12 @@ jobs:
           OSV_MG: ${{ needs.osv-merge-group.result }}
           POLICY: ${{ needs.install-policy.result }}
           PINS: ${{ needs.actions-pins.result }}
+          MACHETE: ${{ needs.machete.result }}
         run: |
           # exactly one of osv-pr/osv-merge-group runs per event (each is
           # if-gated on github.event_name); the other reports 'skipped'.
           OSV="$OSV_PR"; [ "$OSV" != skipped ] || OSV="$OSV_MG"
-          echo "changes=$CHANGES deps=$DEPS osv=$OSV (pr=$OSV_PR mg=$OSV_MG) install-policy=$POLICY actions-pins=$PINS"
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV (pr=$OSV_PR mg=$OSV_MG) install-policy=$POLICY actions-pins=$PINS machete=$MACHETE"
           if [ "$CHANGES" != success ]; then
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
@@ -980,7 +996,7 @@ jobs:
           if [ "$DEPS" != true ]; then
             echo "No dependency manifest, lockfile, or workflow changed -- nothing more to scan."; exit 0
           fi
-          for r in "$OSV" "$POLICY"; do
+          for r in "$OSV" "$POLICY" "$MACHETE"; do
             if [ "$r" != success ]; then
               echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
             fi

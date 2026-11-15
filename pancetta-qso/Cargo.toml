@@ -5,6 +5,7 @@ keywords = ["ham-radio", "ft8", "qso", "adif", "logging"]
 categories = ["simulation", "science", "database"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -30,7 +31,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Database dependencies
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 
 # Logging and tracing
 tracing = "0.1"
@@ -38,7 +39,7 @@ tracing = "0.1"
 # Utilities
 regex = "1.12"
 lazy_static = "1.4"
-dirs = "5.0"
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
