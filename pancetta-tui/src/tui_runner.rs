@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 use crate::app::{App, DecodedMessageView, DevicePanel, DeviceSelectionState};
 use crate::config::Config;
 use crate::keymap::Action;
+use crate::theme::{self, Theme};
 
 // Set before the first mutation, so partial setup is owned too. The panic
 // hook uses this without locking the runner, including during unwinding.
@@ -2950,77 +2951,18 @@ impl TuiRunner {
         synchronized_frame(
             terminal,
             |t| begin_frame(t.backend_mut()),
-            |terminal| {
-                terminal
-                    .draw(|f| {
-                        // Use the rich ui::draw for the full frame
-                        if let Err(e) = crate::ui::draw(f, app) {
-                            // Fallback: render a minimal error message
-                            let error_text = format!("Render error: {}", e);
-                            let paragraph =
-                                Paragraph::new(error_text).style(Style::default().fg(Color::Red));
-                            f.render_widget(paragraph, f.area());
-                        }
-
-                        // Render device selection modal overlay if visible
-                        if app.device_selection.visible {
-                            TuiRunner::render_device_selection_modal(
-                                f,
-                                f.area(),
-                                &app.device_selection,
-                            );
-                        }
-
-                        // Render rig config picker modal overlay if visible (PAN-59)
-                        if app.rig_selection.visible {
-                            TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
-                        }
-
-                        // Render help overlay if visible
-                        if app.help_visible {
-                            TuiRunner::render_help_overlay(f, f.area(), app.help_scroll);
-                        }
-
-                        // Render operator-stop banner if active. Drawn before the
-                        // quit-confirm overlay so the latter sits on top — Q-press
-                        // then q-press should still let the operator quit.
-                        if app.stopped_by_operator {
-                            TuiRunner::render_stopped_by_operator_banner(f, f.area());
-                        }
-
-                        // Render quit-confirm overlay if visible (drawn last so it sits on top)
-                        if app.quit_confirm_visible {
-                            TuiRunner::render_quit_confirm_overlay(f, f.area());
-                        }
-
-                        // Render freq/split/offset modals (out-of-band ack has priority;
-                        // then freq modal; then offset modal — only one visible at a time).
-                        if app.out_of_band_ack_visible {
-                            crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
-                        } else if app.freq_modal.visible {
-                            crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
-                        } else if app.watchlist_modal.visible {
-                            crate::ui::render_watchlist_modal(f, f.area(), &app.watchlist_modal);
-                        } else if app.offset_modal.visible {
-                            crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
-                        } else if app.show_diagnostics {
-                            crate::ui::render_diagnostics_overlay(f, f.area(), app);
-                        } else if app.show_health {
-                            crate::ui::render_health_panel(f, f.area(), app);
-                        } else if app.show_recent_qsos {
-                            crate::ui::render_recent_qsos_panel(f, f.area(), app);
-                        } else if app.show_why {
-                            crate::ui::why::render_why_overlay(f, f.area(), app);
-                        }
-                    })
-                    .map(|_| ())
-            },
+            |terminal| terminal.draw(|f| draw_frame(f, app)).map(|_| ()),
             |t| end_frame(t.backend_mut()),
         )
     }
 
     /// Render device selection modal as an overlay
-    fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {
+    fn render_device_selection_modal(
+        f: &mut Frame,
+        area: Rect,
+        state: &DeviceSelectionState,
+        theme: &Theme,
+    ) {
         // Defensive: a zero/near-zero area (terminal not yet sized, or a
         // remote session reporting 0×0 at launch) makes every dimension
         // computation below underflow. In release builds an unchecked
@@ -3056,7 +2998,7 @@ impl TuiRunner {
             .title(" Audio Device Selection ")
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
+            .style(theme.modal);
 
         let inner = outer_block.inner(modal_area);
         f.render_widget(outer_block, modal_area);
@@ -3077,9 +3019,9 @@ impl TuiRunner {
 
         // --- Input devices panel ---
         let input_border_style = if state.active_panel == DevicePanel::Input {
-            Style::default().fg(Color::Cyan)
+            theme.modal_focus
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme.muted
         };
 
         let input_items: Vec<ListItem> = state
@@ -3091,12 +3033,9 @@ impl TuiRunner {
                 let label = format!("{}{}", name, marker);
                 let style =
                     if i == state.selected_input_idx && state.active_panel == DevicePanel::Input {
-                        Style::default()
-                            .bg(Color::Cyan)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD)
+                        theme.selection.add_modifier(Modifier::BOLD)
                     } else if i == state.selected_input_idx {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                        theme.selection_inactive
                     } else {
                         Style::default()
                     };
@@ -3114,9 +3053,9 @@ impl TuiRunner {
 
         // --- Output devices panel ---
         let output_border_style = if state.active_panel == DevicePanel::Output {
-            Style::default().fg(Color::Cyan)
+            theme.modal_focus
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme.muted
         };
 
         let output_items: Vec<ListItem> = state
@@ -3129,12 +3068,9 @@ impl TuiRunner {
                 let style = if i == state.selected_output_idx
                     && state.active_panel == DevicePanel::Output
                 {
-                    Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selection.add_modifier(Modifier::BOLD)
                 } else if i == state.selected_output_idx {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                    theme.selection_inactive
                 } else {
                     Style::default()
                 };
@@ -3153,7 +3089,7 @@ impl TuiRunner {
         // --- Footer help text ---
         let footer =
             Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(theme.muted);
         f.render_widget(footer, vert_chunks[1]);
     }
 
@@ -3164,16 +3100,17 @@ impl TuiRunner {
         f: &mut Frame,
         area: Rect,
         state: &crate::app::RigSelectionState,
+        theme: &Theme,
     ) {
         use crate::app::RigField;
         use ratatui::text::{Line, Span};
 
         if state.naming_bookmark {
-            Self::render_bookmark_name_input(f, area, state);
+            Self::render_bookmark_name_input(f, area, state, theme);
             return;
         }
         if state.bookmark_overlay_visible {
-            Self::render_bookmark_overlay(f, area, state);
+            Self::render_bookmark_overlay(f, area, state, theme);
             return;
         }
 
@@ -3210,10 +3147,7 @@ impl TuiRunner {
         let mut lines: Vec<Line> = Vec::with_capacity(fields.len() + 2);
         for (label, value, active) in &fields {
             let value_style = if *active {
-                Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD)
+                theme.selection.add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -3223,10 +3157,7 @@ impl TuiRunner {
             ]));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            FOOTER,
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(FOOTER, theme.muted)));
 
         let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
         let inner_width = modal_width.saturating_sub(2);
@@ -3260,7 +3191,7 @@ impl TuiRunner {
             .title(" Rig Config ")
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
+            .style(theme.modal);
 
         let inner = outer_block.inner(modal_area);
         f.render_widget(outer_block, modal_area);
@@ -3276,6 +3207,7 @@ impl TuiRunner {
         f: &mut Frame,
         area: Rect,
         state: &crate::app::RigSelectionState,
+        theme: &Theme,
     ) {
         use ratatui::text::{Line, Span};
 
@@ -3298,7 +3230,7 @@ impl TuiRunner {
             .title(" Save Bookmark ")
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
+            .style(theme.modal);
 
         let inner = outer_block.inner(modal_area);
         f.render_widget(outer_block, modal_area);
@@ -3308,17 +3240,11 @@ impl TuiRunner {
                 Span::raw("Name: "),
                 Span::styled(
                     state.bookmark_name_input.clone(),
-                    Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
+                    theme.selection.add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "Enter: save | Esc: cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled("Enter: save | Esc: cancel", theme.muted)),
         ];
 
         let paragraph = Paragraph::new(lines);
@@ -3328,7 +3254,12 @@ impl TuiRunner {
     /// Render the "load bookmark" list overlay (PAN-61), stacked on top of
     /// the rig-config modal. Mirrors `render_device_selection_modal`'s
     /// list-select idiom.
-    fn render_bookmark_overlay(f: &mut Frame, area: Rect, state: &crate::app::RigSelectionState) {
+    fn render_bookmark_overlay(
+        f: &mut Frame,
+        area: Rect,
+        state: &crate::app::RigSelectionState,
+        theme: &Theme,
+    ) {
         use ratatui::text::{Line, Span};
 
         if area.width < 10 || area.height < 4 {
@@ -3350,7 +3281,7 @@ impl TuiRunner {
             .title(" Load Bookmark ")
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
+            .style(theme.modal);
 
         let inner = outer_block.inner(modal_area);
         f.render_widget(outer_block, modal_area);
@@ -3384,10 +3315,7 @@ impl TuiRunner {
                 let idx = window_start + offset;
                 let selected = idx == state.selected_bookmark_idx;
                 let style = if selected {
-                    Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selection.add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -3407,7 +3335,7 @@ impl TuiRunner {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Up/Down: select | Enter: load | x: delete | Esc: cancel",
-            Style::default().fg(Color::DarkGray),
+            theme.muted,
         )));
 
         let paragraph = Paragraph::new(lines);
@@ -3423,7 +3351,7 @@ impl TuiRunner {
     /// `help_overlay_geometry`); the top blank row, the blank row before the
     /// footer and the footer itself stay put. While the list can't fit, the
     /// footer always names the emergency-stop key.
-    fn render_help_overlay(f: &mut Frame, area: Rect, scroll: u16) {
+    fn render_help_overlay(f: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
         use ratatui::text::{Line, Span};
 
         let geom = help_overlay_geometry(area);
@@ -3436,11 +3364,13 @@ impl TuiRunner {
             .title(" Pancetta Help ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .style(Style::default().bg(Color::Black).fg(Color::Cyan));
+            .style(bordered_surface(theme, theme.modal_border))
+            .border_style(theme.modal_border)
+            .title_style(theme.modal_border);
 
         let inner = outer_block.inner(modal_area);
         f.render_widget(outer_block, modal_area);
-        let bg = Style::default().bg(Color::Black);
+        let bg = theme::bg_of(theme.modal);
         f.render_widget(Paragraph::new("").style(bg), inner);
 
         // Chrome: blank row, scrolling body, blank row, footer.
@@ -3453,7 +3383,7 @@ impl TuiRunner {
         .areas(inner);
 
         let scroll = scroll.min(geom.max_scroll);
-        let body = Paragraph::new(help_body_lines(inner.width))
+        let body = Paragraph::new(help_body_lines(inner.width, theme))
             .style(bg)
             .scroll((scroll, 0));
         f.render_widget(body, body_area);
@@ -3469,11 +3399,7 @@ impl TuiRunner {
             )
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                footer,
-                Style::default().fg(Color::DarkGray),
-            )))
-            .style(bg),
+            Paragraph::new(Line::from(Span::styled(footer, theme.muted))).style(bg),
             footer_area,
         );
     }
@@ -3482,7 +3408,7 @@ impl TuiRunner {
     /// the frame. Non-modal — the operator can still interact with the
     /// rest of the TUI, but the red banner makes it impossible to miss
     /// that the emergency-stop is in effect. Cleared by Esc.
-    fn render_stopped_by_operator_banner(f: &mut Frame, area: Rect) {
+    fn render_stopped_by_operator_banner(f: &mut Frame, area: Rect, theme: &Theme) {
         use ratatui::text::{Line, Span};
 
         // Two-row banner pinned to the top of the screen. Tall enough to
@@ -3501,44 +3427,37 @@ impl TuiRunner {
         let lines = vec![
             Line::from(Span::styled(
                 "  STOPPED BY OPERATOR — autonomous off, TX aborted",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                theme.alarm.add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "  Press Esc to clear banner. Press `a` to re-enable autonomous.",
-                Style::default().fg(Color::White).bg(Color::Red),
+                theme.alarm,
             )),
         ];
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Red).fg(Color::White));
+            .style(theme.alarm);
 
-        let para = Paragraph::new(lines)
-            .block(block)
-            .style(Style::default().bg(Color::Red).fg(Color::White));
+        let para = Paragraph::new(lines).block(block).style(theme.alarm);
         f.render_widget(para, banner_area);
     }
 
     /// Render quit-confirm overlay as a centered modal
-    fn render_quit_confirm_overlay(f: &mut Frame, area: Rect) {
+    fn render_quit_confirm_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         use ratatui::text::{Line, Span};
 
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  Quit pancetta?  [y/N]",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                theme.emphasis.add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  y / Enter = quit    n / Esc / q = cancel",
-                Style::default().fg(Color::DarkGray),
+                theme.muted,
             )),
         ];
 
@@ -3559,7 +3478,9 @@ impl TuiRunner {
             .title(" Confirm Quit ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .style(Style::default().bg(Color::Black).fg(Color::Red));
+            .style(bordered_surface(theme, theme.modal_danger))
+            .border_style(theme.modal_danger)
+            .title_style(theme.modal_danger);
 
         let para = Paragraph::new(lines).block(block);
         f.render_widget(para, modal_area);
@@ -3602,6 +3523,76 @@ impl TuiRunner {
 
         Ok(())
     }
+}
+
+/// Draw one full frame: the view through `ui::draw`, then whichever overlays
+/// are open, in stacking order. The body of `TuiRunner::draw_terminal`'s
+/// draw closure, kept free of the terminal so tests can render it into a
+/// `TestBackend`.
+pub(crate) fn draw_frame(f: &mut Frame, app: &mut App) {
+    // Use the rich ui::draw for the full frame
+    if let Err(e) = crate::ui::draw(f, app) {
+        // Fallback: render a minimal error message
+        let error_text = format!("Render error: {}", e);
+        let paragraph = Paragraph::new(error_text).style(app.theme.error);
+        f.render_widget(paragraph, f.area());
+    }
+
+    // Render device selection modal overlay if visible
+    if app.device_selection.visible {
+        TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection, &app.theme);
+    }
+
+    // Render rig config picker modal overlay if visible (PAN-59)
+    if app.rig_selection.visible {
+        TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection, &app.theme);
+    }
+
+    // Render help overlay if visible
+    if app.help_visible {
+        TuiRunner::render_help_overlay(f, f.area(), app.help_scroll, &app.theme);
+    }
+
+    // Render operator-stop banner if active. Drawn before the
+    // quit-confirm overlay so the latter sits on top — Q-press
+    // then q-press should still let the operator quit.
+    if app.stopped_by_operator {
+        TuiRunner::render_stopped_by_operator_banner(f, f.area(), &app.theme);
+    }
+
+    // Render quit-confirm overlay if visible (drawn last so it sits on top)
+    if app.quit_confirm_visible {
+        TuiRunner::render_quit_confirm_overlay(f, f.area(), &app.theme);
+    }
+
+    // Render freq/split/offset modals (out-of-band ack has priority;
+    // then freq modal; then offset modal — only one visible at a time).
+    if app.out_of_band_ack_visible {
+        crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz, &app.theme);
+    } else if app.freq_modal.visible {
+        crate::ui::render_freq_modal(f, f.area(), &app.freq_modal, &app.theme);
+    } else if app.watchlist_modal.visible {
+        crate::ui::render_watchlist_modal(f, f.area(), &app.watchlist_modal, &app.theme);
+    } else if app.offset_modal.visible {
+        crate::ui::render_offset_modal(f, f.area(), &app.offset_modal, &app.theme);
+    } else if app.show_diagnostics {
+        crate::ui::render_diagnostics_overlay(f, f.area(), app);
+    } else if app.show_health {
+        crate::ui::render_health_panel(f, f.area(), app);
+    } else if app.show_recent_qsos {
+        crate::ui::render_recent_qsos_panel(f, f.area(), app);
+    } else if app.show_why {
+        crate::ui::why::render_why_overlay(f, f.area(), app);
+    }
+}
+
+/// The outer style of an overlay whose block has always painted its border
+/// colour across the whole box (help, quit confirm): the `modal` surface
+/// background with the `border` token's foreground, so every Dark cell keeps
+/// the colours it had. The caller still sets `border_style`/`title_style` so
+/// the border token's modifiers reach the frame only.
+fn bordered_surface(theme: &Theme, border: Style) -> Style {
+    theme::bg_of(theme.modal).fg(theme::fg_color(border))
 }
 
 /// Create and run TUI with message bus integration
@@ -3672,7 +3663,8 @@ pub(crate) fn help_overlay_geometry(area: Rect) -> HelpGeometry {
         .unwrap_or(50);
     // +2 for the left/right borders.
     let modal_width = ((widest_line + 2) as u16).min(area.width.saturating_sub(2));
-    let total_lines = help_body_lines(modal_width.saturating_sub(2)).len() as u16;
+    // Line count only: styles never change how the body wraps.
+    let total_lines = help_body_lines(modal_width.saturating_sub(2), &Theme::DARK).len() as u16;
     let modal_height = total_lines
         .saturating_add(5)
         .min(area.height.saturating_sub(2));
@@ -3731,16 +3723,12 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// bindings in table order. One line per binding, with a description that
 /// doesn't fit wrapped under its own column (a hanging indent of
 /// `2 + HELP_KEY_COL`), never back to column 0.
-fn help_body_lines(inner_width: u16) -> Vec<ratatui::text::Line<'static>> {
+fn help_body_lines(inner_width: u16, theme: &Theme) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::{Line, Span};
     let desc_width = (inner_width as usize).saturating_sub(2 + HELP_KEY_COL);
-    let heading_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let key_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(Color::White);
+    let heading_style = theme.heading.add_modifier(Modifier::BOLD);
+    let key_style = theme.help_key.add_modifier(Modifier::BOLD);
+    let desc_style = theme.text;
     let mut out = Vec::new();
     for category in crate::keymap::Category::ALL {
         out.push(Line::from(Span::styled(
@@ -5615,20 +5603,24 @@ mod key_tests {
             for (w, h) in [(120, 40), (80, 24)] {
                 let mut term =
                     ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-                term.draw(|f| TuiRunner::render_rig_selection_modal(f, f.area(), &state))
-                    .unwrap();
+                term.draw(|f| {
+                    TuiRunner::render_rig_selection_modal(f, f.area(), &state, &Theme::DARK)
+                })
+                .unwrap();
                 assert!(
                     pan353_buffer_text(term.backend().buffer()).contains(&format!("PTT: {label}"))
                 );
-                term.draw(|f| TuiRunner::render_bookmark_overlay(f, f.area(), &state))
-                    .unwrap();
+                term.draw(|f| {
+                    TuiRunner::render_bookmark_overlay(f, f.area(), &state, &Theme::DARK)
+                })
+                .unwrap();
                 assert!(pan353_buffer_text(term.backend().buffer())
                     .contains(&format!("38400, {label}")));
             }
         }
         state.bookmarks.clear();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| TuiRunner::render_bookmark_overlay(f, f.area(), &state))
+        term.draw(|f| TuiRunner::render_bookmark_overlay(f, f.area(), &state, &Theme::DARK))
             .unwrap();
         assert!(pan353_buffer_text(term.backend().buffer()).contains("no saved bookmarks"));
     }
@@ -5868,7 +5860,7 @@ mod key_tests {
             // Must not panic (subtract-with-overflow) at any size.
             terminal
                 .draw(|f| {
-                    TuiRunner::render_device_selection_modal(f, f.area(), &state);
+                    TuiRunner::render_device_selection_modal(f, f.area(), &state, &Theme::DARK);
                 })
                 .unwrap();
         }
@@ -5895,7 +5887,7 @@ mod key_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state, &Theme::DARK);
             })
             .unwrap();
 
@@ -5938,7 +5930,7 @@ mod key_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state, &Theme::DARK);
             })
             .unwrap();
 
@@ -7700,7 +7692,7 @@ mod key_tests {
     fn render_help(w: u16, h: u16, scroll: u16) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| TuiRunner::render_help_overlay(f, f.area(), scroll))
+        term.draw(|f| TuiRunner::render_help_overlay(f, f.area(), scroll, &Theme::DARK))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -7790,7 +7782,7 @@ mod key_tests {
     #[test]
     fn help_overlay_groups_bindings_by_category() {
         use crate::keymap::{Category, KEYBINDINGS};
-        let rows: Vec<String> = help_body_lines(200)
+        let rows: Vec<String> = help_body_lines(200, &Theme::DARK)
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
@@ -9962,6 +9954,9 @@ mod pan_59_command_tests {
 
 #[cfg(test)]
 mod key_effects;
+
+#[cfg(test)]
+mod theme_snapshots;
 
 #[cfg(test)]
 mod decode_log_level_tests {

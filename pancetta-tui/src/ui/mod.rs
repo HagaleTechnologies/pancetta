@@ -1,13 +1,14 @@
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::app::{ActivePanel, App};
+use crate::theme::{self, Theme};
 use crate::widgets::Waterfall;
 
 pub mod active_qsos;
@@ -20,7 +21,6 @@ pub mod qso_status;
 pub mod readiness_strip;
 pub mod slot_clock;
 pub mod station_card;
-pub mod station_info;
 pub mod tx_placement;
 pub mod why;
 
@@ -40,14 +40,6 @@ use tx_placement::{render_placement_zoom, render_tx_placement};
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 const MIN_TERMINAL_HEIGHT: u16 = 20;
 
-// Task 18: `ActivePanel::StationInfo` was removed and `render_station_info`
-// is no longer called from any layout function — the station card
-// (`render_station_card`, above) took its slot in `layout_operate` (and was
-// added below DX Hunter in `layout_hunt` when there's room). `ui/station_info.rs`
-// is kept intact (not deleted, per the task brief) but is now unrouted; its
-// module is still declared above so it continues to build and its own unit
-// tests (grid/distance/bearing math) still run.
-
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     let size = f.area();
@@ -57,10 +49,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // terminal's pre-launch scrollback even where a widget paints nothing
     // (e.g. an empty waterfall when audio is silent) — those gaps would
     // otherwise show through.
-    f.render_widget(
-        Block::default().style(Style::default().bg(app.theme.background_color())),
-        size,
-    );
+    f.render_widget(Block::default().style(app.theme.page), size);
 
     // Minimum-size guard. Below this the multi-panel layout degrades into
     // unreadable empty boxes (and panels silently drop content); show an
@@ -70,9 +59,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         let msg = vec![
             Line::from(Span::styled(
                 "Terminal too small",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.warning.add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
                 "Have {}x{}, need at least {}x{}.",
@@ -701,9 +688,7 @@ fn title_bar_segments(
     app: &App,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<BarSegment<'_>>, usize) {
-    let accent_bold = Style::default()
-        .fg(app.theme.accent_color())
-        .add_modifier(Modifier::BOLD);
+    let accent_bold = app.theme.title.add_modifier(Modifier::BOLD);
 
     let mut segs = vec![
         BarSegment::new(
@@ -723,25 +708,20 @@ fn title_bar_segments(
             " | ",
             vec![Span::styled(
                 &app.station_info.call_sign,
-                Style::default()
-                    .fg(app.theme.success_color())
-                    .add_modifier(Modifier::BOLD),
+                app.theme.own_call.add_modifier(Modifier::BOLD),
             )],
             title_rank::CALLSIGN,
         ),
         BarSegment::new(
             " | ",
-            vec![Span::styled(
-                &app.station_info.grid_square,
-                Style::default().fg(app.theme.foreground_color()),
-            )],
+            vec![Span::styled(&app.station_info.grid_square, app.theme.text)],
             title_rank::GRID,
         ),
     ];
     let grid_idx = segs.len() - 1;
 
     // Frequency + band; the compact form drops the "MHz" unit.
-    let freq_style = Style::default().fg(app.theme.warning_color());
+    let freq_style = app.theme.emphasis;
     let band_span = Span::styled(
         app.config
             .get_current_band(app.station_info.operating_frequency)
@@ -778,27 +758,25 @@ fn title_bar_segments(
 
     // Pinned TX banner: replay is a neutral session fact from the first draw.
     // Live sessions retain the green/yellow/red policy states.
-    let (policy_text, policy_bg) = if app.config.replay {
-        (" TX: REPLAY ".to_string(), Color::Gray)
+    let (policy_text, policy_style) = if app.config.replay {
+        (" TX: REPLAY ".to_string(), app.theme.tx_replay)
     } else {
         match app.tx_policy {
-            pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
+            pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), app.theme.tx_full),
             pancetta_core::TxPolicy::RespondOnly => {
-                (" TX: RESPOND-ONLY ".to_string(), Color::Yellow)
+                (" TX: RESPOND-ONLY ".to_string(), app.theme.tx_respond_only)
             }
-            pancetta_core::TxPolicy::Disabled => {
-                (" TX: DISABLED — RX ONLY ".to_string(), Color::Red)
-            }
+            pancetta_core::TxPolicy::Disabled => (
+                " TX: DISABLED — RX ONLY ".to_string(),
+                app.theme.tx_disabled,
+            ),
         }
     };
     segs.push(BarSegment::new(
         " ",
         vec![Span::styled(
             policy_text,
-            Style::default()
-                .fg(Color::Black)
-                .bg(policy_bg)
-                .add_modifier(Modifier::BOLD),
+            policy_style.add_modifier(Modifier::BOLD),
         )],
         title_rank::TX_POLICY,
     ));
@@ -838,10 +816,7 @@ fn title_bar_segments(
             " ",
             vec![Span::styled(
                 format!(" {} ", label),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.view_chip.add_modifier(Modifier::BOLD),
             )],
             title_rank::VIEW,
         ));
@@ -871,10 +846,7 @@ fn title_bar_segments(
             " ",
             vec![Span::styled(
                 " FOX ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.fox.add_modifier(Modifier::BOLD),
             )],
             title_rank::FOX,
         ));
@@ -901,10 +873,7 @@ fn title_bar_segments(
 
     // FCC §97.221 presence prompt: autonomous on, but operator idle → initiation
     // (CQ/pounce) is suppressed until they prove presence with a keypress.
-    let pause_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let pause_style = app.theme.cq_paused.add_modifier(Modifier::BOLD);
     if app.autonomous_init_paused {
         segs.push(BarSegment::with_compact(
             " ",
@@ -933,10 +902,7 @@ fn title_bar_segments(
             " ",
             vec![Span::styled(
                 " TX ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.alarm.add_modifier(Modifier::BOLD),
             )],
             title_rank::LIVE_TX,
         ));
@@ -980,10 +946,7 @@ fn title_bar_left_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>
     // it never displaces another chip (e.g. the QSOs counter) and only
     // shows when the grid itself made it in.
     if let Some(entity) = app.station_info.entity_name.as_deref() {
-        let entity_span = Span::styled(
-            format!(" ({entity})"),
-            Style::default().fg(app.theme.muted_color()),
-        );
+        let entity_span = Span::styled(format!(" ({entity})"), app.theme.muted);
         if forms[grid_idx] != bar_fit::SegmentForm::Hidden
             && bar_fit::bar_width(&segs, &forms) + entity_span.width() <= width
         {
@@ -1005,9 +968,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let [left_area, clock_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).areas(area);
 
-    let row_style = Style::default()
-        .bg(app.theme.background_color())
-        .fg(app.theme.foreground_color());
+    let row_style = app.theme.page;
 
     f.render_widget(
         Paragraph::new(title_bar_left_line(app, left_area.width, now)).style(row_style),
@@ -1016,9 +977,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             utc_clock,
-            Style::default()
-                .fg(app.theme.foreground_color())
-                .add_modifier(Modifier::BOLD),
+            app.theme.text.add_modifier(Modifier::BOLD),
         )))
         .style(row_style),
         clock_area,
@@ -1059,10 +1018,7 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
             };
             spans.push(Span::styled(
                 label,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.alarm.add_modifier(Modifier::BOLD),
             ));
             let mut on_air: Vec<String> = vec![format!("{} @{:.0}Hz", item.text, item.freq_hz)];
             on_air.extend(
@@ -1075,25 +1031,17 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
             // strip.
             spans.push(Span::styled(
                 format!(" {} ", on_air.join("  |  ")),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.alarm.add_modifier(Modifier::BOLD),
             ));
         }
         None => {
             let live = app.live_tx_assignments();
             if live.is_empty() {
-                spans.push(Span::styled(
-                    "▶ NOW: (idle) ",
-                    Style::default().fg(app.theme.foreground_color()),
-                ));
+                spans.push(Span::styled("▶ NOW: (idle) ", app.theme.text));
             } else {
                 spans.push(Span::styled(
                     format!("▶ NEXT TX ({}): ", live.len()),
-                    Style::default()
-                        .fg(app.theme.accent_color())
-                        .add_modifier(Modifier::BOLD),
+                    app.theme.title.add_modifier(Modifier::BOLD),
                 ));
                 let mut text = live
                     .iter()
@@ -1104,10 +1052,7 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
                 if live.len() > TX_STRIP_MAX_ITEMS {
                     text.push_str(&format!("  |  +{} more", live.len() - TX_STRIP_MAX_ITEMS));
                 }
-                spans.push(Span::styled(
-                    text,
-                    Style::default().fg(app.theme.foreground_color()),
-                ));
+                spans.push(Span::styled(text, app.theme.text));
             }
         }
     }
@@ -1115,16 +1060,11 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     spans.push(Span::raw("  "));
 
     if deferred.is_empty() {
-        spans.push(Span::styled(
-            "⋯ QUEUED: (none)",
-            Style::default().fg(app.theme.foreground_color()),
-        ));
+        spans.push(Span::styled("⋯ QUEUED: (none)", app.theme.text));
     } else {
         spans.push(Span::styled(
             format!("⋯ QUEUED ({}): ", deferred.len()),
-            Style::default()
-                .fg(app.theme.warning_color())
-                .add_modifier(Modifier::BOLD),
+            app.theme.warning.add_modifier(Modifier::BOLD),
         ));
         // Show up to the first three deferred items so the strip stays 1 row.
         let shown: Vec<String> = deferred
@@ -1136,17 +1076,10 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
         if deferred.len() > TX_STRIP_MAX_ITEMS {
             text.push_str(&format!(" | +{} more", deferred.len() - TX_STRIP_MAX_ITEMS));
         }
-        spans.push(Span::styled(
-            text,
-            Style::default().fg(app.theme.warning_color()),
-        ));
+        spans.push(Span::styled(text, app.theme.warning));
     }
 
-    let paragraph = Paragraph::new(Line::from(spans)).style(
-        Style::default()
-            .bg(app.theme.background_color())
-            .fg(app.theme.foreground_color()),
-    );
+    let paragraph = Paragraph::new(Line::from(spans)).style(app.theme.page);
     f.render_widget(paragraph, area);
 }
 
@@ -1158,27 +1091,14 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let (audio_indicator, dsp_indicator, decoder_indicator) = match &app.pipeline_health {
         Some(health) => {
             let audio = if health.audio_alive {
-                Span::styled(
-                    "AUD",
-                    Style::default()
-                        .fg(app.theme.success_color())
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled("AUD", app.theme.success.add_modifier(Modifier::BOLD))
             } else {
-                Span::styled(
-                    "AUD",
-                    Style::default()
-                        .fg(app.theme.error_color())
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled("AUD", app.theme.error.add_modifier(Modifier::BOLD))
             };
             let dsp = if health.dsp_windows > 0 {
-                Span::styled(
-                    format!("DSP:{}", health.dsp_windows),
-                    Style::default().fg(app.theme.success_color()),
-                )
+                Span::styled(format!("DSP:{}", health.dsp_windows), app.theme.success)
             } else {
-                Span::styled("DSP:0", Style::default().fg(app.theme.error_color()))
+                Span::styled("DSP:0", app.theme.error)
             };
             let dec_label = if health.ft8lib_available {
                 "FT8"
@@ -1188,20 +1108,17 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             let decoder = if health.total_decodes > 0 {
                 Span::styled(
                     format!("{}:{}", dec_label, health.total_decodes),
-                    Style::default().fg(app.theme.success_color()),
+                    app.theme.success,
                 )
             } else {
-                Span::styled(
-                    format!("{}:0", dec_label),
-                    Style::default().fg(app.theme.warning_color()),
-                )
+                Span::styled(format!("{}:0", dec_label), app.theme.warning)
             };
             (audio, dsp, decoder)
         }
         None => (
-            Span::styled("AUD", Style::default().fg(app.theme.muted_color())),
-            Span::styled("DSP", Style::default().fg(app.theme.muted_color())),
-            Span::styled("FT8", Style::default().fg(app.theme.muted_color())),
+            Span::styled("AUD", app.theme.muted),
+            Span::styled("DSP", app.theme.muted),
+            Span::styled("FT8", app.theme.muted),
         ),
     };
 
@@ -1214,7 +1131,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(" | "),
         Span::styled(
             format!("Level: {:.1}%", app.audio_level * 100.0),
-            Style::default().fg(app.theme.foreground_color()),
+            app.theme.text,
         ),
         Span::raw(" | "),
         // Rig S-meter (Task 18 — demoted from the Station Info panel). Reuses
@@ -1222,56 +1139,37 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         // `signal_strength_db`/`signal_strength_at` fields + staleness gate
         // as the pre-existing `s_meter_display` (just a compact
         // "S:{signed dB}" / "S:---" format, sized for this one-line bar).
-        Span::styled(
-            app.signal_strength_status_bar(),
-            Style::default().fg(app.theme.foreground_color()),
-        ),
+        Span::styled(app.signal_strength_status_bar(), app.theme.text),
         Span::raw(" | "),
         // Audio device short name — same source `station_info.rs` used
         // (`app.audio_device`, falling back to "Default").
         Span::styled(
             format!("Dev: {}", app.audio_device.as_deref().unwrap_or("Default")),
-            Style::default().fg(app.theme.foreground_color()),
+            app.theme.text,
         ),
         Span::raw(" | "),
-        Span::styled(
-            format!("Msgs: {}", messages_count),
-            Style::default().fg(app.theme.foreground_color()),
-        ),
+        Span::styled(format!("Msgs: {}", messages_count), app.theme.text),
         Span::raw(" | "),
-        Span::styled(
-            format!("DX: {}", dx_count),
-            Style::default().fg(app.theme.foreground_color()),
-        ),
+        Span::styled(format!("DX: {}", dx_count), app.theme.text),
         Span::raw(" | "),
         // While composing a free-text TX message, show the live input line
         // (with cursor) in bold instead of the transient status text so the
         // operator sees exactly what they're about to send.
         match app.compose_prompt() {
-            Some(prompt) => Span::styled(
-                prompt,
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Some(prompt) => Span::styled(prompt, app.theme.emphasis.add_modifier(Modifier::BOLD)),
             // PAN-344: the typed completion toast outranks ordinary status
             // text (which stays stored and reappears on expiry) but never
             // compose input. Rendered in place — no layout change.
             None => match app.active_toast_text(chrono::Utc::now()) {
-                Some(toast) => Span::styled(
-                    toast,
-                    Style::default()
-                        .fg(app.theme.accent_color())
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Some(toast) => Span::styled(toast, app.theme.info.add_modifier(Modifier::BOLD)),
                 // PAN-351: leveled transient status colors by severity.
                 None => Span::styled(
                     app.status_message(),
-                    Style::default().fg(match app.selected_status().map(|(_, level)| level) {
-                        Some(pancetta_core::DiagnosticLevel::Warn) => app.theme.warning_color(),
-                        Some(pancetta_core::DiagnosticLevel::Error) => app.theme.error_color(),
-                        _ => app.theme.accent_color(),
-                    }),
+                    match app.selected_status().map(|(_, level)| level) {
+                        Some(pancetta_core::DiagnosticLevel::Warn) => app.theme.warning,
+                        Some(pancetta_core::DiagnosticLevel::Error) => app.theme.error,
+                        _ => app.theme.info,
+                    },
                 ),
             },
         },
@@ -1281,18 +1179,15 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // a fresh reading, which is sampled solely during TX). Prepend it, bold and
     // color-graded by match quality, so it's unmistakable when keyed.
     if let Some(swr_text) = app.swr_display() {
-        let color = match app.swr {
-            Some(s) if s >= 3.0 => app.theme.error_color(),
-            Some(s) if s >= 2.0 => app.theme.warning_color(),
-            _ => app.theme.success_color(),
+        let swr_style = match app.swr {
+            Some(s) if s >= 3.0 => app.theme.error,
+            Some(s) if s >= 2.0 => app.theme.warning,
+            _ => app.theme.success,
         };
         status_spans.insert(0, Span::raw(" | "));
         status_spans.insert(
             0,
-            Span::styled(
-                swr_text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(swr_text, swr_style.add_modifier(Modifier::BOLD)),
         );
     }
 
@@ -1302,14 +1197,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // tui_runner.rs (the help-overlay is the only other on-screen keymap):
     // band is `=`/`-` (not `+`), quit is `q` (not Ctrl+Q), `?` opens full help,
     // `d` opens the audio-device picker (the common "reclaim my output" action).
-    let key_hint = |k: &'static str| {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    };
+    let key_hint = |k: &'static str| Span::styled(k, app.theme.key.add_modifier(Modifier::BOLD));
     // PAN-88: the hints priority-fit the row (same `bar_fit` policy as the
     // title bar) so a narrow terminal drops whole hints instead of cutting
     // `q:Quit` mid-word. `?:Help` and `q:Quit` are pinned; `Space:Call/Reply`
@@ -1343,17 +1231,10 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    let status_paragraph = Paragraph::new(status_line).style(
-        Style::default()
-            .bg(app.theme.background_color())
-            .fg(app.theme.foreground_color()),
-    );
+    let status_paragraph = Paragraph::new(status_line).style(app.theme.page);
 
-    let help_paragraph = Paragraph::new(help_line).style(
-        Style::default()
-            .bg(app.theme.background_color())
-            .fg(app.theme.muted_color()),
-    );
+    let help_paragraph =
+        Paragraph::new(help_line).style(theme::bg_of(app.theme.page).patch(app.theme.muted));
 
     f.render_widget(status_paragraph, status_chunks[0]);
     f.render_widget(help_paragraph, status_chunks[1]);
@@ -1400,14 +1281,12 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     };
     let waterfall_block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default().fg(app.theme.accent_color()),
-        ))
+        .title(Span::styled(title, app.theme.title))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border_color()));
+        .border_style(app.theme.border);
 
     let waterfall = Waterfall::new(&app.waterfall_data)
+        .theme(&app.theme)
         .block(waterfall_block)
         .tx_offset(cursor_offset)
         .signal_freqs(signal_freqs)
@@ -1420,19 +1299,15 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Create a styled block for panels
 pub fn create_panel_block<'a>(title: &'a str, is_active: bool, app: &App) -> Block<'a> {
     let border_style = if is_active {
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.focus.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.border_color())
+        app.theme.border
     };
 
     let title_style = if is_active {
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.focus.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.accent_color())
+        app.theme.title
     };
 
     Block::default()
@@ -1442,7 +1317,12 @@ pub fn create_panel_block<'a>(title: &'a str, is_active: bool, app: &App) -> Blo
 }
 
 /// Render the Shift+F frequency-entry modal.
-pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModalState) {
+pub fn render_freq_modal(
+    f: &mut Frame<'_>,
+    area: Rect,
+    m: &crate::app::FreqModalState,
+    theme: &Theme,
+) {
     if area.width < 10 || area.height < 4 {
         return;
     }
@@ -1466,12 +1346,18 @@ pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModa
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Set Frequency ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(theme.modal)
+        .border_style(theme.modal_border);
     f.render_widget(Paragraph::new(body).block(block), modal_area);
 }
 
 /// Callsign entry for persistent operator pins.
-pub fn render_watchlist_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
+pub fn render_watchlist_modal(
+    f: &mut Frame<'_>,
+    area: Rect,
+    m: &crate::app::OffsetModalState,
+    theme: &Theme,
+) {
     if area.width < 10 || area.height < 6 {
         return;
     }
@@ -1482,17 +1368,24 @@ pub fn render_watchlist_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Off
         "Callsign to watch\n> {}_\nEnter toggles, Esc cancels",
         m.buffer
     );
-    f.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Watchlist ")),
-        modal,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Watchlist ")
+        .style(theme.modal)
+        .border_style(theme.modal_border);
+    f.render_widget(Paragraph::new(text).block(block), modal);
 }
 
 /// Render the `o`-key TX-audio-offset modal.
 ///
 /// One integer Hz field in the allocator default range; blank Enter = Auto; Esc = cancel.
 /// Mirrors the `render_freq_modal` layout and sizing.
-pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
+pub fn render_offset_modal(
+    f: &mut Frame<'_>,
+    area: Rect,
+    m: &crate::app::OffsetModalState,
+    theme: &Theme,
+) {
     if area.width < 10 || area.height < 4 {
         return;
     }
@@ -1514,7 +1407,8 @@ pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Offset
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Set TX Offset ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(theme.modal)
+        .border_style(theme.modal_border);
     f.render_widget(Paragraph::new(body).block(block), modal_area);
 }
 
@@ -1544,7 +1438,8 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
             app.diagnostic_events.len().min(app.diagnostics_scroll + 1),
             app.diagnostic_events.len()
         ))
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(app.theme.modal)
+        .border_style(app.theme.modal_border);
     let inner = block.inner(modal_area);
     f.render_widget(block, modal_area);
 
@@ -1573,10 +1468,10 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
         .skip(start)
         .take(end - start)
         .map(|(i, ev)| {
-            let color = match ev.level {
-                pancetta_core::DiagnosticLevel::Info => Color::Gray,
-                pancetta_core::DiagnosticLevel::Warn => Color::Yellow,
-                pancetta_core::DiagnosticLevel::Error => Color::Red,
+            let level_style = match ev.level {
+                pancetta_core::DiagnosticLevel::Info => app.theme.secondary,
+                pancetta_core::DiagnosticLevel::Warn => app.theme.warning,
+                pancetta_core::DiagnosticLevel::Error => app.theme.error,
             };
             let who = ev
                 .callsign
@@ -1591,11 +1486,9 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
                 who
             );
             let style = if i == cursor {
-                Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                level_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
-                Style::default().fg(color)
+                level_style
             };
             Line::from(Span::styled(line, style))
         })
@@ -1732,14 +1625,14 @@ mod diagnostics_overlay_tests {
     }
 }
 
-/// Color a `Failed` row by how actionable/severe the reason is — mirrors the
-/// Diagnostics overlay's level-based coloring, but keyed off
+/// Style a `Failed` row by how actionable/severe the reason is — mirrors the
+/// Diagnostics overlay's level-based styling, but keyed off
 /// `QsoFailureReason` since terminal-QSO outcomes don't carry a
-/// `DiagnosticLevel`. Red = a real defect (protocol/callsign/frequency
-/// problem worth investigating); Yellow = propagation/timing, likely just
-/// band conditions; Gray = benign/administrative (cancelled, superseded,
-/// deduped).
-fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
+/// `DiagnosticLevel`. `error` = a real defect (protocol/callsign/frequency
+/// problem worth investigating); `warning` = propagation/timing, likely just
+/// band conditions; `secondary` = benign/administrative (cancelled,
+/// superseded, deduped).
+fn recent_qso_failure_style(reason: &pancetta_qso::QsoFailureReason, theme: &Theme) -> Style {
     use pancetta_qso::QsoFailureReason as R;
     match reason {
         R::Timeout
@@ -1747,12 +1640,12 @@ fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
         | R::StationQrt
         | R::SupervisorRestart
         | R::ComponentCrash(_)
-        | R::CloseNotAired => Color::Yellow,
+        | R::CloseNotAired => theme.warning,
         R::InvalidCallsign
         | R::FrequencyConflict
         | R::ProtocolError(_)
-        | R::MessageUnencodable(_) => Color::Red,
-        R::Duplicate | R::UserCancelled | R::Superseded | R::ControlTransferred => Color::Gray,
+        | R::MessageUnencodable(_) => theme.error,
+        R::Duplicate | R::UserCancelled | R::Superseded | R::ControlTransferred => theme.secondary,
     }
 }
 
@@ -1785,7 +1678,8 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             app.recent_qsos.len().min(app.recent_qsos_scroll + 1),
             app.recent_qsos.len()
         ))
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(app.theme.modal)
+        .border_style(app.theme.modal_border);
     let inner = block.inner(modal_area);
     f.render_widget(block, modal_area);
 
@@ -1856,9 +1750,11 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         .skip(start)
         .take(end - start)
         .map(|(i, qso)| {
-            let color = match &qso.outcome {
-                crate::app::QsoOutcome::Completed => Color::Green,
-                crate::app::QsoOutcome::Failed(reason) => recent_qso_failure_color(reason),
+            let outcome_style = match &qso.outcome {
+                crate::app::QsoOutcome::Completed => app.theme.success,
+                crate::app::QsoOutcome::Failed(reason) => {
+                    recent_qso_failure_style(reason, &app.theme)
+                }
             };
             // `brief_timeline`'s last line is the terminal summary the
             // coordinator already built ("Completed" / "Failed: <reason>") —
@@ -1918,11 +1814,9 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
                 )
             };
             let style = if i == cursor {
-                Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                outcome_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
-                Style::default().fg(color)
+                outcome_style
             };
             if let Some((before, after)) = (!upload_cells.is_empty())
                 .then(|| line.split_once(&upload_cells))
@@ -1937,16 +1831,16 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
                         if index > 0 {
                             spans.push(Span::raw(" "));
                         }
-                        let color = match slot.state {
-                            crate::upload_status::UploadState::Accepted => Color::Green,
-                            crate::upload_status::UploadState::Pending => Color::Yellow,
+                        let state_style = match slot.state {
+                            crate::upload_status::UploadState::Accepted => app.theme.success,
+                            crate::upload_status::UploadState::Pending => app.theme.warning,
                             crate::upload_status::UploadState::Rejected
-                            | crate::upload_status::UploadState::Failed => Color::Red,
-                            crate::upload_status::UploadState::Unknown => Color::Gray,
+                            | crate::upload_status::UploadState::Failed => app.theme.error,
+                            crate::upload_status::UploadState::Unknown => app.theme.secondary,
                         };
                         spans.push(Span::styled(
                             format!("{}{}", target.letter(), slot.state.glyph()),
-                            style.fg(color),
+                            style.patch(state_style),
                         ));
                     }
                 } else {
@@ -1965,17 +1859,17 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             vec![
                 Line::from(Span::styled(
                     "Uploads: Q QRZ \u{b7} C ClubLog \u{b7} E eQSL \u{b7} D cqdx.io \u{b7} L LoTW",
-                    Style::default().fg(Color::DarkGray),
+                    app.theme.muted,
                 )),
                 Line::from(Span::styled(
                     "\u{2713} accepted \u{b7} ~ pending \u{b7} \u{d7} rejected \u{b7} ! failed \u{b7} ? unknown",
-                    Style::default().fg(Color::DarkGray),
+                    app.theme.muted,
                 )),
             ]
         } else {
             vec![Line::from(Span::styled(
                 "Q QRZ C ClubLog E eQSL D cqdx L LoTW",
-                Style::default().fg(Color::DarkGray),
+                app.theme.muted,
             ))]
         };
         f.render_widget(Paragraph::new(legend), legend_area);
@@ -1996,7 +1890,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(app.theme.modal_border);
         f.render_widget(block, card_area);
         f.render_widget(
             Paragraph::new(detail),
@@ -2026,7 +1920,8 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title(" Station Health — k aborts QSO, Esc/S close ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(app.theme.modal)
+        .border_style(app.theme.modal_border);
     let inner = block.inner(modal_area);
 
     // PAN-89: the readiness section can push the panel past its height
@@ -2079,16 +1974,16 @@ pub fn health_panel_scroll_bounds(area: Rect, app: &App) -> (u16, u16) {
 /// The Shift+S panel body: readiness section, pipeline health, rig/audio/
 /// clock rows, session counts.
 fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
-    fn dot(ok: bool) -> Span<'static> {
+    let dot = |ok: bool| -> Span<'static> {
         if ok {
-            Span::styled("●", Style::default().fg(Color::Green))
+            Span::styled("●", app.theme.success)
         } else {
-            Span::styled("●", Style::default().fg(Color::Red))
+            Span::styled("●", app.theme.error)
         }
-    }
-    fn gray_dot() -> Span<'static> {
-        Span::styled("●", Style::default().fg(Color::DarkGray))
-    }
+    };
+    // PAN-291: a TX-meter row with nothing to judge (no CAT rig, no
+    // readings, not keyed) shows a de-emphasised dot.
+    let gray_dot = || -> Span<'static> { Span::styled("●", app.theme.muted) };
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2173,7 +2068,7 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
         None => {
             lines.push(Line::from(Span::styled(
                 "  Waiting for first health tick (~2s after startup)...",
-                Style::default().fg(Color::DarkGray),
+                app.theme.muted,
             )));
         }
     }
@@ -2275,7 +2170,7 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 /// Render the required out-of-band acknowledgment modal.
-pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64) {
+pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64, theme: &Theme) {
     if area.width < 10 || area.height < 4 {
         return;
     }
@@ -2295,17 +2190,9 @@ pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" \u{26a0} Out of band ")
-        .border_style(Style::default().fg(Color::Red));
+        .style(theme.modal)
+        .border_style(theme.modal_danger);
     f.render_widget(Paragraph::new(body).block(block), modal_area);
-}
-
-/// Helper function to get panel-specific colors
-pub fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> Color {
-    match snr {
-        snr if snr >= 0 => theme.success_color(),
-        snr if snr >= -10 => theme.warning_color(),
-        _ => theme.error_color(),
-    }
 }
 
 /// Helper function to format distance
@@ -2353,6 +2240,7 @@ pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
 #[cfg(test)]
 mod view_render_tests {
     use super::*;
+    use crate::theme::ThemeName;
     use ratatui::{backend::TestBackend, Terminal};
 
     async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
@@ -2544,12 +2432,13 @@ mod view_render_tests {
         let buf = term.backend().buffer().clone();
 
         // Row 0 is the title bar. Walk every cell and assert: any cell whose
-        // fg is the theme's accent color carries NO background paint (the
+        // fg is the theme's `title` token carries NO background paint (the
         // chip's bg must equal the plain title-bar background), while at
-        // least one cell still carries the TX-policy banner's Green bg (that
-        // one is untouched by this task).
-        let accent = app.theme.accent_color();
-        let bg = app.theme.background_color();
+        // least one cell still carries the TX-policy banner's `tx_full` bg
+        // (that one is untouched by this task).
+        let accent = theme::fg_color(app.theme.title);
+        let bg = theme::bg_color(app.theme.page);
+        let policy_bg = theme::bg_color(app.theme.tx_full);
         let mut found_accent_chip = false;
         let mut found_policy_banner = false;
         for x in 0..buf.area.width {
@@ -2562,7 +2451,7 @@ mod view_render_tests {
                     cell.bg
                 );
             }
-            if cell.bg == ratatui::style::Color::Green {
+            if cell.bg == policy_bg {
                 found_policy_banner = true;
             }
         }
@@ -2572,7 +2461,7 @@ mod view_render_tests {
         );
         assert!(
             found_policy_banner,
-            "TX-policy banner (Green bg) must be untouched"
+            "TX-policy banner (tx_full bg) must be untouched"
         );
     }
 
@@ -2655,8 +2544,8 @@ mod view_render_tests {
             .find(|&i| chars[i..].iter().collect::<String>().starts_with("⚠ CLOCK"))
             .expect("clock chip in row 1");
         let cell = &buf[(x as u16, 1)];
-        assert_eq!(cell.fg, Color::Black);
-        assert_eq!(cell.bg, Color::Yellow);
+        assert_eq!(cell.fg, theme::fg_color(Theme::DARK.chip_warning));
+        assert_eq!(cell.bg, theme::bg_color(Theme::DARK.chip_warning));
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
@@ -2891,7 +2780,7 @@ mod view_render_tests {
             "{row:?}"
         );
         assert!(!row.contains("reduce audio drive"), "{row:?}");
-        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Green);
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.success.fg.unwrap());
     }
 
     #[tokio::test]
@@ -2911,7 +2800,7 @@ mod view_render_tests {
             row.contains("TX meter: 52 W, ALC 0.81 (limit 0.50), reduce audio drive"),
             "{row:?}"
         );
-        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Red);
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.error.fg.unwrap());
     }
 
     #[tokio::test]
@@ -2962,7 +2851,7 @@ mod view_render_tests {
             if capability.alc_limit.is_none() {
                 assert!(!row.contains("(limit"), "{row:?}");
             }
-            assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Green);
+            assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.success.fg.unwrap());
         }
     }
 
@@ -2978,7 +2867,7 @@ mod view_render_tests {
                 tx_meter_row(&buf).contains("TX meter: needs a connected CAT rig"),
                 "{state:?}"
             );
-            assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
+            assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
         }
         let app = tx_meter_app(
             None,
@@ -2993,7 +2882,7 @@ mod view_render_tests {
         assert!(
             tx_meter_row(&buf).contains("TX meter: this rig does not report power or ALC over CAT")
         );
-        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
 
         // Connected, capability unknown, no reading yet.
         let app = tx_meter_app(None, None).await;
@@ -3012,7 +2901,7 @@ mod view_render_tests {
         app.tx_meter_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3));
         let buf = render_health(&app).await;
         assert!(tx_meter_row(&buf).contains("TX meter: shown while transmitting"));
-        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
     }
 
     async fn render_health(app: &crate::app::App) -> ratatui::buffer::Buffer {
@@ -3170,7 +3059,7 @@ mod view_render_tests {
 
     /// Dot colour of the first row containing `needle` (the `●` sits right
     /// before the text).
-    fn dot_fg_for(buf: &ratatui::buffer::Buffer, needle: &str) -> Color {
+    fn dot_fg_for(buf: &ratatui::buffer::Buffer, needle: &str) -> ratatui::style::Color {
         for y in 0..buf.area.height {
             let row = row_text(buf, y);
             if let Some(byte_idx) = row.find(needle) {
@@ -3193,12 +3082,18 @@ mod view_render_tests {
         app.tx_output_default = true;
         let buf = render_health(&app).await;
         assert!(buffer_contains(&buf, "SYSTEM DEFAULT — check device"));
-        assert_eq!(dot_fg_for(&buf, "TX audio output"), Color::Red);
+        assert_eq!(
+            dot_fg_for(&buf, "TX audio output"),
+            theme::fg_color(app.theme.error)
+        );
 
         app.tx_output_default = false;
         let buf = render_health(&app).await;
         assert!(buffer_contains(&buf, "TX audio output: explicit device"));
-        assert_eq!(dot_fg_for(&buf, "TX audio output"), Color::Green);
+        assert_eq!(
+            dot_fg_for(&buf, "TX audio output"),
+            theme::fg_color(app.theme.success)
+        );
     }
 
     #[tokio::test]
@@ -3254,13 +3149,15 @@ mod view_render_tests {
     }
 
     /// PAN-280: a QSO opened at 73 whose 73 never aired reads as a TX-timing
-    /// outcome (yellow, like `Timeout`), not a defect.
+    /// outcome (`warning`, like `Timeout`), not a defect.
     #[test]
     fn close_not_aired_is_yellow() {
-        assert_eq!(
-            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::CloseNotAired),
-            Color::Yellow
-        );
+        for theme in ThemeName::ALL.map(Theme::for_name) {
+            assert_eq!(
+                recent_qso_failure_style(&pancetta_qso::QsoFailureReason::CloseNotAired, &theme),
+                theme.warning
+            );
+        }
     }
 
     #[test]
@@ -3598,8 +3495,11 @@ mod view_render_tests {
     #[tokio::test]
     async fn render_recent_qsos_panel_smoke_test() {
         assert_eq!(
-            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::ControlTransferred),
-            Color::Gray
+            recent_qso_failure_style(
+                &pancetta_qso::QsoFailureReason::ControlTransferred,
+                &Theme::DARK
+            ),
+            Theme::DARK.secondary
         );
 
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
@@ -3615,17 +3515,21 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Recent QSOs"));
         assert!(buffer_contains(&buf, "No completed QSOs yet this session."));
 
-        // SupervisorRestart rides the same Yellow bucket as Timeout — a
+        // SupervisorRestart rides the same `warning` bucket as Timeout — a
         // system-side interruption, not an operator or protocol error.
         assert_eq!(
-            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::SupervisorRestart),
-            Color::Yellow
+            recent_qso_failure_style(
+                &pancetta_qso::QsoFailureReason::SupervisorRestart,
+                &Theme::DARK
+            ),
+            Theme::DARK.warning
         );
         assert_eq!(
-            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::ComponentCrash(
-                "Hamlib".to_string()
-            )),
-            Color::Yellow
+            recent_qso_failure_style(
+                &pancetta_qso::QsoFailureReason::ComponentCrash("Hamlib".to_string()),
+                &Theme::DARK
+            ),
+            Theme::DARK.warning
         );
 
         // A mixed stream: one Completed, and Faileds spanning all three
@@ -4034,7 +3938,7 @@ mod view_render_tests {
                     .spans
                     .iter()
                     .any(|s| s.content.contains("| AUTO-CQ PAUSED")
-                        && s.style.bg == Some(Color::Yellow)));
+                        && s.style.bg == Some(theme::bg_color(app.theme.cq_paused))));
             }
             assert!(!text.contains('⏸'));
             let buf = render_app(&app, 300, 40);
@@ -4048,9 +3952,8 @@ mod view_render_tests {
             assert!(line.width() <= width as usize);
             if line_text(&line).contains("| CQ PAUSED: press a key") {
                 saw_compact = true;
-                assert!(line.spans.iter().any(
-                    |s| s.content.contains("| CQ PAUSED") && s.style.bg == Some(Color::Yellow)
-                ));
+                assert!(line.spans.iter().any(|s| s.content.contains("| CQ PAUSED")
+                    && s.style.bg == Some(theme::bg_color(app.theme.cq_paused))));
             }
         }
         assert!(saw_compact);
@@ -4081,7 +3984,7 @@ mod view_render_tests {
             assert!(buf
                 .content
                 .iter()
-                .any(|c| c.symbol() == "*" && c.bg == Color::Red));
+                .any(|c| c.symbol() == "*" && c.bg == theme::bg_color(app.theme.alarm)));
         }
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| qso_status::render_qso_status(f, f.area(), &app).unwrap())
@@ -4093,7 +3996,7 @@ mod view_render_tests {
         assert!(buf
             .content
             .iter()
-            .any(|c| c.symbol() == "*" && c.bg == Color::Red));
+            .any(|c| c.symbol() == "*" && c.bg == theme::bg_color(app.theme.alarm)));
         app.tx_now_sending = None;
         app.tx_queued.clear();
         let buf = render_app(&app, 120, 40);
@@ -4258,16 +4161,17 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn replay_title_bar_is_neutral_from_first_draw_for_every_policy() {
-        use crate::config::{Config, Theme};
+        use crate::config::Config;
         use pancetta_core::TxPolicy;
 
-        for theme in [Theme::Dark, Theme::Light] {
+        for name in ThemeName::ALL {
+            let theme = Theme::for_name(name);
             for policy in [TxPolicy::Full, TxPolicy::RespondOnly, TxPolicy::Disabled] {
                 let mut config = Config {
                     replay: true,
                     ..Config::default()
                 };
-                config.ui.theme = theme;
+                config.ui.theme = name;
                 let mut app = App::new(config, None).await.unwrap();
                 app.tx_policy = policy;
                 for view in ALL_VIEWS {
@@ -4277,7 +4181,7 @@ mod view_render_tests {
                         let row = row_text(&buf, 0);
                         let chip = " TX: REPLAY ";
                         let start = row.find(chip).unwrap_or_else(|| {
-                            panic!("{theme:?} {policy:?} {view:?} {width}: [{row}]")
+                            panic!("{name:?} {policy:?} {view:?} {width}: [{row}]")
                         });
                         for text in ["TX: FULL", "TX: RESPOND-ONLY", "TX: DISABLED"] {
                             assert!(!row.contains(text), "[{row}]");
@@ -4286,8 +4190,8 @@ mod view_render_tests {
                         let start_col = row[..start].chars().count() as u16;
                         for x in start_col..start_col + chip.len() as u16 {
                             let cell = &buf[(x, 0)];
-                            assert_eq!(cell.fg, Color::Black);
-                            assert_eq!(cell.bg, Color::Gray);
+                            assert_eq!(cell.fg, theme::fg_color(theme.tx_replay), "{name:?}");
+                            assert_eq!(cell.bg, theme::bg_color(theme.tx_replay), "{name:?}");
                             assert!(cell.modifier.contains(Modifier::BOLD));
                         }
                     }
@@ -4497,6 +4401,7 @@ mod view_render_tests {
                     visible: true,
                     buffer: String::new(),
                 },
+                &Theme::DARK,
             )
         })
         .unwrap();
@@ -4505,7 +4410,7 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn numeric_snr_cells_share_theme_scale_across_panels() {
-        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+        for theme in ThemeName::ALL.map(Theme::for_name) {
             let mut app = default_app().await;
             app.theme = theme;
             app.active_panel = ActivePanel::QsoStatus;
@@ -4525,7 +4430,7 @@ mod view_render_tests {
                     snr_rx: Some(snr),
                     ..Default::default()
                 }];
-                let expected = get_snr_color(snr, &theme);
+                let expected = theme::fg_color(theme.snr(snr));
                 for panel in 0..3 {
                     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
                     term.draw(|f| match panel {
@@ -4548,7 +4453,8 @@ mod view_render_tests {
                             assert_eq!(
                                 buf[(x, y)].fg,
                                 expected,
-                                "panel {panel}, SNR {snr}, theme {theme:?}"
+                                "panel {panel}, SNR {snr}, theme {:?}",
+                                theme.name
                             );
                             found = true;
                         }
@@ -4768,7 +4674,7 @@ mod view_render_tests {
         );
         let cell = &buf[(0, 29)];
         assert_eq!(cell.symbol(), "S");
-        assert_eq!(cell.fg, app.theme.accent_color());
+        assert_eq!(cell.fg, theme::fg_color(app.theme.key));
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 }
@@ -4801,9 +4707,9 @@ mod hit_test_tests {
                     app.compose_mode = false;
                     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                     for (level, color) in [
-                        (Info, app.theme.accent_color()),
-                        (Warn, app.theme.warning_color()),
-                        (Error, app.theme.error_color()),
+                        (Info, theme::fg_color(app.theme.info)),
+                        (Warn, theme::fg_color(app.theme.warning)),
+                        (Error, theme::fg_color(app.theme.error)),
                     ] {
                         app.clear_status_for_test();
                         app.status_test_push("TOKEN", level, Instant::now());

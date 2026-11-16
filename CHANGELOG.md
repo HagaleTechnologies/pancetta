@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-387: `[ui] theme` now selects the TUI palette: `dark` (default, unchanged), `light` or `high-contrast`; `[ui.accessibility] high_contrast = true` selects high-contrast. Every panel and overlay, including the pickers and modals, follows the theme. An unknown theme warns and uses dark. Restart required.
 - PAN-320: `[audio] decimation_antialias_filter` (default `false`, restart required) opts the 48 kHz receive path into a unity-gain 31-tap FIR anti-alias decimator in place of every-fourth-sample subsampling, with its passband pinned flat to 4 kHz by tests and its CPU cost CI-budgeted under 5 ms per 15 s window. The FIR applies only at 48 kHz; other supported rates keep subsampling with a startup warning. The stage resets at every destructive DSP buffer flush (gain change, dial change, mode change, forward clock jump) and its 15-sample group delay is compensated in the decode-window anchor. The shipped default stays `subsample` until the recorded station A/B (quiet, busy, TX-desense; see `docs/measurements/PAN-320-decimation.md`) shows the FIR decoding strictly more merged messages; the local `decimation-ab` research binary runs that comparison once the PAN-393 captures exist.
 - PAN-304: Keep rotating, byte-exact startup snapshots of changed `qsos.adi` logbooks. Enabled by default with seven copies; directory and retention are configurable.
 

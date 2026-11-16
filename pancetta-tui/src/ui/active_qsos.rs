@@ -9,7 +9,7 @@
 use crate::app::App;
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -20,10 +20,7 @@ use ratatui::{
 /// banner row always has consistent visual weight.
 pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
     if app.active_qsos.is_empty() {
-        let text = Line::from(Span::styled(
-            "QSO: (none in progress)",
-            Style::default().fg(app.theme.muted_color()),
-        ));
+        let text = Line::from(Span::styled("QSO: (none in progress)", app.theme.muted));
         f.render_widget(Paragraph::new(text), area);
         return;
     }
@@ -71,9 +68,7 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(
         "QSO: ",
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+        app.theme.title.add_modifier(Modifier::BOLD),
     ));
 
     let budget = area.width as usize;
@@ -137,30 +132,20 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
             break;
         }
         if idx > 0 {
-            spans.push(Span::styled(
-                separator,
-                Style::default().fg(app.theme.muted_color()),
-            ));
+            spans.push(Span::styled(separator, app.theme.muted));
         }
         if is_selected {
             spans.push(Span::styled(
                 marker,
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
+                app.theme.focus.add_modifier(Modifier::BOLD),
             ));
         }
-        let mut call_style = Style::default()
-            .fg(app.theme.success_color())
-            .add_modifier(Modifier::BOLD);
+        let mut call_style = app.theme.engaged.add_modifier(Modifier::BOLD);
         if is_selected {
             call_style = call_style.add_modifier(Modifier::REVERSED);
         }
         spans.push(Span::styled(q.their_callsign.clone(), call_style));
-        spans.push(Span::styled(
-            detail.clone(),
-            Style::default().fg(app.theme.foreground_color()),
-        ));
+        spans.push(Span::styled(detail.clone(), app.theme.text));
         used += separator.chars().count()
             + marker.chars().count()
             + q.their_callsign.chars().count()
@@ -170,7 +155,7 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
     if shown < qsos.len() {
         spans.push(Span::styled(
             format!("  │  +{} more", qsos.len() - shown),
-            Style::default().fg(app.theme.muted_color()),
+            app.theme.muted,
         ));
     }
 

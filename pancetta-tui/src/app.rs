@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::config::{Config, Theme};
+use crate::config::Config;
+use crate::theme::Theme;
 use pancetta_qso::priority::PriorityFactors;
 
 /// PAN-291: a TX meter reading counts as live this many seconds after it
@@ -1951,7 +1952,7 @@ impl App {
                 );
                 statuses
             },
-            theme: config.ui.theme,
+            theme: Theme::for_name(config.ui.theme),
             diagnostic_events: VecDeque::with_capacity(500),
             recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
