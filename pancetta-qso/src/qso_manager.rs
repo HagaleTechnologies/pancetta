@@ -10173,12 +10173,12 @@ mod sm_f5_qso_failed_event_tests;
 mod tx_frequency_hold_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan72_stall_detection_tests.rs"]
-mod pan72_stall_detection_tests;
+#[path = "qso_manager/tests/stall_detection_tests.rs"]
+mod stall_detection_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan83_answered_frame_tests.rs"]
-mod pan83_answered_frame_tests;
+#[path = "qso_manager/tests/answered_frame_tests.rs"]
+mod answered_frame_tests;
 
 #[cfg(test)]
 #[path = "qso_manager/tests/has_active_or_recent_qso_tests.rs"]
@@ -10201,25 +10201,25 @@ mod timeout_config_tests;
 mod current_remote_binding_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan138_recheck_tests.rs"]
-mod pan138_recheck_tests;
+#[path = "qso_manager/tests/guard_recheck_tests.rs"]
+mod guard_recheck_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan138_outcome_tests.rs"]
-mod pan138_outcome_tests;
+#[path = "qso_manager/tests/manual_call_outcome_tests.rs"]
+mod manual_call_outcome_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan260.rs"]
-mod pan260;
+#[path = "qso_manager/tests/completed_history_tests.rs"]
+mod completed_history_tests;
 
 #[cfg(test)]
 #[path = "qso_manager/tests/pending_completion_tests.rs"]
 mod pending_completion_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan275_completed_close_tests.rs"]
-mod pan275_completed_close_tests;
+#[path = "qso_manager/tests/completed_close_tests.rs"]
+mod completed_close_tests;
 
 #[cfg(test)]
-#[path = "qso_manager/tests/pan296_watchdog_tests.rs"]
-mod pan296_watchdog_tests;
+#[path = "qso_manager/tests/clock_step_watchdog_tests.rs"]
+mod clock_step_watchdog_tests;

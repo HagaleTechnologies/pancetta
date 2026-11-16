@@ -8,8 +8,8 @@ while getopts 'n:' option; do
 done
 [[ "$iterations" =~ ^[1-9][0-9]*$ ]] || { echo 'Expected a positive iteration count' >&2; exit 2; }
 # Warm the test artifacts so compilation is not counted as test runtime.
-cargo test -p pancetta-qso --lib pan72_stall_detection_tests --no-run
-cargo test -p pancetta --features pancetta-ft8/transmit --lib pan71_playback_start_tests --no-run
+cargo test -p pancetta-qso --lib stall_detection_tests --no-run
+cargo test -p pancetta --features pancetta-ft8/transmit --lib playback_start_tests --no-run
 python3 - "$iterations" <<'PYTHON'
 import os, signal, statistics, subprocess, sys, tempfile, time
 import atexit
@@ -27,8 +27,8 @@ def cleanup():
     scratch.cleanup()
 atexit.register(cleanup)
 commands = [
-    ['cargo', 'test', '-p', 'pancetta-qso', '--lib', 'pan72_stall_detection_tests'],
-    ['cargo', 'test', '-p', 'pancetta', '--features', 'pancetta-ft8/transmit', '--lib', 'pan71_playback_start_tests'],
+    ['cargo', 'test', '-p', 'pancetta-qso', '--lib', 'stall_detection_tests'],
+    ['cargo', 'test', '-p', 'pancetta', '--features', 'pancetta-ft8/transmit', '--lib', 'playback_start_tests'],
 ]
 times = [[], []]
 passed = 0

@@ -3,7 +3,7 @@
 //! "working" (the DX keeps advancing) — offset is otherwise irrelevant
 //! to whether the DX hears us, since FT8 receivers decode the whole
 //! passband. What happens once it *stops* working (the DX stalls) is
-//! `pan72_stall_detection_tests`, not this module — this module
+//! `stall_detection_tests`, not this module — this module
 //! previously also covered the fixed +300Hz repeat-frame "stuck-DX hop"
 //! escape mechanism, removed by PAN-72 in favor of the silence-driven
 //! stall detector there.

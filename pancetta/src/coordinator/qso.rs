@@ -2677,8 +2677,8 @@ async fn register_autonomous_cq_open_or_decline(
 mod autonomous_cq_open_registration_tests;
 
 #[cfg(test)]
-#[path = "qso/tests/pan6_diagnostic_tests.rs"]
-mod pan6_diagnostic_tests;
+#[path = "qso/tests/skip_diagnostic_tests.rs"]
+mod skip_diagnostic_tests;
 
 fn rejection_reason_text(reason: &pancetta_qso::RejectionReason) -> &'static str {
     use pancetta_qso::RejectionReason as R;
@@ -7884,12 +7884,12 @@ mod remote_controller_change_tests;
 // maybe_answer_caller can create a QSO on the new band.
 // ------------------------------------------------------------------
 #[cfg(test)]
-#[path = "qso/tests/pan69_stale_band_tests.rs"]
-mod pan69_stale_band_tests;
+#[path = "qso/tests/stale_band_tests.rs"]
+mod stale_band_tests;
 
 #[cfg(test)]
-#[path = "qso/tests/pan120_tests.rs"]
-mod pan120_tests;
+#[path = "qso/tests/new_caller_policy_tests.rs"]
+mod new_caller_policy_tests;
 
 /// Attach history only after its dated all-band read succeeds. Keep the manager's broadcaster.
 async fn initialize_qso_history(
@@ -7931,20 +7931,20 @@ pub(super) async fn replay_history_db(
 }
 
 #[cfg(test)]
-#[path = "qso/tests/pan260.rs"]
-mod pan260;
+#[path = "qso/tests/restart_history_recall_tests.rs"]
+mod restart_history_recall_tests;
 
 #[cfg(test)]
-#[path = "qso/tests/pan268.rs"]
-mod pan268;
+#[path = "qso/tests/replay_startup_seed_tests.rs"]
+mod replay_startup_seed_tests;
 
 #[cfg(test)]
 #[path = "qso/tests/dxpedition_receive_integration_tests.rs"]
 mod dxpedition_receive_integration_tests;
 
 #[cfg(test)]
-#[path = "qso/tests/pan50_live_contest.rs"]
-mod pan50_live_contest;
+#[path = "qso/tests/live_contest_completion_tests.rs"]
+mod live_contest_completion_tests;
 
 #[cfg(test)]
 #[path = "qso/tests/completed_tx_purge_tests.rs"]

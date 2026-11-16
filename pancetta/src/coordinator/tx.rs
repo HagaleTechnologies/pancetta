@@ -2720,8 +2720,8 @@ pub fn tx_rf_for_gate(
 }
 
 #[cfg(test)]
-#[path = "tx/tests/pan118_band_plan_gate_tests.rs"]
-mod pan118_band_plan_gate_tests;
+#[path = "tx/tests/band_plan_gate_tests.rs"]
+mod band_plan_gate_tests;
 
 /// PAN-208: a `custom_bands` entry with two or more `ranges` leaves gaps
 /// inside the band. The occupied signal `[floor(low), ceil(low + span)]`
@@ -2729,8 +2729,8 @@ mod pan118_band_plan_gate_tests;
 /// independently let a frame whose base tone sat in one range and top
 /// tone in the next key across the excluded gap (PR #446 Codex review).
 #[cfg(test)]
-#[path = "tx/tests/pan208_band_plan_gap_tests.rs"]
-pub(crate) mod pan208_band_plan_gap_tests;
+#[path = "tx/tests/band_plan_gap_tests.rs"]
+pub(crate) mod band_plan_gap_tests;
 
 /// PAN-89: one TX hard-mute cause, display-only. Declared in
 /// [`tx_hard_mute_reason`]'s priority order; [`TxMuteCause::as_reason`]
@@ -11751,8 +11751,8 @@ mod classifier_tests;
 /// while the rig CAT link is lost, or while the audio output is dead, is
 /// refused at the key-time gate with no `SetPtt{true}` ever reaching Hamlib.
 #[cfg(test)]
-#[path = "tx/tests/pan115_worker_gate_tests.rs"]
-pub(super) mod pan115_worker_gate_tests;
+#[path = "tx/tests/worker_gate_tests.rs"]
+pub(super) mod worker_gate_tests;
 
 #[cfg(test)]
 #[path = "tx/tests/report_transmit_complete_tests.rs"]
@@ -11767,16 +11767,16 @@ mod report_transmit_complete_tests;
 /// `--test-tx`, replay seed) skips the check, keeping those modes
 /// byte-identical.
 #[cfg(test)]
-#[path = "tx/tests/pan118_worker_band_plan_tests.rs"]
-mod pan118_worker_band_plan_tests;
+#[path = "tx/tests/worker_band_plan_tests.rs"]
+mod worker_band_plan_tests;
 
 /// PAN-202: key-down reaches Hamlib's queue while another component's
 /// channel registration holds the bus table, through the real TX worker over
 /// a real `MessageBus`, at every key-down site (single TX, bundle, tune), plus
 /// the shared helper the TUI's manual PTT uses.
 #[cfg(test)]
-#[path = "tx/tests/pan202_key_down_worker_tests.rs"]
-mod pan202_key_down_worker_tests;
+#[path = "tx/tests/key_down_worker_tests.rs"]
+mod key_down_worker_tests;
 
 /// PAN-136: a multi-TX bundle whose item is re-bound during the pre-PTT wait
 /// (Step 4b-pivot swaps the item's binding with its payload) is gated under
@@ -11785,8 +11785,8 @@ mod pan202_key_down_worker_tests;
 /// keyed a frame now bound to an unarmed remote client, and client A's bundle
 /// aired client B's frame under A's gate.
 #[cfg(test)]
-#[path = "tx/tests/pan136_bundle_binding_worker_tests.rs"]
-mod pan136_bundle_binding_worker_tests;
+#[path = "tx/tests/bundle_binding_worker_tests.rs"]
+mod bundle_binding_worker_tests;
 
 /// PAN-208: the gap-straddling Gherkin end to end, through the real TX
 /// worker with a two-range `custom_bands` entry for 20m in its config. A
@@ -11794,44 +11794,44 @@ mod pan136_bundle_binding_worker_tests;
 /// is refused before `SetPtt{true}` reaches Hamlib; a frame wholly inside
 /// one range still keys.
 #[cfg(test)]
-#[path = "tx/tests/pan208_worker_band_plan_tests.rs"]
-mod pan208_worker_band_plan_tests;
+#[path = "tx/tests/worker_band_plan_gap_tests.rs"]
+mod worker_band_plan_gap_tests;
 
 #[cfg(test)]
-#[path = "tx/tests/pan135_ptt_release_tests.rs"]
-mod pan135_ptt_release_tests;
+#[path = "tx/tests/ptt_release_tests.rs"]
+mod ptt_release_tests;
 
 #[cfg(test)]
-#[path = "tx/tests/pan135_disarm_flush_tests.rs"]
-mod pan135_disarm_flush_tests;
+#[path = "tx/tests/disarm_flush_tests.rs"]
+mod disarm_flush_tests;
 #[cfg(test)]
-#[path = "tx/tests/pan135_worker_disarm_tests.rs"]
-mod pan135_worker_disarm_tests;
+#[path = "tx/tests/worker_disarm_tests.rs"]
+mod worker_disarm_tests;
 /// PAN-273: the real TX worker unkeys through `PttGuard::release`, so a
 /// PTT-off dropped on a momentarily full Hamlib channel is retried, and a
 /// delivered one stands the guard down (no duplicate unkey from its `Drop`).
 #[cfg(test)]
-#[path = "tx/tests/pan273_worker_unkey_tests.rs"]
-mod pan273_worker_unkey_tests;
+#[path = "tx/tests/worker_unkey_tests.rs"]
+mod worker_unkey_tests;
 
 /// PAN-122: every frame whose audio the real TX worker enqueues gets one
 /// durable line in `<home>/.pancetta/tx-log.jsonl` — headless, with the TUI
 /// channel full, single or bundled — and nothing else does.
 #[cfg(test)]
-#[path = "tx/tests/pan122_tx_log_worker_tests.rs"]
-mod pan122_tx_log_worker_tests;
+#[path = "tx/tests/tx_log_worker_tests.rs"]
+mod tx_log_worker_tests;
 
 /// PAN-146: the DX-parity gate, through the real TX worker, scopes its a7
 /// evidence to the live dial's band. A DX kept fresh on 20 m Odd holds an
 /// Odd call on 20 m, and does not hold the same call after the operator
 /// moved to 15 m.
 #[cfg(test)]
-#[path = "tx/tests/pan146_dx_parity_context_worker_tests.rs"]
-mod pan146_dx_parity_context_worker_tests;
+#[path = "tx/tests/dx_parity_context_worker_tests.rs"]
+mod dx_parity_context_worker_tests;
 
 #[cfg(test)]
-#[path = "tx/tests/pan182_audio_delivery_tests.rs"]
-mod pan182_audio_delivery_tests;
+#[path = "tx/tests/audio_delivery_tests.rs"]
+mod audio_delivery_tests;
 
 /// PAN-278: a PTT-on that `send_ptt_command` returns `Dropped` while Hamlib's
 /// route is registered (here: Hamlib's channel is full) never keyed the rig.
@@ -11843,32 +11843,32 @@ mod pan182_audio_delivery_tests;
 /// (as `await_completion` does) un-saturates the channel and lets the
 /// key-down through, which hides the defect.
 #[cfg(test)]
-#[path = "tx/tests/pan278_dropped_ptt_on_tests.rs"]
-mod pan278_dropped_ptt_on_tests;
+#[path = "tx/tests/dropped_ptt_on_tests.rs"]
+mod dropped_ptt_on_tests;
 
 /// PAN-223: `report_frame_scheduled` carries the worker's own
 /// `TxSchedule::target_slot` to the QSO engine, durably, and only for frames
 /// that name both a QSO and a ledger attempt.
 #[cfg(test)]
-#[path = "tx/tests/pan223_frame_scheduled_report_tests.rs"]
-mod pan223_frame_scheduled_report_tests;
+#[path = "tx/tests/frame_scheduled_report_tests.rs"]
+mod frame_scheduled_report_tests;
 
 /// PAN-223: the real TX worker reports the slot `schedule_tx` picked from its
 /// own dequeue instant. Each test ends at the report and never waits for the
 /// slot itself.
 #[cfg(test)]
-#[path = "tx/tests/pan223_scheduled_slot_worker_tests.rs"]
-mod pan223_scheduled_slot_worker_tests;
+#[path = "tx/tests/scheduled_slot_worker_tests.rs"]
+mod scheduled_slot_worker_tests;
 
 /// PAN-183: each frame's keep-call ledger attempt rides its request through
 /// coalescing, pivots and supersedes, and comes back on `TxFrameNotSent`, so
 /// the QSO engine rolls back exactly the attempt that failed.
 #[cfg(test)]
-#[path = "tx/tests/pan183_attempt_identity_tests.rs"]
-mod pan183_attempt_identity_tests;
+#[path = "tx/tests/attempt_identity_tests.rs"]
+mod attempt_identity_tests;
 #[cfg(test)]
-#[path = "tx/tests/pan71_playback_start_tests.rs"]
-mod pan71_playback_start_tests;
+#[path = "tx/tests/playback_start_tests.rs"]
+mod playback_start_tests;
 
 #[cfg(test)]
 #[path = "tx/tests/receive_overload_ptt_admission_tests.rs"]
@@ -11877,8 +11877,8 @@ mod receive_overload_ptt_admission_tests;
 /// PAN-279: every unaired frame settles through `tx_outcome`, driven
 /// through the real TX worker.
 #[cfg(test)]
-#[path = "tx/tests/pan279_settlement_worker_tests.rs"]
-mod pan279_settlement_worker_tests;
+#[path = "tx/tests/settlement_worker_tests.rs"]
+mod settlement_worker_tests;
 
 #[cfg(test)]
 mod abort_transcripts;
