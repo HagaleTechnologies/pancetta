@@ -1,14 +1,15 @@
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Gauge, Paragraph},
     Frame,
 };
 
-use super::{create_panel_block, format_time_ago, get_snr_color};
+use super::{create_panel_block, format_time_ago};
 use crate::app::{ActivePanel, App};
+use crate::theme::{self, Theme};
 
 /// Resolve a DX station's DXCC entity name for display: when the partner has
 /// a DX Hunter row, read its `DxStation::display_entity` (cqdx's
@@ -121,11 +122,8 @@ fn snr_label(snr: Option<i32>) -> String {
     snr.map_or_else(|| "—".to_string(), |value| format!("{value:+} dB"))
 }
 
-fn snr_style(snr: Option<i32>, app: &App) -> Style {
-    Style::default().fg(snr.map_or_else(
-        || app.theme.muted_color(),
-        |value| get_snr_color(value, &app.theme),
-    ))
+fn snr_style(snr: Option<i32>, theme: &Theme) -> Style {
+    snr.map_or(theme.muted, |value| theme.snr(value))
 }
 
 fn render_compact_qso(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -156,9 +154,9 @@ fn render_compact_qso(f: &mut Frame<'_>, area: Rect, app: &App) {
             )),
             3 => Line::from(vec![
                 Span::raw("TX SNR: "),
-                Span::styled(snr_label(qso.snr_tx), snr_style(qso.snr_tx, app)),
+                Span::styled(snr_label(qso.snr_tx), snr_style(qso.snr_tx, &app.theme)),
                 Span::raw("  RX SNR: "),
-                Span::styled(snr_label(qso.snr_rx), snr_style(qso.snr_rx, app)),
+                Span::styled(snr_label(qso.snr_rx), snr_style(qso.snr_rx, &app.theme)),
             ]),
             4 => {
                 if let Some(item) =
@@ -166,7 +164,7 @@ fn render_compact_qso(f: &mut Frame<'_>, area: Rect, app: &App) {
                 {
                     Line::from(Span::styled(
                         format!("NOW: TX {} @{:.0}Hz", item.text, item.freq_hz),
-                        Style::default().fg(app.theme.error_color()),
+                        app.theme.own_tx,
                     ))
                 } else {
                     Line::from(format!(
@@ -197,10 +195,7 @@ fn render_compact_qso(f: &mut Frame<'_>, area: Rect, app: &App) {
             }
             _ => unreachable!(),
         };
-        f.render_widget(
-            Paragraph::new(line).style(Style::default().fg(app.theme.foreground_color())),
-            target,
-        );
+        f.render_widget(Paragraph::new(line).style(app.theme.text), target);
     }
 }
 
@@ -210,9 +205,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Header
     lines.push(Line::from(vec![Span::styled(
         "  Call       Freq     State         Step    SNR  Exch ",
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+        app.theme.title.add_modifier(Modifier::BOLD),
     )]));
 
     // Each active QSO. `cursor` selects which row is highlighted; it indexes
@@ -239,38 +232,23 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             .unwrap_or("-");
         let snr = qso.snr_rx.map_or("---".to_string(), |s| format!("{:+}", s));
 
-        let base_fg = if selected {
-            app.theme.accent_color()
+        let base = if selected {
+            app.theme.info
         } else {
-            app.theme.foreground_color()
+            app.theme.text
         };
-        let mut call_style = Style::default().fg(base_fg).add_modifier(Modifier::BOLD);
+        let mut call_style = base.add_modifier(Modifier::BOLD);
         if selected {
             call_style = call_style.add_modifier(Modifier::REVERSED);
         }
 
         let mut row = vec![
             Span::styled(format!("{}{:<10}", marker, call), call_style),
-            Span::styled(
-                format!("{:>7}  ", freq),
-                Style::default().fg(app.theme.warning_color()),
-            ),
-            Span::styled(
-                format!("{:<13}", state),
-                Style::default().fg(app.theme.accent_color()),
-            ),
-            Span::styled(
-                format!("{:<7} ", step),
-                Style::default().fg(app.theme.warning_color()),
-            ),
-            Span::styled(
-                format!("{:>4}  ", snr),
-                Style::default().fg(app.theme.success_color()),
-            ),
-            Span::styled(
-                format!("{:>3}", qso.exchange_count),
-                Style::default().fg(app.theme.foreground_color()),
-            ),
+            Span::styled(format!("{:>7}  ", freq), app.theme.emphasis),
+            Span::styled(format!("{:<13}", state), app.theme.info),
+            Span::styled(format!("{:<7} ", step), app.theme.emphasis),
+            Span::styled(format!("{:>4}  ", snr), app.theme.success),
+            Span::styled(format!("{:>3}", qso.exchange_count), app.theme.text),
         ];
         // PAN-142 (Codex P1 on PR #371, round 4): fixed-width status badges
         // (Hound, drift candidate) go BEFORE the variable-width watchdog
@@ -301,10 +279,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         if qso.hound {
             row.push(Span::styled(
                 status_badge_glyphs::HOUND,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.hound.add_modifier(Modifier::BOLD),
             ));
         }
         // Drift-candidate badge — see the module-level PAN-142/PAN-144 doc
@@ -314,10 +289,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         if let Some(hz) = qso.pending_freq_drift_hz {
             row.push(Span::styled(
                 status_badge_glyphs::drift(hz),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
+                app.theme.chip_warning.add_modifier(Modifier::BOLD),
             ));
         }
         // Batch 2 #1: keep-calling watchdog ("Call 4/10 · stops 3:12") so a
@@ -327,19 +299,14 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
             row.push(Span::styled(
                 format!("  {}", text),
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
+                app.theme.warning.add_modifier(Modifier::BOLD),
             ));
         }
         lines.push(Line::from(row));
     }
 
     if lines.len() == 1 {
-        lines.push(Line::from(Span::styled(
-            " No active QSOs",
-            Style::default().fg(app.theme.muted_color()),
-        )));
+        lines.push(Line::from(Span::styled(" No active QSOs", app.theme.muted)));
     }
 
     // Cross-parity queued calls (#40): show a compact "Queued: …" line when
@@ -347,16 +314,8 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     // for the active TX window to clear rather than being silently dropped.
     if !app.pending_calls.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(
-                " Queued: ",
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format_queued_line(&app.pending_calls),
-                Style::default().fg(app.theme.warning_color()),
-            ),
+            Span::styled(" Queued: ", app.theme.warning.add_modifier(Modifier::BOLD)),
+            Span::styled(format_queued_line(&app.pending_calls), app.theme.warning),
         ]));
     }
 
@@ -365,7 +324,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     // focused.
     lines.push(Line::from(Span::styled(
         " [k] abort (any panel)  [r] re-send  Up/Down select  (r/select: this panel only)",
-        Style::default().fg(app.theme.muted_color()),
+        app.theme.muted,
     )));
 
     let paragraph = Paragraph::new(lines);
@@ -378,11 +337,9 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     let status_text = if qso.active { "ACTIVE QSO" } else { "STANDBY" };
 
     let status_style = if qso.active {
-        Style::default()
-            .fg(app.theme.success_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.success.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     };
 
     let call_text = qso.call_sign.as_deref().unwrap_or("---");
@@ -403,82 +360,57 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     let hound_badge: Option<Span<'_>> = if qso.hound {
         Some(Span::styled(
             " [HOUND]",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            app.theme.hound.add_modifier(Modifier::BOLD),
         ))
     } else {
         None
     };
 
     let mut status_line = vec![
-        Span::styled(
-            "Status: ",
-            Style::default().fg(app.theme.foreground_color()),
-        ),
+        Span::styled("Status: ", app.theme.text),
         Span::styled(status_text, status_style),
     ];
     if let Some(badge) = hound_badge {
         status_line.push(badge);
     }
     status_line.push(Span::raw("  "));
-    status_line.push(Span::styled(
-        "Call: ",
-        Style::default().fg(app.theme.foreground_color()),
-    ));
+    status_line.push(Span::styled("Call: ", app.theme.text));
     status_line.push(Span::styled(
         call_text,
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+        app.theme.info.add_modifier(Modifier::BOLD),
     ));
     // #171: DXCC entity of the station we're in QSO with, when resolvable.
     // Omitted entirely (not "(---)") when unresolved — this panel has less
     // room than DX Hunter's dedicated column.
     if let Some(call) = qso.call_sign.as_deref() {
         if let Some(entity) = resolve_entity(app, call) {
-            status_line.push(Span::styled(
-                format!(" ({entity})"),
-                Style::default().fg(app.theme.muted_color()),
-            ));
+            status_line.push(Span::styled(format!(" ({entity})"), app.theme.muted));
         }
     }
 
     let lines = vec![
         Line::from(status_line),
         Line::from(vec![
-            Span::styled("Freq: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(freq_text, Style::default().fg(app.theme.warning_color())),
+            Span::styled("Freq: ", app.theme.text),
+            Span::styled(freq_text, app.theme.emphasis),
             Span::raw("  "),
-            Span::styled("Mode: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(mode_text, Style::default().fg(app.theme.accent_color())),
+            Span::styled("Mode: ", app.theme.text),
+            Span::styled(mode_text, app.theme.info),
             Span::raw("  "),
-            Span::styled(
-                "Exchanges: ",
-                Style::default().fg(app.theme.foreground_color()),
-            ),
-            Span::styled(
-                format!("{}", qso.exchange_count),
-                Style::default().fg(app.theme.success_color()),
-            ),
+            Span::styled("Exchanges: ", app.theme.text),
+            Span::styled(format!("{}", qso.exchange_count), app.theme.success),
         ]),
         // Batch 94: state-machine phase + reports exchanged. The QSO
         // engine pushes these live via ActiveQsosUpdate snapshots.
         Line::from(vec![
-            Span::styled("State: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(
-                state_text,
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("State: ", app.theme.text),
+            Span::styled(state_text, app.theme.info.add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled("Sent: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(sent_text, Style::default().fg(app.theme.warning_color())),
+            Span::styled("Sent: ", app.theme.text),
+            Span::styled(sent_text, app.theme.emphasis),
             Span::raw("  "),
-            Span::styled("Rcvd: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(rcvd_text, Style::default().fg(app.theme.success_color())),
+            Span::styled("Rcvd: ", app.theme.text),
+            Span::styled(rcvd_text, app.theme.success),
         ]),
     ];
 
@@ -488,9 +420,7 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
         lines.push(Line::from(vec![Span::styled(
             text,
-            Style::default()
-                .fg(app.theme.warning_color())
-                .add_modifier(Modifier::BOLD),
+            app.theme.warning.add_modifier(Modifier::BOLD),
         )]));
     }
 
@@ -593,25 +523,16 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
     // No ladder available (terminal/idle/contest, or no QSO yet): render
     // a quiet placeholder so the layout stays stable.
     if !qso.active || qso.ladder_labels.is_empty() {
-        let paragraph = Paragraph::new(Line::from(Span::styled(
-            "Seq : ---",
-            Style::default().fg(app.theme.muted_color()),
-        )));
+        let paragraph = Paragraph::new(Line::from(Span::styled("Seq : ---", app.theme.muted)));
         f.render_widget(paragraph, area);
         return;
     }
 
-    let mut spans: Vec<Span> = vec![Span::styled(
-        "Seq : ",
-        Style::default().fg(app.theme.foreground_color()),
-    )];
+    let mut spans: Vec<Span> = vec![Span::styled("Seq : ", app.theme.text)];
 
     for (i, label) in qso.ladder_labels.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(
-                " ── ",
-                Style::default().fg(app.theme.muted_color()),
-            ));
+            spans.push(Span::styled(" ── ", app.theme.muted));
         }
         let ours = qso.ladder_ours.get(i).copied().unwrap_or(false);
         let prefix = if ours { "·" } else { "" };
@@ -622,13 +543,11 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
             format!("{}{}", prefix, label)
         };
         let style = if is_current {
-            Style::default()
-                .fg(app.theme.warning_color())
-                .add_modifier(Modifier::BOLD)
+            app.theme.emphasis.add_modifier(Modifier::BOLD)
         } else if ours {
-            Style::default().fg(app.theme.accent_color())
+            app.theme.info
         } else {
-            Style::default().fg(app.theme.foreground_color())
+            app.theme.text
         };
         spans.push(Span::styled(text, style));
     }
@@ -650,19 +569,14 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let now_line = match live_tx {
         Some(item) => Line::from(vec![
-            Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
+            Span::styled("Now : ", app.theme.muted),
             Span::styled(
                 format!(" {} TX ", crate::presentation::TX_MARKER),
-                Style::default()
-                    .fg(ratatui::style::Color::White)
-                    .bg(ratatui::style::Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.alarm.add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {} @{:.0}Hz", item.text, item.freq_hz),
-                Style::default()
-                    .fg(ratatui::style::Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                app.theme.own_tx.add_modifier(Modifier::BOLD),
             ),
         ]),
         None => {
@@ -672,10 +586,10 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
                 qso.now_line.clone()
             };
             Line::from(vec![
-                Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
-                Span::styled(now, Style::default().fg(app.theme.foreground_color())),
-                Span::styled("   Next: ", Style::default().fg(app.theme.muted_color())),
-                Span::styled(next, Style::default().fg(app.theme.muted_color())),
+                Span::styled("Now : ", app.theme.muted),
+                Span::styled(now, app.theme.text),
+                Span::styled("   Next: ", app.theme.muted),
+                Span::styled(next, app.theme.muted),
             ])
         }
     };
@@ -692,7 +606,7 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_control_hint(f: &mut Frame<'_>, area: Rect, app: &App) {
     let paragraph = Paragraph::new(Line::from(Span::styled(
         "[k] abort (any panel)  [r] re-send  Up/Down select  (r/select: this panel only)",
-        Style::default().fg(app.theme.muted_color()),
+        app.theme.muted,
     )));
     f.render_widget(paragraph, area);
 }
@@ -701,16 +615,8 @@ fn render_control_hint(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Only called when `app.pending_calls` is non-empty.
 fn render_queued_calls(f: &mut Frame<'_>, area: Rect, app: &App) {
     let line = Line::from(vec![
-        Span::styled(
-            "Queued: ",
-            Style::default()
-                .fg(app.theme.warning_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format_queued_line(&app.pending_calls),
-            Style::default().fg(app.theme.warning_color()),
-        ),
+        Span::styled("Queued: ", app.theme.warning.add_modifier(Modifier::BOLD)),
+        Span::styled(format_queued_line(&app.pending_calls), app.theme.warning),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -718,12 +624,9 @@ fn render_queued_calls(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Render the last-10-QSOs history line (#165).
 fn render_qso_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     let items: Vec<_> = app.qso_history.iter().cloned().collect();
-    let spans = format_qso_history_line(&items);
+    let spans = format_qso_history_line(&items, &app.theme);
     let line = if spans.is_empty() {
-        Line::from(Span::styled(
-            "No QSOs yet",
-            Style::default().fg(app.theme.muted_color()),
-        ))
+        Line::from(Span::styled("No QSOs yet", app.theme.muted))
     } else {
         Line::from(spans)
     };
@@ -762,21 +665,21 @@ fn format_elapsed(secs: u64) -> String {
 /// `App::push_qso_history`). Not color-only — the ✓/✗ glyph itself carries
 /// the meaning. Pure so it's directly unit-testable, following the same
 /// pattern as `format_queued_line`.
-pub(crate) fn format_qso_history_line(items: &[crate::app::QsoHistoryItem]) -> Vec<Span<'static>> {
+pub(crate) fn format_qso_history_line(
+    items: &[crate::app::QsoHistoryItem],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let (glyph, color) = if item.success {
-            ("\u{2713}", Color::Green)
+        let (glyph, style) = if item.success {
+            ("\u{2713}", theme.success)
         } else {
-            ("\u{2717}", Color::Red)
+            ("\u{2717}", theme.error)
         };
-        spans.push(Span::styled(
-            format!("{glyph}{}", item.call_sign),
-            Style::default().fg(color),
-        ));
+        spans.push(Span::styled(format!("{glyph}{}", item.call_sign), style));
     }
     spans
 }
@@ -800,10 +703,7 @@ fn tx_rx_status_height(qso: &crate::app::QsoStatus) -> u16 {
 /// at most one `Line` — see `tx_rx_status_height`'s doc comment for why
 /// they can't each get their own row in the default layout. `None` when
 /// neither is populated.
-fn combined_status_line(
-    qso: &crate::app::QsoStatus,
-    theme: &crate::config::Theme,
-) -> Option<Line<'static>> {
+fn combined_status_line(qso: &crate::app::QsoStatus, theme: &Theme) -> Option<Line<'static>> {
     let drift = qso.pending_freq_drift_hz.map(|hz| {
         let since = qso
             .pending_freq_drift_since
@@ -814,16 +714,13 @@ fn combined_status_line(
     match (qso.dx_last_activity.as_deref(), drift) {
         (Some(activity), Some(drift)) => Some(Line::from(Span::styled(
             format!("DX: {activity}  |  {drift}"),
-            Style::default().fg(theme.warning_color()),
+            theme.warning,
         ))),
         (Some(activity), None) => Some(Line::from(Span::styled(
             format!("DX: {activity}"),
-            Style::default().fg(theme.muted_color()),
+            theme.muted,
         ))),
-        (None, Some(drift)) => Some(Line::from(Span::styled(
-            drift,
-            Style::default().fg(theme.warning_color()),
-        ))),
+        (None, Some(drift)) => Some(Line::from(Span::styled(drift, theme.warning))),
         (None, None) => None,
     }
 }
@@ -837,14 +734,8 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let rx_status = format_direction_line("RX", qso.last_rx_text.as_deref(), qso.last_rx);
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            tx_status,
-            Style::default().fg(app.theme.warning_color()),
-        )),
-        Line::from(Span::styled(
-            rx_status,
-            Style::default().fg(app.theme.success_color()),
-        )),
+        Line::from(Span::styled(tx_status, app.theme.emphasis)),
+        Line::from(Span::styled(rx_status, app.theme.success)),
     ];
 
     // #41 / PAN-142: what the DX is doing on the band right now, and/or a
@@ -894,14 +785,21 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
         let ratio = snr.map_or(0.0, |value| {
             ((f64::from(value) + 50.0) / 80.0).clamp(0.0, 1.0)
         });
-        let style = snr_style(snr, app);
+        let style = snr_style(snr, &app.theme);
         let gauge = Gauge::default()
             .block(ratatui::widgets::Block::default().title(title))
             .gauge_style(style)
             .ratio(ratio)
             .label(Span::styled(
                 snr_label(snr),
-                style.bg(app.theme.background_color()),
+                // A token that carries its own background (Light `warning` is
+                // black on yellow) keeps it, or the label would read as plain
+                // text; others sit on the page.
+                if style.bg.is_some() {
+                    style
+                } else {
+                    style.patch(theme::bg_of(app.theme.page))
+                },
             ));
         f.render_widget(gauge, target);
     }
@@ -915,16 +813,13 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
         let lines = vec![
             Line::from(vec![Span::styled(
                 "Monitoring for calls...",
-                Style::default().fg(app.theme.muted_color()),
+                app.theme.muted,
             )]),
             Line::from(vec![
-                Span::styled(
-                    "Audio Level: ",
-                    Style::default().fg(app.theme.foreground_color()),
-                ),
+                Span::styled("Audio Level: ", app.theme.text),
                 Span::styled(
                     format!("{:.1}%", app.audio_level * 100.0),
-                    Style::default().fg(get_audio_level_color(app.audio_level, &app.theme)),
+                    app.theme.audio_level(app.audio_level),
                 ),
             ]),
         ];
@@ -958,9 +853,9 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let lines = vec![Line::from(vec![
-        Span::styled(duration, Style::default().fg(app.theme.foreground_color())),
+        Span::styled(duration, app.theme.text),
         Span::raw("  "),
-        Span::styled(cycle_status, Style::default().fg(app.theme.accent_color())),
+        Span::styled(cycle_status, app.theme.info),
     ])];
 
     let paragraph = Paragraph::new(lines);
@@ -977,19 +872,10 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
 
         let cycle_gauge = Gauge::default()
             .ratio(cycle_progress)
-            .gauge_style(Style::default().fg(app.theme.accent_color()))
+            .gauge_style(app.theme.info.patch(theme::bg_of(app.theme.page)))
             .label(format!("{}s", 15 - seconds_in_cycle));
 
         f.render_widget(cycle_gauge, progress_area);
-    }
-}
-
-fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::style::Color {
-    match level {
-        level if level > 0.8 => theme.error_color(), // Too loud
-        level if level > 0.1 => theme.success_color(), // Good level
-        level if level > 0.01 => theme.warning_color(), // Low but present
-        _ => theme.muted_color(),                    // Very low/no signal
     }
 }
 
@@ -998,13 +884,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_snr_gauge_color() {
-        use crate::config::Theme;
-        let theme = Theme::Dark;
+    fn test_snr_gauge_style() {
+        let theme = Theme::DARK;
 
-        assert_eq!(get_snr_color(15, &theme), theme.success_color());
-        assert_eq!(get_snr_color(5, &theme), theme.success_color());
-        assert_eq!(get_snr_color(-15, &theme), theme.error_color());
+        assert_eq!(snr_style(Some(15), &theme), theme.success);
+        assert_eq!(snr_style(Some(5), &theme), theme.success);
+        assert_eq!(snr_style(Some(-15), &theme), theme.error);
+        assert_eq!(snr_style(None, &theme), theme.muted);
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
@@ -1021,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn snr_reports_remain_optional_and_accept_extreme_measurements() {
         use ratatui::{backend::TestBackend, Terminal};
-        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+        for theme in crate::theme::ThemeName::ALL.map(Theme::for_name) {
             let mut app = App::new(crate::config::Config::default(), None)
                 .await
                 .unwrap();
@@ -1048,17 +934,20 @@ mod tests {
                         assert!(row.contains(&label), "{text}");
                         let label_start = row.find(&label).unwrap();
                         let label_x = x + row[..label_start].chars().count() as u16;
-                        assert_eq!(buf[(label_x, 1)].fg, snr_style(value, &app).fg.unwrap());
+                        assert_eq!(
+                            buf[(label_x, 1)].fg,
+                            snr_style(value, &app.theme).fg.unwrap()
+                        );
                         if value == Some(-50) {
-                            assert_eq!(buf[(label_x, 1)].fg, app.theme.error_color());
+                            assert_eq!(buf[(label_x, 1)].fg, theme::fg_color(app.theme.error));
                         }
                         if value.is_none() {
                             assert!(!row.contains('█'), "missing reports have zero fill");
                             assert!(!row.contains("-50"));
                             for col in x..x + 40 {
-                                assert_ne!(buf[(col, 1)].fg, app.theme.error_color());
+                                assert_ne!(buf[(col, 1)].fg, theme::fg_color(app.theme.error));
                                 if buf[(col, 1)].symbol() == "—" {
-                                    assert_eq!(buf[(col, 1)].fg, app.theme.muted_color());
+                                    assert_eq!(buf[(col, 1)].fg, theme::fg_color(app.theme.muted));
                                 }
                             }
                         }
@@ -1362,8 +1251,7 @@ mod tests {
     /// gracefully to just the one field when only it is populated.
     #[test]
     fn test_combined_status_line() {
-        use crate::config::Theme;
-        let theme = Theme::Dark;
+        let theme = Theme::DARK;
         let mut qso = crate::app::QsoStatus::default();
         assert!(combined_status_line(&qso, &theme).is_none());
 
@@ -1478,7 +1366,7 @@ mod tests {
 
     #[test]
     fn format_qso_history_line_empty_is_empty() {
-        assert!(format_qso_history_line(&[]).is_empty());
+        assert!(format_qso_history_line(&[], &Theme::DARK).is_empty());
     }
 
     #[test]
@@ -1496,7 +1384,10 @@ mod tests {
                 completed_at: chrono::Utc::now(),
             },
         ];
-        let spans = format_qso_history_line(&items);
+        let theme = Theme::DARK;
+        let spans = format_qso_history_line(&items, &theme);
+        assert_eq!(spans[0].style, theme.success);
+        assert_eq!(spans[2].style, theme.error);
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             rendered.contains('\u{2713}'),

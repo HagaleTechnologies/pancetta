@@ -64,7 +64,7 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   `TxFrameSent` report, recorded per QSO in `KeepCallLedger::last_aired`. Tests
   that want the aired-frame path must go through `process_message_with_parity`
   and report the aired frame in the reply's preceding slot (see
-  `reply_window_now` in `pan72_stall_detection_tests`); `process_message`
+  `reply_window_now` in `stall_detection_tests`); `process_message`
   without parity exercises the provenance fallback.
 - **The double-PTT-for-73 bug** (open since 2026-07-17) was root-caused and
   fixed 2026-07-18: `coordinator/tx.rs`'s Step-4c late pivot rewrote an
@@ -114,7 +114,7 @@ a `StallDetected`-origin `apply_tx_offset_switch`, or PAN-182's trigger hold
 refuses the commit with `OffsetActionTriggerOutcomePending`. See
 `an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency` and
 `an_advance_answering_the_pre_switch_frame_credits_the_old_offset` in
-`pancetta-qso/src/qso_manager.rs`.
+`pancetta-qso/src/qso_manager/tests/stall_detection_tests.rs`.
 
 Testing gotcha (PAN-223): the stall ledger's slot comes from the TX worker's
 `TxFrameScheduled` report (`QsoManager::record_scheduled_tx_slot`), not only

@@ -4190,6 +4190,7 @@ impl super::ApplicationCoordinator {
                 mode: tui_config_lock.rig.mode.clone(),
                 tx_self_parity: tui_config_lock.station.tx_self_parity,
             },
+<<<<<<< HEAD
             // PAN-389: the first frame renders the session-resolved
             // waterfall palette and gain; the TUI reads no session file.
             ui: tui_ui_config(
@@ -4199,6 +4200,9 @@ impl super::ApplicationCoordinator {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             ),
+=======
+            ui: tui_ui_config(&tui_config_lock.ui),
+>>>>>>> c49dd5fa8d33543e09e484afefd216ffb84e05f1
             audio: pancetta_tui::config::AudioConfig {
                 device: Some(tui_config_lock.audio.input_device.clone()),
                 sample_rate: tui_config_lock.audio.sample_rate,
@@ -4254,6 +4258,17 @@ impl super::ApplicationCoordinator {
 
         info!("TUI component started");
         Ok(())
+    }
+}
+
+/// The TUI's `[ui]` config built from the loaded `pancetta.toml` `[ui]`
+/// section (PAN-387): `theme` and `[ui.accessibility] high_contrast` pick
+/// the palette; an unknown label falls back to dark (the load path already
+/// warned about it).
+pub(crate) fn tui_ui_config(ui: &pancetta_config::ui::UiConfig) -> pancetta_tui::config::UiConfig {
+    pancetta_tui::config::UiConfig {
+        theme: ui.theme_name(),
+        show_coordinates: true,
     }
 }
 
@@ -5610,6 +5625,25 @@ where
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
     }))
+}
+
+#[cfg(test)]
+mod pan387_tests {
+    use super::*;
+
+    #[test]
+    fn tui_ui_config_carries_the_configured_theme() {
+        let mut ui = pancetta_config::ui::UiConfig::default();
+        assert_eq!(tui_ui_config(&ui).theme, pancetta_tui::ThemeName::Dark);
+        ui.theme = "light".to_string();
+        assert_eq!(tui_ui_config(&ui).theme, pancetta_tui::ThemeName::Light);
+        ui.accessibility.high_contrast = true;
+        assert_eq!(
+            tui_ui_config(&ui).theme,
+            pancetta_tui::ThemeName::HighContrast
+        );
+        assert!(tui_ui_config(&ui).show_coordinates);
+    }
 }
 
 #[cfg(test)]
