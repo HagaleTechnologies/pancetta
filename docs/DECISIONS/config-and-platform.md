@@ -1314,7 +1314,8 @@ the documented TUI keymap for keys. The separate TUI config also drops
 
 The serialized-key consumer test checks leaf-name references outside the
 config crate and tests. It is a lexical floor, not proof that a setting runs.
-Its 204 explicit waivers record existing schema debt and references hidden
+Its 204 explicit waivers (203 since PAN-387 started reading
+`ui.accessibility.high_contrast`) record existing schema debt and references hidden
 by the conservative cutoff at each source file's first `#[cfg(test)]`.
 The waiver ceiling cannot grow. Remaining settings need separate consumer
 or removal work; optional values absent from defaults and user map entries

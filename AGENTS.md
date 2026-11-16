@@ -38,6 +38,7 @@ ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXC
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
 CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
+TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
 
 ## Building and Testing
 
@@ -105,6 +106,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - The coordinator supervisor auto-restarts a crashed Autonomous/DxCluster/PskReporter/RemoteGateway/Qso/Dsp/Ft8Decoder/Hamlib/StationAgent/Ft8Transmitter task (5 restarts/10min, capped-exponential backoff). Restart teardown guarantees PTT release for Hamlib and definitive disarm for StationAgent; TX stays inhibited throughout a Hamlib restart window. Audio deliberately remains `DegradeOnly`. QSO-engine loss surfaces as `SupervisorRestart`; dependency loss as `ComponentCrash` with component-specific QSO scope.
 
 - TUI keys (PAN-327): every bound key in every dialog and the main view resolves through `keymap::resolve` into exactly one `Action`; a new key is a chord on its documented `KEYBINDINGS` row (or `MODAL_BINDINGS` for dialog-internal keys) plus an `Action` variant and a `match action` arm in `handle_key_event`, Main-scope chords for `Action::starts_tx()` refuse Ctrl/Alt, Shift+Q resolves in Global scope before any dialog chord or text-entry rule, and any change to what a key does must re-bless `pancetta-tui/tests/fixtures/key_effects.golden` (`PANCETTA_BLESS_KEY_EFFECTS=1`).
+
+- TUI colours (PAN-387): only `pancetta-tui/src/theme.rs` names a colour (`pancetta-tui/tests/theme_invariant.rs`); renderers read semantic tokens from `app.theme` or a `&Theme`. A new meaning gets a token with Dark, Light and HighContrast values; any change to what a theme paints must re-bless `pancetta-tui/tests/fixtures/theme_snapshots/` (`PANCETTA_BLESS_THEME_SNAPSHOTS=1`).
 
 - Spot-call QSY (PAN-287): Space on a DX Hunter network spot changes the dial only through `coordinator::spot_call`, never while the rig is keyed (the `rig_is_keyed` recheck and the `SetFrequency` enqueue run under `ptt_sync_gate`, which every key-down passes before its PTT-on enqueue; the autonomous operator is never locked under that gate), never across a QSO the admission snapshot shows as answered, and never without a Hamlib route. A call parked for PTT-off is dropped after 30 s, on any operator frequency change or operating-mode switch, by a newer spot call, or when TX policy no longer allows initiation.
 

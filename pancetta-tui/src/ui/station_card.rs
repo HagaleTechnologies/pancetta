@@ -96,7 +96,7 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let Some(call) = app.focused_callsign() else {
         let paragraph = Paragraph::new(Line::from(Span::styled(
             "(no station focused — Tab to a list, ↑/↓ to pick)",
-            Style::default().fg(app.theme.muted_color()),
+            app.theme.muted,
         )));
         f.render_widget(paragraph, inner);
         return Ok(());
@@ -142,24 +142,19 @@ fn render_why_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) ->
         }
     };
     let fitted = dx_reason::fit_clauses(&clauses, width.saturating_sub(5) as usize);
-    let mut spans = vec![Span::styled(
-        "Why: ",
-        Style::default().fg(app.theme.muted_color()),
-    )];
+    let mut spans = vec![Span::styled("Why: ", app.theme.muted)];
     for (index, clause) in fitted.split("; ").enumerate() {
         if index > 0 {
             spans.push(Span::raw("; "));
         }
         let style = if clause == "…" {
-            Style::default().fg(app.theme.foreground_color())
+            app.theme.text
         } else if index == 0 {
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD)
+            app.theme.info.add_modifier(Modifier::BOLD)
         } else if index <= caution_count {
-            Style::default().fg(app.theme.warning_color())
+            app.theme.warning
         } else {
-            Style::default().fg(app.theme.foreground_color())
+            app.theme.text
         };
         spans.push(Span::styled(clause.to_owned(), style));
     }
@@ -228,14 +223,12 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
     Line::from(vec![
         Span::styled(
             call.to_string(),
-            Style::default()
-                .fg(app.theme.success_color())
-                .add_modifier(Modifier::BOLD),
+            app.theme.callable.add_modifier(Modifier::BOLD),
         ),
         Span::raw(" \u{2014} "),
-        Span::styled(entity, Style::default().fg(app.theme.foreground_color())),
+        Span::styled(entity, app.theme.text),
         Span::raw(" "),
-        Span::styled(status_flag, Style::default().fg(app.theme.accent_color())),
+        Span::styled(status_flag, app.theme.info),
     ])
 }
 
@@ -255,7 +248,7 @@ fn render_line2<'a>(app: &App, last_decode: Option<&DecodedMessageView>) -> Line
 
     Line::from(Span::styled(
         format!("{grid} {dist_str} \u{b7} {msg_text} ({snr_str}) {age}"),
-        Style::default().fg(app.theme.foreground_color()),
+        app.theme.text,
     ))
 }
 
@@ -279,10 +272,7 @@ fn render_line3<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
         format!("{window}-window \u{b7} Space=call")
     };
 
-    Line::from(Span::styled(
-        text,
-        Style::default().fg(app.theme.muted_color()),
-    ))
+    Line::from(Span::styled(text, app.theme.muted))
 }
 
 #[cfg(test)]
@@ -618,7 +608,7 @@ pub(in crate::ui) mod tests {
         assert!(row(&buf, 4).contains("E-window · Space=call"));
         let why = row(&buf, 2);
         let col = why[..why.find("new entity").unwrap()].chars().count() as u16;
-        assert_eq!(buf[(col, 2)].fg, app.theme.accent_color());
+        assert_eq!(buf[(col, 2)].fg, crate::theme::fg_color(app.theme.info));
         assert!(buf[(col, 2)].modifier.contains(Modifier::BOLD));
     }
 
@@ -699,7 +689,7 @@ pub(in crate::ui) mod tests {
         );
         let text = row(&buf, 2);
         let col = text[..text.find("QSO failed").unwrap()].chars().count() as u16;
-        assert_eq!(buf[(col, 2)].fg, app.theme.warning_color());
+        assert_eq!(buf[(col, 2)].fg, crate::theme::fg_color(app.theme.warning));
     }
 
     #[tokio::test]
