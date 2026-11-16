@@ -1,6 +1,7 @@
 //! Display vocabulary only. Wire and persistence strings belong to their types.
 use crate::{app::RigConnDisplay, view::ActiveView};
 use pancetta_config::rig::PttMethod;
+use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
 use pancetta_core::ResponseStep;
 
 pub(crate) fn rig_label(state: RigConnDisplay) -> &'static str {
@@ -65,11 +66,81 @@ pub(crate) fn rarity_label(tier: Option<&str>) -> &'static str {
     }
 }
 
+/// PAN-291: forward power as the Shift+S TX meter row shows it. Watts under
+/// 10 keep one decimal; a 0..1 fraction shows as a percent of max power.
+pub(crate) fn forward_power_label(power: ForwardPower) -> String {
+    match power {
+        ForwardPower::Watts(w) if w < 10.0 => format!("{w:.1} W"),
+        ForwardPower::Watts(w) => format!("{w:.0} W"),
+        ForwardPower::FractionOfMax(f) => format!("{:.0}% of max power", f * 100.0),
+    }
+}
+
+/// PAN-291: the state of the Shift+S TX meter row, chosen by the caller in
+/// the design's rule order (fresh reading, no CAT, unsupported, idle).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TxMeterRow {
+    /// A reading at most `TX_METER_LIVE_SECS` old, and the ALC warning limit
+    /// when the warning is on and the session announced it.
+    Live {
+        reading: TxMeterReading,
+        alc_limit: Option<f32>,
+    },
+    /// The rig is not connected or polling failed.
+    NeedsCat,
+    /// The rig lists neither meter.
+    NotReported,
+    /// Not keyed, no reading yet, or capability not known yet.
+    Idle,
+}
+
+impl TxMeterRow {
+    /// `true` when a live ALC reading is strictly above the announced limit.
+    pub(crate) fn overdriven(self) -> bool {
+        match self {
+            TxMeterRow::Live {
+                reading: TxMeterReading { alc: Some(alc), .. },
+                alc_limit: Some(limit),
+            } => alc > limit,
+            _ => false,
+        }
+    }
+}
+
+/// PAN-291: the TX meter row text that follows the dot.
+pub(crate) fn tx_meter_text(row: TxMeterRow) -> String {
+    match row {
+        TxMeterRow::Live { reading, alc_limit } => {
+            let power = reading
+                .forward_power
+                .map(forward_power_label)
+                .unwrap_or_else(|| "power n/a".to_string());
+            let alc = match (reading.alc, alc_limit) {
+                (Some(alc), Some(limit)) => format!("ALC {alc:.2} (limit {limit:.2})"),
+                (Some(alc), None) => format!("ALC {alc:.2}"),
+                (None, _) => "ALC n/a".to_string(),
+            };
+            let advice = if row.overdriven() {
+                ", reduce audio drive"
+            } else {
+                ""
+            };
+            format!(" TX meter: {power}, {alc}{advice}")
+        }
+        TxMeterRow::NeedsCat => " TX meter: needs a connected CAT rig".to_string(),
+        TxMeterRow::NotReported => {
+            " TX meter: this rig does not report power or ALC over CAT".to_string()
+        }
+        TxMeterRow::Idle => " TX meter: shown while transmitting".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+<<<<<<< HEAD
     fn view_name_is_view_message_without_suffix() {
         for view in [
             ActiveView::Operate,
@@ -81,6 +152,17 @@ mod tests {
         }
     }
 
+=======
+    fn forward_power_label_formats_watts_and_fraction() {
+        assert_eq!(forward_power_label(ForwardPower::Watts(48.0)), "48 W");
+        assert_eq!(forward_power_label(ForwardPower::Watts(7.5)), "7.5 W");
+        assert_eq!(forward_power_label(ForwardPower::Watts(100.0)), "100 W");
+        assert_eq!(
+            forward_power_label(ForwardPower::FractionOfMax(0.48)),
+            "48% of max power"
+        );
+    }
+>>>>>>> 853a6bc525f992624f5968d3ecf789ee3ced219d
     #[test]
     fn pan353_rendered_text_vocabulary_is_exhaustive() {
         use RigConnDisplay::*;
