@@ -724,7 +724,7 @@ A-TO-B: armed=Some("client-A") completions=[("SM2LIY K5ARH R-14", true), ("C6AVD
 A `Local` bundle keyed a frame re-bound to an unarmed client (with or without
 new text), and client A's bundle aired client B's frame under A's gate. The
 same scenarios are now the `bundle_binding_worker_tests` module in
-`coordinator/tx.rs`. With Step 4b-rebind disabled, its three reproduction tests
+`coordinator/tx/tests/bundle_binding_worker_tests.rs`. With Step 4b-rebind disabled, its three reproduction tests
 fail and the armed-B and unarmed-control tests pass, as on `main`.
 
 **Decision: thread the binding through `TransmitRequestItem` permanently.**

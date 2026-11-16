@@ -81,7 +81,7 @@ the half-duplex [[parity-rule]] and the [[tx-scheduling]] gate.
   `stall_detection_tests` tests `the_dx_s_first_report_advances_a_sending_report_qso`,
   `first_dx_report_grants_exactly_one_expired_watchdog_reprieve`, and
   `a_repeated_dx_report_is_still_not_forward_progress` cover this distinction
-  in `pancetta-qso/src/qso_manager.rs`.
+  in `pancetta-qso/src/qso_manager/tests/stall_detection_tests.rs`.
 
 ## Persistent duplicate history (PAN-260)
 
