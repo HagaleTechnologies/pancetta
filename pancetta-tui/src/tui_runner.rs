@@ -2662,14 +2662,15 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
             }
             // PAN-389: focus can be left on the waterfall after a view switch
-            // (`active_panel` is not reset), but the waterfall is drawn only in
-            // the Monitor view. Off screen, the keys explain themselves and
+            // (`active_panel` is not reset). Unzoomed, the waterfall is drawn
+            // only in the Monitor view; zoomed (`z`), the focused panel is
+            // drawn in every view. Off screen, the keys explain themselves and
             // never change or persist an invisible gain or palette.
             Action::WaterfallGainDown
             | Action::WaterfallGainUp
             | Action::CycleWaterfallPaletteForward
             | Action::CycleWaterfallPaletteBack
-                if app.active_view != crate::view::ActiveView::Monitor =>
+                if !app.zoomed && app.active_view != crate::view::ActiveView::Monitor =>
             {
                 app.set_local_status(
                     WATERFALL_FOCUS_HINT.to_string(),
@@ -6848,6 +6849,47 @@ mod key_tests {
                     "{view:?} {ev:?}"
                 );
                 assert!(cmd_rx.try_recv().is_err(), "{view:?} {ev:?}: no command");
+            }
+        }
+    }
+
+    /// PAN-389 review fix: `z` keeps the focused waterfall on screen in every
+    /// view (`ui::draw` renders the zoomed panel before the view dispatch),
+    /// so after `z` then `v` the gain and palette keys still act on it.
+    #[tokio::test]
+    async fn waterfall_keys_act_on_a_zoomed_waterfall_in_any_view() {
+        for view in [
+            crate::view::ActiveView::Operate,
+            crate::view::ActiveView::Hunt,
+            crate::view::ActiveView::Run,
+        ] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            focus_waterfall(&app).await;
+            {
+                let mut a = app.write().await;
+                a.zoomed = true;
+                a.active_view = view;
+            }
+            r.handle_key_event(key('}')).await.unwrap();
+            assert_eq!(app.read().await.waterfall_gain_db, 1.0, "{view:?}");
+            match cmd_rx.try_recv() {
+                Ok(TuiCommand::SetWaterfallGain { gain_db }) => {
+                    assert_eq!(gain_db, 1.0, "{view:?}")
+                }
+                other => panic!("{view:?}: expected SetWaterfallGain, got {other:?}"),
+            }
+            r.handle_key_event(key('b')).await.unwrap();
+            let palette = app.read().await.waterfall_palette;
+            assert_ne!(
+                palette,
+                pancetta_config::ui::WaterfallPalette::Classic,
+                "{view:?}"
+            );
+            match cmd_rx.try_recv() {
+                Ok(TuiCommand::SetWaterfallPalette { palette: sent }) => {
+                    assert_eq!(sent, palette, "{view:?}")
+                }
+                other => panic!("{view:?}: expected SetWaterfallPalette, got {other:?}"),
             }
         }
     }

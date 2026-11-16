@@ -116,6 +116,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `contest.rs` | Durable contest scoring refresh. |
 | `desense.rs` | Window-based evidence for TX-induced receive desense. |
 | `dsp.rs` | Receive audio downmix, subsampling, decode windows and waterfall. |
+| `dsp/` | Receive audio downmix, subsampling, decode windows and waterfall. |
 | `dx_cluster.rs` | DX cluster component. |
 | `effort.rs` | Decode-effort preset to wall-time budget mapping. |
 | `ft8.rs` | FT8 decoder component startup. |
@@ -144,6 +145,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `swr_guard.rs` | SWR protection trip logic (PAN-251). |
 | `tier.rs` | Hardware-tier auto-classification at startup. |
 | `tui_relay.rs` | TUI relay and command forwarding. |
+| `tui_relay/` | TUI relay and command forwarding. |
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |

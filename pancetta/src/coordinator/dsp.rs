@@ -3634,16 +3634,5 @@ mod decimation_stage_tests {
 }
 
 #[cfg(test)]
-mod waterfall_scale_tests {
-    use super::NOISE_FLOOR_DB_SCALE;
-
-    /// PAN-389 AC19: the TUI's "gain_db / 12 dB" display offset must match
-    /// the scale the live rows are normalised on, so 6 dB stays 0.5.
-    #[test]
-    fn waterfall_db_span_matches_the_dsp_noise_floor_scale() {
-        assert_eq!(
-            pancetta_tui::widgets::WATERFALL_DB_SPAN,
-            NOISE_FLOOR_DB_SCALE
-        );
-    }
-}
+#[path = "dsp/tests/waterfall_scale_tests.rs"]
+mod waterfall_scale_tests;
