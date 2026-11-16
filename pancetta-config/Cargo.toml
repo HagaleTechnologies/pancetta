@@ -3,6 +3,7 @@ name = "pancetta-config"
 description = "Configuration management for Pancetta"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -35,23 +36,18 @@ tokio = { version = "1.50", features = ["full"] }
 notify = "8.2"
 
 # Path and environment utilities
-dirs = "5.0"
+dirs = { workspace = true }
 shellexpand = "3.1"
 tempfile = "3.27"
 
-# Validation and utilities
 # Canonical browser origins for the local gateway allow-list (PAN-99)
 url = { workspace = true }
-validator = { version = "0.21", features = ["derive"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# Optional features for advanced configuration
-clap = { version = "4.6", features = ["derive"], optional = true }
-
 [features]
 default = ["cli"]
-cli = ["clap"]
+cli = []
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
