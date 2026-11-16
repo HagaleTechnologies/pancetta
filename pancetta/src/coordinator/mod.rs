@@ -3954,7 +3954,7 @@ mod tests {
     /// `build_coordinator` with a `pancetta_home` override so the session
     /// state resolves an isolated temp dir (PAN-194 discipline), never the
     /// real `~/.pancetta`.
-    async fn build_coordinator_with_home(
+    pub(super) async fn build_coordinator_with_home(
         config: Config,
         home: Option<PathBuf>,
     ) -> ApplicationCoordinator {
@@ -3979,7 +3979,7 @@ mod tests {
     }
 
     /// Write a session file into `home/.pancetta/session_state.json`.
-    fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
+    pub(super) fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
         let dir = home.join(".pancetta");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session_state.json");
@@ -4073,90 +4073,6 @@ mod tests {
                 std::fs::read_to_string(&path).unwrap(),
                 r#"{"tx_freq_mode":"AUTO","decode_effort":null,"decode_effort_config_at_save":null}"#,
                 "{restart} restart: the superseded effort must be dropped from disk"
-            );
-        }
-    }
-
-    /// PAN-389 AC15: a saved waterfall palette and gain whose baselines match
-    /// the config are restored and become the effective values the TUI
-    /// config is built from.
-    #[tokio::test]
-    async fn session_restore_seeds_the_waterfall_for_the_tui() {
-        let home = tempfile::tempdir().unwrap();
-        write_session_file(
-            home.path(),
-            r#"{"tx_freq_mode":null,"decode_effort":null,"decode_effort_config_at_save":null,"waterfall_palette":"classic","waterfall_palette_config_at_save":"viridis","waterfall_gain_db":8.0,"waterfall_gain_db_config_at_save":6.0}"#,
-        );
-        let mut config = Config::default();
-        config.ui.waterfall.palette = pancetta_config::ui::WaterfallPalette::Viridis;
-        config.ui.waterfall.gain_db = 6.0;
-
-        let coordinator =
-            build_coordinator_with_home(config.clone(), Some(home.path().to_path_buf())).await;
-
-        let effective = session_state::effective_waterfall(
-            &coordinator
-                .session_record
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-            &config.ui.waterfall,
-        );
-        assert_eq!(
-            effective,
-            pancetta_config::ui::WaterfallDisplayConfig {
-                palette: pancetta_config::ui::WaterfallPalette::Classic,
-                gain_db: 8.0,
-            }
-        );
-        assert_eq!(
-            coordinator.session_report.status.as_deref(),
-            Some("Session: restored waterfall palette classic and waterfall gain +8 dB from the last session")
-        );
-    }
-
-    /// PAN-389 AC16: a config `gain_db` edit newer than the saved gain wins
-    /// at startup, the file is rewritten without the gain pair (the matching
-    /// palette pair is kept), and a second restart keeps the config gain.
-    #[tokio::test]
-    async fn session_config_edit_supersedes_saved_waterfall_gain_and_rewrites_the_file() {
-        let home = tempfile::tempdir().unwrap();
-        let path = write_session_file(
-            home.path(),
-            r#"{"tx_freq_mode":"AUTO","decode_effort":null,"decode_effort_config_at_save":null,"waterfall_palette":"classic","waterfall_palette_config_at_save":"viridis","waterfall_gain_db":8.0,"waterfall_gain_db_config_at_save":6.0}"#,
-        );
-        let mut config = Config::default();
-        config.ui.waterfall.palette = pancetta_config::ui::WaterfallPalette::Viridis;
-        config.ui.waterfall.gain_db = 3.0;
-
-        for restart in ["first", "second"] {
-            let coordinator =
-                build_coordinator_with_home(config.clone(), Some(home.path().to_path_buf())).await;
-            let effective = session_state::effective_waterfall(
-                &coordinator
-                    .session_record
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-                &config.ui.waterfall,
-            );
-            assert_eq!(
-                effective.gain_db, 3.0,
-                "{restart} restart: the newer config gain must win over the saved 8 dB"
-            );
-            assert_eq!(
-                effective.palette,
-                pancetta_config::ui::WaterfallPalette::Classic,
-                "{restart} restart: the matching saved palette is kept"
-            );
-            let text = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                !text.contains("waterfall_gain_db"),
-                "{restart} restart: the superseded gain must be dropped from disk: {text}"
-            );
-            assert!(
-                text.contains(
-                    r#""waterfall_palette":"classic","waterfall_palette_config_at_save":"viridis""#
-                ),
-                "{restart} restart: the palette pair must be kept: {text}"
             );
         }
     }
@@ -5814,3 +5730,7 @@ mod active_qso_freq_tests {
         assert_eq!(hint.secondary, Some((1500.0, expires_at)));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/waterfall_session_restore_tests.rs"]
+mod waterfall_session_restore_tests;
