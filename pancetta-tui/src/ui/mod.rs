@@ -1088,17 +1088,8 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// `?:Help` and `q:Quit`, priority-fitted by `bar_fit` (PAN-88), so a narrow
 /// terminal drops whole hints instead of cutting `q:Quit` mid-word.
 fn footer_line(app: &App, width: u16) -> Line<'static> {
-    let key_hint = |k: &'static str| {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let view_style = Style::default()
-        .fg(app.theme.foreground_color())
-        .add_modifier(Modifier::BOLD);
+    let key_hint = |k: &'static str| Span::styled(k, app.theme.key.add_modifier(Modifier::BOLD));
+    let view_style = app.theme.text.add_modifier(Modifier::BOLD);
     let mut segs = vec![BarSegment::with_compact(
         " | ",
         vec![Span::styled(
@@ -1239,39 +1230,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let status_line = Line::from(status_spans);
 
-<<<<<<< HEAD
     let help_line = footer_line(app, area.width);
-=======
-    // Always-visible key hints. These MUST match the real bindings in
-    // tui_runner.rs (the help-overlay is the only other on-screen keymap):
-    // band is `=`/`-` (not `+`), quit is `q` (not Ctrl+Q), `?` opens full help,
-    // `d` opens the audio-device picker (the common "reclaim my output" action).
-    let key_hint = |k: &'static str| Span::styled(k, app.theme.key.add_modifier(Modifier::BOLD));
-    // PAN-88: the hints priority-fit the row (same `bar_fit` policy as the
-    // title bar) so a narrow terminal drops whole hints instead of cutting
-    // `q:Quit` mid-word. `?:Help` and `q:Quit` are pinned; `Space:Call/Reply`
-    // shrinks to `Space:Call` before anything drops.
-    let hint = |k: &'static str, label: &'static str, admit: u8| {
-        BarSegment::new(" | ", vec![key_hint(k), Span::raw(label)], admit)
-    };
-    let hint_segs = vec![
-        BarSegment::with_compact(
-            " | ",
-            vec![key_hint("Space"), Span::raw(":Call/Reply")],
-            vec![key_hint("Space"), Span::raw(":Call")],
-            1,
-            8,
-        ),
-        hint("Arrows", ":TX", 3),
-        hint("=/-", ":Band", 5),
-        hint("g", ":TX-policy", 2),
-        hint("d", ":Audio", 4),
-        hint("?", ":Help", 0),
-        hint("q", ":Quit", 0),
-    ];
-    let hint_forms = bar_fit::fit_bar(&hint_segs, area.width as usize);
-    let help_line = Line::from(bar_fit::bar_spans(hint_segs, &hint_forms));
->>>>>>> c49dd5fa8d33543e09e484afefd216ffb84e05f1
 
     // Split status bar into two lines (Task 20c: the third row — a purely
     // decorative "─" border with no information — was dropped, along with
@@ -4724,7 +4683,7 @@ mod view_render_tests {
         );
         let view = &buf[(0, 29)];
         assert_eq!(view.symbol(), "O");
-        assert_eq!(view.fg, app.theme.foreground_color());
+        assert_eq!(view.fg, theme::fg_color(app.theme.text));
         assert!(view.modifier.contains(Modifier::BOLD));
         let cell = &buf[(15, 29)];
         assert_eq!(cell.symbol(), "S");

@@ -15,7 +15,7 @@ pub(crate) type HintBind = (KeyCode, KeyModifiers, Action);
 /// One `key:label` segment of the footer hint row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FooterHint {
-    /// Key text, drawn in the accent colour (`Space`, `Enter`, `W`, `=/-`).
+    /// Key text, drawn bold in the theme's `key` token (`Space`, `Enter`, `W`, `=/-`).
     pub key: &'static str,
     /// Label after the key, starting with `:`.
     pub label: &'static str,
