@@ -139,7 +139,7 @@ mod timing {
         /// True on the window count that should emit the debug distribution
         /// line (every [`EMIT_EVERY_WINDOWS`] windows).
         pub(super) fn should_emit(&self) -> bool {
-            self.windows > 0 && self.windows % EMIT_EVERY_WINDOWS == 0
+            self.windows > 0 && self.windows.is_multiple_of(EMIT_EVERY_WINDOWS)
         }
 
         /// One debug line covering all three distributions.
@@ -293,6 +293,27 @@ fn log_decoded(msg: &pancetta_ft8::DecodedMessage) {
 /// record per window is not.
 fn log_fp_filter_dropped(dropped: usize, total: usize) {
     info!("FP filter dropped {dropped} of {total} decodes");
+}
+
+/// The hb-062 FP filter lock shared by the coordinator and the decoder.
+type FpFilterLock = std::sync::RwLock<Option<Arc<pancetta_qso::CallsignContinuityFilter>>>;
+
+/// PAN-290: one window's read of the shared FP filter. A poisoned lock
+/// bypasses the filter for this window and logs a warning instead of
+/// panicking the decoder, whose restarts share the same poisoned lock.
+fn fp_filter_for_window(
+    lock: &FpFilterLock,
+) -> Option<Arc<pancetta_qso::CallsignContinuityFilter>> {
+    match lock.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            warn!(
+                target: "pancetta::fp_filter",
+                "FP filter lock poisoned by an earlier panic; decoding this window with the filter bypassed"
+            );
+            None
+        }
+    }
 }
 
 /// Maximum length (in chars) for any human-facing decoded string field.
@@ -973,7 +994,6 @@ impl super::ApplicationCoordinator {
         // of each subsequent slot to surface opposite-parity seeds. Inert
         // until `Ft8Config::cross_sequence_a7_enabled` flips true.
         let cross_sequence_cache = self.cross_sequence_cache.clone();
-        let cross_sequence_fp_filter = self.fp_filter.clone();
 
         // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9). Re-read from
         // this shared atomic once per decode-loop iteration (below, inside the
@@ -1787,7 +1807,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         let waterfall_us = waterfall_start.elapsed().as_micros() as u64;
-                        let waterfall_ms = (waterfall_us / 1_000) as u64;
+                        let waterfall_ms = waterfall_us / 1_000;
 
                         // Merge: start with ft8_lib results, add any native-only
                         // decodes (e.g. from AP injection) that ft8_lib missed.
@@ -1990,7 +2010,11 @@ impl super::ApplicationCoordinator {
                         // lock (see the `fp_filter` field comment in
                         // `mod.rs`). When the snapshot is None (default, or
                         // not yet built), all decodes pass through unchanged.
-                        let fp_filter_snapshot = fp_filter.read().unwrap().clone();
+                        //
+                        // PAN-290: a poisoned lock bypasses the filter for
+                        // this window and warns, rather than panicking the
+                        // decoder on every window and every restart.
+                        let fp_filter_snapshot = fp_filter_for_window(&fp_filter);
                         if let Some(ref filter) = fp_filter_snapshot {
                             let pre = decoded_messages.len();
                             // 2026-07-17 operator finding: capture the raw,
@@ -2127,10 +2151,10 @@ impl super::ApplicationCoordinator {
                         // the band and slot grid each record carries
                         // (PAN-146).
                         //
-                        // Same live-read rationale as `fp_filter_snapshot`
-                        // above — one read per window, not per message.
-                        let cross_sequence_fp_filter_snapshot =
-                            cross_sequence_fp_filter.read().unwrap().clone();
+                        // The hb-237 trust gate below reuses this window's
+                        // `fp_filter_snapshot` (PAN-290): one read of the
+                        // lock per window, so the gate matches the filter
+                        // that actually ran on these decodes.
                         for decoded_msg in &decoded_messages {
                             let parity_u8 = decoded_msg.slot_parity.map(|p| match p {
                                 pancetta_core::slot::SlotParity::Even => 0u8,
@@ -2155,8 +2179,7 @@ impl super::ApplicationCoordinator {
                                     (&decoded_msg.message.from_callsign, parity_u8)
                                 {
                                     if let Ok(mut cache_guard) = cross_sequence_cache.write() {
-                                        let admitted = if let Some(ref filter) =
-                                            cross_sequence_fp_filter_snapshot
+                                        let admitted = if let Some(ref filter) = fp_filter_snapshot
                                         {
                                             cache_guard.record_decoded_trusted(
                                                 call,
@@ -3774,5 +3797,124 @@ mod decode_log_level_tests {
         assert!(text.contains("Waterfall: 184x512 matrix"));
         assert!(text.contains("narrowing main decode"));
         assert!(text.contains("FP filter dropped 3 of 43 decodes"));
+    }
+}
+
+/// PAN-290: the decoder's per-window FP-filter read must survive a
+/// poisoned lock. Before the fix, the unwrapped read panicked on every
+/// window after a writer panic, and every supervisor restart of the
+/// decoder shared the same poisoned lock.
+#[cfg(test)]
+mod pan290_fp_filter_poison_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const BYPASS_WARNING: &str =
+        "FP filter lock poisoned by an earlier panic; decoding this window with the filter bypassed";
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn built_filter() -> Arc<pancetta_qso::CallsignContinuityFilter> {
+        Arc::new(
+            pancetta_qso::callsign_continuity::build_filter_with_seed(
+                None,
+                HashSet::new(),
+                vec!["W1AW".into()],
+                500,
+                5,
+            )
+            .expect("seed-only filter builds"),
+        )
+    }
+
+    /// Poison `lock` the way a real writer panic would: panic on another
+    /// thread while holding the write guard.
+    fn poison(lock: &Arc<FpFilterLock>) {
+        let held = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("PAN-290 test: poisoning the FP filter lock");
+        })
+        .join();
+        assert!(lock.is_poisoned(), "the lock must be poisoned by the panic");
+    }
+
+    /// Run `fp_filter_for_window` under the production default log filter
+    /// and return what it read and what it logged.
+    fn read_with_logs(
+        lock: &FpFilterLock,
+    ) -> (Option<Arc<pancetta_qso::CallsignContinuityFilter>>, String) {
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("pancetta=info,warn"))
+            .with_writer(move || writer.clone())
+            .finish();
+        let read = tracing::subscriber::with_default(subscriber, || fp_filter_for_window(lock));
+        (read, logs.text())
+    }
+
+    #[test]
+    fn poisoned_lock_bypasses_the_stored_filter_and_warns() {
+        let lock: Arc<FpFilterLock> = Arc::new(std::sync::RwLock::new(Some(built_filter())));
+        poison(&lock);
+
+        // The stored filter is still there behind the poison flag...
+        assert!(lock
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
+
+        // ...but the decoder's read bypasses it and warns, every window.
+        for window in 1..=2 {
+            let (read, logs) = read_with_logs(&lock);
+            assert!(
+                read.is_none(),
+                "window {window}: a poisoned lock must bypass the filter"
+            );
+            assert!(logs.contains("WARN"), "window {window}: {logs}");
+            assert!(
+                logs.contains("pancetta::fp_filter"),
+                "window {window}: {logs}"
+            );
+            assert_eq!(
+                logs.matches(BYPASS_WARNING).count(),
+                1,
+                "window {window}: exactly one warning per window: {logs}"
+            );
+        }
+        assert!(lock.is_poisoned(), "the decoder read never clears poison");
+    }
+
+    #[test]
+    fn healthy_lock_returns_the_stored_filter_without_warning() {
+        let stored = built_filter();
+        let lock: FpFilterLock = std::sync::RwLock::new(Some(stored.clone()));
+        let (read, logs) = read_with_logs(&lock);
+        let read = read.expect("a healthy lock returns the stored filter");
+        assert!(Arc::ptr_eq(&read, &stored), "same filter, not a copy");
+        assert!(!logs.contains("poisoned"), "{logs}");
+
+        let unset: FpFilterLock = std::sync::RwLock::new(None);
+        let (read, logs) = read_with_logs(&unset);
+        assert!(read.is_none(), "an unset lock passes decodes unfiltered");
+        assert!(!logs.contains("poisoned"), "{logs}");
     }
 }
