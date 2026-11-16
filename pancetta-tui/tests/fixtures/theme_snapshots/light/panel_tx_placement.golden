@@ -2,34 +2,34 @@
 # Re-bless an intended change: PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots
 # surface=panel_tx_placement theme=light origin=0,0 size=80x16
 r00 |┌TX Placement──────────────────────────────────────────────────────────────────┐|
-r00 s 0+1 DarkGray/White/- 1+12 Blue/White/- 13+67 DarkGray/White/-
+r00 s 0+80 Magenta/White/BOLD
 r01 |│·▀█·▄█··▀█·▄█·▄▀··▄█·▄▀··▀█·▄▀··▀█·▄█·▄▀█·▄█·▄▀··▀█·▄▀··▀█·▄█··▀█· █both ▀E ▄O│|
-r01 s 0+2 DarkGray/White/- 2+1 Black/Yellow/- 3+1 Blue/White/- 4+1 DarkGray/White/- 5+2 Blue/White/- 7+2 DarkGray/White/- 9+1 Black/Yellow/- 10+1 Blue/White/- 11+1 DarkGray/White/- 12+2 Blue/White/- 14+1 DarkGray/White/- 15+1 Blue/White/- 16+1 Black/Yellow/- 17+2 DarkGray/White/- 19+2 Blue/White/- 21+1 DarkGray/White/- 22+1 Blue/White/- 23+1 Black/Yellow/- 24+2 DarkGray/White/- 26+1 Black/Yellow/- 27+1 Blue/White/- 28+1 DarkGray/White/- 29+1 Blue/White/- 30+1 Black/Yellow/- 31+2 DarkGray/White/- 33+1 Black/Yellow/- 34+1 Blue/White/- 35+1 DarkGray/White/- 36+2 Blue/White/- 38+1 DarkGray/White/- 39+1 Blue/White/- 40+1 Black/Yellow/- 41+1 Blue/White/- 42+1 DarkGray/White/- 43+2 Blue/White/- 45+1 DarkGray/White/- 46+1 Blue/White/- 47+1 Black/Yellow/- 48+2 DarkGray/White/- 50+1 Black/Yellow/- 51+1 Blue/White/- 52+1 DarkGray/White/- 53+1 Blue/White/- 54+1 Black/Yellow/- 55+2 DarkGray/White/- 57+1 Black/Yellow/- 58+1 Blue/White/- 59+1 DarkGray/White/- 60+2 Blue/White/- 62+2 DarkGray/White/- 64+1 Black/Yellow/- 65+1 Blue/White/- 66+1 DarkGray/White/- 67+1 Black/White/- 68+1 Blue/White/- 69+5 Black/White/- 74+1 Black/Yellow/- 75+2 Black/White/- 77+1 Blue/White/- 78+1 Black/White/- 79+1 DarkGray/White/-
-r02 |│                                 ◆        │W#AW ####                          │|
-r02 s 0+1 DarkGray/White/- 1+33 Black/White/- 34+1 Magenta/White/BOLD 35+8 Black/White/- 43+10 Blue/White/- 53+26 Black/White/- 79+1 DarkGray/White/-
+r01 s 0+1 Magenta/White/BOLD 1+1 DarkGray/White/- 2+1 Black/Yellow/- 3+1 Blue/White/- 4+1 DarkGray/White/- 5+2 Blue/White/- 7+2 DarkGray/White/- 9+1 Black/Yellow/- 10+1 Blue/White/- 11+1 DarkGray/White/- 12+2 Blue/White/- 14+1 DarkGray/White/- 15+1 Blue/White/- 16+1 Black/Yellow/- 17+2 DarkGray/White/- 19+2 Blue/White/- 21+1 DarkGray/White/- 22+1 Blue/White/- 23+1 Black/Yellow/- 24+2 DarkGray/White/- 26+1 Black/Yellow/- 27+1 Blue/White/- 28+1 DarkGray/White/- 29+1 Blue/White/- 30+1 Black/Yellow/- 31+2 DarkGray/White/- 33+1 Black/Yellow/- 34+1 Blue/White/- 35+1 DarkGray/White/- 36+2 Blue/White/- 38+1 DarkGray/White/- 39+1 Blue/White/- 40+1 Black/Yellow/- 41+1 Blue/White/- 42+1 DarkGray/White/- 43+2 Blue/White/- 45+1 DarkGray/White/- 46+1 Blue/White/- 47+1 Black/Yellow/- 48+2 DarkGray/White/- 50+1 Black/Yellow/- 51+1 Blue/White/- 52+1 DarkGray/White/- 53+1 Blue/White/- 54+1 Black/Yellow/- 55+2 DarkGray/White/- 57+1 Black/Yellow/- 58+1 Blue/White/- 59+1 DarkGray/White/- 60+2 Blue/White/- 62+2 DarkGray/White/- 64+1 Black/Yellow/- 65+1 Blue/White/- 66+1 DarkGray/White/- 67+1 Black/White/- 68+1 Blue/White/- 69+5 Black/White/- 74+1 Black/Yellow/- 75+2 Black/White/- 77+1 Blue/White/- 78+1 Black/White/- 79+1 Magenta/White/BOLD
+r02 |│                                          │W#AW ####                          │|
+r02 s 0+1 Magenta/White/BOLD 1+42 Black/White/- 43+10 Blue/White/- 53+26 Black/White/- 79+1 Magenta/White/BOLD
 r03 |│BEST ① ### E+O ##  ② ### E ##  ③ ### O ##                                     │|
-r03 s 0+1 DarkGray/White/- 1+5 Blue/White/BOLD 6+12 Black/White/BOLD|REVERSED 18+61 Black/White/- 79+1 DarkGray/White/-
+r03 s 0+1 Magenta/White/BOLD 1+5 Blue/White/BOLD 6+12 Black/White/BOLD|REVERSED 18+61 Black/White/- 79+1 Magenta/White/BOLD
 r04 |│not parked — Enter parks ① · │=live ①=cand · ←/→ pick · Enter=park · z=top-## │|
-r04 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r04 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r05 |│─────────┴────────────────┴───────────────┴───────────────┴───────────────┴───│|
-r05 s 0+80 DarkGray/White/-
+r05 s 0+1 Magenta/White/BOLD 1+78 DarkGray/White/- 79+1 Magenta/White/BOLD
 r06 |│                                                                              │|
-r06 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r06 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r07 |│                                                                              │|
-r07 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r07 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r08 |│                                                                              │|
-r08 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r08 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r09 |│                                                                              │|
-r09 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r09 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r10 |│                                                                              │|
-r10 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r10 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r11 |│                                                                              │|
-r11 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r11 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r12 |│                                                                              │|
-r12 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r12 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r13 |│                                                                              │|
-r13 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r13 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r14 |│                                                                              │|
-r14 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r14 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r15 |└──────────────────────────────────────────────────────────────────────────────┘|
-r15 s 0+80 DarkGray/White/-
+r15 s 0+80 Magenta/White/BOLD

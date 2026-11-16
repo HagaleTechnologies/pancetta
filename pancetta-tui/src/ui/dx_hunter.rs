@@ -377,10 +377,10 @@ fn create_dx_row<'a>(
     };
     // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
     // the engaged token + underline, without discarding e.g. the tier-1 BOLD.
+    // A filled focus (HighContrast) keeps its pair (`Theme::engaged_call`).
     let call_style = if is_engaged {
-        call_style
-            .patch(app.theme.engaged)
-            .add_modifier(Modifier::UNDERLINED)
+        app.theme
+            .engaged_call(call_style, is_globally_focused && !is_stale)
     } else {
         call_style
     };

@@ -4,11 +4,11 @@
 r00 |┌ Diagnostics (#/#) — ↑↓ scroll, k aborts QSO, Esc/D close ────────────────────────────────────┐|
 r00 s 0+96 Blue/White/BOLD
 r01 |│##:##:## qso            Fixture diagnostic                                                    │|
-r01 s 0+1 Blue/White/BOLD 1+42 DarkGray/White/BOLD|REVERSED 43+52 Black/White/- 95+1 Blue/White/BOLD
-r02 |│                                                                                              │|
-r02 s 0+1 Blue/White/BOLD 1+94 Black/White/- 95+1 Blue/White/BOLD
-r03 |│                                                                                              │|
-r03 s 0+1 Blue/White/BOLD 1+94 Black/White/- 95+1 Blue/White/BOLD
+r01 s 0+1 Blue/White/BOLD 1+42 DarkGray/White/- 43+52 Black/White/- 95+1 Blue/White/BOLD
+r02 |│##:##:## qso            Fixture warning                                                       │|
+r02 s 0+1 Blue/White/BOLD 1+39 Black/Yellow/- 40+55 Black/White/- 95+1 Blue/White/BOLD
+r03 |│##:##:## qso            Fixture error                                                         │|
+r03 s 0+1 Blue/White/BOLD 1+37 Red/White/BOLD|REVERSED 38+57 Black/White/- 95+1 Blue/White/BOLD
 r04 |│                                                                                              │|
 r04 s 0+1 Blue/White/BOLD 1+94 Black/White/- 95+1 Blue/White/BOLD
 r05 |│                                                                                              │|

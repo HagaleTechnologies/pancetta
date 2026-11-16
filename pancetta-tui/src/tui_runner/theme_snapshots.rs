@@ -202,9 +202,26 @@ fn banner(call: &str, qso_id: &str) -> crate::app::ActiveQsoBanner {
     }
 }
 
-fn dx_station() -> crate::app::DxStation {
+/// W1AW, the engaged and focused QSO, with a keep-calling watchdog.
+fn engaged_banner() -> crate::app::ActiveQsoBanner {
+    let mut b = banner("W1AW", "qso-1");
+    b.call_count = 2;
+    b.max_calls = 5;
+    b.watchdog_deadline = Some(chrono::Utc::now() + chrono::Duration::seconds(120));
+    b
+}
+
+fn queued_call() -> crate::app::PendingCallBanner {
+    crate::app::PendingCallBanner {
+        callsign: "ZL2AB".to_string(),
+        dx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+        waited_secs: 12,
+    }
+}
+
+fn dx_station(call: &str, priority_score: u32) -> crate::app::DxStation {
     crate::app::DxStation {
-        call_sign: "VK9XX".to_string(),
+        call_sign: call.to_string(),
         grid_square: Some("QH30".to_string()),
         frequency: 14.074,
         band: None,
@@ -214,15 +231,15 @@ fn dx_station() -> crate::app::DxStation {
         distance: None,
         bearing: None,
         worked_before: false,
-        needed: true,
+        needed: false,
         atno: false,
         band_needed: false,
-        priority_score: 800,
+        priority_score,
         local_rank: None,
         network_rank: None,
         source: crate::app::SpotSource::Local,
         entity_name: None,
-        offline_entity: pancetta_core::dxcc::entity_for_callsign("VK9XX"),
+        offline_entity: pancetta_core::dxcc::entity_for_callsign(call),
         rarity_tier: None,
         reporter_count: None,
         is_notable: false,
@@ -258,11 +275,30 @@ fn placement() -> crate::app::PlacementView {
     }
 }
 
-/// One deterministic App per theme: a 20 m dial, a CQ, a caller directed at
-/// us, our own TX, SNRs +4/-4/-12, one active QSO, one DX Hunter station, a
-/// placement snapshot, device/rig lists and recent QSOs for the overlays.
+/// One deterministic App per theme, populated with the plan's Phase 1
+/// required state: a 20 m dial; decodes 10 s old in both parities (a CQ, one
+/// calling us, our own TX, needed, ATNO, worked, band-needed, an engaged
+/// station, a plain exchange; SNRs +4/-4/-12); one active QSO with a
+/// watchdog deadline, a queued call and ✓/✗ history (the hound and drift
+/// QSOs are added for `panel_qso_status`, see `render_with`); DX Hunter
+/// stations that are needed, ATNO, notable, worked, engaged, Network and
+/// Both; a transmit in progress; readiness Blocker/Warning/Notice and a
+/// status line; a 20-row waterfall ramp; and overlay data with every
+/// diagnostic level, outcome and upload state. Title-bar chips are set for
+/// `view_operate` only (see `render_with`), so the other views keep room for
+/// the dial and view chip.
+///
+/// The QSO-status focus sits on W1AW, which is also engaged, so every other
+/// list renders the focused-and-engaged callsign (PAN-387 AC7).
+///
+/// Not every state reaches a golden: the ✓/✗ history needs a taller
+/// single-QSO panel than any surface draws, and the readiness strip folds
+/// the Notice into its `+N more` counter at 100 columns.
 async fn fixture(name: ThemeName) -> App {
+    use crate::app::{ActivePanel, SpotSource};
+    use crate::upload_status::{QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget};
     use pancetta_core::slot::SlotParity::{Even, Odd};
+    use pancetta_core::DiagnosticLevel;
     let mut config = Config::default();
     config.ui.theme = name;
     config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
@@ -271,42 +307,59 @@ async fn fixture(name: ThemeName) -> App {
     app.station_info.operating_frequency = 14.074;
     let own = app.station_info.call_sign.clone();
 
-    app.decoded_messages.push_back(decode(
-        "CQ DX JA1ABC PM95",
-        "JA1ABC",
-        4,
-        800.0,
-        Odd,
-        false,
-        false,
-    ));
-    app.decoded_messages.push_back(decode(
-        &format!("{own} G8KHF IO91"),
-        "G8KHF",
-        -4,
-        1234.0,
-        Odd,
-        true,
-        false,
-    ));
-    app.decoded_messages.push_back(decode(
-        &format!("CQ {own} FN42"),
-        &own,
-        0,
-        1500.0,
-        Even,
-        false,
-        true,
-    ));
-    app.decoded_messages.push_back(decode(
-        "CQ W1AW FN31",
-        "W1AW",
-        -12,
-        2100.0,
-        Odd,
-        false,
-        false,
-    ));
+    // Insertion order is oldest first and Band Activity lists newest first,
+    // so the focused, engaged CQ from W1AW is last: it then shows in every
+    // view's Band Activity, not only in the taller panel.
+    let mut decodes = vec![
+        decode("CQ DX JA1ABC PM95", "JA1ABC", 4, 800.0, Odd, false, false),
+        decode("CQ VK9XX QH30", "VK9XX", -4, 600.0, Even, false, false),
+        decode("CQ 3Y0J JD10", "3Y0J", -12, 950.0, Odd, false, false),
+        decode("CQ K1ABC FN42", "K1ABC", 4, 1100.0, Even, false, false),
+        decode("CQ ZL2AB RF70", "ZL2AB", -4, 1700.0, Odd, false, false),
+        decode(
+            "K2XYZ DL1ABC -05",
+            "DL1ABC",
+            -12,
+            1900.0,
+            Even,
+            false,
+            false,
+        ),
+        decode(
+            &format!("{own} G8KHF IO91"),
+            "G8KHF",
+            -4,
+            1234.0,
+            Odd,
+            true,
+            false,
+        ),
+        decode(
+            &format!("{own} W1AW R-08"),
+            "W1AW",
+            -8,
+            2100.0,
+            Odd,
+            true,
+            false,
+        ),
+        decode(
+            &format!("CQ {own} FN42"),
+            &own,
+            0,
+            1500.0,
+            Even,
+            false,
+            true,
+        ),
+        decode("CQ W1AW FN31", "W1AW", -12, 2100.0, Odd, false, false),
+    ];
+    decodes[1].needed = true;
+    decodes[2].atno = true;
+    decodes[2].needed = true;
+    decodes[3].worked_before = true;
+    decodes[4].band_needed = true;
+    app.decoded_messages.extend(decodes);
 
     app.device_selection.input_devices = vec![
         ("Fixture input".into(), true),
@@ -316,32 +369,138 @@ async fn fixture(name: ThemeName) -> App {
         ("Fixture output".into(), true),
         ("Second output".into(), false),
     ];
-    for text in ["Fixture diagnostic", "Second diagnostic"] {
+    for (text, level) in [
+        ("Fixture diagnostic", DiagnosticLevel::Info),
+        ("Fixture warning", DiagnosticLevel::Warn),
+        ("Fixture error", DiagnosticLevel::Error),
+    ] {
         app.diagnostic_events
             .push_back(crate::app::DiagnosticEventRecord {
                 ts: chrono::Utc::now() - chrono::Duration::seconds(10),
                 target: "qso",
-                level: pancetta_core::DiagnosticLevel::Info,
+                level,
                 text: text.into(),
                 qso_id: None,
                 callsign: None,
             });
     }
-    for callsign in ["W1AW", "G8KHF"] {
+    for (callsign, outcome) in [
+        ("W1AW", crate::app::QsoOutcome::Completed),
+        (
+            "G8KHF",
+            crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
+        ),
+    ] {
+        let last_state = match outcome {
+            crate::app::QsoOutcome::Completed => "Completed",
+            crate::app::QsoOutcome::Failed(_) => "Failed",
+        };
         app.recent_qsos.push_back(crate::app::RecentQsoOutcome {
             callsign: callsign.into(),
             qso_uuid: format!("u-{callsign}"),
-            outcome: crate::app::QsoOutcome::Completed,
-            last_state: "Completed".into(),
+            outcome,
+            last_state: last_state.into(),
             freq_hz: 14_074_000,
             ts: chrono::Utc::now() - chrono::Duration::seconds(10),
             brief_timeline: vec![],
         });
     }
-    app.apply_active_qsos(vec![banner("W1AW", "qso-1")], vec![]);
-    app.dx_stations.insert("VK9XX".to_string(), dx_station());
+    // Both overlays show a window ending at their cursor: put it on the
+    // last entry so every level and outcome is drawn.
+    app.diagnostics_scroll = app.diagnostic_events.len() - 1;
+    app.recent_qsos_scroll = app.recent_qsos.len() - 1;
+    app.qso_uploads = vec![QsoUploadStatus {
+        uuid: "u-W1AW".to_string(),
+        callsign: "W1AW".to_string(),
+        revision: 1,
+        targets: vec![
+            (
+                UploadTarget::Qrz,
+                TargetUploadStatus::new(UploadState::Accepted, ""),
+            ),
+            (
+                UploadTarget::ClubLog,
+                TargetUploadStatus::new(UploadState::Pending, "queued"),
+            ),
+            (
+                UploadTarget::Eqsl,
+                TargetUploadStatus::new(UploadState::Rejected, "refused"),
+            ),
+            (
+                UploadTarget::Cqdx,
+                TargetUploadStatus::new(UploadState::Failed, "queue full"),
+            ),
+            (
+                UploadTarget::Lotw,
+                TargetUploadStatus::new(UploadState::Unknown, ""),
+            ),
+        ],
+    }];
+    for (call_sign, success) in [("K1ABC", true), ("OH2XX", false)] {
+        app.qso_history.push_back(crate::app::QsoHistoryItem {
+            call_sign: call_sign.to_string(),
+            success,
+            completed_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+        });
+    }
+
+    app.apply_active_qsos(vec![engaged_banner()], vec![queued_call()]);
+
+    let mut stations = vec![
+        dx_station("W1AW", 900),
+        dx_station("VK9XX", 800),
+        dx_station("3Y0J", 950),
+        dx_station("P5DX", 700),
+        dx_station("K1ABC", 100),
+        dx_station("ZL2AB", 600),
+    ];
+    stations[1].needed = true;
+    stations[2].atno = true;
+    stations[2].needed = true;
+    stations[2].source = SpotSource::Network;
+    stations[2].snr = 0;
+    stations[3].is_notable = true;
+    stations[3].notable_type = Some("DXpedition".to_string());
+    stations[3].source = SpotSource::Both;
+    stations[4].worked_before = true;
+    stations[5].band_needed = true;
+    for s in stations {
+        app.dx_stations.insert(s.call_sign.clone(), s);
+    }
     app.clamp_dx_hunter_selection();
     app.apply_placement(placement());
+
+    app.tx_now_sending = Some(crate::app::TxQueueItem {
+        text: format!("W1AW {own} -12"),
+        freq_hz: 1500.0,
+        qso_id: Some("qso-1".to_string()),
+        deferred: false,
+    });
+    app.is_transmitting = true;
+
+    app.station_readiness = Some(crate::readiness::StationReadiness {
+        ptt_off_unconfirmed: true,
+        autonomous_config_disabled: true,
+        ..Default::default()
+    });
+    app.tx_output_default = true;
+    app.set_local_status("Fixture status".to_string(), DiagnosticLevel::Info);
+    app.pipeline_health = Some(crate::app::PipelineHealth {
+        audio_alive: true,
+        dsp_windows: 40,
+        last_rms: 0.1,
+        ft8lib_available: true,
+        total_decodes: 10,
+        last_decode_elapsed_ms: 900,
+        last_decode_budget_exhausted: false,
+        tx_attempts: 3,
+        tx_defers: 1,
+        decode_panic_count: 0,
+        wdt_panic_count: 0,
+        clock_skew_warning_s: None,
+    });
+    app.waterfall_data = (0..20).map(|row| vec![row as f32 / 19.0; 64]).collect();
+
     app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
     app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
         name: "home".to_string(),
@@ -350,6 +509,11 @@ async fn fixture(name: ThemeName) -> App {
         baud_rate: 38400,
         ptt_method: pancetta_config::rig::PttMethod::Cat,
     }];
+
+    // Focus on the engaged W1AW from the QSO-status panel, so the other
+    // lists draw it with both the focus and the engaged highlight.
+    app.active_panel = ActivePanel::QsoStatus;
+    app.qso_cursor = 0;
     app
 }
 
@@ -501,18 +665,28 @@ fn render_with(app: &mut App, surface: Surface) -> Snapshot {
             let (w, h) = match surface {
                 Surface::view_operate => {
                     app.active_view = ActiveView::Operate;
+                    app.tx_policy = pancetta_core::TxPolicy::Full;
+                    // Title-bar chips: here only, because together they
+                    // push the dial and view chip out of a 100-column bar.
+                    app.fox_mode = true;
+                    app.autonomous_init_paused = true;
+                    app.split_tx_hz = 14_076_000;
+                    app.tx_offset_hold_hz = Some(1500);
                     (100, 30)
                 }
                 Surface::view_monitor => {
                     app.active_view = ActiveView::Monitor;
+                    app.config.replay = true;
                     (100, 30)
                 }
                 Surface::view_hunt => {
                     app.active_view = ActiveView::Hunt;
+                    app.tx_policy = pancetta_core::TxPolicy::RespondOnly;
                     (100, 30)
                 }
                 Surface::view_run => {
                     app.active_view = ActiveView::Run;
+                    app.tx_policy = pancetta_core::TxPolicy::Disabled;
                     (100, 30)
                 }
                 Surface::view_monitor_basic => {
@@ -527,14 +701,29 @@ fn render_with(app: &mut App, surface: Surface) -> Snapshot {
             Snapshot::from_buffer(&buf, buf.area)
         }
         Kind::Panel => {
+            // The panel under test is the active one, so its focus border
+            // and selection highlight show.
+            use crate::app::ActivePanel;
+            app.active_panel = match surface {
+                Surface::panel_band_activity => ActivePanel::BandActivity,
+                Surface::panel_qso_status => ActivePanel::QsoStatus,
+                Surface::panel_callers => ActivePanel::Callers,
+                Surface::panel_dx_hunter => ActivePanel::DxHunter,
+                Surface::panel_tx_placement | Surface::panel_tx_placement_zoom => {
+                    ActivePanel::TxPlacement
+                }
+                _ => app.active_panel,
+            };
             if surface == Surface::panel_qso_status {
-                // Two active QSOs select the multi-QSO list; the single-QSO
-                // detail carries a wall-clock slot gauge whose fill width
-                // would make the golden depend on the second it ran in.
-                app.apply_active_qsos(
-                    vec![banner("W1AW", "qso-1"), banner("JA1ABC", "qso-2")],
-                    vec![],
-                );
+                // Three active QSOs select the multi-QSO list, with the hound
+                // and drift badges; the single-QSO detail is in the views.
+                let mut hound = banner("DL1HND", "qso-2");
+                hound.hound = true;
+                let mut drift = banner("F5DRF", "qso-3");
+                drift.pending_freq_drift_hz = Some(25.0);
+                drift.pending_freq_drift_since =
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+                app.apply_active_qsos(vec![engaged_banner(), hound, drift], vec![queued_call()]);
             }
             let buf = draw_panel(app, surface);
             Snapshot::from_buffer(&buf, buf.area)

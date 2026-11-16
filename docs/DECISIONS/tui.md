@@ -633,7 +633,12 @@ accepted but ignored, and every renderer picked its own colours.
 - **HighContrast rules.** The meaning tokens are pairwise distinct styles;
   alarms (`error`, `needed`, `own_tx`, `chip_blocker`, `verdict_held`,
   `tx_disabled`, `alarm`, `modal_danger`) are bold; `selection` is REVERSED
-  with no colours; focus is a filled black-on-light-yellow frame.
+  with no colours; focus is a filled black-on-light-yellow frame. A focused
+  callsign that is also engaged keeps that fill and gains the underline
+  (`Theme::engaged_call`), because `engaged`'s light green on light yellow is
+  1.28:1. Dark and Light have an unfilled focus and still stack `engaged` on
+  it. The snapshot fixture focuses an engaged station so the goldens cover
+  that pairing.
 - **Waterfall data palette.** The intensity ramp (`waterfall_ramp`) is data,
   the same in every theme, drawn on a black `waterfall_data` panel.
 - **Occupancy by enum.** The waterfall occupancy decision is

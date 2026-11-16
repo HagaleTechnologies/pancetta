@@ -3,13 +3,13 @@
 # surface=panel_station_card theme=dark origin=0,0 size=60x6
 r00 |┌Station───────────────────────────────────────────────────┐|
 r00 s 0+1 Gray/Black/- 1+7 Cyan/Black/- 8+52 Gray/Black/-
-r01 |│G#KHF — --- new                                           │|
-r01 s 0+1 Gray/Black/- 1+5 Green/Black/BOLD 6+7 White/Black/- 13+3 Cyan/Black/- 16+43 White/Black/- 59+1 Gray/Black/-
-r02 |│Why: …                                                    │|
-r02 s 0+1 Gray/Black/- 1+5 DarkGray/Black/- 6+53 White/Black/- 59+1 Gray/Black/-
-r03 |│---- --- · N#CALL G#KHF IO## (-#) ##s                     │|
+r01 |│W#AW — --- new                                            │|
+r01 s 0+1 Gray/Black/- 1+4 Green/Black/BOLD 5+7 White/Black/- 12+3 Cyan/Black/- 15+44 White/Black/- 59+1 Gray/Black/-
+r02 |│Why: not scored yet (no decode or cqdx data)              │|
+r02 s 0+1 Gray/Black/- 1+5 DarkGray/Black/- 6+39 Cyan/Black/BOLD 45+14 White/Black/- 59+1 Gray/Black/-
+r03 |│---- --- · CQ W#AW FN## (-##) ##s                         │|
 r03 s 0+1 Gray/Black/- 1+58 White/Black/- 59+1 Gray/Black/-
-r04 |│O-window · Space=call                                     │|
-r04 s 0+1 Gray/Black/- 1+21 DarkGray/Black/- 22+37 White/Black/- 59+1 Gray/Black/-
+r04 |│in QSO: wait rpt                                          │|
+r04 s 0+1 Gray/Black/- 1+16 DarkGray/Black/- 17+42 White/Black/- 59+1 Gray/Black/-
 r05 |└──────────────────────────────────────────────────────────┘|
 r05 s 0+60 Gray/Black/-

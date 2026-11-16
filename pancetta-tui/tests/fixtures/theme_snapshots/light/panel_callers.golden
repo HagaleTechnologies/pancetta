@@ -2,34 +2,34 @@
 # Re-bless an intended change: PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots
 # surface=panel_callers theme=light origin=0,0 size=80x16
 r00 |┌Callers───────────────────────────────────────────────────────────────────────┐|
-r00 s 0+1 DarkGray/White/- 1+7 Blue/White/- 8+72 DarkGray/White/-
-r01 |│Call                       Msg                       SNR  Freq  Age  Flags    │|
-r01 s 0+1 DarkGray/White/- 1+26 Blue/White/BOLD 27+1 Black/White/- 28+25 Blue/White/BOLD 53+1 Black/White/- 54+4 Blue/White/BOLD 58+1 Black/White/- 59+5 Blue/White/BOLD 64+1 Black/White/- 65+4 Blue/White/BOLD 69+1 Black/White/- 70+9 Blue/White/BOLD 79+1 DarkGray/White/-
-r02 |│G#KHF                      N#CALL G#KHF IO…          -#   ####  ##s           │|
-r02 s 0+1 DarkGray/White/- 1+26 Magenta/White/BOLD 27+27 Black/White/- 54+4 Black/Yellow/- 58+1 Black/White/- 59+5 Blue/White/- 64+1 Black/White/- 65+4 DarkGray/White/- 69+1 Black/White/- 70+10 DarkGray/White/-
-r03 |│                                                                              │|
-r03 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r00 s 0+80 Magenta/White/BOLD
+r01 |│  Call                      Msg                      SNR  Freq  Age  Flags    │|
+r01 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+25 Blue/White/BOLD 28+1 Black/White/- 29+24 Blue/White/BOLD 53+1 Black/White/- 54+4 Blue/White/BOLD 58+1 Black/White/- 59+5 Blue/White/BOLD 64+1 Black/White/- 65+4 Blue/White/BOLD 69+1 Black/White/- 70+9 Blue/White/BOLD 79+1 Magenta/White/BOLD
+r02 |│▶ ● W#AW                    N#CALL W#AW R-##         -#   ####  ##s  MINE     │|
+r02 s 0+1 Magenta/White/BOLD 1+2 Black/White/BOLD|REVERSED 3+25 Blue/White/BOLD|UNDERLINED|REVERSED 28+26 Black/White/BOLD|REVERSED 54+4 Black/Yellow/BOLD|REVERSED 58+1 Black/White/BOLD|REVERSED 59+5 Blue/White/BOLD|REVERSED 64+1 Black/White/BOLD|REVERSED 65+4 DarkGray/White/BOLD|REVERSED 69+1 Black/White/BOLD|REVERSED 70+9 DarkGray/White/BOLD|REVERSED 79+1 Magenta/White/BOLD
+r03 |│  G#KHF                     N#CALL G#KHF IO…         -#   ####  ##s           │|
+r03 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+25 Blue/White/BOLD 28+26 Black/White/- 54+4 Black/Yellow/- 58+1 Black/White/- 59+5 Blue/White/- 64+1 Black/White/- 65+4 DarkGray/White/- 69+1 Black/White/- 70+9 DarkGray/White/- 79+1 Magenta/White/BOLD
 r04 |│                                                                              │|
-r04 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r04 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r05 |│                                                                              │|
-r05 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r05 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r06 |│                                                                              │|
-r06 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r06 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r07 |│                                                                              │|
-r07 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r07 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r08 |│                                                                              │|
-r08 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r08 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r09 |│                                                                              │|
-r09 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r09 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r10 |│                                                                              │|
-r10 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r10 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r11 |│                                                                              │|
-r11 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r11 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r12 |│                                                                              │|
-r12 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r12 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r13 |│                                                                              │|
-r13 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
-r14 |│reply ◂ -# ▸   Enter=send                                                     │|
-r14 s 0+7 DarkGray/White/- 7+2 Blue/White/- 9+2 Magenta/White/BOLD 11+2 Blue/White/- 13+13 DarkGray/White/- 26+53 Black/White/- 79+1 DarkGray/White/-
+r13 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
+r14 |│reply ◂ RR## ▸   Enter=send                                                   │|
+r14 s 0+1 Magenta/White/BOLD 1+6 DarkGray/White/- 7+2 Blue/White/- 9+4 Magenta/White/BOLD 13+2 Blue/White/- 15+13 DarkGray/White/- 28+51 Black/White/- 79+1 Magenta/White/BOLD
 r15 |└──────────────────────────────────────────────────────────────────────────────┘|
-r15 s 0+80 DarkGray/White/-
+r15 s 0+80 Magenta/White/BOLD

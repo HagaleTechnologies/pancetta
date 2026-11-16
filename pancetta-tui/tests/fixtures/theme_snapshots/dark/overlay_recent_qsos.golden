@@ -3,10 +3,10 @@
 # surface=overlay_recent_qsos theme=dark origin=2,2 size=96x26
 r00 |┌ Recent QSOs (#/#) — ↑↓ scroll, k aborts QSO, Esc/R close ────────────────────────────────────┐|
 r00 s 0+96 Cyan/Black/-
-r01 |│##:##:## W#AW       Completed  ?  (######## Hz)                                               │|
-r01 s 0+1 Cyan/Black/- 1+47 Green/Black/BOLD|REVERSED 48+47 White/Black/- 95+1 Cyan/Black/-
-r02 |│                                                                                              │|
-r02 s 0+1 Cyan/Black/- 1+94 White/Black/- 95+1 Cyan/Black/-
+r01 |│##:##:## W#AW       Completed  Q✓ C~ E× D! L?  (######## Hz)                                  │|
+r01 s 0+1 Cyan/Black/- 1+33 Green/Black/- 34+1 White/Black/- 35+2 Yellow/Black/- 37+1 White/Black/- 38+2 Red/Black/- 40+1 White/Black/- 41+2 Red/Black/- 43+1 White/Black/- 44+2 Gray/Black/- 46+15 Green/Black/- 61+34 White/Black/- 95+1 Cyan/Black/-
+r02 |│##:##:## G#KHF      Failed  (######## Hz)                                                     │|
+r02 s 0+1 Cyan/Black/- 1+41 Yellow/Black/BOLD|REVERSED 42+53 White/Black/- 95+1 Cyan/Black/-
 r03 |│                                                                                              │|
 r03 s 0+1 Cyan/Black/- 1+94 White/Black/- 95+1 Cyan/Black/-
 r04 |│                                                                                              │|
@@ -45,10 +45,10 @@ r20 |│Uploads: Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW            
 r20 s 0+1 Cyan/Black/- 1+56 DarkGray/Black/- 57+38 White/Black/- 95+1 Cyan/Black/-
 r21 |│✓ accepted · ~ pending · × rejected · ! failed · ? unknown                                    │|
 r21 s 0+1 Cyan/Black/- 1+58 DarkGray/Black/- 59+36 White/Black/- 95+1 Cyan/Black/-
-r22 |│┌ Station: W#AW · ##:##:## UTC · ######## Hz ────────────────────────────────────────────────┐│|
+r22 |│┌ Station: G#KHF · ##:##:## UTC · ######## Hz ───────────────────────────────────────────────┐│|
 r22 s 0+96 Cyan/Black/-
-r23 |││Uploads: checking…                                                                          ││|
-r23 s 0+2 Cyan/Black/- 2+18 White/Black/DIM 20+74 White/Black/- 94+2 Cyan/Black/-
+r23 |││Uploads: not applicable                                                                     ││|
+r23 s 0+2 Cyan/Black/- 2+23 White/Black/DIM 25+69 White/Black/- 94+2 Cyan/Black/-
 r24 |│└────────────────────────────────────────────────────────────────────────────────────────────┘│|
 r24 s 0+96 Cyan/Black/-
 r25 |└──────────────────────────────────────────────────────────────────────────────────────────────┘|

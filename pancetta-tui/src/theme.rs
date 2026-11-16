@@ -80,7 +80,8 @@ pub struct Theme {
     pub needed: Style,
     /// All-time new one.
     pub atno: Style,
-    /// Station in a live QSO, stacked on the call style.
+    /// Station in a live QSO, stacked on the call style (see
+    /// [`Theme::engaged_call`]).
     pub engaged: Style,
     /// DX Hunter notable (`★`).
     pub notable: Style,
@@ -378,6 +379,22 @@ impl Theme {
             Occupancy::OtherParity => self.occupancy_other,
             Occupancy::OwnParity => self.occupancy_own,
         }
+    }
+
+    /// The callsign style for a station in a live QSO: `engaged` stacked on
+    /// `base`, plus the underline. When `base` is the `focus` style and
+    /// `focus` is a filled pair (HighContrast, black on light yellow), the
+    /// pair is kept instead: `engaged`'s light-green foreground on that fill
+    /// is 1.28:1, and replacing the fill would hide the focus. The `●`
+    /// marker and the underline still show the station is engaged. Dark and
+    /// Light have an unfilled `focus`, so their output is unchanged.
+    pub fn engaged_call(&self, base: Style, base_is_focus: bool) -> Style {
+        let style = if base_is_focus && self.focus.bg.is_some() {
+            base
+        } else {
+            base.patch(self.engaged)
+        };
+        style.add_modifier(Modifier::UNDERLINED)
     }
 
     /// Every token with its name, in declaration order (53 tokens).
@@ -693,6 +710,29 @@ mod tests {
     /// Every Dark token against the colour the pre-PAN-387 code painted for
     /// that meaning (the file it came from), so Dark keeps today's look. The
     /// one change is `page`, which gains a white foreground.
+    #[test]
+    fn engaged_call_keeps_a_filled_focus() {
+        let focused = |t: &Theme| t.focus.add_modifier(Modifier::BOLD);
+        // HighContrast: the filled focus pair survives, the underline marks
+        // the engaged station, and the pair meets 4.5:1.
+        let hc = Theme::HIGH_CONTRAST;
+        let s = hc.engaged_call(focused(&hc), true);
+        assert_eq!((s.fg, s.bg), (hc.focus.fg, hc.focus.bg));
+        assert!(s.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(contrast_ratio(s.fg.unwrap(), s.bg.unwrap()).unwrap() >= 4.5);
+        // An unfocused engaged station still takes the `engaged` colour.
+        let s = hc.engaged_call(hc.callable, false);
+        assert_eq!(s.fg, hc.engaged.fg);
+        // Dark and Light keep `base.patch(engaged)`, focused or not.
+        for t in [Theme::DARK, Theme::LIGHT] {
+            let base = focused(&t);
+            assert_eq!(
+                t.engaged_call(base, true),
+                base.patch(t.engaged).add_modifier(Modifier::UNDERLINED)
+            );
+        }
+    }
+
     #[test]
     fn dark_tokens_match_legacy_dark_colours() {
         use Color::*;

@@ -2,34 +2,34 @@
 # Re-bless an intended change: PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots
 # surface=panel_dx_hunter theme=light origin=0,0 size=80x16
 r00 |┌DX Hunter─────────────────────────────────────────────────────────────────────┐|
-r00 s 0+1 DarkGray/White/- 1+9 Blue/White/- 10+70 DarkGray/White/-
-r01 |│Src  Call         Band  Entity             Grid  SNR  Rarity    Rpt Last  Pri │|
-r01 s 0+1 DarkGray/White/- 1+4 Blue/White/BOLD 5+1 Black/White/- 6+12 Blue/White/BOLD 18+1 Black/White/- 19+5 Blue/White/BOLD 24+1 Black/White/- 25+18 Blue/White/BOLD 43+1 Black/White/- 44+5 Blue/White/BOLD 49+1 Black/White/- 50+4 Blue/White/BOLD 54+1 Black/White/- 55+9 Blue/White/BOLD 64+1 Black/White/- 65+3 Blue/White/BOLD 68+1 Black/White/- 69+5 Blue/White/BOLD 74+1 Black/White/- 75+4 Blue/White/BOLD 79+1 DarkGray/White/-
-r02 |│RX   +VK#XX       ---   Christmas Island   QH##  -##  -             ##s   ### │|
-r02 s 0+1 DarkGray/White/- 1+4 Blue/White/- 5+1 Black/White/- 6+12 Red/White/BOLD|UNDERLINED 18+7 Black/White/- 25+16 Blue/White/- 41+9 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 DarkGray/White/-
-r03 |│                                                                              │|
-r03 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
-r04 |│                                                                              │|
-r04 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
-r05 |│                                                                              │|
-r05 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
-r06 |│                                                                              │|
-r06 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
-r07 |│                                                                              │|
-r07 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r00 s 0+80 Magenta/White/BOLD
+r01 |│  Src  Call         Band  Entity           Grid  SNR  Rarity    Rpt Last  Pri │|
+r01 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/BOLD 7+1 Black/White/- 8+12 Blue/White/BOLD 20+1 Black/White/- 21+5 Blue/White/BOLD 26+1 Black/White/- 27+16 Blue/White/BOLD 43+1 Black/White/- 44+5 Blue/White/BOLD 49+1 Black/White/- 50+4 Blue/White/BOLD 54+1 Black/White/- 55+9 Blue/White/BOLD 64+1 Black/White/- 65+3 Blue/White/BOLD 68+1 Black/White/- 69+5 Blue/White/BOLD 74+1 Black/White/- 75+4 Blue/White/BOLD 79+1 Magenta/White/BOLD
+r02 |│▶ NET  !#Y#J        ---   Bouvet           QH##  ---  -             ##s   ### │|
+r02 s 0+1 Magenta/White/BOLD 1+2 Black/White/BOLD|REVERSED 3+4 Blue/White/BOLD|REVERSED 7+1 Black/White/BOLD|REVERSED 8+12 Magenta/White/BOLD|UNDERLINED|REVERSED 20+7 Black/White/BOLD|REVERSED 27+6 Blue/White/BOLD|REVERSED 33+17 Black/White/BOLD|REVERSED 50+4 Blue/White/BOLD|REVERSED 54+25 Black/White/BOLD|REVERSED 79+1 Magenta/White/BOLD
+r03 |│  RX   ● W#AW       ---   United States    QH##  -##  -             ##s   ### │|
+r03 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Blue/White/BOLD|UNDERLINED 20+7 Black/White/- 27+13 Blue/White/- 40+10 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
+r04 |│  RX   +VK#XX       ---   Christmas Island QH##  -##  -             ##s   ### │|
+r04 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Red/White/BOLD|UNDERLINED 20+7 Black/White/- 27+16 Blue/White/- 43+7 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
+r05 |│  RX+N ★P#DX        ---   DPR of Korea     QH##  -##  -             ##s   ### │|
+r05 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Magenta/White/BOLD|ITALIC 20+7 Black/White/- 27+12 Blue/White/- 39+11 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
+r06 |│  RX   ▲ZL#AB       ---   New Zealand      QH##  -##  -             ##s   ### │|
+r06 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Black/White/BOLD 20+7 Black/White/- 27+11 Blue/White/- 38+12 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
+r07 |│  RX   K#ABC        ---   United States    QH##  -##  -             ##s   ### │|
+r07 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 DarkGray/White/- 20+7 Black/White/- 27+13 Blue/White/- 40+10 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
 r08 |│                                                                              │|
-r08 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r08 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r09 |│                                                                              │|
-r09 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r09 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r10 |│                                                                              │|
-r10 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r10 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r11 |│                                                                              │|
-r11 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r11 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r12 |│                                                                              │|
-r12 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r12 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r13 |│                                                                              │|
-r13 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r13 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r14 |│                                                                              │|
-r14 s 0+1 DarkGray/White/- 1+78 Black/White/- 79+1 DarkGray/White/-
+r14 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r15 |└──────────────────────────────────────────────────────────────────────────────┘|
-r15 s 0+80 DarkGray/White/-
+r15 s 0+80 Magenta/White/BOLD

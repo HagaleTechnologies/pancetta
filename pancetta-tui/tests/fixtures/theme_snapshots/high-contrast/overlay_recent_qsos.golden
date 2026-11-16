@@ -3,10 +3,10 @@
 # surface=overlay_recent_qsos theme=high-contrast origin=2,2 size=96x26
 r00 |┌ Recent QSOs (#/#) — ↑↓ scroll, k aborts QSO, Esc/R close ────────────────────────────────────┐|
 r00 s 0+96 White/Black/BOLD
-r01 |│##:##:## W#AW       Completed  ?  (######## Hz)                                               │|
-r01 s 0+1 White/Black/BOLD 1+47 LightGreen/Black/BOLD|REVERSED 48+47 White/Black/- 95+1 White/Black/BOLD
-r02 |│                                                                                              │|
-r02 s 0+1 White/Black/BOLD 1+94 White/Black/- 95+1 White/Black/BOLD
+r01 |│##:##:## W#AW       Completed  Q✓ C~ E× D! L?  (######## Hz)                                  │|
+r01 s 0+1 White/Black/BOLD 1+33 LightGreen/Black/BOLD 34+1 White/Black/- 35+2 Yellow/Black/BOLD 37+1 White/Black/- 38+2 LightRed/Black/BOLD 40+1 White/Black/- 41+2 LightRed/Black/BOLD 43+1 White/Black/- 44+2 Gray/Black/BOLD 46+15 LightGreen/Black/BOLD 61+34 White/Black/- 95+1 White/Black/BOLD
+r02 |│##:##:## G#KHF      Failed  (######## Hz)                                                     │|
+r02 s 0+1 White/Black/BOLD 1+41 Yellow/Black/BOLD|REVERSED 42+53 White/Black/- 95+1 White/Black/BOLD
 r03 |│                                                                                              │|
 r03 s 0+1 White/Black/BOLD 1+94 White/Black/- 95+1 White/Black/BOLD
 r04 |│                                                                                              │|
@@ -45,10 +45,10 @@ r20 |│Uploads: Q QRZ · C ClubLog · E eQSL · D cqdx.io · L LoTW            
 r20 s 0+1 White/Black/BOLD 1+56 Gray/Black/- 57+38 White/Black/- 95+1 White/Black/BOLD
 r21 |│✓ accepted · ~ pending · × rejected · ! failed · ? unknown                                    │|
 r21 s 0+1 White/Black/BOLD 1+58 Gray/Black/- 59+36 White/Black/- 95+1 White/Black/BOLD
-r22 |│┌ Station: W#AW · ##:##:## UTC · ######## Hz ────────────────────────────────────────────────┐│|
+r22 |│┌ Station: G#KHF · ##:##:## UTC · ######## Hz ───────────────────────────────────────────────┐│|
 r22 s 0+96 White/Black/BOLD
-r23 |││Uploads: checking…                                                                          ││|
-r23 s 0+2 White/Black/BOLD 2+18 White/Black/DIM 20+74 White/Black/- 94+2 White/Black/BOLD
+r23 |││Uploads: not applicable                                                                     ││|
+r23 s 0+2 White/Black/BOLD 2+23 White/Black/DIM 25+69 White/Black/- 94+2 White/Black/BOLD
 r24 |│└────────────────────────────────────────────────────────────────────────────────────────────┘│|
 r24 s 0+96 White/Black/BOLD
 r25 |└──────────────────────────────────────────────────────────────────────────────────────────────┘|

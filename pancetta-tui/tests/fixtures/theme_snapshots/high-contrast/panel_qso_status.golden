@@ -2,34 +2,34 @@
 # Re-bless an intended change: PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots
 # surface=panel_qso_status theme=high-contrast origin=0,0 size=80x16
 r00 |┌QSO Status (#/#)──────────────────────────────────────────────────────────────┐|
-r00 s 0+1 Gray/Black/- 1+16 LightCyan/Black/- 17+63 Gray/Black/-
+r00 s 0+80 Black/LightYellow/BOLD
 r01 |│  Call       Freq     State         Step    SNR  Exch                         │|
-r01 s 0+1 Gray/Black/- 1+54 LightCyan/Black/BOLD 55+24 White/Black/- 79+1 Gray/Black/-
-r02 |│▶ W#AW         ####  wait rpt     -        ---    #                           │|
-r02 s 0+1 Gray/Black/- 1+12 Cyan/Black/BOLD|REVERSED 13+9 LightYellow/Black/BOLD 22+13 Cyan/Black/- 35+8 LightYellow/Black/BOLD 43+6 LightGreen/Black/BOLD 49+30 White/Black/- 79+1 Gray/Black/-
-r03 |│  JA#ABC       ####  wait rpt     -        ---    #                           │|
-r03 s 0+1 Gray/Black/- 1+12 White/Black/BOLD 13+9 LightYellow/Black/BOLD 22+13 Cyan/Black/- 35+8 LightYellow/Black/BOLD 43+6 LightGreen/Black/BOLD 49+30 White/Black/- 79+1 Gray/Black/-
-r04 |│ [k] abort (any panel)  [r] re-send  Up/Down select  (r/select: this panel onl│|
-r04 s 0+80 Gray/Black/-
-r05 |│                                                                              │|
-r05 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
-r06 |│                                                                              │|
-r06 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r01 s 0+1 Black/LightYellow/BOLD 1+54 LightCyan/Black/BOLD 55+24 White/Black/- 79+1 Black/LightYellow/BOLD
+r02 |│▶ W#AW         ####  wait rpt     -        ---    #  Call #/# · stops #:##    │|
+r02 s 0+1 Black/LightYellow/BOLD 1+12 Cyan/Black/BOLD|REVERSED 13+9 LightYellow/Black/BOLD 22+13 Cyan/Black/- 35+8 LightYellow/Black/BOLD 43+6 LightGreen/Black/BOLD 49+3 White/Black/- 52+23 Yellow/Black/BOLD 75+4 White/Black/- 79+1 Black/LightYellow/BOLD
+r03 |│  DL#HND       ####  wait rpt     -        ---    # H                         │|
+r03 s 0+1 Black/LightYellow/BOLD 1+12 White/Black/BOLD 13+9 LightYellow/Black/BOLD 22+13 Cyan/Black/- 35+8 LightYellow/Black/BOLD 43+6 LightGreen/Black/BOLD 49+3 White/Black/- 52+2 Black/Cyan/BOLD 54+25 White/Black/- 79+1 Black/LightYellow/BOLD
+r04 |│  F#DRF        ####  wait rpt     -        ---    # D##                       │|
+r04 s 0+1 Black/LightYellow/BOLD 1+12 White/Black/BOLD 13+9 LightYellow/Black/BOLD 22+13 Cyan/Black/- 35+8 LightYellow/Black/BOLD 43+6 LightGreen/Black/BOLD 49+3 White/Black/- 52+4 Black/Yellow/BOLD 56+23 White/Black/- 79+1 Black/LightYellow/BOLD
+r05 |│ Queued: ZL#AB (waiting Even window, #:##)                                    │|
+r05 s 0+1 Black/LightYellow/BOLD 1+42 Yellow/Black/BOLD 43+36 White/Black/- 79+1 Black/LightYellow/BOLD
+r06 |│ [k] abort (any panel)  [r] re-send  Up/Down select  (r/select: this panel onl│|
+r06 s 0+1 Black/LightYellow/BOLD 1+78 Gray/Black/- 79+1 Black/LightYellow/BOLD
 r07 |│                                                                              │|
-r07 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r07 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r08 |│                                                                              │|
-r08 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r08 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r09 |│                                                                              │|
-r09 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r09 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r10 |│                                                                              │|
-r10 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r10 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r11 |│                                                                              │|
-r11 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r11 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r12 |│                                                                              │|
-r12 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r12 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r13 |│                                                                              │|
-r13 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r13 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r14 |│                                                                              │|
-r14 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r14 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r15 |└──────────────────────────────────────────────────────────────────────────────┘|
-r15 s 0+80 Gray/Black/-
+r15 s 0+80 Black/LightYellow/BOLD

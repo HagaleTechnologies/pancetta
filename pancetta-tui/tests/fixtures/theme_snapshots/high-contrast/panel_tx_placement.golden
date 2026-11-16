@@ -2,34 +2,34 @@
 # Re-bless an intended change: PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots
 # surface=panel_tx_placement theme=high-contrast origin=0,0 size=80x16
 r00 |┌TX Placement──────────────────────────────────────────────────────────────────┐|
-r00 s 0+1 Gray/Black/- 1+12 LightCyan/Black/- 13+67 Gray/Black/-
+r00 s 0+80 Black/LightYellow/BOLD
 r01 |│·▀█·▄█··▀█·▄█·▄▀··▄█·▄▀··▀█·▄▀··▀█·▄█·▄▀█·▄█·▄▀··▀█·▄▀··▀█·▄█··▀█· █both ▀E ▄O│|
-r01 s 0+2 Gray/Black/- 2+1 Yellow/Black/BOLD 3+1 LightGreen/Black/BOLD 4+1 Gray/Black/- 5+1 Cyan/Black/- 6+1 LightGreen/Black/BOLD 7+2 Gray/Black/- 9+1 Yellow/Black/BOLD 10+1 LightGreen/Black/BOLD 11+1 Gray/Black/- 12+1 Cyan/Black/- 13+1 LightGreen/Black/BOLD 14+1 Gray/Black/- 15+1 Cyan/Black/- 16+1 Yellow/Black/BOLD 17+2 Gray/Black/- 19+1 Cyan/Black/- 20+1 LightGreen/Black/BOLD 21+1 Gray/Black/- 22+1 Cyan/Black/- 23+1 Yellow/Black/BOLD 24+2 Gray/Black/- 26+1 Yellow/Black/BOLD 27+1 LightGreen/Black/BOLD 28+1 Gray/Black/- 29+1 Cyan/Black/- 30+1 Yellow/Black/BOLD 31+2 Gray/Black/- 33+1 Yellow/Black/BOLD 34+1 LightGreen/Black/BOLD 35+1 Gray/Black/- 36+1 Cyan/Black/- 37+1 LightGreen/Black/BOLD 38+1 Gray/Black/- 39+1 Cyan/Black/- 40+1 Yellow/Black/BOLD 41+1 LightGreen/Black/BOLD 42+1 Gray/Black/- 43+1 Cyan/Black/- 44+1 LightGreen/Black/BOLD 45+1 Gray/Black/- 46+1 Cyan/Black/- 47+1 Yellow/Black/BOLD 48+2 Gray/Black/- 50+1 Yellow/Black/BOLD 51+1 LightGreen/Black/BOLD 52+1 Gray/Black/- 53+1 Cyan/Black/- 54+1 Yellow/Black/BOLD 55+2 Gray/Black/- 57+1 Yellow/Black/BOLD 58+1 LightGreen/Black/BOLD 59+1 Gray/Black/- 60+1 Cyan/Black/- 61+1 LightGreen/Black/BOLD 62+2 Gray/Black/- 64+1 Yellow/Black/BOLD 65+1 LightGreen/Black/BOLD 66+1 Gray/Black/- 67+1 White/Black/- 68+1 LightGreen/Black/BOLD 69+5 White/Black/- 74+1 Yellow/Black/BOLD 75+2 White/Black/- 77+1 Cyan/Black/- 78+1 White/Black/- 79+1 Gray/Black/-
-r02 |│                                 ◆        │W#AW ####                          │|
-r02 s 0+1 Gray/Black/- 1+33 White/Black/- 34+1 Black/LightYellow/BOLD 35+8 White/Black/- 43+10 LightGreen/Black/BOLD 53+26 White/Black/- 79+1 Gray/Black/-
+r01 s 0+1 Black/LightYellow/BOLD 1+1 Gray/Black/- 2+1 Yellow/Black/BOLD 3+1 LightGreen/Black/BOLD 4+1 Gray/Black/- 5+1 Cyan/Black/- 6+1 LightGreen/Black/BOLD 7+2 Gray/Black/- 9+1 Yellow/Black/BOLD 10+1 LightGreen/Black/BOLD 11+1 Gray/Black/- 12+1 Cyan/Black/- 13+1 LightGreen/Black/BOLD 14+1 Gray/Black/- 15+1 Cyan/Black/- 16+1 Yellow/Black/BOLD 17+2 Gray/Black/- 19+1 Cyan/Black/- 20+1 LightGreen/Black/BOLD 21+1 Gray/Black/- 22+1 Cyan/Black/- 23+1 Yellow/Black/BOLD 24+2 Gray/Black/- 26+1 Yellow/Black/BOLD 27+1 LightGreen/Black/BOLD 28+1 Gray/Black/- 29+1 Cyan/Black/- 30+1 Yellow/Black/BOLD 31+2 Gray/Black/- 33+1 Yellow/Black/BOLD 34+1 LightGreen/Black/BOLD 35+1 Gray/Black/- 36+1 Cyan/Black/- 37+1 LightGreen/Black/BOLD 38+1 Gray/Black/- 39+1 Cyan/Black/- 40+1 Yellow/Black/BOLD 41+1 LightGreen/Black/BOLD 42+1 Gray/Black/- 43+1 Cyan/Black/- 44+1 LightGreen/Black/BOLD 45+1 Gray/Black/- 46+1 Cyan/Black/- 47+1 Yellow/Black/BOLD 48+2 Gray/Black/- 50+1 Yellow/Black/BOLD 51+1 LightGreen/Black/BOLD 52+1 Gray/Black/- 53+1 Cyan/Black/- 54+1 Yellow/Black/BOLD 55+2 Gray/Black/- 57+1 Yellow/Black/BOLD 58+1 LightGreen/Black/BOLD 59+1 Gray/Black/- 60+1 Cyan/Black/- 61+1 LightGreen/Black/BOLD 62+2 Gray/Black/- 64+1 Yellow/Black/BOLD 65+1 LightGreen/Black/BOLD 66+1 Gray/Black/- 67+1 White/Black/- 68+1 LightGreen/Black/BOLD 69+5 White/Black/- 74+1 Yellow/Black/BOLD 75+2 White/Black/- 77+1 Cyan/Black/- 78+1 White/Black/- 79+1 Black/LightYellow/BOLD
+r02 |│                                          │W#AW ####                          │|
+r02 s 0+1 Black/LightYellow/BOLD 1+42 White/Black/- 43+10 LightGreen/Black/BOLD 53+26 White/Black/- 79+1 Black/LightYellow/BOLD
 r03 |│BEST ① ### E+O ##  ② ### E ##  ③ ### O ##                                     │|
-r03 s 0+1 Gray/Black/- 1+5 LightCyan/Black/BOLD 6+12 White/Black/BOLD|REVERSED 18+61 White/Black/- 79+1 Gray/Black/-
+r03 s 0+1 Black/LightYellow/BOLD 1+5 LightCyan/Black/BOLD 6+12 White/Black/BOLD|REVERSED 18+61 White/Black/- 79+1 Black/LightYellow/BOLD
 r04 |│not parked — Enter parks ① · │=live ①=cand · ←/→ pick · Enter=park · z=top-## │|
-r04 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r04 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r05 |│─────────┴────────────────┴───────────────┴───────────────┴───────────────┴───│|
-r05 s 0+80 Gray/Black/-
+r05 s 0+1 Black/LightYellow/BOLD 1+78 Gray/Black/- 79+1 Black/LightYellow/BOLD
 r06 |│                                                                              │|
-r06 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r06 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r07 |│                                                                              │|
-r07 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r07 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r08 |│                                                                              │|
-r08 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r08 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r09 |│                                                                              │|
-r09 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r09 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r10 |│                                                                              │|
-r10 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r10 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r11 |│                                                                              │|
-r11 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r11 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r12 |│                                                                              │|
-r12 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r12 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r13 |│                                                                              │|
-r13 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r13 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r14 |│                                                                              │|
-r14 s 0+1 Gray/Black/- 1+78 White/Black/- 79+1 Gray/Black/-
+r14 s 0+1 Black/LightYellow/BOLD 1+78 White/Black/- 79+1 Black/LightYellow/BOLD
 r15 |└──────────────────────────────────────────────────────────────────────────────┘|
-r15 s 0+80 Gray/Black/-
+r15 s 0+80 Black/LightYellow/BOLD
