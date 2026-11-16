@@ -1557,31 +1557,6 @@ mod tests {
         );
     }
 
-    /// PAN-388: Enter on DX Hunter opens the Why details overlay.
-    #[test]
-    fn enter_resolves_per_panel() {
-        for (panel, expected) in [
-            (ActivePanel::DxHunter, Action::OpenWhy),
-            (ActivePanel::BandActivity, Action::ComposeHint),
-            (ActivePanel::QsoStatus, Action::ComposeHint),
-            (ActivePanel::Callers, Action::ReplyToSelectedCaller),
-            (ActivePanel::TxPlacement, Action::ParkAtPlacement),
-        ] {
-            let ctx = KeyContext {
-                scope: Scope::Main,
-                panel,
-                zoomed: false,
-                stopped_by_operator: false,
-                rig_field_is_model: false,
-            };
-            assert_eq!(
-                resolve(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                Some(expected),
-                "Enter on {panel:?}"
-            );
-        }
-    }
-
     #[test]
     fn essentials_table_is_exactly_ten_rows() {
         let n = KEYBINDINGS.iter().filter(|b| b.essential).count();
@@ -1909,3 +1884,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "keymap/tests/enter_resolution_tests.rs"]
+mod enter_resolution_tests;

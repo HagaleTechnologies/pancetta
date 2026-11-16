@@ -140,18 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn view_name_is_view_message_without_suffix() {
-        for view in [
-            ActiveView::Operate,
-            ActiveView::Hunt,
-            ActiveView::Run,
-            ActiveView::Monitor,
-        ] {
-            assert_eq!(view_message(view), format!("{} view", view_name(view)));
-        }
-    }
-
-    #[test]
     fn forward_power_label_formats_watts_and_fraction() {
         assert_eq!(forward_power_label(ForwardPower::Watts(48.0)), "48 W");
         assert_eq!(forward_power_label(ForwardPower::Watts(7.5)), "7.5 W");
@@ -314,3 +302,7 @@ mod marker_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "presentation/tests/view_name_tests.rs"]
+mod view_name_tests;
