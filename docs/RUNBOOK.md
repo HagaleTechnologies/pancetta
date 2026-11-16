@@ -267,7 +267,9 @@ operator-supervised.
    - Rig display: PTT engages just before the next opposite slot
      boundary (`:00`/`:30` if DX was odd; `:15`/`:45` if DX was even)
    - Watch the rig: ALC stays clean, no flat-line; audio level looks
-     normal.
+     normal. While keyed, Shift+S also shows the rig's forward power
+     and ALC read over CAT (`TX meter:` under `Rig:`), when the rig
+     reports them.
    - PTT releases ~12.7s + 50ms after audio start. The slot-aware
      scheduler ensures we never key during the DX's slot.
 
@@ -315,6 +317,11 @@ operator-supervised.
    The halt is held in memory; see the process-restart warning under [Operating modes](#modes-of-operation). If the strip shows
    `⚠ SWR protection is unavailable on this rig`, your rig or Hamlib
    build does not report SWR, so keep watching an external meter.
+   If the strip shows `⚠ ALC overdrive: reduce audio drive …`, two ALC
+   readings in a row were above `max_alc` while keyed: lower the
+   computer's sound-card output level or the rig's USB/DATA input level
+   until ALC stays at or below the limit. TX continues meanwhile; press
+   `!` to acknowledge the warning.
 
 9. **One real manual QSO.** Repeat steps 6–7 against an actual on-air
    CQ. Watch PSKReporter (within ~30s of TX) to confirm we got out.

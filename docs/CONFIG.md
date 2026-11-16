@@ -407,6 +407,8 @@ and negative values fail validation at config load.
 swr_protection = true   # default true; needs CAT rig control ([rig.interface].enabled = true)
 max_swr = 3.0           # default 3.0; halt when readings stay above this; must be a number above 1.0
 swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX halts; 0 to 30000
+alc_overdrive_warning = true  # default true; warn (never block TX) when ALC stays above max_alc
+max_alc = 0.5                 # default 0.5, uncalibrated; must be above 0.0 and below 1.0
 ```
 
 | Key | Type | Default | Notes |
@@ -414,6 +416,8 @@ swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX h
 | `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
 | `max_swr` | float | `3.0` | Trip when readings are above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
 | `swr_trip_delay_ms` | int | `5000` | How much keyed time with SWR above `max_swr` halts TX, so an antenna tuner can settle after key-down. Keyed high time adds up across transmissions, so short frames (FT4, FT2) still trip; unkeyed time never counts. A reading at or below the limit resets it, and so does a gap of more than 2 minutes without a high reading. `0` trips on the first high reading. Must be 0 to 30000. |
+| `alc_overdrive_warning` | bool | `true` | Warn-only: never blocks, delays or halts TX. Raises one sticky warning to reduce audio drive when two consecutive ALC readings in one transmission are above `max_alc`, at most once per transmission. Needs CAT rig control and a rig that reports ALC. |
+| `max_alc` | float | `0.5` | ALC limit on Hamlib's 0..1 ALC scale; a reading above it (strictly) counts as overdriven. Must be a number above 0.0 and below 1.0 while `alc_overdrive_warning` is on, or the config fails to load. Uncalibrated: on the FTdx10, Hamlib maps the raw ALC meter 0..64 onto 0..1. |
 
 `[rig.power_control].enabled` (default false) controls rig power setting
 only. SWR protection does not depend on it.
@@ -440,11 +444,37 @@ Headless, the same text is logged at `warn` (target `rig.swr`). Set
 `swr_protection = false` to silence it. With rig control off (mock rig) no
 such alert appears.
 
+While the rig is keyed, pancetta also reads its forward-power and ALC meters
+on the same poll tick, twice a second. The Shift+S station health panel shows
+them in a `TX meter:` row under `Rig:`, for example
+`TX meter: 48 W, ALC 0.12 (limit 0.50)`. Forward power is in watts when the
+rig reports `RFPOWER_METER_WATTS`, otherwise a percent of maximum power from
+`RFPOWER_METER`. A meter the rig does not report shows `n/a`, and a rig that
+reports neither shows `TX meter: this rig does not report power or ALC over CAT`.
+Neither case blocks TX. When not keyed the row reads
+`TX meter: shown while transmitting`.
+
+When two consecutive ALC readings in one transmission are above `max_alc`,
+the readiness strip shows
+`⚠ ALC overdrive: reduce audio drive (ALC above 0.50 while transmitting)`
+until `!` acknowledges it; a repeat while unacknowledged counts up (`×2`).
+Shift+D keeps the readings under `rig.alc`. Headless, the same detail is
+logged at `warn` (target `rig.alc`). TX continues either way: lower the
+computer's sound-card output level or the rig's USB/DATA input level until
+ALC stays at or below the limit. Set `alc_overdrive_warning = false` to turn
+the warning off; the readings still show.
+
 Readings of 0, or anything else below 1.0, are ignored rather than treated
 as a perfect match. A bad `max_swr` stops config validation:
 
 ```text
 Error: Invalid configuration value: power_control.protection.max_swr = 0.5 (must be a number above 1.0 while swr_protection = true)
+```
+
+A bad `max_alc` stops it the same way:
+
+```text
+Error: Invalid configuration value: power_control.protection.max_alc = 1.5 (must be a number above 0.0 and below 1.0 while alc_overdrive_warning = true)
 ```
 
 Changes apply on restart. `max_power_watts`, `temperature_protection` and
