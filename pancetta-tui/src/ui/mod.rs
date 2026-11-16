@@ -1283,7 +1283,6 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
             format!("TX {:.0} Hz", app.tx_frequency_offset),
         ),
     };
-<<<<<<< HEAD
     let focused = app.active_panel == ActivePanel::Waterfall;
     let title = waterfall_title(
         &tx_label,
@@ -1292,12 +1291,6 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         focused,
     );
     let waterfall_block = create_panel_block(&title, focused, app);
-=======
-    let waterfall_block = Block::default()
-        .title(Span::styled(title, app.theme.title))
-        .borders(Borders::ALL)
-        .border_style(app.theme.border);
->>>>>>> c49dd5fa8d33543e09e484afefd216ffb84e05f1
 
     let waterfall = Waterfall::new(&app.waterfall_data)
         .theme(&app.theme)
@@ -3279,6 +3272,15 @@ mod view_render_tests {
         buf[(rect.x + 5, rect.y + 2)].fg
     }
 
+    /// The 256-colour ramp entry a floor cell should show (PAN-387: the
+    /// colour values live in theme.rs and are pinned there).
+    fn floor_ramp(
+        palette: pancetta_config::ui::WaterfallPalette,
+        intensity: f32,
+    ) -> ratatui::style::Color {
+        theme::waterfall_ramp(palette, crate::app::ColorCapability::TwoFiftySix, intensity)
+    }
+
     fn wf(
         palette: pancetta_config::ui::WaterfallPalette,
         gain_db: f32,
@@ -3288,6 +3290,7 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn monitor_waterfall_uses_configured_palette_and_gain() {
+        use pancetta_config::ui::WaterfallPalette::Viridis;
         let app = monitor_app(wf(pancetta_config::ui::WaterfallPalette::Viridis, 6.0)).await;
         let buf = draw_app(&app);
         let rect = waterfall_rect(&app);
@@ -3297,7 +3300,7 @@ mod view_render_tests {
             "{title}"
         );
         assert!(!title.contains("[/]"), "{title}");
-        assert_eq!(floor_cell(&buf, rect), ratatui::style::Color::Indexed(31));
+        assert_eq!(floor_cell(&buf, rect), floor_ramp(Viridis, 0.5));
     }
 
     #[tokio::test]
@@ -3327,13 +3330,13 @@ mod view_render_tests {
 
         let buf = draw_app(&app);
         let corner = &buf[(rect.x, rect.y)];
-        assert_eq!(corner.fg, app.theme.border_color());
+        assert_eq!(corner.fg, theme::fg_color(app.theme.border));
         assert!(!corner.modifier.contains(Modifier::BOLD));
 
         app.active_panel = crate::app::ActivePanel::Waterfall;
         let buf = draw_app(&app);
         let corner = &buf[(rect.x, rect.y)];
-        assert_eq!(corner.fg, app.theme.selected_color());
+        assert_eq!(corner.fg, theme::fg_color(app.theme.focus));
         assert!(corner.modifier.contains(Modifier::BOLD));
     }
 
@@ -3359,17 +3362,16 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn gain_key_press_moves_the_rendered_floor() {
+        use pancetta_config::ui::WaterfallPalette::Classic;
         let mut app = monitor_app(Default::default()).await;
         app.active_panel = crate::app::ActivePanel::Waterfall;
         let rect = waterfall_rect(&app);
-        assert_eq!(
-            floor_cell(&draw_app(&app), rect),
-            ratatui::style::Color::Indexed(232)
-        );
+        assert_eq!(floor_cell(&draw_app(&app), rect), floor_ramp(Classic, 0.0));
         assert_eq!(app.adjust_waterfall_gain(1.0), Some(1.0));
+        assert_ne!(floor_ramp(Classic, 0.0), floor_ramp(Classic, 1.0 / 12.0));
         assert_eq!(
             floor_cell(&draw_app(&app), rect),
-            ratatui::style::Color::Indexed(233)
+            floor_ramp(Classic, 1.0 / 12.0)
         );
     }
 

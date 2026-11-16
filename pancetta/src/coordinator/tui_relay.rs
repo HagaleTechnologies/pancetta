@@ -4190,19 +4190,16 @@ impl super::ApplicationCoordinator {
                 mode: tui_config_lock.rig.mode.clone(),
                 tx_self_parity: tui_config_lock.station.tx_self_parity,
             },
-<<<<<<< HEAD
-            // PAN-389: the first frame renders the session-resolved
-            // waterfall palette and gain; the TUI reads no session file.
+            // PAN-387 theme from `[ui]`; PAN-389: the first frame renders the
+            // session-resolved waterfall palette and gain; the TUI reads no
+            // session file.
             ui: tui_ui_config(
-                &tui_config_lock,
+                &tui_config_lock.ui,
                 &self
                     .session_record
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             ),
-=======
-            ui: tui_ui_config(&tui_config_lock.ui),
->>>>>>> c49dd5fa8d33543e09e484afefd216ffb84e05f1
             audio: pancetta_tui::config::AudioConfig {
                 device: Some(tui_config_lock.audio.input_device.clone()),
                 sample_rate: tui_config_lock.audio.sample_rate,
@@ -4264,11 +4261,16 @@ impl super::ApplicationCoordinator {
 /// The TUI's `[ui]` config built from the loaded `pancetta.toml` `[ui]`
 /// section (PAN-387): `theme` and `[ui.accessibility] high_contrast` pick
 /// the palette; an unknown label falls back to dark (the load path already
-/// warned about it).
-pub(crate) fn tui_ui_config(ui: &pancetta_config::ui::UiConfig) -> pancetta_tui::config::UiConfig {
+/// warned about it). PAN-389: the waterfall palette and gain are the
+/// effective (session-resolved) values.
+pub(crate) fn tui_ui_config(
+    ui: &pancetta_config::ui::UiConfig,
+    record: &super::session_state::SessionRecord,
+) -> pancetta_tui::config::UiConfig {
     pancetta_tui::config::UiConfig {
         theme: ui.theme_name(),
         show_coordinates: true,
+        waterfall: super::session_state::effective_waterfall(record, &ui.waterfall),
     }
 }
 
@@ -5633,16 +5635,23 @@ mod pan387_tests {
 
     #[test]
     fn tui_ui_config_carries_the_configured_theme() {
+        let record = crate::coordinator::session_state::SessionRecord::default();
         let mut ui = pancetta_config::ui::UiConfig::default();
-        assert_eq!(tui_ui_config(&ui).theme, pancetta_tui::ThemeName::Dark);
+        assert_eq!(
+            tui_ui_config(&ui, &record).theme,
+            pancetta_tui::ThemeName::Dark
+        );
         ui.theme = "light".to_string();
-        assert_eq!(tui_ui_config(&ui).theme, pancetta_tui::ThemeName::Light);
+        assert_eq!(
+            tui_ui_config(&ui, &record).theme,
+            pancetta_tui::ThemeName::Light
+        );
         ui.accessibility.high_contrast = true;
         assert_eq!(
-            tui_ui_config(&ui).theme,
+            tui_ui_config(&ui, &record).theme,
             pancetta_tui::ThemeName::HighContrast
         );
-        assert!(tui_ui_config(&ui).show_coordinates);
+        assert!(tui_ui_config(&ui, &record).show_coordinates);
     }
 }
 
@@ -9540,20 +9549,6 @@ pub(super) fn waterfall_session_update(
     }
 }
 
-/// PAN-389: the TUI `[ui]` config the coordinator hands the only production
-/// TUI construction: the fixed theme and coordinates, plus the effective
-/// (session-resolved) waterfall palette and gain.
-pub(super) fn tui_ui_config(
-    config: &pancetta_config::Config,
-    record: &super::session_state::SessionRecord,
-) -> pancetta_tui::config::UiConfig {
-    pancetta_tui::config::UiConfig {
-        theme: pancetta_tui::Theme::Dark,
-        show_coordinates: true,
-        waterfall: super::session_state::effective_waterfall(record, &config.ui.waterfall),
-    }
-}
-
 // Store before publishing shutdown, independently of who collects the task handle.
 pub(super) fn record_tui_failure(
     failure: &std::sync::Mutex<Option<String>>,
@@ -9618,8 +9613,8 @@ mod pan389_tests {
         let mut config = pancetta_config::Config::default();
         config.ui.waterfall = viridis_six();
 
-        let ui = tui_ui_config(&config, &SessionRecord::default());
-        assert!(matches!(ui.theme, pancetta_tui::Theme::Dark));
+        let ui = tui_ui_config(&config.ui, &SessionRecord::default());
+        assert_eq!(ui.theme, pancetta_tui::ThemeName::Dark);
         assert!(ui.show_coordinates);
         assert_eq!(ui.waterfall, viridis_six());
 
@@ -9634,8 +9629,8 @@ mod pan389_tests {
             }),
             ..Default::default()
         };
-        let ui = tui_ui_config(&config, &record);
-        assert!(matches!(ui.theme, pancetta_tui::Theme::Dark));
+        let ui = tui_ui_config(&config.ui, &record);
+        assert_eq!(ui.theme, pancetta_tui::ThemeName::Dark);
         assert!(ui.show_coordinates);
         assert_eq!(
             ui.waterfall,

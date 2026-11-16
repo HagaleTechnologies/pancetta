@@ -331,7 +331,6 @@ mod tests {
         assert!(!saved.contains("replay"));
         assert!(!Config::load(temp_file.path()).unwrap().replay);
     }
-<<<<<<< HEAD
 
     /// PAN-389: the TUI config defaults the waterfall to classic / 0 dB and
     /// still deserialises a config written before `ui.waterfall` existed.
@@ -350,17 +349,4 @@ mod tests {
         assert_eq!(loaded.ui.waterfall.palette, WaterfallPalette::Classic);
         assert_eq!(loaded.ui.waterfall.gain_db, 0.0);
     }
-
-    #[test]
-    fn test_theme_colors() {
-        let dark_theme = Theme::Dark;
-        let light_theme = Theme::Light;
-
-        assert_eq!(dark_theme.background_color(), Color::Black);
-        assert_eq!(light_theme.background_color(), Color::White);
-        assert_eq!(dark_theme.foreground_color(), Color::White);
-        assert_eq!(light_theme.foreground_color(), Color::Black);
-    }
-=======
->>>>>>> c49dd5fa8d33543e09e484afefd216ffb84e05f1
 }
