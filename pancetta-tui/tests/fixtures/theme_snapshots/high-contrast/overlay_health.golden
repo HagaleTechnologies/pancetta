@@ -13,17 +13,17 @@ r04 |│                                                                    │|
 r04 s 0+1 White/Black/BOLD 1+68 White/Black/- 69+1 White/Black/BOLD
 r05 |│● Rig: not connected                                                │|
 r05 s 0+1 White/Black/BOLD 1+1 LightGreen/Black/BOLD 2+67 White/Black/- 69+1 White/Black/BOLD
-r06 |│● TX audio output: explicit device                                  │|
-r06 s 0+1 White/Black/BOLD 1+1 LightGreen/Black/BOLD 2+67 White/Black/- 69+1 White/Black/BOLD
-r07 |│● RX input: configured device                                       │|
+r06 |│● TX meter: needs a connected CAT rig                               │|
+r06 s 0+1 White/Black/BOLD 1+1 Gray/Black/- 2+67 White/Black/- 69+1 White/Black/BOLD
+r07 |│● TX audio output: explicit device                                  │|
 r07 s 0+1 White/Black/BOLD 1+1 LightGreen/Black/BOLD 2+67 White/Black/- 69+1 White/Black/BOLD
-r08 |│● Clock: not monitored                                              │|
+r08 |│● RX input: configured device                                       │|
 r08 s 0+1 White/Black/BOLD 1+1 LightGreen/Black/BOLD 2+67 White/Black/- 69+1 White/Black/BOLD
-r09 |│                                                                    │|
-r09 s 0+1 White/Black/BOLD 1+68 White/Black/- 69+1 White/Black/BOLD
-r10 |│  QSOs completed: #   failed: #   TX drops: #                       │|
+r09 |│● Clock: not monitored                                              │|
+r09 s 0+1 White/Black/BOLD 1+1 LightGreen/Black/BOLD 2+67 White/Black/- 69+1 White/Black/BOLD
+r10 |│                                                                    │|
 r10 s 0+1 White/Black/BOLD 1+68 White/Black/- 69+1 White/Black/BOLD
-r11 |│                                                                    │|
+r11 |│  QSOs completed: #   failed: #   TX drops: #                       │|
 r11 s 0+1 White/Black/BOLD 1+68 White/Black/- 69+1 White/Black/BOLD
 r12 |│                                                                    │|
 r12 s 0+1 White/Black/BOLD 1+68 White/Black/- 69+1 White/Black/BOLD

@@ -1198,6 +1198,16 @@ impl RelayDriverHost for TuiRelayLoop {
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
             }
+            MessageType::RigControl(
+                msg @ (crate::message_bus::RigControlMessage::TxMeterResponse(_)
+                | crate::message_bus::RigControlMessage::TxMeterCapability(_)),
+            ) => {
+                // PAN-291: real keyed power/ALC reads and the session's meter
+                // plan, forwarded verbatim to the Shift+S panel.
+                if let Some(tui_msg) = tx_meter_tui_message(&msg) {
+                    let _ = tui_msg_tx_relay.send(tui_msg);
+                }
+            }
             MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                 callsign,
                 frequency,
@@ -4620,6 +4630,22 @@ struct ClusterSpotRelay {
     band_needed: bool,
 }
 
+/// PAN-291: the TUI message for a TX meter bus message, or `None` for any
+/// other rig-control message. Readings pass through unchanged.
+fn tx_meter_tui_message(
+    msg: &crate::message_bus::RigControlMessage,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    match msg {
+        crate::message_bus::RigControlMessage::TxMeterResponse(reading) => Some(
+            pancetta_tui::tui_runner::TuiMessage::TxMeterUpdate(*reading),
+        ),
+        crate::message_bus::RigControlMessage::TxMeterCapability(capability) => Some(
+            pancetta_tui::tui_runner::TuiMessage::TxMeterCapability(*capability),
+        ),
+        _ => None,
+    }
+}
+
 /// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
 /// pass through unchanged (PAN-345).
 fn cluster_spot_tui_message(spot: ClusterSpotRelay) -> pancetta_tui::tui_runner::TuiMessage {
@@ -5632,6 +5658,35 @@ mod pan351_tests {
 
 #[cfg(test)]
 mod tui_relay_tests {
+    /// PAN-291 AC10: TX meter bus messages become their TUI messages
+    /// unchanged; other rig-control messages are not TX meter messages.
+    #[test]
+    fn tx_meter_messages_relay_to_the_tui() {
+        use crate::message_bus::RigControlMessage;
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+        use pancetta_tui::tui_runner::TuiMessage;
+        let reading = TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.8),
+        };
+        assert!(matches!(
+            super::tx_meter_tui_message(&RigControlMessage::TxMeterResponse(reading)),
+            Some(TuiMessage::TxMeterUpdate(r)) if r == reading
+        ));
+        let capability = TxMeterCapability {
+            forward_power: true,
+            alc: true,
+            alc_limit: Some(0.5),
+        };
+        assert!(matches!(
+            super::tx_meter_tui_message(&RigControlMessage::TxMeterCapability(capability)),
+            Some(TuiMessage::TxMeterCapability(c)) if c == capability
+        ));
+        assert!(
+            super::tx_meter_tui_message(&RigControlMessage::SwrResponse { swr: 1.5 }).is_none()
+        );
+    }
+
     /// PAN-330 AC1: the TUI relay's directed flag recognizes prefix/suffix
     /// portable calls, mixed case and resolved hash renders, and rejects
     /// absent, empty, whitespace-only, unresolved-hash and wrong-call

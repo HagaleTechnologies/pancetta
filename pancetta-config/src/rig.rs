@@ -703,6 +703,14 @@ pub struct PowerProtectionConfig {
     /// antenna tuner can settle after key-down. 0 trips on the first reading. At most 30000.
     pub swr_trip_delay_ms: u32,
 
+    /// PAN-291: warn (never block TX) when two consecutive ALC readings in one
+    /// transmission are above max_alc. Needs CAT rig control and a rig that reports ALC.
+    pub alc_overdrive_warning: bool,
+
+    /// PAN-291: ALC limit on Hamlib's 0..1 scale, uncalibrated. Must be finite, above 0.0
+    /// and below 1.0 while alc_overdrive_warning is on.
+    pub max_alc: f32,
+
     /// Temperature protection
     pub temperature_protection: bool,
 
@@ -1014,6 +1022,9 @@ impl Default for PowerRampingConfig {
 /// PAN-262: default time SWR must stay high before TX halts.
 pub const DEFAULT_SWR_TRIP_DELAY_MS: u32 = 5_000;
 
+/// PAN-291: default ALC overdrive limit on Hamlib's 0..1 scale (uncalibrated).
+pub const DEFAULT_MAX_ALC: f32 = 0.5;
+
 /// PAN-262: longest allowed SWR trip delay.
 pub const MAX_SWR_TRIP_DELAY_MS: u32 = 30_000;
 
@@ -1024,6 +1035,8 @@ impl Default for PowerProtectionConfig {
             swr_protection: true,
             max_swr: 3.0,
             swr_trip_delay_ms: DEFAULT_SWR_TRIP_DELAY_MS,
+            alc_overdrive_warning: true,
+            max_alc: DEFAULT_MAX_ALC,
             temperature_protection: true,
             max_temperature_c: 80.0,
         }
@@ -1227,6 +1240,21 @@ impl ConfigSection for RigConfig {
                 value: format!(
                     "{} (must be 0 to {MAX_SWR_TRIP_DELAY_MS})",
                     protection.swr_trip_delay_ms
+                ),
+            });
+        }
+        // PAN-291: Hamlib's ALC level is 0..1 and the Yaesu backend clamps at
+        // 1.0, so a limit at or above 1.0 could never be exceeded.
+        if protection.alc_overdrive_warning
+            && !(protection.max_alc.is_finite()
+                && protection.max_alc > 0.0
+                && protection.max_alc < 1.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "power_control.protection.max_alc".to_string(),
+                value: format!(
+                    "{} (must be a number above 0.0 and below 1.0 while alc_overdrive_warning = true)",
+                    protection.max_alc
                 ),
             });
         }
@@ -1585,6 +1613,66 @@ mod tests {
             cfg.power_control.protection.swr_trip_delay_ms,
             DEFAULT_SWR_TRIP_DELAY_MS
         );
+    }
+
+    #[test]
+    fn alc_overdrive_warning_rejects_a_limit_outside_zero_to_one() {
+        for bad in [f32::NAN, f32::INFINITY, 0.0, -0.1, 1.0, 1.5] {
+            let mut cfg = RigConfig::default();
+            cfg.power_control.protection.max_alc = bad;
+            let err = cfg.validate_section().unwrap_err().to_string();
+            assert!(
+                err.contains("power_control.protection.max_alc"),
+                "{bad}: {err}"
+            );
+            assert!(
+                err.contains("must be a number above 0.0 and below 1.0"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn alc_overdrive_warning_off_accepts_any_limit_and_defaults_validate() {
+        let defaults = RigConfig::default();
+        assert!(defaults.power_control.protection.alc_overdrive_warning);
+        assert_eq!(defaults.power_control.protection.max_alc, DEFAULT_MAX_ALC);
+        assert!(defaults.validate_section().is_ok());
+        let mut cfg = RigConfig::default();
+        cfg.power_control.protection.alc_overdrive_warning = false;
+        cfg.power_control.protection.max_alc = 1.5;
+        assert!(cfg.validate_section().is_ok());
+        cfg.power_control.protection.alc_overdrive_warning = true;
+        for ok in [0.01, 0.99] {
+            cfg.power_control.protection.max_alc = ok;
+            assert!(cfg.validate_section().is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn partial_protection_table_keeps_alc_defaults() {
+        let cfg: RigConfig = toml::from_str("[power_control.protection]\nmax_alc = 0.3\n").unwrap();
+        let protection = &cfg.power_control.protection;
+        assert!(protection.alc_overdrive_warning);
+        assert_eq!(protection.max_alc, 0.3);
+        assert!(protection.swr_protection);
+        assert_eq!(protection.max_swr, 3.0);
+        assert_eq!(protection.swr_trip_delay_ms, DEFAULT_SWR_TRIP_DELAY_MS);
+        let off: RigConfig =
+            toml::from_str("[power_control.protection]\nalc_overdrive_warning = false\n").unwrap();
+        assert!(!off.power_control.protection.alc_overdrive_warning);
+        assert_eq!(off.power_control.protection.max_alc, DEFAULT_MAX_ALC);
+    }
+
+    #[test]
+    fn merge_with_carries_alc_protection_fields() {
+        let mut base = RigConfig::default();
+        let mut overlay = RigConfig::default();
+        overlay.power_control.protection.alc_overdrive_warning = false;
+        overlay.power_control.protection.max_alc = 0.25;
+        base.merge_with(overlay);
+        assert!(!base.power_control.protection.alc_overdrive_warning);
+        assert_eq!(base.power_control.protection.max_alc, 0.25);
     }
 
     #[test]

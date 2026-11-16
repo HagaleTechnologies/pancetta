@@ -13,17 +13,17 @@ r04 |│                                                                    │|
 r04 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-
 r05 |│● Rig: not connected                                                │|
 r05 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
-r06 |│● TX audio output: explicit device                                  │|
-r06 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
-r07 |│● RX input: configured device                                       │|
+r06 |│● TX meter: needs a connected CAT rig                               │|
+r06 s 0+1 Cyan/Black/- 1+1 DarkGray/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
+r07 |│● TX audio output: explicit device                                  │|
 r07 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
-r08 |│● Clock: not monitored                                              │|
+r08 |│● RX input: configured device                                       │|
 r08 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
-r09 |│                                                                    │|
-r09 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-
-r10 |│  QSOs completed: #   failed: #   TX drops: #                       │|
+r09 |│● Clock: not monitored                                              │|
+r09 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
+r10 |│                                                                    │|
 r10 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-
-r11 |│                                                                    │|
+r11 |│  QSOs completed: #   failed: #   TX drops: #                       │|
 r11 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-
 r12 |│                                                                    │|
 r12 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-

@@ -11,6 +11,10 @@ use crate::config::Config;
 use crate::theme::Theme;
 use pancetta_qso::priority::PriorityFactors;
 
+/// PAN-291: a TX meter reading counts as live this many seconds after it
+/// arrives. Readings arrive every 500 ms while keyed.
+pub const TX_METER_LIVE_SECS: i64 = 2;
+
 /// Bounds for a real, in-band FT8 audio-offset decode — used to guard against
 /// genuinely out-of-range decoder output (split-VFO artifacts, reference
 /// markers), NOT to bound where we choose to transmit (that's a separate,
@@ -1654,6 +1658,13 @@ pub struct App {
     /// arrived. Shown in the status bar only during TX; goes stale after 5s.
     pub swr: Option<f32>,
     pub swr_at: Option<DateTime<Utc>>,
+    /// PAN-291: last keyed forward-power/ALC reading and when it arrived.
+    /// Live for [`TX_METER_LIVE_SECS`] after it arrives.
+    pub tx_meter: Option<pancetta_core::tx_meter::TxMeterReading>,
+    pub tx_meter_at: Option<DateTime<Utc>>,
+    /// PAN-291: which TX meters this Hamlib session reads, and the ALC
+    /// warning limit when the warning is on. `None` until announced.
+    pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -1984,6 +1995,9 @@ impl App {
             signal_strength_at: None,
             swr: None,
             swr_at: None,
+            tx_meter: None,
+            tx_meter_at: None,
+            tx_meter_capability: None,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
@@ -3240,6 +3254,36 @@ impl App {
     pub fn update_signal_strength(&mut self, db_over_s9: i32) {
         self.signal_strength_db = Some(db_over_s9);
         self.signal_strength_at = Some(Utc::now());
+    }
+
+    /// PAN-291: record a keyed forward-power/ALC reading from the rig.
+    pub fn update_tx_meter(&mut self, reading: pancetta_core::tx_meter::TxMeterReading) {
+        self.tx_meter = Some(reading);
+        self.tx_meter_at = Some(Utc::now());
+    }
+
+    /// PAN-291: record which TX meters this Hamlib session reads.
+    pub fn set_tx_meter_capability(
+        &mut self,
+        capability: pancetta_core::tx_meter::TxMeterCapability,
+    ) {
+        self.tx_meter_capability = Some(capability);
+    }
+
+    /// PAN-291: the last TX meter reading when it arrived at most
+    /// [`TX_METER_LIVE_SECS`] before `now`, else `None` (not keyed, or stale).
+    pub fn tx_meter_live_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<pancetta_core::tx_meter::TxMeterReading> {
+        let at = self.tx_meter_at?;
+        let age = now.signed_duration_since(at);
+        // A negative age (wall clock stepped back) is not live either.
+        if age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(TX_METER_LIVE_SECS) {
+            self.tx_meter
+        } else {
+            None
+        }
     }
 
     /// Record a live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed.
@@ -5631,6 +5675,65 @@ fn band_plan_candidate_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tx_meter_reading_is_live_for_two_seconds() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let now = Utc::now();
+        assert_eq!(app.tx_meter_live_at(now), None);
+        let reading = TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.12),
+        };
+        app.update_tx_meter(reading);
+        assert_eq!(app.tx_meter_live_at(Utc::now()), Some(reading));
+        let at = app.tx_meter_at.unwrap();
+        assert_eq!(
+            app.tx_meter_live_at(at + chrono::Duration::seconds(TX_METER_LIVE_SECS)),
+            Some(reading)
+        );
+        assert_eq!(
+            app.tx_meter_live_at(at + chrono::Duration::milliseconds(2_001)),
+            None
+        );
+        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(3));
+        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        // A reading stamped after `now` (clock stepped back) is not live.
+        assert_eq!(
+            app.tx_meter_live_at(at - chrono::Duration::seconds(3600)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn alc_overdrive_alert_stays_until_acknowledged() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let text = "ALC overdrive: reduce audio drive (ALC above 0.50 while transmitting)";
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_coded_error_message(text.to_string(), None);
+        for _ in 0..3 {
+            app.update_tx_meter(TxMeterReading {
+                forward_power: Some(ForwardPower::Watts(48.0)),
+                alc: Some(0.2),
+            });
+        }
+        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        let unacked: Vec<_> = app.alerts.iter().filter(|a| !a.acknowledged).collect();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].text, text);
+        assert_eq!(unacked[0].count, 1);
+        app.add_coded_error_message(text.to_string(), None);
+        assert_eq!(app.alerts.iter().filter(|a| a.text == text).count(), 1);
+        assert_eq!(app.alerts.iter().find(|a| a.text == text).unwrap().count, 2);
+        assert!(app.acknowledge_readiness() >= 1);
+        assert!(app
+            .alerts
+            .iter()
+            .filter(|a| a.text == text)
+            .all(|a| a.acknowledged));
+    }
 
     #[tokio::test]
     async fn dx_row_band_is_source_unit_correct() {

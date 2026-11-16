@@ -179,6 +179,12 @@ pub enum TuiMessage {
     SwrUpdate {
         swr: f32,
     },
+    /// PAN-291: one keyed forward-power/ALC reading from the rig. Shown in
+    /// the Shift+S station health panel. Real CAT reads, never synthesized.
+    TxMeterUpdate(pancetta_core::tx_meter::TxMeterReading),
+    /// PAN-291: which TX meters this Hamlib session reads, and the ALC
+    /// warning limit when the warning is on.
+    TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
     /// DX spot
     DxSpot {
         callsign: String,
@@ -1055,6 +1061,12 @@ impl TuiRunner {
             }
             TuiMessage::SwrUpdate { swr } => {
                 app.update_swr(swr);
+            }
+            TuiMessage::TxMeterUpdate(reading) => {
+                app.update_tx_meter(reading);
+            }
+            TuiMessage::TxMeterCapability(capability) => {
+                app.set_tx_meter_capability(capability);
             }
             TuiMessage::DxSpot {
                 callsign,
@@ -3762,6 +3774,34 @@ mod key_tests {
     /// share (and race on) the same file — see `App::set_test_tui_state_path`.
     static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn pan291_tx_meter_messages_update_the_app() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+        let (mut runner, _, app) = make_runner().await;
+        let capability = TxMeterCapability {
+            forward_power: true,
+            alc: true,
+            alc_limit: Some(0.5),
+        };
+        let reading = TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.12),
+        };
+        runner
+            .handle_message(TuiMessage::TxMeterCapability(capability))
+            .await
+            .unwrap();
+        runner
+            .handle_message(TuiMessage::TxMeterUpdate(reading))
+            .await
+            .unwrap();
+        let app = app.read().await;
+        assert_eq!(app.tx_meter_capability, Some(capability));
+        assert_eq!(app.tx_meter, Some(reading));
+        assert!(app.tx_meter_at.is_some());
+        assert_eq!(app.tx_meter_live_at(chrono::Utc::now()), Some(reading));
+    }
 
     #[tokio::test]
     async fn pan351_health_recovery_removes_only_matching_warning() {
