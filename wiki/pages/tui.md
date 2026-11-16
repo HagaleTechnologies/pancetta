@@ -7,6 +7,7 @@ maintainer: agent
 sources:
   - docs/DECISIONS/tui.md
   - pancetta-tui/src/app.rs
+  - pancetta-tui/src/theme.rs
 verified:
   commit: eac7aab
   date: 2026-07-07
@@ -149,3 +150,19 @@ index to terminal height. Short Hunt layouts compress TX Placement to keep a
 station row visible at 132x24. Waterfall updates, including empty ones, sweep
 24-hour-old station data and orphan normalized state keys. They do not clear
 persistent watchlist pins or the QRZ cache.
+
+## Themes (PAN-387)
+
+Every colour comes from a semantic token in `pancetta-tui/src/theme.rs`
+(Dark, Light, HighContrast); no other file under `pancetta-tui/src` may name a
+`Color::` (`pancetta-tui/tests/theme_invariant.rs`). A new meaning needs a new
+token with all three values, not a literal. Selection:
+`[ui.accessibility] high_contrast` wins, then `[ui] theme`; unknown labels warn
+and use dark; restart required. Contrast tests assume the xterm default palette.
+
+Per-theme snapshot goldens live in
+`pancetta-tui/tests/fixtures/theme_snapshots/<theme>/<surface>.golden`. Re-bless
+with
+`PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots`. Text is masked before comparison: ASCII digits become `#`,
+`▮`/`▯` become `▪`, and the slot letter is masked, so clocks and meters do not
+churn the goldens. See [the PAN-387 decision](../../docs/DECISIONS/tui.md#semantic-theme-tokens-and-a-high-contrast-theme-pan-387-2026-11).

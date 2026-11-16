@@ -359,20 +359,45 @@ is the canonical example.
 
 ### Unit Tests
 
-Place unit tests in the same file as the code:
+Unit tests go in the same crate, `src/<module>/tests/`: one file per behaviour,
+declared from the module under test so the tests keep access to private items.
 
 ```rust
+// pancetta-qso/src/qso_manager.rs
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "qso_manager/tests/clock_step_watchdog_tests.rs"]
+mod clock_step_watchdog_tests;
+```
 
-    #[test]
-    fn test_audio_buffer_creation() {
-        let buffer = AudioBuffer::new(1024);
-        assert_eq!(buffer.capacity(), 1024);
-    }
+```rust
+// pancetta-qso/src/qso_manager/tests/clock_step_watchdog_tests.rs
+// PAN-296. Formerly the inline module `pan296_watchdog_tests`.
+use super::*;
+
+#[tokio::test]
+async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
+    // ...
 }
 ```
+
+- The `#[path]` string is relative to the directory that holds the declaring
+  file. From `qso_manager.rs` it is `"qso_manager/tests/<name>.rs"`. From a
+  `mod.rs` file, such as `station_agent/mod.rs`, it is `"tests/<name>.rs"`.
+- The test module is still a child of the module under test. `use super::*;`
+  reaches private items, and sibling test modules share helpers through
+  `super::<sibling>::`.
+- Name the module and its file after the behaviour under test, ending in
+  `_tests`, not after the ticket that added it. Name the ticket in a comment on
+  the first line of the file.
+- A test's full name is `<module path>::<test module>::<test>`, so renaming a
+  test module renames every test in it. Update scripts, `docs/` and `wiki/` that
+  name the module in the same PR.
+- `include_str!` and other file-relative macros resolve from the test file.
+- Test-only items that production code uses, such as a probe, a
+  `#[cfg(test)]` constructor or a `#[cfg(test)]` field, stay next to that code.
+- A file whose tests are one short `mod tests` block may keep it inline. Move it
+  to `src/<module>/tests/` when the file gains a second test module or the block
+  grows past a few hundred lines.
 
 ### Integration Tests
 
