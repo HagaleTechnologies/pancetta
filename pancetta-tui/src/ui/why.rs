@@ -3,7 +3,6 @@ use crate::app::App;
 use crate::dx_reason::{self, FocusedReason};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -39,7 +38,8 @@ pub fn render_why_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(app.theme.modal)
+        .border_style(app.theme.modal_border);
     let inner = block.inner(modal);
     f.render_widget(block, modal);
     let wrapped: Vec<Line<'static>> = lines
@@ -55,7 +55,7 @@ pub fn render_why_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(wrapped)
             .scroll((app.why_scroll, 0))
-            .style(Style::default().fg(app.theme.foreground_color())),
+            .style(app.theme.text),
         inner,
     );
 }

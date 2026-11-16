@@ -5,7 +5,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -17,43 +17,37 @@ use crate::readiness::{readiness_items, verdict, ClockState, ReadinessItem, Seve
 /// Chip style for an item of `severity` (shared with the Shift+S panel's
 /// readiness dots).
 pub fn severity_style(severity: Severity, app: &App) -> Style {
-    match severity {
-        Severity::Blocker => Style::default()
-            .fg(Color::White)
-            .bg(Color::Red)
-            .add_modifier(Modifier::BOLD),
-        Severity::Warning => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        Severity::Notice => Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
-    }
+    let token = match severity {
+        Severity::Blocker => app.theme.chip_blocker,
+        Severity::Warning => app.theme.chip_warning,
+        Severity::Notice => app.theme.notice,
+    };
+    token.add_modifier(Modifier::BOLD)
 }
 
 /// Shift+S dot glyph and colour for a readiness item.
 pub fn item_dot(item: &ReadinessItem, app: &App) -> Span<'static> {
     if item.acknowledged {
-        return Span::styled("○ ", Style::default().fg(app.theme.muted_color()));
+        return Span::styled("○ ", app.theme.muted);
     }
     match item.severity {
-        Severity::Blocker => Span::styled("● ", Style::default().fg(Color::Red)),
-        Severity::Warning => Span::styled("● ", Style::default().fg(Color::Yellow)),
-        Severity::Notice => Span::styled("◌ ", Style::default().fg(Color::Cyan)),
+        Severity::Blocker => Span::styled("● ", app.theme.error),
+        Severity::Warning => Span::styled("● ", app.theme.warning),
+        Severity::Notice => Span::styled("◌ ", app.theme.notice),
     }
 }
 
 fn verdict_style(v: Verdict, app: &App) -> Style {
-    let bold = |fg: Color, bg: Color| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
-    match v {
-        Verdict::Checking => Style::default().fg(app.theme.muted_color()),
-        Verdict::Held => bold(Color::White, Color::Red),
-        Verdict::RxOnly => bold(Color::Black, Color::White),
-        Verdict::Wait => bold(Color::Black, Color::Cyan),
-        Verdict::Open => bold(Color::Black, Color::Yellow),
-        Verdict::Ready => bold(Color::Black, Color::Green),
-    }
+    let t = &app.theme;
+    let chip = match v {
+        Verdict::Checking => return t.muted,
+        Verdict::Held => t.verdict_held,
+        Verdict::RxOnly => t.verdict_rx_only,
+        Verdict::Wait => t.verdict_wait,
+        Verdict::Open => t.verdict_open,
+        Verdict::Ready => t.verdict_ready,
+    };
+    chip.add_modifier(Modifier::BOLD)
 }
 
 /// Muted "all calm" detail after the verdict: `rig ✓ · audio ✓ · clock ✓`.
@@ -129,15 +123,13 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     if can_ack {
         right.push(Span::styled(
             " ! ack",
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
+            app.theme.key.add_modifier(Modifier::BOLD),
         ));
     }
     if acked > 0 {
         right.push(Span::styled(
             format!(" {acked} ack'd · Shift+S"),
-            Style::default().fg(app.theme.muted_color()),
+            app.theme.muted,
         ));
     }
     if !right.is_empty() {
@@ -158,10 +150,7 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             format!(" {}", calm_details(app))
         };
-        left.push(Span::styled(
-            text,
-            Style::default().fg(app.theme.muted_color()),
-        ));
+        left.push(Span::styled(text, app.theme.muted));
     } else {
         let more_text = |n: usize| format!(" +{n} more · Shift+S");
         for (idx, item) in visible.iter().enumerate() {
@@ -186,17 +175,11 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
                         severity_style(item.severity, app),
                     ));
                     if remaining_after > 0 {
-                        left.push(Span::styled(
-                            more_text(remaining_after),
-                            Style::default().fg(app.theme.muted_color()),
-                        ));
+                        left.push(Span::styled(more_text(remaining_after), app.theme.muted));
                     }
                     break;
                 }
-                let more = Span::styled(
-                    more_text(visible.len() - idx),
-                    Style::default().fg(app.theme.muted_color()),
-                );
+                let more = Span::styled(more_text(visible.len() - idx), app.theme.muted);
                 if used + more.width() <= budget {
                     left.push(more);
                 }
@@ -213,11 +196,7 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     spans.push(Span::raw(" ".repeat(padding)));
     spans.extend(right);
 
-    let paragraph = Paragraph::new(Line::from(spans)).style(
-        Style::default()
-            .bg(app.theme.background_color())
-            .fg(app.theme.foreground_color()),
-    );
+    let paragraph = Paragraph::new(Line::from(spans)).style(app.theme.page);
     f.render_widget(paragraph, area);
 }
 
