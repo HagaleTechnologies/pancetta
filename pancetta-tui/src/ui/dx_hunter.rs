@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{create_panel_block, format_bearing, format_distance, format_time_ago, get_snr_color};
+use super::{create_panel_block, format_bearing, format_distance, format_time_ago};
 use crate::app::{ActivePanel, App, DxStation, SpotSource};
 
 /// Format the DX Hunter SNR cell. A pure NETWORK spot that carried no SNR
@@ -178,13 +178,9 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // show fewer, whole columns (see `visible_columns`).
     let columns = visible_columns(area.width);
     let now = chrono::Utc::now();
-    let header_cells = columns.iter().map(|c| {
-        Cell::from(c.header()).style(
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    });
+    let header_cells = columns
+        .iter()
+        .map(|c| Cell::from(c.header()).style(app.theme.title.add_modifier(Modifier::BOLD)));
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
@@ -209,7 +205,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
                 DxHunterColumn::Entity => "stations",
                 _ => "",
             };
-            Cell::from(text).style(Style::default().fg(app.theme.muted_color()))
+            Cell::from(text).style(app.theme.muted)
         })));
     }
 
@@ -219,7 +215,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
         .header(header)
         .block(block)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()))
+        .style(app.theme.text)
         // Visible cursor: reversed video + a leading marker on the
         // selected row so the operator can see exactly which station
         // Space will call.
@@ -249,10 +245,13 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
             height: 1,
         };
 
-        let scroll_text = ratatui::text::Line::from(Span::styled(
-            scroll_info,
-            Style::default().fg(app.theme.muted_color()),
-        ));
+        // On the top border: take the focus band's colours when it paints one.
+        let scroll_style = if is_active && app.theme.focus.bg.is_some() {
+            app.theme.focus
+        } else {
+            app.theme.muted
+        };
+        let scroll_text = ratatui::text::Line::from(Span::styled(scroll_info, scroll_style));
 
         let scroll_widget = ratatui::widgets::Paragraph::new(scroll_text);
         f.render_widget(scroll_widget, scroll_area);
@@ -291,13 +290,11 @@ fn needed_span(
     if needed {
         Span::styled(
             format!("+{value}"),
-            Style::default()
-                .fg(if stale {
-                    app.theme.muted_color()
-                } else {
-                    app.theme.error_color()
-                })
-                .add_modifier(Modifier::BOLD),
+            if stale {
+                app.theme.muted.add_modifier(Modifier::BOLD)
+            } else {
+                needed_style(&app.theme)
+            },
         )
     } else {
         Span::styled(value, normal)
@@ -323,9 +320,8 @@ fn create_dx_row<'a>(
     // Source indicator
     let src_str = station.source.to_string();
     let src_style = match station.source {
-        SpotSource::Local => Style::default().fg(app.theme.success_color()),
-        SpotSource::Network => Style::default().fg(app.theme.accent_color()),
-        SpotSource::Both => Style::default().fg(ratatui::style::Color::Cyan),
+        SpotSource::Local => app.theme.success,
+        SpotSource::Network | SpotSource::Both => app.theme.info,
     };
 
     // Callsign with need/notable markers. `!` = ATNO (all-time new one),
@@ -358,42 +354,32 @@ fn create_dx_row<'a>(
     };
 
     let call_style = if is_stale {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     } else if is_globally_focused {
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.focus.add_modifier(Modifier::BOLD)
     } else if atno {
-        // ATNO — the highest-value catch. Bold magenta + underline so it
-        // stands apart from merely-notable (bold magenta) rows.
-        atno_style()
+        // ATNO — the highest-value catch. Bold + underline so it stands
+        // apart from merely-notable (bold) rows.
+        atno_style(&app.theme)
     } else if station.is_notable {
-        Style::default()
-            .fg(ratatui::style::Color::Magenta)
-            .add_modifier(Modifier::BOLD)
+        app.theme.notable.add_modifier(Modifier::BOLD)
     } else if station.worked_before {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.worked
     } else if needed {
         // Needed DXCC (band-fill, not ATNO).
         needed_style(&app.theme)
     } else if is_rare_dx_from_tier(station) {
-        Style::default()
-            .fg(app.theme.error_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.needed.add_modifier(Modifier::BOLD)
     } else if station.distance.unwrap_or(0.0) > 5000.0 {
-        Style::default()
-            .fg(app.theme.warning_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.emphasis.add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(app.theme.success_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.callable.add_modifier(Modifier::BOLD)
     };
     // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
-    // green + underline, without discarding e.g. the tier-1 BOLD.
+    // the engaged token + underline, without discarding e.g. the tier-1 BOLD.
     let call_style = if is_engaged {
         call_style
-            .fg(app.theme.success_color())
+            .patch(app.theme.engaged)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         call_style
@@ -415,9 +401,9 @@ fn create_dx_row<'a>(
     let band_str = band_cell_text(station);
 
     let dim = if is_stale {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     } else {
-        Style::default().fg(app.theme.foreground_color())
+        app.theme.text
     };
 
     let grid_span = match station
@@ -440,7 +426,7 @@ fn create_dx_row<'a>(
         .or_else(|| app.station_state_for(&station.call_sign))
         .filter(|_| pancetta_core::dxcc::is_us_related_entity(&entity))
         .and_then(pancetta_core::dxcc::normalize_us_state);
-    let entity_style = Style::default().fg(app.theme.accent_color());
+    let entity_style = app.theme.info;
     let mut entity_spans = vec![Span::styled(entity, entity_style)];
     if let Some(code) = state {
         entity_spans.push(Span::styled(" - ", entity_style));
@@ -454,17 +440,13 @@ fn create_dx_row<'a>(
     }
 
     let rarity_style = match station.rarity_tier.as_deref() {
-        Some("legendary") => Style::default()
-            .fg(ratatui::style::Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-        Some("very_rare") => Style::default()
-            .fg(app.theme.error_color())
-            .add_modifier(Modifier::BOLD),
-        Some("rare") => Style::default().fg(app.theme.warning_color()),
+        Some("legendary") => app.theme.notable.add_modifier(Modifier::BOLD),
+        Some("very_rare") => app.theme.needed.add_modifier(Modifier::BOLD),
+        Some("rare") => app.theme.emphasis,
         _ => dim,
     };
 
-    let snr_style = Style::default().fg(get_snr_color(station.snr, &app.theme));
+    let snr_style = app.theme.snr(station.snr);
 
     let priority_style = match station.priority_score {
         score
@@ -472,18 +454,14 @@ fn create_dx_row<'a>(
                 >= pancetta_qso::priority::PriorityTier::SpecialStation as u32
                     * pancetta_qso::priority::TIER_BAND_WIDTH =>
         {
-            Style::default()
-                .fg(app.theme.error_color())
-                .add_modifier(Modifier::BOLD)
+            app.theme.needed.add_modifier(Modifier::BOLD)
         }
         score
             if score
                 >= pancetta_qso::priority::PriorityTier::PerBandGridNew as u32
                     * pancetta_qso::priority::TIER_BAND_WIDTH =>
         {
-            Style::default()
-                .fg(app.theme.warning_color())
-                .add_modifier(Modifier::BOLD)
+            app.theme.emphasis.add_modifier(Modifier::BOLD)
         }
         _ => dim,
     };
@@ -496,7 +474,7 @@ fn create_dx_row<'a>(
             .enumerate()
             .flat_map(|(index, clause)| {
                 let style = if !is_stale && index > 0 && index <= reason.cautions.len() {
-                    Style::default().fg(app.theme.warning_color())
+                    app.theme.warning
                 } else {
                     dim
                 };
@@ -639,6 +617,7 @@ fn extract_base_prefix(call_sign: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
     use std::collections::HashSet;
 
     struct Need(crate::dx_need::DxNeedStatus);
@@ -846,7 +825,7 @@ mod tests {
             let band_x = x_of(&buf, header_y, "Band").unwrap();
             let y = y_of(&buf, "JA1STL").unwrap();
             let cell = &buf[(band_x, y)];
-            assert_eq!(cell.fg, app.theme.muted_color());
+            assert_eq!(cell.fg, theme::fg_color(app.theme.muted));
             assert_eq!(cell.modifier.contains(Modifier::REVERSED), selected);
         }
     }
@@ -886,7 +865,10 @@ mod tests {
                     crate::presentation::assert_readable_buffer(&buf);
                     assert!(text(&buf).contains(label), "{label}: {}", text(&buf));
                     if slug == Some("very_rare") {
-                        assert_eq!(cell_at_text(&buf, label).fg, app.theme.error_color());
+                        assert_eq!(
+                            cell_at_text(&buf, label).fg,
+                            theme::fg_color(app.theme.needed)
+                        );
                     }
                     assert!(!text(&buf).contains("very_rare"));
                 }
@@ -904,11 +886,11 @@ mod tests {
         );
         for token in ["+EM34", "+AR"] {
             let cell = cell_at_text(&buf, token);
-            assert_eq!(cell.fg, app.theme.error_color());
+            assert_eq!(cell.fg, theme::fg_color(app.theme.needed));
             assert!(cell.modifier.contains(Modifier::BOLD));
         }
         let entity = cell_at_text(&buf, "United States");
-        assert_eq!(entity.fg, app.theme.accent_color());
+        assert_eq!(entity.fg, theme::fg_color(app.theme.info));
         assert!(!entity.modifier.contains(Modifier::BOLD));
         assert_eq!(
             app.dx_stations["W5ABC"].grid_square.as_deref(),
@@ -921,9 +903,9 @@ mod tests {
         assert!(!text(&buf).contains("+EM34"));
         assert!(text(&buf).contains("+W5ABC"));
         let grid = cell_at_text(&buf, "EM34");
-        assert_eq!(grid.fg, app.theme.foreground_color());
+        assert_eq!(grid.fg, theme::fg_color(app.theme.text));
         assert!(!grid.modifier.contains(Modifier::BOLD));
-        assert_eq!(cell_at_text(&buf, "AR").fg, app.theme.accent_color());
+        assert_eq!(cell_at_text(&buf, "AR").fg, theme::fg_color(app.theme.info));
     }
 
     #[tokio::test]
@@ -941,7 +923,7 @@ mod tests {
             let buf = render_buffer(&app, 108, 8);
             for token in ["+EM34", "+AR"] {
                 let cell = cell_at_text(&buf, token);
-                assert_eq!(cell.fg, app.theme.muted_color());
+                assert_eq!(cell.fg, theme::fg_color(app.theme.muted));
                 assert!(cell.modifier.contains(Modifier::BOLD));
                 assert_eq!(cell.modifier.contains(Modifier::REVERSED), selected);
             }
@@ -1053,7 +1035,10 @@ mod tests {
             "QSO failed this session",
             "maybe POTA/SOTA",
         ] {
-            assert_eq!(cell_at_text(&buf, text).fg, app.theme.muted_color());
+            assert_eq!(
+                cell_at_text(&buf, text).fg,
+                theme::fg_color(app.theme.muted)
+            );
         }
     }
 
@@ -1266,8 +1251,8 @@ mod tests {
         assert!(output.contains("!ZL1ABC"), "{output}");
         assert!(!output.contains("▲ZL1ABC"), "{output}");
         let cell = cell_at_text(&buf, "!ZL1ABC");
-        assert_eq!(cell.fg, atno_style().fg.unwrap());
-        assert!(cell.modifier.contains(atno_style().add_modifier));
+        assert_eq!(cell.fg, atno_style(&app.theme).fg.unwrap());
+        assert!(cell.modifier.contains(atno_style(&app.theme).add_modifier));
     }
 
     #[tokio::test]

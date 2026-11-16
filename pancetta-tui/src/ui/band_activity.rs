@@ -3,13 +3,13 @@ use crate::dx_need::canonical_grid_square;
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Cell, Row, Table, TableState},
     Frame,
 };
 
-use super::{create_panel_block, format_distance_cell, get_snr_color};
+use super::{create_panel_block, format_distance_cell};
 use crate::app::{ActivePanel, App, DecodedMessageView};
 
 /// Single source of truth for Band Activity's column set (Task 20b). Header
@@ -95,13 +95,9 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
     // widths — see `visible_columns`.
     let columns = visible_columns(area.width);
 
-    let header_cells = columns.iter().map(|c| {
-        Cell::from(c.header()).style(
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    });
+    let header_cells = columns
+        .iter()
+        .map(|c| Cell::from(c.header()).style(app.theme.title.add_modifier(Modifier::BOLD)));
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
@@ -124,7 +120,7 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
                 BandActivityColumn::Msg => "Monitoring...",
                 _ => "",
             };
-            Cell::from(text).style(Style::default().fg(app.theme.muted_color()))
+            Cell::from(text).style(app.theme.muted)
         })));
     }
 
@@ -134,13 +130,8 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
         .header(header)
         .block(block)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()))
-        .row_highlight_style(
-            Style::default()
-                .bg(app.theme.accent_color())
-                .fg(ratatui::style::Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
+        .style(app.theme.text)
+        .row_highlight_style(app.theme.selection.add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
 
     // Create table state for potential selection
@@ -165,10 +156,15 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
             height: 1,
         };
 
-        let scroll_text = Line::from(Span::styled(
-            scroll_info,
-            Style::default().fg(app.theme.muted_color()),
-        ));
+        // The indicator sits on the panel's top border: when the focus
+        // token paints a band there (High contrast), take that band's
+        // colours so the counter stays legible on it.
+        let scroll_style = if is_active && app.theme.focus.bg.is_some() {
+            app.theme.focus
+        } else {
+            app.theme.muted
+        };
+        let scroll_text = Line::from(Span::styled(scroll_info, scroll_style));
 
         let scroll_widget = ratatui::widgets::Paragraph::new(scroll_text);
         f.render_widget(scroll_widget, scroll_area);
@@ -284,27 +280,23 @@ fn create_message_row<'a>(
     };
 
     // "Calling me" rows take priority over CQ highlighting; the entire row
-    // gets the selected_color background-equivalent treatment so they're
-    // visually distinct from CQs on the same screen.
-    let directed_style = Style::default()
-        .fg(app.theme.selected_color())
-        .add_modifier(Modifier::BOLD);
+    // gets the `directed` treatment so they're visually distinct from CQs on
+    // the same screen.
+    let directed_style = app.theme.directed.add_modifier(Modifier::BOLD);
 
     // #172: distinct style for own-TX rows so they read as ours at a
     // glance, checked before the existing is_directed_at_us styling
     // (own-TX rows are always is_directed_at_us: true too, but the "»"/
     // "TX" text markers already carry the meaning independent of color —
     // this is additional, not the only, signal).
-    let own_tx_style = Style::default()
-        .fg(ratatui::style::Color::Red)
-        .add_modifier(Modifier::BOLD);
+    let own_tx_style = app.theme.own_tx.add_modifier(Modifier::BOLD);
 
     let snr_style = if msg.is_own_tx {
         own_tx_style
     } else if msg.is_directed_at_us {
         directed_style
     } else {
-        Style::default().fg(get_snr_color(msg.snr, &app.theme))
+        app.theme.snr(msg.snr)
     };
 
     let call_style = if msg.is_own_tx {
@@ -312,30 +304,27 @@ fn create_message_row<'a>(
     } else if msg.is_directed_at_us {
         directed_style
     } else if is_globally_focused {
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.focus.add_modifier(Modifier::BOLD)
     } else if atno {
-        atno_style()
+        atno_style(&app.theme)
     } else if msg.worked_before {
         // Already in the log on this band — dim the callsign the same
         // way the DX hunter panel does, so the operator's eye skips
         // stations the autonomous scorer would also dup-penalize.
-        Style::default().fg(app.theme.muted_color())
+        app.theme.worked
     } else if needed {
         needed_style(&app.theme)
     } else if msg.call_sign.is_some() {
-        Style::default()
-            .fg(app.theme.success_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.callable.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     };
     // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
-    // green + underline, without discarding e.g. the tier-1 BOLD.
+    // the `engaged` style + underline, without discarding e.g. the tier-1
+    // BOLD.
     let call_style = if is_engaged {
         call_style
-            .fg(app.theme.success_color())
+            .patch(app.theme.engaged)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         call_style
@@ -346,22 +335,20 @@ fn create_message_row<'a>(
     } else if msg.is_directed_at_us {
         directed_style
     } else if msg.message.contains("CQ") {
-        Style::default()
-            .fg(app.theme.warning_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.cq.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.foreground_color())
+        app.theme.text
     };
 
     let neutral_style = if msg.is_directed_at_us {
         directed_style
     } else {
-        Style::default().fg(app.theme.foreground_color())
+        app.theme.text
     };
     let muted_style = if msg.is_directed_at_us {
         directed_style
     } else {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     };
 
     // Build every cell in canonical column order, then keep only the ones
@@ -479,6 +466,7 @@ fn is_valid_callsign(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
     use chrono::Utc;
 
     struct Need(crate::dx_need::DxNeedStatus);
@@ -538,7 +526,6 @@ mod tests {
 
     #[tokio::test]
     async fn pan350_call_need_parity() {
-        use ratatui::style::Color;
         for (needed, atno, band, worked, prefix) in [
             (true, true, true, false, "!"),
             (true, false, true, false, "+▲"),
@@ -563,15 +550,15 @@ mod tests {
             assert_eq!((a.fg, a.modifier), (b.fg, b.modifier));
             assert_eq!(
                 a.fg,
-                if atno {
-                    Color::Magenta
+                theme::fg_color(if atno {
+                    app.theme.atno
                 } else if worked {
-                    app.theme.muted_color()
+                    app.theme.worked
                 } else if needed {
-                    app.theme.error_color()
+                    app.theme.needed
                 } else {
-                    app.theme.success_color()
-                }
+                    app.theme.callable
+                })
             );
             assert_eq!(
                 a.modifier,
@@ -622,7 +609,7 @@ mod tests {
                     for buf in [&band, &dx] {
                         let c = token_cell(buf, grid);
                         if grid_need == Some(true) {
-                            assert_eq!(c.fg, app.theme.error_color());
+                            assert_eq!(c.fg, theme::fg_color(app.theme.needed));
                             assert!(c.modifier.contains(Modifier::BOLD));
                         } else {
                             assert!(!row_text(buf, 2).contains("+RF72"));
@@ -666,7 +653,7 @@ mod tests {
         for width in [120, 77, 76, 70, 65, 64, 63, 55, 51] {
             let buf = render_need(&app, width, false);
             let cell = token_cell(&buf, "+▲→ ZL1ABC/P");
-            assert_eq!(cell.fg, app.theme.selected_color());
+            assert_eq!(cell.fg, theme::fg_color(app.theme.directed));
             token_cell(&buf, "CQ ZL1ABC/P RF72");
             assert_eq!(header_row_text(&buf).contains("Grid"), width >= 77);
             assert_eq!(header_row_text(&buf).contains("DT"), width >= 64);
@@ -677,21 +664,21 @@ mod tests {
         app.active_panel = ActivePanel::BandActivity;
         let buf = render_need(&app, 120, false);
         let c = token_cell(&buf, "+▲→ ZL1ABC/P");
-        assert_eq!(c.fg, ratatui::style::Color::Black);
-        assert_eq!(c.bg, app.theme.accent_color());
+        assert_eq!(c.fg, theme::fg_color(app.theme.selection));
+        assert_eq!(c.bg, theme::bg_color(app.theme.selection));
         app.active_panel = ActivePanel::Callers;
         app.decoded_messages.front_mut().unwrap().is_directed_at_us = false;
         app.active_qsos.push(fixture_banner("ZL1ABC/P"));
         let buf = render_need(&app, 120, false);
         let c = token_cell(&buf, "+▲● ZL1ABC/P");
-        assert_eq!(c.fg, app.theme.success_color());
+        assert_eq!(c.fg, theme::fg_color(app.theme.engaged));
         assert!(c.modifier.contains(Modifier::UNDERLINED));
         app.active_qsos.clear();
         app.active_panel = ActivePanel::DxHunter;
         let buf = render_need(&app, 120, false);
         assert_eq!(
             token_cell(&buf, "+▲ZL1ABC/P").fg,
-            app.theme.selected_color()
+            theme::fg_color(app.theme.focus)
         );
         app.active_panel = ActivePanel::Callers;
         let row = app.decoded_messages.front_mut().unwrap();

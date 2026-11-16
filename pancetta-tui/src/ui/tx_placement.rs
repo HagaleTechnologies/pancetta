@@ -16,7 +16,7 @@
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Cell, Paragraph, Row, Table},
     Frame,
@@ -66,7 +66,7 @@ pub fn render_tx_placement(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let Some(placement) = app.placement.as_ref() else {
         let msg =
             Paragraph::new("Waiting for TX-placement data (first autonomous tick pending)\u{2026}")
-                .style(Style::default().fg(app.theme.muted_color()));
+                .style(app.theme.muted);
         f.render_widget(msg, inner);
         return Ok(());
     };
@@ -104,7 +104,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
             let msg = Paragraph::new(
                 "Waiting for TX-placement data (first autonomous tick pending)\u{2026}",
             )
-            .style(Style::default().fg(app.theme.muted_color()));
+            .style(app.theme.muted);
             f.render_widget(msg, inner);
         }
         return Ok(());
@@ -112,13 +112,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
 
     let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Assigned"]
         .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
+        .map(|h| Cell::from(*h).style(app.theme.title.add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
     let n_bins = placement.openness.len();
@@ -185,14 +179,13 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         .header(header)
         .block(block)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()));
+        .style(app.theme.text);
 
     f.render_widget(table, area);
     if empty && inner.width > 0 && inner.height > 1 {
         // An empty-state sentence spans the body rather than one narrow column.
         f.render_widget(
-            Paragraph::new("no clear placement candidates yet")
-                .style(Style::default().fg(app.theme.muted_color())),
+            Paragraph::new("no clear placement candidates yet").style(app.theme.muted),
             Rect {
                 y: inner.y + 1,
                 height: 1,
@@ -358,28 +351,28 @@ fn render_openness_strip(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
     let n_bins = placement.openness.len();
 
     for col in 0..strip_width {
-        let (glyph, color) = if n_bins == 0 {
-            ('\u{00b7}', app.theme.muted_color())
+        let (glyph, style) = if n_bins == 0 {
+            ('\u{00b7}', app.theme.muted)
         } else {
             let bin = bin_for_col(col, strip_width, placement.range, placement.bin_hz, n_bins);
             match placement.openness.get(bin).copied().unwrap_or(0) {
-                3 => ('\u{2588}', app.theme.success_color()), // █ both clear
-                2 => ('\u{2580}', app.theme.warning_color()), // ▀ first (even) only
-                1 => ('\u{2584}', app.theme.accent_color()),  // ▄ second (odd) only
-                _ => ('\u{00b7}', app.theme.muted_color()),   // · busy
+                3 => ('\u{2588}', app.theme.success), // █ both clear
+                2 => ('\u{2580}', app.theme.warning), // ▀ first (even) only
+                1 => ('\u{2584}', app.theme.info),    // ▄ second (odd) only
+                _ => ('\u{00b7}', app.theme.muted),   // · busy
             }
         };
         let x = row.x + col as u16;
-        f.buffer_mut()[(x, row.y)].set_char(glyph).set_fg(color);
+        f.buffer_mut()[(x, row.y)].set_char(glyph).set_style(style);
     }
 
     if show_legend {
         let spans = vec![
-            Span::styled("\u{2588}", Style::default().fg(app.theme.success_color())),
+            Span::styled("\u{2588}", app.theme.success),
             Span::raw("both "),
-            Span::styled("\u{2580}", Style::default().fg(app.theme.warning_color())),
+            Span::styled("\u{2580}", app.theme.warning),
             Span::raw("E "),
-            Span::styled("\u{2584}", Style::default().fg(app.theme.accent_color())),
+            Span::styled("\u{2584}", app.theme.info),
             Span::raw("O"),
         ];
         let legend_rect = Rect {
@@ -393,7 +386,7 @@ fn render_openness_strip(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
 }
 
 /// Row 2: stream markers. One `│` per active QSO at its TX audio offset
-/// (red if that bin reads busy, else green), followed by the callsign
+/// (`error` if that bin reads busy, else `success`), followed by the callsign
 /// while columns remain. The global focus (if it has a known frequency
 /// from its latest decode) gets an overlaid `◆` diamond.
 fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &PlacementView) {
@@ -425,15 +418,15 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
             let bin = bin_for_col(col, width, placement.range, placement.bin_hz, n_bins);
             placement.openness.get(bin).copied().unwrap_or(0)
         };
-        let color = if code == 0 {
-            app.theme.error_color()
+        let style = if code == 0 {
+            app.theme.error
         } else {
-            app.theme.success_color()
+            app.theme.success
         };
         let x = row.x + col as u16;
         f.buffer_mut()[(x, row.y)]
             .set_char('\u{2502}')
-            .set_fg(color);
+            .set_style(style);
 
         // Room between this marker and the next one (or the right edge).
         let limit = marker_cols
@@ -458,7 +451,7 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
             }
             f.buffer_mut()[(row.x + cx as u16, row.y)]
                 .set_char(ch)
-                .set_fg(color);
+                .set_style(style);
         }
     }
 
@@ -475,7 +468,7 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
                 let x = row.x + col as u16;
                 f.buffer_mut()[(x, row.y)]
                     .set_char('\u{25c6}')
-                    .set_fg(app.theme.selected_color());
+                    .set_style(app.theme.focus);
             }
         }
     }
@@ -488,18 +481,15 @@ fn render_best_row(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placemen
         return;
     }
     if placement.slices.is_empty() {
-        let p = Paragraph::new("no clear placement candidates yet")
-            .style(Style::default().fg(app.theme.muted_color()));
+        let p = Paragraph::new("no clear placement candidates yet").style(app.theme.muted);
         f.render_widget(p, row);
         return;
     }
 
-    let base = Style::default().fg(app.theme.foreground_color());
+    let base = app.theme.text;
     let mut spans: Vec<Span> = vec![Span::styled(
         "BEST ",
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+        app.theme.title.add_modifier(Modifier::BOLD),
     )];
     let live = app.live_tx_assignments();
     let n_bins = placement.openness.len();
@@ -581,7 +571,7 @@ fn render_park_line(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
     } else {
         format!("{main} \u{b7} {legend}")
     };
-    let p = Paragraph::new(line).style(Style::default().fg(app.theme.foreground_color()));
+    let p = Paragraph::new(line).style(app.theme.text);
     f.render_widget(p, row);
 }
 
@@ -597,7 +587,7 @@ fn render_freq_axis(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
         let x = row.x + col as u16;
         f.buffer_mut()[(x, row.y)]
             .set_char('\u{2500}')
-            .set_fg(app.theme.muted_color());
+            .set_style(app.theme.muted);
     }
     if width < AXIS_TICK_MIN_WIDTH {
         return;
@@ -607,7 +597,7 @@ fn render_freq_axis(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
             let x = row.x + col as u16;
             f.buffer_mut()[(x, row.y)]
                 .set_char('\u{2534}')
-                .set_fg(app.theme.border_color());
+                .set_style(app.theme.border);
         }
     }
 }

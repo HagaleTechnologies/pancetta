@@ -124,13 +124,9 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
 
     // Keep the outer-width column budget, including the border reservation.
     let columns = visible_columns(area.width);
-    let header_cells = columns.iter().map(|c| {
-        Cell::from(c.header()).style(
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    });
+    let header_cells = columns
+        .iter()
+        .map(|c| Cell::from(c.header()).style(app.theme.title.add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
     // Same ordering the selection resolver walks.
@@ -158,7 +154,7 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
                 CallersColumn::Msg => "calling",
                 _ => "",
             };
-            Cell::from(text).style(Style::default().fg(app.theme.muted_color()))
+            Cell::from(text).style(app.theme.muted)
         })));
     }
 
@@ -167,7 +163,7 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()))
+        .style(app.theme.text)
         .row_highlight_style(
             Style::default()
                 .add_modifier(Modifier::REVERSED)
@@ -185,27 +181,16 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
 
     // Reply-hint line: "reply ◂ R-10 ▸   Enter=send".
     let hint = if callers.is_empty() {
-        Line::from(Span::styled(
-            "(no callers)",
-            Style::default().fg(app.theme.muted_color()),
-        ))
+        Line::from(Span::styled("(no callers)", app.theme.muted))
     } else {
         let step = app.current_caller_reply_step();
         let label = reply_label(step, app.caller_report_value());
         Line::from(vec![
-            Span::styled("reply ", Style::default().fg(app.theme.muted_color())),
-            Span::styled("◂ ", Style::default().fg(app.theme.accent_color())),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(app.theme.selected_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ▸", Style::default().fg(app.theme.accent_color())),
-            Span::styled(
-                "   Enter=send",
-                Style::default().fg(app.theme.muted_color()),
-            ),
+            Span::styled("reply ", app.theme.muted),
+            Span::styled("◂ ", app.theme.key),
+            Span::styled(label, app.theme.focus.add_modifier(Modifier::BOLD)),
+            Span::styled(" ▸", app.theme.key),
+            Span::styled("   Enter=send", app.theme.muted),
         ])
     };
     f.render_widget(Paragraph::new(hint), hint_area);
@@ -269,30 +254,26 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColu
         call.clone()
     };
 
-    let dim = Style::default().fg(app.theme.foreground_color());
+    let dim = app.theme.text;
     let call_style = if is_globally_focused {
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.focus.add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD)
+        app.theme.info.add_modifier(Modifier::BOLD)
     };
     // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
-    // green + underline, without discarding e.g. the tier-1 BOLD.
+    // the engaged token + underline, without discarding e.g. the tier-1 BOLD.
     let call_style = if is_engaged {
         call_style
-            .fg(app.theme.success_color())
+            .patch(app.theme.engaged)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         call_style
     };
-    let snr_style = Style::default().fg(super::get_snr_color(msg.snr, &app.theme));
+    let snr_style = app.theme.snr(msg.snr);
     let flags_style = if flags.contains(&"BUSY") {
-        Style::default().fg(app.theme.warning_color())
+        app.theme.warning
     } else {
-        Style::default().fg(app.theme.muted_color())
+        app.theme.muted
     };
 
     // One cell per visible column (PAN-88).
@@ -306,11 +287,11 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColu
             (CallersColumn::Snr, Cell::from(snr_str).style(snr_style)),
             (
                 CallersColumn::Freq,
-                Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
+                Cell::from(freq_str).style(app.theme.info),
             ),
             (
                 CallersColumn::Age,
-                Cell::from(age_str).style(Style::default().fg(app.theme.muted_color())),
+                Cell::from(age_str).style(app.theme.muted),
             ),
             (
                 CallersColumn::Flags,
@@ -431,12 +412,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callers_snr_uses_shared_scale_in_both_themes() {
+    async fn callers_snr_uses_shared_scale_in_every_theme() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
-        for theme in [crate::config::Theme::Dark, crate::config::Theme::Light] {
+        use crate::theme::{self, Theme, ThemeName};
+        for theme in ThemeName::ALL.map(Theme::for_name) {
             app.theme = theme;
             for snr in [-15, -11, -10, -1, 0, 5, 10] {
                 let mut msg = caller_fixture("K1ABC");
@@ -458,10 +440,7 @@ mod tests {
                     .position(|w| w == label_cells)
                     .unwrap_or_else(|| panic!("missing {label}: {row}"));
                 for x in start..start + label.len() {
-                    assert_eq!(
-                        buf[(x as u16, 2)].fg,
-                        super::super::get_snr_color(snr, &app.theme)
-                    );
+                    assert_eq!(buf[(x as u16, 2)].fg, theme::fg_color(app.theme.snr(snr)));
                 }
             }
         }
