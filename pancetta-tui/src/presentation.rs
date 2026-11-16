@@ -140,7 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn view_name_is_view_message_without_suffix() {
         for view in [
             ActiveView::Operate,
@@ -152,7 +151,7 @@ mod tests {
         }
     }
 
-=======
+    #[test]
     fn forward_power_label_formats_watts_and_fraction() {
         assert_eq!(forward_power_label(ForwardPower::Watts(48.0)), "48 W");
         assert_eq!(forward_power_label(ForwardPower::Watts(7.5)), "7.5 W");
@@ -162,7 +161,7 @@ mod tests {
             "48% of max power"
         );
     }
->>>>>>> 853a6bc525f992624f5968d3ecf789ee3ced219d
+
     #[test]
     fn pan353_rendered_text_vocabulary_is_exhaustive() {
         use RigConnDisplay::*;
