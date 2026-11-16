@@ -2000,7 +2000,10 @@ impl ConfigSection for UiConfig {
         // be carried here (these nested sections are inert today, but the
         // `merge_with_carries_every_field` guardrail in lib.rs makes it safe to
         // wire them up later without silently dropping them to defaults).
-        if !other.theme.is_empty() {
+        // PAN-387: `theme` is read at runtime. A higher layer whose file has
+        // no `[ui] theme` deserializes the serde default "default", which must
+        // not reset a lower layer's choice; an explicit "dark" still does.
+        if !other.theme.is_empty() && other.theme != "default" {
             self.theme = other.theme;
         }
 
@@ -2105,6 +2108,28 @@ mod pan387_theme_tests {
         upper.accessibility.high_contrast = true;
         base.merge_with(upper);
         assert!(base.accessibility.high_contrast);
+    }
+
+    /// Review fix: a higher layer that never sets `[ui] theme` carries the
+    /// serde default "default" and must not reset a lower layer's theme.
+    #[test]
+    fn merge_keeps_a_lower_layer_theme_when_the_upper_layer_is_unset() {
+        let mut lower = UiConfig {
+            theme: "light".to_string(),
+            ..UiConfig::default()
+        };
+        lower.merge_with(UiConfig::default());
+        assert_eq!(lower.theme_name(), ThemeName::Light);
+
+        let mut lower = UiConfig {
+            theme: "light".to_string(),
+            ..UiConfig::default()
+        };
+        lower.merge_with(UiConfig {
+            theme: "dark".to_string(),
+            ..UiConfig::default()
+        });
+        assert_eq!(lower.theme_name(), ThemeName::Dark);
     }
 
     #[test]

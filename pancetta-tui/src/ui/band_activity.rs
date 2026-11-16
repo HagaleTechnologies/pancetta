@@ -323,8 +323,8 @@ fn create_message_row<'a>(
     // the `engaged` style + underline, without discarding e.g. the tier-1
     // BOLD.
     let call_style = if is_engaged {
-        call_style
-            .patch(app.theme.engaged)
+        app.theme
+            .engaged_on(call_style)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         call_style

@@ -263,8 +263,8 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColu
     // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
     // the engaged token + underline, without discarding e.g. the tier-1 BOLD.
     let call_style = if is_engaged {
-        call_style
-            .patch(app.theme.engaged)
+        app.theme
+            .engaged_on(call_style)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         call_style

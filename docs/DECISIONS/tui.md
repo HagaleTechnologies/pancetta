@@ -661,5 +661,16 @@ accepted but ignored, and every renderer picked its own colours.
   scroll counters on a focused border use `focus` when that token has a
   background (HighContrast's filled frame); Gray on light yellow measured
   1.17:1. No token value changed.
+- **Stacked and shape-coded styles (self-review).** `Theme::engaged_on`
+  stacks the engaged highlight on a callsign style: a base that paints its
+  own background (Light `directed` and `own_tx`, HighContrast `focus`)
+  keeps its colours and gains only `engaged`'s modifiers, because patching
+  `engaged`'s fg onto it drew Light Blue on Blue and HighContrast LightGreen
+  on LightYellow. Dark bases set no background, so Dark is unchanged. The
+  TX-placement openness half blocks (`▀`, `▄`) take their tokens' fg only,
+  since a token background (Light `warning`) filled the empty half and hid
+  which slot was clear. A higher config layer with no `[ui] theme` no longer
+  resets a lower layer's theme (`merge_with` skips the serde default
+  `"default"` as it skips an empty string).
 - **Not yet qualified.** Contrast is checked by tests on the xterm default
   palette only; no real terminal has been checked.

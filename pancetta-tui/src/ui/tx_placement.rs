@@ -24,6 +24,7 @@ use ratatui::{
 
 use super::create_panel_block;
 use crate::app::{ActivePanel, App, LiveTxAssignment, PlacementView};
+use crate::theme;
 
 /// Circled digits for ranked candidates (①-⑩) — shared by the compact
 /// BEST row (Task 11, top 5) and the full-screen top-10 zoom table
@@ -352,14 +353,17 @@ fn render_openness_strip(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
 
     for col in 0..strip_width {
         let (glyph, style) = if n_bins == 0 {
-            ('\u{00b7}', app.theme.muted)
+            ('\u{00b7}', theme::fg_of(app.theme.muted))
         } else {
             let bin = bin_for_col(col, strip_width, placement.range, placement.bin_hz, n_bins);
+            // The half blocks encode which slot is clear by shape, so they
+            // take the token's foreground only: a token background (Light
+            // `warning` is Black on Yellow) would fill the empty half.
             match placement.openness.get(bin).copied().unwrap_or(0) {
-                3 => ('\u{2588}', app.theme.success), // █ both clear
-                2 => ('\u{2580}', app.theme.warning), // ▀ first (even) only
-                1 => ('\u{2584}', app.theme.info),    // ▄ second (odd) only
-                _ => ('\u{00b7}', app.theme.muted),   // · busy
+                3 => ('\u{2588}', theme::fg_of(app.theme.success)), // █ both clear
+                2 => ('\u{2580}', theme::fg_of(app.theme.warning)), // ▀ first (even) only
+                1 => ('\u{2584}', theme::fg_of(app.theme.info)),    // ▄ second (odd) only
+                _ => ('\u{00b7}', theme::fg_of(app.theme.muted)),   // · busy
             }
         };
         let x = row.x + col as u16;
@@ -368,11 +372,11 @@ fn render_openness_strip(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
 
     if show_legend {
         let spans = vec![
-            Span::styled("\u{2588}", app.theme.success),
+            Span::styled("\u{2588}", theme::fg_of(app.theme.success)),
             Span::raw("both "),
-            Span::styled("\u{2580}", app.theme.warning),
+            Span::styled("\u{2580}", theme::fg_of(app.theme.warning)),
             Span::raw("E "),
-            Span::styled("\u{2584}", app.theme.info),
+            Span::styled("\u{2584}", theme::fg_of(app.theme.info)),
             Span::raw("O"),
         ];
         let legend_rect = Rect {

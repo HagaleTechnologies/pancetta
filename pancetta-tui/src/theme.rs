@@ -345,6 +345,21 @@ impl Theme {
         }
     }
 
+    /// The `engaged` highlight (a station in a live QSO) stacked on a
+    /// callsign style. A base that paints its own background (Light
+    /// `directed` and `own_tx`, HighContrast `focus`) keeps its colours and
+    /// gains only `engaged`'s modifiers, so the stack never draws `engaged`'s
+    /// foreground on a background it was not contrast-checked against (Light
+    /// Blue on `directed`'s Blue). No Dark callsign base sets a background, so
+    /// Dark keeps today's `patch`.
+    pub fn engaged_on(&self, base: Style) -> Style {
+        if base.bg.is_some() {
+            base.add_modifier(self.engaged.add_modifier)
+        } else {
+            base.patch(self.engaged)
+        }
+    }
+
     /// SNR scale (`docs/DECISIONS/tui.md`): SNR ≥ 0 `success`, -10 to -1
     /// `warning`, below -10 `error`.
     pub fn snr(&self, snr: i32) -> Style {
@@ -1070,6 +1085,44 @@ mod tests {
             ("modal_danger", t.modal_danger),
         ] {
             assert!(style.add_modifier.contains(Modifier::BOLD), "{name}");
+        }
+    }
+
+    /// Review fix: `engaged` stacked on a filled callsign base (Light
+    /// `directed`, HighContrast `focus`) must stay readable, and Dark must
+    /// keep today's plain `patch`.
+    #[test]
+    fn engaged_stack_keeps_contrast_on_every_callsign_base() {
+        for (theme, min) in [
+            (Theme::DARK, None),
+            (Theme::LIGHT, Some(3.0)),
+            (Theme::HIGH_CONTRAST, Some(4.5)),
+        ] {
+            for (name, base) in [
+                ("directed", theme.directed),
+                ("own_tx", theme.own_tx),
+                ("focus", theme.focus),
+                ("needed", theme.needed),
+                ("atno", theme.atno),
+                ("callable", theme.callable),
+                ("emphasis", theme.emphasis),
+                ("info", theme.info),
+                ("muted", theme.muted),
+            ] {
+                let stacked = theme.engaged_on(base);
+                let Some(min) = min else {
+                    assert_eq!(stacked, base.patch(theme.engaged), "dark {name}");
+                    continue;
+                };
+                let fg = fg_color(stacked);
+                let bg = stacked.bg.or(theme.page.bg).unwrap_or(Color::Reset);
+                let ratio = contrast_ratio(fg, bg).unwrap_or(0.0);
+                assert!(
+                    ratio >= min,
+                    "{} engaged on {name}: {fg:?} on {bg:?} = {ratio:.2}",
+                    theme.name.as_str()
+                );
+            }
         }
     }
 

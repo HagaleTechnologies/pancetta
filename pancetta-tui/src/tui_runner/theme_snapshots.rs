@@ -654,8 +654,18 @@ async fn check(theme: ThemeName, surface: Surface) {
             .enumerate()
             .find(|(_, (a, b))| a != b)
             .expect("texts differ");
+        // Three lines of context either side of the first difference, from
+        // the actual render (same shape as `key_effects_match_golden`).
+        let context: String = actual
+            .lines()
+            .enumerate()
+            .skip(i.saturating_sub(3))
+            .take(7)
+            .map(|(n, l)| format!("  {:>4} {l}\n", n + 1))
+            .collect();
         panic!(
             "{} {} differs from {} at line {}:\n  golden: {want}\n  actual: {got}\n\
+             actual context:\n{context}\
              If the change is intended, re-bless with `{BLESS_CMD}`",
             theme.as_str(),
             surface.name(),
