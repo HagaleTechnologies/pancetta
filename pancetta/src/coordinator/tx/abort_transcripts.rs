@@ -10,12 +10,9 @@
 //! `PANCETTA_BLESS_TX_ABORT=1 cargo test -p pancetta --lib coordinator::tx::abort_transcripts`.
 //!
 //! This module uses only items that exist before PAN-322, so it can be
-//! dropped onto the base commit to re-check the golden there. On a base
-//! older than PAN-326 the harness module still has its former ticket name,
-//! given on the first line of `tests/worker_gate_tests.rs`; change the first
-//! `use` line to match.
+//! dropped onto the base commit to re-check the golden there.
 
-use super::worker_gate_tests::{worker_harness_with_clock, Harness};
+use super::pan115_worker_gate_tests::{worker_harness_with_clock, Harness};
 use crate::coordinator::active_tx_qso_key;
 use crate::message_bus::{
     ComponentId, ComponentMessage, ControlMessage, MessageType, QsoMessage, RigControlMessage,

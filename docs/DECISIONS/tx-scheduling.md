@@ -107,7 +107,7 @@ parameter at all four call sites (Step 4b/4d, single and multi TX).
   the gate then proceeds, which is the pre-PAN-141 behaviour for that cycle.
 - **Tests.** Unit tests in `schedule_tx_tests` pin cross-band, cross-grid,
   intra-band retune, unknown dial, filter order, Step 4d and the bundle mask.
-  `dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
+  `pan146_dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
   with a fresh 20 m sighting keys, and the same call on 20 m is held.
 
 ## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
@@ -1062,7 +1062,7 @@ every later reader, and each `.await` on it is a cooperative-scheduling yield po
   same best-effort semantics as its old `send_message`.
 - **Tests.** `message_bus.rs` holds the table's write lock and asserts the rig route enqueues
   inside the hold within a 50 ms cap, with a hazard pin showing the table path still waits.
-  `key_down_worker_tests` parks the real TX worker between its last gate and the
+  `pan202_key_down_worker_tests` parks the real TX worker between its last gate and the
   key-down with a `#[cfg(test)]` `KeyDownProbe`, holds the table (`hold_channel_table`), and
   requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
   helper is tested directly.
@@ -1100,7 +1100,7 @@ tune in the same state played a tone with no carrier.
   worker: its command loop skips a key-down during a receive-gain transition, while the restart
   inhibit is active, or when `hardware_ptt_on` refuses (`coordinator/hamlib.rs`, the `SetPtt`
   handling). So `TxFrameSent` is still not proof of keying.
-- **Tests.** `dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
+- **Tests.** `pan278_dropped_ptt_on_tests` fills Hamlib's channel and reads its backlog only
   after the outcome settles (draining earlier lets the key-down through and hides the defect).
   It covers single TX, a two-item bundle, a tune, and the no-route proceed path on
   `worker_harness_without_rig`.
@@ -1317,7 +1317,7 @@ PAN-322 moves each outcome into one handler. Behaviour and log lines do not chan
   it can be copied into a worktree at `git merge-base origin/main HEAD` and run there.
 - **The real worker, not `coord_sim`.** `pancetta/tests/coord_sim.rs` copies the decision chain and
   never starts the TX worker. The cells run the real worker on a real `MessageBus` through
-  `worker_gate_tests::worker_harness_with_clock`, with `ptt_lead_ms = 2000`, a clock offset
+  `pan115_worker_gate_tests::worker_harness_with_clock`, with `ptt_lead_ms = 2000`, a clock offset
   that expires the remote arm, and `max_concurrent_qsos = 2` for bundles.
 - **Per-channel format.** Each cell lists `pre|post <channel> <event>`, split at a marker id from
   the bus's global counter. Channels go in the order hamlib, autonomous, qso, tui, audio, each in

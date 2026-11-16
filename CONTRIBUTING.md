@@ -363,25 +363,26 @@ Unit tests go in the same crate, `src/<module>/tests/`: one file per behaviour,
 declared from the module under test so the tests keep access to private items.
 
 ```rust
-// pancetta/src/coordinator/tx.rs
+// pancetta-qso/src/qso_manager.rs
 #[cfg(test)]
-#[path = "tx/tests/ptt_release_tests.rs"]
-mod ptt_release_tests;
+#[path = "qso_manager/tests/clock_step_watchdog_tests.rs"]
+mod clock_step_watchdog_tests;
 ```
 
 ```rust
-// pancetta/src/coordinator/tx/tests/ptt_release_tests.rs
+// pancetta-qso/src/qso_manager/tests/clock_step_watchdog_tests.rs
+// PAN-296. Formerly the inline module `pan296_watchdog_tests`.
 use super::*;
 
 #[tokio::test]
-async fn release_on_a_healthy_channel_unkeys_once_and_stands_the_guard_down() {
+async fn three_qsos_survive_forward_step_then_expire_from_recovery() {
     // ...
 }
 ```
 
 - The `#[path]` string is relative to the directory that holds the declaring
-  file. From `tx.rs` it is `"tx/tests/<name>.rs"`. From a `mod.rs` file, such as
-  `station_agent/mod.rs`, it is `"tests/<name>.rs"`.
+  file. From `qso_manager.rs` it is `"qso_manager/tests/<name>.rs"`. From a
+  `mod.rs` file, such as `station_agent/mod.rs`, it is `"tests/<name>.rs"`.
 - The test module is still a child of the module under test. `use super::*;`
   reaches private items, and sibling test modules share helpers through
   `super::<sibling>::`.
