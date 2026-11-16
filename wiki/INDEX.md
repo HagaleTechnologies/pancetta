@@ -27,3 +27,4 @@
 - [What will bite you about macOS microphone approval?](pages/macos-microphone-approval.md)
 
 - [What will bite you about shutdown PTT-off?](pages/shutdown-ptt-off.md) — PAN-277: enqueue versus unkey, drain ordering, and direct-client timeouts.
+- [What will bite you about out-of-line test modules?](pages/out-of-line-test-modules.md) — PAN-326: `#[path]` is relative to the declaring file's directory (`tx/tests/` from `tx.rs`, `tests/` from `mod.rs`), `include_str!` resolves from the test file, and renaming a test module renames its tests.

@@ -60,6 +60,8 @@ cargo test -p pancetta --test loopback_qso
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 ```
 
+New unit tests go in the same crate, `src/<module>/tests/<behaviour>_tests.rs`, declared with `#[cfg(test)] #[path = "..."] mod <behaviour>_tests;` (CONTRIBUTING.md § Unit Tests); renaming a test module renames its tests.
+
 ## Domain Context
 
 - **Ham radio / FT8**: Digital mode protocol — 15-second slots, 8-GFSK modulation, LDPC+CRC coding, structured message exchange (CQ → grid → report → RR73)
