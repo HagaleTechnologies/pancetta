@@ -7,12 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 - PAN-389: `[ui.waterfall]` sets the waterfall palette (`classic`, `spectrum`, `thermal`, `viridis`) and a display gain (`gain_db`, -12 to 12 dB, positive brightens). In the Monitor view, Tab focuses the waterfall; `{`/`}` step the gain by 1 dB and `b`/`B` cycle the palette. Live changes persist in `~/.pancetta/session_state.json`, and a later config edit wins at the next start. Config edits need a restart. 16-colour terminals ignore the palette.
 
-=======
 - PAN-291: while the rig is keyed, the Shift+S station health panel shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `[rig.power_control.protection] max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Set `alc_overdrive_warning = false` to turn it off. Changes require restart. Automated coverage only; real-rig qualification pending.
->>>>>>> 853a6bc525f992624f5968d3ecf789ee3ced219d
 - PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
 
