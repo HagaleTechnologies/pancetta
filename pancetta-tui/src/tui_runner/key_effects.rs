@@ -9,8 +9,10 @@
 //! `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`.
 //!
 //! This file uses only APIs that existed before PAN-327 (`new_for_test`,
-//! the private `handle_key_event`, `App` fields, `TuiCommand`), so it can be
-//! dropped onto the base commit to re-check the golden there.
+//! the private `handle_key_event`, `App` fields, `TuiCommand`), apart from
+//! the PAN-389 waterfall scenarios, which name `ActivePanel::Waterfall` and
+//! the `waterfall_*` fields. It therefore no longer drops onto the
+//! pre-PAN-327 base commit unchanged: remove those to re-check there.
 
 use super::{TuiCommand, TuiMessage, TuiRunner};
 use crate::app::{ActivePanel, App};
@@ -72,6 +74,11 @@ pub(super) const SCENARIOS: &[Scenario] = &[
         setup: |a| a.active_panel = ActivePanel::TxPlacement,
     },
     Scenario {
+        name: "empty/waterfall",
+        rich: false,
+        setup: waterfall_setup,
+    },
+    Scenario {
         name: "rich/band",
         rich: true,
         setup: |a| a.active_panel = ActivePanel::BandActivity,
@@ -95,6 +102,11 @@ pub(super) const SCENARIOS: &[Scenario] = &[
         name: "rich/placement",
         rich: true,
         setup: |a| a.active_panel = ActivePanel::TxPlacement,
+    },
+    Scenario {
+        name: "rich/waterfall",
+        rich: true,
+        setup: waterfall_setup,
     },
     Scenario {
         name: "rich/band/zoomed",
@@ -565,7 +577,18 @@ fn snapshot(app: &App) -> Vec<(&'static str, String)> {
             format!("{:?}", app.clear_armed_at.is_some()),
         ),
         ("acknowledged_readiness", format!("{ack:?}")),
+        ("waterfall_palette", format!("{:?}", app.waterfall_palette)),
+        ("waterfall_gain_db", format!("{:?}", app.waterfall_gain_db)),
     ]
+}
+
+/// PAN-389: the Monitor view with the waterfall focused. The colour
+/// capability is pinned so the palette status line never depends on the
+/// test environment's `TERM`/`COLORTERM`.
+fn waterfall_setup(a: &mut App) {
+    a.active_view = crate::view::ActiveView::Monitor;
+    a.active_panel = ActivePanel::Waterfall;
+    a.color_capability = crate::app::ColorCapability::TwoFiftySix;
 }
 
 /// A runner whose `App` starts from a state file that does not exist yet,
@@ -600,7 +623,7 @@ impl Scenario {
     pub(super) fn is_main_view(&self) -> bool {
         matches!(
             self.name.split('/').nth(1),
-            Some("band" | "qso" | "callers" | "dx" | "placement")
+            Some("band" | "qso" | "callers" | "dx" | "placement" | "waterfall")
         )
     }
 }

@@ -512,6 +512,11 @@ pub enum TuiMessage {
 }
 
 /// Commands sent from TUI
+/// Status line for `{ } b B` while the waterfall is not the focused,
+/// on-screen panel (PAN-389).
+const WATERFALL_FOCUS_HINT: &str =
+    "Focus the waterfall (Monitor view, Tab) to change its gain or palette";
+
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     /// Add or remove an operator watchlist pin.
@@ -695,6 +700,16 @@ pub enum TuiCommand {
     /// since only the coordinator knows the resolved hardware tier `Auto`
     /// needs to pick the right budget.
     CycleDecodeEffort,
+    /// Operator pressed `{` or `}` with the waterfall focused (PAN-389). The
+    /// TUI has already applied the new absolute gain; the coordinator only
+    /// persists it to the session file and sends no echo.
+    SetWaterfallGain { gain_db: f32 },
+    /// Operator pressed `b` or `B` with the waterfall focused (PAN-389). The
+    /// TUI has already applied the new palette; the coordinator only persists
+    /// it to the session file and sends no echo.
+    SetWaterfallPalette {
+        palette: pancetta_config::ui::WaterfallPalette,
+    },
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
@@ -2646,6 +2661,58 @@ impl TuiRunner {
             Action::CycleDecodeEffort => {
                 self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
             }
+            // PAN-389: focus can be left on the waterfall after a view switch
+            // (`active_panel` is not reset). Unzoomed, the waterfall is drawn
+            // only in the Monitor view; zoomed (`z`), the focused panel is
+            // drawn in every view. Off screen, the keys explain themselves and
+            // never change or persist an invisible gain or palette.
+            Action::WaterfallGainDown
+            | Action::WaterfallGainUp
+            | Action::CycleWaterfallPaletteForward
+            | Action::CycleWaterfallPaletteBack
+                if !app.zoomed && app.active_view != crate::view::ActiveView::Monitor =>
+            {
+                app.set_local_status(
+                    WATERFALL_FOCUS_HINT.to_string(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
+            }
+            // PAN-389: `{`/`}` step the waterfall display gain while the
+            // waterfall is focused. The TUI applies the new value at once and
+            // sends the absolute gain for the coordinator to persist; a press
+            // at the ±12 dB limit changes nothing and sends nothing.
+            Action::WaterfallGainDown => {
+                if let Some(gain_db) =
+                    app.adjust_waterfall_gain(-crate::app::WATERFALL_GAIN_STEP_DB)
+                {
+                    self.message_tx
+                        .send(TuiCommand::SetWaterfallGain { gain_db })?;
+                }
+            }
+            Action::WaterfallGainUp => {
+                if let Some(gain_db) = app.adjust_waterfall_gain(crate::app::WATERFALL_GAIN_STEP_DB)
+                {
+                    self.message_tx
+                        .send(TuiCommand::SetWaterfallGain { gain_db })?;
+                }
+            }
+            // PAN-389: `b`/`B` cycle the waterfall palette while focused.
+            Action::CycleWaterfallPaletteForward => {
+                let palette = app.cycle_waterfall_palette(true);
+                self.message_tx
+                    .send(TuiCommand::SetWaterfallPalette { palette })?;
+            }
+            Action::CycleWaterfallPaletteBack => {
+                let palette = app.cycle_waterfall_palette(false);
+                self.message_tx
+                    .send(TuiCommand::SetWaterfallPalette { palette })?;
+            }
+            Action::WaterfallFocusHint => {
+                app.set_local_status(
+                    WATERFALL_FOCUS_HINT.to_string(),
+                    pancetta_core::DiagnosticLevel::Info,
+                );
+            }
 
             // === Activity views (Phase 2 TUI redesign) ===
             // v / V - cycle the operator's active view forward/backward
@@ -4465,7 +4532,7 @@ mod key_tests {
         assert_eq!(r.metrics.frames_rendered, 2);
     }
 
-    async fn make_runner() -> (
+    pub(super) async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
         Arc<RwLock<App>>,
@@ -4558,11 +4625,11 @@ mod key_tests {
         assert_eq!(need.state.as_deref(), Some("AR"));
     }
 
-    fn key(c: char) -> KeyEvent {
+    pub(super) fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
-    fn key_shift(c: char) -> KeyEvent {
+    pub(super) fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
     }
 
@@ -10211,3 +10278,7 @@ mod pan333_terminal_guard {
         assert_eq!(*calls.lock().unwrap(), ["raw", "leave", "show"]);
     }
 }
+
+#[cfg(test)]
+#[path = "tui_runner/tests/waterfall_key_tests.rs"]
+mod waterfall_key_tests;
