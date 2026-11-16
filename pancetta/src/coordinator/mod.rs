@@ -58,6 +58,7 @@ mod tui_relay;
 mod tx;
 mod tx_halt;
 mod tx_log;
+mod tx_meter;
 mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;

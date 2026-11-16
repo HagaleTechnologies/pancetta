@@ -2112,6 +2112,9 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled("●", Style::default().fg(Color::Red))
         }
     }
+    fn gray_dot() -> Span<'static> {
+        Span::styled("●", Style::default().fg(Color::DarkGray))
+    }
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2211,6 +2214,32 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
             crate::presentation::rig_label(app.rig_connected)
         )),
     ]));
+    // PAN-291: forward power and ALC while keyed. First matching rule wins:
+    // fresh reading, rig not connected, rig lists neither meter, idle.
+    {
+        use crate::presentation::TxMeterRow;
+        let capability = app.tx_meter_capability;
+        let row = if let Some(reading) = app.tx_meter_live_at(chrono::Utc::now()) {
+            TxMeterRow::Live {
+                reading,
+                alc_limit: capability.and_then(|c| c.alc_limit),
+            }
+        } else if !matches!(app.rig_connected, crate::app::RigConnDisplay::Connected) {
+            TxMeterRow::NeedsCat
+        } else if capability.is_some_and(|c| !c.forward_power && !c.alc) {
+            TxMeterRow::NotReported
+        } else {
+            TxMeterRow::Idle
+        };
+        let marker = match row {
+            TxMeterRow::Live { .. } => dot(!row.overdriven()),
+            _ => gray_dot(),
+        };
+        lines.push(Line::from(vec![
+            marker,
+            Span::raw(crate::presentation::tx_meter_text(row)),
+        ]));
+    }
     // PAN-89: was inverted (green "system default" for the misconfig).
     lines.push(Line::from(vec![
         dot(!app.tx_output_default),
@@ -2833,6 +2862,183 @@ mod view_render_tests {
                 assert!(buffer_contains(&buf, &format!("Rig: {label}")));
             }
         }
+    }
+
+    /// PAN-291: the TX meter row text, asserting it sits on the row right
+    /// after `Rig:`.
+    fn tx_meter_row(buf: &ratatui::buffer::Buffer) -> String {
+        let rig_y = (0..buf.area.height)
+            .find(|&y| row_text(buf, y).contains("Rig: "))
+            .expect("Rig: row rendered");
+        let row = row_text(buf, rig_y + 1);
+        assert!(row.contains("TX meter:"), "row after Rig: is {row:?}");
+        row
+    }
+
+    async fn tx_meter_app(
+        reading: Option<pancetta_core::tx_meter::TxMeterReading>,
+        capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    ) -> crate::app::App {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.rig_connected = crate::app::RigConnDisplay::Connected;
+        if let Some(capability) = capability {
+            app.set_tx_meter_capability(capability);
+        }
+        if let Some(reading) = reading {
+            app.update_tx_meter(reading);
+        }
+        app
+    }
+
+    const BOTH_METERS: pancetta_core::tx_meter::TxMeterCapability =
+        pancetta_core::tx_meter::TxMeterCapability {
+            forward_power: true,
+            alc: true,
+            alc_limit: Some(0.5),
+        };
+
+    #[tokio::test]
+    async fn health_panel_shows_live_tx_meter() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let app = tx_meter_app(
+            Some(TxMeterReading {
+                forward_power: Some(ForwardPower::Watts(48.0)),
+                alc: Some(0.12),
+            }),
+            Some(BOTH_METERS),
+        )
+        .await;
+        let buf = render_health(&app).await;
+        let row = tx_meter_row(&buf);
+        assert!(
+            row.contains("TX meter: 48 W, ALC 0.12 (limit 0.50)"),
+            "{row:?}"
+        );
+        assert!(!row.contains("reduce audio drive"), "{row:?}");
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Green);
+    }
+
+    #[tokio::test]
+    async fn health_panel_tx_meter_flags_alc_above_the_limit() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let app = tx_meter_app(
+            Some(TxMeterReading {
+                forward_power: Some(ForwardPower::Watts(52.0)),
+                alc: Some(0.81),
+            }),
+            Some(BOTH_METERS),
+        )
+        .await;
+        let buf = render_health(&app).await;
+        let row = tx_meter_row(&buf);
+        assert!(
+            row.contains("TX meter: 52 W, ALC 0.81 (limit 0.50), reduce audio drive"),
+            "{row:?}"
+        );
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Red);
+    }
+
+    #[tokio::test]
+    async fn health_panel_tx_meter_formats_fraction_and_missing_values() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+        for (reading, capability, expected) in [
+            (
+                TxMeterReading {
+                    forward_power: Some(ForwardPower::FractionOfMax(0.48)),
+                    alc: Some(0.12),
+                },
+                BOTH_METERS,
+                "TX meter: 48% of max power, ALC 0.12 (limit 0.50)",
+            ),
+            (
+                TxMeterReading {
+                    forward_power: None,
+                    alc: Some(0.12),
+                },
+                BOTH_METERS,
+                "TX meter: power n/a, ALC 0.12 (limit 0.50)",
+            ),
+            (
+                TxMeterReading {
+                    forward_power: Some(ForwardPower::Watts(48.0)),
+                    alc: None,
+                },
+                BOTH_METERS,
+                "TX meter: 48 W, ALC n/a",
+            ),
+            (
+                TxMeterReading {
+                    forward_power: Some(ForwardPower::Watts(48.0)),
+                    alc: Some(0.12),
+                },
+                TxMeterCapability {
+                    alc_limit: None,
+                    ..BOTH_METERS
+                },
+                "TX meter: 48 W, ALC 0.12",
+            ),
+        ] {
+            let app = tx_meter_app(Some(reading), Some(capability)).await;
+            let buf = render_health(&app).await;
+            let row = tx_meter_row(&buf);
+            assert!(row.contains(expected), "{expected:?} not in {row:?}");
+            assert!(!row.contains("reduce audio drive"), "{row:?}");
+            if capability.alc_limit.is_none() {
+                assert!(!row.contains("(limit"), "{row:?}");
+            }
+            assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::Green);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_panel_tx_meter_idle_unsupported_and_no_cat() {
+        use crate::app::RigConnDisplay;
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+        for state in [RigConnDisplay::NotConnected, RigConnDisplay::PollingFailed] {
+            let mut app = tx_meter_app(None, Some(BOTH_METERS)).await;
+            app.rig_connected = state;
+            let buf = render_health(&app).await;
+            assert!(
+                tx_meter_row(&buf).contains("TX meter: needs a connected CAT rig"),
+                "{state:?}"
+            );
+            assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
+        }
+        let app = tx_meter_app(
+            None,
+            Some(TxMeterCapability {
+                forward_power: false,
+                alc: false,
+                alc_limit: Some(0.5),
+            }),
+        )
+        .await;
+        let buf = render_health(&app).await;
+        assert!(
+            tx_meter_row(&buf).contains("TX meter: this rig does not report power or ALC over CAT")
+        );
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
+
+        // Connected, capability unknown, no reading yet.
+        let app = tx_meter_app(None, None).await;
+        let buf = render_health(&app).await;
+        assert!(tx_meter_row(&buf).contains("TX meter: shown while transmitting"));
+
+        // Connected with a 3 s old reading: idle again.
+        let mut app = tx_meter_app(
+            Some(TxMeterReading {
+                forward_power: Some(ForwardPower::Watts(48.0)),
+                alc: Some(0.9),
+            }),
+            Some(BOTH_METERS),
+        )
+        .await;
+        app.tx_meter_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3));
+        let buf = render_health(&app).await;
+        assert!(tx_meter_row(&buf).contains("TX meter: shown while transmitting"));
+        assert_eq!(dot_fg_for(&buf, "TX meter:"), Color::DarkGray);
     }
 
     async fn render_health(app: &crate::app::App) -> ratatui::buffer::Buffer {

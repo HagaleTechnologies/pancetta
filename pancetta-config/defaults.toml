@@ -452,6 +452,8 @@ method = "none"
 [rig.power_control.band_power]
 
 [rig.power_control.protection]
+alc_overdrive_warning = true
+max_alc = 0.5
 max_power_watts = 100
 max_swr = 3.0
 max_temperature_c = 80.0
