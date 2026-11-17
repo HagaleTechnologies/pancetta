@@ -111,6 +111,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `audio.rs` | Audio component startup. |
 | `audio/` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
+| `audio_recovery/` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
 | `autonomous/` | Autonomous operator component. |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
@@ -137,6 +138,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `qso_upload_status.rs` | Registry of per-QSO upload results for the TUI (PAN-344). |
 | `raw_capture.rs` | Timed raw 48 kHz capture, one WAV per FT8 slot (PAN-393). |
 | `readiness.rs` | Coordinator side of the TUI readiness strip (PAN-89). |
+| `readiness/` | Coordinator side of the TUI readiness strip (PAN-89). |
 | `receive_overload.rs` | Receive-window overload policy and bounded ATT transactions. |
 | `remote_gateway/` | Local read-only WebSocket gateway (Panino). |
 | `replay.rs` | Replay mode: listing recorded WAVs and feeding decode windows. |
