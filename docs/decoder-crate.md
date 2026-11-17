@@ -185,10 +185,12 @@ so run the dry-run first and stop at any surprise.
    `git submodule update --init` and confirm `git status` is clean.
 3. Run `cargo publish --dry-run -p pancetta-core -p pancetta-ft8`. Expect
    "Packaged 33 files" for `pancetta-core`, "Packaged 72 files" for
-   `pancetta-ft8`, two "aborting upload due to dry run" lines and 35
-   `warning: ignoring ...` lines. The warnings are expected: the `include`
-   whitelists leave tests, benches and most examples out of the packages. A
-   build-script panic naming `vendor/ft8_lib` means the submodule is missing.
+   `pancetta-ft8`, two "aborting upload due to dry run" lines and one
+   `warning: ignoring ...` line for each test, bench and example target the
+   `include` whitelists leave out of the packages. Each of those warnings ends
+   "is not included in the published package". Any warning beyond these is a
+   surprise. A build-script panic naming `vendor/ft8_lib` means the submodule
+   is missing.
 4. Tag the commit `pancetta-core-v<core version>` and
    `pancetta-ft8-v<ft8 version>`, and push both tags. The README's links pin
    the `pancetta-ft8-v<version>` tag, so they resolve only after it exists.

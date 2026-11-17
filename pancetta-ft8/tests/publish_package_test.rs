@@ -447,6 +447,45 @@ fn third_party_notices_carry_every_bundled_license() {
     );
 }
 
+/// The notice ships inside the `.crate`, so its account of what the package
+/// bundles from `vendor/ft8_lib/` must cover the real package list: every
+/// bundled directory is named, the bundled C files `build.rs` does not
+/// compile are named, and no C file it does compile is named among them.
+#[test]
+fn third_party_notices_describe_every_bundled_vendor_file() {
+    if !submodule_present() {
+        eprintln!(
+            "NOTE: pancetta-ft8/vendor/ft8_lib is not checked out; skipping the \
+             notice's vendor/ description check (CI's packaging step hard-fails here)"
+        );
+        return;
+    }
+    let notices = read(&manifest_dir().join("THIRD-PARTY-NOTICES.md"));
+    let build_rs = read(&manifest_dir().join("build.rs"));
+    for path in package_list("pancetta-ft8") {
+        let Some(rel) = path.strip_prefix("vendor/ft8_lib/") else {
+            continue;
+        };
+        if let Some((dir, _)) = rel.split_once('/') {
+            assert!(
+                notices.contains(&format!("`{dir}/`")),
+                "THIRD-PARTY-NOTICES.md does not name the bundled directory `{dir}/`"
+            );
+        }
+        if !rel.ends_with(".c") {
+            continue;
+        }
+        // build.rs names each compiled file as format!("{}/<rel>", ft8_dir).
+        let compiled = build_rs.contains(&format!("/{rel}\""));
+        assert_eq!(
+            notices.contains(&format!("`{rel}`")),
+            !compiled,
+            "THIRD-PARTY-NOTICES.md must name `{rel}` exactly when it ships but \
+             build.rs does not compile it (compiled: {compiled})"
+        );
+    }
+}
+
 #[test]
 fn publishing_runbook_names_the_two_package_commands() {
     let runbook = read(&repo_root().join("docs/decoder-crate.md"));
@@ -467,4 +506,62 @@ fn publishing_runbook_names_the_two_package_commands() {
         !runbook.contains("`publish = false` stays"),
         "docs/decoder-crate.md still says `publish = false` stays"
     );
+}
+
+/// The test, bench and example targets of `package` that its `include`
+/// whitelist leaves out. `cargo publish` prints one `warning: ignoring ...`
+/// line for each.
+fn targets_left_out_of_the_package(metadata: &serde_json::Value, name: &str) -> usize {
+    let pkg = package(metadata, name);
+    let root = Path::new(
+        pkg["manifest_path"]
+            .as_str()
+            .expect("manifest_path is a string"),
+    )
+    .parent()
+    .expect("a manifest has a parent directory")
+    .to_path_buf();
+    let shipped: BTreeSet<String> = package_list(name).into_iter().collect();
+    pkg["targets"]
+        .as_array()
+        .expect("package has targets")
+        .iter()
+        .filter(|t| {
+            t["kind"].as_array().is_some_and(|k| {
+                k.iter()
+                    .any(|k| k == "test" || k == "bench" || k == "example")
+            })
+        })
+        .filter(|t| {
+            let src = Path::new(t["src_path"].as_str().expect("src_path is a string"));
+            let rel = src.strip_prefix(&root).unwrap_or(src);
+            !shipped.contains(&rel.to_string_lossy().replace('\\', "/"))
+        })
+        .count()
+}
+
+/// Runbook step 3 is the operator's expected output for an irreversible
+/// publish. It must state the rule for the `warning: ignoring ...` lines, and
+/// any count it gives must equal the real number of left-out targets.
+#[test]
+fn publishing_runbook_expects_the_real_ignored_target_warnings() {
+    let runbook = read(&repo_root().join("docs/decoder-crate.md"));
+    assert!(
+        runbook.contains("is not included in the published package"),
+        "docs/decoder-crate.md must say which `warning: ignoring ...` lines the dry-run prints"
+    );
+    let metadata = workspace_metadata();
+    let left_out = targets_left_out_of_the_package(&metadata, "pancetta-core")
+        + targets_left_out_of_the_package(&metadata, "pancetta-ft8");
+    for (idx, _) in runbook.match_indices("`warning: ignoring") {
+        let before = runbook[..idx].trim_end();
+        let digits = &before[before.trim_end_matches(|c: char| c.is_ascii_digit()).len()..];
+        if let Ok(stated) = digits.parse::<usize>() {
+            assert_eq!(
+                stated, left_out,
+                "docs/decoder-crate.md expects {stated} `warning: ignoring` lines, but the \
+                 dry-run prints {left_out} (one per left-out test, bench and example target)"
+            );
+        }
+    }
 }

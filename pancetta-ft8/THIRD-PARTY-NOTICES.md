@@ -15,8 +15,10 @@ listed here.
 
 - **Project:** [`kgoba/ft8_lib`](https://github.com/kgoba/ft8_lib)
 - **Author:** Kārlis Goba (YL3JG)
-- **Bundled at:** `vendor/ft8_lib/` (only the sources `build.rs` compiles,
-  and the project's `LICENSE`)
+- **Bundled at:** `vendor/ft8_lib/`: the `ft8/`, `fft/` and `common/`
+  directories and the project's `LICENSE`. `build.rs` compiles every C file
+  there except `common/audio.c` and `common/wave.c`, which ship with their
+  headers but are not compiled.
 - **Used as:** the FT8/FT4 reference decoder, compiled by `build.rs` and
   called through FFI in `src/ft8_lib_ffi.rs`. Also a source of algorithms
   ported into the native Rust decoder and encoder, each marked by an
