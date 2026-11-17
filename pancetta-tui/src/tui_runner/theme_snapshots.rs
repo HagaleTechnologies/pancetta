@@ -166,6 +166,7 @@ fn decode(
         priority_score: None,
         priority_factors: None,
         is_own_tx: own,
+        external: false,
     }
 }
 

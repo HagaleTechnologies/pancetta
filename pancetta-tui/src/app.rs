@@ -224,6 +224,10 @@ pub struct DecodedMessageView {
     /// full exchange text is already in `message`. Test-default false.
     #[serde(default)]
     pub is_own_tx: bool,
+    /// `true` when this decode came from a same-host WSJT-X over UDP
+    /// (PAN-381), not pancetta's receiver. Display only. Test-default false.
+    #[serde(default)]
+    pub external: bool,
 }
 
 /// One entry in the last-10-QSOs history panel (#165).
@@ -455,6 +459,39 @@ pub enum SpotSource {
     Network,
     /// Seen locally AND in network
     Both,
+    /// Heard only through a same-host WSJT-X's UDP decodes (PAN-381)
+    External,
+    /// Heard through WSJT-X's UDP decodes AND in network (PAN-381)
+    ExternalNetwork,
+}
+
+impl SpotSource {
+    /// The source a row takes after a decode of its station arrives
+    /// (PAN-381). A native decode upgrades an external row to `Local` or
+    /// `Both`; an external decode never downgrades `Local` or `Both`.
+    pub fn after_decode(self, external: bool) -> SpotSource {
+        match (self, external) {
+            (SpotSource::Local, _) => SpotSource::Local,
+            (SpotSource::Both, _) => SpotSource::Both,
+            (SpotSource::External, false) => SpotSource::Local,
+            (SpotSource::External, true) => SpotSource::External,
+            (SpotSource::Network, false) => SpotSource::Both,
+            (SpotSource::Network, true) => SpotSource::ExternalNetwork,
+            (SpotSource::ExternalNetwork, false) => SpotSource::Both,
+            (SpotSource::ExternalNetwork, true) => SpotSource::ExternalNetwork,
+        }
+    }
+
+    /// The source a row takes after a network spot of its station merges
+    /// in (PAN-381): a locally heard row becomes `Both`, an externally
+    /// heard row `ExternalNetwork`.
+    pub fn after_network_spot(self) -> SpotSource {
+        match self {
+            SpotSource::Local | SpotSource::Both => SpotSource::Both,
+            SpotSource::External | SpotSource::ExternalNetwork => SpotSource::ExternalNetwork,
+            SpotSource::Network => SpotSource::Network,
+        }
+    }
 }
 
 impl std::fmt::Display for SpotSource {
@@ -463,6 +500,8 @@ impl std::fmt::Display for SpotSource {
             SpotSource::Local => write!(f, "RX"),
             SpotSource::Network => write!(f, "NET"),
             SpotSource::Both => write!(f, "RX+N"),
+            SpotSource::External => write!(f, "EXT"),
+            SpotSource::ExternalNetwork => write!(f, "EX+N"),
         }
     }
 }
@@ -2639,6 +2678,12 @@ impl App {
             // local decode actually knows about and leave network metadata
             // intact.
             match self.dx_stations.get_mut(call_sign) {
+                // PAN-381: pancetta's own receiver heard this station. A
+                // WSJT-X decode (possibly another receiver or band) leaves
+                // that row, and its call target, as pancetta heard it.
+                Some(entry)
+                    if message.external
+                        && matches!(entry.source, SpotSource::Local | SpotSource::Both) => {}
                 Some(entry) => {
                     entry.grid_square = grid_square;
                     entry.frequency = message.frequency;
@@ -2656,11 +2701,10 @@ impl App {
                     entry.slot_parity = message.slot_parity;
                     // A station previously known only from the network is
                     // now also heard locally → upgrade to Both. A
-                    // local-only station stays Local.
-                    entry.source = match entry.source {
-                        SpotSource::Network | SpotSource::Both => SpotSource::Both,
-                        SpotSource::Local => SpotSource::Local,
-                    };
+                    // local-only station stays Local. PAN-381: a native
+                    // decode upgrades an external row; an external decode
+                    // never downgrades a locally heard one.
+                    entry.source = entry.source.clone().after_decode(message.external);
                     // Keep the latest observation from each source, so ranks can fall.
                     entry.local_rank = Some(local_rank);
                     entry.refresh_priority_score();
@@ -2689,7 +2733,11 @@ impl App {
                             priority_score: local_rank.score,
                             local_rank: Some(local_rank),
                             network_rank: None,
-                            source: SpotSource::Local,
+                            source: if message.external {
+                                SpotSource::External
+                            } else {
+                                SpotSource::Local
+                            },
                             entity_name: None,
                             // PAN-284: resolved once, here; frames read it.
                             offline_entity: pancetta_core::dxcc::entity_for_callsign(call_sign),
@@ -3504,6 +3552,7 @@ impl App {
             priority_score: None,
             priority_factors: None,
             is_own_tx: true,
+            external: false,
         });
         // Same highlight-preservation bump `add_decoded_message` does
         // (app.rs:1598-1600) — a push_back makes a new row-0, so a
@@ -4554,7 +4603,12 @@ impl App {
                 .selected_dx_hunter_row()
                 .filter(|r| pancetta_core::callsign::callsigns_match(&r.call_sign, &callsign))
             {
-                if let (None, Some(rf)) = (row.audio_offset_hz, row.spot_rf_hz) {
+                // PAN-381: an `EX+N` row's offset came from a same-host
+                // WSJT-X, possibly on another dial; pancetta never heard it,
+                // so it is still called at the spot's own dial.
+                let heard_locally =
+                    row.audio_offset_hz.is_some() && row.source != SpotSource::ExternalNetwork;
+                if let (false, Some(rf)) = (heard_locally, row.spot_rf_hz) {
                     return Some(
                         match crate::spot_call::resolve_spot_call(
                             rf,
@@ -5226,10 +5280,9 @@ impl App {
                     pinned: false,
                 });
 
-            // If already exists from local decode, upgrade source
-            if entry.source == SpotSource::Local {
-                entry.source = SpotSource::Both;
-            }
+            // If already exists from a local (or PAN-381 external) decode,
+            // upgrade source
+            entry.source = entry.source.clone().after_network_spot();
             // Always update network metadata
             entry.rarity_tier = Some(spot.rarity_tier.clone());
             entry.reporter_count = Some(spot.reporter_count);
@@ -6385,6 +6438,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
         let score = app.calculate_dx_priority(&message).score;
         // ATNO + needed -> PriorityTier::Atno -> display range 5000-5999
@@ -6517,7 +6571,7 @@ mod tests {
         assert_eq!(App::home_session_state_path(), expected);
     }
 
-    fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
+    pub(super) fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
             timestamp: chrono::Utc::now(),
             frequency: 14_074_000.0,
@@ -6539,6 +6593,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -11763,3 +11818,7 @@ mod tests {
 #[cfg(test)]
 #[path = "app/tests/waterfall_panel_focus_tests.rs"]
 mod waterfall_panel_focus_tests;
+
+#[cfg(test)]
+#[path = "app/tests/external_decode_tests.rs"]
+mod external_decode_tests;
