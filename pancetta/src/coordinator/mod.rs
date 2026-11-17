@@ -1724,6 +1724,12 @@ pub struct ApplicationCoordinator {
     /// exiting. Read by `tx_hard_mute_reason`.
     pub(crate) audio_output_alive: Arc<AtomicBool>,
 
+    /// PAN-295 display-only: `true` while the output is stalled and the
+    /// real audio thread's next automatic output reopen was refused by its
+    /// rolling budget (3 per 10 min). Never a TX-gate input; stays `false`
+    /// under `--no-audio`, stub audio and replay.
+    pub(crate) audio_output_reopen_exhausted: Arc<AtomicBool>,
+
     /// Latched true when the configured audio INPUT device was not found and
     /// capture fell back to another device — RX-side mirror of
     /// `audio_output_default`. Drives a persistent TUI badge via the relay.
@@ -2634,6 +2640,7 @@ impl ApplicationCoordinator {
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
+            audio_output_reopen_exhausted: Arc::new(AtomicBool::new(false)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
