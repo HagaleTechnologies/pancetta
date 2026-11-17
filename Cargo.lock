@@ -3087,6 +3087,7 @@ dependencies = [
  "pancetta-tui",
  "parking_lot",
  "predicates",
+ "quick-xml",
  "ratatui",
  "reqwest",
  "rustfft",

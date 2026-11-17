@@ -40,7 +40,7 @@ fn coordinator_dir() -> PathBuf {
 /// One concise, accurate role per immediate coordinator module. Keys are
 /// names without the directory suffix. Keep in sync with the module docs.
 fn roles() -> BTreeMap<&'static str, &'static str> {
-    let entries: [(&str, &str); 48] = [
+    let entries: [(&str, &str); 49] = [
         ("adif_backup", "Changed startup ADIF snapshots and independent retention."),
         (
             "alerts",
@@ -94,6 +94,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
         (
             "mod",
             "ApplicationCoordinator: component lifecycle and startup sequencing.",
+        ),
+        (
+            "n1mm_udp",
+            "N1MM Logger+ contactinfo UDP broadcast of logged QSOs (PAN-382).",
         ),
         (
             "pipeline",
