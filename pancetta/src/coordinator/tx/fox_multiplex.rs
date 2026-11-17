@@ -29,7 +29,7 @@ impl FoxPart {
 ///
 /// Accepts exactly three whitespace tokens: the Hound, the Fox (optionally in
 /// `<...>`, brackets stripped), then `RR73` or a signed report `[+-]N` in
-/// -50..=49. Anything else (a CQ, an R-report, a 73, a grid) is `None`.
+/// -30..=32 (what a type 0.1 report field can carry). Anything else (a CQ, an R-report, a 73, a grid) is `None`.
 pub(crate) fn parse_fox_part(text: &str) -> Option<FoxPart> {
     let mut tokens = text.split_whitespace();
     let hound = tokens.next()?;
@@ -60,7 +60,10 @@ pub(crate) fn parse_fox_part(text: &str) -> Option<FoxPart> {
         return None;
     }
     let db: i32 = last.parse().ok()?;
-    if !(-50..=49).contains(&db) {
+    // The type 0.1 report field holds 2*r5 - 30 dB (r5 = 0..31), so only
+    // -30..=32 fits; anything else goes out as a standard frame rather than
+    // being clamped to a different report.
+    if !(-30..=32).contains(&db) {
         return None;
     }
     Some(FoxPart::Report {

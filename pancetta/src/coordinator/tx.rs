@@ -7837,8 +7837,29 @@ pub fn coalesce_transmit_requests(
 pub fn coalesce_transmit_requests_with_fox_priority(
     drained: Vec<CoalesceEntry>,
     max_concurrent_qsos: u32,
+    qso_is_live: impl FnMut(Option<&str>) -> bool,
+    is_fox_admitted: impl FnMut(&str) -> bool,
+) -> CoalesceOutcome {
+    coalesce_with_fox(
+        drained,
+        max_concurrent_qsos,
+        qso_is_live,
+        is_fox_admitted,
+        true,
+    )
+}
+
+/// [`coalesce_transmit_requests_with_fox_priority`] with the Fox-pair spacing
+/// switchable: `fox_spacing` is `true` only while the worker's protocol is
+/// FT8, the only protocol whose encode relaxes the modulator guard for Fox
+/// frames (PAN-386). With `false` every pair keeps
+/// [`pancetta_qso::MIN_TX_SEPARATION_HZ`], as before PAN-386.
+fn coalesce_with_fox(
+    drained: Vec<CoalesceEntry>,
+    max_concurrent_qsos: u32,
     mut qso_is_live: impl FnMut(Option<&str>) -> bool,
     mut is_fox_admitted: impl FnMut(&str) -> bool,
+    fox_spacing: bool,
 ) -> CoalesceOutcome {
     use std::collections::HashMap;
 
@@ -7981,7 +8002,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
             .is_some_and(|id| fox_keys.contains(&super::active_tx_qso_key(id)))
     };
     let min_separation = |a: &CoalesceEntry, b: &CoalesceEntry| {
-        if entry_is_fox(a) && entry_is_fox(b) {
+        if fox_spacing && entry_is_fox(a) && entry_is_fox(b) {
             pancetta_qso::FOX_MIN_SEPARATION_HZ
         } else {
             pancetta_qso::MIN_TX_SEPARATION_HZ
@@ -8103,6 +8124,8 @@ fn coalesce_entry_frame(entry: &CoalesceEntry) -> TxFrame {
 /// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
 /// truncated, so silent backlog reduction is always operator-visible.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn coalesce_backlog_into(
     head: MessageType,
     inbox: &TxInbox,
@@ -8110,6 +8133,42 @@ pub(crate) async fn coalesce_backlog_into(
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    audit_log: &pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pivots: Option<(
+        &mut std::collections::HashMap<String, (String, f64)>,
+        &mut PivotReplaced,
+    )>,
+) -> MessageType {
+    coalesce_backlog_into_with_fox_spacing(
+        head,
+        inbox,
+        message_bus,
+        active_tx_qsos,
+        fox_admitted_qsos,
+        max_concurrent_qsos,
+        true,
+        remote_tx_arm,
+        audit_log,
+        display_feed_enabled,
+        pivots,
+    )
+    .await
+}
+
+/// The worker's backlog coalescer. `fox_spacing` is `true` while the worker's
+/// protocol is FT8, so two Fox-admitted streams may sit on adjacent 60 Hz Fox
+/// slots (PAN-386); otherwise every pair keeps 75 Hz.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn coalesce_backlog_into_with_fox_spacing(
+    head: MessageType,
+    inbox: &TxInbox,
+    message_bus: &MessageBus,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    max_concurrent_qsos: u32,
+    fox_spacing: bool,
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -8381,11 +8440,12 @@ pub(crate) async fn coalesce_backlog_into(
         .read()
         .map(|s| s.clone())
         .unwrap_or_default();
-    let mut outcome = coalesce_transmit_requests_with_fox_priority(
+    let mut outcome = coalesce_with_fox(
         admitted,
         max_concurrent_qsos,
         |id| tx_qso_is_live(id, active_tx_qsos),
         |key| fox_admitted.contains(key),
+        fox_spacing,
     );
 
     if !outcome.is_noop() {
@@ -10039,7 +10099,7 @@ impl super::ApplicationCoordinator {
                                     continue;
                                 }
 
-                                message.message_type = coalesce_backlog_into(
+                                message.message_type = coalesce_backlog_into_with_fox_spacing(
                                     message.message_type,
                                     &inbox,
                                     &message_bus,
@@ -10053,6 +10113,8 @@ impl super::ApplicationCoordinator {
                                         &fox_mode,
                                         &fox_max_streams,
                                     ),
+                                    // PAN-386: Fox-pair spacing only in FT8.
+                                    active_protocol == pancetta_ft8::Protocol::Ft8,
                                     &remote_tx_arm,
                                     &audit_log,
                                     &display_feed_enabled,

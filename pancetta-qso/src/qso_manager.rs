@@ -3137,13 +3137,19 @@ impl QsoManager {
     /// marks a Hound after creation. A Fox stream is pinned to its slot (see
     /// `hound_switch_range_for`) and never drift-relatched, so a pending drift
     /// candidate is cleared here, with a state refresh only when one existed.
-    /// Returns `false` for an unknown, inactive or Hound QSO.
+    /// Returns `false` for an unknown or Hound QSO, or one that is neither
+    /// active nor `Completed`.
     pub async fn mark_fox_role(&self, qso_id: QsoId) -> bool {
         let mut qsos = self.qsos.write().await;
         let Some(progress) = qsos.get_mut(&qso_id) else {
             return false;
         };
-        if progress.metadata.hound || !progress.state.is_active() {
+        // A Hound answered at its RR73 step opens already `Completed` with
+        // the closing RR73 still to air; it is a Fox stream too, so its slot
+        // stays held through the completion grace.
+        let open_or_closing =
+            progress.state.is_active() || matches!(progress.state, QsoState::Completed { .. });
+        if progress.metadata.hound || !open_or_closing {
             return false;
         }
         progress.metadata.fox = true;

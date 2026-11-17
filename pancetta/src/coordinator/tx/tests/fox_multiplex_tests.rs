@@ -33,9 +33,7 @@ fn encode(
     let mut enc = Ft8Encoder::new();
     let params = ProtocolParams::from_protocol(protocol);
     let is_fox = fox_stream_predicate(&set);
-    let outcome =
-        encode_and_modulate_multi_tx_with_fox(&mut enc, protocol, &params, items, &is_fox);
-    outcome
+    encode_and_modulate_multi_tx_with_fox(&mut enc, protocol, &params, items, &is_fox)
 }
 
 /// Decode a bundle with a Hound context for `fox`, through both production
@@ -59,7 +57,7 @@ fn decode_both(samples: &[f32], fox: &str) -> [Vec<(f64, String)>; 2] {
     [native, reference]
 }
 
-fn find_near<'a>(frames: &'a [(f64, String)], hz: f64, tol: f64) -> Vec<&'a str> {
+fn find_near(frames: &[(f64, String)], hz: f64, tol: f64) -> Vec<&str> {
     frames
         .iter()
         .filter(|(f, _)| (f - hz).abs() <= tol)
@@ -99,6 +97,9 @@ fn parse_fox_part_reads_rr73_and_report_texts() {
         "W9XYZ KH7Z FN31",
         "W9XYZ KH7Z -8 extra",
         "W9XYZ KH7Z",
+        // Outside the type 0.1 report field (-30..=32).
+        "W9XYZ KH7Z -31",
+        "W9XYZ KH7Z +33",
     ] {
         assert_eq!(parse_fox_part(text), None, "{text}");
     }
@@ -367,6 +368,23 @@ fn coalescer_keeps_fox_streams_60_hz_apart() {
     );
     assert_eq!(retained_ids(&outcome), vec!["a", "b", "c"]);
     assert_eq!(outcome.freq_excluded, 0);
+}
+
+/// Outside FT8 the worker coalesces with Fox spacing off, so even two
+/// Fox-admitted streams keep 75 Hz (the FT4/FT2 encode never relaxes the
+/// modulator guard).
+#[test]
+fn coalescer_keeps_75_hz_between_fox_streams_outside_ft8() {
+    let fox = fox_set(&["a", "b", "c"]);
+    let outcome = coalesce_with_fox(
+        vec![entry("a", 300.0), entry("b", 360.0), entry("c", 420.0)],
+        MAX_RETAINED_TX_STREAMS as u32,
+        |_| true,
+        |key| fox.contains(key),
+        false,
+    );
+    assert_eq!(retained_ids(&outcome), vec!["a", "c"]);
+    assert_eq!(outcome.freq_excluded, 1);
 }
 
 #[test]
