@@ -7,6 +7,74 @@ use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// The TUI colour palette selected by `[ui] theme` and
+/// `[ui.accessibility] high_contrast` (PAN-387).
+///
+/// The serde form keeps the Rust variant names (`"Dark"`, `"Light"`,
+/// `"HighContrast"`), so the TUI's own on-disk config keeps its wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ThemeName {
+    /// Today's dark palette (the default).
+    #[default]
+    Dark,
+    /// Dark text on a white page.
+    Light,
+    /// Named ANSI-16 colours at 4.5:1 or better, distinct style per meaning.
+    HighContrast,
+}
+
+impl ThemeName {
+    /// Every theme, in display order.
+    pub const ALL: [ThemeName; 3] = [ThemeName::Dark, ThemeName::Light, ThemeName::HighContrast];
+
+    /// The canonical config label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Dark => "dark",
+            ThemeName::Light => "light",
+            ThemeName::HighContrast => "high-contrast",
+        }
+    }
+
+    /// Parse a `[ui] theme` label. Trimmed and case-insensitive; empty and
+    /// `default` mean Dark; `high-contrast`, `high_contrast` and
+    /// `highcontrast` are the same. Unknown labels give `None`.
+    pub fn from_label(label: &str) -> Option<ThemeName> {
+        // Only the documented spellings: a typo such as `da-rk` must warn,
+        // not load silently.
+        match label.trim().to_ascii_lowercase().as_str() {
+            "" | "default" | "dark" => Some(ThemeName::Dark),
+            "light" => Some(ThemeName::Light),
+            "high-contrast" | "high_contrast" | "highcontrast" => Some(ThemeName::HighContrast),
+            _ => None,
+        }
+    }
+}
+
+impl UiConfig {
+    /// The theme the TUI should draw with: `accessibility.high_contrast`
+    /// wins, then the `theme` label, then Dark for an unknown label.
+    pub fn theme_name(&self) -> ThemeName {
+        if self.accessibility.high_contrast {
+            return ThemeName::HighContrast;
+        }
+        ThemeName::from_label(&self.theme).unwrap_or_default()
+    }
+
+    /// The load warning for an unknown `theme` label, `None` when the label
+    /// is accepted.
+    pub fn theme_warning(&self) -> Option<String> {
+        match ThemeName::from_label(&self.theme) {
+            Some(_) => None,
+            None => Some(format!(
+                "Unknown ui.theme \"{}\"; using the {} theme. Valid values: dark, light, high-contrast.",
+                self.theme,
+                self.theme_name().as_str()
+            )),
+        }
+    }
+}
+
 /// User interface configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: omitted fields fall back to defaults rather
@@ -49,9 +117,111 @@ pub struct UiConfig {
     /// Waterfall and spectrum display settings
     pub spectrum: SpectrumDisplayConfig,
 
+    /// `[ui.waterfall]`: the Monitor-view waterfall palette and display gain
+    /// (PAN-389). This is the live table the TUI reads; it is distinct from
+    /// the inert `[ui.spectrum.waterfall]` schema.
+    pub waterfall: WaterfallDisplayConfig,
+
     /// Custom UI components
     #[serde(default)]
     pub custom_widgets: HashMap<String, WidgetConfig>,
+}
+
+/// Lowest accepted `[ui.waterfall] gain_db` (PAN-389).
+pub const WATERFALL_GAIN_DB_MIN: f32 = -12.0;
+
+/// Highest accepted `[ui.waterfall] gain_db` (PAN-389).
+pub const WATERFALL_GAIN_DB_MAX: f32 = 12.0;
+
+/// Colour palette for the TUI waterfall (`[ui.waterfall] palette`, PAN-389).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaterfallPalette {
+    /// Grayscale ramp, the historical look (default).
+    #[default]
+    Classic,
+    /// Four blue steps.
+    Spectrum,
+    /// Three-step heat ramp.
+    Thermal,
+    /// Perceptually uniform viridis ramp.
+    Viridis,
+}
+
+impl WaterfallPalette {
+    /// Every palette, in cycle order.
+    pub const ALL: [WaterfallPalette; 4] = [
+        WaterfallPalette::Classic,
+        WaterfallPalette::Spectrum,
+        WaterfallPalette::Thermal,
+        WaterfallPalette::Viridis,
+    ];
+
+    /// The config / session-file label (`classic`, `spectrum`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaterfallPalette::Classic => "classic",
+            WaterfallPalette::Spectrum => "spectrum",
+            WaterfallPalette::Thermal => "thermal",
+            WaterfallPalette::Viridis => "viridis",
+        }
+    }
+
+    /// Parse a label written by [`as_str`](Self::as_str).
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == label)
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|p| *p == self)
+            .unwrap_or_default()
+    }
+
+    /// The next palette in cycle order, wrapping.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    /// The previous palette in cycle order, wrapping.
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// `[ui.waterfall]`: palette and display gain for the TUI waterfall (PAN-389).
+///
+/// Gain is applied at render time only: positive values brighten, showing the
+/// noise floor `gain_db` dB higher on the waterfall's 12 dB colour scale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaterfallDisplayConfig {
+    /// Colour palette (`classic`, `spectrum`, `thermal`, `viridis`).
+    pub palette: WaterfallPalette,
+
+    /// Display gain in dB, from -12.0 to 12.0. Positive brightens.
+    pub gain_db: f32,
+}
+
+impl Default for WaterfallDisplayConfig {
+    fn default() -> Self {
+        Self {
+            palette: WaterfallPalette::Classic,
+            gain_db: 0.0,
+        }
+    }
+}
+
+/// Format a waterfall gain for display: `0 dB`, `+6 dB`, `-3 dB`, `+2.5 dB`.
+pub fn format_gain_db(db: f32) -> String {
+    if db.abs() < 0.05 {
+        "0 dB".to_string()
+    } else if (db - db.round()).abs() < 0.05 {
+        format!("{:+.0} dB", db.round())
+    } else {
+        format!("{db:+.1} dB")
+    }
 }
 
 /// Window management configuration
@@ -1363,6 +1533,7 @@ impl Default for UiConfig {
             status_bar: StatusBarConfig::default(),
             logging: LoggingDisplayConfig::default(),
             spectrum: SpectrumDisplayConfig::default(),
+            waterfall: WaterfallDisplayConfig::default(),
             custom_widgets: HashMap::new(),
         }
     }
@@ -1923,6 +2094,15 @@ impl ConfigSection for UiConfig {
             });
         }
 
+        // PAN-389: the waterfall display gain must be finite and within ±12 dB.
+        let gain = self.waterfall.gain_db;
+        if !gain.is_finite() || !(WATERFALL_GAIN_DB_MIN..=WATERFALL_GAIN_DB_MAX).contains(&gain) {
+            return Err(ConfigError::InvalidValue {
+                field: "ui.waterfall.gain_db".to_string(),
+                value: gain.to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -1946,15 +2126,143 @@ impl ConfigSection for UiConfig {
         self.typography = other.typography;
         self.colors = other.colors;
         self.panels = other.panels;
+        // PAN-387: `high_contrast` is an accessibility need and is read at
+        // runtime. A higher layer that never mentions it (the environment
+        // layer, or a file with no `[ui.accessibility]`) carries the serde
+        // default `false`, so taking `accessibility` wholesale would drop a
+        // lower layer's `true`. Once any layer asks for it, keep it.
+        let high_contrast = self.accessibility.high_contrast || other.accessibility.high_contrast;
         self.accessibility = other.accessibility;
+        self.accessibility.high_contrast = high_contrast;
         self.animations = other.animations;
         self.toolbars = other.toolbars;
         self.status_bar = other.status_bar;
         self.logging = other.logging;
         self.spectrum = other.spectrum;
+        self.waterfall = other.waterfall;
 
         // Merge custom widgets
         self.custom_widgets.extend(other.custom_widgets);
+    }
+}
+
+#[cfg(test)]
+mod pan387_theme_tests {
+    use super::*;
+
+    #[test]
+    fn theme_name_from_label_accepts_documented_spellings() {
+        for label in ["", "default", "dark", " Dark ", "DARK"] {
+            assert_eq!(
+                ThemeName::from_label(label),
+                Some(ThemeName::Dark),
+                "{label:?}"
+            );
+        }
+        for label in ["light", "LIGHT", " Light"] {
+            assert_eq!(
+                ThemeName::from_label(label),
+                Some(ThemeName::Light),
+                "{label:?}"
+            );
+        }
+        for label in [
+            "high-contrast",
+            "high_contrast",
+            "highcontrast",
+            "HighContrast",
+        ] {
+            assert_eq!(
+                ThemeName::from_label(label),
+                Some(ThemeName::HighContrast),
+                "{label:?}"
+            );
+        }
+        assert_eq!(ThemeName::from_label("solarized"), None);
+        for typo in ["da-rk", "l_ight", "high contrast", "high--contrast"] {
+            assert_eq!(ThemeName::from_label(typo), None, "{typo:?}");
+        }
+        for name in ThemeName::ALL {
+            assert_eq!(ThemeName::from_label(name.as_str()), Some(name));
+        }
+    }
+
+    #[test]
+    fn high_contrast_flag_selects_high_contrast() {
+        for label in ["light", "solarized", "dark"] {
+            let mut ui = UiConfig {
+                theme: label.to_string(),
+                ..UiConfig::default()
+            };
+            ui.accessibility.high_contrast = true;
+            assert_eq!(ui.theme_name(), ThemeName::HighContrast, "{label}");
+        }
+        let ui = UiConfig {
+            theme: "light".to_string(),
+            ..UiConfig::default()
+        };
+        assert_eq!(ui.theme_name(), ThemeName::Light);
+        assert_eq!(UiConfig::default().theme_name(), ThemeName::Dark);
+    }
+
+    #[test]
+    fn merge_keeps_a_lower_layer_high_contrast_request() {
+        let mut lower = UiConfig::default();
+        lower.accessibility.high_contrast = true;
+        lower.merge_with(UiConfig::default());
+        assert!(lower.accessibility.high_contrast);
+        assert_eq!(lower.theme_name(), ThemeName::HighContrast);
+
+        let mut base = UiConfig::default();
+        let mut upper = UiConfig::default();
+        upper.accessibility.high_contrast = true;
+        base.merge_with(upper);
+        assert!(base.accessibility.high_contrast);
+    }
+
+    #[test]
+    fn theme_warning_names_the_palette_actually_used() {
+        let mut ui = UiConfig {
+            theme: "solarized".to_string(),
+            ..UiConfig::default()
+        };
+        ui.accessibility.high_contrast = true;
+        assert_eq!(
+            ui.theme_warning().as_deref(),
+            Some(
+                "Unknown ui.theme \"solarized\"; using the high-contrast theme. Valid values: dark, light, high-contrast."
+            )
+        );
+    }
+
+    #[test]
+    fn theme_warning_names_unknown_values_only() {
+        let ui = UiConfig {
+            theme: "solarized".to_string(),
+            ..UiConfig::default()
+        };
+        assert_eq!(
+            ui.theme_warning().as_deref(),
+            Some(
+                "Unknown ui.theme \"solarized\"; using the dark theme. Valid values: dark, light, high-contrast."
+            )
+        );
+        assert_eq!(ui.theme_name(), ThemeName::Dark);
+        for label in [
+            "",
+            "default",
+            "dark",
+            "light",
+            "high-contrast",
+            "high_contrast",
+            "HighContrast",
+        ] {
+            let ui = UiConfig {
+                theme: label.to_string(),
+                ..UiConfig::default()
+            };
+            assert_eq!(ui.theme_warning(), None, "{label:?}");
+        }
     }
 }
 
@@ -2013,3 +2321,7 @@ mod tests {
         assert_eq!(config.colors.status.transmitting, "#ef4444");
     }
 }
+
+#[cfg(test)]
+#[path = "ui/tests/waterfall_palette_tests.rs"]
+mod waterfall_palette_tests;

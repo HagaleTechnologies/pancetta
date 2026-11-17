@@ -1,8 +1,10 @@
 //! DSP component startup.
 //!
 //! Reads 48 kHz audio batches from the audio relay, decimates to 12 kHz
-//! mono via simple subsampling (FT8 sits well below the 6 kHz Nyquist),
-//! and emits FT8-aligned 12.64-second windows aligned to UTC slot
+//! mono — by simple subsampling, or (PAN-320, `[audio]
+//! decimation_antialias_filter = true` at 48 kHz) by the unity-gain
+//! 31-tap FIR in `pancetta-dsp` — and emits FT8-aligned 12.64-second
+//! windows aligned to UTC slot
 //! boundaries (:00/:15/:30/:45 + 13 s for headroom).
 //!
 //! In parallel, computes a 1 Hz waterfall via a 2048-point Hann-windowed
@@ -39,6 +41,12 @@ const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 /// so the configured input rate must be a whole multiple of this.
 pub(crate) const DSP_TARGET_SAMPLE_RATE_HZ: u32 = 12_000;
 
+/// dB span of the live waterfall rows: each row value is the signal above the
+/// per-bin median noise floor over this many dB, clamped to 0..1. The TUI
+/// waterfall's display gain (PAN-389) uses the same span
+/// (`pancetta_tui::widgets::WATERFALL_DB_SPAN`); a test pins the two equal.
+pub(crate) const NOISE_FLOOR_DB_SCALE: f32 = 12.0;
+
 /// Whether `rate` can drive the DSP decimation path in
 /// [`start_dsp_pipeline`].
 ///
@@ -67,6 +75,215 @@ pub(crate) fn unsupported_input_rate_message(rate: u32) -> String {
         "Audio sample rate {rate} Hz is not evenly divisible by {DSP_TARGET_SAMPLE_RATE_HZ} Hz. \
          Of the [audio] sample_rate values pancetta accepts, use 48000 (the default), 96000, or 192000."
     )
+}
+
+/// The worker-owned 48 kHz→12 kHz decimation stage (PAN-320).
+///
+/// `Subsample` is the historical path, byte-for-byte: increment a counter
+/// per input sample and keep every `factor`-th one (indices 3, 7, 11, … at
+/// 48 kHz). `Fir31` is the opt-in unity-gain 31-tap FIR anti-alias
+/// decimator (`pancetta_dsp::decimation`), selected only when
+/// `[audio] decimation_antialias_filter` is true *and* the input rate is
+/// exactly 48 kHz — the FIR is designed for that rate; 96/192 kHz keep the
+/// subsample loop unchanged.
+///
+/// One type owns both selection and reset so the worker loop and the tests
+/// exercise the same code (no duplicate test-only decimation loop). One
+/// worker owns one stage, so the size asymmetry between the arms does not
+/// matter.
+#[allow(clippy::large_enum_variant)]
+enum DecimationStage {
+    Subsample { counter: usize, factor: usize },
+    Fir31(pancetta_dsp::decimation::DecimationFilter, PreFilterPeaks),
+}
+
+/// Pre-filter peak per FIR output sample, for the receive-overload guard
+/// (Codex P1 on #654).
+///
+/// The guard must judge the audio the codec actually captured, but the FIR
+/// suppresses out-of-band energy: a near-full-scale 9 kHz tone overloads
+/// the input yet comes out ~47 dB down. So beside each FIR output `k` we
+/// record `max |x|` over the four input samples it consumed (absolute
+/// indices `4k..=4k+3`, the same grouping the filter uses for its newest
+/// input), or NaN if any of them was non-finite. `peaks` stays index-aligned
+/// with the caller's capture buffer: both grow only through
+/// [`DecimationStage::process`], and every other buffer mutation is a full
+/// clear or a front drain, so the buffer's tail always matches the tail of
+/// `peaks` and [`PreFilterPeaks::align`] restores the alignment by
+/// trimming the front.
+#[derive(Default)]
+struct PreFilterPeaks {
+    phase: usize,
+    acc: f32,
+    peaks: Vec<f32>,
+}
+
+impl PreFilterPeaks {
+    fn push_inputs(&mut self, mono: &[f32]) {
+        for &x in mono {
+            let a = if x.is_finite() { x.abs() } else { f32::NAN };
+            // NaN is sticky for the group so the guard still sees it.
+            self.acc = if self.acc.is_nan() || a.is_nan() {
+                f32::NAN
+            } else {
+                self.acc.max(a)
+            };
+            self.phase += 1;
+            if self.phase == 4 {
+                self.peaks.push(self.acc);
+                self.phase = 0;
+                self.acc = 0.0;
+            }
+        }
+    }
+
+    fn align(&mut self, buffer_len: usize) {
+        if self.peaks.len() > buffer_len {
+            let cut = self.peaks.len() - buffer_len;
+            self.peaks.drain(..cut);
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl DecimationStage {
+    /// Resolve the configured stage for `input_rate`. Must be called only
+    /// with a rate [`dsp_supports_input_rate`] accepts.
+    fn new(input_rate: u32, antialias_filter: bool) -> Self {
+        if antialias_filter && input_rate == 48_000 {
+            Self::Fir31(
+                pancetta_dsp::decimation::DecimationFilter::new(),
+                PreFilterPeaks::default(),
+            )
+        } else {
+            let factor = (input_rate / DSP_TARGET_SAMPLE_RATE_HZ) as usize;
+            Self::Subsample { counter: 0, factor }
+        }
+    }
+
+    /// Append this batch's decimated samples to `out`. The subsample arm
+    /// keeps the exact historical loop (counter starts at 0, pushes when it
+    /// reaches the factor, retained indices factor−1, 2·factor−1, …).
+    fn process(&mut self, mono: &[f32], out: &mut Vec<f32>) {
+        match self {
+            Self::Subsample { counter, factor } => {
+                for &sample in mono {
+                    *counter += 1;
+                    if *counter >= *factor {
+                        *counter = 0;
+                        out.push(sample);
+                    }
+                }
+            }
+            Self::Fir31(fir, pre) => {
+                fir.process(mono, out);
+                pre.push_inputs(mono);
+                // `out` is the capture buffer; keep `peaks` aligned to it
+                // (and bounded) on every batch.
+                pre.align(out.len());
+            }
+        }
+    }
+
+    /// Drop all history and phase: the next batch starts a fresh stream.
+    /// Joins every destructive `ft8_buffer` flush (see
+    /// [`destructive_capture_flush`]); ordinary overlap retention between
+    /// windows is *not* a reset.
+    fn reset(&mut self) {
+        match self {
+            Self::Subsample { counter, .. } => *counter = 0,
+            Self::Fir31(fir, pre) => {
+                fir.reset();
+                pre.reset();
+            }
+        }
+    }
+
+    /// Startup-line label for the selected path.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Subsample { .. } => "subsample",
+            Self::Fir31(..) => "fir31",
+        }
+    }
+
+    /// Whether the FIR path is active (window-anchor compensation applies).
+    fn is_fir31(&self) -> bool {
+        matches!(self, Self::Fir31(..))
+    }
+
+    /// Peak (dBFS) the receive-overload guard measures for `window`,
+    /// which is `buffer[start..start + window.len()]` of a capture buffer
+    /// of `buffer_len` samples.
+    ///
+    /// Subsample: the window itself, exactly as before. FIR: the larger of
+    /// the window's peak and the pre-filter input peak over the same
+    /// samples, so anti-alias filtering can never hide an overload from
+    /// the ATT protection. A non-finite sample on either side yields
+    /// `None`, as [`raw_peak_dbfs`](super::receive_overload::raw_peak_dbfs)
+    /// does.
+    fn overload_peak_dbfs(
+        &mut self,
+        buffer_len: usize,
+        window: &[f32],
+        start: usize,
+    ) -> Option<f64> {
+        use super::receive_overload::raw_peak_dbfs;
+        let filtered = raw_peak_dbfs(window);
+        let Self::Fir31(_, pre) = self else {
+            return filtered;
+        };
+        pre.align(buffer_len);
+        let end = start + window.len();
+        if pre.peaks.len() != buffer_len || end > buffer_len {
+            // Alignment invariant broken (not expected): fall back to the
+            // filtered peak rather than mis-attributing samples.
+            return filtered;
+        }
+        let pre_peak = raw_peak_dbfs(&pre.peaks[start..end])?;
+        filtered.map(|f| f.max(pre_peak))
+    }
+}
+
+/// The one destructive-flush action, shared by every cause that clears the
+/// capture buffer mid-stream (gain/capture-epoch change, dial change, mode
+/// change, forward wall-clock jump; supervisor restart rebuilds the whole
+/// worker). Clearing the buffer without resetting the decimation stage
+/// would splice the pre-flush filter history (or subsample phase) onto
+/// post-flush audio — a discontinuity inside the "fresh" stream.
+fn destructive_capture_flush(
+    ft8_buffer: &mut Vec<f32>,
+    last_live_wf_samples: &mut usize,
+    stage: &mut DecimationStage,
+) {
+    ft8_buffer.clear();
+    *last_live_wf_samples = 0;
+    stage.reset();
+}
+
+/// The wall-clock instant the buffer's newest sample corresponds to, for
+/// [`boundary_anchored_slice`] (PAN-320).
+///
+/// The subsample path emits a sample the instant it arrives, so its newest
+/// output is `now`. The causal FIR's newest output averages a window
+/// centered `delay_input_samples()` (15) input samples — 312.5 µs — in the
+/// past, so the buffer's *effective* end is that much earlier. Compensating
+/// the slice's time anchor (not the slot scheduler, which stays on real
+/// `now`) keeps the window's slot-relative coordinates aligned across both
+/// paths to within one output sample.
+fn effective_buffer_end(
+    now: chrono::DateTime<chrono::Utc>,
+    stage: &DecimationStage,
+) -> chrono::DateTime<chrono::Utc> {
+    if stage.is_fir31() {
+        // 15 / 48000 s = 312.5 µs = 312_500 ns, exactly representable.
+        now - chrono::Duration::nanoseconds(312_500)
+    } else {
+        now
+    }
 }
 
 /// Peak absolute amplitude of an f32 audio window (0.0 if empty).
@@ -652,6 +869,11 @@ impl super::ApplicationCoordinator {
         let gain_safety = self.message_bus.receive_gain.clone();
         let input_rate = config.audio.sample_rate;
         let _input_channels = config.audio.input_channels as u16;
+        // PAN-320: the anti-alias decimation flag is resolved once at DSP
+        // construction — restart required; the config file watcher does not
+        // live-apply it (a mid-stream filter swap would splice two impulse
+        // responses into one window).
+        let antialias_filter = config.audio.decimation_antialias_filter;
         // Derive the active protocol's DSP timing once at startup. mode=FT8
         // yields exactly the historical 12.64s window / 13s decode phase /
         // 15×rate overlap (asserted by `derive_dsp_timing_ft8_byte_identical`).
@@ -733,7 +955,17 @@ impl super::ApplicationCoordinator {
             // to detect a runtime switch.
             let mut cached_mode_u8: u8 = seed_mode_u8;
 
-            let mut decimate_counter: usize = 0;
+            // PAN-320: the decimation stage (subsample by default; the
+            // opt-in 31-tap FIR at 48 kHz). Resets with every destructive
+            // buffer flush below — see `destructive_capture_flush`.
+            let mut decimate_stage = DecimationStage::new(input_rate, antialias_filter);
+            if antialias_filter && input_rate != 48_000 {
+                warn!(
+                    "DSP: decimation_antialias_filter applies only at 48000Hz; \
+                     using subsample at {}Hz",
+                    input_rate
+                );
+            }
 
             let mut ft8_buffer: Vec<f32> = Vec::with_capacity(ft8_window_samples * 2);
             let mut window_count: u64 = 0;
@@ -795,15 +1027,18 @@ impl super::ApplicationCoordinator {
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
             const BIN_HISTORY_LEN: usize = 60;
-            const NOISE_FLOOR_DB_SCALE: f32 = 12.0;
             const MIN_HISTORY_FOR_FLOOR: usize = 5;
             let mut bin_history: Vec<std::collections::VecDeque<f32>> = Vec::new();
             let mut live_wf_planner = rustfft::FftPlanner::<f32>::new();
             let live_wf_fft = live_wf_planner.plan_fft_forward(2048);
 
             info!(
-                "DSP: {}Hz -> {}Hz mono (decimate {}:1, subsample), window={}",
-                input_rate, FT8_SAMPLE_RATE, decimation_factor, ft8_window_samples
+                "DSP: {}Hz -> {}Hz mono (decimate {}:1, {}), window={}",
+                input_rate,
+                FT8_SAMPLE_RATE,
+                decimation_factor,
+                decimate_stage.label(),
+                ft8_window_samples
             );
 
             // Continuously capture audio -- don't wait for boundaries.
@@ -845,8 +1080,11 @@ impl super::ApplicationCoordinator {
                             receive_gain_epoch.load(Ordering::Acquire),
                             &mut last_gain_epoch,
                         ) {
-                            ft8_buffer.clear();
-                            last_live_wf_samples = 0;
+                            destructive_capture_flush(
+                                &mut ft8_buffer,
+                                &mut last_live_wf_samples,
+                                &mut decimate_stage,
+                            );
                             if let Some(raw) = raw_capture.as_mut() {
                                 raw.abandon(super::raw_capture::AbandonReason::GainChange);
                             }
@@ -908,19 +1146,22 @@ impl super::ApplicationCoordinator {
                             );
                         }
 
-                        // Decimate by taking every Nth sample (simple subsampling).
-                        // FT8 signals occupy 0–3 kHz, well below the 6 kHz Nyquist
-                        // of the 12 kHz target rate, so anti-alias filtering is
-                        // unnecessary and the previous 65-tap FIR was attenuating
-                        // signals (ft8_lib decoded 86 from naive decimation vs 1
-                        // from the FIR output on the same live audio).
-                        for &sample in mono.iter() {
-                            decimate_counter += 1;
-                            if decimate_counter >= decimation_factor {
-                                decimate_counter = 0;
-                                ft8_buffer.push(sample);
-                            }
-                        }
+                        // Decimate 48 kHz -> 12 kHz (PAN-320). The default
+                        // keeps the historical every-Nth-sample subsampling
+                        // (retained indices 3, 7, 11, …); with
+                        // `[audio] decimation_antialias_filter = true` at
+                        // 48 kHz the unity-gain 31-tap FIR in
+                        // `pancetta-dsp` runs instead, suppressing the
+                        // out-of-band energy (> 6 kHz) that subsampling
+                        // folds into the decode band. The historical 65-tap
+                        // FIR this loop once replaced was mis-specified (it
+                        // attenuated in-band signals, 86 vs 1 decodes); the
+                        // shipped filter's passband is pinned flat to 4 kHz
+                        // by `pancetta-dsp` tests, and the shipped default
+                        // stays `subsample` unless the recorded station A/B
+                        // (`docs/measurements/PAN-320-decimation.md`) shows
+                        // the FIR strictly ahead on merged decodes.
+                        decimate_stage.process(&mono, &mut ft8_buffer);
 
                         // Dial-change guard (PAN-70): if the dial moved since
                         // the audio now buffered was captured — across a band
@@ -939,6 +1180,10 @@ impl super::ApplicationCoordinator {
                             &mut last_live_wf_samples,
                             &mut bin_history,
                         ) {
+                            // The dial guard cleared the buffer above; the
+                            // decimation stage's history/phase went with it
+                            // (PAN-320).
+                            decimate_stage.reset();
                             raw_flush = true;
                             if let Ok(mut registry) = sweep_capture.lock() {
                                 registry.invalidate_all("dial changed during capture");
@@ -996,8 +1241,11 @@ impl super::ApplicationCoordinator {
                             dsp_decode_phase = new_timing.decode_phase;
                             dsp_overlap_samples = new_timing.overlap_samples;
                             dsp_slot_ns = new_timing.slot_ns;
-                            ft8_buffer.clear();
-                            last_live_wf_samples = 0;
+                            destructive_capture_flush(
+                                &mut ft8_buffer,
+                                &mut last_live_wf_samples,
+                                &mut decimate_stage,
+                            );
                             bin_history.clear();
                             next_window_time = pancetta_core::slot::next_phase_with_period(
                                 chrono::Utc::now(),
@@ -1168,8 +1416,11 @@ impl super::ApplicationCoordinator {
                                 // (above): the buffer spans the jump.
                                 // `bin_history` (the waterfall noise floor) is
                                 // kept — the band did not change.
-                                ft8_buffer.clear();
-                                last_live_wf_samples = 0;
+                                destructive_capture_flush(
+                                    &mut ft8_buffer,
+                                    &mut last_live_wf_samples,
+                                    &mut decimate_stage,
+                                );
                             }
                             warn!(
                                 target: "pancetta::slot_clock",
@@ -1181,9 +1432,17 @@ impl super::ApplicationCoordinator {
                             // is the decode-phase instant, `decode_phase` past the
                             // boundary (FT8 → :13/:28/:43/:58; FT4 → :6.5 cadence).
                             let slot_boundary = next_window_time - dsp_decode_phase;
+                            // PAN-320: the FIR path's newest output sample
+                            // reflects input ~312.5 µs in the past, so the
+                            // buffer's effective end (what
+                            // `boundary_anchored_slice` treats as `now`) is
+                            // compensated; the scheduler, the emit trigger
+                            // and every other consumer of `now` stay on the
+                            // real clock.
+                            let emit_now = effective_buffer_end(now, &decimate_stage);
                             let (start, send_len) = boundary_anchored_slice(
                                 ft8_buffer.len(),
-                                now,
+                                emit_now,
                                 slot_boundary,
                                 FT8_SAMPLE_RATE,
                                 ft8_window_samples,
@@ -1192,7 +1451,7 @@ impl super::ApplicationCoordinator {
                             let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
                             if overload_enabled {
                                 use super::receive_overload::{
-                                    raw_peak_dbfs, Identity, Measurement, WindowValidity,
+                                    Identity, Measurement, WindowValidity,
                                 };
                                 let capture_start = slot_boundary.timestamp_millis()
                                     - (window_lead_secs * 1000.0) as i64;
@@ -1221,7 +1480,14 @@ impl super::ApplicationCoordinator {
                                         capture_epoch: overload_capture_epoch
                                             .load(Ordering::Acquire),
                                     },
-                                    peak_dbfs: raw_peak_dbfs(&window),
+                                    // Pre-filter peak on the FIR path (Codex
+                                    // P1 on #654); the window itself on the
+                                    // subsample path, unchanged.
+                                    peak_dbfs: decimate_stage.overload_peak_dbfs(
+                                        ft8_buffer.len(),
+                                        &window,
+                                        start,
+                                    ),
                                     validity,
                                 };
                                 if overload_tx.try_send(measurement).is_err() {
@@ -1250,8 +1516,11 @@ impl super::ApplicationCoordinator {
                                 receive_gain_epoch.load(Ordering::Acquire),
                                 &mut last_gain_epoch,
                             ) {
-                                ft8_buffer.clear();
-                                last_live_wf_samples = 0;
+                                destructive_capture_flush(
+                                    &mut ft8_buffer,
+                                    &mut last_live_wf_samples,
+                                    &mut decimate_stage,
+                                );
                                 if let Some(raw) = raw_capture.as_mut() {
                                     raw.abandon(super::raw_capture::AbandonReason::GainChange);
                                 }
@@ -3088,3 +3357,282 @@ mod wav_recording_gate_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod decimation_stage_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// AC3: `false` preserves the original samples and indices at every
+    /// supported integer input-rate multiple; `true` selects the FIR only
+    /// at 48 kHz. The legacy selection (counter starts 0, retained indices
+    /// factor−1, 2·factor−1, …) is byte-identical after a reset.
+    #[test]
+    fn decimation_selection_and_legacy_samples() {
+        for rate in [12_000u32, 24_000, 48_000, 96_000, 192_000] {
+            assert!(dsp_supports_input_rate(rate), "fixture rate {rate}");
+            let mut stage = DecimationStage::new(rate, false);
+            assert!(
+                matches!(stage, DecimationStage::Subsample { .. }),
+                "rate {rate}: default must stay subsample"
+            );
+            assert_eq!(stage.label(), "subsample");
+            let factor = (rate / DSP_TARGET_SAMPLE_RATE_HZ) as usize;
+            let input: Vec<f32> = (0..factor * 5).map(|i| i as f32).collect();
+            let mut out = Vec::new();
+            stage.process(&input, &mut out);
+            let expected: Vec<f32> = (0..5).map(|m| (factor * m + factor - 1) as f32).collect();
+            assert_eq!(
+                out, expected,
+                "rate {rate}: retained indices must be factor-1, 2·factor-1, …"
+            );
+            // Reset restores the exact phase: the same batch selects the
+            // same samples again.
+            stage.reset();
+            let mut again = Vec::new();
+            stage.process(&input, &mut again);
+            assert_eq!(out, again, "rate {rate}: reset must restore the phase");
+        }
+
+        // `true` uses the FIR only at 48 kHz; every other supported rate
+        // keeps the subsample path (and the caller logs the warning).
+        let fir = DecimationStage::new(48_000, true);
+        assert!(matches!(fir, DecimationStage::Fir31(..)));
+        assert_eq!(fir.label(), "fir31");
+        assert!(fir.is_fir31());
+        for rate in [12_000u32, 24_000, 96_000, 192_000] {
+            let stage = DecimationStage::new(rate, true);
+            assert!(
+                matches!(stage, DecimationStage::Subsample { .. }),
+                "rate {rate}: FIR must not run at rates other than 48 kHz"
+            );
+            assert!(!stage.is_fir31());
+        }
+    }
+
+    /// AC3: every destructive DSP flush resets the decimation stage's
+    /// history and phase (a seeded impulse must not ring into post-flush
+    /// audio), while ordinary overlap retention between windows does not
+    /// reset it.
+    #[test]
+    fn decimator_flush_boundaries() {
+        // The five destructive flush causes that run
+        // `destructive_capture_flush` in the worker loop (supervisor
+        // restart rebuilds the whole stage by construction):
+        const FLUSH_CAUSES: [&str; 5] = [
+            "gain-change (batch)",
+            "dial change",
+            "mode change",
+            "forward clock jump",
+            "gain-change (window emit)",
+        ];
+        for cause in FLUSH_CAUSES {
+            // Seed history with an impulse: both arms must show it.
+            let mut stage = DecimationStage::new(48_000, true);
+            let mut buf = Vec::new();
+            stage.process(&[1.0f32], &mut buf);
+            stage.process(&[0.0f32; 124], &mut buf);
+            assert_eq!(buf.len(), 31);
+            assert!(
+                buf.iter().any(|&s| s != 0.0),
+                "{cause}: fixture premise — the impulse must ring first"
+            );
+            let mut last_live_wf_samples = buf.len();
+            destructive_capture_flush(&mut buf, &mut last_live_wf_samples, &mut stage);
+            assert!(buf.is_empty());
+            assert_eq!(last_live_wf_samples, 0);
+            // Silence afterward: the impulse is gone from the history.
+            stage.process(&[0.0f32; 128], &mut buf);
+            assert_eq!(buf.len(), 32);
+            assert!(
+                buf.iter().all(|&s| s == 0.0),
+                "{cause}: flush must remove all previous samples"
+            );
+
+            // Same invariant for the subsample arm: the counter resets, so
+            // post-flush selection restarts at index 3.
+            let mut stage = DecimationStage::new(48_000, false);
+            let mut buf = Vec::new();
+            stage.process(&[9.0f32, 9.0, 9.0], &mut buf); // phase 3/4, no output
+            assert!(buf.is_empty());
+            let mut wf = 0;
+            destructive_capture_flush(&mut buf, &mut wf, &mut stage);
+            stage.process(&[0.0, 1.0, 2.0, 3.0], &mut buf);
+            assert_eq!(
+                buf,
+                vec![3.0],
+                "{cause}: reset counter must retain index 3 first"
+            );
+        }
+
+        // Ordinary overlap retention is NOT a flush: draining the front of
+        // `ft8_buffer` after an emit keeps the subsample phase running.
+        let mut stage = DecimationStage::new(48_000, false);
+        let mut buf = Vec::new();
+        stage.process(&[0.0, 1.0, 2.0, 3.0], &mut buf); // retains 3
+        let keep = 1;
+        if buf.len() > keep {
+            buf.drain(..buf.len() - keep);
+        }
+        stage.process(&[4.0, 5.0, 6.0, 7.0], &mut buf); // retains 7, not 4
+        assert_eq!(
+            buf,
+            vec![3.0, 7.0],
+            "overlap drain must not reset the phase"
+        );
+    }
+
+    /// Codex P1 on #654: with the FIR on, the receive-overload guard must
+    /// measure the *pre-filter* peak of the same capture window. A
+    /// near-full-scale out-of-band tone (9 kHz at 48 kHz) is suppressed by
+    /// the FIR, so measuring the filtered buffer would let it slip under
+    /// the guard's −1 dBFS threshold while it is overloading the codec.
+    /// The subsample path stays byte-identical: it measures the window.
+    #[test]
+    fn overload_guard_sees_pre_filter_peaks() {
+        use super::super::receive_overload::raw_peak_dbfs;
+        const GUARD_DBFS: f64 = -1.0;
+        let tone = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| 0.99 * (2.0 * std::f32::consts::PI * 9_000.0 * i as f32 / 48_000.0).sin())
+                .collect()
+        };
+        let input = tone(48_000 * 2);
+
+        // FIR arm, fed in uneven batches like the live worker.
+        let mut fir = DecimationStage::new(48_000, true);
+        let mut buf = Vec::new();
+        for chunk in input.chunks(509) {
+            fir.process(chunk, &mut buf);
+        }
+        assert_eq!(buf.len(), 24_000);
+        let start = 2_000;
+        let filtered = raw_peak_dbfs(&buf[start..]).unwrap();
+        assert!(
+            filtered < GUARD_DBFS,
+            "premise: the FIR suppresses the 9 kHz tone below the guard ({filtered} dBFS)"
+        );
+        let window = buf[start..].to_vec();
+        let guard = fir.overload_peak_dbfs(buf.len(), &window, start).unwrap();
+        assert!(
+            guard >= GUARD_DBFS,
+            "guard must see the pre-filter peak: got {guard} dBFS"
+        );
+
+        // Overlap retention (front drain) keeps the measurement aligned.
+        buf.drain(..buf.len() - 1_000);
+        for chunk in input[..48_000].chunks(511) {
+            fir.process(chunk, &mut buf);
+        }
+        let window = buf.clone();
+        let guard = fir.overload_peak_dbfs(buf.len(), &window, 0).unwrap();
+        assert!(guard >= GUARD_DBFS, "after drain: {guard} dBFS");
+
+        // A destructive flush drops the pre-filter history with the buffer:
+        // quiet audio afterwards must not report the old hot peak.
+        let mut wf = buf.len();
+        destructive_capture_flush(&mut buf, &mut wf, &mut fir);
+        fir.process(&vec![0.01f32; 4_800], &mut buf);
+        let window = buf.clone();
+        let quiet = fir.overload_peak_dbfs(buf.len(), &window, 0).unwrap();
+        assert!(
+            quiet < -30.0,
+            "post-flush peak must be the new audio: {quiet} dBFS"
+        );
+
+        // A non-finite input sample still invalidates the measurement.
+        let mut fir = DecimationStage::new(48_000, true);
+        let mut buf = Vec::new();
+        let mut bad = vec![0.1f32; 400];
+        bad[201] = f32::NAN;
+        fir.process(&bad, &mut buf);
+        let window = buf.clone();
+        assert_eq!(fir.overload_peak_dbfs(buf.len(), &window, 0), None);
+
+        // Subsample arm: exactly the historical measurement of the window.
+        let mut sub = DecimationStage::new(48_000, false);
+        let mut buf = Vec::new();
+        for chunk in input.chunks(509) {
+            sub.process(chunk, &mut buf);
+        }
+        let window = buf[start..].to_vec();
+        assert_eq!(
+            sub.overload_peak_dbfs(buf.len(), &window, start),
+            raw_peak_dbfs(&window)
+        );
+    }
+
+    /// AC3: the FIR's window anchor accounts for the 15-input-sample group
+    /// delay — the compensated effective buffer end moves the sliced
+    /// window's start by 3.75 output samples (within the one-output-sample
+    /// rounding tolerance of 4 samples) at both window-lead settings, and
+    /// the subsample path is anchored to `now` unchanged.
+    #[test]
+    fn fir_window_anchor_accounts_for_latency() {
+        let subsample = DecimationStage::new(48_000, false);
+        let fir = DecimationStage::new(48_000, true);
+
+        let slot = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let now = slot + chrono::Duration::seconds(13);
+
+        // Subsample: no compensation.
+        assert_eq!(effective_buffer_end(now, &subsample), now);
+        // FIR: exactly 312.5 µs earlier (15 / 48000 s).
+        let fir_end = effective_buffer_end(now, &fir);
+        assert_eq!(
+            now - fir_end,
+            chrono::Duration::nanoseconds(312_500),
+            "15 input samples of group delay = 312.5 µs"
+        );
+
+        // End-to-end through `boundary_anchored_slice`: the impulse (a
+        // marker sample at a known slot coordinate) must land within one
+        // output sample of the same window coordinate in both arms.
+        let ft8_window_samples = 151_680usize;
+        for lead in [0.5f64, 1.0] {
+            let buffer_len = (((13.0 + lead) * 12_000.0) as usize) + 37;
+            let (start_sub, len_sub) = boundary_anchored_slice(
+                buffer_len,
+                effective_buffer_end(now, &subsample),
+                slot,
+                12_000,
+                ft8_window_samples,
+                lead,
+            );
+            let (start_fir, len_fir) = boundary_anchored_slice(
+                buffer_len,
+                effective_buffer_end(now, &fir),
+                slot,
+                12_000,
+                ft8_window_samples,
+                lead,
+            );
+            // Ideal continuous shift: 3.75 output samples; the rounded
+            // slice grid lands 4 — within one output sample.
+            let delta = start_fir as f64 - start_sub as f64;
+            assert!(
+                (delta - 3.75).abs() <= 1.0,
+                "lead {lead}: FIR window start shifted {delta} samples, expected ≈3.75"
+            );
+            // The window length shrinks by the same latency: the FIR's
+            // newest sample is 312.5 µs older, so the anchored window
+            // holds ≈3.75 fewer trailing samples (of 162000).
+            let len_delta = len_sub as f64 - len_fir as f64;
+            assert!(
+                (len_delta - 3.75).abs() <= 1.0,
+                "lead {lead}: FIR window length differs by {len_delta} samples, expected ≈3.75"
+            );
+            // The subsample arm anchors sample 0 at slot − lead exactly.
+            let ideal_back = ((13.0 + lead) * 12_000.0).round() as usize;
+            assert_eq!(
+                buffer_len - start_sub,
+                ideal_back,
+                "lead {lead}: subsample anchor must be exact"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "dsp/tests/waterfall_scale_tests.rs"]
+mod waterfall_scale_tests;

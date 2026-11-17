@@ -177,3 +177,8 @@ intent, and initialize intent once, so reloads and supervisor restarts cannot
 undo an operator pause. Lead/parity belong to new attempts; the late cap must
 also be read at key-time. Receive preset saves take effect on a later band
 crossing and must not write CAT immediately.
+
+PAN-293: recent-failure scoring history stores the latest monotonic timestamp per
+resolved callsign, shared by cloned lookups. Reads and recordings prune entries
+at the window boundary. `[autonomous] recent_failure_window_secs` is seeded at
+startup, defaults to 1800 seconds, and requires restart; zero disables history.

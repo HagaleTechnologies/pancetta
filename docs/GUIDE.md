@@ -281,10 +281,10 @@ waits for it to finish.
 - `=` / `-` step the band up/down (CAT moves the dial; active QSOs are
   torn down safely — turning the rig's physical dial does the same).
 - `Shift+F` for any arbitrary dial frequency, including split.
-- `Shift+M` cycles the station operating mode: **FT8 → FT4 → FT8**.
-  Builds with the experimental `ft2` cargo feature also include FT2:
-  **FT8 → FT4 → FT2 → FT8**. Switching can be refused while a QSO is
-  in flight. Finish or press `k` to cancel the QSO first.
+- `Shift+M` cycles FT8 → FT4 → FT8 in release builds. FT2 is experimental
+  and available only in custom builds with the `ft2` feature;
+  it is not a qualified on-air capability. See [Capability status](../README.md#capability-status).
+  Switching can be refused while a QSO is in flight. Finish or press `k` to cancel the QSO first.
 - `e` cycles decode effort (Eco → Standard → Deep → Max → Auto) if you're
   CPU-bound.
 
@@ -380,7 +380,8 @@ once `accept_udp_requests = true`, independent of `allow_tx_initiation`
 2. `Shift+D` in the TUI — retained diagnostics history (why TX was
    dropped, why a QSO failed, rig errors).
 3. `Shift+S` — the station-health panel (one screen: is the station
-   healthy right now?).
+   healthy right now?). While the rig is keyed, its `TX meter:` row
+   shows forward power and ALC read over CAT.
 4. Badges in Station Info: `⚠ TX→system default` (TX audio going to your
    speakers, not the rig) and `⚠ RX→fallback device` (configured input
    device not found).

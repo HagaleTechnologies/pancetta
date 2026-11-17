@@ -57,6 +57,8 @@ Press `?` inside the TUI for the same list as an overlay.
 | `Shift+P` | Pause / resume autonomous |
 | `Shift+M` | Cycle operating mode (FT8 → FT4; waits for coordinator confirm) |
 | `e` | Cycle decode-effort preset: Eco → Standard → Deep → Max → Auto |
+| `{ / }` | Waterfall gain −/+ 1 dB (waterfall focused) |
+| `b / B` | Waterfall palette next / previous (waterfall focused) |
 | `Shift+X` | Toggle Fox (DXpedition) mode |
 
 ## Audio & devices

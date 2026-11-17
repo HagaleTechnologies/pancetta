@@ -159,6 +159,39 @@ pub struct ReceiveGainCapabilities {
     pub attenuator_db: Vec<i32>,
 }
 
+/// A transmit meter Hamlib can read while keyed (PAN-291).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TxMeter {
+    /// The ALC meter, on Hamlib's 0..1 scale.
+    Alc,
+    /// The RF power meter in watts.
+    ForwardPowerWatts,
+    /// The RF power meter as a 0..1 fraction of the rig's maximum.
+    ForwardPowerFraction,
+}
+
+impl TxMeter {
+    /// The Hamlib level name: "ALC", "RFPOWER_METER_WATTS" or "RFPOWER_METER".
+    pub const fn hamlib_level(self) -> &'static str {
+        match self {
+            TxMeter::Alc => "ALC",
+            TxMeter::ForwardPowerWatts => "RFPOWER_METER_WATTS",
+            TxMeter::ForwardPowerFraction => "RFPOWER_METER",
+        }
+    }
+}
+
+/// Which transmit meters the backend lists in its `Get level:` capabilities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxMeterLevels {
+    /// `ALC` is listed.
+    pub alc: bool,
+    /// `RFPOWER_METER_WATTS` is listed.
+    pub forward_power_watts: bool,
+    /// `RFPOWER_METER` is listed.
+    pub forward_power_fraction: bool,
+}
+
 /// Trait for rig control operations
 #[async_trait]
 pub trait RigControl: Send + Sync {
@@ -262,6 +295,20 @@ pub trait RigControl: Send + Sync {
     /// cannot tell must return an error, never assume a meter exists (PAN-251).
     async fn reports_swr(&self) -> Result<bool> {
         Err(HamlibError::not_supported("reports_swr", None, None).into())
+    }
+
+    /// Read one transmit meter while keyed (PAN-291). ALC is on Hamlib's 0..1
+    /// scale; forward power is in watts or a 0..1 fraction of the rig's
+    /// maximum. An unsupported meter or an unparseable reply is an error,
+    /// never a default.
+    async fn get_tx_meter(&self, _meter: TxMeter) -> Result<f32> {
+        Err(HamlibError::not_supported("get_tx_meter", None, None).into())
+    }
+
+    /// Which transmit meters the backend lists in its `Get level:`
+    /// capabilities (PAN-291). A backend that cannot tell returns an error.
+    async fn tx_meter_levels(&self) -> Result<TxMeterLevels> {
+        Err(HamlibError::not_supported("tx_meter_levels", None, None).into())
     }
 
     /// Set memory channel
@@ -401,5 +448,21 @@ mod split_default_tests {
             .to_string()
             .contains("Feature not supported"));
         assert!(DefaultOnlyRig.reports_swr().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_tx_meter_reads_fail_closed() {
+        assert!(DefaultOnlyRig
+            .get_tx_meter(TxMeter::Alc)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
+        assert!(DefaultOnlyRig
+            .tx_meter_levels()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
     }
 }

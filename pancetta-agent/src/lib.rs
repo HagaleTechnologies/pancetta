@@ -12,3 +12,5 @@ pub mod pairing;
 pub mod peer_identity;
 pub mod relay;
 pub mod session;
+
+pub mod trust;

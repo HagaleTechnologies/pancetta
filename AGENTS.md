@@ -22,7 +22,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-config` | Configuration loading, validation; file watch live-applies selected autonomous policy, TX timing, receive gain presets and remote-access consent/revocations (operational reload unreleased) | Production-ready |
 | `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic |
 | `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live; eQSL awaiting live-account check; LoTW web-scrape module is unused scaffolding |
-| `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; CAT/PTT on-air validated (FTdx10); opt-in receive overload ATT guard and configured data-mode control are hardware-unverified |
+| `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; CAT/PTT on-air validated (FTdx10); opt-in receive overload ATT guard, configured data-mode control and TX power/ALC meter reads are hardware-unverified |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Live; spots envelope unverified against live API |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
 | `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable |
@@ -37,6 +37,8 @@ Operator-facing capability state: README.md § Capability status — keep both c
 ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXCC/CQZ/ITUZ with token zone overrides, stored-field precedence and unknown omission, including export-time enrichment. Automated coverage only; live qualification pending.
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
+CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
+TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
 
 ## Building and Testing
 
@@ -58,6 +60,8 @@ cargo test -p pancetta --test loopback_qso
 # pancetta-hamlib: per-test current_thread tokio runtime; run single-threaded for deterministic mock-rig tests
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 ```
+
+New unit tests go in the same crate, `src/<module>/tests/<behaviour>_tests.rs`, declared with `#[cfg(test)] #[path = "..."] mod <behaviour>_tests;` (CONTRIBUTING.md § Unit Tests); renaming a test module renames its tests.
 
 ## Domain Context
 
@@ -105,6 +109,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 - TUI keys (PAN-327): every bound key in every dialog and the main view resolves through `keymap::resolve` into exactly one `Action`; a new key is a chord on its documented `KEYBINDINGS` row (or `MODAL_BINDINGS` for dialog-internal keys) plus an `Action` variant and a `match action` arm in `handle_key_event`, Main-scope chords for `Action::starts_tx()` refuse Ctrl/Alt, Shift+Q resolves in Global scope before any dialog chord or text-entry rule, and any change to what a key does must re-bless `pancetta-tui/tests/fixtures/key_effects.golden` (`PANCETTA_BLESS_KEY_EFFECTS=1`).
 
+- TUI colours (PAN-387): only `pancetta-tui/src/theme.rs` names a colour (`pancetta-tui/tests/theme_invariant.rs`); renderers read semantic tokens from `app.theme` or a `&Theme`. A new meaning gets a token with Dark, Light and HighContrast values; any change to what a theme paints must re-bless `pancetta-tui/tests/fixtures/theme_snapshots/` (`PANCETTA_BLESS_THEME_SNAPSHOTS=1`).
+
 - Spot-call QSY (PAN-287): Space on a DX Hunter network spot changes the dial only through `coordinator::spot_call`, never while the rig is keyed (the `rig_is_keyed` recheck and the `SetFrequency` enqueue run under `ptt_sync_gate`, which every key-down passes before its PTT-on enqueue; the autonomous operator is never locked under that gate), never across a QSO the admission snapshot shows as answered, and never without a Hamlib route. A call parked for PTT-off is dropped after 30 s, on any operator frequency change or operating-mode switch, by a newer spot call, or when TX policy no longer allows initiation.
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
@@ -114,7 +120,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Where Things Live
 
-- `docs/superpowers/specs/` — design specs (authoritative for current behavior)
+- `docs/superpowers/specs/` — design specs
 - `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
@@ -153,3 +159,5 @@ docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
 credenza; edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
 instead of hand-editing this copy.
+
+When sources conflict: code > curated docs > docs/DECISIONS/ > docs/superpowers/specs/ and implementation plans.

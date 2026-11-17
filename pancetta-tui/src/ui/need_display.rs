@@ -1,5 +1,7 @@
 //! Shared need glyphs and styles. Renderers only consume prepared verdicts.
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+
+use crate::theme::Theme;
 
 /// Build the callsign-prefix marker string for the DX Hunter:
 /// `!` for ATNO, `+` for a needed (non-ATNO) DXCC, then `★` for notable.
@@ -27,14 +29,12 @@ pub(super) fn band_marker(band_needed: bool, atno: bool) -> &'static str {
     }
 }
 
-pub(super) fn atno_style() -> Style {
-    Style::default()
-        .fg(Color::Magenta)
+pub(super) fn atno_style(theme: &Theme) -> Style {
+    theme
+        .atno
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
 
-pub(super) fn needed_style(theme: &crate::config::Theme) -> Style {
-    Style::default()
-        .fg(theme.error_color())
-        .add_modifier(Modifier::BOLD)
+pub(super) fn needed_style(theme: &Theme) -> Style {
+    theme.needed.add_modifier(Modifier::BOLD)
 }

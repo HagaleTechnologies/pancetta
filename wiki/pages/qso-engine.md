@@ -78,10 +78,10 @@ the half-duplex [[parity-rule]] and the [[tx-scheduling]] gate.
   elapsed-watchdog pass without resetting `first_call_at` or spending a call.
   Once a report is latched, both identical and changed-value reports cancel
   a pending reprieve and preserve the stall count and generation. The
-  `pan72_stall_detection_tests` tests `the_dx_s_first_report_advances_a_sending_report_qso`,
+  `stall_detection_tests` tests `the_dx_s_first_report_advances_a_sending_report_qso`,
   `first_dx_report_grants_exactly_one_expired_watchdog_reprieve`, and
   `a_repeated_dx_report_is_still_not_forward_progress` cover this distinction
-  in `pancetta-qso/src/qso_manager.rs`.
+  in `pancetta-qso/src/qso_manager/tests/stall_detection_tests.rs`.
 
 ## Persistent duplicate history (PAN-260)
 

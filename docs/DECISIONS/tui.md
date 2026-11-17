@@ -259,7 +259,7 @@ stuck-PTT warning cleared` to Shift+D. It does not mute TX: that is a TX-safety 
 own ticket.
 
 **Other findings.** `ui/station_info.rs`'s RIG / TX→default / RX→fallback badges have been unrouted
-since Task 18, so those conditions were invisible in every view; the strip now carries them. The
+since Task 18 (the file was deleted in PAN-387), so those conditions were invisible in every view; the strip now carries them. The
 Shift+S TX-audio row was inverted (green for the misconfiguration) and is fixed; Shift+S gains a
 readiness section (acknowledged items marked `(ack'd)`), an RX-input row and a clock row. Because
 the readiness section can outgrow the panel (at 80×24 about four items fit before the rig, audio and
@@ -521,8 +521,8 @@ complete lines in this priority: status/callsign, TX, RX, queued parity, control
 hint, SNR, NOW, NEXT. Admitted lines retain their normal display order.
 The multi-QSO table is unchanged.
 
-The unused public SignalMeter, Modal and SpectrumDisplay widgets remain for a
-separate compatibility review. They are not an alternate production SNR scale.
+The unused public SignalMeter, Modal and SpectrumDisplay widgets were later
+removed by PAN-387. They were never an alternate production SNR scale.
 Physical tmux and Windows Terminal glyph checks still need operator qualification.
 
 ## Space on a network spot QSYs the rig (PAN-287, 2026-11)
@@ -607,3 +607,115 @@ computed from the panel rectangle after contest, QRZ-card and zoom layout.
 At short Hunt sizes, TX Placement compresses to leave DX Hunter a data row.
 Waterfall updates prune stations at the strict 24-hour cutoff and retain state
 entries only for normalized surviving callsigns. Watchlist pins remain stored.
+
+## Semantic theme tokens and a high-contrast theme (PAN-387, 2026-11)
+
+`pancetta-tui/src/theme.rs`, `pancetta-config/src/ui.rs`: `[ui] theme` was
+accepted but ignored, and every renderer picked its own colours.
+
+- **One meaning, one token (D3).** The nine generic colour methods were removed,
+  not kept as shims. Every call site was re-read and mapped to a semantic token
+  (`text`, `muted`, `focus`, `warning`, `cq`, `needed`, `own_tx`, `selection`,
+  …). A site whose meaning matches no token gets a new token with Dark, Light
+  and HighContrast values, never a literal. Only `theme.rs` names a colour;
+  `pancetta-tui/tests/theme_invariant.rs` scans `pancetta-tui/src` for
+  `Color::` and the other ways to build a colour.
+- **Dark keeps today's look.** Dark tokens carry colours only; call sites add
+  the modifiers they always added. Two changes: the full-frame `page` also sets
+  a white foreground, and overlays that set no background now paint the
+  `modal` surface (white on black).
+- **Thresholds (D5).** Light reaches 3.0:1 and HighContrast 4.5:1 on every
+  glyph cell and token, computed on the xterm default palette. Dark is held to
+  its previous output, not to a ratio. Block elements U+2580..U+259F are
+  excluded: waterfall swatches and occupancy blocks are colour areas, not text.
+  All palettes use the 16 named ANSI colours, so a 16-colour SSH session
+  renders every theme.
+- **HighContrast rules.** The meaning tokens are pairwise distinct styles;
+  alarms (`error`, `needed`, `own_tx`, `chip_blocker`, `verdict_held`,
+  `tx_disabled`, `alarm`, `modal_danger`) are bold; `selection` is REVERSED
+  with no colours; focus is a filled black-on-light-yellow frame. A focused
+  callsign that is also engaged keeps that fill and gains the underline
+  (`Theme::engaged_call`), because `engaged`'s light green on light yellow is
+  1.28:1. Dark and Light have an unfilled focus and still stack `engaged` on
+  it. The snapshot fixture focuses an engaged station so the goldens cover
+  that pairing.
+- **Waterfall data palette.** The intensity ramp (`waterfall_ramp`) is data,
+  the same in every theme, drawn on a black `waterfall_data` panel.
+- **Occupancy by enum.** The waterfall occupancy decision is
+  `widgets::Occupancy { Clear, OtherParity, OwnParity }`, styled through
+  `Theme::occupancy`; the TX-cursor suffix follows the enum, never a colour
+  comparison.
+- **Config precedence.** `[ui.accessibility] high_contrast = true` wins;
+  otherwise `ThemeName::from_label` parses `theme` (trimmed, case-insensitive;
+  empty and `default` mean dark). An unknown label starts in dark and adds one
+  load warning. `PANCETTA_THEME` still overrides `ui.theme`. A change needs a
+  restart. `ThemeName` lives in `pancetta-config` so the config crate can
+  validate the label without depending on the TUI.
+  `ui.accessibility.high_contrast` left the PAN-303 unread-key waiver list.
+- **Dead code deleted.** `pancetta-tui/src/ui/station_info.rs` and the unused
+  `SignalMeter`, `Modal` and `SpectrumDisplay` widgets were removed rather than
+  themed.
+- **Snapshot goldens.** Each theme and surface has a golden under
+  `pancetta-tui/tests/fixtures/theme_snapshots/<theme>/<surface>.golden`.
+  Text is masked so clocks and counters do not churn them: ASCII digits become
+  `#`, `▮`/`▯` become `▪`, and the slot letter is masked. Re-bless with
+  `PANCETTA_BLESS_THEME_SNAPSHOTS=1 cargo test -p pancetta-tui --lib theme_snapshots`.
+- **Value changes found by the property tests.** The QSO-status slot gauge
+  now patches the page background under its label (its filled cells were
+  `Reset`, so Dark changes only there). The Band Activity and DX Hunter
+  scroll counters on a focused border use `focus` when that token has a
+  background (HighContrast's filled frame); Gray on light yellow measured
+  1.17:1. No token value changed.
+- **Not yet qualified.** Contrast is checked by tests on the xterm default
+  palette only; no real terminal has been checked.
+
+## Waterfall palette and gain (PAN-389, 2026-11)
+
+`[ui.waterfall]` sets `palette` (`classic`, `spectrum`, `thermal`, `viridis`)
+and `gain_db` (-12 to 12 dB, default 0). The default draws exactly the
+earlier grayscale ramp.
+
+Gain is an additive offset on the waterfall's 12 dB colour scale, and
+positive brightens: display intensity is `(v + gain_db / 12).clamp(0, 1)`.
+In dB a gain is an addition, and adding gain raises the noise floor, so
+`gain_db = 6` shows the floor at half scale. The research proposed the
+opposite sign; it was rejected because a "gain" that darkens contradicts the
+name. The widget's `WATERFALL_DB_SPAN` is pinned to the DSP's
+`NOISE_FLOOR_DB_SCALE` by a test.
+
+The same offset applies to every row. The live DSP rows (one per second,
+signal above the per-bin median over 12 dB) and the per-decode-window rows
+(min/max stretched) share one display, so the dB meaning is exact for live
+rows and approximate for window rows. Normalising the two producers was left
+out because it touches the autonomous allocator feed and the remote gateway.
+
+Gain and palette are applied at render time only, once per output cell after
+the max over bins and compressed rows. The palettes, viridis included, are
+arms of the PAN-387 `theme::waterfall_ramp` data palette, the same in every
+theme; the widget only adds the gain before calling it. That equals applying them per sample
+because the map is monotone. `App::waterfall_data`, which the TX allocator
+and the `t` key read, never changes (single-scorer invariant). A change
+re-colours the whole history on the next frame.
+
+The waterfall is a focusable panel (`ActivePanel::Waterfall`) in the Monitor
+view only. The Monitor Tab order is waterfall, then Band Activity, following
+the on-screen top-to-bottom rule. A left click focuses it, and `z` zooms it.
+
+While it is focused, `{`/`}` step the gain by 1 dB and `b`/`B` cycle the
+palette. All chords refuse Ctrl and Alt, so Ctrl+B (the tmux prefix) stays
+unbound. The same keys in any other panel resolve to a hint action, following
+the `HoundFocusHint` precedent, so a press explains itself instead of doing
+nothing. No new action starts TX.
+
+Live changes persist through the PAN-270 session-state seam. The TUI applies
+the change at once and sends the absolute new value; the coordinator, the
+only writer of `session_state.json`, persists it with the running config value
+as a per-field baseline and sends no echo. The decode effort needs an echo
+because the coordinator owns the decoder budget; the waterfall is rendered
+only by the TUI. At the next start a saved value whose baseline differs from
+the config is dropped, because the config edit is newer. Palette and gain are
+compared separately (gains within 0.001 dB). The new on-disk keys are skipped
+when absent, so a file without waterfall choices keeps the PAN-270 format, and
+a bad waterfall field is dropped on its own rather than discarding the saved
+TX mode and decode effort. The first frame gets its values from the TUI config
+the coordinator builds after the startup resolve, so the TUI reads no file.

@@ -1198,6 +1198,16 @@ impl RelayDriverHost for TuiRelayLoop {
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
             }
+            MessageType::RigControl(
+                msg @ (crate::message_bus::RigControlMessage::TxMeterResponse(_)
+                | crate::message_bus::RigControlMessage::TxMeterCapability(_)),
+            ) => {
+                // PAN-291: real keyed power/ALC reads and the session's meter
+                // plan, forwarded verbatim to the Shift+S panel.
+                if let Some(tui_msg) = tx_meter_tui_message(&msg) {
+                    let _ = tui_msg_tx_relay.send(tui_msg);
+                }
+            }
             MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                 callsign,
                 frequency,
@@ -4071,6 +4081,23 @@ impl super::ApplicationCoordinator {
                                 warn!("Failed to forward ToggleFoxMode command: {}", e);
                             }
                         }
+                        // PAN-389: the TUI already applied the new waterfall
+                        // gain/palette; persist it with the RUNNING
+                        // `[ui.waterfall]` value as the baseline (restart-
+                        // required, so the snapshot is what the station
+                        // runs). No echo: only the TUI renders it.
+                        pancetta_tui::tui_runner::TuiCommand::SetWaterfallGain { .. }
+                        | pancetta_tui::tui_runner::TuiCommand::SetWaterfallPalette { .. } => {
+                            let config_waterfall = cmd_config.read().await.ui.waterfall;
+                            if let Some(update) = waterfall_session_update(&cmd, &config_waterfall)
+                            {
+                                super::session_state::persist_session_choice(
+                                    &cmd_session_record,
+                                    &cmd_session_state_path,
+                                    update,
+                                );
+                            }
+                        }
                         _ => {
                             debug!("Unhandled TUI command: {:?}", cmd);
                         }
@@ -4163,10 +4190,16 @@ impl super::ApplicationCoordinator {
                 mode: tui_config_lock.rig.mode.clone(),
                 tx_self_parity: tui_config_lock.station.tx_self_parity,
             },
-            ui: pancetta_tui::config::UiConfig {
-                theme: pancetta_tui::Theme::Dark,
-                show_coordinates: true,
-            },
+            // PAN-387 theme from `[ui]`; PAN-389: the first frame renders the
+            // session-resolved waterfall palette and gain; the TUI reads no
+            // session file.
+            ui: tui_ui_config(
+                &tui_config_lock.ui,
+                &self
+                    .session_record
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
             audio: pancetta_tui::config::AudioConfig {
                 device: Some(tui_config_lock.audio.input_device.clone()),
                 sample_rate: tui_config_lock.audio.sample_rate,
@@ -4222,6 +4255,22 @@ impl super::ApplicationCoordinator {
 
         info!("TUI component started");
         Ok(())
+    }
+}
+
+/// The TUI's `[ui]` config built from the loaded `pancetta.toml` `[ui]`
+/// section (PAN-387): `theme` and `[ui.accessibility] high_contrast` pick
+/// the palette; an unknown label falls back to dark (the load path already
+/// warned about it). PAN-389: the waterfall palette and gain are the
+/// effective (session-resolved) values.
+pub(crate) fn tui_ui_config(
+    ui: &pancetta_config::ui::UiConfig,
+    record: &super::session_state::SessionRecord,
+) -> pancetta_tui::config::UiConfig {
+    pancetta_tui::config::UiConfig {
+        theme: ui.theme_name(),
+        show_coordinates: true,
+        waterfall: super::session_state::effective_waterfall(record, &ui.waterfall),
     }
 }
 
@@ -4610,6 +4659,22 @@ struct ClusterSpotRelay {
     needed: bool,
     atno: bool,
     band_needed: bool,
+}
+
+/// PAN-291: the TUI message for a TX meter bus message, or `None` for any
+/// other rig-control message. Readings pass through unchanged.
+fn tx_meter_tui_message(
+    msg: &crate::message_bus::RigControlMessage,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    match msg {
+        crate::message_bus::RigControlMessage::TxMeterResponse(reading) => Some(
+            pancetta_tui::tui_runner::TuiMessage::TxMeterUpdate(*reading),
+        ),
+        crate::message_bus::RigControlMessage::TxMeterCapability(capability) => Some(
+            pancetta_tui::tui_runner::TuiMessage::TxMeterCapability(*capability),
+        ),
+        _ => None,
+    }
 }
 
 /// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
@@ -5565,6 +5630,32 @@ where
 }
 
 #[cfg(test)]
+mod pan387_tests {
+    use super::*;
+
+    #[test]
+    fn tui_ui_config_carries_the_configured_theme() {
+        let record = crate::coordinator::session_state::SessionRecord::default();
+        let mut ui = pancetta_config::ui::UiConfig::default();
+        assert_eq!(
+            tui_ui_config(&ui, &record).theme,
+            pancetta_tui::ThemeName::Dark
+        );
+        ui.theme = "light".to_string();
+        assert_eq!(
+            tui_ui_config(&ui, &record).theme,
+            pancetta_tui::ThemeName::Light
+        );
+        ui.accessibility.high_contrast = true;
+        assert_eq!(
+            tui_ui_config(&ui, &record).theme,
+            pancetta_tui::ThemeName::HighContrast
+        );
+        assert!(tui_ui_config(&ui, &record).show_coordinates);
+    }
+}
+
+#[cfg(test)]
 mod pan351_tests {
     use super::*;
     #[test]
@@ -5605,6 +5696,35 @@ mod pan351_tests {
 
 #[cfg(test)]
 mod tui_relay_tests {
+    /// PAN-291 AC10: TX meter bus messages become their TUI messages
+    /// unchanged; other rig-control messages are not TX meter messages.
+    #[test]
+    fn tx_meter_messages_relay_to_the_tui() {
+        use crate::message_bus::RigControlMessage;
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+        use pancetta_tui::tui_runner::TuiMessage;
+        let reading = TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.8),
+        };
+        assert!(matches!(
+            super::tx_meter_tui_message(&RigControlMessage::TxMeterResponse(reading)),
+            Some(TuiMessage::TxMeterUpdate(r)) if r == reading
+        ));
+        let capability = TxMeterCapability {
+            forward_power: true,
+            alc: true,
+            alc_limit: Some(0.5),
+        };
+        assert!(matches!(
+            super::tx_meter_tui_message(&RigControlMessage::TxMeterCapability(capability)),
+            Some(TuiMessage::TxMeterCapability(c)) if c == capability
+        ));
+        assert!(
+            super::tx_meter_tui_message(&RigControlMessage::SwrResponse { swr: 1.5 }).is_none()
+        );
+    }
+
     /// PAN-330 AC1: the TUI relay's directed flag recognizes prefix/suffix
     /// portable calls, mixed case and resolved hash renders, and rejects
     /// absent, empty, whitespace-only, unresolved-hash and wrong-call
@@ -9404,6 +9524,31 @@ mod tui_relay_tests {
     }
 }
 
+/// PAN-389: map a TUI waterfall command to the session update to persist,
+/// with the running `[ui.waterfall]` value as the baseline. `None` for every
+/// other command.
+pub(super) fn waterfall_session_update(
+    cmd: &pancetta_tui::tui_runner::TuiCommand,
+    config_waterfall: &pancetta_config::ui::WaterfallDisplayConfig,
+) -> Option<super::session_state::SessionChoiceUpdate> {
+    use pancetta_tui::tui_runner::TuiCommand;
+    match cmd {
+        TuiCommand::SetWaterfallGain { gain_db } => {
+            Some(super::session_state::SessionChoiceUpdate::WaterfallGain {
+                choice: *gain_db,
+                config_at_save: config_waterfall.gain_db,
+            })
+        }
+        TuiCommand::SetWaterfallPalette { palette } => Some(
+            super::session_state::SessionChoiceUpdate::WaterfallPalette {
+                choice: *palette,
+                config_at_save: config_waterfall.palette,
+            },
+        ),
+        _ => None,
+    }
+}
+
 // Store before publishing shutdown, independently of who collects the task handle.
 pub(super) fn record_tui_failure(
     failure: &std::sync::Mutex<Option<String>>,
@@ -9416,3 +9561,7 @@ pub(super) fn record_tui_failure(
             .get_or_insert_with(|| format!("{error:#}"));
     }
 }
+
+#[cfg(test)]
+#[path = "tui_relay/tests/waterfall_session_tests.rs"]
+mod waterfall_session_tests;

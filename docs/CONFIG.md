@@ -119,6 +119,7 @@ active        = true
 | `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
 | `input_channels` | integer | `2` | Most CODECs are 2-channel; Pancetta downmixes to mono. |
 | `output_channels` | integer | `2` | TX path will write mono into both channels. |
+| `decimation_antialias_filter` | boolean | `false` | Enable the unity-gain FIR anti-alias filter for 48 kHz to 12 kHz receive decimation. Set false to use the original subsampler. Restart required. Other supported input rates retain their existing path. The shipped default is false until station recordings show a strictly larger merged decode count with the filter ([PAN-320](measurements/PAN-320-decimation.md)). |
 
 The `[audio.processing]` block controls the DSP chain (bandpass filter,
 compression). The defaults are tuned for FT8 and most users won't
@@ -406,6 +407,8 @@ and negative values fail validation at config load.
 swr_protection = true   # default true; needs CAT rig control ([rig.interface].enabled = true)
 max_swr = 3.0           # default 3.0; halt when readings stay above this; must be a number above 1.0
 swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX halts; 0 to 30000
+alc_overdrive_warning = true  # default true; warn (never block TX) when ALC stays above max_alc
+max_alc = 0.5                 # default 0.5, uncalibrated; must be above 0.0 and below 1.0
 ```
 
 | Key | Type | Default | Notes |
@@ -413,6 +416,8 @@ swr_trip_delay_ms = 5000 # default 5000; how long SWR must stay high before TX h
 | `swr_protection` | bool | `true` | Halts all TX when the rig reports SWR above `max_swr` while keyed (any PTT path, manual PTT included): aborts the frame, PTT off, autonomous off, active QSOs cancelled, TX policy Disabled. Needs CAT rig control. Independent of `[rig.power_control].enabled`. |
 | `max_swr` | float | `3.0` | Trip when readings are above this (strictly). Must be a number above 1.0 while `swr_protection` is on, or the config fails to load. |
 | `swr_trip_delay_ms` | int | `5000` | How much keyed time with SWR above `max_swr` halts TX, so an antenna tuner can settle after key-down. Keyed high time adds up across transmissions, so short frames (FT4, FT2) still trip; unkeyed time never counts. A reading at or below the limit resets it, and so does a gap of more than 2 minutes without a high reading. `0` trips on the first high reading. Must be 0 to 30000. |
+| `alc_overdrive_warning` | bool | `true` | Warn-only: never blocks, delays or halts TX. Raises one sticky warning to reduce audio drive when two consecutive ALC readings in one transmission are above `max_alc`, at most once per transmission. Needs CAT rig control and a rig that reports ALC. |
+| `max_alc` | float | `0.5` | ALC limit on Hamlib's 0..1 ALC scale; a reading above it (strictly) counts as overdriven. Must be a number above 0.0 and below 1.0 while `alc_overdrive_warning` is on, or the config fails to load. Uncalibrated: on the FTdx10, Hamlib maps the raw ALC meter 0..64 onto 0..1. |
 
 `[rig.power_control].enabled` (default false) controls rig power setting
 only. SWR protection does not depend on it.
@@ -439,11 +444,37 @@ Headless, the same text is logged at `warn` (target `rig.swr`). Set
 `swr_protection = false` to silence it. With rig control off (mock rig) no
 such alert appears.
 
+While the rig is keyed, pancetta also reads its forward-power and ALC meters
+on the same poll tick, twice a second. The Shift+S station health panel shows
+them in a `TX meter:` row under `Rig:`, for example
+`TX meter: 48 W, ALC 0.12 (limit 0.50)`. Forward power is in watts when the
+rig reports `RFPOWER_METER_WATTS`, otherwise a percent of maximum power from
+`RFPOWER_METER`. A meter the rig does not report shows `n/a`, and a rig that
+reports neither shows `TX meter: this rig does not report power or ALC over CAT`.
+Neither case blocks TX. When not keyed the row reads
+`TX meter: shown while transmitting`.
+
+When two consecutive ALC readings in one transmission are above `max_alc`,
+the readiness strip shows
+`⚠ ALC overdrive: reduce audio drive (ALC above 0.50 while transmitting)`
+until `!` acknowledges it; a repeat while unacknowledged counts up (`×2`).
+Shift+D keeps the readings under `rig.alc`. Headless, the same detail is
+logged at `warn` (target `rig.alc`). TX continues either way: lower the
+computer's sound-card output level or the rig's USB/DATA input level until
+ALC stays at or below the limit. Set `alc_overdrive_warning = false` to turn
+the warning off; the readings still show.
+
 Readings of 0, or anything else below 1.0, are ignored rather than treated
 as a perfect match. A bad `max_swr` stops config validation:
 
 ```text
 Error: Invalid configuration value: power_control.protection.max_swr = 0.5 (must be a number above 1.0 while swr_protection = true)
+```
+
+A bad `max_alc` stops it the same way:
+
+```text
+Error: Invalid configuration value: power_control.protection.max_alc = 1.5 (must be a number above 0.0 and below 1.0 while alc_overdrive_warning = true)
 ```
 
 Changes apply on restart. `max_power_watts`, `temperature_protection` and
@@ -500,11 +531,13 @@ min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
 min_multi_slot_score = 0.7 # Higher bar (0–1) for opening a 2nd+ concurrent QSO
 cq_direction = ""          # Directed CQ text ("DX", "NA", …); empty = general CQ
 dry_run = false            # Log autonomous TX decisions without keying the rig
+recent_failure_window_secs = 1800 # Seconds after the latest failed QSO; 0 disables; restart required
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `recent_failure_window_secs` | integer | `1800` | Nonnegative seconds since the latest failed QSO. Recent only while elapsed time is strictly less than this window; expires at the boundary. `0` disables the penalty. Requires restart. |
 | `unattended_policy` | enum | `"off"` | `off` requires recent console activity to open an automatic reply to a direct caller. `respond_only` permits that reply without console activity. Autonomous CQ and calls to stations advertising CQ still require presence. Requires restart. |
 | `slot_parity` | enum | `"auto"` | Slots alternate even/odd at the active mode's slot length (FT8 15 s, FT4 7.5 s); `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
@@ -1250,23 +1283,101 @@ section. With the old values a WSJT-X Fox never sees your call.
 
 ## `[ui]` — TUI behaviour
 
-> The `[ui]` settings are accepted by the configuration schema but do not
-> currently change the TUI. The coordinator constructs its TUI settings with
-> the built-in dark theme. Setting `theme` to `"light"` has no effect,
-> including after restart. The remaining schema keys are listed in
-> `defaults.toml`. Keybindings are not configurable; see
-> [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
-> `[ui.keyboard]` section was removed in PAN-303. Old configs still load
-> with one warning naming the removed section.
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `theme` | string | `"default"` | TUI palette (PAN-387): `"dark"` (also `"default"` or empty), `"light"` or `"high-contrast"`. Trimmed and case-insensitive; `"high_contrast"`, `"highcontrast"` and `"HighContrast"` are also accepted. `PANCETTA_THEME` overrides it. Restart required. |
+
+An unknown `theme` value starts the TUI in the dark theme and adds this load
+warning:
+`Unknown ui.theme "<label>"; using the dark theme. Valid values: dark, light, high-contrast.`
+Dark keeps the colours of earlier releases. Every panel and overlay, including
+the pickers and modals, follows the selected theme. `[ui.waterfall]` (below)
+sets the waterfall palette and gain. The other schema keys are listed in
+`defaults.toml` and do not change the TUI. Keybindings are not configurable;
+see [KEYBINDINGS.md](KEYBINDINGS.md), or press `?` in the TUI. The
+`[ui.keyboard]` section was removed in PAN-303. Old configs still load with
+one warning naming the removed section.
+
+### `[ui.accessibility]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `high_contrast` | bool | `false` | `true` selects the high-contrast theme whatever `[ui] theme` says (PAN-387). Restart required. |
+
+The contrast figures the theme tests enforce (at least 3:1 for every Light
+token, at least 4.5:1 for HighContrast) are computed on the xterm default
+palette; every theme uses the 16 named ANSI colours, so a terminal with a
+different palette shows different contrast.
+
+### `[ui.waterfall]` — waterfall palette and gain
+
+```toml
+[ui.waterfall]
+palette = "viridis"   # classic (default) | spectrum | thermal | viridis
+gain_db = 6           # -12.0 to 12.0 dB, default 0.0; positive brightens
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `palette` | string | `"classic"` | One of classic, spectrum, thermal, viridis. 16-colour terminals ignore it. |
+| `gain_db` | float | `0.0` | -12.0 to 12.0. Positive brightens: the noise floor shows `gain_db` dB higher on the 12 dB colour scale. |
+
+An unknown palette fails the config load, and the error lists the four valid
+names. A gain that is out of range or not a finite number fails startup with
+`Invalid configuration value: ui.waterfall.gain_db = …`. The default
+(`classic`, `0.0`) draws exactly the colours of earlier releases.
+
+The palette has no effect on 16-colour terminals, which show intensity with
+density glyphs. Gain still applies there.
+
+**Live keys.** In the Monitor view, Tab focuses the waterfall panel (a left
+click on it does too). While it is focused, `{` and `}` step the gain down and
+up by 1 dB, and `b` and `B` cycle the palette forward and back. The title shows
+the current palette and gain. The same keys in any other panel only show a hint.
+
+**Persistence.** A live change is saved in `~/.pancetta/session_state.json`,
+like the decode effort (PAN-270), and restored at the next start. The file also
+records the config value that was running when you made the change. If the
+config value differs at the next start, the config edit is newer: it applies,
+and that saved choice is dropped. The palette and the gain are compared
+separately, so editing one keeps the other's saved choice.
+
+**Restart required.** Edits to `[ui.waterfall]` in `pancetta.toml` take effect
+at the next restart, like every other `[ui]` key.
+
+**What a dB means.** Gain is applied when the waterfall is drawn and never
+changes the data the TX allocator reads. The live rows (one per second) scale
+signal above the per-bin noise median over 12 dB, so on them the dB value is
+exact. The rows drawn once per decode window are stretched between that
+window's minimum and maximum, so on them it is approximate.
 
 ---
 
 ## Environment variables
 
-A small set of environment variables override config keys:
+The first nine variables override config fields. Numeric loader overrides use
+unsigned integers and ignore parse failures. The remaining variables control
+runtime behavior.
+
+Internal relaunch markers such as `PANCETTA_MACOS_RELAUNCHED`, test/rebless
+variables such as `PANCETTA_REGEN_DOCS`, `PANCETTA_BLESS_KEY_EFFECTS`,
+`PANCETTA_BLESS_TX_ABORT`, `PANCETTA_BLESS_THEME_SNAPSHOTS` and `PANCETTA_TX_LOG_CRASH_CHILD`, and benchmark
+instrumentation are not supported operator settings.
 
 | Variable | Effect |
 |---|---|
+| `PANCETTA_CALLSIGN` | `station.callsign` |
+| `PANCETTA_GRID_SQUARE` | `station.grid_square` |
+| `PANCETTA_POWER_WATTS` | `station.power_watts` |
+| `PANCETTA_CAT_PORT` | `rig.interface.port` |
+| `PANCETTA_CAT_BAUD` | `rig.interface.baud_rate` |
+| `PANCETTA_AUDIO_INPUT` | `audio.input_device` |
+| `PANCETTA_AUDIO_OUTPUT` | `audio.output_device` |
+| `PANCETTA_SAMPLE_RATE` | `audio.sample_rate` |
+| `PANCETTA_THEME` | `ui.theme` |
+| `PANCETTA_WORKER_THREADS` | Tokio worker count, default 2 |
+| `PANCETTA_QSO_FILTER_OFF` | `1` disables the in-QSO bandwidth filter |
+| `PANCETTA_SCOPED_FAST_PATH` | `1` forces on, `0` forces off; otherwise the probe decides |
 | `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
 | `PANCETTA_MACOS_RELAUNCH=0` | macOS only. Do not relaunch pancetta as its own microphone-responsible process; macOS then uses the launching app's microphone approval (behavior before PAN-264). |
 | `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
@@ -1274,7 +1385,7 @@ A small set of environment variables override config keys:
 | `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |
 | `RUST_LOG` | Standard `tracing` filter. `info` is recommended; `debug` for triage. |
 
-CLI flags (e.g. `--audio-device`, `--no-rig`, `--no-audio`) take final
+CLI flags (e.g. `--audio-device`, `--no-audio`) take final
 priority over both config and environment.
 
 ---
@@ -1385,6 +1496,33 @@ attenuator_db = 6
 - `[network.station_agent].enabled` set to `false` — the relay session
   and authorization poll stop and remote TX is disarmed, live.
 
+### Station-agent local TX trust
+
+`<key_dir>/clients/<keyId>.pub` is the station-local TX trust root. Each file
+contains a raw 32-byte Ed25519 device public key.
+`pancetta trust-client <keyId> --key-file <path>` creates the `clients/` directory with mode 0700 and its file
+with mode 0600 on Unix. The input can be raw bytes, base64 or base64url text.
+Compare the 12 printed device-key words with the client's own words before it
+transmits. Existing files require `--force` for atomic replacement. Windows
+uses inherited per-user directory ACLs rather than POSIX modes.
+
+`pancetta untrust-client <keyId>` removes the file. Removing an absent file is
+safe. The next local trust refresh disarms that client and the TX
+worker drops queued frames or aborts a keyed frame on its next recheck. It
+remains admitted for read and status; remove its cqdx edge or static
+`tx_allow_list` entry to revoke admission too.
+
+The live `tx_arm_allow_list` is the explicit intersection
+`txArmSet = localTrust ∩ owner edges` in cqdx mode, or
+`txArmSet = localTrust ∩ static tx_allow_list` in static mode. It starts empty
+in cqdx mode until the first successful poll. Both modes reread local keys
+at `[network.cqdx].authorizations_poll_interval_secs` intervals, default 45 s,
+minimum 10 s. Static refreshes read the current admission list, respecting
+live config removals. Cloud mode retains the last successful admission and
+owner-edge sets on fetch failure, but refreshes their intersection with local
+keys every interval, including while a cloud request is stalled. Local
+revocation does not depend on cqdx availability.
+
 **Explicitly restart-required (a diagnostic says so on save):**
 
 - Autonomous `slot_parity`, `needed_means`, `unattended_policy`,
@@ -1404,9 +1542,10 @@ attenuator_db = 6
   unlisted `[station]` and `[autonomous]` keys, `[ui]`, upload/logging settings, …
   Nothing outside the live list above is applied to a running process,
   not even to its in-memory copy of the config; restart pancetta to
-  enforce them. Changes outside the live allowlist are restart-required,
-  but a restart does not activate the unused `[ui]` settings (see
-  `[ui]` — TUI behaviour above). (`[station].callsign`,
+  enforce them. Changes outside the live allowlist are restart-required;
+  a restart applies `[ui] theme`, `[ui.accessibility] high_contrast` and
+  `[ui.waterfall]`, but not the other unused `[ui]` settings (see `[ui]` —
+  TUI behaviour above). (`[station].callsign`,
   `[station].grid_square` and `[autonomous].slot_parity` in particular
   can never change under an in-progress QSO.)
 
@@ -1606,7 +1745,7 @@ not enable autonomous contest operation or change general duplicate admission.
 
 ```toml
 [contest]
-instance_id = "KSQP-2026-K5ARH"
+instance_id = "KSQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "ksqp-ft-2026"
 operator_region = "TX"
@@ -1621,7 +1760,7 @@ For South Carolina fixed digital, use a separate instance and
 
 ```toml
 [contest]
-instance_id = "SCQP-2026-K5ARH"
+instance_id = "SCQP-2026-W5AU"
 profile_id = "us-state-qso-party"
 rules_id = "scqp-digital-fixed-2026"
 operator_region = "SC"

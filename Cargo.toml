@@ -162,8 +162,7 @@ opt-level = 1
 # opt back in with CARGO_PROFILE_DEV_DEBUG=2 and CARGO_INCREMENTAL=1.
 debug = 0
 incremental = false
-# panic = "unwind" so backtraces and panic catching work during testing —
-# release keeps "abort" for binary size and predictable failure semantics.
+# Both dev and release use panic = "unwind" so panic handlers can run.
 panic = "unwind"
 
 [profile.dev.package.pancetta-ft8]
