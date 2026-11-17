@@ -790,6 +790,13 @@ pub enum RigControlMessage {
     /// Live SWR reading (e.g. 1.3 = 1.3:1), from the hamlib polling loop's
     /// `\get_level SWR` reads while PTT is keyed. Only meaningful during TX.
     SwrResponse { swr: f32 },
+    /// PAN-291: one keyed poll's forward-power and ALC readings, from the
+    /// hamlib polling loop while PTT is keyed. `None` fields were not reported
+    /// or not read; never synthesized.
+    TxMeterResponse(pancetta_core::tx_meter::TxMeterReading),
+    /// PAN-291: which TX meters this Hamlib session reads while keyed, and the
+    /// ALC warning limit when the warning is on. Sent once per Hamlib session.
+    TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
     /// Enable/disable rig-level split (RX dial ≠ TX dial). When `enabled`,
     /// the rig transmits on VFO B at `tx_frequency` (Hz) while receiving on
     /// VFO A. When disabled, `tx_frequency` is ignored. Produced by the TUI

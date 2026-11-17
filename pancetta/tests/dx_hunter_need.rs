@@ -111,8 +111,18 @@ async fn completed_and_logged_contact_clears_existing_rows_across_bands_and_rest
     add_rows(&mut app).await;
     let before = render(&mut app, &cache);
     assert_eq!(text(&before).matches("United States - +AR").count(), 2);
-    assert_token_style(&before, "+EM34", app.theme.error_color(), true);
-    assert_token_style(&before, "+AR", app.theme.error_color(), true);
+    assert_token_style(
+        &before,
+        "+EM34",
+        pancetta_tui::theme::fg_color(app.theme.needed),
+        true,
+    );
+    assert_token_style(
+        &before,
+        "+AR",
+        pancetta_tui::theme::fg_color(app.theme.needed),
+        true,
+    );
     println!("Before completion:\n{}", text(&before));
 
     let metadata = contact("AR", "20250101");
@@ -126,8 +136,18 @@ async fn completed_and_logged_contact_clears_existing_rows_across_bands_and_rest
     assert_eq!(app.dx_stations.len(), 2);
     assert!(!text(&after).contains("+EM34"));
     assert!(!text(&after).contains("+AR"));
-    assert_token_style(&after, "EM34", app.theme.foreground_color(), false);
-    assert_token_style(&after, "AR", app.theme.accent_color(), false);
+    assert_token_style(
+        &after,
+        "EM34",
+        pancetta_tui::theme::fg_color(app.theme.text),
+        false,
+    );
+    assert_token_style(
+        &after,
+        "AR",
+        pancetta_tui::theme::fg_color(app.theme.info),
+        false,
+    );
     println!("After completion, without another spot:\n{}", text(&after));
 
     app.band_down(); // 30m
@@ -196,5 +216,10 @@ async fn unavailable_history_preserves_known_values_but_empty_history_enables_ne
     let failed = render(&mut app, &cache);
     assert_eq!(text(&failed).matches("United States - AR").count(), 2);
     assert!(!text(&failed).contains("+EM34"));
-    assert_token_style(&failed, "EM34", app.theme.foreground_color(), false);
+    assert_token_style(
+        &failed,
+        "EM34",
+        pancetta_tui::theme::fg_color(app.theme.text),
+        false,
+    );
 }

@@ -26,6 +26,7 @@ url = ""
 [audio]
 bit_depth = "float32"
 buffer_size = 512
+decimation_antialias_filter = false
 input_channels = 2
 input_device = "default"
 output_channels = 2
@@ -145,6 +146,7 @@ min_dx_score = 0.3
 min_multi_slot_score = 0.7
 needed_means = "unworked"
 qso_stall_switch_after = 4
+recent_failure_window_secs = 1800
 slot_parity = "auto"
 tx_offset_hz = 1500.0
 unattended_policy = "off"
@@ -211,6 +213,9 @@ call_max_hz = 2700.0
 call_min_hz = 1000.0
 response_max_hz = 900.0
 response_min_hz = 300.0
+
+[logging]
+attribution_comment = false
 
 [network.clublog]
 api_key = ""
@@ -447,6 +452,8 @@ method = "none"
 [rig.power_control.band_power]
 
 [rig.power_control.protection]
+alc_overdrive_warning = true
+max_alc = 0.5
 max_power_watts = 100
 max_swr = 3.0
 max_temperature_c = 80.0
@@ -831,6 +838,10 @@ log_scale = 0.8999999761581421
 menu_scale = 1.0
 tooltip_scale = 0.8999999761581421
 ui_scale = 1.0
+
+[ui.waterfall]
+gain_db = 0.0
+palette = "classic"
 
 [ui.window]
 always_on_top = false

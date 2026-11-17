@@ -940,6 +940,11 @@ impl RigControl for RigctldClient {
         parse_reports_swr(&self.dump_caps().await?)
     }
 
+    async fn tx_meter_levels(&self) -> Result<crate::rig::TxMeterLevels> {
+        let _transaction = self.managed_lock().await;
+        parse_tx_meter_levels(&self.dump_caps().await?)
+    }
+
     async fn get_receive_gain(&self) -> Result<ReceiveGain> {
         let _transaction = self.managed_lock().await;
         let replies = self
@@ -1055,13 +1060,15 @@ impl RigControl for RigctldClient {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
                 .await?;
         }
-        self.send_command_with_retry(&format!("F {}", frequency))
-            .await?;
+        let result = self
+            .send_command_with_retry(&format!("F {}", frequency))
+            .await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -1106,13 +1113,17 @@ impl RigControl for RigctldClient {
             self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
                 .await?;
         }
-        let response = self.send_command_with_retry("f").await?;
-        let frequency = Self::parse_frequency(&response)?;
+        let result = async {
+            let response = self.send_command_with_retry("f").await?;
+            Self::parse_frequency(&response)
+        }
+        .await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        let frequency = result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -1138,12 +1149,13 @@ impl RigControl for RigctldClient {
         // rigctld \set_mode takes only (mode, passband), NOT (vfo, mode, passband)
         let cmd = format!("\\set_mode {} {}", Self::mode_to_string(mode), pb);
 
-        self.send_command_with_retry(&cmd).await?;
+        let result = self.send_command_with_retry(&cmd).await;
 
         // Restore to VFO A after operating on a non-current VFO
         if !matches!(vfo, Vfo::Current | Vfo::A) {
             let _ = self.send_command_with_retry("V VFOA").await;
         }
+        result?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -1404,6 +1416,23 @@ impl RigControl for RigctldClient {
         })
     }
 
+    async fn get_tx_meter(&self, meter: crate::rig::TxMeter) -> Result<f32> {
+        let _transaction = self.managed_lock().await;
+        // PAN-291: read once, without retry, like `get_swr`. The coordinator
+        // samples every 500 ms while keyed. Never invent a reading: an
+        // unparseable reply is an error, not 0.
+        let level = meter.hamlib_level();
+        let response = self.send_command(&format!("\\get_level {level}")).await?;
+        response.trim().parse::<f32>().map_err(|e| {
+            anyhow!(
+                "rigctld: could not parse {} from '{}': {}",
+                level,
+                response.trim(),
+                e
+            )
+        })
+    }
+
     async fn set_memory_channel(&self, vfo: Vfo, channel: i32) -> Result<()> {
         let _transaction = self.managed_lock().await;
         if self.data_mode.is_some() {
@@ -1549,15 +1578,33 @@ fn parse_gain_capabilities(response: &str) -> Result<ReceiveGainCapabilities> {
     })
 }
 
-/// `true` when Hamlib's dump_caps `Get level:` list names SWR.
-fn parse_reports_swr(response: &str) -> Result<bool> {
+/// The level names in Hamlib's dump_caps `Get level:` line, with any
+/// `(range)` suffix removed. A reply without that line is an error.
+fn get_level_names(response: &str) -> Result<Vec<&str>> {
     let levels = response
         .lines()
         .find_map(|line| line.strip_prefix("Get level:"))
         .ok_or_else(|| anyhow!("Missing Get level capability field"))?;
     Ok(levels
         .split_whitespace()
-        .any(|token| token.split('(').next() == Some("SWR")))
+        .filter_map(|token| token.split('(').next())
+        .collect())
+}
+
+/// `true` when Hamlib's dump_caps `Get level:` list names SWR.
+fn parse_reports_swr(response: &str) -> Result<bool> {
+    Ok(get_level_names(response)?.contains(&"SWR"))
+}
+
+/// Which transmit meters Hamlib's dump_caps `Get level:` list names, by exact
+/// token (PAN-291). `RFPOWER` alone is the power setting, not a meter.
+fn parse_tx_meter_levels(response: &str) -> Result<crate::rig::TxMeterLevels> {
+    let names = get_level_names(response)?;
+    Ok(crate::rig::TxMeterLevels {
+        alc: names.contains(&"ALC"),
+        forward_power_watts: names.contains(&"RFPOWER_METER_WATTS"),
+        forward_power_fraction: names.contains(&"RFPOWER_METER"),
+    })
 }
 
 #[cfg(test)]
@@ -1592,6 +1639,9 @@ mod allow_list_tests {
             "\\get_level STRENGTH",
             "\\get_level RFPOWER",
             "\\get_level SWR",
+            "\\get_level ALC",
+            "\\get_level RFPOWER_METER",
+            "\\get_level RFPOWER_METER_WATTS",
             "\\set_level RFPOWER 0.5",
             "\\set_vfo VFOA",
             "\\get_vfo",
@@ -2049,7 +2099,7 @@ mod swr_tests {
     }
 
     /// Hang up, let the fake server drain, and return how many SWR reads it saw.
-    async fn requests_after_hangup(
+    pub(super) async fn requests_after_hangup(
         client: Arc<RigctldClient>,
         requests: Arc<AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
@@ -2121,6 +2171,120 @@ mod swr_tests {
 }
 
 #[cfg(test)]
+mod tx_meter_tests {
+    use super::*;
+    use crate::rig::{TxMeter, TxMeterLevels};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fake rigctld: answers every command with `reply`, asserts each command
+    /// equals `expected_command`, and counts requests until the client hangs up.
+    async fn meter_fixture(
+        expected_command: String,
+        reply: &'static str,
+    ) -> (
+        Arc<RigctldClient>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                assert_eq!(command, expected_command);
+                counted.fetch_add(1, Ordering::SeqCst);
+                if writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (client, requests, task)
+    }
+
+    const METERS: [(TxMeter, &str); 3] = [
+        (TxMeter::Alc, "\\get_level ALC\n"),
+        (
+            TxMeter::ForwardPowerWatts,
+            "\\get_level RFPOWER_METER_WATTS\n",
+        ),
+        (TxMeter::ForwardPowerFraction, "\\get_level RFPOWER_METER\n"),
+    ];
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_tx_meter_sends_each_level_once() {
+        for (meter, command) in METERS {
+            let (client, requests, task) = meter_fixture(command.to_string(), "0.35").await;
+            assert_eq!(client.get_tx_meter(meter).await.unwrap(), 0.35);
+            assert_eq!(
+                super::swr_tests::requests_after_hangup(client, requests, task).await,
+                1,
+                "{meter:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_tx_meter_unparseable_reply_is_an_error() {
+        for (meter, command) in METERS {
+            for reply in ["N/A", ""] {
+                let (client, requests, task) = meter_fixture(command.to_string(), reply).await;
+                let result = client.get_tx_meter(meter).await;
+                assert!(result.is_err(), "{reply:?} must not read as {result:?}");
+                assert_eq!(
+                    super::swr_tests::requests_after_hangup(client, requests, task).await,
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_tx_meter_rprt_error_is_read_once() {
+        let (client, requests, task) =
+            meter_fixture("\\get_level ALC\n".to_string(), "RPRT -11").await;
+        assert!(client.get_tx_meter(TxMeter::Alc).await.is_err());
+        assert_eq!(
+            super::swr_tests::requests_after_hangup(client, requests, task).await,
+            1
+        );
+    }
+
+    #[test]
+    fn parse_tx_meter_levels_reads_the_get_level_line() {
+        let all = TxMeterLevels {
+            alc: true,
+            forward_power_watts: true,
+            forward_power_fraction: true,
+        };
+        for (response, expected) in [
+            (
+                "Get level: ATT(0..0/0) PREAMP(0..0/0) ALC(0..1/0) SWR(0..5/0) RFPOWER(0..1/0) RFPOWER_METER(0..1/0) RFPOWER_METER_WATTS(0..100/0)\n",
+                all,
+            ),
+            // Older Hamlib lists bare level names.
+            ("Get level: ALC RFPOWER_METER RFPOWER_METER_WATTS\n", all),
+            // RFPOWER alone is the power setting, not a meter.
+            ("Get level: PREAMP RFPOWER(0..1/0)\n", TxMeterLevels::default()),
+            // Exact token match: ALCX is not ALC.
+            ("Get level: ALCX(0..1/0)\n", TxMeterLevels::default()),
+        ] {
+            assert_eq!(parse_tx_meter_levels(response).unwrap(), expected, "{response}");
+        }
+        assert!(parse_tx_meter_levels("dump_caps:\nSet level: ALC(0..1/0)\n").is_err());
+    }
+}
+
+#[cfg(test)]
 mod receive_gain_tests {
     use super::*;
 
@@ -2169,6 +2333,24 @@ mod receive_gain_tests {
         )])
         .await;
         assert!(client.reports_swr().await.unwrap());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_meter_levels_round_trips_dump_caps() {
+        let (client, task) = fixture(vec![(
+            "+\\dump_caps",
+            "dump_caps:\nGet level: PREAMP(0..0/0) ALC(0..1/0) RFPOWER_METER_WATTS(0..100/0)\nSet level: PREAMP(0..0/0)\nRPRT 0\n",
+        )])
+        .await;
+        assert_eq!(
+            client.tx_meter_levels().await.unwrap(),
+            crate::rig::TxMeterLevels {
+                alc: true,
+                forward_power_watts: true,
+                forward_power_fraction: false,
+            }
+        );
         task.await.unwrap();
     }
 
@@ -2808,5 +2990,200 @@ mod managed_recovery_tests {
         assert!(ready.is_ready());
         client.set_ptt(Vfo::Current, PttState::On).await.unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vfo_restore_tests {
+    use super::*;
+
+    const A_FREQUENCY: u64 = 14_074_000;
+    const B_FREQUENCY: u64 = 7_074_000;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        WriteFrequency,
+        ReadFrequency,
+        WriteMode,
+    }
+
+    impl Operation {
+        fn command(self) -> String {
+            match self {
+                Self::WriteFrequency => format!("F {B_FREQUENCY}"),
+                Self::ReadFrequency => "f".into(),
+                Self::WriteMode => "\\set_mode CW 500".into(),
+            }
+        }
+
+        async fn run(self, client: &RigctldClient, vfo: Vfo) -> Result<()> {
+            match self {
+                Self::WriteFrequency => client.set_frequency(vfo, B_FREQUENCY).await,
+                Self::ReadFrequency => client.get_frequency(vfo).await.map(|_| ()),
+                Self::WriteMode => client.set_mode(vfo, Mode::CW, Some(500)).await,
+            }
+        }
+    }
+
+    // The transcript checks wire order; the stateful replies independently check
+    // which VFO the next current-frequency query actually addresses.
+    async fn exercise(
+        operation: Operation,
+        vfo: Vfo,
+        failure: Option<&'static str>,
+        restore_fails: bool,
+    ) {
+        let (client, server) = super::split_read_tests::connected_client().await;
+        {
+            let mut state = client.state.write().await;
+            state.last_frequency = A_FREQUENCY;
+            state.last_mode = Mode::USB;
+        }
+        let switches = !matches!(vfo, Vfo::A | Vfo::Current);
+        let mut expected = Vec::new();
+        if switches {
+            expected.push(("V VFOB".to_string(), "RPRT 0".to_string()));
+        }
+        let reply = failure.map(str::to_owned).unwrap_or_else(|| {
+            if matches!(operation, Operation::ReadFrequency) {
+                if switches { B_FREQUENCY } else { A_FREQUENCY }.to_string()
+            } else {
+                "RPRT 0".into()
+            }
+        });
+        let attempts = if reply.starts_with("RPRT -") {
+            client.config.retry_count
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            expected.push((operation.command(), reply.clone()));
+        }
+        if switches {
+            for _ in 0..if restore_fails {
+                client.config.retry_count
+            } else {
+                1
+            } {
+                expected.push((
+                    "V VFOA".to_string(),
+                    if restore_fails { "RPRT -2" } else { "RPRT 0" }.to_string(),
+                ));
+            }
+        }
+        expected.push(("f".to_string(), String::new()));
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            let mut selected_b = false;
+            let mut frequencies = [A_FREQUENCY, B_FREQUENCY];
+            for (command, mut reply) in expected {
+                let mut line = String::new();
+                timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(line.trim(), command);
+                if command == "V VFOB" && reply == "RPRT 0" {
+                    selected_b = true;
+                } else if command == "V VFOA" && reply == "RPRT 0" {
+                    selected_b = false;
+                } else if command.starts_with("F ") && reply == "RPRT 0" {
+                    frequencies[usize::from(selected_b)] = B_FREQUENCY;
+                }
+                if reply.is_empty() || (command == "f" && failure.is_none()) {
+                    reply = frequencies[usize::from(selected_b)].to_string();
+                }
+                writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = operation.run(&client, vfo).await;
+        let cached = {
+            let state = client.state.read().await;
+            (state.last_frequency, state.last_mode)
+        };
+        let next_frequency = client.get_frequency(Vfo::Current).await;
+        server_task.await.unwrap();
+        if let Some(failure) = failure {
+            let error = result.unwrap_err().to_string();
+            if failure == "malformed" {
+                assert!(error.contains("Failed to parse frequency"), "{error}");
+            } else {
+                assert!(
+                    error.contains("-1"),
+                    "original operation error lost: {error}"
+                );
+                assert!(
+                    !error.contains("-2"),
+                    "restore error replaced operation error: {error}"
+                );
+            }
+            assert_eq!(cached, (A_FREQUENCY, Mode::USB));
+        } else {
+            result.unwrap();
+            let frequency = match operation {
+                Operation::WriteFrequency => B_FREQUENCY,
+                Operation::ReadFrequency if switches => B_FREQUENCY,
+                _ => A_FREQUENCY,
+            };
+            let mode = if matches!(operation, Operation::WriteMode) {
+                Mode::CW
+            } else {
+                Mode::USB
+            };
+            assert_eq!(cached, (frequency, mode));
+        }
+        let expected_current = if restore_fails
+            || (!switches && matches!(operation, Operation::WriteFrequency) && failure.is_none())
+        {
+            B_FREQUENCY
+        } else {
+            A_FREQUENCY
+        };
+        assert_eq!(next_frequency.unwrap(), expected_current);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_frequency_write_restores_a_before_current_read() {
+        exercise(Operation::WriteFrequency, Vfo::B, Some("RPRT -1"), false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_frequency_read_restores_a() {
+        for reply in ["RPRT -1", "malformed"] {
+            exercise(Operation::ReadFrequency, Vfo::B, Some(reply), false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_mode_write_restores_a() {
+        exercise(Operation::WriteMode, Vfo::B, Some("RPRT -1"), false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_error_survives_failed_restore() {
+        for operation in [
+            Operation::WriteFrequency,
+            Operation::ReadFrequency,
+            Operation::WriteMode,
+        ] {
+            exercise(operation, Vfo::B, Some("RPRT -1"), true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_operations_preserve_vfo_sequences() {
+        for operation in [
+            Operation::WriteFrequency,
+            Operation::ReadFrequency,
+            Operation::WriteMode,
+        ] {
+            for vfo in [Vfo::B, Vfo::A, Vfo::Current] {
+                exercise(operation, vfo, None, false).await;
+            }
+        }
     }
 }

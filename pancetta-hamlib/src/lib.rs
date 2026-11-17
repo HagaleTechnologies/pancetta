@@ -69,12 +69,12 @@ pub use models::{
 };
 pub use rig::{
     ConnectionState, PttState, ReceiveGain, ReceiveGainCapabilities, RigConfig, RigControl,
-    RigStatus,
+    RigStatus, TxMeter, TxMeterLevels,
 };
 pub use rigctld::{RigctldClient, RigctldConfig};
 
 #[cfg(feature = "mock-rig")]
-pub use mock::{MockRig, MockRigConfig};
+pub use mock::{MockRig, MockRigConfig, MockTxMeters};
 
 /// Convenience `Result` alias bound to [`HamlibError`].
 pub type HamlibResult<T> = std::result::Result<T, HamlibError>;

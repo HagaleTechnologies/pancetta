@@ -541,6 +541,27 @@ mod tests {
         }
     }
 
+    /// PAN-291: TX meter readings and capability stay local until dispensa
+    /// Q-0081 defines the `txMeter` event.
+    #[test]
+    fn tx_meter_messages_are_not_on_the_wire() {
+        use crate::message_bus::RigControlMessage;
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterCapability, TxMeterReading};
+
+        let reading = MessageType::RigControl(RigControlMessage::TxMeterResponse(TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.8),
+        }));
+        assert!(server_event_from_bus(&reading).is_none());
+        let capability =
+            MessageType::RigControl(RigControlMessage::TxMeterCapability(TxMeterCapability {
+                forward_power: true,
+                alc: true,
+                alc_limit: Some(0.5),
+            }));
+        assert!(server_event_from_bus(&capability).is_none());
+    }
+
     #[test]
     fn server_event_from_bus_handles_tx_placement_update() {
         use pancetta_qso::frequency::PlacementSnapshot;

@@ -1207,6 +1207,10 @@ async fn emit_split_status(
     .await;
 }
 
+/// Hamlib poll loop tick. PAN-291 reads TX meters on every keyed tick, so this
+/// must stay at or below 500 ms for at least one reading per second.
+pub(crate) const HAMLIB_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Consecutive failed 500 ms polls before the link counts as lost (5 s).
 pub(crate) const RIG_POLL_FAILED_THRESHOLD: u32 = 10;
 /// First poll-loop redial after this many failed polls (2 s).
@@ -2372,7 +2376,7 @@ impl super::ApplicationCoordinator {
                         this_generation,
                         hamlib_generation_for_polling,
                     );
-                    let mut poll_interval = interval(Duration::from_millis(500));
+                    let mut poll_interval = interval(HAMLIB_POLL_INTERVAL);
                     // PAN-115: failure counting + redial schedule (5 s to
                     // PollingFailed; redial 2 s backing off to 30 s).
                     let mut poll_health = RigPollHealth::new();
@@ -2381,6 +2385,10 @@ impl super::ApplicationCoordinator {
                     // PAN-251: one SWR guard per Hamlib session.
                     let mut swr_guard =
                         super::swr_guard::SwrGuard::new(&swr_protection, rig_enabled);
+                    // PAN-291: TX power/ALC readback and the ALC overdrive
+                    // warning, on the same keyed tick as SWR.
+                    let mut alc_guard = super::tx_meter::AlcGuard::new(&swr_protection);
+                    let mut tx_meter_plan: Option<super::tx_meter::TxMeterPlan> = None;
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -2595,6 +2603,28 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                     }
+                                    // PAN-291: probe the TX meters once per Hamlib
+                                    // session, after the SWR probe, so a probe that
+                                    // dropped the link fails fast here.
+                                    if tx_meter_plan.is_none() {
+                                        let plan = super::tx_meter::probe_tx_meters(
+                                            rig_for_polling.as_ref(),
+                                        )
+                                        .await;
+                                        let _ = message_bus
+                                            .send_message(ComponentMessage::new(
+                                                ComponentId::Hamlib,
+                                                ComponentId::Tui,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::TxMeterCapability(
+                                                        plan.capability(alc_guard.alc_limit()),
+                                                    ),
+                                                ),
+                                                Instant::now(),
+                                            ))
+                                            .await;
+                                        tx_meter_plan = Some(plan);
+                                    }
                                     let keyed = super::swr_guard::poll_sees_keyed(
                                         &ptt_active_poll,
                                         &ptt_on_since_poll,
@@ -2609,6 +2639,16 @@ impl super::ApplicationCoordinator {
                                         &display_feed_enabled_poll,
                                     )
                                     .await;
+                                    if let Some(plan) = tx_meter_plan.as_ref() {
+                                        super::tx_meter::tx_meter_poll_step(
+                                            rig_for_polling.as_ref(),
+                                            plan,
+                                            &mut alc_guard,
+                                            keyed,
+                                            &message_bus,
+                                        )
+                                        .await;
+                                    }
                                     // PAN-206: every successful frequency poll also
                                     // observes split. An unsupported read does not
                                     // affect poll_ok or the CAT-link hard mute; a
@@ -9970,6 +10010,190 @@ async fn gain_band_before_retune(
     match rig.get_frequency(vfo).await {
         Ok(hz) => pancetta_core::Band::from_frequency(hz),
         Err(_) => fallback,
+    }
+}
+
+#[cfg(test)]
+mod pan291_tx_meter_tests {
+    //! PAN-291: TX power and ALC readback end to end through the real
+    //! `start_hamlib_component` poll loop, with an injected mock rig that
+    //! reports 48 W and ALC 0.8 (above the default 0.5 limit).
+    use super::*;
+    use crate::message_bus::{RigControlMessage, SendIfOutcome};
+    use pancetta_config::Config;
+    use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+    use pancetta_hamlib::{MockRig, MockRigConfig, MockTxMeters, PttState, RigControl, Vfo};
+    use std::sync::atomic::AtomicBool;
+
+    async fn test_coordinator(config: Config) -> super::super::ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true, // no_audio
+            true, // headless
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    fn metered_rig() -> Arc<MockRig> {
+        Arc::new(MockRig::new(MockRigConfig {
+            tx_meters: Some(MockTxMeters {
+                alc: Some(0.8),
+                forward_power_watts: Some(48.0),
+                forward_power_fraction: None,
+            }),
+            swr_override: Some(1.2),
+            connection_delay_ms: 0,
+            operation_delay_ms: 0,
+            ..Default::default()
+        }))
+    }
+
+    struct Started {
+        coordinator: super::super::ApplicationCoordinator,
+        rig: Arc<MockRig>,
+        tui: crossbeam_channel::Receiver<ComponentMessage>,
+    }
+
+    async fn start() -> Started {
+        let mut coordinator = test_coordinator(Config::default()).await;
+        let rig = metered_rig();
+        coordinator.test_mock_rig = Some(rig.clone());
+        let (_, tui) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+        for _ in 0..250 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire));
+        Started {
+            coordinator,
+            rig,
+            tui,
+        }
+    }
+
+    fn is_overdrive(m: &MessageType) -> bool {
+        matches!(
+            m,
+            MessageType::Error { error_message, .. }
+                if *error_message == super::super::tx_meter::overdrive_alert(0.5)
+        )
+    }
+
+    #[tokio::test]
+    async fn keyed_rig_streams_tx_meter_readings_at_least_once_per_second() {
+        let s = start().await;
+        let c = &s.coordinator;
+        assert_eq!(
+            super::super::tx::send_ptt_command(&c.message_bus, ComponentId::Tui, true, || true),
+            SendIfOutcome::Enqueued
+        );
+        let mut collected: Vec<ComponentMessage> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            collected.extend(s.tui.try_iter());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        collected.extend(s.tui.try_iter());
+
+        let capabilities: Vec<_> = collected
+            .iter()
+            .filter_map(|m| match &m.message_type {
+                MessageType::RigControl(RigControlMessage::TxMeterCapability(cap)) => Some(*cap),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(capabilities.len(), 1, "{capabilities:?}");
+        assert!(capabilities[0].forward_power);
+        assert!(capabilities[0].alc);
+        assert_eq!(capabilities[0].alc_limit, Some(0.5));
+
+        let readings: Vec<(Instant, TxMeterReading)> = collected
+            .iter()
+            .filter_map(|m| match &m.message_type {
+                MessageType::RigControl(RigControlMessage::TxMeterResponse(r)) => {
+                    Some((m.timestamp, *r))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!readings.is_empty(), "no TX meter readings while keyed");
+        for (_, r) in &readings {
+            assert_eq!(
+                *r,
+                TxMeterReading {
+                    forward_power: Some(ForwardPower::Watts(48.0)),
+                    alc: Some(0.8),
+                }
+            );
+        }
+        let first = readings[0].0;
+        let within = readings
+            .iter()
+            .filter(|(at, _)| at.duration_since(first) <= Duration::from_millis(2_500))
+            .count();
+        assert!(within >= 3, "only {within} readings within 2.5 s");
+        for pair in readings.windows(2) {
+            let gap = pair[1].0.duration_since(pair[0].0);
+            assert!(
+                gap <= Duration::from_secs(1),
+                "gap {gap:?} between readings"
+            );
+        }
+
+        let overdrive = collected
+            .iter()
+            .filter(|m| is_overdrive(&m.message_type))
+            .count();
+        assert_eq!(overdrive, 1, "exactly one sticky overdrive alert");
+
+        // Warn-only: TX policy untouched and the rig still keyed.
+        assert_eq!(
+            pancetta_core::TxPolicy::from_u8(c.tx_policy.load(Ordering::Acquire)),
+            pancetta_core::TxPolicy::Full
+        );
+        assert_eq!(s.rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+    }
+
+    #[tokio::test]
+    async fn unkeyed_rig_sends_no_tx_meter_readings() {
+        let s = start().await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let tui: Vec<_> = s.tui.try_iter().map(|m| m.message_type).collect();
+        assert!(
+            !tui.iter().any(|m| matches!(
+                m,
+                MessageType::RigControl(RigControlMessage::TxMeterResponse(_))
+            )),
+            "{tui:?}"
+        );
+        assert!(!tui.iter().any(is_overdrive), "{tui:?}");
     }
 }
 

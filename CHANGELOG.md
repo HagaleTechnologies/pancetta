@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 - PAN-295: a silent audio-output stall (no callbacks for 2 s, no cpal error) now requests a forced device reopen, retrying every 10 s while the output stays silent, at most three times in a rolling ten minutes. The cap covers only these output-watchdog reopens; input-stale and processing-error recovery keep their own cadence. TX stays muted until output callbacks resume; a reopen result alone never unmutes. When the limit is reached the readiness strip shows `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d`. Automated coverage only; hardware qualification pending.
+=======
+- PAN-389: `[ui.waterfall]` sets the waterfall palette (`classic`, `spectrum`, `thermal`, `viridis`) and a display gain (`gain_db`, -12 to 12 dB, positive brightens). In the Monitor view, Tab focuses the waterfall; `{`/`}` step the gain by 1 dB and `b`/`B` cycle the palette. Live changes persist in `~/.pancetta/session_state.json`, and a later config edit wins at the next start. Config edits need a restart. 16-colour terminals ignore the palette.
+
+- PAN-291: while the rig is keyed, the Shift+S station health panel shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `[rig.power_control.protection] max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Set `alc_overdrive_warning = false` to turn it off. Changes require restart. Automated coverage only; real-rig qualification pending.
+- PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
+- PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
+>>>>>>> 397ab8c76cef10a4c7221039b885e91c018ee9ea
 
 - PAN-299: `pancetta export` reads `qsos.adi` without an index, accepts `--since`, `--band`, `--mode` and `--logbook`, and writes ADIF to standard output when `--output` is omitted. Removed `--database`.
+
+- PAN-292: autonomous pouncing honours CQ modifiers. It no longer calls a `CQ DX` from a station on our own continent, or a `CQ NA`, `SA`, `EU`, `AS`, `AF` or `OC` aimed at another continent, and the Diagnostics overlay shows `Skipped CQ from W1ABC — CQ DX excludes us`. Continents come from the offline cty.dat entity data and our station callsign. A callsign that does not resolve is answered as before. Other modifiers, manual calls and spot calls are unchanged.
 
 - PAN-302: selected autonomous policy and TX timing settings apply from validated file edits without restart. Receive gain preset edits apply at the next band crossing. File permission preserves operator pauses, and the readiness strip shows `AUTO OFF IN CONFIG`. Hardware bindings and other settings remain restart-required.
 - PAN-306: logged and exported ADIF records infer COUNTRY, DXCC, CQZ and ITUZ offline, including prefix and exact-call zone overrides. Stored imported fields take precedence individually; unknown calls gain no inferred fields. Existing logs are not rewritten. Automated coverage only; live qualification pending.
@@ -25,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-387: `[ui] theme` now selects the TUI palette: `dark` (default, unchanged), `light` or `high-contrast`; `[ui.accessibility] high_contrast = true` selects high-contrast. Every panel and overlay, including the pickers and modals, follows the theme. An unknown theme warns and uses dark. Restart required.
+- PAN-320: `[audio] decimation_antialias_filter` (default `false`, restart required) opts the 48 kHz receive path into a unity-gain 31-tap FIR anti-alias decimator in place of every-fourth-sample subsampling, with its passband pinned flat to 4 kHz by tests and its CPU cost CI-budgeted under 5 ms per 15 s window. The FIR applies only at 48 kHz; other supported rates keep subsampling with a startup warning. The stage resets at every destructive DSP buffer flush (gain change, dial change, mode change, forward clock jump) and its 15-sample group delay is compensated in the decode-window anchor. The shipped default stays `subsample` until the recorded station A/B (quiet, busy, TX-desense; see `docs/measurements/PAN-320-decimation.md`) shows the FIR decoding strictly more merged messages; the local `decimation-ab` research binary runs that comparison once the PAN-393 captures exist.
 - PAN-304: Keep rotating, byte-exact startup snapshots of changed `qsos.adi` logbooks. Enabled by default with seven copies; directory and retention are configurable.
 
 - PAN-340: `rig.model` now accepts any Hamlib model — a name from the bundled Hamlib 4.5.5 catalog (`"IC-7300"`, `"KX3"`, `"Barrett 950"`), a manufacturer-qualified name, or a numeric Hamlib model ID (`"1045"`), so rigs newer than the bundled catalog still work by number. Case, hyphens and spaces are ignored when matching names; ambiguous names and all-digit model names require the manufacturer-qualified form or the numeric ID. Unknown, malformed or ambiguous values fail config validation with the closest matches and a `rigctl -l` numeric-ID hint, and `pancetta doctor` reports the same message. Selecting more models adds no hardware qualification: only the FTdx10 is radio-qualified. Empty and `Generic` keep their placeholder behavior, and external `rigctld` users with an unknown name must now use its numeric ID.
@@ -42,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pancetta-ft8` 0.9.7: the encoder and modulator are in every build. A program that uses the crate with default features (manta) now gets the decoder passes the station runs: A7 templates, cross-sequence A7 and the GFSK subtraction reference. Before, turning those flags on did nothing in that build. `transmit` now adds only the audio/PTT transmitter (`Ft8Transmitter` with `cpal`, `serialport` and `tokio`) and turns on the `serde` feature, so a `transmit` build also gets the crate's serde derives. `decode_cycle` output is unchanged (PAN-331).
 
 ### Fixed
+
+- PAN-399: DX Hunter keeps a station's `!` (all-time new entity) after a cqdx spot refresh when the local logbook says it is all-time new. The `!` now follows the Pri score and Why text the row shows, so a later decode or a worked contact moves them together. Band Activity, the station card and everything sent to cqdx or remote clients are unchanged.
 
 - PAN-305: The next contest serial number is saved with a crash-safe atomic write (synced temporary sibling, atomic rename) instead of a truncating `fs::write` whose errors were ignored, so a crash mid-write can no longer leave the serial file empty and reset numbering to 001. A failed save is now returned to the contest-response caller instead of being silently swallowed. This fixes persistence only; the dormant contest-exchange scaffolding is not activated by it.
 - PAN-335: The Linux service waits for pipeline initialization and restarts after missed coordinator health passes. `pancetta doctor` now checks enabled network services, log disk space and microphone permission separately, with a fix for each problem. Real systemd restart and macOS TCC qualification remain pending.
@@ -803,6 +817,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
 - Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
 - Station agent: `takeControl` now requires a currently-valid `qsy` or `tx` capability. A status-only viewer's request is refused and the current controller keeps control and stays armed (PAN-253).
+- Station agent: `txArm`, `setFrequency`, `setSplit` and TX requests (`callStation`, `answerCaller`, `startCq`) now require a currently-valid `qsy` or `tx` hello capability before they can take control. A client without one is refused, and the controller and other clients' QSOs are left alone (PAN-283).
 - Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
 - Network errors from the QRZ XML lookup and LoTW clients no longer carry account credentials or session keys into log lines or error messages (PAN-100).
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).

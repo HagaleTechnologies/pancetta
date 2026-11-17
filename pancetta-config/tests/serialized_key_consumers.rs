@@ -105,7 +105,6 @@ const WAIVERS: &[(&str, &str)] = &[
     ("station.antennas", "Pre-existing station schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("tx_placement.auto_repark", "Pre-existing tx_placement schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("tx_placement.repark_min_score_gain", "Pre-existing tx_placement schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
-    ("ui.accessibility.high_contrast", "Pre-existing ui schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("ui.accessibility.keyboard_navigation.focus_ring_color", "Pre-existing ui schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("ui.accessibility.keyboard_navigation.focus_ring_width", "Pre-existing ui schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("ui.accessibility.keyboard_navigation.show_focus", "Pre-existing ui schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
@@ -214,7 +213,7 @@ const WAIVERS: &[(&str, &str)] = &[
     ("watchlist.ttl_secs", "Pre-existing watchlist schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
 ];
 // PAN-303 baseline. This ceiling may only decrease.
-const MAX_WAIVERS: usize = 204;
+const MAX_WAIVERS: usize = 203;
 
 fn collect_words(path: &Path, words: &mut BTreeSet<String>) {
     for entry in std::fs::read_dir(path).unwrap() {

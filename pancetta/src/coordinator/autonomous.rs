@@ -450,6 +450,26 @@ mod pan6_diagnostic_tests {
     }
 
     #[test]
+    fn cq_excludes_us_diagnostic_names_the_modifier() {
+        for (call, modifier, text) in [
+            ("W1ABC", "DX", "Skipped CQ from W1ABC — CQ DX excludes us"),
+            ("DL1ABC", "EU", "Skipped CQ from DL1ABC — CQ EU excludes us"),
+        ] {
+            let diagnostic = skip_record_diagnostic(&pancetta_qso::CqSkipRecord {
+                callsign: Some(call.into()),
+                reason: pancetta_qso::SkipReason::CqExcludesUs { modifier },
+            });
+            assert_eq!(diagnostic.text, text);
+            assert_eq!(diagnostic.target, "qso.autonomous");
+            assert_eq!(diagnostic.level, pancetta_core::DiagnosticLevel::Info);
+        }
+        assert_eq!(
+            skip_reason_key(&pancetta_qso::SkipReason::CqExcludesUs { modifier: "DX" }),
+            "cq_excludes_us"
+        );
+    }
+
+    #[test]
     fn skip_suppression_is_per_reason_and_callsign_and_bounded() {
         let mut seen = SkipDiagSeen::default();
         let now = std::time::Instant::now();
@@ -1871,6 +1891,7 @@ fn skip_reason_key(reason: &pancetta_qso::SkipReason) -> &'static str {
         pancetta_qso::SkipReason::ContentScore { .. } => "content_score",
         pancetta_qso::SkipReason::FrequencyClash => "frequency_clash",
         pancetta_qso::SkipReason::BelowPounceTier => "below_pounce_tier",
+        pancetta_qso::SkipReason::CqExcludesUs { .. } => "cq_excludes_us",
     }
 }
 
@@ -1916,6 +1937,11 @@ pub(crate) fn skip_record_diagnostic(record: &pancetta_qso::CqSkipRecord) -> Gat
             target: "qso.autonomous",
             level: L::Info,
             text: format!("Skipped CQ from {call} — frequency clashes with our own TX"),
+        },
+        pancetta_qso::SkipReason::CqExcludesUs { modifier } => GateDiagnostic {
+            target: "qso.autonomous",
+            level: L::Info,
+            text: format!("Skipped CQ from {call} — CQ {modifier} excludes us"),
         },
     }
 }
@@ -7454,6 +7480,92 @@ mod fq_f9_placement_feed_when_disabled_tests {
             let starts = drain(&qso);
             assert_eq!(starts.iter().any(|m| matches!(&m.message_type,
                 MessageType::QsoMessage(crate::message_bus::QsoMessage::StartAutonomousQso { callsign: Some(call), .. }) if call == "W1AW")), expected, "threshold={threshold}, snr={snr}, bus={starts:?}");
+            c.shutdown_signal.store(true, Ordering::Release);
+        }
+    }
+
+    /// PAN-292 through the real autonomous task (station W1ABC, North
+    /// America): a same-continent `CQ DX` and a `CQ EU` reach the
+    /// Diagnostics overlay as skips and never reach Qso; a `CQ NA` is
+    /// called.
+    #[tokio::test]
+    async fn pan292_cq_modifier_gate_reaches_the_bus_and_the_diagnostics_overlay() {
+        let now = chrono::Utc::now();
+        let next = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        if pancetta_qso::SlotParity::of_time_with_period(next, pancetta_core::slot::SLOT_NS)
+            == pancetta_qso::SlotParity::Odd
+        {
+            tokio::time::sleep(
+                pancetta_core::slot::duration_until(next, now) + Duration::from_millis(500),
+            )
+            .await;
+        }
+        let mut fixtures = Vec::new();
+        for (text, expected_call, expected_skip) in [
+            (
+                "CQ DX W1AW FN31",
+                false,
+                Some("Skipped CQ from W1AW — CQ DX excludes us"),
+            ),
+            (
+                "CQ EU W1AW FN31",
+                false,
+                Some("Skipped CQ from W1AW — CQ EU excludes us"),
+            ),
+            ("CQ NA W1AW FN31", true, None),
+        ] {
+            let mut c = pan302_ready_coordinator(true).await;
+            c.config.write().await.autonomous.cq_after_idle_cycles = 1000;
+            c.config.write().await.autonomous.min_dx_score = 0.5;
+            let (_, qso) = c
+                .message_bus
+                .create_channel(ComponentId::Qso)
+                .await
+                .unwrap();
+            let (_, tui) = c
+                .message_bus
+                .create_channel(ComponentId::Tui)
+                .await
+                .unwrap();
+            c.start_autonomous_component().await.unwrap();
+            let mut decoded = cq_decoded_message();
+            decoded.text = text.to_string();
+            decoded.snr_db = -4.0;
+            // Unknown parity leaves the existing fixed TX-slot policy in charge.
+            decoded.slot_parity = None;
+            c.message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Decoder,
+                    ComponentId::Autonomous,
+                    MessageType::DecodedMessage(decoded),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+            fixtures.push((c, qso, tui, text, expected_call, expected_skip));
+        }
+        pan302_wait_for_even_tx_slot().await;
+        for (c, qso, tui, text, expected_call, expected_skip) in fixtures {
+            let starts = drain(&qso);
+            assert_eq!(
+                starts.iter().any(|m| matches!(&m.message_type,
+                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StartAutonomousQso { callsign: Some(call), .. }) if call == "W1AW")),
+                expected_call,
+                "{text}: bus={starts:?}"
+            );
+            let skip = drain(&tui).into_iter().find_map(|m| match m.message_type {
+                MessageType::DiagnosticEvent { text, callsign, .. }
+                    if text.contains("excludes us") =>
+                {
+                    Some((text, callsign))
+                }
+                _ => None,
+            });
+            assert_eq!(
+                skip,
+                expected_skip.map(|t| (t.to_string(), Some("W1AW".to_string()))),
+                "{text}"
+            );
             c.shutdown_signal.store(true, Ordering::Release);
         }
     }

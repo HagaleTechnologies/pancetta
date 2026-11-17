@@ -7,8 +7,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::config::{Config, Theme};
+use crate::config::Config;
+use crate::theme::Theme;
 use pancetta_qso::priority::PriorityFactors;
+
+/// PAN-291: a TX meter reading counts as live this many seconds after it
+/// arrives. Readings arrive every 500 ms while keyed.
+pub const TX_METER_LIVE_SECS: i64 = 2;
 
 /// Bounds for a real, in-band FT8 audio-offset decode — used to guard against
 /// genuinely out-of-range decoder output (split-VFO artifacts, reference
@@ -502,7 +507,9 @@ pub struct DxStation {
     /// network-spot rescoring, which only runs while the list is loaded
     /// (cqdx spots wait for it).
     pub needed: bool,
-    /// Entity is an ATNO (all-time new one). Subset of `needed`.
+    /// Last writer's ATNO verdict: policy-selected for a decode, cqdx-only
+    /// for a spot. Feeds network-spot scoring; DX Hunter's marker reads
+    /// `ranked_atno` instead (PAN-399).
     pub atno: bool,
     /// Entity never worked on THIS specific band before, per the local QSO
     /// database — independent of `needed`/`atno` (cqdx's needed set for
@@ -576,6 +583,17 @@ impl DxStation {
             (None, Some(network)) => Some((RankOrigin::NetworkSpot, network)),
             (None, None) => None,
         }
+    }
+
+    /// ATNO as the displayed score saw it: the `atno` factor of the rank
+    /// `rank_basis` picks, so DX Hunter's `!`, Pri and Why come from one scoring
+    /// call. The stored `atno` is whichever source wrote last (a decode's
+    /// policy-selected verdict or a cqdx spot's cqdx-only one) and is used only
+    /// for an unscored row or a rank without factors (PAN-399).
+    pub fn ranked_atno(&self) -> bool {
+        self.rank_basis()
+            .and_then(|(_, rank)| rank.factors)
+            .map_or(self.atno, |factors| factors.atno)
     }
 
     fn refresh_priority_score(&mut self) {
@@ -1308,6 +1326,10 @@ impl RigSelectionState {
     }
 }
 
+/// One press of `{`/`}` steps the waterfall display gain by this many dB
+/// (PAN-389).
+pub const WATERFALL_GAIN_STEP_DB: f32 = 1.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivePanel {
     BandActivity,
@@ -1321,6 +1343,10 @@ pub enum ActivePanel {
     /// `Tab`/`Shift+Tab`. Has no "focused callsign" concept (see
     /// `focused_callsign`).
     TxPlacement,
+    /// The Monitor-view waterfall (PAN-389). Monitor-only, with no row cursor
+    /// and no "focused callsign"; focusing it enables the gain (`{`/`}`) and
+    /// palette (`b`/`B`) keys.
+    Waterfall,
 }
 
 impl ActivePanel {
@@ -1329,7 +1355,8 @@ impl ActivePanel {
     /// column where a view has two columns) — so Tab always moves focus to
     /// the next panel actually drawn on screen, and never lands on a panel
     /// the current view doesn't render (Hunt has no Callers row; Run has
-    /// neither Band Activity nor DX Hunter; Monitor has only Band Activity).
+    /// neither Band Activity nor DX Hunter; Monitor has the waterfall and
+    /// Band Activity).
     /// `StationInfo` has no variant here — it was demoted to a non-navigable
     /// station card + status-bar spans in Task 18.
     ///
@@ -1360,7 +1387,7 @@ impl ActivePanel {
                 ActivePanel::Callers,
                 ActivePanel::QsoStatus,
             ],
-            ActiveView::Monitor => &[ActivePanel::BandActivity],
+            ActiveView::Monitor => &[ActivePanel::Waterfall, ActivePanel::BandActivity],
         }
     }
 }
@@ -1640,6 +1667,13 @@ pub struct App {
     /// arrived. Shown in the status bar only during TX; goes stale after 5s.
     pub swr: Option<f32>,
     pub swr_at: Option<DateTime<Utc>>,
+    /// PAN-291: last keyed forward-power/ALC reading and when it arrived.
+    /// Live for [`TX_METER_LIVE_SECS`] after it arrives.
+    pub tx_meter: Option<pancetta_core::tx_meter::TxMeterReading>,
+    pub tx_meter_at: Option<DateTime<Utc>>,
+    /// PAN-291: which TX meters this Hamlib session reads, and the ALC
+    /// warning limit when the warning is on. `None` until announced.
+    pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -1651,6 +1685,14 @@ pub struct App {
     pub autonomous_init_paused: bool,
     pub color_capability: ColorCapability,
     pub waterfall_data: Vec<Vec<f32>>,
+    /// Waterfall colour palette (PAN-389), seeded from `config.ui.waterfall`
+    /// and changed live by `b`/`B` with the waterfall focused. Display only.
+    pub waterfall_palette: pancetta_config::ui::WaterfallPalette,
+    /// Waterfall display gain in dB (PAN-389), seeded from
+    /// `config.ui.waterfall` and stepped live by `{`/`}`. Applied at render
+    /// time only: it never changes `waterfall_data`, which the TX allocator
+    /// and `t` key read.
+    pub waterfall_gain_db: f32,
 
     // Autonomous operator
     pub autonomous_status: Option<AutonomousStatus>,
@@ -1927,7 +1969,7 @@ impl App {
                 );
                 statuses
             },
-            theme: config.ui.theme,
+            theme: Theme::for_name(config.ui.theme),
             diagnostic_events: VecDeque::with_capacity(500),
             recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
@@ -1970,10 +2012,15 @@ impl App {
             signal_strength_at: None,
             swr: None,
             swr_at: None,
+            tx_meter: None,
+            tx_meter_at: None,
+            tx_meter_capability: None,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
             waterfall_data: Vec::new(),
+            waterfall_palette: config.ui.waterfall.palette,
+            waterfall_gain_db: config.ui.waterfall.gain_db,
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
             rig_selection: RigSelectionState::new(),
@@ -2344,6 +2391,8 @@ impl App {
                         self.repin_qso_selection();
                     }
                 }
+                // The waterfall has no row cursor: a click only focuses it.
+                ActivePanel::Waterfall => {}
                 ActivePanel::TxPlacement => unreachable!("excluded by the guard above"),
             }
             return None;
@@ -3036,8 +3085,9 @@ impl App {
     /// is one, wins over the flags stored at decode or spot time, so both
     /// follow a list that loads or changes between decodes, as the Why view
     /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
-    /// too; a newly needed ATNO waits for the next decode. With no verdict
-    /// for the row, the stored flags stand.
+    /// too; a newly needed ATNO's `!` changes with the row's score, at its next
+    /// decode or spot. `atno` is the caller's ATNO input; DX Hunter passes
+    /// `DxStation::ranked_atno` (PAN-399). With no verdict, the inputs stand.
     pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
         match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
             Some(listed) => (listed, atno && listed),
@@ -3225,6 +3275,36 @@ impl App {
     pub fn update_signal_strength(&mut self, db_over_s9: i32) {
         self.signal_strength_db = Some(db_over_s9);
         self.signal_strength_at = Some(Utc::now());
+    }
+
+    /// PAN-291: record a keyed forward-power/ALC reading from the rig.
+    pub fn update_tx_meter(&mut self, reading: pancetta_core::tx_meter::TxMeterReading) {
+        self.tx_meter = Some(reading);
+        self.tx_meter_at = Some(Utc::now());
+    }
+
+    /// PAN-291: record which TX meters this Hamlib session reads.
+    pub fn set_tx_meter_capability(
+        &mut self,
+        capability: pancetta_core::tx_meter::TxMeterCapability,
+    ) {
+        self.tx_meter_capability = Some(capability);
+    }
+
+    /// PAN-291: the last TX meter reading when it arrived at most
+    /// [`TX_METER_LIVE_SECS`] before `now`, else `None` (not keyed, or stale).
+    pub fn tx_meter_live_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<pancetta_core::tx_meter::TxMeterReading> {
+        let at = self.tx_meter_at?;
+        let age = now.signed_duration_since(at);
+        // A negative age (wall clock stepped back) is not live either.
+        if age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(TX_METER_LIVE_SECS) {
+            self.tx_meter
+        } else {
+            None
+        }
     }
 
     /// Record a live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed.
@@ -3625,6 +3705,59 @@ impl App {
             .selected(std::time::Instant::now())
             .map(|e| (e.text.as_str(), e.level))
     }
+    /// Step the waterfall display gain by `step_db` (PAN-389), clamped to
+    /// the config's ±12 dB range, and set the status line. Returns the new
+    /// gain only when it changed, so a press at a limit sends no command.
+    pub fn adjust_waterfall_gain(&mut self, step_db: f32) -> Option<f32> {
+        use pancetta_config::ui::{format_gain_db, WATERFALL_GAIN_DB_MAX, WATERFALL_GAIN_DB_MIN};
+        let old = self.waterfall_gain_db;
+        let new = (old + step_db).clamp(WATERFALL_GAIN_DB_MIN, WATERFALL_GAIN_DB_MAX);
+        let changed = (new - old).abs() > f32::EPSILON;
+        let limit = if !changed && step_db > 0.0 {
+            " (maximum)"
+        } else if !changed && step_db < 0.0 {
+            " (minimum)"
+        } else {
+            ""
+        };
+        if changed {
+            self.waterfall_gain_db = new;
+        }
+        self.set_local_status(
+            format!(
+                "Waterfall gain {}{limit}",
+                format_gain_db(self.waterfall_gain_db)
+            ),
+            pancetta_core::DiagnosticLevel::Info,
+        );
+        changed.then_some(new)
+    }
+
+    /// Cycle the waterfall palette forward (`b`) or back (`B`) (PAN-389) and
+    /// set the status line; on a 16-colour terminal the line says the palette
+    /// only shows on 256-colour terminals. Returns the new palette.
+    pub fn cycle_waterfall_palette(
+        &mut self,
+        forward: bool,
+    ) -> pancetta_config::ui::WaterfallPalette {
+        let palette = if forward {
+            self.waterfall_palette.next()
+        } else {
+            self.waterfall_palette.prev()
+        };
+        self.waterfall_palette = palette;
+        let suffix = if self.color_capability == ColorCapability::Basic {
+            " (shown on 256-colour terminals only)"
+        } else {
+            ""
+        };
+        self.set_local_status(
+            format!("Waterfall palette: {}{suffix}", palette.as_str()),
+            pancetta_core::DiagnosticLevel::Info,
+        );
+        palette
+    }
+
     pub fn set_local_status(&mut self, text: String, level: pancetta_core::DiagnosticLevel) {
         self.statuses.push(
             text,
@@ -4628,6 +4761,8 @@ impl App {
             // its own selection cursor is `placement_cursor` (a slice index,
             // not a callsign).
             ActivePanel::TxPlacement => None,
+            // The waterfall has no station selection either (PAN-389).
+            ActivePanel::Waterfall => None,
         }
     }
 
@@ -5618,6 +5753,65 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn tx_meter_reading_is_live_for_two_seconds() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let now = Utc::now();
+        assert_eq!(app.tx_meter_live_at(now), None);
+        let reading = TxMeterReading {
+            forward_power: Some(ForwardPower::Watts(48.0)),
+            alc: Some(0.12),
+        };
+        app.update_tx_meter(reading);
+        assert_eq!(app.tx_meter_live_at(Utc::now()), Some(reading));
+        let at = app.tx_meter_at.unwrap();
+        assert_eq!(
+            app.tx_meter_live_at(at + chrono::Duration::seconds(TX_METER_LIVE_SECS)),
+            Some(reading)
+        );
+        assert_eq!(
+            app.tx_meter_live_at(at + chrono::Duration::milliseconds(2_001)),
+            None
+        );
+        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(3));
+        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        // A reading stamped after `now` (clock stepped back) is not live.
+        assert_eq!(
+            app.tx_meter_live_at(at - chrono::Duration::seconds(3600)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn alc_overdrive_alert_stays_until_acknowledged() {
+        use pancetta_core::tx_meter::{ForwardPower, TxMeterReading};
+        let text = "ALC overdrive: reduce audio drive (ALC above 0.50 while transmitting)";
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_coded_error_message(text.to_string(), None);
+        for _ in 0..3 {
+            app.update_tx_meter(TxMeterReading {
+                forward_power: Some(ForwardPower::Watts(48.0)),
+                alc: Some(0.2),
+            });
+        }
+        app.tx_meter_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        assert_eq!(app.tx_meter_live_at(Utc::now()), None);
+        let unacked: Vec<_> = app.alerts.iter().filter(|a| !a.acknowledged).collect();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].text, text);
+        assert_eq!(unacked[0].count, 1);
+        app.add_coded_error_message(text.to_string(), None);
+        assert_eq!(app.alerts.iter().filter(|a| a.text == text).count(), 1);
+        assert_eq!(app.alerts.iter().find(|a| a.text == text).unwrap().count, 2);
+        assert!(app.acknowledge_readiness() >= 1);
+        assert!(app
+            .alerts
+            .iter()
+            .filter(|a| a.text == text)
+            .all(|a| a.acknowledged));
+    }
+
+    #[tokio::test]
     async fn dx_row_band_is_source_unit_correct() {
         use pancetta_core::Band;
         // PAN-345: each source derives band from its own unit — cluster Hz,
@@ -6399,7 +6593,7 @@ mod tests {
         }
     }
 
-    async fn fixture_app() -> App {
+    pub(super) async fn fixture_app() -> App {
         App::new(Config::default(), None)
             .await
             .expect("default Config should construct App")
@@ -8298,6 +8492,76 @@ mod tests {
             app.dx_stations.contains_key("JA1ABC"),
             "merge_spot_groups must still insert other stations"
         );
+    }
+
+    #[tokio::test]
+    async fn ranked_atno_follows_the_displayed_rank() {
+        let mut app = fixture_app().await;
+        let mut view = fixture_view("JA1ABC", -10);
+        view.frequency = 14.074;
+        view.needed = true;
+        view.atno = true;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        let local = app.dx_stations["JA1ABC"].local_rank.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".to_string(),
+            needed: false,
+            atno: false,
+        };
+
+        app.merge_spot_groups(std::slice::from_ref(&spot));
+        let entry = &app.dx_stations["JA1ABC"];
+        assert!(!entry.atno);
+        assert!(entry.ranked_atno());
+        // No rank, then a precomputed rank with no factors, use the stored flag.
+        let mut fallback = entry.clone();
+        fallback.local_rank = None;
+        fallback.network_rank = None;
+        for stored in [false, true] {
+            fallback.atno = stored;
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = Some(RankedBy {
+                factors: None,
+                ..local
+            });
+            assert_eq!(fallback.ranked_atno(), stored);
+            fallback.local_rank = None;
+        }
+        // A higher network score wins even after a decode overwrites the flag.
+        view.atno = false;
+        app.add_decoded_message(view.clone()).await.unwrap();
+        app.merge_spot_groups(&[crate::tui_runner::CqdxSpotInfo {
+            needed: true,
+            atno: true,
+            ..spot
+        }]);
+        app.add_decoded_message(view).await.unwrap();
+        assert!(!app.dx_stations["JA1ABC"].atno);
+        assert!(
+            app.dx_stations["JA1ABC"].network_rank.unwrap().score
+                > app.dx_stations["JA1ABC"].local_rank.unwrap().score
+        );
+        assert!(app.dx_stations["JA1ABC"].ranked_atno());
+        // A local refresh clears a stale stored ATNO when its new rank wins.
+        let mut factors = local.factors.unwrap();
+        factors.atno = false;
+        app.dx_stations.get_mut("JA1ABC").unwrap().network_rank = None;
+        app.dx_stations.get_mut("JA1ABC").unwrap().atno = true;
+        app.refresh_local_rank("JA1ABC", 4000, factors);
+        assert!(!app.dx_stations["JA1ABC"].ranked_atno());
     }
 
     #[tokio::test]
@@ -11174,7 +11438,7 @@ mod tests {
 
     // === Task 19: mouse click-to-focus / click-to-park =====================
 
-    fn left_click(x: u16, y: u16) -> crossterm::event::MouseEvent {
+    pub(super) fn left_click(x: u16, y: u16) -> crossterm::event::MouseEvent {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: x,
@@ -11187,7 +11451,7 @@ mod tests {
     /// the SAME `ui::view_rects` the renderer draws from — so this proves
     /// the click lands on the boundary the operator actually sees, not
     /// just on whatever coordinates the test happened to hand-compute.
-    fn operate_panel_rect(app: &App, panel: ActivePanel) -> ratatui::layout::Rect {
+    pub(super) fn operate_panel_rect(app: &App, panel: ActivePanel) -> ratatui::layout::Rect {
         let content_area =
             crate::ui::content_area(Rect::new(0, 0, app.terminal_size.0, app.terminal_size.1));
         crate::ui::view_rects(
@@ -11495,3 +11759,7 @@ mod tests {
         assert_eq!(app.decoded_messages.back().unwrap().message, "frame 1004");
     }
 }
+
+#[cfg(test)]
+#[path = "app/tests/waterfall_panel_focus_tests.rs"]
+mod waterfall_panel_focus_tests;

@@ -67,6 +67,7 @@ pub mod fox;
 pub mod hot_reload;
 pub mod hound;
 pub mod loader;
+pub mod logging;
 pub mod network;
 pub mod rig;
 pub mod station;
@@ -84,6 +85,7 @@ pub use duplicate_check::*;
 pub use fox::*;
 pub use hound::*;
 pub use loader::*;
+pub use logging::*;
 pub use network::*;
 pub use rig::*;
 pub use station::*;
@@ -210,6 +212,10 @@ pub struct Config {
     #[serde(default)]
     pub database: database::DatabaseConfig,
 
+    /// Attribution preferences for new logbook records.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
     /// Contest scoring (PAN-50). Optional startup-only opt-in; absent means
     /// contest scoring is disabled and nothing changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +269,7 @@ impl Default for Config {
             decoder: decoder::DecoderConfig::default(),
             duplicate_checking: duplicate_check::DuplicateCheckingConfig::default(),
             database: database::DatabaseConfig::default(),
+            logging: LoggingConfig::default(),
             contest: None,
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
@@ -284,6 +291,15 @@ fn is_default_app_dir(parent: &std::path::Path, home_dir: Option<&std::path::Pat
     home_dir.map(|h| h.join(".pancetta")).as_deref() == Some(parent)
 }
 
+/// Push the `[ui] theme` load warning (PAN-387) when the label is unknown.
+/// Every config loader that returns warnings calls this once, so an unknown
+/// theme is never silent.
+fn append_theme_warning(config: &Config, warnings: &mut Vec<String>) {
+    if let Some(warning) = config.ui.theme_warning() {
+        warnings.push(warning);
+    }
+}
+
 impl Config {
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
@@ -300,7 +316,8 @@ impl Config {
     pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
         let config = loader.load()?;
-        let warnings = loader.load_warnings();
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
         Ok((config, warnings))
     }
 
@@ -311,10 +328,12 @@ impl Config {
     pub fn load_default_unvalidated() -> ConfigResult<(Self, LoadReport)> {
         let loader = ConfigLoader::new()?;
         let config = loader.load_merged()?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
         let report = LoadReport {
             files: loader.loaded_files(),
             searched: loader.search_paths().to_vec(),
-            warnings: loader.load_warnings(),
+            warnings,
         };
         Ok((config, report))
     }
@@ -332,10 +351,12 @@ impl Config {
         };
         let loader = ConfigLoader::new().map_err(wrap)?;
         let config = loader.load_from_file(path).map_err(wrap)?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
         let report = LoadReport {
             files: vec![path.to_path_buf()],
             searched: Vec::new(),
-            warnings: loader.load_warnings(),
+            warnings,
         };
         Ok((config, report))
     }
@@ -357,7 +378,8 @@ impl Config {
     ) -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
         let config = loader.load_from_file(path)?;
-        let warnings = loader.load_warnings();
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
         Ok((config, warnings))
     }
 
@@ -380,6 +402,7 @@ impl Config {
         self.decoder.validate_section()?;
         self.duplicate_checking.validate_section()?;
         self.database.validate_section()?;
+        self.logging.validate_section()?;
 
         if let Some(contest) = &self.contest {
             contest.validate_section()?;
@@ -407,6 +430,7 @@ impl Config {
         self.decoder.merge_with(other.decoder);
         self.duplicate_checking.merge_with(other.duplicate_checking);
         self.database.merge_with(other.database);
+        self.logging.merge_with(other.logging);
 
         // [contest] replaces as a unit; an overlay without the section leaves
         // the base's contest untouched (absent ≠ disabled — the explicit
@@ -1020,6 +1044,38 @@ pub trait ConfigSection: Default + Clone {
 
     /// Merge this section with another, with the other taking precedence
     fn merge_with(&mut self, other: Self);
+}
+
+#[cfg(test)]
+mod pan387_theme_warning_tests {
+    use super::*;
+
+    #[test]
+    fn append_theme_warning_adds_one_warning_for_an_unknown_theme() {
+        let mut config = Config::default();
+        config.ui.theme = "solarized".to_string();
+        let mut warnings = vec!["existing".to_string()];
+        append_theme_warning(&config, &mut warnings);
+        assert_eq!(
+            warnings,
+            vec![
+                "existing".to_string(),
+                "Unknown ui.theme \"solarized\"; using the dark theme. Valid values: dark, light, high-contrast."
+                    .to_string()
+            ]
+        );
+
+        for label in ["light", "default"] {
+            let mut config = Config::default();
+            config.ui.theme = label.to_string();
+            let mut warnings = Vec::new();
+            append_theme_warning(&config, &mut warnings);
+            assert!(warnings.is_empty(), "{label}");
+        }
+        let mut warnings = Vec::new();
+        append_theme_warning(&Config::default(), &mut warnings);
+        assert!(warnings.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2131,7 +2187,11 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
-        assert_carries_all::<ui::UiConfig>("UiConfig", &[], |a, b| a.merge_with(b));
+        assert_carries_all::<ui::UiConfig>(
+            "UiConfig",
+            &[("waterfall", json!({"palette": "viridis", "gain_db": 7.5}))],
+            |a, b| a.merge_with(b),
+        );
 
         assert_carries_all::<rig::RigConfig>(
             "RigConfig",
@@ -2227,6 +2287,7 @@ mod merge_guard {
             |a, b| a.merge_with(b),
         );
 
+        assert_carries_all::<LoggingConfig>("LoggingConfig", &[], |a, b| a.merge_with(b));
         assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
             a.merge_with(b)
         });

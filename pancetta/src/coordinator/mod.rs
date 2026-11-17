@@ -58,6 +58,7 @@ mod tui_relay;
 mod tx;
 mod tx_halt;
 mod tx_log;
+mod tx_meter;
 mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;
@@ -2299,6 +2300,7 @@ impl ApplicationCoordinator {
         let session_state_path = session_state::session_state_path(pancetta_home.as_deref());
         let session_startup = session_state::resolve(
             config.decoder.effort,
+            &config.ui.waterfall,
             match session_state_path.as_deref() {
                 Some(path) => session_state::load(path),
                 None => session_state::SessionLoad::Missing,
@@ -2308,14 +2310,15 @@ impl ApplicationCoordinator {
         if let Some(reason) = &session_startup.ignored_reason {
             warn!("Session: saved choices ignored ({reason}); using defaults");
         }
-        // A superseding config edit becomes the saved choice: rewrite the
-        // file now, best-effort, so the NEXT restart compares against the
-        // config value that actually won.
-        if session_startup.superseded_saved_effort.is_some() {
+        // A superseding config edit (decode effort, or a PAN-389 waterfall
+        // palette/gain) drops that saved choice: rewrite the file now,
+        // best-effort, so the NEXT restart compares against the config value
+        // that actually won.
+        if session_startup.needs_rewrite() {
             if let Some(path) = session_state_path.as_deref() {
                 if let Err(e) = session_state::save(path, &session_startup.record) {
                     warn!(
-                        "Session: failed to rewrite {} after the config superseded the saved effort: {e}",
+                        "Session: failed to rewrite {} after the config superseded a saved choice: {e}",
                         path.display()
                     );
                 }
@@ -2375,6 +2378,8 @@ impl ApplicationCoordinator {
         ));
 
         // Wrap config in Arc<RwLock> for hot-reloading
+        let recent_failure_window =
+            Duration::from_secs(config.autonomous.recent_failure_window_secs);
         let config = Arc::new(RwLock::new(config));
 
         // hb-216 S2: shared FT8 decoder config + scoped-fast-path atomic.
@@ -2536,7 +2541,9 @@ impl ApplicationCoordinator {
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
-                crate::priority_evaluator::CachedStationLookup::new(),
+                crate::priority_evaluator::CachedStationLookup::with_recent_failure_window(
+                    recent_failure_window,
+                ),
             ),
             cqdx_bridge: None,
             waterfall_to_auto_tx: Some(waterfall_to_auto_tx),
@@ -3954,7 +3961,7 @@ mod tests {
     /// `build_coordinator` with a `pancetta_home` override so the session
     /// state resolves an isolated temp dir (PAN-194 discipline), never the
     /// real `~/.pancetta`.
-    async fn build_coordinator_with_home(
+    pub(super) async fn build_coordinator_with_home(
         config: Config,
         home: Option<PathBuf>,
     ) -> ApplicationCoordinator {
@@ -3979,7 +3986,7 @@ mod tests {
     }
 
     /// Write a session file into `home/.pancetta/session_state.json`.
-    fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
+    pub(super) fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
         let dir = home.join(".pancetta");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session_state.json");
@@ -4854,6 +4861,35 @@ mod tests {
         assert!(coordinator.is_ok());
     }
 
+    #[tokio::test]
+    async fn recent_failure_window_is_seeded_from_config() {
+        let mut config = Config::default();
+        config.autonomous.recent_failure_window_secs = 0;
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true, // no_audio
+            true, // headless
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+            None, // PAN-270: no session-home override
+        )
+        .await;
+
+        let coordinator = coordinator.unwrap();
+        coordinator.cached_lookup.record_failure("DL1ABC");
+        use pancetta_qso::priority::WorkedStationLookup;
+        assert!(!coordinator.cached_lookup.is_recent_failure("DL1ABC"));
+    }
+
     /// Regression test for the blank-TX-placement-instrument bug: the FT8
     /// pipeline (started by `start_pipeline()`, before
     /// `start_autonomous_component()` runs) clones `waterfall_to_auto_tx` by
@@ -5701,3 +5737,7 @@ mod active_qso_freq_tests {
         assert_eq!(hint.secondary, Some((1500.0, expires_at)));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/waterfall_session_restore_tests.rs"]
+mod waterfall_session_restore_tests;

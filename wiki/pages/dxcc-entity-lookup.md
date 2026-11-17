@@ -7,6 +7,7 @@ maintainer: agent
 sources:
   - pancetta-core/src/dxcc.rs
   - pancetta-core/src/dxcc_table.rs
+  - pancetta-core/src/dxcc_continents.rs
   - pancetta-core/scripts/gen_dxcc_table.py
   - pancetta-tui/src/app.rs
   - pancetta-tui/src/dx_need.rs
@@ -88,3 +89,21 @@ N2NL/MM needs CQ 7 even though its entity remains United States. K0ABC uses
 ADIF inference runs in `qso_to_adif`, never the renderer or a TUI frame.
 Imported tags suppress inference per field; historical files stay untouched
 until an explicit export. Tests cover these paths without a rig or account.
+
+## Continent data (PAN-292)
+
+`continent_for_callsign` maps the entity `entity_for_callsign` selects to its
+continent, so it inherits the same normalization, exact-call and KG4 layers.
+The continent is per entity, taken from the cty.dat header (field 3) and keyed
+by the mapped entity name; `continent_of_entity` also answers every registry
+alias (`Cabo Verde` is Africa). An unresolved call returns `None`, and the
+autonomous CQ-modifier gate then never skips.
+
+`dxcc_continents.rs` is regenerated with the same
+`python3 pancetta-core/scripts/gen_dxcc_table.py --supplemental` command and
+leaves the other generated files byte-identical. A per-token `{CC}` continent
+override fails generation on purpose: a per-entity table cannot represent it,
+and silently dropping it could misfile a station. The pinned input has none.
+
+CQ zones are not a continent proxy: zone 40 holds Greenland (North America)
+and Iceland and Svalbard (Europe).
