@@ -129,7 +129,7 @@ ruby -ryaml <<'RUBY' || struct_fail=1
     expect.call(fi == "always() && (#{pr_mg})", "supply-chain if is #{fi.inspect}")
     expect.call(sc_jobs.dig('supply-chain', 'name') == 'Supply Chain',
                 'fan-in job name must stay "Supply Chain" (the required status check)')
-    want = %w[changes osv-pr osv-merge-group install-policy actions-pins]
+    want = %w[changes osv-pr osv-merge-group install-policy actions-pins machete]
     expect.call(sc_jobs.dig('supply-chain', 'needs') == want,
                 "fan-in needs is #{sc_jobs.dig('supply-chain', 'needs').inspect}, want #{want.inspect}")
   end
