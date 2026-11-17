@@ -130,6 +130,10 @@ pub struct StationReadiness {
     pub autonomous_config_disabled: bool,
     /// Every active TX hard-mute cause, in the gate's priority order. Empty ⇔ gate open.
     pub tx_mute_causes: Vec<TxMuteCause>,
+    /// PAN-295: the output is stalled and its automatic reopen budget
+    /// (3 per 10 min) is spent. Display only: shown on the audio blocker
+    /// when `tx_mute_causes` has `AudioOutputDead`; never a TX-gate input.
+    pub audio_output_reopen_exhausted: bool,
     /// The rig did not confirm a PTT-off (teardown or a live unkey); cleared
     /// only when the rig accepts a later PTT-off.
     pub ptt_off_unconfirmed: bool,
@@ -426,6 +430,10 @@ fn item(key: ReadinessKey, severity: Severity, label: &str, detail: &str) -> Rea
     }
 }
 
+/// PAN-295: the audio blocker's label once automatic output reopen is paused.
+const TX_AUDIO_REOPEN_LIMIT_LABEL: &str = "⚠ TX AUDIO AUTO-REOPEN LIMIT: press d";
+const TX_AUDIO_REOPEN_LIMIT_DETAIL: &str = "Automatic output reopen paused after 3 attempts in 10 minutes. TX stays muted until output callbacks resume. Press d to pick a device.";
+
 /// Blocker and Notice items derived from the snapshot's mute causes and the
 /// PTT latch.
 fn cause_items(
@@ -455,6 +463,14 @@ fn cause_items(
                 "⚠ RIG CAT LINK LOST",
                 "Rig CAT link lost — polls failing; pancetta keeps redialling rigctld.",
             )),
+            TxMuteCause::AudioOutputDead if r.audio_output_reopen_exhausted => {
+                blockers.push(item(
+                    ReadinessKey::TxAudioDead,
+                    Severity::Blocker,
+                    TX_AUDIO_REOPEN_LIMIT_LABEL,
+                    TX_AUDIO_REOPEN_LIMIT_DETAIL,
+                ))
+            }
             TxMuteCause::AudioOutputDead => blockers.push(item(
                 ReadinessKey::TxAudioDead,
                 Severity::Blocker,
@@ -688,11 +704,11 @@ mod tests {
     use crate::app::PipelineHealth;
     use crate::config::Config;
 
-    async fn app() -> App {
+    pub(super) async fn app() -> App {
         App::new(Config::default(), None).await.unwrap()
     }
 
-    fn health(audio_alive: bool, clock_skew_warning_s: Option<f64>) -> PipelineHealth {
+    pub(super) fn health(audio_alive: bool, clock_skew_warning_s: Option<f64>) -> PipelineHealth {
         PipelineHealth {
             audio_alive,
             dsp_windows: 10,
@@ -709,18 +725,18 @@ mod tests {
         }
     }
 
-    fn snapshot(causes: &[TxMuteCause]) -> StationReadiness {
+    pub(super) fn snapshot(causes: &[TxMuteCause]) -> StationReadiness {
         StationReadiness {
             tx_mute_causes: causes.to_vec(),
             ..StationReadiness::default()
         }
     }
 
-    fn labels(app: &App) -> Vec<String> {
+    pub(super) fn labels(app: &App) -> Vec<String> {
         readiness_items(app).into_iter().map(|i| i.label).collect()
     }
 
-    fn visible_labels(app: &App) -> Vec<String> {
+    pub(super) fn visible_labels(app: &App) -> Vec<String> {
         readiness_items(app)
             .into_iter()
             .filter(ReadinessItem::is_visible)
@@ -1394,3 +1410,7 @@ mod tests {
         assert_eq!(visible_labels(&app), vec!["⚠ CQDX NEEDS UNKNOWN"]);
     }
 }
+
+#[cfg(test)]
+#[path = "readiness/tests/output_reopen_limit_tests.rs"]
+mod output_reopen_limit_tests;

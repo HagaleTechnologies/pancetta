@@ -1724,6 +1724,12 @@ pub struct ApplicationCoordinator {
     /// exiting. Read by `tx_hard_mute_reason`.
     pub(crate) audio_output_alive: Arc<AtomicBool>,
 
+    /// PAN-295 display-only: `true` while the output is stalled and the
+    /// real audio thread's next automatic output reopen was refused by its
+    /// rolling budget (3 per 10 min). Never a TX-gate input; stays `false`
+    /// under `--no-audio`, stub audio and replay.
+    pub(crate) audio_output_reopen_exhausted: Arc<AtomicBool>,
+
     /// Latched true when the configured audio INPUT device was not found and
     /// capture fell back to another device — RX-side mirror of
     /// `audio_output_default`. Drives a persistent TUI badge via the relay.
@@ -2634,6 +2640,7 @@ impl ApplicationCoordinator {
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
+            audio_output_reopen_exhausted: Arc::new(AtomicBool::new(false)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2864,7 +2871,15 @@ impl ApplicationCoordinator {
                                 .unwrap_or_else(|| "~/.pancetta/callsign_seed.txt".to_string())
                         );
                     }
-                    *self.fp_filter.write().unwrap() = Some(std::sync::Arc::new(filter));
+                    // PAN-290: this write replaces the whole value, so a
+                    // poison flag left by an earlier panic no longer
+                    // describes the data: recover the guard and clear it.
+                    *self
+                        .fp_filter
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(std::sync::Arc::new(filter));
+                    self.fp_filter.clear_poison();
                 }
                 Err(e) => {
                     warn!("FP filter init failed, decodes will pass unfiltered: {}", e);
