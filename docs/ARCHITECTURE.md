@@ -109,6 +109,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `adif_backup.rs` | Changed startup ADIF snapshots and independent retention. |
 | `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
 | `audio.rs` | Audio component startup. |
+| `audio/` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
