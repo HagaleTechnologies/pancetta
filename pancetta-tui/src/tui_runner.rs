@@ -4977,6 +4977,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -5507,6 +5508,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             a.callers_scroll = 0;
             assert!(a.get_selected_station().is_some());
@@ -5596,6 +5598,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
         }
         for event in [
@@ -7002,6 +7005,7 @@ mod key_tests {
                 priority_score: None,
                 priority_factors: None,
                 is_own_tx: false,
+                external: false,
             });
             for i in 0..2 {
                 a.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
@@ -8812,6 +8816,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
@@ -9205,6 +9210,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
             assert!(a.is_engaged("G8KHF"));
@@ -10115,6 +10121,7 @@ mod decode_log_level_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 

@@ -23,7 +23,7 @@ must be treated as best-effort by the implementer.
 | Default port | **2237** |
 | Datagram = 1 message | No batching, no fragmentation handling. Keep datagrams comfortably under MTU; py-wsjtx rejects > 2048 bytes, so treat ~1400 B as a practical ceiling (only `LoggedADIF` gets close) |
 | Direction OUT (pancetta → apps) | Heartbeat, Status, Decode, Clear, QSOLogged, Close, WSPRDecode, LoggedADIF |
-| Direction IN (apps → pancetta) | Heartbeat, Clear, Reply, Close, Replay, HaltTx, FreeText, Location, HighlightCallsign, SwitchConfiguration, Configure, AnnotationInfo |
+| Direction IN (apps → pancetta) | Heartbeat, Clear, Reply, Close, Replay, HaltTx, FreeText, Location, HighlightCallsign, SwitchConfiguration, Configure, AnnotationInfo. The PAN-381 decode listener (a separate loopback socket, server role) also consumes Decode(2) and Status(1) (Status through Mode only) from a same-host WSJT-X |
 
 **Who binds what.** The WSJT-X-role process (pancetta) opens **one** UDP socket on an
 **ephemeral local port**, sends all outbound messages to the single configured
@@ -239,6 +239,16 @@ closed).
 other.
 
 ### IN — pancetta consumes
+
+**PAN-381 decode listener.** A separate, receive-only loopback socket (`decode_listen`,
+pancetta in the server role, the way GridTracker listens on 2237) also consumes
+**Decode (2)** and **Status (1)** from a same-host WSJT-X. Decode uses the OUT field table
+above (New, Time, snr, Delta time, Delta frequency, Mode, Message, Low confidence, Off
+air), each missing trailing field read as its default. Status is read only through Mode
+(`Dial Frequency: u64`, `Mode: utf8`); later fields are ignored under the trailing-bytes
+rule. A Decode is used only after the same Id has sent a Status with a non-zero dial,
+matching GridTracker's rule that an instance is valid only after its first Status (§5).
+Close forgets that Id's dial. The listener never sends a datagram.
 
 **Heartbeat (0)**: same layout as OUT. Liveness/schema info only; **do not require it**
 (GridTracker never sends one).

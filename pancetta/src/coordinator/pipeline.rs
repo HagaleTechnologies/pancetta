@@ -209,6 +209,22 @@ impl GainCaptureRegistry {
 pub(crate) struct RelayedDecode {
     pub(crate) message: pancetta_ft8::DecodedMessage,
     pub(crate) dial_hz: u64,
+    /// PAN-381: `WsjtxUdp` decodes reach only this channel, never the
+    /// message bus.
+    pub(crate) origin: DecodeOrigin,
+}
+
+/// PAN-381: where a [`RelayedDecode`] came from. `Native` is pancetta's own
+/// receiver; `WsjtxUdp` is a same-host WSJT-X's Decode(2) datagram taken in
+/// by the loopback decode listener, carrying the mode its glyph named. An
+/// external decode is display and scoring only: it travels on
+/// `ft8_to_tui_tx` and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeOrigin {
+    Native,
+    WsjtxUdp {
+        mode: pancetta_config::OperatingMode,
+    },
 }
 
 /// PAN-316 (review H-28): the headless decode-drain record, DEBUG-only
@@ -606,6 +622,7 @@ mod tests {
             .send(RelayedDecode {
                 message,
                 dial_hz: window.dial_hz,
+                origin: DecodeOrigin::Native,
             })
             .unwrap();
 
@@ -822,5 +839,23 @@ mod headless_log_level_tests {
         drain_forty(verbose.clone(), "pancetta=debug,warn");
         let text = String::from_utf8(verbose.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.matches("Decoded:").count(), 40);
+    }
+}
+
+/// PAN-381 test hook: hand a test the TUI decode receiver the relay would
+/// otherwise take, so a coordinator-level test can watch exactly what the
+/// WSJT-X decode listener puts on `ft8_to_tui_tx`. Placed after all
+/// production code so the first `#[cfg(test)]` cutoff hides nothing.
+#[cfg(test)]
+impl super::ApplicationCoordinator {
+    pub(crate) fn take_tui_decode_receiver_for_test(
+        &mut self,
+    ) -> crossbeam_channel::Receiver<RelayedDecode> {
+        self.decode_handles
+            .as_mut()
+            .expect("decode handles initialized")
+            .ft8_to_tui_rx
+            .take()
+            .expect("TUI decode receiver not yet taken")
     }
 }

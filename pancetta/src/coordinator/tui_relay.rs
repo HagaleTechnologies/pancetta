@@ -4800,11 +4800,22 @@ fn decoded_view_for_relay(
         );
     }
 
+    // PAN-381: an external (WSJT-X UDP) decode shows the mode its glyph
+    // named, not pancetta's own protocol mode, and is tagged for display.
+    // Everything above — enrichment and the display rank — is the same
+    // code path a native decode takes.
+    let (mode, external) = match relayed.origin {
+        super::pipeline::DecodeOrigin::WsjtxUdp { mode } => (mode, true),
+        super::pipeline::DecodeOrigin::Native => (
+            pancetta_config::OperatingMode::from_u8(ctx.protocol_mode),
+            false,
+        ),
+    };
+
     pancetta_tui::DecodedMessageView {
         timestamp: chrono::Utc::now(),
         frequency: dial_mhz,
-        mode: super::mode_str(pancetta_config::OperatingMode::from_u8(ctx.protocol_mode))
-            .to_string(),
+        mode: super::mode_str(mode).to_string(),
         snr: decoded_msg.snr_db as i32,
         delta_time: decoded_msg.time_offset as f32,
         delta_freq: decoded_msg.frequency_offset as f32,
@@ -4822,6 +4833,7 @@ fn decoded_view_for_relay(
         priority_score,
         priority_factors,
         is_own_tx: false,
+        external,
     }
 }
 
@@ -5752,6 +5764,7 @@ mod tui_relay_tests {
             let relayed = crate::coordinator::pipeline::RelayedDecode {
                 message,
                 dial_hz: 14_074_000,
+                origin: crate::coordinator::pipeline::DecodeOrigin::Native,
             };
             let mut last_grids = super::RelayCache::default();
             let mut last_rank_inputs = super::RelayCache::default();
@@ -5942,6 +5955,7 @@ mod tui_relay_tests {
                     priority_score,
                     priority_factors,
                     is_own_tx: false,
+                    external: false,
                 })
                 .await
                 .unwrap();
@@ -6039,6 +6053,7 @@ mod tui_relay_tests {
         crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 14_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         }
     }
 
@@ -6819,6 +6834,7 @@ mod tui_relay_tests {
             priority_score,
             priority_factors,
             is_own_tx: false,
+            external: false,
         })
         .await
         .unwrap();
@@ -7577,10 +7593,12 @@ mod tui_relay_tests {
         let old_band = crate::coordinator::pipeline::RelayedDecode {
             message: message.clone(),
             dial_hz: 7_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
         let new_band = crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 14_074_000,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
 
         assert_eq!(decode_view_dial_mhz(&old_band), 7.074);
@@ -7603,6 +7621,7 @@ mod tui_relay_tests {
         let unknown_dial = crate::coordinator::pipeline::RelayedDecode {
             message,
             dial_hz: 0,
+            origin: crate::coordinator::pipeline::DecodeOrigin::Native,
         };
 
         assert_eq!(decode_view_dial_mhz(&unknown_dial), 14.074);
@@ -9565,3 +9584,7 @@ pub(super) fn record_tui_failure(
 #[cfg(test)]
 #[path = "tui_relay/tests/waterfall_session_tests.rs"]
 mod waterfall_session_tests;
+
+#[cfg(test)]
+#[path = "tui_relay/tests/external_decode_tests.rs"]
+mod external_decode_tests;
