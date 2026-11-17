@@ -29,6 +29,7 @@ pancetta-tui = { path = "../pancetta-tui" }
 pancetta-config = { path = "../pancetta-config" }
 pancetta-hamlib = { path = "../pancetta-hamlib" }
 pancetta-qso = { path = "../pancetta-qso" }
+quick-xml = { workspace = true }
 pancetta-dx = { path = "../pancetta-dx" }
 pancetta-cqdx = { path = "../pancetta-cqdx" }
 pancetta-protocol = { path = "../pancetta-protocol" }

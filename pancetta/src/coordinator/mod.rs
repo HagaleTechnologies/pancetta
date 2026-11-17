@@ -31,6 +31,7 @@ mod ft8;
 pub mod gain_sweep;
 mod gain_sweep_runtime;
 mod hamlib;
+mod n1mm_udp;
 pub use hamlib::apply_receive_gain_preset;
 mod health;
 mod pipeline;

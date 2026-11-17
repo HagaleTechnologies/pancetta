@@ -157,3 +157,52 @@ PAN-300 verifies actual subprocess execution with fake tqsl, including optional 
 ### Export (PAN-299)
 
 `pancetta export` reads `qsos.adi` directly without opening the index or taking the writer lock. It converts records through `record_to_qso`, `adif_to_qso`, `qso_to_adif` and `qso_to_record`, preserving export-time entity enrichment and imported type indicators. Filters combine with AND: `--since` is an inclusive UTC date, `--band` matches BAND or falls back to FREQ, `--mode` matches MODE or SUBMODE, and `--callsign` matches a CALL substring. Text comparisons ignore case; unknown bands do not match. Unreadable records are reported and skipped. `--logbook` replaces `--database`; without `--output`, ADIF goes to standard output and status goes to standard error. Records keep logbook order.
+
+### N1MM contactinfo UDP (PAN-382)
+
+`[logging] n1mm_udp` names one IP address and port. When it is set, Pancetta
+sends one N1MM Logger+ `<contactinfo>` XML datagram there for every logged QSO.
+The builder, the gate and the emitter task live in a coordinator module,
+`pancetta/src/coordinator/n1mm_udp.rs`, beside the WSJT-X UDP mapper. The QSO
+component spawns the emitter next to the upload subscriber, so `qso.rs` gains
+only the gate and the spawn.
+
+The key is an `Option<String>` that is not serialized when unset, so
+`defaults.toml` is unchanged. Absent or blank means off, which keeps a settings
+editor that writes `""` from breaking startup. A non-blank value must parse as
+a socket address, the same rule as `network.wsjtx_udp.destination`, and the
+error names the field and gives an example. Hostnames, a bare port and an
+address without a port are rejected.
+
+The datagram is built from the `AdifQso` record `qso_to_adif` makes for
+`qsos.adi`, with the station power and attribution settings, so it never
+formats a field a second way. An unknown contra callsign, or a frequency
+outside the 13 known bands (as when the rig dial is unknown and the event
+still carries the audio offset), logs one warning and sends nothing; a wrong
+band would land in the operator's other logbook.
+
+Each text value drops the characters XML 1.0 cannot carry and is then
+escaped with `quick_xml::escape::escape`. `quick-xml` was already built for
+`pancetta-dx`, so no new crate enters the build.
+
+The emitter binds an unspecified address of the destination's family and
+enables broadcast on IPv4, so a LAN broadcast address works. A bind failure
+disables it for the run with a warning, as the WSJT-X component does. Its task
+ends when the QSO-event channel closes and never reads the shutdown flag (the
+PAN-232 and PAN-274 rule), so a QSO that completes after the shutdown flag
+is set is still broadcast. Shutdown does not wait for the task, because a UDP
+send has nothing to flush. A Qso supervisor restart closes the old channel and spawns a new
+emitter on the new manager. Under `--replay` the gate returns no destination
+and no socket is bound.
+
+`app` is `N1MM`, because programs written for N1MM may filter on it. Other
+constants copy the N1MM+ documentation example. The 60 m token `5.3` and the
+70 cm token `432` are not in that page and are listed as unverified.
+
+`docs/INTEROP.md` lists GridTracker 2, JTAlert, Log4OM 2 and WaveLogGate on
+both outbound channels, because review item L3 D2 concerns the WSJT-X path
+and the vendor documentation says three of the four programs do not take
+`contactinfo`. A separate column keeps what the vendor documents apart from
+what was verified. `pancetta-config/tests/interop_table.rs` stops a row from
+claiming a result without a date. Every row ships unverified; JTAlert and
+Log4OM 2 stay `unverified (no Windows station)` until a Windows host exists.

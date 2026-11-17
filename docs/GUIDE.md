@@ -374,6 +374,8 @@ required. GridTracker's "Halt TX" button (`HaltTx`) is always honored
 once `accept_udp_requests = true`, independent of `allow_tx_initiation`
 — stopping TX doesn't need the same consent as starting it.
 
+What has been checked with each logger: [compatibility table](INTEROP.md).
+
 ### …see why something isn't working?
 
 1. `pancetta doctor` from a shell — config, clock, audio, decoder, rig.

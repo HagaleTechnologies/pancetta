@@ -105,3 +105,19 @@ Only complete generated ADIF names count, separately from SQLite and import
 backups. Retention never rotates or replaces the source `qsos.adi`.
 A temporary owner-only file is synced before no-clobber hard-link publication;
 a failed write or publication never prunes old snapshots.
+
+## N1MM contactinfo UDP gotchas (PAN-382)
+
+- `QsoMetadata.frequency` in the emitted `QsoCompleted` is the RF frequency
+  (dial plus offset) only when a dial is known. With no dial it is still the
+  audio offset, so the emitter skips the QSO with a warning instead of sending
+  an empty or wrong band.
+- `n1mm_udp` is an `Option` leaf. The `merge_with` guard perturbs only scalar
+  leaves, so `merge_with_carries_every_field` needs the
+  `("n1mm_udp", json!("127.0.0.1:12060"))` override; without it a dropped
+  merge line passes.
+- The emitter task ends on `RecvError::Closed`, never on the shutdown flag
+  (PAN-232/PAN-274), so a completion after the shutdown flag is set is still
+  broadcast. Shutdown does not wait for the task.
+- `<app>` is `N1MM`, not `pancetta`: consumers written for N1MM may filter on
+  it.
