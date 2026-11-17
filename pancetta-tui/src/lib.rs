@@ -45,6 +45,7 @@ mod presentation;
 pub mod readiness;
 pub mod spot_call;
 mod status;
+pub mod theme;
 pub mod tui_runner;
 pub mod ui;
 pub mod upload_status;
@@ -56,7 +57,8 @@ pub use app::{
     ActivePanel, App, AutonomousStatus, ColorCapability, DecodedMessageView, DevicePanel,
     DeviceSelectionState, DxStation, PipelineHealth, QsoStatus, StationInfo,
 };
-pub use config::{Config, Theme};
+pub use config::Config;
+pub use theme::{Theme, ThemeName};
 pub use view::ActiveView;
 
 /// TUI library version

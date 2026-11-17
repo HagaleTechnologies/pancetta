@@ -41,6 +41,12 @@ const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 /// so the configured input rate must be a whole multiple of this.
 pub(crate) const DSP_TARGET_SAMPLE_RATE_HZ: u32 = 12_000;
 
+/// dB span of the live waterfall rows: each row value is the signal above the
+/// per-bin median noise floor over this many dB, clamped to 0..1. The TUI
+/// waterfall's display gain (PAN-389) uses the same span
+/// (`pancetta_tui::widgets::WATERFALL_DB_SPAN`); a test pins the two equal.
+pub(crate) const NOISE_FLOOR_DB_SCALE: f32 = 12.0;
+
 /// Whether `rate` can drive the DSP decimation path in
 /// [`start_dsp_pipeline`].
 ///
@@ -1021,7 +1027,6 @@ impl super::ApplicationCoordinator {
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
             const BIN_HISTORY_LEN: usize = 60;
-            const NOISE_FLOOR_DB_SCALE: f32 = 12.0;
             const MIN_HISTORY_FOR_FLOOR: usize = 5;
             let mut bin_history: Vec<std::collections::VecDeque<f32>> = Vec::new();
             let mut live_wf_planner = rustfft::FftPlanner::<f32>::new();
@@ -3627,3 +3632,7 @@ mod decimation_stage_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dsp/tests/waterfall_scale_tests.rs"]
+mod waterfall_scale_tests;

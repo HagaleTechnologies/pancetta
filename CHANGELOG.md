@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - PAN-315: use rustls for HTTPS and WSS, remove SQLite TLS and unused dependencies, replace validator with equivalent station bound checks, align WebSocket and system utility versions, declare Rust 1.98, and enforce dependency hygiene in Supply Chain. The sha2 0.11 migration remains follow-up work.
+- PAN-389: `[ui.waterfall]` sets the waterfall palette (`classic`, `spectrum`, `thermal`, `viridis`) and a display gain (`gain_db`, -12 to 12 dB, positive brightens). In the Monitor view, Tab focuses the waterfall; `{`/`}` step the gain by 1 dB and `b`/`B` cycle the palette. Live changes persist in `~/.pancetta/session_state.json`, and a later config edit wins at the next start. Config edits need a restart. 16-colour terminals ignore the palette.
 - PAN-291: while the rig is keyed, the Shift+S station health panel shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `[rig.power_control.protection] max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Set `alc_overdrive_warning = false` to turn it off. Changes require restart. Automated coverage only; real-rig qualification pending.
 - PAN-293: failed-QSO priority penalties expire after 30 minutes by default. `[autonomous] recent_failure_window_secs` sets the window in seconds; `0` disables it. Changes require restart.
 - PAN-298: new contacts no longer carry the cqdx.io/Pancetta attribution in ADIF COMMENT; set `[logging] attribution_comment = true` to keep it.
@@ -30,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PAN-387: `[ui] theme` now selects the TUI palette: `dark` (default, unchanged), `light` or `high-contrast`; `[ui.accessibility] high_contrast = true` selects high-contrast. Every panel and overlay, including the pickers and modals, follows the theme. An unknown theme warns and uses dark. Restart required.
 - PAN-320: `[audio] decimation_antialias_filter` (default `false`, restart required) opts the 48 kHz receive path into a unity-gain 31-tap FIR anti-alias decimator in place of every-fourth-sample subsampling, with its passband pinned flat to 4 kHz by tests and its CPU cost CI-budgeted under 5 ms per 15 s window. The FIR applies only at 48 kHz; other supported rates keep subsampling with a startup warning. The stage resets at every destructive DSP buffer flush (gain change, dial change, mode change, forward clock jump) and its 15-sample group delay is compensated in the decode-window anchor. The shipped default stays `subsample` until the recorded station A/B (quiet, busy, TX-desense; see `docs/measurements/PAN-320-decimation.md`) shows the FIR decoding strictly more merged messages; the local `decimation-ab` research binary runs that comparison once the PAN-393 captures exist.
 - PAN-304: Keep rotating, byte-exact startup snapshots of changed `qsos.adi` logbooks. Enabled by default with seven copies; directory and retention are configurable.
 

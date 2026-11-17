@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -48,8 +47,13 @@ pub struct StationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
-    pub theme: Theme,
+    /// Palette name; `crate::theme::Theme::for_name` turns it into tokens.
+    pub theme: crate::theme::ThemeName,
     pub show_coordinates: bool,
+    /// Waterfall palette and display gain (`[ui.waterfall]`, PAN-389). The
+    /// coordinator passes the session-resolved effective values.
+    #[serde(default)]
+    pub waterfall: pancetta_config::ui::WaterfallDisplayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,12 +89,6 @@ pub struct Band {
     pub power_limit: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum Theme {
-    Dark,
-    Light,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -106,8 +104,9 @@ impl Default for Config {
                 tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
             },
             ui: UiConfig {
-                theme: Theme::Dark,
+                theme: crate::theme::ThemeName::Dark,
                 show_coordinates: true,
+                waterfall: pancetta_config::ui::WaterfallDisplayConfig::default(),
             },
             audio: AudioConfig {
                 device: None,
@@ -288,63 +287,6 @@ impl Config {
     }
 }
 
-// Color schemes for different themes
-impl Theme {
-    pub fn background_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::Black,
-            Theme::Light => Color::White,
-        }
-    }
-
-    pub fn foreground_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::White,
-            Theme::Light => Color::Black,
-        }
-    }
-
-    pub fn accent_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::Cyan,
-            Theme::Light => Color::Blue,
-        }
-    }
-
-    pub fn border_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::Gray,
-            Theme::Light => Color::DarkGray,
-        }
-    }
-
-    pub fn selected_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::Yellow,
-            Theme::Light => Color::Red,
-        }
-    }
-
-    pub fn success_color(&self) -> Color {
-        Color::Green
-    }
-
-    pub fn warning_color(&self) -> Color {
-        Color::Yellow
-    }
-
-    pub fn error_color(&self) -> Color {
-        Color::Red
-    }
-
-    pub fn muted_color(&self) -> Color {
-        match self {
-            Theme::Dark => Color::DarkGray,
-            Theme::Light => Color::Gray,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +315,7 @@ mod tests {
         let loaded_config = Config::load(temp_file.path()).unwrap();
 
         assert_eq!(config.station.call_sign, loaded_config.station.call_sign);
-        assert_eq!(config.ui.theme as u8, loaded_config.ui.theme as u8);
+        assert_eq!(config.ui.theme, loaded_config.ui.theme);
     }
 
     #[test]
@@ -389,15 +331,8 @@ mod tests {
         assert!(!saved.contains("replay"));
         assert!(!Config::load(temp_file.path()).unwrap().replay);
     }
-
-    #[test]
-    fn test_theme_colors() {
-        let dark_theme = Theme::Dark;
-        let light_theme = Theme::Light;
-
-        assert_eq!(dark_theme.background_color(), Color::Black);
-        assert_eq!(light_theme.background_color(), Color::White);
-        assert_eq!(dark_theme.foreground_color(), Color::White);
-        assert_eq!(light_theme.foreground_color(), Color::Black);
-    }
 }
+
+#[cfg(test)]
+#[path = "config/tests/waterfall_config_tests.rs"]
+mod waterfall_config_tests;
