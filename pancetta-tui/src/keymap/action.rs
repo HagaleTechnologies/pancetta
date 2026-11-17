@@ -26,7 +26,7 @@ pub enum Action {
     OpenOffsetModal,
     /// `/`: enter compose (free-text TX) mode.
     EnterCompose,
-    /// Enter outside Callers/TxPlacement: hint toward compose.
+    /// Enter on Band Activity or QSO Status: hint toward compose.
     ComposeHint,
     /// Shift+D: open the diagnostics overlay at the newest event.
     OpenDiagnostics,
@@ -34,7 +34,7 @@ pub enum Action {
     OpenHealth,
     /// Shift+R: open the Recent-QSOs overlay at the newest entry.
     OpenRecentQsos,
-    /// `w`: open the Why overlay.
+    /// `w`, or Enter on DX Hunter: open the Why overlay.
     OpenWhy,
     /// Esc while the operator-stop banner shows: clear it.
     ClearStopBanner,

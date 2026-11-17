@@ -59,5 +59,5 @@ r27 | * TX NOW  W#AW N#CALL -## @####Hz   ⋯ QUEUED: (none)                    
 r27 s 0+35 White/Red/BOLD 35+65 White/Black/-
 r28 |AUD DSP:## FT#:## | Level: #.#% | S:--- | Dev: Default | Msgs: ## | DX: # | Fixture status          |
 r28 s 0+3 LightGreen/Black/BOLD 3+1 White/Black/- 4+6 LightGreen/Black/BOLD 10+1 White/Black/- 11+6 LightGreen/Black/BOLD 17+59 White/Black/- 76+14 Cyan/Black/- 90+10 White/Black/-
-r29 |Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit                   |
-r29 s 0+5 LightYellow/Black/BOLD 5+14 Gray/Black/- 19+6 LightYellow/Black/BOLD 25+6 Gray/Black/- 31+3 LightYellow/Black/BOLD 34+8 Gray/Black/- 42+1 LightYellow/Black/BOLD 43+13 Gray/Black/- 56+1 LightYellow/Black/BOLD 57+9 Gray/Black/- 66+1 LightYellow/Black/BOLD 67+8 Gray/Black/- 75+1 LightYellow/Black/BOLD 76+24 Gray/Black/-
+r29 |Run view | Up/Down:Select | r:Resend | k:Abort | v:View | ?:Help | q:Quit                           |
+r29 s 0+8 White/Black/BOLD 8+3 Gray/Black/- 11+7 LightYellow/Black/BOLD 18+10 Gray/Black/- 28+1 LightYellow/Black/BOLD 29+10 Gray/Black/- 39+1 LightYellow/Black/BOLD 40+9 Gray/Black/- 49+1 LightYellow/Black/BOLD 50+8 Gray/Black/- 58+1 LightYellow/Black/BOLD 59+8 Gray/Black/- 67+1 LightYellow/Black/BOLD 68+32 Gray/Black/-
