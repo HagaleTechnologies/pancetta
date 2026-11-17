@@ -360,6 +360,8 @@ async fn fixture(name: ThemeName) -> App {
     decodes[2].needed = true;
     decodes[3].worked_before = true;
     decodes[4].band_needed = true;
+    // PAN-381: the JA1ABC CQ came from a same-host WSJT-X (`EXT` tag).
+    decodes[0].external = true;
     app.decoded_messages.extend(decodes);
 
     app.device_selection.input_devices = vec![
@@ -464,6 +466,8 @@ async fn fixture(name: ThemeName) -> App {
     stations[3].notable_type = Some("DXpedition".to_string());
     stations[3].source = SpotSource::Both;
     stations[4].worked_before = true;
+    // PAN-381: K1ABC heard only through WSJT-X (`EXT` Src).
+    stations[4].source = SpotSource::External;
     stations[5].band_needed = true;
     for s in stations {
         app.dx_stations.insert(s.call_sign.clone(), s);

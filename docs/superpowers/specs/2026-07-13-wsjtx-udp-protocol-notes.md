@@ -24,6 +24,7 @@ must be treated as best-effort by the implementer.
 | Datagram = 1 message | No batching, no fragmentation handling. Keep datagrams comfortably under MTU; py-wsjtx rejects > 2048 bytes, so treat ~1400 B as a practical ceiling (only `LoggedADIF` gets close) |
 | Direction OUT (pancetta → apps) | Heartbeat, Status, Decode, Clear, QSOLogged, Close, WSPRDecode, LoggedADIF |
 | Direction IN (apps → pancetta) | Heartbeat, Clear, Reply, Close, Replay, HaltTx, FreeText, Location, HighlightCallsign, SwitchConfiguration, Configure, AnnotationInfo |
+| Direction IN, PAN-381 decode listener (WSJT-X → pancetta) | Decode, Status (through Mode only), Close |
 
 **Who binds what.** The WSJT-X-role process (pancetta) opens **one** UDP socket on an
 **ephemeral local port**, sends all outbound messages to the single configured
@@ -33,6 +34,15 @@ of the datagrams they receive. Verified in GridTracker (BSD-3): it stores `remot
 from each received packet and sends Reply/HaltTx/Configure to exactly that addr:port;
 k0swe/wsjtx-go (Apache-2.0) does the same. So pancetta must keep its sending socket
 open and poll it for requests — there is no separate listening port on the WSJT-X side.
+
+**PAN-381 decode listener (server role).** Separately from the WSJT-X-role socket
+above, pancetta can bind a second, receive-only UDP socket on a fixed loopback
+address (`[network.wsjtx_udp] decode_listen`, default `127.0.0.1:2238`) when
+`accept_decodes = true`. Here pancetta plays the *companion* role: a same-host
+WSJT-X's **UDP Server** setting points at that address, and pancetta also consumes
+WSJT-X's **Decode (2)** and **Status (1)** datagrams (Status through its Mode field
+only; later fields are ignored under the trailing-bytes rule). This socket never
+sends a datagram, so it never answers or replies to WSJT-X.
 
 ### Pancetta admission policy (PAN-312, not an upstream protocol requirement)
 
@@ -239,6 +249,14 @@ closed).
 other.
 
 ### IN — pancetta consumes
+
+**PAN-381 decode listener.** The separate loopback decode listener (§1) also consumes
+**Decode (2)** with the OUT layout above (all fields through `OffAir`; missing
+trailing fields read as their defaults) and **Status (1)** through `Mode`
+(`DialFrequency` and the mode string; the remaining fields are ignored). It acts
+only on a live decode (`New = true`, `OffAir = false`, `LowConfidence = false`) with mode glyph
+`~` or `+` from a sender Id that has sent a Status with a non-zero dial, and a
+Close from that Id forgets its dial. Every other message type is ignored there.
 
 **Heartbeat (0)**: same layout as OUT. Liveness/schema info only; **do not require it**
 (GridTracker never sends one).
