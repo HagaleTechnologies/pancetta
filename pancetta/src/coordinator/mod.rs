@@ -2294,6 +2294,7 @@ impl ApplicationCoordinator {
         let session_state_path = session_state::session_state_path(pancetta_home.as_deref());
         let session_startup = session_state::resolve(
             config.decoder.effort,
+            &config.ui.waterfall,
             match session_state_path.as_deref() {
                 Some(path) => session_state::load(path),
                 None => session_state::SessionLoad::Missing,
@@ -2303,14 +2304,15 @@ impl ApplicationCoordinator {
         if let Some(reason) = &session_startup.ignored_reason {
             warn!("Session: saved choices ignored ({reason}); using defaults");
         }
-        // A superseding config edit becomes the saved choice: rewrite the
-        // file now, best-effort, so the NEXT restart compares against the
-        // config value that actually won.
-        if session_startup.superseded_saved_effort.is_some() {
+        // A superseding config edit (decode effort, or a PAN-389 waterfall
+        // palette/gain) drops that saved choice: rewrite the file now,
+        // best-effort, so the NEXT restart compares against the config value
+        // that actually won.
+        if session_startup.needs_rewrite() {
             if let Some(path) = session_state_path.as_deref() {
                 if let Err(e) = session_state::save(path, &session_startup.record) {
                     warn!(
-                        "Session: failed to rewrite {} after the config superseded the saved effort: {e}",
+                        "Session: failed to rewrite {} after the config superseded a saved choice: {e}",
                         path.display()
                     );
                 }
@@ -3952,7 +3954,7 @@ mod tests {
     /// `build_coordinator` with a `pancetta_home` override so the session
     /// state resolves an isolated temp dir (PAN-194 discipline), never the
     /// real `~/.pancetta`.
-    async fn build_coordinator_with_home(
+    pub(super) async fn build_coordinator_with_home(
         config: Config,
         home: Option<PathBuf>,
     ) -> ApplicationCoordinator {
@@ -3977,7 +3979,7 @@ mod tests {
     }
 
     /// Write a session file into `home/.pancetta/session_state.json`.
-    fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
+    pub(super) fn write_session_file(home: &std::path::Path, contents: &str) -> PathBuf {
         let dir = home.join(".pancetta");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session_state.json");
@@ -5728,3 +5730,7 @@ mod active_qso_freq_tests {
         assert_eq!(hint.secondary, Some((1500.0, expires_at)));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/waterfall_session_restore_tests.rs"]
+mod waterfall_session_restore_tests;

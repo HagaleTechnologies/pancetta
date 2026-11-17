@@ -10,6 +10,7 @@ fn enter_resolves_per_panel() {
         (ActivePanel::QsoStatus, Action::ComposeHint),
         (ActivePanel::Callers, Action::ReplyToSelectedCaller),
         (ActivePanel::TxPlacement, Action::ParkAtPlacement),
+        (ActivePanel::Waterfall, Action::ComposeHint),
     ] {
         let ctx = KeyContext {
             scope: Scope::Main,

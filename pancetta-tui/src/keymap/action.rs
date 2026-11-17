@@ -276,11 +276,22 @@ pub enum Action {
     WhyDown,
     /// Shift+L: look up the focused callsign on QRZ.
     LookupSelectedStation,
+    /// `{` with the waterfall focused: lower its display gain 1 dB (PAN-389).
+    WaterfallGainDown,
+    /// `}` with the waterfall focused: raise its display gain 1 dB (PAN-389).
+    WaterfallGainUp,
+    /// `b` with the waterfall focused: next waterfall palette (PAN-389).
+    CycleWaterfallPaletteForward,
+    /// `B` with the waterfall focused: previous waterfall palette (PAN-389).
+    CycleWaterfallPaletteBack,
+    /// `{`, `}`, `b` or `B` with another panel focused: explain that the
+    /// waterfall must be focused first (PAN-389).
+    WaterfallFocusHint,
 }
 
 impl Action {
     /// Every variant once, in declaration order (`ALL[i].ordinal() == i`).
-    pub const ALL: [Action; 134] = [
+    pub const ALL: [Action; 139] = [
         Action::EmergencyStop,
         Action::OpenQuitConfirm,
         Action::ToggleHelp,
@@ -415,6 +426,11 @@ impl Action {
         Action::WhyUp,
         Action::WhyDown,
         Action::LookupSelectedStation,
+        Action::WaterfallGainDown,
+        Action::WaterfallGainUp,
+        Action::CycleWaterfallPaletteForward,
+        Action::CycleWaterfallPaletteBack,
+        Action::WaterfallFocusHint,
     ];
 
     /// Position in [`Action::ALL`]. Exhaustive with no `_` arm, so a new
@@ -556,6 +572,11 @@ impl Action {
             Action::CloseWhy => 130,
             Action::WhyUp => 131,
             Action::WhyDown => 132,
+            Action::WaterfallGainDown => 134,
+            Action::WaterfallGainUp => 135,
+            Action::CycleWaterfallPaletteForward => 136,
+            Action::CycleWaterfallPaletteBack => 137,
+            Action::WaterfallFocusHint => 138,
         }
     }
 
@@ -698,7 +719,12 @@ impl Action {
             | Action::RecentQsosDown
             | Action::CloseWhy
             | Action::WhyUp
-            | Action::WhyDown => false,
+            | Action::WhyDown
+            | Action::WaterfallGainDown
+            | Action::WaterfallGainUp
+            | Action::CycleWaterfallPaletteForward
+            | Action::CycleWaterfallPaletteBack
+            | Action::WaterfallFocusHint => false,
         }
     }
 }

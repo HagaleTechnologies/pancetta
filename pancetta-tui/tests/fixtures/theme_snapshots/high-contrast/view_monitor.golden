@@ -7,8 +7,8 @@ r01 | ⚠ TX OPEN  ⚠ PTT MAY STILL BE KEYED — check radio  ⚠ TX AUDIO → 
 r01 s 0+11 Black/Yellow/BOLD 11+40 White/Red/BOLD 51+24 Black/Yellow/BOLD 75+18 Gray/Black/- 93+6 LightYellow/Black/BOLD 99+1 White/Black/-
 r02 |QSO: W#AW (wait rpt · #:## · ####Hz)                                                                |
 r02 s 0+5 LightCyan/Black/BOLD 5+4 LightGreen/Black/BOLD|UNDERLINED 9+91 White/Black/-
-r03 |┌ Waterfall [/]: TX #### Hz (LIVE) ────────────────────────────────────────────────────────────────┐|
-r03 s 0+1 Gray/Black/- 1+34 LightCyan/Black/- 35+65 Gray/Black/-
+r03 |┌ Waterfall: TX #### Hz (LIVE) · classic · gain # dB ──────────────────────────────────────────────┐|
+r03 s 0+1 Gray/Black/- 1+52 LightCyan/Black/- 53+47 Gray/Black/-
 r04 |│··················█▼█····█▼···█▼···▼█··█▼█······█▼TX ##▼# ✗··█▼····█▼█····························│|
 r04 s 0+19 Gray/Black/- 19+1 LightRed/Black/- 20+1 LightYellow/Black/- 21+1 LightRed/Black/- 22+4 Gray/Black/- 26+1 Yellow/Black/- 27+1 LightYellow/Black/- 28+3 Gray/Black/- 31+1 Yellow/Black/- 32+1 LightYellow/Black/- 33+3 Gray/Black/- 36+1 LightYellow/Black/- 37+1 LightRed/Black/- 38+2 Gray/Black/- 40+1 Yellow/Black/- 41+1 LightYellow/Black/- 42+1 Yellow/Black/- 43+6 Gray/Black/- 49+1 LightRed/Black/- 50+1 LightYellow/Black/- 51+5 LightRed/Black/- 56+1 LightYellow/Black/- 57+3 LightRed/Black/- 60+2 Gray/Black/- 62+1 LightRed/Black/- 63+1 LightYellow/Black/- 64+4 Gray/Black/- 68+1 Yellow/Black/- 69+1 LightYellow/Black/- 70+1 Yellow/Black/- 71+29 Gray/Black/-
 r05 |│███████████████████▼██████▼████▼███▼████▼████████▼█████▼██████▼█████▼█████████████████████████████│|

@@ -57,6 +57,7 @@ async fn footer_pins_view_help_and_quit_at_every_width() {
             ActivePanel::Callers,
             ActivePanel::DxHunter,
             ActivePanel::TxPlacement,
+            ActivePanel::Waterfall,
         ] {
             app.active_view = view;
             app.active_panel = panel;
@@ -83,7 +84,7 @@ async fn footer_pins_view_help_and_quit_at_every_width() {
             }
         }
     }
-    assert_eq!(renders, 2420);
+    assert_eq!(renders, 2904);
 }
 
 /// PAN-388 scenario 2: the footer names the current view.
@@ -156,5 +157,23 @@ async fn footer_strips_per_panel() {
         if panel == ActivePanel::TxPlacement {
             assert!(!row.contains("Space:"), "{row}");
         }
+    }
+}
+
+/// PAN-388 x PAN-389: the focused Monitor waterfall shows its gain and
+/// palette keys.
+#[tokio::test]
+async fn footer_shows_waterfall_keys_when_focused() {
+    let mut app = default_app().await;
+    app.active_view = crate::view::ActiveView::Monitor;
+    app.active_panel = ActivePanel::Waterfall;
+    for (w, h) in [(80, 24), (100, 30)] {
+        let buf = render_app(&app, w, h);
+        let row = row_text(&buf, h - 1);
+        let row = row.trim_end();
+        assert_eq!(
+            row, "Monitor view | {/}:Gain | b/B:Palette | v:View | ?:Help | q:Quit",
+            "at {w}x{h}"
+        );
     }
 }

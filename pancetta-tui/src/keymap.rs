@@ -1054,6 +1054,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
                 When::Panel(ActivePanel::QsoStatus),
                 Action::ComposeHint,
             ),
+            main_when(
+                KeyCode::Enter,
+                Mods::Any,
+                When::Panel(ActivePanel::Waterfall),
+                Action::ComposeHint,
+            ),
         ],
     ),
     kb(
@@ -1252,6 +1258,70 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         Category::ModesViews,
         false,
         &[main(c('e'), Action::CycleDecodeEffort)],
+    ),
+    kb(
+        "{ / }",
+        "Waterfall gain −/+ 1 dB (waterfall focused)",
+        Category::ModesViews,
+        false,
+        &[
+            main_when(
+                c('{'),
+                Mods::NoCtrlAlt,
+                When::Panel(ActivePanel::Waterfall),
+                Action::WaterfallGainDown,
+            ),
+            main_when(
+                c('}'),
+                Mods::NoCtrlAlt,
+                When::Panel(ActivePanel::Waterfall),
+                Action::WaterfallGainUp,
+            ),
+            main_when(
+                c('{'),
+                Mods::NoCtrlAlt,
+                When::NotPanel(ActivePanel::Waterfall),
+                Action::WaterfallFocusHint,
+            ),
+            main_when(
+                c('}'),
+                Mods::NoCtrlAlt,
+                When::NotPanel(ActivePanel::Waterfall),
+                Action::WaterfallFocusHint,
+            ),
+        ],
+    ),
+    kb(
+        "b / B",
+        "Waterfall palette next / previous (waterfall focused)",
+        Category::ModesViews,
+        false,
+        &[
+            main_when(
+                c('b'),
+                Mods::NoCtrlAlt,
+                When::Panel(ActivePanel::Waterfall),
+                Action::CycleWaterfallPaletteForward,
+            ),
+            main_when(
+                c('B'),
+                Mods::NoCtrlAlt,
+                When::Panel(ActivePanel::Waterfall),
+                Action::CycleWaterfallPaletteBack,
+            ),
+            main_when(
+                c('b'),
+                Mods::NoCtrlAlt,
+                When::NotPanel(ActivePanel::Waterfall),
+                Action::WaterfallFocusHint,
+            ),
+            main_when(
+                c('B'),
+                Mods::NoCtrlAlt,
+                When::NotPanel(ActivePanel::Waterfall),
+                Action::WaterfallFocusHint,
+            ),
+        ],
     ),
     kb(
         "Shift+H",
@@ -1568,12 +1638,13 @@ mod tests {
 
     // ---- PAN-327: key dispatch through the table -------------------------
 
-    const PANELS: [ActivePanel; 5] = [
+    const PANELS: [ActivePanel; 6] = [
         ActivePanel::BandActivity,
         ActivePanel::QsoStatus,
         ActivePanel::Callers,
         ActivePanel::DxHunter,
         ActivePanel::TxPlacement,
+        ActivePanel::Waterfall,
     ];
 
     const MOD_SETS: [KeyModifiers; 5] = [
@@ -1584,7 +1655,7 @@ mod tests {
         KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
     ];
 
-    /// Every context sample: 5 panels x zoomed x stopped.
+    /// Every context sample: 6 panels x zoomed x stopped.
     fn contexts(scope: Scope) -> Vec<KeyContext> {
         let mut out = Vec::new();
         for panel in PANELS {
@@ -1873,7 +1944,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 47);
+        assert_eq!(KEYBINDINGS.len(), 49);
     }
 
     #[test]

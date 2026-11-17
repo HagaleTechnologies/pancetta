@@ -193,6 +193,33 @@ const TX_PLACEMENT: &[FooterHint] = &[
     ),
 ];
 
+/// Monitor-view waterfall (PAN-389): its gain and palette keys work only
+/// while it is focused.
+const WATERFALL: &[FooterHint] = &[
+    hint(
+        "{/}",
+        ":Gain",
+        1,
+        &[
+            (KeyCode::Char('{'), NONE, Action::WaterfallGainDown),
+            (KeyCode::Char('}'), NONE, Action::WaterfallGainUp),
+        ],
+    ),
+    hint(
+        "b/B",
+        ":Palette",
+        2,
+        &[
+            (
+                KeyCode::Char('b'),
+                NONE,
+                Action::CycleWaterfallPaletteForward,
+            ),
+            (KeyCode::Char('B'), SHIFT, Action::CycleWaterfallPaletteBack),
+        ],
+    ),
+];
+
 /// Hints after every panel's set: how to change view, then the pinned pair.
 const TRAILER: &[FooterHint] = &[
     hint(
@@ -223,6 +250,7 @@ pub(crate) fn panel_hints(panel: ActivePanel) -> &'static [FooterHint] {
         ActivePanel::Callers => CALLERS,
         ActivePanel::DxHunter => DX_HUNTER,
         ActivePanel::TxPlacement => TX_PLACEMENT,
+        ActivePanel::Waterfall => WATERFALL,
     }
 }
 

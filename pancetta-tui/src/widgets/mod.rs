@@ -2,6 +2,7 @@ use ratatui::{layout::Rect, widgets::Block};
 
 use crate::app::ColorCapability;
 use crate::theme::{self, Theme};
+pub use pancetta_config::ui::WaterfallPalette;
 
 /// The occupancy state of one waterfall column (PAN-387): the decision is
 /// data, the colour comes from the theme, so the TX-cursor suffix stays right
@@ -72,7 +73,12 @@ pub(crate) fn occupancy(
 pub struct Waterfall<'a> {
     block: Option<Block<'a>>,
     data: &'a [Vec<f32>],
-    color_scheme: WaterfallColorScheme,
+    /// Colour palette (`[ui.waterfall] palette`, PAN-389). Ignored on
+    /// 16-colour terminals, which encode intensity in density glyphs.
+    palette: WaterfallPalette,
+    /// Display gain in dB (`[ui.waterfall] gain_db`, PAN-389). Added at render
+    /// time on the [`WATERFALL_DB_SPAN`] scale; positive brightens.
+    gain_db: f32,
     /// Audio frequency range covered by the data bins (Hz)
     freq_range: (f64, f64),
     /// TX frequency offset (Hz) — shown as a vertical marker styled by the
@@ -98,19 +104,20 @@ pub struct Waterfall<'a> {
     theme: &'a Theme,
 }
 
-#[derive(Clone, Copy)]
-pub enum WaterfallColorScheme {
-    Classic,
-    Spectrum,
-    Thermal,
-}
+/// The dB span the waterfall's 0..1 colour scale covers (PAN-389).
+///
+/// Must equal `NOISE_FLOOR_DB_SCALE` in `pancetta/src/coordinator/dsp.rs`,
+/// which normalises the live rows (signal above the per-bin median over this
+/// many dB); a test there pins the two together so "6 dB = 0.5" cannot drift.
+pub const WATERFALL_DB_SPAN: f32 = 12.0;
 
 impl<'a> Waterfall<'a> {
     pub fn new(data: &'a [Vec<f32>]) -> Self {
         Self {
             block: None,
             data,
-            color_scheme: WaterfallColorScheme::Classic,
+            palette: WaterfallPalette::Classic,
+            gain_db: 0.0,
             freq_range: (0.0, 3000.0),
             tx_offset: None,
             signal_freqs: Vec::new(),
@@ -133,8 +140,15 @@ impl<'a> Waterfall<'a> {
         self
     }
 
-    pub fn color_scheme(mut self, scheme: WaterfallColorScheme) -> Self {
-        self.color_scheme = scheme;
+    /// Set the colour palette (PAN-389).
+    pub fn palette(mut self, palette: WaterfallPalette) -> Self {
+        self.palette = palette;
+        self
+    }
+
+    /// Set the display gain in dB (PAN-389). Positive brightens.
+    pub fn gain_db(mut self, gain_db: f32) -> Self {
+        self.gain_db = gain_db;
         self
     }
 
@@ -268,10 +282,12 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                         }
                     }
 
-                    let color =
-                        theme::waterfall_ramp(self.color_scheme, self.color_capability, intensity);
+                    // PAN-389: display gain, applied once per output cell
+                    // (equivalent to per-sample because the map is monotone).
+                    let shown = (intensity + self.gain_db / WATERFALL_DB_SPAN).clamp(0.0, 1.0);
+                    let color = theme::waterfall_ramp(self.palette, self.color_capability, shown);
                     let glyph = if self.color_capability == ColorCapability::Basic {
-                        Self::glyph_for_intensity_basic(intensity)
+                        Self::glyph_for_intensity_basic(shown)
                     } else {
                         '█'
                     };
@@ -559,3 +575,7 @@ mod tests {
         assert_eq!(own_fg, theme::fg_color(alike.occupancy_other));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/waterfall_palette_gain_tests.rs"]
+mod waterfall_palette_gain_tests;

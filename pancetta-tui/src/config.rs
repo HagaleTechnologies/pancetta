@@ -50,6 +50,10 @@ pub struct UiConfig {
     /// Palette name; `crate::theme::Theme::for_name` turns it into tokens.
     pub theme: crate::theme::ThemeName,
     pub show_coordinates: bool,
+    /// Waterfall palette and display gain (`[ui.waterfall]`, PAN-389). The
+    /// coordinator passes the session-resolved effective values.
+    #[serde(default)]
+    pub waterfall: pancetta_config::ui::WaterfallDisplayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +106,7 @@ impl Default for Config {
             ui: UiConfig {
                 theme: crate::theme::ThemeName::Dark,
                 show_coordinates: true,
+                waterfall: pancetta_config::ui::WaterfallDisplayConfig::default(),
             },
             audio: AudioConfig {
                 device: None,
@@ -327,3 +332,7 @@ mod tests {
         assert!(!Config::load(temp_file.path()).unwrap().replay);
     }
 }
+
+#[cfg(test)]
+#[path = "config/tests/waterfall_config_tests.rs"]
+mod waterfall_config_tests;

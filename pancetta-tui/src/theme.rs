@@ -23,7 +23,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::app::ColorCapability;
-use crate::widgets::{Occupancy, WaterfallColorScheme};
+use crate::widgets::{Occupancy, WaterfallPalette};
 
 pub use pancetta_config::ui::ThemeName;
 
@@ -490,12 +490,17 @@ pub fn bg_color(token: Style) -> Color {
     token.bg.unwrap_or(Color::Reset)
 }
 
+/// Viridis as an 11-step ramp of xterm-256 indices with strictly rising
+/// luminance, indexed by `(intensity * 10).round()` (PAN-389).
+pub(crate) const VIRIDIS_256: [u8; 11] = [53, 54, 60, 61, 30, 31, 36, 71, 113, 148, 220];
+
 /// The waterfall intensity ramp. A data palette, the same in every theme:
-/// 256-colour terminals get the chosen scheme's ramp; 16-colour terminals
-/// get bright, always-visible colours paired with density glyphs (the glyph
-/// encodes intensity, so the lowest band is never the page colour).
+/// 256-colour terminals get the chosen `[ui.waterfall] palette`'s ramp
+/// (PAN-389); 16-colour terminals get bright, always-visible colours paired
+/// with density glyphs (the glyph encodes intensity, so the lowest band is
+/// never the page colour). `intensity` is the gain-adjusted 0..1 value.
 pub fn waterfall_ramp(
-    scheme: WaterfallColorScheme,
+    palette: WaterfallPalette,
     capability: ColorCapability,
     intensity: f32,
 ) -> Color {
@@ -513,8 +518,8 @@ pub fn waterfall_ramp(
         };
     }
 
-    match scheme {
-        WaterfallColorScheme::Classic => {
+    match palette {
+        WaterfallPalette::Classic => {
             // Luminance-based: dark = quiet, bright = loud.
             // Colorblind-safe — relies on brightness, not hue.
             // Uses 256-color grayscale ramp (232–255) for smooth gradient.
@@ -522,7 +527,7 @@ pub fn waterfall_ramp(
             let idx = 232 + (clamped * 23.0) as u8;
             Color::Indexed(idx)
         }
-        WaterfallColorScheme::Spectrum => {
+        WaterfallPalette::Spectrum => {
             // Blue-to-white luminance ramp (colorblind-safe)
             // Uses 256-color: dark blue → blue → cyan → white
             if clamped < 0.25 {
@@ -535,7 +540,7 @@ pub fn waterfall_ramp(
                 Color::Indexed(255) // white
             }
         }
-        WaterfallColorScheme::Thermal => {
+        WaterfallPalette::Thermal => {
             // Black → dark → bright (pure luminance)
             if clamped < 0.33 {
                 Color::Black
@@ -544,6 +549,11 @@ pub fn waterfall_ramp(
             } else {
                 Color::White
             }
+        }
+        WaterfallPalette::Viridis => {
+            // Perceptually uniform purple → teal → yellow ramp.
+            let step = (clamped * 10.0).round() as usize;
+            Color::Indexed(VIRIDIS_256[step.min(VIRIDIS_256.len() - 1)])
         }
     }
 }
@@ -1138,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_waterfall_color_intensity() {
-        use WaterfallColorScheme::*;
+        use WaterfallPalette::*;
         let full = ColorCapability::TwoFiftySix;
         assert_eq!(waterfall_ramp(Classic, full, 0.0), Color::Indexed(232));
         assert_eq!(waterfall_ramp(Classic, full, 1.0), Color::Indexed(255));
@@ -1151,5 +1161,43 @@ mod tests {
         assert_eq!(waterfall_ramp(Classic, basic, 0.4), Color::Cyan);
         assert_eq!(waterfall_ramp(Classic, basic, 0.7), Color::White);
         assert_eq!(waterfall_ramp(Classic, basic, 0.95), Color::Yellow);
+    }
+
+    /// PAN-389: the classic ramp keeps its pre-PAN-389 indices, and the
+    /// values the widget's gain tests land on are distinct steps.
+    #[test]
+    fn classic_ramp_keeps_its_indices() {
+        let full = ColorCapability::TwoFiftySix;
+        let expected = [232u8, 234, 236, 238, 241, 243, 245, 248, 250, 252, 255];
+        for (i, idx) in expected.iter().enumerate() {
+            let v = i as f32 / 10.0;
+            let got = waterfall_ramp(WaterfallPalette::Classic, full, v);
+            assert_eq!(got, Color::Indexed(*idx), "intensity {v}");
+        }
+        assert_eq!(
+            waterfall_ramp(WaterfallPalette::Classic, full, 0.75),
+            Color::Indexed(249)
+        );
+        assert_eq!(
+            waterfall_ramp(WaterfallPalette::Classic, ColorCapability::Basic, 0.5),
+            Color::Cyan
+        );
+    }
+
+    /// PAN-389: viridis maps onto its 11-step xterm-256 ramp.
+    #[test]
+    fn viridis_ramp_uses_its_256_colour_indices() {
+        let full = ColorCapability::TwoFiftySix;
+        let viridis = |v| waterfall_ramp(WaterfallPalette::Viridis, full, v);
+        assert_eq!(viridis(0.0), Color::Indexed(53));
+        assert_eq!(viridis(0.5), Color::Indexed(31));
+        assert_eq!(viridis(1.0), Color::Indexed(220));
+        for i in 0..=20 {
+            let v = i as f32 / 20.0;
+            match viridis(v) {
+                Color::Indexed(idx) => assert!(VIRIDIS_256.contains(&idx), "{v} -> {idx}"),
+                other => panic!("{v} -> {other:?}"),
+            }
+        }
     }
 }

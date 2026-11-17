@@ -17,6 +17,7 @@ empty/band | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pance
 empty/band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -34,6 +35,7 @@ empty/band | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pance
 empty/band | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/band | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 empty/band | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/band | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/band | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 empty/band | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 empty/band | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -54,6 +56,8 @@ empty/band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pance
 empty/band | Char('w') | none,shift | show_why: false -> true
 empty/band | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/band | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/band | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/band | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/band | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 empty/band | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> QsoStatus
 empty/band | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> TxPlacement
@@ -76,6 +80,7 @@ empty/qso | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 empty/qso | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/qso | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/qso | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/qso | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -93,6 +98,7 @@ empty/qso | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 empty/qso | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/qso | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 empty/qso | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/qso | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/qso | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 empty/qso | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 empty/qso | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -113,6 +119,8 @@ empty/qso | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 empty/qso | Char('w') | none,shift | show_why: false -> true
 empty/qso | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/qso | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/qso | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/qso | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/qso | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 empty/qso | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: QsoStatus -> DxHunter
 empty/qso | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: QsoStatus -> BandActivity
@@ -135,6 +143,7 @@ empty/callers | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pa
 empty/callers | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/callers | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/callers | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/callers | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -152,6 +161,7 @@ empty/callers | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pa
 empty/callers | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/callers | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 empty/callers | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/callers | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/callers | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 empty/callers | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 empty/callers | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -172,6 +182,8 @@ empty/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pa
 empty/callers | Char('w') | none,shift | show_why: false -> true
 empty/callers | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/callers | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/callers | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/callers | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/callers | Enter | none,shift | status_message: "Pancetta TUI Ready" -> "No caller selected"
 empty/callers | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: Callers -> TxPlacement
 empty/callers | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: Callers -> DxHunter
@@ -194,6 +206,7 @@ empty/dx | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 empty/dx | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/dx | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/dx | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/dx | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -211,6 +224,7 @@ empty/dx | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 empty/dx | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/dx | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 empty/dx | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/dx | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/dx | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 empty/dx | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 empty/dx | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -231,6 +245,8 @@ empty/dx | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 empty/dx | Char('w') | none,shift | show_why: false -> true
 empty/dx | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/dx | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/dx | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/dx | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/dx | Enter | none,shift,ctrl,alt,ctrl+shift | show_why: false -> true
 empty/dx | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> Callers
 empty/dx | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> QsoStatus
@@ -253,6 +269,7 @@ empty/placement | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "
 empty/placement | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 empty/placement | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 empty/placement | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/placement | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
 empty/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 empty/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -270,6 +287,7 @@ empty/placement | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "
 empty/placement | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/placement | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 empty/placement | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/placement | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/placement | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 empty/placement | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 empty/placement | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -290,11 +308,76 @@ empty/placement | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "
 empty/placement | Char('w') | none,shift | show_why: false -> true
 empty/placement | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 empty/placement | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/placement | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+empty/placement | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 empty/placement | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No placement candidate selected"
 empty/placement | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlacement -> BandActivity
 empty/placement | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlacement -> Callers
 empty/placement | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/placement | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/waterfall | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
+empty/waterfall | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
+empty/waterfall | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+empty/waterfall | Char('-') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
+empty/waterfall | Char('.') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/waterfall | Char('/') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Compose TX message — type, Enter to send, Esc to cancel"; compose_mode: false -> true
+empty/waterfall | Char('1') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Band Activity"; active_panel: Waterfall -> BandActivity
+empty/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: QSO Status"; active_panel: Waterfall -> QsoStatus
+empty/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Callers"; active_panel: Waterfall -> Callers
+empty/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: DX Hunter"; active_panel: Waterfall -> DxHunter
+empty/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: TX Placement"; active_panel: Waterfall -> TxPlacement
+empty/waterfall | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+empty/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
+empty/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/waterfall | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+empty/waterfall | Char('B') | none,shift | cmds=["SetWaterfallPalette { palette: Viridis }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: viridis"; waterfall_palette: Classic -> Viridis
+empty/waterfall | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true
+empty/waterfall | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
+empty/waterfall | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
+empty/waterfall | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+empty/waterfall | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
+empty/waterfall | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
+empty/waterfall | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
+empty/waterfall | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true
+empty/waterfall | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
+empty/waterfall | Char('T') | none,shift | cmds=["ToggleTune"]
+empty/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_view: Monitor -> Run
+empty/waterfall | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
+empty/waterfall | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
+empty/waterfall | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
+empty/waterfall | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
+empty/waterfall | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
+empty/waterfall | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous toggle sent (waiting for live status)"
+empty/waterfall | Char('b') | none,shift | cmds=["SetWaterfallPalette { palette: Spectrum }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: spectrum"; waterfall_palette: Classic -> Spectrum
+empty/waterfall | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
+empty/waterfall | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "No audio devices reported — check coordinator connection"; device_selection: DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [], output_devices: [], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
+empty/waterfall | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
+empty/waterfall | Char('f') | none,shift,ctrl,alt,ctrl+shift | cmds=["ToggleTxFreqMode"]; status_message: "Pancetta TUI Ready" -> "TX freq: AUTO"; tx_freq_mode: Hold -> Auto
+empty/waterfall | Char('g') | none,shift | cmds=["CycleTxPolicy"]; status_message: "Pancetta TUI Ready" -> "TX policy: RESPOND-ONLY"; tx_policy: Full -> RespondOnly
+empty/waterfall | Char('h') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopTx"]
+empty/waterfall | Char('i') | none,shift,ctrl,alt,ctrl+shift | cmds=["RequestRigConfig"]; status_message: "Pancetta TUI Ready" -> "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"; rig_selection: RigSelectionState { visible: false, available_ports: [], model: "", selected_port_idx: 0, selected_baud_idx: 1, selected_ptt_idx: 0, live_baud_rate: 9600, live_ptt_method: None, active_field: Model, committed_model: "", committed_port_idx: 0, committed_baud_idx: 1, committed_ptt_idx: 0, bookmarks: [], bookmark_overlay_visible: false, selected_bookmark_idx: 0, naming_bookmark: false, bookmark_name_input: "", submits_sent: 0 } -> RigSelectionState { visible: true, available_ports: [], model: "", selected_port_idx: 0, selected_baud_idx: 1, selected_ptt_idx: 0, live_baud_rate: 9600, live_ptt_method: None, active_field: Model, committed_model: "", committed_port_idx: 0, committed_baud_idx: 1, committed_ptt_idx: 0, bookmarks: [], bookmark_overlay_visible: false, selected_bookmark_idx: 0, naming_bookmark: false, bookmark_name_input: "", submits_sent: 0 }
+empty/waterfall | Char('k') | none | status_message: "Pancetta TUI Ready" -> "No active QSO to abort"
+empty/waterfall | Char('m') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Audio monitoring enabled"; is_monitoring: false -> true
+empty/waterfall | Char('o') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: enter Hz (200–2800), blank=Auto, Enter, Esc"; offset_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
+empty/waterfall | Char('p') | none,shift | cmds=["TogglePtt"]
+empty/waterfall | Char('q') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel"; quit_confirm_visible: false -> true
+empty/waterfall | Char('r') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the QSO Status panel (2) to re-send (r)"
+empty/waterfall | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
+empty/waterfall | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(1500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 1500 Hz (clear, held)"; tx_offset_hold_hz: None -> Some(1500); parked_since: false -> true
+empty/waterfall | Char('u') | none,shift | cmds=["NudgeTxOffset"]
+empty/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_view: Monitor -> Operate
+empty/waterfall | Char('w') | none,shift | show_why: false -> true
+empty/waterfall | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
+empty/waterfall | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+empty/waterfall | Char('{') | none,shift | cmds=["SetWaterfallGain { gain_db: -1.0 }"]; status_message: "Pancetta TUI Ready" -> "Waterfall gain -1 dB"; waterfall_gain_db: 0.0 -> -1.0
+empty/waterfall | Char('}') | none,shift | cmds=["SetWaterfallGain { gain_db: 1.0 }"]; status_message: "Pancetta TUI Ready" -> "Waterfall gain +1 dB"; waterfall_gain_db: 0.0 -> 1.0
+empty/waterfall | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
+empty/waterfall | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: Waterfall -> BandActivity
+empty/waterfall | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: Waterfall -> BandActivity
+empty/waterfall | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
+empty/waterfall | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
+empty/waterfall | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+empty/waterfall | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -310,6 +393,7 @@ rich/band | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 rich/band | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/band | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/band | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -328,6 +412,7 @@ rich/band | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 rich/band | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/band | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/band | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/band | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/band | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -348,6 +433,8 @@ rich/band | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 rich/band | Char('w') | none,shift | show_why: false -> true
 rich/band | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/band | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/band | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/band | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> QsoStatus
 rich/band | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> TxPlacement
@@ -370,6 +457,7 @@ rich/qso | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 rich/qso | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/qso | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/qso | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/qso | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/qso | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/qso | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/qso | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -388,6 +476,7 @@ rich/qso | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 rich/qso | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/qso | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/qso | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/qso | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/qso | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/qso | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/qso | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -408,6 +497,8 @@ rich/qso | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 rich/qso | Char('w') | none,shift | show_why: false -> true
 rich/qso | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/qso | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/qso | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/qso | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/qso | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/qso | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: QsoStatus -> DxHunter
 rich/qso | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: QsoStatus -> BandActivity
@@ -430,6 +521,7 @@ rich/callers | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pan
 rich/callers | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/callers | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/callers | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/callers | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/callers | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/callers | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/callers | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -448,6 +540,7 @@ rich/callers | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pan
 rich/callers | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/callers | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/callers | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/callers | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/callers | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/callers | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/callers | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -468,6 +561,8 @@ rich/callers | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pan
 rich/callers | Char('w') | none,shift | show_why: false -> true
 rich/callers | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/callers | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/callers | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/callers | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/callers | Enter | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying to G8KHF (signal report)"
 rich/callers | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: Callers -> TxPlacement
 rich/callers | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: Callers -> DxHunter
@@ -490,6 +585,7 @@ rich/dx | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta
 rich/dx | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/dx | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/dx | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/dx | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/dx | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/dx | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/dx | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -508,6 +604,7 @@ rich/dx | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta
 rich/dx | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/dx | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/dx | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/dx | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/dx | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/dx | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/dx | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -528,6 +625,8 @@ rich/dx | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta
 rich/dx | Char('w') | none,shift | show_why: false -> true
 rich/dx | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/dx | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/dx | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/dx | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/dx | Enter | none,shift,ctrl,alt,ctrl+shift | show_why: false -> true
 rich/dx | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> Callers
 rich/dx | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: DxHunter -> QsoStatus
@@ -550,6 +649,7 @@ rich/placement | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "P
 rich/placement | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/placement | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/placement | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/placement | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/placement | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/placement | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/placement | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -568,6 +668,7 @@ rich/placement | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "P
 rich/placement | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/placement | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/placement | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/placement | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/placement | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/placement | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/placement | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -588,12 +689,78 @@ rich/placement | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "P
 rich/placement | Char('w') | none,shift | show_why: false -> true
 rich/placement | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/placement | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/placement | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/placement | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/placement | Enter | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "Parked at 500 Hz (E+O)"; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
 rich/placement | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlacement -> BandActivity
 rich/placement | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlacement -> Callers
 rich/placement | Right | none,shift,ctrl,alt,ctrl+shift | placement_cursor: 0 -> 1
 rich/placement | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/placement | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/waterfall | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
+rich/waterfall | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
+rich/waterfall | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+rich/waterfall | Char('-') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
+rich/waterfall | Char('.') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/waterfall | Char('/') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Compose TX message — type, Enter to send, Esc to cancel"; compose_mode: false -> true
+rich/waterfall | Char('1') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Band Activity"; active_panel: Waterfall -> BandActivity
+rich/waterfall | Char('2') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: QSO Status"; active_panel: Waterfall -> QsoStatus
+rich/waterfall | Char('3') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: Callers"; active_panel: Waterfall -> Callers
+rich/waterfall | Char('4') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: DX Hunter"; active_panel: Waterfall -> DxHunter
+rich/waterfall | Char('5') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel: TX Placement"; active_panel: Waterfall -> TxPlacement
+rich/waterfall | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+rich/waterfall | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
+rich/waterfall | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/waterfall | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/waterfall | Char('B') | none,shift | cmds=["SetWaterfallPalette { palette: Viridis }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: viridis"; waterfall_palette: Classic -> Viridis
+rich/waterfall | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
+rich/waterfall | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
+rich/waterfall | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
+rich/waterfall | Char('H') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus DX Hunter (H key) to engage Hound on selected station"
+rich/waterfall | Char('L') | none,shift | status_message: "Pancetta TUI Ready" -> "no station focused — Tab to a list, ↑/↓ to pick"
+rich/waterfall | Char('M') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleOperatingMode"]
+rich/waterfall | Char('P') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Autonomous paused"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: true, state: "Paused", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/waterfall | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
+rich/waterfall | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: false -> true; recent_qsos_scroll: 0 -> 1
+rich/waterfall | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: false -> true
+rich/waterfall | Char('T') | none,shift | cmds=["ToggleTune"]
+rich/waterfall | Char('V') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Run view"; active_view: Monitor -> Run
+rich/waterfall | Char('W') | none,shift | watchlist_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
+rich/waterfall | Char('X') | none,shift | cmds=["ToggleFoxMode"]; status_message: "Pancetta TUI Ready" -> "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)"; fox_mode: false -> true
+rich/waterfall | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
+rich/waterfall | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
+rich/waterfall | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
+rich/waterfall | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/waterfall | Char('b') | none,shift | cmds=["SetWaterfallPalette { palette: Spectrum }"]; status_message: "Pancetta TUI Ready" -> "Waterfall palette: spectrum"; waterfall_palette: Classic -> Spectrum
+rich/waterfall | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
+rich/waterfall | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
+rich/waterfall | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
+rich/waterfall | Char('f') | none,shift,ctrl,alt,ctrl+shift | cmds=["ToggleTxFreqMode"]; status_message: "Pancetta TUI Ready" -> "TX freq: AUTO"; tx_freq_mode: Hold -> Auto
+rich/waterfall | Char('g') | none,shift | cmds=["CycleTxPolicy"]; status_message: "Pancetta TUI Ready" -> "TX policy: RESPOND-ONLY"; tx_policy: Full -> RespondOnly
+rich/waterfall | Char('h') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopTx"]
+rich/waterfall | Char('i') | none,shift,ctrl,alt,ctrl+shift | cmds=["RequestRigConfig"]; status_message: "Pancetta TUI Ready" -> "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"; rig_selection: RigSelectionState { visible: false, available_ports: ["/dev/ttyUSB0"], model: "", selected_port_idx: 0, selected_baud_idx: 1, selected_ptt_idx: 0, live_baud_rate: 9600, live_ptt_method: None, active_field: Model, committed_model: "", committed_port_idx: 0, committed_baud_idx: 1, committed_ptt_idx: 0, bookmarks: [RigBookmark { name: "home", model: "1042", port: "/dev/ttyUSB0", baud_rate: 38400, ptt_method: Cat }], bookmark_overlay_visible: false, selected_bookmark_idx: 0, naming_bookmark: false, bookmark_name_input: "", submits_sent: 0 } -> RigSelectionState { visible: true, available_ports: ["/dev/ttyUSB0"], model: "", selected_port_idx: 0, selected_baud_idx: 1, selected_ptt_idx: 0, live_baud_rate: 9600, live_ptt_method: None, active_field: Model, committed_model: "", committed_port_idx: 0, committed_baud_idx: 1, committed_ptt_idx: 0, bookmarks: [RigBookmark { name: "home", model: "1042", port: "/dev/ttyUSB0", baud_rate: 38400, ptt_method: Cat }], bookmark_overlay_visible: false, selected_bookmark_idx: 0, naming_bookmark: false, bookmark_name_input: "", submits_sent: 0 }
+rich/waterfall | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
+rich/waterfall | Char('m') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Audio monitoring enabled"; is_monitoring: false -> true
+rich/waterfall | Char('o') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: enter Hz (200–2800), blank=Auto, Enter, Esc"; offset_modal: OffsetModalState { visible: false, buffer: "" } -> OffsetModalState { visible: true, buffer: "" }
+rich/waterfall | Char('p') | none,shift | cmds=["TogglePtt"]
+rich/waterfall | Char('q') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel"; quit_confirm_visible: false -> true
+rich/waterfall | Char('r') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the QSO Status panel (2) to re-send (r)"
+rich/waterfall | Char('s') | none,shift,ctrl,alt,ctrl+shift | cmds=["StopCq"]
+rich/waterfall | Char('t') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetTxOffset { offset_hz: Some(500) }"]; status_message: "Pancetta TUI Ready" -> "TX cursor → 500 Hz (clear, held)"; tx_frequency_offset: 1500.0 -> 500.0; tx_offset_hold_hz: None -> Some(500); parked_since: false -> true
+rich/waterfall | Char('u') | none,shift | cmds=["NudgeTxOffset"]
+rich/waterfall | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operate view"; active_view: Monitor -> Operate
+rich/waterfall | Char('w') | none,shift | show_why: false -> true
+rich/waterfall | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
+rich/waterfall | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/waterfall | Char('{') | none,shift | cmds=["SetWaterfallGain { gain_db: -1.0 }"]; status_message: "Pancetta TUI Ready" -> "Waterfall gain -1 dB"; waterfall_gain_db: 0.0 -> -1.0
+rich/waterfall | Char('}') | none,shift | cmds=["SetWaterfallGain { gain_db: 1.0 }"]; status_message: "Pancetta TUI Ready" -> "Waterfall gain +1 dB"; waterfall_gain_db: 0.0 -> 1.0
+rich/waterfall | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
+rich/waterfall | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: Waterfall -> BandActivity
+rich/waterfall | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: Waterfall -> BandActivity
+rich/waterfall | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1450 Hz"; tx_frequency_offset: 1500.0 -> 1450.0
+rich/waterfall | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
+rich/waterfall | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
+rich/waterfall | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/zoomed | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band/zoomed | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/zoomed | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -609,6 +776,7 @@ rich/band/zoomed | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message: 
 rich/band/zoomed | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/band/zoomed | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/zoomed | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/band/zoomed | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/zoomed | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -627,6 +795,7 @@ rich/band/zoomed | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message: 
 rich/band/zoomed | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/zoomed | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/band/zoomed | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/band/zoomed | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/band/zoomed | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/band/zoomed | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -647,6 +816,8 @@ rich/band/zoomed | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message: 
 rich/band/zoomed | Char('w') | none,shift | show_why: false -> true
 rich/band/zoomed | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/band/zoomed | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Zoom cleared"; zoomed: true -> false
+rich/band/zoomed | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/zoomed | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/band/zoomed | Esc | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Zoom cleared"; zoomed: true -> false
 rich/band/zoomed | Tab | none,shift,ctrl,alt,ctrl+shift | zoomed: true -> false; active_panel: BandActivity -> QsoStatus
@@ -670,6 +841,7 @@ rich/band/stopped | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_message:
 rich/band/stopped | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/band/stopped | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/stopped | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/band/stopped | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -688,6 +860,7 @@ rich/band/stopped | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_message:
 rich/band/stopped | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/stopped | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/band/stopped | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; stopped_by_operator: true -> false; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/band/stopped | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/stopped | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/band/stopped | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/band/stopped | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -708,6 +881,8 @@ rich/band/stopped | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_message:
 rich/band/stopped | Char('w') | none,shift | show_why: false -> true
 rich/band/stopped | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/band/stopped | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/band/stopped | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/stopped | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/stopped | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/band/stopped | Esc | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operator-stop banner cleared"; stopped_by_operator: true -> false
 rich/band/stopped | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> QsoStatus
@@ -731,6 +906,7 @@ rich/band/zoomed+stopped | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_m
 rich/band/zoomed+stopped | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/band/zoomed+stopped | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/zoomed+stopped | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/band/zoomed+stopped | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed+stopped | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/zoomed+stopped | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/zoomed+stopped | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -749,6 +925,7 @@ rich/band/zoomed+stopped | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_m
 rich/band/zoomed+stopped | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/zoomed+stopped | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/band/zoomed+stopped | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; stopped_by_operator: true -> false; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/band/zoomed+stopped | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed+stopped | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/band/zoomed+stopped | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/band/zoomed+stopped | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -769,6 +946,8 @@ rich/band/zoomed+stopped | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_m
 rich/band/zoomed+stopped | Char('w') | none,shift | show_why: false -> true
 rich/band/zoomed+stopped | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/band/zoomed+stopped | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Zoom cleared"; zoomed: true -> false
+rich/band/zoomed+stopped | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/zoomed+stopped | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/zoomed+stopped | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/band/zoomed+stopped | Esc | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Operator-stop banner cleared"; stopped_by_operator: true -> false
 rich/band/zoomed+stopped | Tab | none,shift,ctrl,alt,ctrl+shift | zoomed: true -> false; active_panel: BandActivity -> QsoStatus
@@ -792,6 +971,7 @@ rich/band/tx-disabled | Char('<') | none,shift,ctrl,alt,ctrl+shift | status_mess
 rich/band/tx-disabled | Char('=') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 18100000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 17M — 18.100 MHz"; current_band_index: 5 -> 6; operating_frequency: 14.074 -> 18.1
 rich/band/tx-disabled | Char('>') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
 rich/band/tx-disabled | Char('?') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Help — press Escape or ? to close"; help_visible: false -> true
+rich/band/tx-disabled | Char('B') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/tx-disabled | Char('D') | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: false -> true; diagnostics_scroll: 0 -> 1
 rich/band/tx-disabled | Char('F') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Freq entry: dial MHz, Tab→split, Enter, Esc"; freq_modal: FreqModalState { visible: false, rx_buffer: "", tx_buffer: "", field: RxDial } -> FreqModalState { visible: true, rx_buffer: "", tx_buffer: "", field: RxDial }
 rich/band/tx-disabled | Char('G') | none,shift | cmds=["SaveReceiveGainPreset"]; status_message: "Pancetta TUI Ready" -> "Saving 20m gain preset…"
@@ -810,6 +990,7 @@ rich/band/tx-disabled | Char('[') | none,shift,ctrl,alt,ctrl+shift | status_mess
 rich/band/tx-disabled | Char(']') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/tx-disabled | Char('_') | none,shift,ctrl,alt,ctrl+shift | cmds=["SetFrequency { vfo: 0, frequency: 10136000 }"]; status_message: "Pancetta TUI Ready" -> "Band: 30M — 10.136 MHz"; current_band_index: 5 -> 4; operating_frequency: 14.074 -> 10.136
 rich/band/tx-disabled | Char('a') | none,shift | cmds=["ToggleAutonomous"]; status_message: "Pancetta TUI Ready" -> "Autonomous mode disabled"; autonomous_status: Some(AutonomousStatus { enabled: true, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 }) -> Some(AutonomousStatus { enabled: false, state: "Hunting", slot_parity: None, listen_counter: "", active_qsos: 1, max_qsos: 2, idle_cycles: 0, band_name: "20m", tx_offset_hz: 1500.0 })
+rich/band/tx-disabled | Char('b') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/tx-disabled | Char('c') | none,shift | cmds=["StartCq { frequency_offset: 1500.0 }"]
 rich/band/tx-disabled | Char('d') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"; device_selection: DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: false } -> DeviceSelectionState { input_devices: [("Fixture input", true), ("Second input", false)], output_devices: [("Fixture output", true), ("Second output", false)], selected_input_idx: 0, selected_output_idx: 0, active_panel: Input, visible: true }
 rich/band/tx-disabled | Char('e') | none,shift,ctrl,alt,ctrl+shift | cmds=["CycleDecodeEffort"]
@@ -830,6 +1011,8 @@ rich/band/tx-disabled | Char('v') | none,shift,ctrl,alt,ctrl+shift | status_mess
 rich/band/tx-disabled | Char('w') | none,shift | show_why: false -> true
 rich/band/tx-disabled | Char('x') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "press x again within 3s to clear decodes"; clear_armed_at: false -> true
 rich/band/tx-disabled | Char('z') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Panel zoomed"; zoomed: false -> true
+rich/band/tx-disabled | Char('{') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
+rich/band/tx-disabled | Char('}') | none,shift | status_message: "Pancetta TUI Ready" -> "Focus the waterfall (Monitor view, Tab) to change its gain or palette"
 rich/band/tx-disabled | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Press / to compose a free-text TX message"
 rich/band/tx-disabled | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> QsoStatus
 rich/band/tx-disabled | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: BandActivity -> TxPlacement
@@ -1632,7 +1815,7 @@ rich/help | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 rich/help | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/help | Esc | none,shift,ctrl,alt,ctrl+shift | help_visible: true -> false
 rich/help | Down | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 1
-rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 51
+rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 54
 rich/help | PageDown | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 17
 rich/compose | Char(' ') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST "; tx_input_buffer: "CQ TEST" -> "CQ TEST "; tx_input_cursor: 7 -> 8
 rich/compose | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST!"; tx_input_buffer: "CQ TEST" -> "CQ TEST!"; tx_input_cursor: 7 -> 8

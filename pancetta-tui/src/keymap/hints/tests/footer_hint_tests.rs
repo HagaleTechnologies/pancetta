@@ -3,12 +3,13 @@ use super::*;
 use crate::keymap::{resolve, KeyContext, Scope};
 use crossterm::event::KeyEvent;
 
-const PANELS: [ActivePanel; 5] = [
+const PANELS: [ActivePanel; 6] = [
     ActivePanel::BandActivity,
     ActivePanel::QsoStatus,
     ActivePanel::Callers,
     ActivePanel::DxHunter,
     ActivePanel::TxPlacement,
+    ActivePanel::Waterfall,
 ];
 
 #[test]
@@ -119,4 +120,21 @@ fn help_and_quit_are_pinned_last() {
             assert_ne!(h.admit, 0, "{panel:?} hint {} must not be pinned", h.key);
         }
     }
+}
+
+#[test]
+fn waterfall_hints_name_its_gain_and_palette_keys() {
+    let actions: Vec<Action> = panel_hints(ActivePanel::Waterfall)
+        .iter()
+        .flat_map(|h| h.binds.iter().map(|&(_, _, a)| a))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            Action::WaterfallGainDown,
+            Action::WaterfallGainUp,
+            Action::CycleWaterfallPaletteForward,
+            Action::CycleWaterfallPaletteBack,
+        ]
+    );
 }
