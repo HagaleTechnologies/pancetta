@@ -578,6 +578,23 @@ pub fn modulate_multi_tx(
     base_frequency: f64,
     tx_power: f64,
 ) -> Ft8Result<Vec<f32>> {
+    modulate_multi_tx_with_guard(items, sample_rate, base_frequency, tx_power, 25.0)
+}
+
+/// [`modulate_multi_tx`] with a caller-chosen guard between signals.
+///
+/// Every pair of items must be at least the wider signal's bandwidth plus
+/// `guard_hz` apart. [`modulate_multi_tx`] uses a 25 Hz guard. A WSJT-X Fox
+/// places its streams 60 Hz apart (`foxgen.f90`, `fstep=60`), which needs a
+/// 9 Hz guard for FT8's 50 Hz signal (PAN-386). The caller owns the decision
+/// to relax the guard; this function only enforces it.
+pub fn modulate_multi_tx_with_guard(
+    items: &[MultiTxItem],
+    sample_rate: u32,
+    base_frequency: f64,
+    tx_power: f64,
+    guard_hz: f64,
+) -> Ft8Result<Vec<f32>> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -586,10 +603,10 @@ pub fn modulate_multi_tx(
     for i in 0..items.len() {
         for j in (i + 1)..items.len() {
             let sep = (items[i].frequency_offset - items[j].frequency_offset).abs();
-            // Minimum separation: wider signal's bandwidth + 25 Hz guard
+            // Minimum separation: wider signal's bandwidth + guard
             let bw_i = items[i].params.signal_bandwidth();
             let bw_j = items[j].params.signal_bandwidth();
-            let min_sep = bw_i.max(bw_j) + 25.0;
+            let min_sep = bw_i.max(bw_j) + guard_hz;
             if sep < min_sep {
                 return Err(Ft8Error::ConfigError(format!(
                     "Frequency separation {:.1} Hz too small (minimum {:.1} Hz) \
@@ -799,6 +816,10 @@ pub fn convert_samples(samples: &[f32], format: AudioFormat) -> Vec<u8> {
 
     output
 }
+
+#[cfg(test)]
+#[path = "modulator/tests/multi_tx_guard_tests.rs"]
+mod multi_tx_guard_tests;
 
 #[cfg(test)]
 mod tests {

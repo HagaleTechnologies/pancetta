@@ -1382,9 +1382,17 @@ async fn maybe_auto_resend_73(
 /// Whether a completed QSO is stashed for `maybe_auto_resend_73`. Only manual
 /// completions are; a Hound completion never is, because in the Fox/Hound
 /// procedure the Fox's RR73 ends the contact and a Hound sends no 73 (PAN-259).
+/// A Fox-role completion never is either: the Fox's RR73 already closed it
+/// and a WSJT-X Hound sends no 73 back (PAN-386).
 fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
-    metadata.initiated_by == pancetta_qso::CallInitiation::Manual && !metadata.hound
+    metadata.initiated_by == pancetta_qso::CallInitiation::Manual
+        && !metadata.hound
+        && !metadata.fox
 }
+
+#[cfg(test)]
+#[path = "qso/tests/fox_slot_tests.rs"]
+mod fox_slot_tests;
 
 /// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
 /// frame. Only touches the entry this call committed (same completed QSO,
@@ -2778,6 +2786,7 @@ mod pan6_diagnostic_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
         }
@@ -3499,6 +3508,7 @@ mod ap_ranking_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
         }
@@ -7160,6 +7170,7 @@ mod secondary_decoder_hint_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
@@ -9171,6 +9182,7 @@ mod snapshot_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
@@ -12058,6 +12070,7 @@ mod adif_subscriber_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
             },
@@ -12380,6 +12393,7 @@ mod cqdx_upload_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
@@ -12818,6 +12832,7 @@ mod qrz_enrichment_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
@@ -14298,6 +14313,7 @@ mod replay_history_seed_tests {
                 partner_freq: None,
                 pending_freq_drift: None,
                 hound_qsyed: false,
+                fox: false,
                 remote_origin: false,
                 remote_client_key_id: None,
                 tx_parity_provisional: false,
