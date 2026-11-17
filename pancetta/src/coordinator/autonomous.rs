@@ -2023,21 +2023,7 @@ impl super::ApplicationCoordinator {
                 collision_interval: config.autonomous.listen_cycle.collision_interval,
                 backoff_threshold: config.autonomous.listen_cycle.backoff_threshold,
             },
-            band_hopping: pancetta_qso::autonomous::BandHoppingConfig {
-                enabled: config.autonomous.band_hopping.enabled,
-                hop_threshold: config.autonomous.band_hopping.hop_threshold,
-                bands: config
-                    .autonomous
-                    .band_hopping
-                    .bands
-                    .iter()
-                    .map(|b| pancetta_qso::autonomous::BandEntry {
-                        dial_frequency: b.dial_frequency,
-                        band_name: b.band_name.clone(),
-                        priority: b.priority,
-                    })
-                    .collect(),
-            },
+            band_hopping: super::band_hop::qso_band_hopping_config(&config.autonomous),
             frequency: pancetta_qso::frequency::FrequencyAllocatorConfig {
                 decode_history_cycles: config.autonomous.frequency.decode_history_cycles,
                 center_bias_hz: config.autonomous.frequency.center_bias_hz,
@@ -2097,6 +2083,9 @@ impl super::ApplicationCoordinator {
             config.rig.operating_mode(),
             Ok(pancetta_config::rig::OperatingMode::Ft4)
         );
+        // PAN-385: band hopping is restart-required; read once, like the
+        // rest of this fn. Gates the per-slot exchange snapshot below.
+        let band_hopping_enabled = config.autonomous.band_hopping.enabled;
 
         // Task 16: opt-in auto-repark. Default OFF — read once at startup
         // (mirrors every other config extraction in this fn); a config
@@ -2269,6 +2258,18 @@ impl super::ApplicationCoordinator {
         // re-key mid-slot, transmitting neither frame slot-aligned. See
         // `apply_tx_offset_switch`'s call site below.
         let ptt_active_for_drain = self.ptt_active.clone();
+        // PAN-385: the hop executor's shared state. It rechecks the keyed
+        // state under `ptt_sync_gate` (PAN-287 style) before retuning.
+        let band_hop_ctx = super::band_hop::BandHopCtx {
+            bus: self.message_bus.clone(),
+            operating_frequency_hz: operating_frequency_hz.clone(),
+            last_freq_command,
+            split_tx_hz,
+            display_feed_enabled: display_feed_enabled.clone(),
+            ptt_active: self.ptt_active.clone(),
+            ptt_sync_gate: self.ptt_sync_gate.clone(),
+            active_is_ft4,
+        };
         // PAN-72 (Codex round 1 on PR #350, finding 6): the shared Hold/Auto
         // atomic, re-read INSIDE the drain at commit time. The operator can
         // press `f` for Hold after an action was queued but before this
@@ -2489,6 +2490,20 @@ impl super::ApplicationCoordinator {
                                 bridge.report_spots(spot_reports);
                             }
 
+                            // PAN-385 (PAN-287 style): snapshot the partner-
+                            // answered exchanges BEFORE locking the operator,
+                            // so the operator lock is never held while
+                            // waiting on the QSO manager. Bound to a `let`
+                            // so the watch `Ref` is dropped before `.await`.
+                            let hop_exchange_in_progress = if band_hopping_enabled {
+                                let manager = qso_manager_watch.borrow().clone();
+                                !crate::coordinator::spot_call::exchange_in_progress(manager)
+                                    .await
+                                    .is_empty()
+                            } else {
+                                false
+                            };
+
                             let mut op = operator.lock().await;
 
                             // PAN-43/45 follow-up (Codex round 2 on PR
@@ -2553,6 +2568,9 @@ impl super::ApplicationCoordinator {
                             if let Some(ref bridge) = cqdx_bridge_for_auto {
                                 let spot_freqs = bridge.spot_frequencies().await;
                                 op.update_live_spots(&spot_freqs);
+                                // PAN-385: needed-entity counts per band for
+                                // the needed-activity hop (`None` = stale).
+                                op.update_band_opportunities(bridge.band_opportunities().await);
                             }
 
                             // Tier admission chooses the scorer's RF-dial context
@@ -2873,6 +2891,11 @@ impl super::ApplicationCoordinator {
                                 // than holding it through `decide()`/dispatch.
                                 drop(op);
                             } else {
+                            // PAN-385: while a partner has answered, the
+                            // scheduler emits no hop.
+                            if band_hopping_enabled {
+                                op.set_exchange_in_progress(hop_exchange_in_progress);
+                            }
                             let actions = op.decide();
                             let skip_records = op.take_skip_log();
                             // PAN-38: captured before `drop(op)` — if a
@@ -2957,115 +2980,47 @@ impl super::ApplicationCoordinator {
                                             tx_parity,
                                         ));
                                     }
-                                    pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
-                                        // FT4-mode dial override: the band-hop
-                                        // config carries FT8 dials. In FT4 mode,
-                                        // resolve the hopped band and substitute
-                                        // its FT4 sub-band frequency. If the band
-                                        // has no FT4 frequency (e.g. 60m/160m) or
-                                        // can't be resolved, keep the configured
-                                        // (FT8) dial and warn. FT8 mode never
-                                        // enters this branch (byte-identical).
-                                        let dial_frequency = if active_is_ft4 {
-                                            match pancetta_core::Band::from_frequency(dial_frequency)
-                                                .and_then(|b| b.ft4_frequency())
-                                            {
-                                                Some(ft4) => ft4,
-                                                None => {
-                                                    warn!(
-                                                        target: "operator.override",
-                                                        "FT4 mode: no FT4 dial for band-hop target {} Hz; using configured (FT8) dial",
-                                                        dial_frequency
-                                                    );
-                                                    dial_frequency
-                                                }
-                                            }
-                                        } else {
-                                            dial_frequency
-                                        };
-                                        // C9 — the autonomous operator is changing
-                                        // band. An active QSO can't complete on the
-                                        // new band, so tear active QSOs down (same
-                                        // mechanism as the TUI SetFrequency path)
-                                        // before/at the band switch. Capture the
-                                        // *old* dial freq, update the shared atomic,
-                                        // and stamp the dedup anchor so the hamlib
-                                        // poll loop doesn't double-fire when it reads
-                                        // the new freq back off the rig.
-                                        let old_freq_hz =
-                                            operating_frequency_hz.load(Ordering::Relaxed);
-                                        operating_frequency_hz
-                                            .store(dial_frequency, Ordering::Relaxed);
-                                        if let Ok(mut anchor) = last_freq_command.lock() {
-                                            *anchor = Some((dial_frequency, Instant::now()));
-                                        }
-                                        if crate::coordinator::is_band_change(
-                                            old_freq_hz,
-                                            dial_frequency,
-                                        ) {
-                                            info!(
-                                                target: "operator.override",
-                                                "Autonomous band change {} Hz -> {} Hz — tearing down active QSOs",
-                                                old_freq_hz, dial_frequency
-                                            );
-                                            let teardown = ComponentMessage::new(
-                                                ComponentId::Autonomous,
-                                                ComponentId::Qso,
-                                                MessageType::QsoMessage(
-                                                    crate::message_bus::QsoMessage::BandChanged {
-                                                        previous_hz: old_freq_hz,
-                                                        new_hz: dial_frequency,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) = message_bus.send_message(teardown).await {
-                                                warn!(
-                                                    "Autonomous band change: failed to send teardown: {}",
-                                                    e
-                                                );
-                                            }
-                                            // A band change invalidates any split TX freq.
-                                            if split_tx_hz.load(Ordering::Relaxed) != 0 {
-                                                let store = super::forward_split_change(
+                                    pancetta_qso::OperatorAction::ChangeBand { dial_frequency, reason } => {
+                                        // PAN-385: the operator lock is
+                                        // already dropped, so the executor's
+                                        // `ptt_sync_gate` never nests it.
+                                        // Re-read the exchange snapshot fresh:
+                                        // a partner may have answered since
+                                        // `decide()`.
+                                        let manager = qso_manager_watch.borrow().clone();
+                                        let exchanges =
+                                            crate::coordinator::spot_call::exchange_in_progress(
+                                                manager,
+                                            )
+                                            .await;
+                                        if let super::band_hop::BandHopOutcome::Waiting(text) =
+                                            super::band_hop::execute_band_hop(
+                                                &band_hop_ctx,
+                                                dial_frequency,
+                                                &reason,
+                                                &exchanges,
+                                            )
+                                            .await
+                                        {
+                                            let to_band =
+                                                reason.to_band().map(|b| b.name()).unwrap_or("?");
+                                            if should_report_skip(
+                                                &mut skip_seen,
+                                                "band_hop_waiting",
+                                                Some(to_band),
+                                                std::time::Instant::now(),
+                                            ) {
+                                                crate::coordinator::tx::emit_diagnostic_full(
                                                     &message_bus,
                                                     ComponentId::Autonomous,
-                                                    &split_tx_hz,
-                                                    false,
-                                                    0,
-                                                )
-                                                .await;
-                                                // Push authoritative split state to the TUI chip
-                                                // via the message bus (Autonomous → Tui relay).
-                                                let split_clr_tui = ComponentMessage::new(
-                                                    ComponentId::Autonomous,
-                                                    ComponentId::Tui,
-                                                    MessageType::SplitStatus { tx_hz: store },
-                                                    Instant::now(),
-                                                );
-                                                let _ = message_bus.send_message(split_clr_tui).await;
-                                                super::remote_gateway::relay_to_gateway(
-                                                    &message_bus,
-                                                    &display_feed_enabled,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::SplitStatus { tx_hz: store },
+                                                    "qso.autonomous",
+                                                    pancetta_core::DiagnosticLevel::Info,
+                                                    text,
+                                                    None,
+                                                    None,
                                                 )
                                                 .await;
                                             }
-                                        }
-                                        let msg = ComponentMessage::new(
-                                            ComponentId::Autonomous,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetFrequency {
-                                                    vfo: 0,
-                                                    frequency: dial_frequency,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(msg).await {
-                                            warn!("Failed to send ChangeBand: {}", e);
                                         }
                                     }
                                     pancetta_qso::OperatorAction::StatusUpdate(status) => {
@@ -7778,6 +7733,69 @@ mod fq_f9_placement_feed_when_disabled_tests {
             Some(7_074_000),
             0
         ));
+    }
+
+    /// PAN-385 AC18: a plan hop goes through the real Autonomous task to
+    /// Hamlib and shows why in the Diagnostics overlay. The full-day window
+    /// keeps the test independent of the wall clock.
+    #[tokio::test]
+    async fn pan385_plan_hop_reaches_hamlib_and_the_diagnostics_overlay() {
+        let mut c = pan302_ready_coordinator(true).await;
+        {
+            let mut config = c.config.write().await;
+            config.autonomous.band_hopping.enabled = true;
+            config.autonomous.band_plan = vec![pancetta_config::autonomous::BandPlanWindow {
+                utc: "00:00-24:00".into(),
+                bands: vec!["17m".into()],
+            }];
+        }
+        c.operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        let (_, hamlib) = c
+            .message_bus
+            .create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        let (_, tui) = c
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        c.start_autonomous_component().await.unwrap();
+        wait_for_next_slot_tick().await;
+        let rig = drain(&hamlib);
+        assert!(
+            rig.iter().any(|m| matches!(
+                m.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    frequency: 18_100_000,
+                    ..
+                })
+            )),
+            "hamlib={rig:?}"
+        );
+        let diagnostics: Vec<(&'static str, String, Option<String>)> = drain(&tui)
+            .into_iter()
+            .filter_map(|m| match m.message_type {
+                MessageType::DiagnosticEvent {
+                    target,
+                    text,
+                    callsign,
+                    ..
+                } if text.starts_with("Band hop") => Some((target, text, callsign)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            diagnostics.contains(&(
+                "qso.autonomous",
+                "Band hop 20m -> 17m: UTC plan window 00:00-24:00 (17m)".to_string(),
+                None
+            )),
+            "diagnostics={diagnostics:?}"
+        );
+        assert_eq!(c.operating_frequency_hz.load(Ordering::Relaxed), 18_100_000);
+        c.shutdown_signal.store(true, Ordering::Release);
     }
 
     async fn build_coordinator(autonomous_enabled: bool, headless: bool) -> ApplicationCoordinator {

@@ -637,11 +637,86 @@ atno_bonus             = 0.15   # extra premium on top of needed_dxcc for an
   bias, DX-proximity window, own-QSO separation, neighbor guard).
 - `[autonomous.listen_cycle]` — adaptive forced-listen-slot cadence for
   collision detection.
-- `[autonomous.band_hopping]` — off by default; ordered band list with a
-  low-activity hop threshold.
 
-Defaults for all three live in `Config::default()`; see
+Defaults for both live in `Config::default()`; see
 `pancetta-config/src/autonomous.rs` for every field with doc comments.
+
+### `[autonomous.band_hopping]` — automatic band changes
+
+Off by default. When enabled, the autonomous operator changes band on its
+own for three reasons, checked every slot in this order: a UTC plan window
+starting (`[[autonomous.band_plan]]`, below), needed activity spotted on
+cqdx.io, and the low-activity round-robin over `bands`. A hop never happens
+while the rig is keyed or while a QSO partner has answered; it waits and is
+re-evaluated next slot. Each hop writes one line, naming its trigger, to the
+Diagnostics overlay (Shift+D). Every key is restart-required.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch for every automatic band change, including `[[autonomous.band_plan]]`. |
+| `hop_threshold` | integer | `20` | Slots with no decodes before a low-activity hop; also the hop interval (`hop_threshold` slots, 5 min by default) that a needed-activity hop waits before another one. Must be at least 1. |
+| `needed_activity` | boolean | `true` | Hop toward a band where cqdx.io spots more needed FT8/FT4 entities (all-time new ones first). Needs cqdx configured; inert without its data. |
+| `needed_idle_secs` | integer | `600` | Seconds with no needed caller (a decoded CQ tiered new-DXCC-on-band or better) heard on the current band before a `needed_activity` hop. |
+| `grey_line` | boolean | `true` | Within 30 min of local sunrise or sunset (computed from the station grid square), prefer bands below 14 MHz when needed-activity candidates tie, and on a plan window's start pick its first band below 14 MHz. |
+
+`bands` is the ordered list of `[[autonomous.band_hopping.bands]]` entries
+(`band_name`, `dial_frequency`, `priority`). Each `dial_frequency` must fall
+inside an amateur band.
+
+### `[[autonomous.band_plan]]` — UTC band plan
+
+Optional, empty by default, restart-required, and used only when
+`[autonomous.band_hopping]` `enabled = true` (otherwise loading warns that
+the plan is not used). Each window names the bands to work during a UTC
+time of day:
+
+```toml
+[autonomous.band_hopping]
+enabled = true            # master switch for every automatic band change
+hop_threshold = 20        # silent slots before a low-activity hop; also the hop interval
+needed_activity = true    # hop toward needed entities spotted on cqdx.io
+needed_idle_secs = 600    # no needed caller heard on this band for this long first
+grey_line = true          # near sunrise/sunset prefer bands below 14 MHz on a tie
+
+[[autonomous.band_hopping.bands]]
+band_name = "20m"
+dial_frequency = 14074000
+priority = 1
+
+[[autonomous.band_hopping.bands]]
+band_name = "17m"
+dial_frequency = 18100000
+priority = 2
+
+[[autonomous.band_plan]]
+utc = "00:00-06:00"        # start inclusive, end exclusive
+bands = ["40m", "80m"]     # preference order
+
+[[autonomous.band_plan]]
+utc = "06:00-24:00"
+bands = ["20m", "17m"]
+```
+
+- `utc` is `HH:MM-HH:MM`, start inclusive and end exclusive. A start later
+  than the end wraps midnight (`"22:00-02:00"`); `24:00` is allowed as an
+  end (`"18:00-24:00"`, `"00:00-24:00"`). Start and end must differ.
+- `bands` is a non-empty list of canonical lowercase band names (`"160m"`
+  to `"6m"`), in preference order. Each band needs an FT8 dial frequency or
+  a `[[autonomous.band_hopping.bands]]` entry on that band; a configured
+  entry's `dial_frequency` wins over the standard FT8 dial.
+- Windows are matched in file order, first match wins. Time not covered by
+  any window has no plan constraint.
+- A window acts on entry only. When UTC enters a window (or at startup
+  inside one) and the rig is not on one of its bands, the operator hops to
+  the first listed band, or, with `grey_line` on near local sunrise or
+  sunset, to the first listed band below 14 MHz (the Diagnostics line then
+  ends `grey-line sunrise favours 40m`). A manual QSY inside the window is left alone
+  until the next window starts.
+- While a window is active, needed-activity and low-activity hops choose
+  only among its bands.
+
+This is not `[rig.frequency.band_plan]`, which sets the band edges TX is
+allowed within (PAN-118).
 
 ### `[duplicate_checking]` — don't call the same station twice
 
@@ -1527,7 +1602,7 @@ revocation does not depend on cqdx availability.
 
 - Autonomous `slot_parity`, `needed_means`, `unattended_policy`,
   `max_concurrent_qsos`, `tx_offset_hz`, `qso_stall_switch_after`, `frequency.*`,
-  `listen_cycle.*`, `band_hopping.*` and `priorities.*`.
+  `listen_cycle.*`, `band_hopping.*`, `band_plan` and `priorities.*`.
 - Station identity and `power_watts` (log metadata), and every rig setting
   except receive gain presets, including hardware bindings, band plans and
   protection settings.
