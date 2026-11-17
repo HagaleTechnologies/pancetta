@@ -785,6 +785,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         })
         .await
         .unwrap();

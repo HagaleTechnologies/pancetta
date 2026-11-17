@@ -422,6 +422,9 @@ impl OutMsg {
 
 /// Messages pancetta consumes (sent by companion apps such as GridTracker).
 /// Field lists are exactly protocol notes §4 IN tables, in order.
+/// `Decode` and `Status` are consumed only by the PAN-381 decode listener
+/// (`wsjtx_udp::ingest`), which hears a same-host WSJT-X in the server
+/// role; the companion socket still treats them as "no action".
 /// `Other(type)` is the catch-all for every inbound type this codec does
 /// not (yet) act on — bytes beyond the header are ignored, matching the
 /// "ignore unknown message types" framing rule (§2).
@@ -432,6 +435,22 @@ pub(crate) enum InMsg {
         max_schema: u32,
         version: String,
         revision: String,
+    },
+    /// Type 1, WSJT-X's state. Only `dial_frequency` and `mode` are read;
+    /// the remaining 19 fields are ignored under the trailing-bytes rule
+    /// (§3). A truncated field reads as its default.
+    Status { dial_frequency: u64, mode: String },
+    /// Type 2, one decode, in the same field order as the OUT table.
+    Decode {
+        new: bool,
+        time_ms: u32,
+        snr: i32,
+        delta_time: f64,
+        delta_freq: u32,
+        mode: String,
+        message: String,
+        low_confidence: bool,
+        off_air: bool,
     },
     /// Type 3. `window` is `None` when the field is absent (older peer).
     Clear { window: Option<u8> },
@@ -482,6 +501,21 @@ impl InMsg {
                 max_schema: r.read_u32().unwrap_or_default(),
                 version: r.read_utf8().unwrap_or_default(),
                 revision: r.read_utf8().unwrap_or_default(),
+            },
+            TYPE_STATUS => InMsg::Status {
+                dial_frequency: r.read_u64().unwrap_or_default(),
+                mode: r.read_utf8().unwrap_or_default(),
+            },
+            TYPE_DECODE => InMsg::Decode {
+                new: r.read_bool().unwrap_or_default(),
+                time_ms: r.read_qtime_ms().unwrap_or_default(),
+                snr: r.read_i32().unwrap_or_default(),
+                delta_time: r.read_f64().unwrap_or_default(),
+                delta_freq: r.read_u32().unwrap_or_default(),
+                mode: r.read_utf8().unwrap_or_default(),
+                message: r.read_utf8().unwrap_or_default(),
+                low_confidence: r.read_bool().unwrap_or_default(),
+                off_air: r.read_bool().unwrap_or_default(),
             },
             TYPE_CLEAR => InMsg::Clear {
                 window: r.read_u8(),
@@ -918,3 +952,7 @@ mod additional {
         assert!(InMsg::decode(w.as_slice()).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "codec/tests/inbound_decode_tests.rs"]
+mod inbound_decode_tests;

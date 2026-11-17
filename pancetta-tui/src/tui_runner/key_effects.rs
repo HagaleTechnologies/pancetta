@@ -456,6 +456,7 @@ fn rich_fixture(app: &mut App) {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         });
     app.dx_stations.insert("VK9XX".to_string(), cq_dx_station());
     app.clamp_dx_hunter_selection();

@@ -166,6 +166,7 @@ fn decode(
         priority_score: None,
         priority_factors: None,
         is_own_tx: own,
+        external: false,
     }
 }
 
@@ -359,6 +360,8 @@ async fn fixture(name: ThemeName) -> App {
     decodes[2].needed = true;
     decodes[3].worked_before = true;
     decodes[4].band_needed = true;
+    // PAN-381: one decode arrived from a same-host WSJT-X over UDP.
+    decodes[0].external = true;
     app.decoded_messages.extend(decodes);
 
     app.device_selection.input_devices = vec![
@@ -463,6 +466,8 @@ async fn fixture(name: ThemeName) -> App {
     stations[3].notable_type = Some("DXpedition".to_string());
     stations[3].source = SpotSource::Both;
     stations[4].worked_before = true;
+    // PAN-381: a station heard only through WSJT-X's UDP decodes.
+    stations[4].source = SpotSource::External;
     stations[5].band_needed = true;
     for s in stations {
         app.dx_stations.insert(s.call_sign.clone(), s);

@@ -1261,3 +1261,42 @@ when that contract exists; this ticket does not wait for it.
   the key's generation is unchanged, so a reopened, failed or re-completed QSO
   keeps the key it needs. A reopened QSO shows `73 to <call> was not sent; QSO
   not logged, still open`.
+
+## WSJT-X decode ingest (PAN-381), 2026-11
+
+`pancetta/src/coordinator/wsjtx_udp/{codec.rs,ingest.rs}`, `pancetta/src/coordinator/{pipeline.rs,tui_relay.rs}`,
+`pancetta-config/src/network.rs`, `pancetta-tui/src/{app.rs,ui/band_activity.rs,ui/dx_hunter.rs,theme.rs}`:
+`[network.wsjtx_udp] accept_decodes = true` lets a same-host WSJT-X feed its decodes into
+Band Activity and DX Hunter, tagged `EXT`.
+
+- **Display only (D1).** External decodes go only on a clone of `ft8_to_tui_tx`, never the
+  message bus. The QSO engine and Autonomous can key transmit and read no provenance, so
+  the relay channel makes "never triggers a transmission on its own" structural. The same
+  `PriorityScorer` scores them in `decoded_view_for_relay`. Feeding Autonomous, alerts,
+  PSKReporter, the remote gateway or the WSJT-X re-emit is out of scope.
+- **Separate receive-only loopback socket (D2).** The listener binds `decode_listen`
+  (default `127.0.0.1:2238`, distinct from the default `destination` and GridTracker's
+  2237) and never calls `send_to`. Validation and the start path both refuse a
+  non-loopback address; UDP sources are unauthenticated, so loopback binding is the
+  protection and the per-datagram source check is defence in depth (the PAN-312 posture).
+- **Independent of `enabled` (D3).** `enabled` keeps meaning "pancetta broadcasts as a
+  WSJT-X-role app"; an operator using WSJT-X as the modem may not want that broadcast.
+- **Dial from Status, never guessed (D4).** The listener keeps the last non-zero Status
+  dial per sender Id (at most 8 Ids) and drops decodes from an Id with no dial. There is
+  no fallback to pancetta's own dial or a 14.074 MHz default, which would mis-band every
+  decode on a station without CAT. Close forgets the Id.
+- **Live, confident FT8/FT4 only (D5).** `New = true`, `OffAir = false`,
+  `LowConfidence = false`, glyph `~` (FT8, 15 s slots) or `+` (FT4, 7.5 s). Pancetta's own
+  `instance_id` is dropped as echo. SNR, DT, DF and time-of-day are range-checked.
+- **Native constructor and sanitizing (D6).** The decode is built with
+  `DecodedMessage::from_ft8lib` and sanitized like a native decode; a sender call that
+  fails `is_plausible_callsign` keeps its text but loses its from-call, to-call and grid,
+  so free text creates no DX Hunter row.
+- **Flood bounds (D7).** `try_send` only, so a full display channel drops and never blocks
+  the native decoder's blocking send. At most 250 decodes per 15 s window. One summary
+  diagnostic per 60 s, only for operator-actionable drops.
+- **Headless and replay start nothing (D12).** Headless has no display consumer, and live
+  WSJT-X traffic would mix with `--replay` decodes. Each case logs one line.
+
+Both keys are restart-required. Clean room: built from the protocol notes only, never
+WSJT-X's GPL source. Automated coverage only; not yet checked against a real WSJT-X.

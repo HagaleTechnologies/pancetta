@@ -28,4 +28,5 @@
 
 - [What will bite you about silent audio-output recovery?](pages/audio-output-recovery.md) — PAN-295: the watchdog's dead latch survives a reopen, so retries run on the policy's own clock; a reopen result never unmutes; the 3-per-10-min budget survives recovery and manual picks.
 - [What will bite you about shutdown PTT-off?](pages/shutdown-ptt-off.md) — PAN-277: enqueue versus unkey, drain ordering, and direct-client timeouts.
+- [What will bite you about WSJT-X decode ingest?](pages/wsjtx-decode-ingest.md) — PAN-381: the dial comes only from Status (never 14.074 MHz), external decodes reach only `ft8_to_tui_tx` and never the bus, the native decoder's blocking send is why the listener uses `try_send` and a 250-per-15 s budget, own-Id echo, and the free-text guard.
 - [What will bite you about out-of-line test modules?](pages/out-of-line-test-modules.md) — PAN-326: `#[path]` is relative to the declaring file's directory (`qso_manager/tests/` from `qso_manager.rs`, `tests/` from `mod.rs`), `include_str!` resolves from the test file, and renaming a test module renames its tests.
