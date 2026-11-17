@@ -188,3 +188,41 @@ async fn space_on_external_network_row_keeps_the_spot_call() {
         Some(SpaceAction::Call { .. })
     ));
 }
+
+/// Codex review on PR #700: a QSO-outcome rescore names the origin of the
+/// inputs it was scored from, and applies only to a row of that origin. A
+/// row pancetta heard itself (`RX`, `RX+N`) takes only native rescores; an
+/// `EXT` or `EX+N` row, which a band change may have rebuilt from WSJT-X
+/// decodes, takes only WSJT-X rescores.
+#[tokio::test]
+async fn rank_refresh_applies_only_to_a_row_of_its_origin() {
+    let factors = pancetta_qso::PriorityScorer::new(
+        pancetta_qso::priority::PriorityWeights::default(),
+        Box::new(pancetta_qso::priority::NullLookup),
+    )
+    .score_tiered_explained("N4BP", None, -10, 14_074_000.0)
+    .factors;
+    for (source, external) in [
+        (SpotSource::Local, false),
+        (SpotSource::Both, false),
+        (SpotSource::External, true),
+        (SpotSource::ExternalNetwork, true),
+    ] {
+        let mut app = app_with_row("N4BP", source.clone()).await;
+        let before = app.dx_stations["N4BP"].local_rank.unwrap().score;
+
+        app.refresh_local_rank_from("N4BP", before + 777, factors, !external);
+        assert_eq!(
+            app.dx_stations["N4BP"].local_rank.unwrap().score,
+            before,
+            "{source:?} row took a rescore of the other origin"
+        );
+
+        app.refresh_local_rank_from("N4BP", before + 777, factors, external);
+        assert_eq!(
+            app.dx_stations["N4BP"].local_rank.unwrap().score,
+            before + 777,
+            "{source:?} row ignored a rescore of its own origin"
+        );
+    }
+}

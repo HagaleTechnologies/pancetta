@@ -611,7 +611,9 @@ struct RankInputs {
 /// The `last_rank_inputs` key for a decoded callsign: the DX Hunter row's call
 /// (a resolved hash-render unwrapped, as `pancetta_tui`'s row key does), so a
 /// station heard as both `6W/IK2HKT` and `<6W/IK2HKT>` keeps one entry — its
-/// newest decode — and a QSO outcome rescores its single row once.
+/// newest decode — and a QSO outcome rescores its single row once. The cache
+/// pairs it with the decode's origin (`true` for a same-host WSJT-X decode,
+/// PAN-381), so native and external inputs never replace each other.
 fn rank_inputs_key(call: &str) -> String {
     pancetta_core::callsign::resolve_hash_render(call)
         .unwrap_or(call)
@@ -626,7 +628,7 @@ fn rank_inputs_key(call: &str) -> String {
 /// decoded in this relay session.
 fn outcome_rank_refresh(
     scorer: &pancetta_qso::PriorityScorer,
-    last_inputs: &RelayCache<String, RankInputs>,
+    last_inputs: &RelayCache<(String, bool), RankInputs>,
     callsign: &str,
 ) -> Vec<pancetta_tui::tui_runner::TuiMessage> {
     let identity = |call: &str| {
@@ -637,8 +639,8 @@ fn outcome_rank_refresh(
     };
     last_inputs
         .iter()
-        .filter(|(call, _)| identity(call).as_deref() == Some(target.as_str()))
-        .filter_map(|(call, inputs)| {
+        .filter(|((call, _), _)| identity(call).as_deref() == Some(target.as_str()))
+        .filter_map(|((call, external), inputs)| {
             let (Some(score), Some(factors)) = display_rank(
                 scorer,
                 Some(call),
@@ -652,6 +654,7 @@ fn outcome_rank_refresh(
                 callsign: call.clone(),
                 score,
                 factors,
+                external: *external,
             })
         })
         .collect()
@@ -829,7 +832,7 @@ struct TuiRelayLoop {
     /// 4,096 entries) instead of an unbounded HashMap.
     sent_states: RelayCache<String, String>,
     last_grids: RelayCache<(String, String), String>,
-    last_rank_inputs: RelayCache<String, RankInputs>,
+    last_rank_inputs: RelayCache<(String, bool), RankInputs>,
     last_rig_state: Option<u8>,
     last_audio_default: Option<bool>,
     last_input_fallback: Option<bool>,
@@ -4725,7 +4728,7 @@ fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
 /// (see the note at its spawn, and `TxPolicyCmdCtx` for the same pattern).
 struct RelayDecodeCtx<'a> {
     last_grids: &'a mut RelayCache<(String, String), String>,
-    last_rank_inputs: &'a mut RelayCache<String, RankInputs>,
+    last_rank_inputs: &'a mut RelayCache<(String, bool), RankInputs>,
     station_coords: Option<(f64, f64)>,
     lookup: &'a crate::priority_evaluator::CachedStationLookup,
     scorer: &'a pancetta_qso::PriorityScorer,
@@ -4789,17 +4792,6 @@ fn decoded_view_for_relay(
         decoded_msg.snr_db,
         dial_mhz,
     );
-    if let Some(call) = call_sign.as_deref() {
-        ctx.last_rank_inputs.insert(
-            rank_inputs_key(call),
-            RankInputs {
-                grid: grid_square.clone(),
-                snr_db: decoded_msg.snr_db,
-                dial_mhz,
-            },
-        );
-    }
-
     // PAN-381: an external (WSJT-X UDP) decode shows the mode its glyph
     // named, not pancetta's own protocol mode, and is tagged for display.
     // Everything above — enrichment and the display rank — is the same
@@ -4811,6 +4803,21 @@ fn decoded_view_for_relay(
             false,
         ),
     };
+
+    if let Some(call) = call_sign.as_deref() {
+        // PAN-381: native and WSJT-X inputs are kept apart. The TUI leaves a
+        // row pancetta heard itself untouched by a WSJT-X decode, so each
+        // QSO-outcome rescore names its origin and the TUI applies it only
+        // to a row of that origin (`App::refresh_local_rank_from`).
+        ctx.last_rank_inputs.insert(
+            (rank_inputs_key(call), external),
+            RankInputs {
+                grid: grid_square.clone(),
+                snr_db: decoded_msg.snr_db,
+                dial_mhz,
+            },
+        );
+    }
 
     pancetta_tui::DecodedMessageView {
         timestamp: chrono::Utc::now(),
@@ -6843,7 +6850,7 @@ mod tui_relay_tests {
 
         let mut last_inputs = super::RelayCache::default();
         last_inputs.insert(
-            "K1ABC/P".to_owned(),
+            ("K1ABC/P".to_owned(), false),
             super::RankInputs {
                 grid: Some("FN42".into()),
                 snr_db: -3.0,
@@ -6862,6 +6869,7 @@ mod tui_relay_tests {
             callsign,
             score,
             factors,
+            ..
         }) = refreshes.into_iter().next()
         else {
             panic!("a decoded station's QSO outcome must rescore its row");
@@ -6890,7 +6898,7 @@ mod tui_relay_tests {
         let mut last_inputs = super::RelayCache::default();
         for (call, dial_mhz) in [("6W/IK2HKT", 7.074), ("<6W/IK2HKT>", 14.074)] {
             last_inputs.insert(
-                super::rank_inputs_key(call),
+                (super::rank_inputs_key(call), false),
                 super::RankInputs {
                     grid: None,
                     snr_db: -8.0,

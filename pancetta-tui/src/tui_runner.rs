@@ -508,6 +508,9 @@ pub enum TuiMessage {
         callsign: String,
         score: u32,
         factors: pancetta_qso::priority::PriorityFactors,
+        /// The rescored inputs came from a same-host WSJT-X decode (PAN-381).
+        /// It applies only to a row of the same origin.
+        external: bool,
     },
 }
 
@@ -1383,8 +1386,9 @@ impl TuiRunner {
                 callsign,
                 score,
                 factors,
+                external,
             } => {
-                app.refresh_local_rank(&callsign, score, factors);
+                app.refresh_local_rank_from(&callsign, score, factors, external);
             }
         }
 

@@ -176,3 +176,119 @@ fn dial_band_scopes_external_like_native() {
         assert_scored_alike(&native, &external);
     }
 }
+
+/// The DX Hunter rescores a QSO outcome sends for `call`, as
+/// `(external, score)` pairs sorted native first.
+fn refreshed_scores(
+    scorer: &pancetta_qso::PriorityScorer,
+    last_rank_inputs: &RelayCache<(String, bool), RankInputs>,
+    call: &str,
+) -> Vec<(bool, u32)> {
+    let mut scores: Vec<(bool, u32)> = outcome_rank_refresh(scorer, last_rank_inputs, call)
+        .into_iter()
+        .map(|refresh| match refresh {
+            pancetta_tui::tui_runner::TuiMessage::DxRankRefresh {
+                score, external, ..
+            } => (external, score),
+            other => panic!("expected a DxRankRefresh, got {other:?}"),
+        })
+        .collect();
+    scores.sort();
+    scores
+}
+
+/// Feed decodes through the relay's conversion with shared caches, as the
+/// relay loop does across frames, and return its rank-input memory.
+fn rank_inputs_after(
+    lookup: &CachedStationLookup,
+    scorer: &pancetta_qso::PriorityScorer,
+    decodes: &[RelayedDecode],
+) -> RelayCache<(String, bool), RankInputs> {
+    let mut last_grids = RelayCache::default();
+    let mut last_rank_inputs = RelayCache::default();
+    for relayed in decodes {
+        decoded_view_for_relay(
+            relayed,
+            &mut RelayDecodeCtx {
+                last_grids: &mut last_grids,
+                last_rank_inputs: &mut last_rank_inputs,
+                station_coords: Some((35.0, -97.0)),
+                lookup,
+                scorer,
+                our_callsign: "K5ARH",
+                protocol_mode: 0,
+            },
+        );
+    }
+    last_rank_inputs
+}
+
+/// Codex review on PR #700: the TUI ignores a WSJT-X decode for a row
+/// pancetta heard itself, so the QSO-outcome rescore of that row must keep
+/// the native band, grid and SNR. Before the fix, one per-call slot held the
+/// newest decode, so a later external decode on another band replaced the
+/// native inputs and the 20m-worked K1ABC was rescored as unworked on 40m.
+/// Now each origin keeps its own inputs, and each rescore names its origin
+/// so the TUI applies it only to a row of that origin.
+#[test]
+fn external_decode_keeps_native_rank_inputs() {
+    let lookup = seeded_lookup();
+    let scorer = pancetta_qso::PriorityScorer::new(
+        pancetta_qso::priority::PriorityWeights::default(),
+        Box::new(lookup.clone()),
+    );
+    let ext = DecodeOrigin::WsjtxUdp {
+        mode: OperatingMode::Ft8,
+    };
+    let native_20m = relayed("CQ K1ABC FN42", 14_074_000, DecodeOrigin::Native);
+    let mut external_40m = relayed("CQ K1ABC FN31", 7_074_000, ext);
+    external_40m.message.snr_db = 12.0;
+
+    let native_only = refreshed_scores(
+        &scorer,
+        &rank_inputs_after(&lookup, &scorer, std::slice::from_ref(&native_20m)),
+        "K1ABC",
+    );
+    let external_only = refreshed_scores(
+        &scorer,
+        &rank_inputs_after(&lookup, &scorer, std::slice::from_ref(&external_40m)),
+        "K1ABC",
+    );
+    let [(false, native_score)] = native_only[..] else {
+        panic!("one native rescore expected, got {native_only:?}");
+    };
+    let [(true, external_score)] = external_only[..] else {
+        panic!("one external rescore expected, got {external_only:?}");
+    };
+    // The two inputs score differently (worked on 20m, not on 40m), so the
+    // equalities below are each origin's own inputs surviving.
+    assert_ne!(native_score, external_score);
+
+    // Either order: the native rescore still uses the native 20m inputs, and
+    // the external rescore the WSJT-X 40m inputs.
+    for decodes in [
+        [native_20m.clone(), external_40m.clone()],
+        [external_40m.clone(), native_20m.clone()],
+    ] {
+        assert_eq!(
+            refreshed_scores(
+                &scorer,
+                &rank_inputs_after(&lookup, &scorer, &decodes),
+                "K1ABC"
+            ),
+            vec![(false, native_score), (true, external_score)],
+            "an external decode replaced a native row's rank inputs"
+        );
+    }
+
+    // A later external decode still updates the external inputs.
+    let mut external_20m = relayed("CQ K1ABC FN42", 14_074_000, ext);
+    external_20m.message.snr_db = -15.0;
+    let latest = rank_inputs_after(&lookup, &scorer, &[external_40m, external_20m]);
+    let inputs = latest
+        .get(&("K1ABC".to_owned(), true))
+        .expect("external K1ABC cached");
+    assert_eq!(inputs.dial_mhz, 14.074);
+    assert_eq!(inputs.snr_db, -15.0);
+    assert!(latest.get(&("K1ABC".to_owned(), false)).is_none());
+}

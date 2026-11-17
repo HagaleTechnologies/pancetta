@@ -4035,6 +4035,31 @@ impl App {
             .map(str::to_string)
     }
 
+    /// Apply a relay rescore only to a row whose rank came from the same
+    /// decode origin (PAN-381): native inputs rescore an `RX` or `RX+N` row,
+    /// same-host WSJT-X inputs an `EXT` or `EX+N` row. A WSJT-X decode never
+    /// updates a row pancetta heard itself, so its inputs never rescore one,
+    /// and a row rebuilt from WSJT-X decodes after a band change is not
+    /// rescored from another band's native inputs.
+    pub fn refresh_local_rank_from(
+        &mut self,
+        callsign: &str,
+        score: u32,
+        factors: PriorityFactors,
+        external: bool,
+    ) {
+        let Some(entry) = self.dx_stations.get(dx_row_call(callsign)) else {
+            return;
+        };
+        let row_external = matches!(
+            entry.source,
+            SpotSource::External | SpotSource::ExternalNetwork
+        );
+        if row_external == external {
+            self.refresh_local_rank(callsign, score, factors);
+        }
+    }
+
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
     /// with that station ended (PAN-94), and rescore its cqdx spot with the
     /// same history so a stale network score cannot keep the row up. Keeps
