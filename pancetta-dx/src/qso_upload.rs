@@ -1273,17 +1273,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tls_security_tests {
-    use super::*;
-    mod fixture {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../test-support/tls.rs"
-        ));
-    }
-    // ClubLog, QRZ Logbook and eQSL all call this same production builder.
-    #[tokio::test]
-    async fn tls_untrusted_upload_services() {
-        fixture::rejects_http(http_builder().no_proxy().build().unwrap()).await;
-    }
-}
+#[path = "qso_upload/tests/tls_security_tests.rs"]
+mod tls_security_tests;

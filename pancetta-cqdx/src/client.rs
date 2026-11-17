@@ -1468,16 +1468,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tls_security_tests {
-    use super::*;
-    mod fixture {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../test-support/tls.rs"
-        ));
-    }
-    #[tokio::test]
-    async fn tls_untrusted_cqdx() {
-        fixture::rejects_http(CqdxClient::http_builder().no_proxy().build().unwrap()).await;
-    }
-}
+#[path = "client/tests/tls_security_tests.rs"]
+mod tls_security_tests;
