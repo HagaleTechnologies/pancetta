@@ -1342,3 +1342,62 @@ Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
 receive a release-candidate notice. They require a real, matching CHANGELOG
 section; there is no Unreleased fallback. The operator still publishes the
 draft. macOS signing and notarization remain PAN-265.
+
+## Registry packaging for pancetta-ft8 and pancetta-core (PAN-384, 2026-11-17)
+
+- **Per-crate `publish = true`.** `pancetta-core` and `pancetta-ft8` opt in
+  on their own switch, and `[workspace.package] publish` stays `false`.
+  Eleven crates inherit the workspace flag, so flipping it would make the
+  TUI, hamlib and the station binary publishable by accident.
+  `only_core_and_ft8_are_publishable` pins the set.
+- **`pancetta-core` publishes with `pancetta-ft8`.** `DecodedMessage::slot_parity`
+  is a public field of a `pancetta-core` type, and the encoder and message
+  modules call core's callsign, grid and token helpers. Dropping the
+  dependency would change a public field and duplicate validators the rest
+  of the workspace shares. Tony's command is
+  `cargo publish -p pancetta-core -p pancetta-ft8`, not `-p pancetta-ft8`
+  alone.
+- **Vendored ft8_lib through an `include` whitelist, no `build.rs` fetch.**
+  The C that `build.rs` compiles is about 0.2 MB, and the package is about
+  780 KB. A fetch would add a network dependency and a checksum to maintain,
+  and docs.rs builds have no network. The whitelist fails closed: a new
+  large file in the submodule cannot slip in, and the unlicensed WSJT-X
+  files under `vendor/ft8_lib/ft4_ft8_public/` stay out of an
+  `MIT OR Apache-2.0` package.
+- **The packaging guard keys on `Cargo.toml.orig`.** cargo writes it into
+  every packaged crate, including one built outside any git repository,
+  where `.cargo_vcs_info.json` is absent. A git checkout never has it, so
+  git-tag consumers such as manta keep the stub fallback. A packaged
+  `pancetta-ft8` without `vendor/ft8_lib` now fails its build script, so
+  `cargo publish` verification refuses it instead of shipping the stub.
+- **`pancetta-core` has its own version, starting at 0.9.7.** Ten commits
+  changed `pancetta-core` after the `v0.9.6` tag, so publishing today's tree
+  as 0.9.6 would put a 0.9.6 on the registry that differs from the git tag.
+  `pancetta-ft8` requires `version = "0.9.7"`, and
+  `registry_metadata_is_complete` keeps that requirement equal to core's
+  version.
+- **License expression stays `MIT OR Apache-2.0`.** The bundled ft8_lib
+  (MIT) and kissfft (BSD-3-Clause) texts ship in the crate's
+  `THIRD-PARTY-NOTICES.md` and the README names them. `libz-sys`,
+  `libgit2-sys` and `openssl-src` handle bundled C the same way.
+- **`rust-version = "1.88"` with `#![deny(clippy::incompatible_msrv)]`.** Both
+  libraries compile with 1.88.0 on the current lockfile. The deny makes CI's
+  existing clippy step fail on any std API newer than 1.88. Without it, such
+  a use would only warn.
+- **README links pin the release tag.** A published README cannot change,
+  and a `blob/main` link would drift away from the published version. The
+  links use `blob/pancetta-ft8-v<version>/`, the version test updates them at
+  every bump, and the runbook cuts the tag before the publish.
+- **The packaging check is a step in `workspace-check`, not a new job.**
+  `test-ci-cargo-coverage.sh` pins the set of jobs with a rust-cache and the
+  `ci` aggregator's `needs`. A step inherits the job's submodule checkout,
+  toolchain pin and cache.
+- **Size limit 10,000,000 bytes.** That is under the crates.io limit whether
+  it means 10 MB or 10 MiB. The package is about 0.78 MB, so the gate only
+  catches real mistakes, such as test WAVs slipping into the whitelist.
+- **The `cty.dat` gate.** `pancetta-core`'s DXCC tables are generated from
+  the AD1C BigCTY `cty.dat`, whose terms the repository records only as
+  "free for amateur use". A person must confirm the redistribution terms
+  before the publish (follow-up ticket). If the terms forbid it, the
+  fallback is to move the DXCC modules out of `pancetta-core` into a crate
+  that stays unpublished; `pancetta-ft8` does not use them.

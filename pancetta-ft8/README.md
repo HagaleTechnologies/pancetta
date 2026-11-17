@@ -1,8 +1,31 @@
-# Pancetta FT8 - High-Performance FT8 Digital Mode Decoder
+# pancetta-ft8
 
-A Rust implementation of FT8 digital-mode encoding, decoding, and
-modulation, optimized for real-time use inside Pancetta's autonomous
-station pipeline.
+An FT8 and FT4 decoder, encoder and modulator in Rust, with the MIT-licensed
+[ft8_lib](https://github.com/kgoba/ft8_lib) C reference decoder built in.
+It is the decoder the Pancetta autonomous station runs. The crate is licensed
+`MIT OR Apache-2.0`.
+
+## Install
+
+```toml
+[dependencies]
+pancetta-ft8 = "0.9"
+```
+
+The package contains the ft8_lib C sources it compiles, so the build host needs
+a C compiler (gcc or clang). On Windows, build the `x86_64-pc-windows-gnu`
+target with MinGW. MSVC cannot compile ft8_lib's variable-length arrays, so
+`*-windows-msvc` targets are not supported. Minimum Rust 1.88.
+
+`pancetta-ft8` depends on `pancetta-core`, the Pancetta workspace's shared
+types crate, which is published with it.
+
+To pin the git tag instead of the registry version:
+
+```toml
+[dependencies]
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.7" }
+```
 
 ## Using the decoder from another program
 
@@ -10,11 +33,6 @@ Other programs can depend on this crate alone to decode FT8 and FT4 — no
 station, audio-device, rig-control or network code comes with it. Pass one
 full cycle of 12 kHz mono audio to `decode_cycle` and you get the same
 decodes Pancetta's own station gets for that audio.
-
-```toml
-[dependencies]
-pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta", tag = "pancetta-ft8-v0.9.7" }
-```
 
 Default features only. The default build already includes the encoder and
 modulator and every decoder pass the station runs. `transmit` adds the
@@ -42,11 +60,9 @@ reads the whole cycle; the native pass reads the first `WINDOW_SAMPLES`
 Hold a `CycleDecoder::new(Protocol)` and call its `decode_cycle` method to
 reuse buffers across slots.
 
-A runnable version of the above ships as an example:
-
-```console
-cargo run -p pancetta-ft8 --example decode_cycle -- pancetta-ft8/tests/fixtures/wav/jtdx/190227_155815.wav
-```
+The `decode_cycle` example in the package is a runnable version of the
+above; see [Working in the repository](#working-in-the-repository) for the
+command.
 
 ### The no-station-dependencies guarantee
 
@@ -63,20 +79,23 @@ convention.
 
 ### Submodule note
 
+The crates.io package already contains the ft8_lib C sources; nothing more
+is needed. The rest of this note is for git consumers.
+
 The reference C decoder lives in the `vendor/ft8_lib` git submodule. Cargo
 1.98 (verified 2026-10-30) fetches git-dependency submodules automatically;
 on older cargo versions run `git submodule update --init` in the source
-checkout. Without the submodule the crate still builds, with reduced decode
-recall (the build script warns loudly).
+checkout. Without the submodule a git checkout still builds, with reduced
+decode recall (the build script warns loudly). A packaged crate without the
+C sources now fails to build instead of building the stub.
 
 ### Versioning and pinning
 
 The crate carries its own `version` in its `Cargo.toml`, bumped
-independently of the workspace. Pin it with the matching
-`pancetta-ft8-v<version>` git tag (release process cuts the tag on the
-merge commit). Registry publication stays off (`publish = false`); the pin
-is the tag/rev. When no `pancetta-ft8-v<version>` tag exists, pin a full
-40-character `rev`.
+independently of the Pancetta workspace. Each published version has a
+`pancetta-ft8-v<version>` git tag on the commit it was packaged from.
+Depend on the registry version, or pin the tag. For an unreleased commit
+with no tag, pin a full 40-character `rev`.
 
 ### Stable API and compatibility policy
 
@@ -131,7 +150,8 @@ Compatibility policy:
   the variant for every consumer. Match `Protocol` with a wildcard arm.
 - Decode results are not part of this list. The parity tolerances above and
   `docs/decoder-crate.md` cover them.
-- Pin a `pancetta-ft8-v<version>` tag when one exists, otherwise a full
+- Depend on `pancetta-ft8 = "0.9"` from crates.io, or pin a
+  `pancetta-ft8-v<version>` tag when one exists, otherwise a full
   40-character `rev`. `git ls-remote --tags
   https://github.com/HagaleTechnologies/pancetta 'pancetta-ft8-v*'` lists
   the tags.
@@ -151,7 +171,7 @@ station exactly; SNR may differ by at most 1.0 dB and DT by at most 0.15 s
 not). DT is slot-boundary-relative: sample 0 of the cycle is the slot
 boundary, so no lead subtraction is needed. The full contract, including
 window geometry and the feature table, is
-[`docs/decoder-crate.md`](../docs/decoder-crate.md).
+[`docs/decoder-crate.md`](https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v0.9.7/docs/decoder-crate.md).
 
 ## Implementation Provenance
 
@@ -162,10 +182,10 @@ MIT/Apache-2.0 crate is fully permitted — the only obligation is to retain its
 copyright notice, which we do here and in `THIRD-PARTY-NOTICES.md`. No GPL
 source (WSJT-X, JTDX, MSHV, JS8Call) is read, ported, or copied anywhere in this
 crate; GPL-peer *techniques* are adopted only via the clean-room spec firewall
-described in [`docs/PROVENANCE.md`](../docs/PROVENANCE.md). The split:
+described in [`docs/PROVENANCE.md`](https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v0.9.7/docs/PROVENANCE.md). The split:
 
-- **Vendored, used via FFI** — `vendor/ft8_lib/` is the unmodified
-  C source of [kgoba/ft8_lib](https://github.com/kgoba/ft8_lib) (MIT,
+- **Vendored, used via FFI** — `vendor/ft8_lib/` holds the unmodified
+  C sources the build compiles, from [kgoba/ft8_lib](https://github.com/kgoba/ft8_lib) (MIT,
   © 2018 Kārlis Goba). It is compiled by `build.rs` and invoked
   through `src/ft8_lib_ffi.rs`. **`ft8_lib` is the primary runtime
   decoder** — the Rust decoder runs alongside it as a secondary path
@@ -200,13 +220,13 @@ and Steve Franke (K9AN), published in
 [*The FT4 and FT8 Communication Protocols*](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf).
 Pancetta does not link or copy any WSJT-X source code.
 
-See the repo-root [`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md)
-for full license text.
+See [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md), which ships with
+this crate, for the full license texts.
 
 ## Features
 
 ### Core Capabilities
-- **Decode performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](../docs/decoder-comparison.md)
+- **Decode performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v0.9.7/docs/decoder-comparison.md)
 - **Real-Time Processing**: 12.64-second window processing with sub-second latency
 - **Parallel Processing**: Support for 50+ simultaneous decode candidates
 - **Zero-Allocation Hot Path**: Memory-efficient processing for real-time constraints
@@ -221,22 +241,6 @@ for full license text.
 - **Error Correction**: LDPC(174,91) with CRC-14 validation
 
 ## Architecture
-
-### Module Structure
-
-```
-pancetta-ft8/
-├── src/
-│   ├── lib.rs              # Public API and core types
-│   ├── decoder.rs          # Main FT8 decoder implementation
-│   ├── signal_processing.rs # DSP functions and FFT operations
-│   ├── message.rs          # FT8 message types and parsing
-│   └── sync.rs             # Time synchronization engine
-├── tests/
-│   └── integration_tests.rs # Comprehensive testing suite
-└── benches/
-    └── decoder_benchmark.rs # Performance benchmarks
-```
 
 ### Key Components
 
@@ -337,7 +341,7 @@ let decoder = Ft8Decoder::with_message_handler(
 - **Real-time Factor**: ~0.1x (processes 12.64s audio in ~1.3s on modern hardware)
 - **Memory Usage**: <10MB peak memory for complex scenarios
 - **Decode Throughput**: 50+ simultaneous candidates
-- **Weak Signal Performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](../docs/decoder-comparison.md)
+- **Weak Signal Performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v0.9.7/docs/decoder-comparison.md)
 
 ### Optimization Features
 
@@ -359,54 +363,6 @@ The decoder supports all standard FT8 message types:
 - **Free Text**: Up to 13 characters
 - **Grid-Only**: Grid square transmission
 - **Telemetry**: Custom data payloads
-
-## Testing
-
-### Running Tests
-
-```bash
-# Run all unit tests
-cargo test --package pancetta-ft8
-
-# Run integration tests
-cargo test --package pancetta-ft8 --test integration_tests
-
-# Run benchmarks
-cargo bench --package pancetta-ft8
-```
-
-### Test Coverage
-
-- **Unit Tests**: 33 tests covering all major components
-- **Integration Tests**: 12 comprehensive end-to-end scenarios
-- **Performance Tests**: Real-time processing validation
-- **Signal Generation**: Synthetic FT8 signal creation for testing
-- **Error Conditions**: Comprehensive error handling validation
-
-## Profiling
-
-`cargo run --release -p pancetta-ft8 --example profile_decode -- [native|native-fresh|ft8lib] [iters]`
-
-Decodes `tests/fixtures/wav/wsjt/210703_133430.wav` repeatedly and prints per-window
-wall time. `RAYON_NUM_THREADS=1` gives clean single-thread numbers. For call-graph
-profiles build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false`
-(the workspace release profile strips symbols) and use `sample`/Instruments (macOS).
-Ablation env vars: `ABL_LDPC_ITERS`, `ABL_SYNC_CANDS`, `ABL_MULTIPASS`,
-`ABL_CROSS_CYCLE` (0/1), `ABL_JOINT_PAIR` (0/1).
-
-## Dependencies
-
-### Core Dependencies
-- **rustfft**: Fast Fourier Transform implementation
-- **num-complex**: Complex number arithmetic
-- **bitvec**: Efficient bit manipulation
-- **crossbeam**: Lock-free concurrency primitives
-- **bumpalo**: Arena allocation for zero-copy processing
-
-### DSP Dependencies
-- **nalgebra**: Linear algebra operations
-- **time**: High-precision timing
-- **thiserror**: Structured error handling
 
 ## Configuration Options
 
@@ -431,39 +387,57 @@ The crate provides comprehensive error handling through the `Ft8Error` enum:
 - **SyncError**: Time synchronization failures
 - **InsufficientData**: Incomplete audio data
 
-## Future Enhancements
+## Working in the repository
 
-### Planned Features
-- **MSK144 Support**: Meteor scatter mode decoding
-- **GPU Acceleration**: CUDA/OpenCL processing
-- **Real-time Streaming**: Continuous audio processing
-- **Advanced LDPC**: Enhanced error correction
-- **Machine Learning**: AI-assisted signal detection
+Tests, fixtures, benches and the other examples live in the git repository,
+not in the crates.io package. The commands below run from a checkout of the
+[repository](https://github.com/HagaleTechnologies/pancetta).
 
-### Performance Improvements
-- **SIMD Optimization**: Enhanced vectorization
-- **Memory Pool**: Custom allocator for hot paths
-- **Async Processing**: Non-blocking decode pipeline
-- **Hardware Acceleration**: FPGA integration support
+Run the `decode_cycle` example on a repository fixture:
 
-## Contributing
+```console
+cargo run -p pancetta-ft8 --example decode_cycle -- pancetta-ft8/tests/fixtures/wav/jtdx/190227_155815.wav
+```
 
-Contributions are welcome! Please ensure:
-- All tests pass (`cargo test`)
-- Benchmarks maintain performance (`cargo bench`)
-- Code follows Rust best practices
-- Documentation is updated for new features
+### Testing
+
+```bash
+# Run all unit tests
+cargo test --package pancetta-ft8
+
+# Run integration tests
+cargo test --package pancetta-ft8 --test integration_tests
+
+# Run benchmarks
+cargo bench --package pancetta-ft8
+```
+
+### Profiling
+
+`cargo run --release -p pancetta-ft8 --example profile_decode -- [native|native-fresh|ft8lib] [iters]`
+
+Decodes `tests/fixtures/wav/wsjt/210703_133430.wav` repeatedly and prints per-window
+wall time. `RAYON_NUM_THREADS=1` gives clean single-thread numbers. For call-graph
+profiles build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false`
+(the workspace release profile strips symbols) and use `sample`/Instruments (macOS).
+Ablation env vars: `ABL_LDPC_ITERS`, `ABL_SYNC_CANDS`, `ABL_MULTIPASS`,
+`ABL_CROSS_CYCLE` (0/1), `ABL_JOINT_PAIR` (0/1).
+
+See `CONTRIBUTING.md` in the [repository](https://github.com/HagaleTechnologies/pancetta).
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option (`MIT OR Apache-2.0`).
+
+The package also contains third-party code under its own permissive licenses.
+The ft8_lib C sources in `vendor/ft8_lib/` are MIT (© 2018 Kārlis Goba), and
+the kissfft FFT inside them is BSD-3-Clause (© 2003-2010 Mark Borgerding).
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) reproduces both license
+texts. Keep it with any binary you distribute.
 
 ## References
 
 - [FT8 Protocol Specification](https://physics.princeton.edu/pulsar/k1jt/FT8_Protocol.pdf)
 - [WSJT-X Implementation](https://www.physics.princeton.edu/pulsar/k1jt/wsjtx.html)
 - [Amateur Radio Digital Modes](https://www.arrl.org/digital-modes)
-
----
-
-Built with ❤️ for the amateur radio community.

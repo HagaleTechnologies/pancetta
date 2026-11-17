@@ -159,12 +159,57 @@ reduced decode recall and a loud build-script warning.
 - External consumers pin the `pancetta-ft8-v<version>` git tag when one
   exists, otherwise a full 40-character `rev`; the release process cuts
   the tag on the merge commit, not this branch.
-- `publish = false` stays (workspace-wide pre-1.0 posture); registry
-  publication (which would also need a versioned, published
-  `pancetta-core`) is a separate ticket.
+- `pancetta-ft8` and `pancetta-core` are publishable to crates.io (PAN-384).
+  They are the only publishable crates: each sets its own `publish = true`,
+  and `[workspace.package] publish` stays `false` for every other crate.
+  They publish together, because `pancetta-ft8` depends on `pancetta-core`.
+  Both carry their own versions, independent of the workspace, and
+  `pancetta-ft8`'s `pancetta-core` requirement always equals core's version.
 - `tests/versioning_contract_test.rs` pins the tag-scheme/version link and
   the README's contract section.
 - The stable item list and the compatibility policy live in
   `pancetta-ft8/README.md` § Stable API and compatibility policy, and
   `tests/stable_api_guard.rs` pins every listed item at compile time
   (PAN-380).
+
+## Publishing to crates.io
+
+Nothing is published yet. These steps publish `pancetta-core` and
+`pancetta-ft8` together. Versions can be yanked from crates.io, never deleted,
+so run the dry-run first and stop at any surprise.
+
+1. Preconditions: E9 and G4 have landed (ticket PAN-384). The AD1C `cty.dat`
+   redistribution terms for `pancetta-core`'s DXCC tables are confirmed (the
+   follow-up ticket). `cargo login` is done with the publisher's token.
+2. On the commit to publish (a `main` merge commit), run
+   `git submodule update --init` and confirm `git status` is clean.
+3. Run `cargo publish --dry-run -p pancetta-core -p pancetta-ft8`. Expect
+   "Packaged 33 files" for `pancetta-core`, "Packaged 72 files" for
+   `pancetta-ft8`, two "aborting upload due to dry run" lines and 35
+   `warning: ignoring ...` lines. The warnings are expected: the `include`
+   whitelists leave tests, benches and most examples out of the packages. A
+   build-script panic naming `vendor/ft8_lib` means the submodule is missing.
+4. Tag the commit `pancetta-core-v<core version>` and
+   `pancetta-ft8-v<ft8 version>`, and push both tags. The README's links pin
+   the `pancetta-ft8-v<version>` tag, so they resolve only after it exists.
+5. Run `cargo publish -p pancetta-core -p pancetta-ft8`. Cargo uploads
+   `pancetta-core` first and waits for it in the index before uploading
+   `pancetta-ft8`. This order comes from cargo's dependency handling. Only the
+   dry-run was tested.
+6. Check `https://crates.io/crates/pancetta-ft8` and its docs.rs build, then
+   note the registry dependency line in dispensa for manta.
+7. Later releases: bump `pancetta-ft8`'s version per the stable API policy.
+   If `pancetta-core` changed since its last published version, bump it and
+   `pancetta-ft8`'s `pancetta-core` requirement together. The
+   `registry_metadata_is_complete` test in
+   `pancetta-ft8/tests/publish_package_test.rs` enforces the match. Publish
+   both, or `-p pancetta-ft8` alone when core is unchanged.
+
+`cargo publish --dry-run -p pancetta-ft8` alone passes only once
+`pancetta-core` at the required version is on crates.io. Before that, the
+dry-run fails with "no matching package named `pancetta-core` found". This
+follows from that error and was not tested.
+
+CI runs `scripts/ci/check-publish-package.sh` on every code change. It runs
+the two-package dry-run and checks each `.crate` against a 10,000,000-byte
+limit. A dry-run never uploads.

@@ -130,6 +130,16 @@ jobs:
               - '.config/nextest.toml'
               # PAN-284: the Workspace Check lane runs this gate on real bench output.
               - 'scripts/ci/check-criterion-budget.sh'
+              # PAN-384: packaging inputs that are not .rs or Cargo.toml
+              - 'scripts/ci/check-publish-package.sh'
+              - 'scripts/ci/check-crate-size.sh'
+              - 'pancetta-ft8/README.md'
+              - 'pancetta-core/README.md'
+              - '**/LICENSE-*'
+              - '**/THIRD-PARTY-NOTICES.md'
+              - 'pancetta-ft8/assets/**'
+              - 'pancetta-ft8/*.h'
+              - 'pancetta-ft8/vendor/**'
 
       # PAN-172: a merge group whose cumulative diff (base_sha..head_sha covers every PR
       # ahead in the queue plus this one) touches nothing outside research/notes/ has a
@@ -550,6 +560,12 @@ jobs:
         # PAN-331). `transmit` adds only the audio/PTT transmitter; its tests
         # run in workspace-tests with `--features transmit`.
         run: cargo test -p pancetta-ft8
+
+      # PAN-384: pancetta-core and pancetta-ft8 must stay publishable together,
+      # with the ft8_lib C sources inside and each .crate under crates.io's
+      # 10 MB limit. A dry-run never uploads.
+      - name: Publish dry-run, pancetta-core + pancetta-ft8 (PAN-384)
+        run: bash scripts/ci/check-publish-package.sh
 
       - name: Build examples
         run: cargo build --workspace --exclude pancetta-research --examples

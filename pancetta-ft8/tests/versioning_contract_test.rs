@@ -76,3 +76,147 @@ fn readme_carries_the_decoder_contract() {
     assert_contains("0.15 s");
     assert_contains("slot boundary");
 }
+
+// --- Registry readiness (PAN-384) -------------------------------------------
+//
+// The README becomes the crates.io page and cannot change after a publish,
+// so it must show the registry dependency line, state the build requirements,
+// carry a correct license section and avoid links that only resolve inside
+// the repository.
+
+fn crate_lib_rs() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("pancetta-ft8/src/lib.rs is readable")
+}
+
+/// `<major>.<minor>` of the crate version, the registry requirement a
+/// consumer types.
+fn major_minor() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut parts = version.split('.');
+    let major = parts.next().expect("version has a major part");
+    let minor = parts.next().expect("version has a minor part");
+    format!("{major}.{minor}")
+}
+
+#[test]
+fn readme_is_ready_for_the_registry() {
+    let readme = crate_readme();
+    let rust_version = env!("CARGO_PKG_RUST_VERSION");
+    assert!(
+        !rust_version.is_empty(),
+        "pancetta-ft8/Cargo.toml must set `rust-version`"
+    );
+
+    for needle in [
+        format!("pancetta-ft8 = \"{}\"", major_minor()),
+        "MSVC".to_string(),
+        "C compiler".to_string(),
+        format!("Rust {rust_version}"),
+    ] {
+        assert!(
+            readme.contains(&needle),
+            "README must contain {needle:?} for the crates.io page"
+        );
+    }
+
+    let heading = "## License";
+    let start = readme
+        .find(heading)
+        .unwrap_or_else(|| panic!("README must have a `{heading}` section"));
+    let body = &readme[start + heading.len()..];
+    let section = &body[..body.find("\n## ").unwrap_or(body.len())];
+    for needle in [
+        "MIT OR Apache-2.0",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "THIRD-PARTY-NOTICES.md",
+        "BSD-3-Clause",
+    ] {
+        assert!(
+            section.contains(needle),
+            "README's license section must mention {needle:?}:\n{section}"
+        );
+    }
+
+    for banned in [
+        "](../",
+        "/blob/main/",
+        "/blob/HEAD/",
+        "publish = false",
+        "Registry publication stays off",
+        "see the LICENSE file",
+        "### Module Structure",
+        "### Test Coverage",
+        "## Dependencies",
+        "## Future Enhancements",
+    ] {
+        assert!(
+            !readme.contains(banned),
+            "README must not contain {banned:?}: it is false or broken on the crates.io page"
+        );
+    }
+}
+
+/// Every concrete `pancetta-ft8-v<x.y.z>` in `text`, skipping the
+/// `pancetta-ft8-v*` glob and the `pancetta-ft8-v<version>` placeholder.
+fn pinned_tag_versions(text: &str) -> Vec<String> {
+    let marker = "pancetta-ft8-v";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(marker) {
+        rest = &rest[at + marker.len()..];
+        let raw: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let version = raw.trim_end_matches('.');
+        if version.starts_with(|c: char| c.is_ascii_digit()) {
+            found.push(version.to_string());
+        }
+    }
+    found
+}
+
+#[test]
+fn every_pinned_tag_names_the_current_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    for (name, text) in [
+        ("README.md", crate_readme()),
+        ("src/lib.rs", crate_lib_rs()),
+    ] {
+        for pinned in pinned_tag_versions(&text) {
+            assert_eq!(
+                pinned, version,
+                "{name} pins `pancetta-ft8-v{pinned}`, but the crate version is {version}"
+            );
+        }
+    }
+
+    let runbook_link = format!(
+        "https://github.com/HagaleTechnologies/pancetta/blob/pancetta-ft8-v{version}/docs/decoder-crate.md"
+    );
+    assert!(
+        crate_readme().contains(&runbook_link),
+        "README must link the decoder contract at the release tag: {runbook_link}"
+    );
+}
+
+#[test]
+fn crate_docs_show_the_registry_dependency_line() {
+    let lib = crate_lib_rs();
+    let line = format!("pancetta-ft8 = \"{}\"", major_minor());
+    assert!(
+        lib.contains(&line),
+        "src/lib.rs crate docs must show the registry line `{line}`"
+    );
+    for doc_line in lib
+        .lines()
+        .filter(|l| l.contains("PTT control") || l.contains("FCC Part 97"))
+    {
+        assert!(
+            doc_line.contains("`transmit`"),
+            "crate docs must say this needs the `transmit` feature: {doc_line}"
+        );
+    }
+}
