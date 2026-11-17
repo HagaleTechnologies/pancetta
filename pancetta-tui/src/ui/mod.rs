@@ -1089,6 +1089,43 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
+/// PAN-388: the hint row. The active view's name (pinned, compact first),
+/// then the focused panel's hints from `keymap::hints`, then `v:View`,
+/// `?:Help` and `q:Quit`, priority-fitted by `bar_fit` (PAN-88), so a narrow
+/// terminal drops whole hints instead of cutting `q:Quit` mid-word.
+fn footer_line(app: &App, width: u16) -> Line<'static> {
+    let key_hint = |k: &'static str| Span::styled(k, app.theme.key.add_modifier(Modifier::BOLD));
+    let view_style = app.theme.text.add_modifier(Modifier::BOLD);
+    let mut segs = vec![BarSegment::with_compact(
+        " | ",
+        vec![Span::styled(
+            crate::presentation::view_message(app.active_view),
+            view_style,
+        )],
+        vec![Span::styled(
+            crate::presentation::view_name(app.active_view),
+            view_style,
+        )],
+        0,
+        crate::keymap::hints::VIEW_UPGRADE_RANK,
+    )];
+    for h in crate::keymap::hints::footer_hints(app.active_panel) {
+        let full = vec![key_hint(h.key), Span::raw(h.label)];
+        segs.push(match h.compact_label {
+            Some(c) => BarSegment::with_compact(
+                " | ",
+                full,
+                vec![key_hint(h.key), Span::raw(c)],
+                h.admit,
+                h.upgrade,
+            ),
+            None => BarSegment::new(" | ", full, h.admit),
+        });
+    }
+    let forms = bar_fit::fit_bar(&segs, width as usize);
+    Line::from(bar_fit::bar_spans(segs, &forms))
+}
+
 fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let messages_count = app.decoded_messages.len();
     let dx_count = app.dx_stations.len();
@@ -1199,35 +1236,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let status_line = Line::from(status_spans);
 
-    // Always-visible key hints. These MUST match the real bindings in
-    // tui_runner.rs (the help-overlay is the only other on-screen keymap):
-    // band is `=`/`-` (not `+`), quit is `q` (not Ctrl+Q), `?` opens full help,
-    // `d` opens the audio-device picker (the common "reclaim my output" action).
-    let key_hint = |k: &'static str| Span::styled(k, app.theme.key.add_modifier(Modifier::BOLD));
-    // PAN-88: the hints priority-fit the row (same `bar_fit` policy as the
-    // title bar) so a narrow terminal drops whole hints instead of cutting
-    // `q:Quit` mid-word. `?:Help` and `q:Quit` are pinned; `Space:Call/Reply`
-    // shrinks to `Space:Call` before anything drops.
-    let hint = |k: &'static str, label: &'static str, admit: u8| {
-        BarSegment::new(" | ", vec![key_hint(k), Span::raw(label)], admit)
-    };
-    let hint_segs = vec![
-        BarSegment::with_compact(
-            " | ",
-            vec![key_hint("Space"), Span::raw(":Call/Reply")],
-            vec![key_hint("Space"), Span::raw(":Call")],
-            1,
-            8,
-        ),
-        hint("Arrows", ":TX", 3),
-        hint("=/-", ":Band", 5),
-        hint("g", ":TX-policy", 2),
-        hint("d", ":Audio", 4),
-        hint("?", ":Help", 0),
-        hint("q", ":Quit", 0),
-    ];
-    let hint_forms = bar_fit::fit_bar(&hint_segs, area.width as usize);
-    let help_line = Line::from(bar_fit::bar_spans(hint_segs, &hint_forms));
+    let help_line = footer_line(app, area.width);
 
     // Split status bar into two lines (Task 20c: the third row — a purely
     // decorative "─" border with no information — was dropped, along with
@@ -4036,13 +4045,13 @@ mod view_render_tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    fn render_app(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    pub(super) fn render_app(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, app).unwrap()).unwrap();
         term.backend().buffer().clone()
     }
 
-    async fn default_app() -> App {
+    pub(super) async fn default_app() -> App {
         crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap()
@@ -4689,7 +4698,7 @@ mod view_render_tests {
         let buf = render_app(&app, 80, 24);
         assert_eq!(
             row_text(&buf, 23).trim_end(),
-            "Space:Call | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+            "Operate view | Space:Call | Arrows:TX | g:TX-policy | d:Audio | ?:Help | q:Quit"
         );
     }
 
@@ -4699,14 +4708,24 @@ mod view_render_tests {
         let buf = render_app(&app, 100, 30);
         assert_eq!(
             row_text(&buf, 29).trim_end(),
-            "Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+            "Operate view | Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
         );
-        let cell = &buf[(0, 29)];
+        let view = &buf[(0, 29)];
+        assert_eq!(view.symbol(), "O");
+        assert_eq!(view.fg, theme::fg_color(app.theme.text));
+        assert!(view.modifier.contains(Modifier::BOLD));
+        let cell = &buf[(15, 29)];
         assert_eq!(cell.symbol(), "S");
         assert_eq!(cell.fg, theme::fg_color(app.theme.key));
         assert!(cell.modifier.contains(Modifier::BOLD));
+        // The title bar still has no view chip in Operate.
+        assert!(!row_text(&buf, 0).contains("OPERATE"));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/footer_tests.rs"]
+mod footer_tests;
 
 /// Task 19: pure geometry tests for `view_rects`/`hit_test` — the shared
 /// rect map that makes mouse clicking reliable. No terminal/Frame involved;
