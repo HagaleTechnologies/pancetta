@@ -21,6 +21,7 @@ mod alerts;
 mod audio;
 mod audio_recovery;
 mod autonomous;
+mod band_hop;
 mod clock_monitor;
 mod config_reload;
 mod desense;
@@ -2785,6 +2786,29 @@ impl ApplicationCoordinator {
                 });
                 self.named_task_handles
                     .push((ComponentId::DxCluster, wrapped));
+                // PAN-385: the all-band needed-activity poll feeds the band
+                // hopper's needed trigger, so it runs only when that is on.
+                let opportunity_candidates = {
+                    let config = self.config.read().await;
+                    let hopping = &config.autonomous.band_hopping;
+                    (hopping.enabled && hopping.needed_activity)
+                        .then(|| band_hop::opportunity_candidate_bands(&config.autonomous))
+                };
+                if let Some(candidates) = opportunity_candidates {
+                    let opportunity_handle = bridge.spawn_opportunity_poller(
+                        self.shutdown_signal.clone(),
+                        self.last_decode_timestamp.clone(),
+                        candidates,
+                    );
+                    let wrapped = tokio::spawn(async move {
+                        opportunity_handle.await.map_err(|e| {
+                            anyhow::anyhow!("cqdx opportunity poller join error: {}", e)
+                        })?;
+                        Ok(())
+                    });
+                    self.named_task_handles
+                        .push((ComponentId::DxCluster, wrapped));
+                }
                 self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);

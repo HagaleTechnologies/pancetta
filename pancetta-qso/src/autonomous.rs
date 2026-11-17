@@ -478,7 +478,11 @@ pub enum OperatorAction {
     /// Listen specifically for collisions on our TX offset.
     CollisionListen,
     /// Request a band/frequency change via Hamlib.
-    ChangeBand { dial_frequency: u64 },
+    ChangeBand {
+        dial_frequency: u64,
+        /// Why the scheduler hopped (PAN-385); rendered in the Diagnostics overlay.
+        reason: crate::band_scheduler::BandHopReason,
+    },
     /// Shift our TX offset (collision avoidance).
     FrequencyShift { new_offset_hz: f64 },
     /// Status update for TUI consumption.
@@ -566,9 +570,29 @@ pub struct BandEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BandHoppingConfig {
     pub enabled: bool,
-    /// Number of low-activity cycles before hopping.
+    /// Number of low-activity cycles before hopping; also the hop interval.
     pub hop_threshold: u32,
     pub bands: Vec<BandEntry>,
+    /// PAN-385: UTC time-of-day band plan windows, in file order.
+    #[serde(default)]
+    pub plan: Vec<crate::band_scheduler::BandPlanEntry>,
+    /// PAN-385: hop toward needed entities spotted on cqdx.io.
+    #[serde(default = "default_true")]
+    pub needed_activity: bool,
+    /// PAN-385: seconds without a needed caller on this band before a needed-activity hop.
+    #[serde(default = "default_needed_idle_secs")]
+    pub needed_idle_secs: u64,
+    /// PAN-385: near local sunrise/sunset prefer bands below 14 MHz on a tie.
+    #[serde(default = "default_true")]
+    pub grey_line: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_needed_idle_secs() -> u64 {
+    600
 }
 
 impl Default for BandHoppingConfig {
@@ -588,6 +612,10 @@ impl Default for BandHoppingConfig {
                     priority: 2,
                 },
             ],
+            plan: Vec::new(),
+            needed_activity: true,
+            needed_idle_secs: 600,
+            grey_line: true,
         }
     }
 }
@@ -677,6 +705,8 @@ pub struct BandStrategy {
     /// Settling period after a band change — don't make decisions.
     settling_cycles: u32,
     activity_per_band: HashMap<String, u32>,
+    /// PAN-385: plan, needed-activity and grey-line decision state.
+    scheduler: crate::band_scheduler::BandScheduler,
 }
 
 impl BandStrategy {
@@ -693,6 +723,7 @@ impl BandStrategy {
             low_activity_cycles: 0,
             settling_cycles: 0,
             activity_per_band,
+            scheduler: crate::band_scheduler::BandScheduler::new(),
         }
     }
 
@@ -740,7 +771,270 @@ impl BandStrategy {
         }
     }
 
+    /// PAN-385: the decision state, for the operator's setters.
+    pub fn scheduler_mut(&mut self) -> &mut crate::band_scheduler::BandScheduler {
+        &mut self.scheduler
+    }
+
+    /// PAN-385: the decision state.
+    pub fn scheduler(&self) -> &crate::band_scheduler::BandScheduler {
+        &self.scheduler
+    }
+
+    /// PAN-385: learn the real band from the live dial. A non-zero dial sets
+    /// the current band and moves the round-robin index to the first
+    /// configured entry on that band; zero (unknown) changes nothing.
+    pub fn observe_dial(&mut self, live_dial_hz: u64, now: DateTime<Utc>) {
+        if live_dial_hz == 0 {
+            return;
+        }
+        let Some(band) = pancetta_core::Band::from_frequency(live_dial_hz) else {
+            return;
+        };
+        self.scheduler.observe_band(band, now);
+        if let Some(idx) = self.entry_index_for(band) {
+            self.current_band_index = idx;
+        }
+    }
+
+    /// PAN-385: a CQ tiered `PerBandDxccNew` or higher was decoded.
+    pub fn note_needed_heard(&mut self, now: DateTime<Utc>) {
+        self.scheduler.note_needed_heard(now);
+    }
+
+    /// PAN-385: the station's latitude/longitude for grey-line.
+    pub fn set_station_location(&mut self, location: Option<(f64, f64)>) {
+        self.scheduler.set_station_location(location);
+    }
+
+    fn entry_band(entry: &BandEntry) -> Option<pancetta_core::Band> {
+        pancetta_core::Band::from_frequency(entry.dial_frequency)
+            .or_else(|| entry.band_name.parse::<pancetta_core::Band>().ok())
+    }
+
+    fn entry_index_for(&self, band: pancetta_core::Band) -> Option<usize> {
+        self.config
+            .bands
+            .iter()
+            .position(|e| Self::entry_band(e) == Some(band))
+    }
+
+    /// Dial for `band`: the first configured entry on it, else the FT8 table.
+    fn dial_for(&self, band: pancetta_core::Band) -> Option<u64> {
+        self.entry_index_for(band)
+            .map(|i| self.config.bands[i].dial_frequency)
+            .or_else(|| band.ft8_frequency())
+    }
+
+    fn configured_band(&self) -> Option<pancetta_core::Band> {
+        self.config
+            .bands
+            .get(self.current_band_index)
+            .and_then(Self::entry_band)
+    }
+
+    /// Bands of the `bands` entries, distinct, by priority then list order.
+    fn list_bands(&self) -> Vec<pancetta_core::Band> {
+        let mut order: Vec<usize> = (0..self.config.bands.len()).collect();
+        order.sort_by_key(|&i| (self.config.bands[i].priority, i));
+        let mut out = Vec::new();
+        for i in order {
+            if let Some(b) = Self::entry_band(&self.config.bands[i]) {
+                if !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
+    /// Mark a hop: reset the low-activity counter, start the settle, point
+    /// the round-robin index at the destination's entry and remember it.
+    fn commit_hop(&mut self, to: Option<pancetta_core::Band>, needed: bool, now: DateTime<Utc>) {
+        self.low_activity_cycles = 0;
+        self.settling_cycles = 2;
+        if let Some(idx) = to.and_then(|b| self.entry_index_for(b)) {
+            self.current_band_index = idx;
+        }
+        self.scheduler.note_hop(to, needed, now);
+    }
+
+    /// PAN-385: evaluate the triggers for this slot, in order: (a) a pending
+    /// plan-window move, (b) needed activity, (c) low activity. Returns the
+    /// dial to move to and why.
+    pub fn next_hop(
+        &mut self,
+        now: DateTime<Utc>,
+        slot_ns: i64,
+    ) -> Option<(u64, crate::band_scheduler::BandHopReason)> {
+        use crate::band_scheduler::{is_low_band, BandHopReason};
+        if !self.config.enabled {
+            return None;
+        }
+        self.scheduler.expire_in_flight();
+        self.scheduler.ensure_arrival(now);
+        let current = self.scheduler.current_band(self.configured_band());
+        let plan = self.config.plan.clone();
+        let (active, pending) = self.scheduler.update_plan(&plan, now, current);
+        if self.scheduler.exchange_in_progress() {
+            return None;
+        }
+        let grey = self.scheduler.grey_line(self.config.grey_line, now);
+
+        // (a) Plan-window entry: ignores the needed-activity dwell.
+        if let Some(i) = pending {
+            let entry = &plan[i];
+            let first = entry.bands.first().copied();
+            let pick = if grey.is_some() {
+                entry
+                    .bands
+                    .iter()
+                    .copied()
+                    .find(|b| is_low_band(*b))
+                    .or(first)
+            } else {
+                first
+            };
+            if let Some(to) = pick {
+                if let Some(dial) = self.dial_for(to) {
+                    let reason = BandHopReason::PlanWindow {
+                        from: current,
+                        to,
+                        window: entry.window,
+                        bands: entry.bands.clone(),
+                        grey_line: if Some(to) != first { grey } else { None },
+                    };
+                    self.commit_hop(Some(to), false, now);
+                    return Some((dial, reason));
+                }
+            }
+        }
+
+        // (b) Needed activity.
+        if let Some((to, reason)) = self.needed_pick(now, slot_ns, current, active, grey) {
+            if let Some(dial) = self.dial_for(to) {
+                self.commit_hop(Some(to), true, now);
+                return Some((dial, reason));
+            }
+        }
+
+        // (c) Low activity: round-robin over `bands`, or over the active
+        // window's bands so it never leaves the window.
+        if let Some(i) = active {
+            if self.settling_cycles > 0 || self.low_activity_cycles < self.config.hop_threshold {
+                return None;
+            }
+            let bands = &plan[i].bands;
+            let next = match current.and_then(|c| bands.iter().position(|b| *b == c)) {
+                Some(p) => bands.get((p + 1) % bands.len()).copied(),
+                None => bands.first().copied(),
+            }?;
+            if Some(next) == current {
+                return None;
+            }
+            let dial = self.dial_for(next)?;
+            let silent = self.low_activity_cycles;
+            self.commit_hop(Some(next), false, now);
+            return Some((
+                dial,
+                BandHopReason::LowActivity {
+                    from: current,
+                    to: Some(next),
+                    silent_slots: silent,
+                },
+            ));
+        }
+        let silent = self.low_activity_cycles;
+        let dial = self.should_hop()?;
+        let to = self
+            .config
+            .bands
+            .get(self.current_band_index)
+            .and_then(Self::entry_band);
+        self.scheduler.note_hop(to, false, now);
+        Some((
+            dial,
+            BandHopReason::LowActivity {
+                from: current,
+                to,
+                silent_slots: silent,
+            },
+        ))
+    }
+
+    /// Needed-activity trigger (Decision 10).
+    fn needed_pick(
+        &self,
+        now: DateTime<Utc>,
+        slot_ns: i64,
+        current: Option<pancetta_core::Band>,
+        active: Option<usize>,
+        grey: Option<&'static str>,
+    ) -> Option<(pancetta_core::Band, crate::band_scheduler::BandHopReason)> {
+        use crate::band_scheduler::{is_low_band, BandHopReason};
+        if !self.config.needed_activity {
+            return None;
+        }
+        let snapshot = self.scheduler.snapshot()?;
+        if !snapshot.is_fresh(now) {
+            return None;
+        }
+        let hop_interval = ChronoDuration::nanoseconds(
+            i64::from(self.config.hop_threshold).saturating_mul(slot_ns),
+        );
+        if !self.scheduler.needed_dwell_passed(now, hop_interval) {
+            return None;
+        }
+        let idle_secs = self.scheduler.idle_secs(now);
+        if idle_secs < 0 || (idle_secs as u64) < self.config.needed_idle_secs {
+            return None;
+        }
+        let candidates: Vec<pancetta_core::Band> = match active {
+            Some(i) => self.config.plan[i].bands.clone(),
+            None => self.list_bands(),
+        };
+        let ranked: Vec<(usize, crate::band_scheduler::BandOpportunity)> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| Some(**b) != current)
+            .map(|(i, b)| (i, snapshot.for_band(*b)))
+            .collect();
+        let key = |prefer_low: bool, (i, o): &(usize, crate::band_scheduler::BandOpportunity)| {
+            (
+                o.atno_entities,
+                o.needed_entities,
+                prefer_low && is_low_band(o.band),
+                std::cmp::Reverse(*i),
+            )
+        };
+        let best = ranked.iter().max_by_key(|c| key(grey.is_some(), c))?;
+        let plain = ranked.iter().max_by_key(|c| key(false, c))?;
+        let here = current.map(|b| snapshot.for_band(b));
+        let (here_atno, here_needed) = here
+            .map(|o| (o.atno_entities, o.needed_entities))
+            .unwrap_or((0, 0));
+        let to = best.1;
+        if to.needed_entities < 1
+            || (to.atno_entities, to.needed_entities) <= (here_atno, here_needed)
+        {
+            return None;
+        }
+        let reason = BandHopReason::NeededActivity {
+            from: current,
+            to: to.band,
+            to_needed: to.needed_entities,
+            to_atno: to.atno_entities,
+            from_needed: here_needed,
+            idle_mins: (idle_secs as u64) / 60,
+            grey_line: if plain.1.band != to.band { grey } else { None },
+        };
+        Some((to.band, reason))
+    }
+
     pub fn current_band_name(&self) -> &str {
+        if let Some(band) = self.scheduler.live_band() {
+            return band.name();
+        }
         self.config
             .bands
             .get(self.current_band_index)
@@ -1159,7 +1453,13 @@ impl AutonomousOperator {
         let slot_manager = SlotManager::new(config.slot_parity, &config.listen_cycle);
         let collision_detector =
             CollisionDetector::new(config.tx_offset_hz, 50.0, our_callsign.clone());
-        let band_strategy = BandStrategy::new(config.band_hopping.clone());
+        let mut band_strategy = BandStrategy::new(config.band_hopping.clone());
+        // PAN-385: grey-line uses the centre of our grid square.
+        band_strategy.set_station_location(
+            our_grid
+                .as_deref()
+                .and_then(|g| pancetta_core::gridsquare::grid_to_coordinates(g).ok()),
+        );
         // FT8 bandwidth: 8 tones * 6.25 Hz = 50 Hz, plus 25 Hz guard = 75 Hz min separation
         let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
         let decode_history = DecodeHistory::new(config.frequency.decode_history_cycles);
@@ -1698,7 +1998,9 @@ impl AutonomousOperator {
                 .record_slot_activity(current_parity, untracked_count);
         }
 
-        // Band-hopping activity tracking.
+        // Band-hopping activity tracking. PAN-385: learn the real band first
+        // so activity is counted against it.
+        self.band_strategy.observe_dial(live_dial_hz, now);
         self.band_strategy.record_activity(messages.len() as u32);
 
         // Update frequency allocator with observed activity.
@@ -1810,6 +2112,8 @@ impl AutonomousOperator {
                         if tiered.tier >= PriorityTier::PerBandDxccNew {
                             self.watchlist
                                 .refresh(call, grid.as_deref(), tiered.tier, now);
+                            // PAN-385: a needed caller restarts the idle clock.
+                            self.band_strategy.note_needed_heard(now);
                         }
                     }
 
@@ -2430,6 +2734,22 @@ impl AutonomousOperator {
         }
     }
 
+    /// PAN-385: push the latest all-band cqdx needed-activity snapshot.
+    pub fn update_band_opportunities(
+        &mut self,
+        snapshot: Option<crate::band_scheduler::OpportunitySnapshot>,
+    ) {
+        self.band_strategy.scheduler_mut().set_snapshot(snapshot);
+    }
+
+    /// PAN-385: whether a partner-answered exchange is in progress; while
+    /// true no band hop is emitted.
+    pub fn set_exchange_in_progress(&mut self, in_progress: bool) {
+        self.band_strategy
+            .scheduler_mut()
+            .set_exchange_in_progress(in_progress);
+    }
+
     /// Clear every piece of allocator state scoped to the current dial's
     /// audio-offset space. Called by the autonomous band hop and (PAN-287)
     /// by the coordinator after any commanded dial change (band keys,
@@ -2478,12 +2798,15 @@ impl AutonomousOperator {
             return actions;
         }
 
-        // Step 0: band hopping
-        if let Some(new_freq) = self.band_strategy.should_hop() {
+        // Step 0: band hopping (PAN-385: plan window, needed activity, low activity)
+        if let Some((new_freq, reason)) = self.band_strategy.next_hop(now, self.slot_ns()) {
             actions.push(OperatorAction::ChangeBand {
                 dial_frequency: new_freq,
+                reason,
             });
             self.invalidate_band_scoped_state();
+            // A hop drops this slot's old-band CQ candidates (PAN-69 extended).
+            self.pending_cqs.clear();
         }
 
         // Step 1: slot manager
@@ -5763,6 +6086,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            ..Default::default()
         };
         let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
         op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
@@ -5845,6 +6169,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            ..Default::default()
         };
         let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
         op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
@@ -6825,6 +7150,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            ..Default::default()
         };
 
         let mut strategy = BandStrategy::new(config);
@@ -8614,3 +8940,7 @@ mod dx_busy_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "autonomous/tests/band_hop_tests.rs"]
+mod band_hop_tests;
