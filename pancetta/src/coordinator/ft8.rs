@@ -295,6 +295,27 @@ fn log_fp_filter_dropped(dropped: usize, total: usize) {
     info!("FP filter dropped {dropped} of {total} decodes");
 }
 
+/// The hb-062 FP filter lock shared by the coordinator and the decoder.
+type FpFilterLock = std::sync::RwLock<Option<Arc<pancetta_qso::CallsignContinuityFilter>>>;
+
+/// PAN-290: one window's read of the shared FP filter. A poisoned lock
+/// bypasses the filter for this window and logs a warning instead of
+/// panicking the decoder, whose restarts share the same poisoned lock.
+fn fp_filter_for_window(
+    lock: &FpFilterLock,
+) -> Option<Arc<pancetta_qso::CallsignContinuityFilter>> {
+    match lock.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            warn!(
+                target: "pancetta::fp_filter",
+                "FP filter lock poisoned by an earlier panic; decoding this window with the filter bypassed"
+            );
+            None
+        }
+    }
+}
+
 /// Maximum length (in chars) for any human-facing decoded string field.
 /// FT8 message payloads are short (callsigns ≤ ~11 chars, grids 4-6, the
 /// full text well under 64); anything longer is malformed/hostile.
@@ -973,7 +994,6 @@ impl super::ApplicationCoordinator {
         // of each subsequent slot to surface opposite-parity seeds. Inert
         // until `Ft8Config::cross_sequence_a7_enabled` flips true.
         let cross_sequence_cache = self.cross_sequence_cache.clone();
-        let cross_sequence_fp_filter = self.fp_filter.clone();
 
         // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9). Re-read from
         // this shared atomic once per decode-loop iteration (below, inside the
@@ -1990,7 +2010,11 @@ impl super::ApplicationCoordinator {
                         // lock (see the `fp_filter` field comment in
                         // `mod.rs`). When the snapshot is None (default, or
                         // not yet built), all decodes pass through unchanged.
-                        let fp_filter_snapshot = fp_filter.read().unwrap().clone();
+                        //
+                        // PAN-290: a poisoned lock bypasses the filter for
+                        // this window and warns, rather than panicking the
+                        // decoder on every window and every restart.
+                        let fp_filter_snapshot = fp_filter_for_window(&fp_filter);
                         if let Some(ref filter) = fp_filter_snapshot {
                             let pre = decoded_messages.len();
                             // 2026-07-17 operator finding: capture the raw,
@@ -2127,10 +2151,10 @@ impl super::ApplicationCoordinator {
                         // the band and slot grid each record carries
                         // (PAN-146).
                         //
-                        // Same live-read rationale as `fp_filter_snapshot`
-                        // above — one read per window, not per message.
-                        let cross_sequence_fp_filter_snapshot =
-                            cross_sequence_fp_filter.read().unwrap().clone();
+                        // The hb-237 trust gate below reuses this window's
+                        // `fp_filter_snapshot` (PAN-290): one read of the
+                        // lock per window, so the gate matches the filter
+                        // that actually ran on these decodes.
                         for decoded_msg in &decoded_messages {
                             let parity_u8 = decoded_msg.slot_parity.map(|p| match p {
                                 pancetta_core::slot::SlotParity::Even => 0u8,
@@ -2155,8 +2179,7 @@ impl super::ApplicationCoordinator {
                                     (&decoded_msg.message.from_callsign, parity_u8)
                                 {
                                     if let Ok(mut cache_guard) = cross_sequence_cache.write() {
-                                        let admitted = if let Some(ref filter) =
-                                            cross_sequence_fp_filter_snapshot
+                                        let admitted = if let Some(ref filter) = fp_filter_snapshot
                                         {
                                             cache_guard.record_decoded_trusted(
                                                 call,
@@ -3776,3 +3799,7 @@ mod decode_log_level_tests {
         assert!(text.contains("FP filter dropped 3 of 43 decodes"));
     }
 }
+
+#[cfg(test)]
+#[path = "ft8/tests/fp_filter_poison_tests.rs"]
+mod fp_filter_poison_tests;

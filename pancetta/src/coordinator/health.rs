@@ -1014,7 +1014,7 @@ mod supervisor_tests {
     /// `TempDir` guard) since this helper has many callers today that hold
     /// no guard for the returned coordinator; the directory is empty, so
     /// history-seeding simply finds nothing, same as a fresh install.
-    async fn test_coordinator() -> ApplicationCoordinator {
+    pub(super) async fn test_coordinator() -> ApplicationCoordinator {
         let config = Config::default();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
@@ -1919,6 +1919,10 @@ mod supervisor_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "health/tests/fp_filter_poison_tests.rs"]
+mod fp_filter_poison_tests;
 
 #[cfg(test)]
 mod degraded_summary_tests {
