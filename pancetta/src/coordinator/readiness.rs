@@ -36,6 +36,8 @@ pub(crate) struct ReadinessSources {
     hamlib_command_in_flight: Arc<AtomicU32>,
     rig_conn_state: Arc<AtomicU8>,
     audio_output_alive: Arc<AtomicBool>,
+    /// PAN-295: display-only; the output reopen budget is spent.
+    audio_output_reopen_exhausted: Arc<AtomicBool>,
     receive_gain: Arc<super::receive_overload::GainSafety>,
     data_mode: pancetta_hamlib::DataModeReadiness,
     ptt_off_unconfirmed: Arc<AtomicBool>,
@@ -65,6 +67,7 @@ impl ReadinessSources {
             hamlib_command_in_flight: c.hamlib_command_in_flight.clone(),
             rig_conn_state: c.rig_conn_state.clone(),
             audio_output_alive: c.audio_output_alive.clone(),
+            audio_output_reopen_exhausted: c.audio_output_reopen_exhausted.clone(),
             receive_gain: c.message_bus.receive_gain.clone(),
             data_mode: c.message_bus.data_mode.clone(),
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
@@ -113,6 +116,9 @@ impl ReadinessSources {
         StationReadiness {
             autonomous_config_disabled: !self.autonomous_config_enabled.load(Ordering::Acquire),
             tx_mute_causes,
+            audio_output_reopen_exhausted: self
+                .audio_output_reopen_exhausted
+                .load(Ordering::Acquire),
             ptt_off_unconfirmed: self.ptt_off_unconfirmed.load(Ordering::Acquire),
             clock: tui_clock_state(self.clock_skew.status()),
             degraded,
@@ -284,7 +290,7 @@ mod tests {
     use crate::coordinator::upload_outbox::DestinationHealth;
     use pancetta_dx::upload_outbox::UploadDestination;
 
-    fn sources() -> ReadinessSources {
+    pub(super) fn sources() -> ReadinessSources {
         ReadinessSources {
             autonomous_config_enabled: Arc::new(AtomicBool::new(true)),
             tx_policy: Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8())),
@@ -295,6 +301,7 @@ mod tests {
             hamlib_command_in_flight: Arc::new(AtomicU32::new(0)),
             rig_conn_state: Arc::new(AtomicU8::new(RigConnState::Connected.as_u8())),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
+            audio_output_reopen_exhausted: Arc::new(AtomicBool::new(false)),
             receive_gain: {
                 let gain = super::super::receive_overload::GainSafety::default();
                 gain.confirmed_off(0);
@@ -413,6 +420,7 @@ mod tests {
             StationReadiness {
                 autonomous_config_disabled: false,
                 tx_mute_causes: vec![TuiTxMuteCause::PolicyDisabled],
+                audio_output_reopen_exhausted: false,
                 ptt_off_unconfirmed: true,
                 clock: ClockState::Unreachable,
                 degraded: Some("dx_cluster: telnet closed".into()),
@@ -747,3 +755,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "readiness/tests/output_reopen_limit_tests.rs"]
+mod output_reopen_limit_tests;

@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{error, info, span, warn, Level};
 
-use crate::coordinator::audio_recovery::OutputEdge;
+use crate::coordinator::audio_recovery::{
+    OutputEdge, OutputReopenDecision, OutputReopenPolicy, OUTPUT_REOPEN_MAX_ATTEMPTS,
+    OUTPUT_REOPEN_WINDOW,
+};
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType, AUDIO_RUNTIME_ERROR_CODE};
 
 /// PAN-115: clears `audio_output_alive` whenever the real audio thread exits
@@ -54,6 +57,171 @@ fn report_output_edge(edge: OutputEdge, report: &impl Fn(Level, &'static str, St
             info!("{text}");
             report(Level::INFO, "audio.health", text.to_string());
         }
+    }
+}
+
+/// PAN-295: the audio thread's bounded automatic reopen for a silent output
+/// stall. Owns the policy, a sender into the thread's own reopen FIFO and the
+/// one outstanding reply, which it polls without waiting (the same thread
+/// drains the request). `exhausted` is the coordinator's display-only
+/// `audio_output_reopen_exhausted` flag; it never gates TX.
+pub(crate) struct OutputStallRecovery {
+    policy: OutputReopenPolicy,
+    reopen_tx: crossbeam_channel::Sender<AudioReopenRequest>,
+    pending: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    exhausted: Arc<std::sync::atomic::AtomicBool>,
+    exhausted_published: bool,
+    send_failure_logged: bool,
+}
+
+impl OutputStallRecovery {
+    pub(crate) fn new(
+        reopen_tx: crossbeam_channel::Sender<AudioReopenRequest>,
+        exhausted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        exhausted.store(false, Ordering::Release);
+        Self {
+            policy: OutputReopenPolicy::new(),
+            reopen_tx,
+            pending: None,
+            exhausted,
+            exhausted_published: false,
+            send_failure_logged: false,
+        }
+    }
+
+    /// Settle this policy's outstanding request if its reply arrived (or the
+    /// responder was dropped). Never blocks.
+    pub(crate) fn poll_pending(&mut self, now: Instant) {
+        let Some(rx) = self.pending.as_mut() else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Ok(Ok(())) => "stream rebuilt; waiting for output callbacks",
+            Ok(Err(_)) => "reopen failed; old stream kept",
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => "reply dropped",
+        };
+        info!("Audio output watchdog: automatic reopen settled ({outcome})");
+        self.pending = None;
+        self.policy.on_request_settled(now);
+    }
+
+    /// Any rebuild finished on the audio thread: postpone the next automatic
+    /// retry without touching the attempt history.
+    pub(crate) fn note_rebuild(&mut self, now: Instant) {
+        self.policy.on_rebuild(now);
+    }
+
+    /// Call after each successful output observation, once the liveness for
+    /// `alive` is published. Returns `true` when a reopen was queued.
+    pub(crate) fn on_observation(
+        &mut self,
+        edge: OutputEdge,
+        alive: bool,
+        dead: bool,
+        now: Instant,
+        report: &impl Fn(Level, &'static str, String),
+    ) -> bool {
+        self.poll_pending(now);
+        let was_exhausted = self.policy.is_exhausted();
+        let mut requested = false;
+        match self.policy.decide(edge, alive, dead, now) {
+            OutputReopenDecision::None => {}
+            OutputReopenDecision::Request => {
+                let (respond, rx) = tokio::sync::oneshot::channel();
+                let sent = self.reopen_tx.send(AudioReopenRequest {
+                    input: None,
+                    output: None,
+                    force: true,
+                    respond,
+                });
+                if sent.is_ok() {
+                    self.policy.on_request_sent(now);
+                    self.pending = Some(rx);
+                    self.send_failure_logged = false;
+                    requested = true;
+                    let text = format!(
+                        "Audio output stalled — automatic reopen {} of {} in {} min; TX stays muted until callbacks resume",
+                        self.policy.attempts_in_window(),
+                        OUTPUT_REOPEN_MAX_ATTEMPTS,
+                        OUTPUT_REOPEN_WINDOW.as_secs() / 60
+                    );
+                    warn!("{text}");
+                    report(Level::WARN, "audio.recovery", text);
+                } else {
+                    self.policy.on_send_failed(now);
+                    if !self.send_failure_logged {
+                        self.send_failure_logged = true;
+                        warn!(
+                            "Audio output watchdog: reopen channel closed, cannot request recovery"
+                        );
+                    }
+                }
+            }
+            OutputReopenDecision::Refused => {
+                if !was_exhausted {
+                    let text = format!(
+                        "Audio output still stalled — automatic reopen paused after {} attempts in {} min; press d to pick a device",
+                        OUTPUT_REOPEN_MAX_ATTEMPTS,
+                        OUTPUT_REOPEN_WINDOW.as_secs() / 60
+                    );
+                    warn!("{text}");
+                    report(Level::WARN, "audio.recovery", text);
+                }
+            }
+        }
+        let exhausted = self.policy.is_exhausted();
+        if exhausted != self.exhausted_published {
+            self.exhausted.store(exhausted, Ordering::Release);
+            self.exhausted_published = exhausted;
+        }
+        requested
+    }
+}
+
+/// PAN-115/PAN-295: the audio loop's common output tail. Reports the
+/// watchdog edge, publishes liveness (dead before any request), then feeds a
+/// successful observation (`Some(edge)`) to the bounded reopen policy. A
+/// processing-error iteration passes `None` and never queues an output
+/// reopen. Returns `true` when a reopen was queued.
+pub(crate) fn finish_output_observation(
+    watch: &crate::coordinator::audio_recovery::OutputWatchdog,
+    recovery: &mut OutputStallRecovery,
+    alive_flag: &std::sync::atomic::AtomicBool,
+    alive_published: &mut bool,
+    observation: Option<OutputEdge>,
+    now: Instant,
+    report: &impl Fn(Level, &'static str, String),
+) -> bool {
+    report_output_edge(observation.unwrap_or(OutputEdge::None), report);
+    let alive = watch.is_alive(now);
+    publish_output_alive(alive_flag, alive_published, alive);
+    match observation {
+        Some(edge) => recovery.on_observation(edge, alive, watch.is_dead_announced(), now, report),
+        None => false,
+    }
+}
+
+/// PAN-115/PAN-295: after any reopen on the audio thread (success or
+/// failure): drop the counter baseline, publish not-alive before any TX
+/// command is handled, and postpone the next automatic output reopen.
+pub(crate) fn after_output_reopen(
+    watch: &mut crate::coordinator::audio_recovery::OutputWatchdog,
+    recovery: &mut OutputStallRecovery,
+    alive_flag: &std::sync::atomic::AtomicBool,
+    alive_published: &mut bool,
+    now: Instant,
+) {
+    watch.rebaseline(now);
+    publish_output_alive(alive_flag, alive_published, false);
+    recovery.note_rebuild(now);
+}
+
+impl Drop for OutputStallRecovery {
+    /// The audio thread is gone; nothing is paused any more.
+    fn drop(&mut self) {
+        self.exhausted.store(false, Ordering::Release);
     }
 }
 
@@ -380,6 +548,9 @@ impl super::ApplicationCoordinator {
             // new cross-thread coordination is needed (the audio thread's
             // loop already serializes every reopen_devices call).
             let reopen_tx_watchdog = reopen_tx.clone();
+            // PAN-295: the audio thread's own sender for the bounded
+            // silent-output-stall reopen, through the same FIFO.
+            let reopen_tx_output = reopen_tx.clone();
             self.audio_reopen_tx = Some(reopen_tx);
 
             // Audio thread sends samples via a tokio mpsc to an async relay
@@ -398,6 +569,7 @@ impl super::ApplicationCoordinator {
             // until this thread has actually observed output callbacks.
             let audio_output_alive = self.audio_output_alive.clone();
             self.audio_output_alive.store(false, Ordering::Release);
+            let audio_output_reopen_exhausted = self.audio_output_reopen_exhausted.clone();
 
             let sweep_capture_audio = self.sweep_capture.clone();
             let initialized = self.service_notify.audio.clone();
@@ -561,6 +733,9 @@ impl super::ApplicationCoordinator {
                 let mut output_watch =
                     crate::coordinator::audio_recovery::OutputWatchdog::new(Instant::now());
                 let mut output_alive_published = false;
+                // PAN-295: bounded automatic reopen of a silent output stall.
+                let mut output_recovery =
+                    OutputStallRecovery::new(reopen_tx_output, audio_output_reopen_exhausted);
                 let mut playback_watch =
                     crate::coordinator::audio_recovery::PlaybackStartWatch::new();
 
@@ -569,6 +744,9 @@ impl super::ApplicationCoordinator {
                         break;
                     }
                     let output_edge: OutputEdge;
+                    // PAN-295: a successful observation feeds the output
+                    // reopen policy; a processing error never does.
+                    let observed: bool;
 
                     // Live device switch: drain any reopen requests from the TUI
                     // picker. Performed here (on the thread that owns the cpal
@@ -612,10 +790,20 @@ impl super::ApplicationCoordinator {
                         // PAN-115: a reopen (success or failure) replaces the
                         // stream and restarts its callback counter; wait for
                         // fresh progress, silently.
-                        output_watch.rebaseline(Instant::now());
+                        // PAN-295: not alive again until fresh callbacks,
+                        // published before any TX command is handled; and
+                        // the next automatic output reopen waits.
+                        after_output_reopen(
+                            &mut output_watch,
+                            &mut output_recovery,
+                            &audio_output_alive,
+                            &mut output_alive_published,
+                            Instant::now(),
+                        );
                         // The receiver may have dropped (e.g. TUI gone); ignore.
                         let _ = respond.send(result);
                     }
+                    output_recovery.poll_pending(Instant::now());
 
                     playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
                     // Check for TX audio to play out
@@ -664,6 +852,7 @@ impl super::ApplicationCoordinator {
                             }
                             output_edge = output_watch
                                 .observe(audio_manager.output_callback_count(), Instant::now());
+                            observed = true;
                             if result_tx.blocking_send(samples).is_err() {
                                 break;
                             }
@@ -671,6 +860,7 @@ impl super::ApplicationCoordinator {
                         Ok(None) => {
                             output_edge = output_watch
                                 .observe(audio_manager.output_callback_count(), Instant::now());
+                            observed = true;
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         Err(e) => {
@@ -690,6 +880,7 @@ impl super::ApplicationCoordinator {
                                 &report_audio_diagnostic,
                             );
                             output_edge = OutputEdge::None;
+                            observed = false;
 
                             // docs/audio-robustness-plan.md item 1: auto-
                             // recovery. force=true is REQUIRED — with no new
@@ -749,14 +940,22 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             }
+                            // PAN-295: this rebuild (either result) postpones
+                            // the output policy; it neither counts nor resets.
+                            output_recovery.note_rebuild(Instant::now());
                         }
                     }
 
-                    report_output_edge(output_edge, &report_audio_diagnostic);
-                    publish_output_alive(
+                    // PAN-295: dead liveness is published before any
+                    // recovery request is queued.
+                    finish_output_observation(
+                        &output_watch,
+                        &mut output_recovery,
                         &audio_output_alive,
                         &mut output_alive_published,
-                        output_watch.is_alive(Instant::now()),
+                        observed.then_some(output_edge),
+                        Instant::now(),
+                        &report_audio_diagnostic,
                     );
 
                     if last_drop_report.elapsed() >= drop_report_interval {
@@ -1192,3 +1391,7 @@ mod initialization_tests {
         assert!(!flag.load(Ordering::Acquire));
     }
 }
+
+#[cfg(test)]
+#[path = "audio/tests/output_recovery_tests.rs"]
+mod output_recovery_tests;
