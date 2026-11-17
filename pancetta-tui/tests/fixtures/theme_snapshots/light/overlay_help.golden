@@ -31,26 +31,26 @@ r13 |│                          its dial first; waits for PTT-off)            
 r13 s 0+1 Blue/White/BOLD 1+26 Blue/White/- 27+34 Black/White/- 61+36 Blue/White/- 97+1 Blue/White/BOLD
 r14 |│  /                       Compose free-text TX (Enter sends, Esc cancels)                       │|
 r14 s 0+27 Blue/White/BOLD 27+47 Black/White/- 74+23 Blue/White/- 97+1 Blue/White/BOLD
-r15 |│  Enter                   Callers: reply at shown step; TX Placement: park at selected slice    │|
-r15 s 0+27 Blue/White/BOLD 27+66 Black/White/- 93+4 Blue/White/- 97+1 Blue/White/BOLD
-r16 |│  c / s                   Start / stop CQ                                                       │|
-r16 s 0+27 Blue/White/BOLD 27+15 Black/White/- 42+55 Blue/White/- 97+1 Blue/White/BOLD
-r17 |│  k                       Abort selected QSO now, no confirm (any panel)                        │|
-r17 s 0+27 Blue/White/BOLD 27+46 Black/White/- 73+24 Blue/White/- 97+1 Blue/White/BOLD
-r18 |│  r                       Re-send last TX (QSO Status panel only)                               │|
-r18 s 0+27 Blue/White/BOLD 27+39 Black/White/- 66+31 Blue/White/- 97+1 Blue/White/BOLD
-r19 |│  Shift+H                 Engage Hound on selected DX Hunter station                            │|
-r19 s 0+27 Blue/White/BOLD 27+42 Black/White/- 69+28 Blue/White/- 97+1 Blue/White/BOLD
-r20 |│  TX control                                                                                    │|
-r20 s 0+1 Blue/White/BOLD 1+12 Black/White/BOLD|UNDERLINED 13+84 Blue/White/- 97+1 Blue/White/BOLD
-r21 |│  Left / Right            TX offset −/+ ## Hz (Callers: cycle reply step)                       │|
-r21 s 0+27 Blue/White/BOLD 27+47 Black/White/- 74+23 Blue/White/- 97+1 Blue/White/BOLD
-r22 |│  [ / ]                   TX offset −/+ ## Hz                                                   │|
-r22 s 0+27 Blue/White/BOLD 27+19 Black/White/- 46+51 Blue/White/- 97+1 Blue/White/BOLD
-r23 |│  = / -                   Band up / down                                                        │|
-r23 s 0+27 Blue/White/BOLD 27+14 Black/White/- 41+56 Blue/White/- 97+1 Blue/White/BOLD
-r24 |│  t                       Find clear TX offset (auto-pick + pin)                                │|
-r24 s 0+27 Blue/White/BOLD 27+38 Black/White/- 65+32 Blue/White/- 97+1 Blue/White/BOLD
+r15 |│  Enter                   Callers: reply at shown step; TX Placement: park at selected slice; DX│|
+r15 s 0+27 Blue/White/BOLD 27+70 Black/White/- 97+1 Blue/White/BOLD
+r16 |│                          Hunter: details (Why)                                                 │|
+r16 s 0+1 Blue/White/BOLD 1+26 Blue/White/- 27+21 Black/White/- 48+49 Blue/White/- 97+1 Blue/White/BOLD
+r17 |│  c / s                   Start / stop CQ                                                       │|
+r17 s 0+27 Blue/White/BOLD 27+15 Black/White/- 42+55 Blue/White/- 97+1 Blue/White/BOLD
+r18 |│  k                       Abort selected QSO now, no confirm (any panel)                        │|
+r18 s 0+27 Blue/White/BOLD 27+46 Black/White/- 73+24 Blue/White/- 97+1 Blue/White/BOLD
+r19 |│  r                       Re-send last TX (QSO Status panel only)                               │|
+r19 s 0+27 Blue/White/BOLD 27+39 Black/White/- 66+31 Blue/White/- 97+1 Blue/White/BOLD
+r20 |│  Shift+H                 Engage Hound on selected DX Hunter station                            │|
+r20 s 0+27 Blue/White/BOLD 27+42 Black/White/- 69+28 Blue/White/- 97+1 Blue/White/BOLD
+r21 |│  TX control                                                                                    │|
+r21 s 0+1 Blue/White/BOLD 1+12 Black/White/BOLD|UNDERLINED 13+84 Blue/White/- 97+1 Blue/White/BOLD
+r22 |│  Left / Right            TX offset −/+ ## Hz (Callers: cycle reply step)                       │|
+r22 s 0+27 Blue/White/BOLD 27+47 Black/White/- 74+23 Blue/White/- 97+1 Blue/White/BOLD
+r23 |│  [ / ]                   TX offset −/+ ## Hz                                                   │|
+r23 s 0+27 Blue/White/BOLD 27+19 Black/White/- 46+51 Blue/White/- 97+1 Blue/White/BOLD
+r24 |│  = / -                   Band up / down                                                        │|
+r24 s 0+27 Blue/White/BOLD 27+14 Black/White/- 41+56 Blue/White/- 97+1 Blue/White/BOLD
 r25 |│                                                                                                │|
 r25 s 0+1 Blue/White/BOLD 1+96 Blue/White/- 97+1 Blue/White/BOLD
 r26 |│  ↑↓ PgUp PgDn scroll · #–## of ## · Shift+Q EMERGENCY STOP · Esc close                         │|

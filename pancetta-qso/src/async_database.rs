@@ -3525,7 +3525,14 @@ mod pan282_tests {
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
-                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                // The rebuild renames and removes files while a step callback runs, so a
+                // file listed above can be gone by now. A crash at this instant would not
+                // have it either, so skipping it keeps the snapshot faithful.
+                match std::fs::copy(entry.path(), to.join(entry.file_name())) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("copy {:?}: {e}", entry.path()),
+                }
             }
         }
     }
