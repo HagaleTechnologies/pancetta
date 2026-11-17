@@ -1394,6 +1394,10 @@ fn stashes_auto_73(metadata: &pancetta_qso::states::QsoMetadata) -> bool {
 #[path = "qso/tests/fox_slot_tests.rs"]
 mod fox_slot_tests;
 
+#[cfg(test)]
+#[path = "qso/tests/upload_subscriber_startup_tests.rs"]
+mod upload_subscriber_startup_tests;
+
 /// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
 /// frame. Only touches the entry this call committed (same completed QSO,
 /// `last_resend_at` still its own stamp), so a newer completion stashed for
@@ -4035,6 +4039,16 @@ impl super::ApplicationCoordinator {
             }));
         }
 
+        // The local logbook and upload receivers are taken before the manager
+        // is published below. Both consumers start inside the spawned task,
+        // the upload subscriber only after the startup index rebuild and
+        // logger open. A QSO completed through the published manager in that
+        // window waits in these receivers instead of missing the logbook of
+        // record or the upload queue. Replay opens no logbook, so it takes no
+        // ADIF receiver.
+        let adif_events = (!replay_mode).then(|| qso_manager.subscribe());
+        let upload_events = upload_enabled.then(|| qso_manager.subscribe());
+
         // PAN-72 critical-finding fix: also publish the fresh handle onto
         // the watch channel so the (not respawned on a Qso-only restart)
         // Autonomous task's drain can pick up this brand-new manager
@@ -4133,7 +4147,8 @@ impl super::ApplicationCoordinator {
                 // before this point: the decode/command loops below have not
                 // started yet.
                 qso_lookup.reset_display_history();
-                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
+                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers_with(
+                    adif_events,
                     replay_mode,
                     &adif_path,
                     &db_path,
@@ -4156,13 +4171,13 @@ impl super::ApplicationCoordinator {
                 // a QRZ lookup in flight
                 // and keeps queuing completions until `stop_upload_outbox`
                 // asks it to finish (PAN-232).
-                if upload_enabled {
+                if let Some(upload_events) = upload_events {
                     start_qso_upload_subscriber(
                         upload_outbox.clone(),
                         qrz_xml_cfg.clone(),
                         station_power_watts,
                         attribution_comment,
-                        qso_manager.subscribe(),
+                        upload_events,
                         shutdown.clone(),
                         qso_lookup.clone(),
                         qrz_xml_base_url.clone(),
@@ -11680,6 +11695,40 @@ async fn start_local_qso_log_writers(
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
     LocalIndex,
 ) {
+    start_local_qso_log_writers_with(
+        None,
+        replay,
+        adif_path,
+        db_path,
+        station_power_watts,
+        attribution_comment,
+        database_settings,
+        qso_manager,
+        adif_subscribers,
+    )
+    .await
+}
+
+/// [`start_local_qso_log_writers`] with the ADIF writer's receiver already
+/// taken (`Some`), so it holds every completion since the caller subscribed;
+/// `None` subscribes here, before the index work.
+// Startup settings and subscriber handles are passed together.
+#[allow(clippy::too_many_arguments)]
+async fn start_local_qso_log_writers_with(
+    adif_events: Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
+    replay: bool,
+    adif_path: &std::path::Path,
+    db_path: &std::path::Path,
+    station_power_watts: u32,
+    attribution_comment: bool,
+    database_settings: &pancetta_config::DatabaseConfig,
+    qso_manager: &pancetta_qso::QsoManager,
+    adif_subscribers: &AdifSubscribers,
+) -> (
+    Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
+    Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
+    LocalIndex,
+) {
     if replay {
         info!(
             "--replay: local QSO log writes suppressed — neither {} nor {} is \
@@ -11699,7 +11748,7 @@ async fn start_local_qso_log_writers(
     // Subscribe before the index work below: a QSO that completes while a
     // large log replays waits in this receiver and is appended once the
     // writer opens, instead of missing the logbook of record.
-    let adif_events = qso_manager.subscribe();
+    let adif_events = adif_events.unwrap_or_else(|| qso_manager.subscribe());
 
     // Before either writer below creates a file: opening the writers first
     // made a legacy-only `qso.db` look stale (wiped by the rebuild) and a
