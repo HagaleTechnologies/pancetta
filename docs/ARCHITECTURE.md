@@ -112,6 +112,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `audio/` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
+| `autonomous/` | Autonomous operator component. |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
 | `config_reload.rs` | Applying saved config edits: live security fields, restart list. |
 | `contest.rs` | Durable contest scoring refresh. |
@@ -121,10 +122,12 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `dx_cluster.rs` | DX cluster component. |
 | `effort.rs` | Decode-effort preset to wall-time budget mapping. |
 | `ft8.rs` | FT8 decoder component startup. |
+| `ft8/` | FT8 decoder component startup. |
 | `gain_sweep.rs` | Receive-gain experiment measurements and inference (PAN-244). |
 | `gain_sweep_runtime.rs` | Coordinator runtime driving the receive-gain experiment. |
 | `hamlib.rs` | rigctld TCP client: poll loop, watchdog, SWR metering, gain transactions. |
 | `health.rs` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
+| `health/` | Health checks, panic counting, audit-log retention, supervisor restart policy. |
 | `mod.rs` | ApplicationCoordinator: component lifecycle and startup sequencing. |
 | `pipeline.rs` | Decode-pipeline crossbeam channel wiring and startup. |
 | `psk_reporter.rs` | PSKReporter component. |

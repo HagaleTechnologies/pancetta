@@ -24,7 +24,7 @@ Press `?` inside the TUI for the same list as an overlay.
 | `Shift+W` | Watchlist: toggle focused/typed callsign (persists; removed when worked) |
 | `Space` | Call selected station (a DX Hunter cluster/cqdx spot QSYs the rig to its dial first; waits for PTT-off) |
 | `/` | Compose free-text TX (Enter sends, Esc cancels) |
-| `Enter` | Callers: reply at shown step; TX Placement: park at selected slice |
+| `Enter` | Callers: reply at shown step; TX Placement: park at selected slice; DX Hunter: details (Why) |
 | `c / s` | Start / stop CQ |
 | `k` | Abort selected QSO now, no confirm (any panel) |
 | `r` | Re-send last TX (QSO Status panel only) |

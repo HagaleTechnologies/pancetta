@@ -21,6 +21,16 @@ pub(crate) fn view_message(view: ActiveView) -> &'static str {
     }
 }
 
+/// Short view name for the footer (PAN-388): `view_message` without " view".
+pub(crate) fn view_name(view: ActiveView) -> &'static str {
+    match view {
+        ActiveView::Operate => "Operate",
+        ActiveView::Hunt => "Hunt",
+        ActiveView::Run => "Run",
+        ActiveView::Monitor => "Monitor",
+    }
+}
+
 pub(crate) fn reply_label(step: ResponseStep) -> &'static str {
     match step {
         ResponseStep::Grid => "grid",
@@ -139,6 +149,7 @@ mod tests {
             "48% of max power"
         );
     }
+
     #[test]
     fn pan353_rendered_text_vocabulary_is_exhaustive() {
         use RigConnDisplay::*;
@@ -291,3 +302,7 @@ mod marker_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "presentation/tests/view_name_tests.rs"]
+mod view_name_tests;
