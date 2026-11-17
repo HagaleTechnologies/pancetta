@@ -649,16 +649,5 @@ mod evidence_tests {
 }
 
 #[cfg(test)]
-mod tls_security_tests {
-    use super::*;
-    mod fixture {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../test-support/tls.rs"
-        ));
-    }
-    #[tokio::test]
-    async fn tls_untrusted_alerts() {
-        fixture::rejects_http(AlertDispatcher::http_builder().no_proxy().build().unwrap()).await;
-    }
-}
+#[path = "alerts/tests/tls_security_tests.rs"]
+mod tls_security_tests;
