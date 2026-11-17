@@ -2864,7 +2864,15 @@ impl ApplicationCoordinator {
                                 .unwrap_or_else(|| "~/.pancetta/callsign_seed.txt".to_string())
                         );
                     }
-                    *self.fp_filter.write().unwrap() = Some(std::sync::Arc::new(filter));
+                    // PAN-290: this write replaces the whole value, so a
+                    // poison flag left by an earlier panic no longer
+                    // describes the data: recover the guard and clear it.
+                    *self
+                        .fp_filter
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(std::sync::Arc::new(filter));
+                    self.fp_filter.clear_poison();
                 }
                 Err(e) => {
                     warn!("FP filter init failed, decodes will pass unfiltered: {}", e);

@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-290: a poisoned false-positive filter lock no longer stops FT8 decoding; each window decodes with the filter bypassed and logs a warning, and the autonomous TX-side gate keeps its stored filter.
 - PAN-388: the TUI footer shows the keys for the focused panel and names the current view. DX Hunter shows `Space:Call`, `Enter:Details`, `W:Watchlist` and `L:Lookup`; TX Placement no longer shows `Space:Call`. Enter on DX Hunter opens the Why overlay. At 80 columns Band Activity's footer drops `=/-:Band` to fit the view name. The focused Monitor waterfall shows `{/}:Gain` and `b/B:Palette`.
 - PAN-389: `[ui.waterfall]` sets the waterfall palette (`classic`, `spectrum`, `thermal`, `viridis`) and a display gain (`gain_db`, -12 to 12 dB, positive brightens). In the Monitor view, Tab focuses the waterfall; `{`/`}` step the gain by 1 dB and `b`/`B` cycle the palette. Live changes persist in `~/.pancetta/session_state.json`, and a later config edit wins at the next start. Config edits need a restart. 16-colour terminals ignore the palette.
 - PAN-291: while the rig is keyed, the Shift+S station health panel shows forward power and ALC read over CAT twice a second. Two ALC readings in a row above `[rig.power_control.protection] max_alc` (default 0.5, uncalibrated) raise a sticky warning to reduce audio drive; TX is never blocked. Set `alc_overdrive_warning = false` to turn it off. Changes require restart. Automated coverage only; real-rig qualification pending.
