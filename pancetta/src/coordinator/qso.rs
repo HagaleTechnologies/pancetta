@@ -2357,15 +2357,39 @@ async fn maybe_answer_caller(
     // multi-TX bundle when the coalescer folds them together. A genuine
     // no-op (byte-identical) when nothing is within MIN_TX_SEPARATION_HZ —
     // `deconflict_offset` returns the input unchanged in that case.
-    let active = qso_manager.active_tx_offsets().await;
-    let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
-    if tx_off != frequency_hz {
+    //
+    // PAN-386: an FT8 Fox answers on its own lowest free 60 Hz slot in
+    // 300-900 Hz instead (WSJT-X `foxgen.f90`), and hears the Hound at its
+    // calling frequency (`partner_freq`). FT4/FT2 Fox mode keeps Tx=Rx.
+    let fox_slots =
+        snap.fox_mode && pancetta_qso::fox_slots_apply(&qso_manager.config().active_mode);
+    let (tx_off, partner_freq) = if fox_slots {
+        let (fox_offsets, other_offsets) = qso_manager.active_tx_offsets_by_fox_role().await;
+        let Some(slot) = pancetta_qso::fox_slot_offset(&fox_offsets, &other_offsets) else {
+            info!(
+                target: "qso",
+                "Not auto-answering {}: no free Fox slot in 300-900 Hz", answer.their_call
+            );
+            return;
+        };
         info!(
             target: "qso",
-            "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
-            frequency_hz, tx_off, active.len()
+            "Fox answer slot: caller_freq={:.0} → tx_off={:.0} Hz ({} Fox stream(s))",
+            frequency_hz, slot, fox_offsets.len()
         );
-    }
+        (slot, Some(frequency_hz))
+    } else {
+        let active = qso_manager.active_tx_offsets().await;
+        let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
+        if tx_off != frequency_hz {
+            info!(
+                target: "qso",
+                "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
+                frequency_hz, tx_off, active.len()
+            );
+        }
+        (tx_off, partner_freq)
+    };
 
     match qso_manager
         .respond_to_caller(
@@ -2401,6 +2425,11 @@ async fn maybe_answer_caller(
             // mode was turned off during the awaits since.
             if snap.fox_mode {
                 record_fox_admitted(fox_admitted_qsos, &qso_id);
+                // PAN-386: an FT8 Fox answer is a Fox-role stream, pinned to
+                // its slot and completed by the Hound's R-report.
+                if fox_slots {
+                    qso_manager.mark_fox_role(qso_id).await;
+                }
             }
             emit_status(
                 message_bus,
@@ -6791,11 +6820,14 @@ impl super::ApplicationCoordinator {
 
                                                 // Start the repeating Fox CQ (same as manual `c`):
                                                 // CallingCq QSO re-emits CQ every slot under the
-                                                // manual watchdog until a Hound answers.
-                                                // Use 1500 Hz (FT8 passband centre) as the default
-                                                // Fox CQ audio offset; tx_parity = None (Fox
-                                                // picks its own slot via the self-parity fallback).
-                                                const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
+                                                // manual watchdog until a Hound answers;
+                                                // tx_parity = None (Fox picks its own slot via the
+                                                // self-parity fallback). PAN-386: in FT8 the CQ
+                                                // takes the lowest free 60 Hz Fox slot in
+                                                // 300-900 Hz (WSJT-X `foxgen.f90`) and is a
+                                                // Fox-role stream; FT4/FT2 keep 1500 Hz (passband
+                                                // centre), the legacy geometry.
+                                                const LEGACY_FOX_CQ_OFFSET_HZ: f64 = 1500.0;
                                                 // PAN-76: a Hound that converts the Fox CQ
                                                 // skips maybe_answer_caller's cap. Start no
                                                 // CQ while a Fox CQ is still calling, or while
@@ -6834,11 +6866,33 @@ impl super::ApplicationCoordinator {
                                                     };
                                                     emit_status(&message_bus, status, pancetta_core::DiagnosticLevel::Warn).await;
                                                 } else {
-                                                    match qso_manager
-                                                        .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
-                                                        .await
-                                                    {
-                                                        Ok(qso_id) => {
+                                                    let fox_slots = pancetta_qso::fox_slots_apply(
+                                                        &qso_manager.config().active_mode,
+                                                    );
+                                                    let cq_offset: Result<f64, String> = if fox_slots {
+                                                        let (fox_offsets, other_offsets) = qso_manager
+                                                            .active_tx_offsets_by_fox_role()
+                                                            .await;
+                                                        pancetta_qso::fox_slot_offset(
+                                                            &fox_offsets,
+                                                            &other_offsets,
+                                                        )
+                                                        .ok_or_else(|| {
+                                                            "no free Fox slot in 300-900 Hz".to_string()
+                                                        })
+                                                    } else {
+                                                        Ok(LEGACY_FOX_CQ_OFFSET_HZ)
+                                                    };
+                                                    let started = match cq_offset {
+                                                        Ok(cq_offset) => qso_manager
+                                                            .start_cq_manual(cq_offset, None, false, None)
+                                                            .await
+                                                            .map(|qso_id| (qso_id, cq_offset))
+                                                            .map_err(|e| e.to_string()),
+                                                        Err(e) => Err(e),
+                                                    };
+                                                    match started {
+                                                        Ok((qso_id, cq_offset)) => {
                                                             // PAN-76: a Hound answering within 15 Hz
                                                             // of the CQ converts this QSO into its
                                                             // exchange, so it counts as Fox-admitted.
@@ -6846,10 +6900,13 @@ impl super::ApplicationCoordinator {
                                                                 &fox_admitted_qsos,
                                                                 &qso_id,
                                                             );
+                                                            if fox_slots {
+                                                                qso_manager.mark_fox_role(qso_id).await;
+                                                            }
                                                             info!(
                                                                 "Fox mode ON — CQ started: {} \
                                                                  ({:.0} Hz, up to {} streams)",
-                                                                qso_id, FOX_CQ_OFFSET_HZ, n
+                                                                qso_id, cq_offset, n
                                                             );
                                                             emit_status(
                                                                 &message_bus,
@@ -17271,7 +17328,7 @@ mod respond_to_caller_admission_tests {
     /// The real Qso component for K5ARH with `max_concurrent_qsos = 1`, its
     /// event forwarder proven subscribed (readiness probe, then the probe QSO
     /// failed and gone from `active_tx_qsos`), and a Tui channel to observe.
-    async fn pan76_station() -> (
+    pub(super) async fn pan76_station() -> (
         ApplicationCoordinator,
         pancetta_qso::QsoManager,
         crossbeam_channel::Receiver<ComponentMessage>,
@@ -17332,7 +17389,7 @@ mod respond_to_caller_admission_tests {
         (coordinator, manager, tui_rx)
     }
 
-    async fn pan76_set_fox_mode(
+    pub(super) async fn pan76_set_fox_mode(
         coordinator: &ApplicationCoordinator,
         tui_rx: &crossbeam_channel::Receiver<ComponentMessage>,
         on: bool,
@@ -17452,7 +17509,7 @@ mod respond_to_caller_admission_tests {
                     grid: Some("FN31".to_string()),
                 },
                 "K5ARH W1AAA FN31".to_string(),
-                1505.0,
+                305.0,
                 Some(-10.0),
             )
             .await
@@ -17533,7 +17590,7 @@ mod respond_to_caller_admission_tests {
         assert_eq!(cap, 1, "Fox mode is off, so the base cap is back to 1");
         let result = pan76_coalesce(
             &coordinator,
-            pan76_request(&hound_ids[0], "W1AAA K5ARH -10", 1505.0),
+            pan76_request(&hound_ids[0], "W1AAA K5ARH -10", 305.0),
             vec![
                 pan76_request(&hound_ids[1], "W2BBB K5ARH -12", 1200.0),
                 pan76_request(&hound_ids[2], "W3CCC K5ARH -08", 1800.0),
@@ -17815,7 +17872,7 @@ mod respond_to_caller_admission_tests {
                     grid: Some("FN31".to_string()),
                 },
                 "K5ARH W1AAA FN31".to_string(),
-                1505.0,
+                305.0,
                 Some(-10.0),
             )
             .await

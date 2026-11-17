@@ -53,6 +53,14 @@ periods, band dial tables, and offset regions are normative in the code and
   threshold there, so a new stream is not restricted to the old offset.
   Report-driven moves take the QSO-map lock before the shared PTT gate and
   retain both through epoch invalidation and reply publication.
+- **Fox slot rule (PAN-386)**: in FT8 Fox mode (Shift+X), each Fox-role QSO
+  (`QsoMetadata.fox`: the Fox CQ and every Hound answer) takes a 60 Hz slot in
+  300-900 Hz from `pancetta_qso::fox_slot_offset`: the lowest slot at least
+  59 Hz from other Fox streams and 75 Hz from other streams. The slot is pinned
+  for the QSO's life. An RR73 and a report for the same Fox call air as one
+  type 0.1 frame at the report's slot, but only at encode time; each QSO keeps
+  its own item, attempt id and outcome. The contact logs when RR73 airs
+  (PAN-280 hold). FT4/FT2 Fox keeps the 1500 Hz CQ and Tx=Rx answers.
 
 The autonomous `SlotTicker` in `pancetta/src/coordinator/autonomous.rs` remembers
 the previous poll time. When it observes a mode change, a current-mode boundary
