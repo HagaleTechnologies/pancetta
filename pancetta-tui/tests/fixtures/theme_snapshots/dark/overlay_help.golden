@@ -31,26 +31,26 @@ r13 |│                          its dial first; waits for PTT-off)            
 r13 s 0+27 Cyan/Black/- 27+34 White/Black/- 61+37 Cyan/Black/-
 r14 |│  /                       Compose free-text TX (Enter sends, Esc cancels)                       │|
 r14 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+47 White/Black/- 74+24 Cyan/Black/-
-r15 |│  Enter                   Callers: reply at shown step; TX Placement: park at selected slice    │|
-r15 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+66 White/Black/- 93+5 Cyan/Black/-
-r16 |│  c / s                   Start / stop CQ                                                       │|
-r16 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+15 White/Black/- 42+56 Cyan/Black/-
-r17 |│  k                       Abort selected QSO now, no confirm (any panel)                        │|
-r17 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+46 White/Black/- 73+25 Cyan/Black/-
-r18 |│  r                       Re-send last TX (QSO Status panel only)                               │|
-r18 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+39 White/Black/- 66+32 Cyan/Black/-
-r19 |│  Shift+H                 Engage Hound on selected DX Hunter station                            │|
-r19 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+42 White/Black/- 69+29 Cyan/Black/-
-r20 |│  TX control                                                                                    │|
-r20 s 0+1 Cyan/Black/- 1+12 Cyan/Black/BOLD 13+85 Cyan/Black/-
-r21 |│  Left / Right            TX offset −/+ ## Hz (Callers: cycle reply step)                       │|
-r21 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+47 White/Black/- 74+24 Cyan/Black/-
-r22 |│  [ / ]                   TX offset −/+ ## Hz                                                   │|
-r22 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+19 White/Black/- 46+52 Cyan/Black/-
-r23 |│  = / -                   Band up / down                                                        │|
-r23 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+14 White/Black/- 41+57 Cyan/Black/-
-r24 |│  t                       Find clear TX offset (auto-pick + pin)                                │|
-r24 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+38 White/Black/- 65+33 Cyan/Black/-
+r15 |│  Enter                   Callers: reply at shown step; TX Placement: park at selected slice; DX│|
+r15 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+70 White/Black/- 97+1 Cyan/Black/-
+r16 |│                          Hunter: details (Why)                                                 │|
+r16 s 0+27 Cyan/Black/- 27+21 White/Black/- 48+50 Cyan/Black/-
+r17 |│  c / s                   Start / stop CQ                                                       │|
+r17 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+15 White/Black/- 42+56 Cyan/Black/-
+r18 |│  k                       Abort selected QSO now, no confirm (any panel)                        │|
+r18 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+46 White/Black/- 73+25 Cyan/Black/-
+r19 |│  r                       Re-send last TX (QSO Status panel only)                               │|
+r19 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+39 White/Black/- 66+32 Cyan/Black/-
+r20 |│  Shift+H                 Engage Hound on selected DX Hunter station                            │|
+r20 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+42 White/Black/- 69+29 Cyan/Black/-
+r21 |│  TX control                                                                                    │|
+r21 s 0+1 Cyan/Black/- 1+12 Cyan/Black/BOLD 13+85 Cyan/Black/-
+r22 |│  Left / Right            TX offset −/+ ## Hz (Callers: cycle reply step)                       │|
+r22 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+47 White/Black/- 74+24 Cyan/Black/-
+r23 |│  [ / ]                   TX offset −/+ ## Hz                                                   │|
+r23 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+19 White/Black/- 46+52 Cyan/Black/-
+r24 |│  = / -                   Band up / down                                                        │|
+r24 s 0+1 Cyan/Black/- 1+26 Yellow/Black/BOLD 27+14 White/Black/- 41+57 Cyan/Black/-
 r25 |│                                                                                                │|
 r25 s 0+98 Cyan/Black/-
 r26 |│  ↑↓ PgUp PgDn scroll · #–## of ## · Shift+Q EMERGENCY STOP · Esc close                         │|

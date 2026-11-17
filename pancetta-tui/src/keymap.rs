@@ -15,6 +15,8 @@
 //!    and, when what a key does changed on purpose, re-bless the key-effect
 //!    golden (`tests/fixtures/key_effects.golden`):
 //!    `PANCETTA_BLESS_KEY_EFFECTS=1 cargo test -p pancetta-tui --lib key_effects_match_golden`
+//! 5. if the key appears in the footer, update `keymap/hints.rs`;
+//!    `every_footer_hint_resolves_to_its_action` fails until it matches.
 //!
 //! The table tests below then prove every chord resolves to exactly one
 //! action and every action is reachable. Dialog-internal chords live in
@@ -22,6 +24,7 @@
 
 mod action;
 pub use action::Action;
+pub(crate) mod hints;
 
 use crate::app::{ActivePanel, App};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1017,7 +1020,7 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
     ),
     kb(
         "Enter",
-        "Callers: reply at shown step; TX Placement: park at selected slice",
+        "Callers: reply at shown step; TX Placement: park at selected slice; DX Hunter: details (Why)",
         Category::QsoOperation,
         false,
         &[
@@ -1036,7 +1039,25 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
             main_when(
                 KeyCode::Enter,
                 Mods::Any,
-                When::NeitherPanel(ActivePanel::Callers, ActivePanel::TxPlacement),
+                When::Panel(ActivePanel::DxHunter),
+                Action::OpenWhy,
+            ),
+            main_when(
+                KeyCode::Enter,
+                Mods::Any,
+                When::Panel(ActivePanel::BandActivity),
+                Action::ComposeHint,
+            ),
+            main_when(
+                KeyCode::Enter,
+                Mods::Any,
+                When::Panel(ActivePanel::QsoStatus),
+                Action::ComposeHint,
+            ),
+            main_when(
+                KeyCode::Enter,
+                Mods::Any,
+                When::Panel(ActivePanel::Waterfall),
                 Action::ComposeHint,
             ),
         ],
@@ -1934,3 +1955,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "keymap/tests/enter_resolution_tests.rs"]
+mod enter_resolution_tests;
