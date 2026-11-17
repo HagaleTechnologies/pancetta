@@ -4415,11 +4415,26 @@ impl QsoManager {
     /// same `is_active()` filter as [`Self::active_tx_offsets`]. Fox slot
     /// selection (`fox_slot_offset`) spaces Fox streams 60 Hz apart and keeps
     /// 75 Hz from every other stream.
+    ///
+    /// A Fox-role QSO that completed within [`COMPLETED_QSO_REWORK_GRACE`]
+    /// still holds its slot: its closing RR73 may not have aired yet (the
+    /// PAN-280 hold), and a new Hound answered on that slot would collide
+    /// with it in the same bundle.
     pub async fn active_tx_offsets_by_fox_role(&self) -> (Vec<f64>, Vec<f64>) {
         let qsos = self.qsos.read().await;
+        let now = self.now_utc();
         let mut fox = Vec::new();
         let mut others = Vec::new();
-        for p in qsos.values().filter(|p| p.state.is_active()) {
+        let holds_slot = |p: &&QsoProgress| {
+            p.state.is_active()
+                || (p.metadata.fox
+                    && matches!(
+                        p.state,
+                        QsoState::Completed { completed_at, .. }
+                            if now - completed_at < COMPLETED_QSO_REWORK_GRACE
+                    ))
+        };
+        for p in qsos.values().filter(holds_slot) {
             if p.metadata.fox {
                 fox.push(p.metadata.frequency);
             } else {

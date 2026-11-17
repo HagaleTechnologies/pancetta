@@ -360,3 +360,17 @@ async fn fox_stream_skips_drift_relatch() {
         }
     }
 }
+
+/// A Fox-role QSO whose RR73 is still closing keeps its slot, so the next
+/// Hound is not answered on top of the RR73 (PAN-386).
+#[tokio::test]
+async fn completing_fox_stream_keeps_its_slot() {
+    let (manager, id, _events) = hound_sends_r_report_at_our_slot(true).await;
+    assert!(matches!(
+        manager.get_qso(id).await.unwrap().state,
+        QsoState::Completed { .. }
+    ));
+    let (fox_offsets, _others) = manager.active_tx_offsets_by_fox_role().await;
+    assert_eq!(fox_offsets, vec![360.0]);
+    assert_eq!(crate::fox::fox_slot_offset(&fox_offsets, &[]), Some(300.0));
+}
