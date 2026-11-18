@@ -28,7 +28,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
-| `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
+| `pancetta-research` | Local-only decoder-iteration harness | Local-only; excluded from CI except a non-required compile-only check lane (PAN-372) |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 LoTW outbox retries, optional certificate passwords and duplicate tqsl exits 8/9 are integration-tested with fake tqsl, unreleased; live-account qualification remains pending.

@@ -138,15 +138,15 @@ cmd_guard_ci() {
             "research/corpus"
         )
         for term in "${forbidden[@]}"; do
-            # A reference is forbidden UNLESS it is the sanctioned exclusion form
-            # (`--exclude pancetta-research`, which is precisely how CI keeps the
-            # local-only research crate out of `--workspace` builds) or a comment
-            # explaining it. Filter those allowed forms out before flagging.
+            # PAN-372 also permits the compile-only check and its filter path.
+            # All other research references, including test runs, remain forbidden.
             local matches
             # `|| true`: an empty filter result (grep exit 1) is the SUCCESS
             # case here and must not trip the script's `set -e`.
             matches=$(grep -rIn "$term" "${REPO_ROOT}/.github/workflows" 2>/dev/null \
                 | grep -v -- '--exclude pancetta-research' \
+                | grep -v -- 'cargo check -p pancetta-research' \
+                | grep -vE ":[0-9]+:[[:space:]]*-[[:space:]]*'pancetta-research/\*\*'" \
                 | grep -vE ':[0-9]+:[[:space:]]*#' || true)
             if [ -n "$matches" ]; then
                 echo "FORBIDDEN reference in .github/workflows:"

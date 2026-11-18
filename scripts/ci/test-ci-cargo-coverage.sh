@@ -33,7 +33,7 @@ raise 'standalone commands must precede examples and workspace doc tests' unless
   commands.index(standalone) < commands.index(examples) &&
   commands.index(examples) < commands.index(doc)
 cache_jobs = jobs.select { |_, j| j.fetch('steps', []).any? { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') } }
-raise 'wrong cache jobs' unless cache_jobs.keys.sort == %w[clippy cross-platform-check workspace-check workspace-tests]
+raise 'wrong cache jobs' unless cache_jobs.keys.sort == %w[clippy cross-platform-check research-check workspace-check workspace-tests]
 cache_jobs.each do |name, job|
   caches = job['steps'].select { |s| s['uses'].to_s.start_with?('Swatinem/rust-cache@') }
   raise "#{name}: wrong cache count" unless caches.length == 1
@@ -58,6 +58,26 @@ raise 'aggregator must always run' unless jobs['ci']['if'] == 'always()'
 raise 'aggregator no longer rejects failed/cancelled jobs' unless
   jobs['ci']['steps'].any? { |s| s['run'].to_s.include?('grep -q \'"failure"\\|"cancelled"\'') }
 raise 'workspace needs changed' unless workspace['needs'] == %w[changes codex-clean]
+# PAN-372: keep the research lane path-filtered, compile-only, and non-required.
+research = jobs.fetch('research-check')
+raise 'Research Check must never join the aggregator needs' if jobs.fetch('ci').fetch('needs').include?('research-check')
+raise 'Research Check display name changed' unless research['name'] == 'Research Check'
+raise 'Research Check must depend only on changes' unless Array(research['needs']) == %w[changes]
+rc_if = "always() && (needs.changes.outputs.research == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))"
+raise 'Research Check event gate changed' unless research['if'] == rc_if
+rc_cmds = research.fetch('steps').filter_map { |s| s['run'] }
+['cargo check -p pancetta-research --all-targets',
+ 'cargo check -p pancetta-research --all-targets --features research-eval'].each do |cmd|
+  raise "Research Check lost its compile command: #{cmd}" unless rc_cmds.include?(cmd)
+end
+raise 'Research Check must stay compile-only (no test runs)' if
+  rc_cmds.any? { |c| c.start_with?('cargo test') || c.start_with?('cargo nextest') }
+filters = jobs.fetch('changes').fetch('steps').find { |s| s.is_a?(Hash) && s.dig('with', 'filters') }.dig('with', 'filters')
+raise 'changes job lost the research filter' unless filters.is_a?(String) && filters.include?("research:\n")
+raise 'changes job lost the research output' unless jobs.fetch('changes').fetch('outputs').fetch('research') == '${{ steps.filter.outputs.research }}'
+%w['pancetta-research/**' 'pancetta-ft8/**' 'pancetta-qso/**' 'pancetta-dsp/**' 'Cargo.toml' 'Cargo.lock' 'rust-toolchain.toml' 'pancetta-ft8/vendor/ft8_lib' '.github/workflows/ci.yml'].each do |pat|
+  raise "research filter lost a path: #{pat}" unless filters.include?(pat)
+end
 expected_if = "always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))"
 raise 'workspace event gate changed' unless workspace['if'] == expected_if
 failure = steps.first

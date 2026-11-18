@@ -8,15 +8,15 @@
 # is therefore a FAST local PRE-FLIGHT, not a full CI mirror.
 #
 #   - As a pre-push HOOK (auto-detected): runs the FAST lane — fmt + clippy +
-#     research-guard + `cargo check --workspace --examples` (compile/API-drift,
-#     incl. the CI-excluded pancetta-research examples) + cargo-deny. ~5 min.
+#     research-guard + `cargo check --workspace --all-targets` (compile/API-drift,
+#     incl. pancetta-research examples) + cargo-deny. ~5 min.
 #     The full test RUN is left to CI (it runs on the resulting push/PR).
 #   - Run MANUALLY with no args for the FULL lane (adds the workspace test run)
 #     when you want local certainty before a big/risky change.
 #
-# The one thing CI does NOT cover is pancetta-research (local-only harness,
-# excluded from CI). The always-on `cargo check --workspace --examples` here is
-# its cheap drift guard — it type-checks the research example call-sites so a
+# CI type-checks pancetta-research in the non-required Research Check lane.
+# The always-on `cargo check --workspace --all-targets` here remains the
+# local drift guard: it type-checks the research example call-sites so a
 # decoder-API change can't silently break them (no codegen/linking of the dozens
 # of example binaries, which is what used to make this gate ~40 min).
 #
@@ -122,7 +122,7 @@ run "research guard-ci" ./scripts/research-env.sh --guard-ci
 # --- Compile / drift lane (always; cheap with `check`) ----------------------
 #
 # `cargo check --workspace --all-targets` type-checks every crate's lib/bins AND
-# all example AND **test** targets — including the CI-excluded pancetta-research
+# all example AND **test** targets — including pancetta-research
 # examples — so a struct/API change that breaks an example OR an integration-test
 # call-site is caught here. (Was `--examples`, which compiled examples but NOT the
 # `tests/` dirs — a `QsoManagerConfig` field added 2026-06-28 broke an integration

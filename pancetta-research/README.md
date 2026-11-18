@@ -1,8 +1,12 @@
 # pancetta-research
 
-**Local-only crate. Builds and runs from your dev machine only. No GitHub
-Actions, no CI, no cron — burns Actions minutes for no benefit. If you find
-yourself wiring this into CI, stop.**
+**Local-only crate. Run experiments on your dev machine. GitHub Actions
+runs only the non-required, compile-only Research Check (PAN-372). No CI tests,
+corpus runs, or cron jobs. If you find yourself wiring more into CI, stop.**
+
+PAN-372 adds one exception: the non-required, compile-only Research Check
+type-checks this crate on dependency-affecting PRs. It runs no tests and
+does not gate merges.
 
 This crate is the iteration harness for improving the pancetta decoder. It is
 deliberately excluded from the workspace `default-members`, so `cargo build`
