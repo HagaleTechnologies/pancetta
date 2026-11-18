@@ -69,6 +69,12 @@ pub(super) struct AlertDispatcher {
     delivery: [Arc<Mutex<DeliveryState>>; 2],
 }
 impl AlertDispatcher {
+    fn http_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+    }
+
     pub(super) fn new(
         config: AlertsConfig,
         lookup: CachedStationLookup,
@@ -77,10 +83,7 @@ impl AlertDispatcher {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: Self::http_builder().build()?,
             scorer: PriorityScorer::new(weights, Box::new(lookup.clone())),
             lookup,
             tui,
@@ -644,3 +647,7 @@ mod evidence_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "alerts/tests/tls_security_tests.rs"]
+mod tls_security_tests;

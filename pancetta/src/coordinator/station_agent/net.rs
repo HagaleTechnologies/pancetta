@@ -342,6 +342,10 @@ pub struct ReqwestPairingHttp {
 }
 
 impl ReqwestPairingHttp {
+    fn http_builder(timeout: Duration) -> reqwest::ClientBuilder {
+        reqwest::Client::builder().timeout(timeout)
+    }
+
     /// Create a pairing HTTP client rooted at `base_url` (e.g.
     /// `https://pair.example/api/v1`). Must be constructed within a Tokio
     /// runtime.
@@ -359,8 +363,7 @@ impl ReqwestPairingHttp {
     fn with_timeout(base_url: String, origin: Option<String>, timeout: Duration) -> Self {
         Self {
             handle: Handle::current(),
-            client: reqwest::Client::builder()
-                .timeout(timeout)
+            client: Self::http_builder(timeout)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -1071,3 +1074,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "net/tests/tls_security_tests.rs"]
+mod tls_security_tests;
