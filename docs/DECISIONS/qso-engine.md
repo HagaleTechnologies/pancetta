@@ -175,9 +175,9 @@ Recovery precedes rearming, which still precedes retirement. Call-count caps, un
 
 `pancetta-qso/src/qso_manager.rs` held one `impl QsoManager` of 8,203 lines and 136 methods. PAN-375 moved four clusters, unchanged, into child modules of `qso_manager`, each one `impl QsoManager` block (the coordinator's cross-file pattern):
 
-- `qso_manager/relevance.rs`: `find_qsos_for_message`, `classify_relevance`, `is_message_relevant`, and the identity checks `is_us`, `is_partner` and `is_hound_fox_frame`.
-- `qso_manager/transition.rs`: `process_message_for_qso`, `determine_state_transition`, the sender and addressee checks, the ladder ranks and `advance_existing_qso_to_step`.
-- `qso_manager/relocation.rs`: `apply_tx_offset_switch`, `maybe_confirm_frequency_drift(_at)` and `tx_separation_warning`.
-- `qso_manager/manual_calls.rs`: the manual open paths, repeat-press resolution, supersession, `rearm_manual_calls_at`, `watchdog_pass_at` and `check_timeouts_at`.
+- Decode routing in `find_qsos_for_message`, `classify_relevance` and `is_message_relevant`, with identity checks in `is_us`, `is_partner` and `is_hound_fox_frame`. [`pancetta-qso/src/qso_manager/relevance.rs`](../../pancetta-qso/src/qso_manager/relevance.rs)
+- State transitions in `process_message_for_qso` and `determine_state_transition`, with sender and addressee checks, ladder ranks and `advance_existing_qso_to_step`. [`pancetta-qso/src/qso_manager/transition.rs`](../../pancetta-qso/src/qso_manager/transition.rs)
+- TX offset changes and receive frequency drift in `apply_tx_offset_switch`, `maybe_confirm_frequency_drift(_at)` and `tx_separation_warning`. [`pancetta-qso/src/qso_manager/relocation.rs`](../../pancetta-qso/src/qso_manager/relocation.rs)
+- Manual open paths, repeat-press resolution and supersession, plus `rearm_manual_calls_at`, `watchdog_pass_at` and `check_timeouts_at`. [`pancetta-qso/src/qso_manager/manual_calls.rs`](../../pancetta-qso/src/qso_manager/manual_calls.rs)
 
-Types, constants and free functions stayed in `qso_manager.rs`, so no public path changed. A moved method that another file calls is `pub(super)`, the scope it had as a private method of `qso_manager`. Never use `pub(crate)` for these. Older entries above that cite `qso_manager.rs::<method>` describe the code at their date; the method now lives in the file listed here.
+Types, constants and free functions stayed in `qso_manager.rs`. Twenty formerly private methods, including `determine_state_transition`, use `pub(super)` so the parent module and its descendants can still call them. The eight moved public methods kept their visibility. Older entries that cite `qso_manager.rs::<method>` describe the code at their date.
