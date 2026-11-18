@@ -191,46 +191,102 @@ async fn exchange_in_progress_waits_and_sends_nothing() {
 }
 
 #[tokio::test]
-async fn keyed_recheck_runs_under_ptt_sync_gate() {
+async fn held_ptt_sync_gate_waits_without_blocking() {
+    // A held gate is a key-down under way: the hop returns at once, sends
+    // nothing, and the next slot re-reads the exchange snapshot instead of
+    // retuning on this one after the gate opens (a partner may answer while
+    // the gate is held).
     let h = harness(false, false).await;
     let held = h.ctx.ptt_sync_gate.clone().lock_owned().await;
-    let task = {
-        let ctx = h.ctx.clone();
-        tokio::spawn(async move { execute_band_hop(&ctx, TO_HZ, &ac1_reason(), &[]).await })
-    };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        drain(&h.hamlib_rx).is_empty(),
-        "no SetFrequency may be enqueued while ptt_sync_gate is held"
-    );
-    assert!(drain(&h.qso_rx).is_empty());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &[]),
+    )
+    .await
+    .expect("the hop never waits on ptt_sync_gate");
     assert_eq!(
-        h.ctx.operating_frequency_hz.load(Ordering::Relaxed),
-        FROM_HZ
-    );
-    drop(held);
-    assert!(matches!(
-        task.await.unwrap(),
-        BandHopOutcome::Moved { dial_hz: TO_HZ, .. }
-    ));
-    assert_eq!(set_freqs(&drain(&h.hamlib_rx)), vec![TO_HZ]);
-
-    // A key-down that landed while the hop waited for the gate is seen by
-    // the recheck under the gate: the hop waits and sends nothing.
-    let h = harness(false, false).await;
-    let held = h.ctx.ptt_sync_gate.clone().lock_owned().await;
-    let task = {
-        let ctx = h.ctx.clone();
-        tokio::spawn(async move { execute_band_hop(&ctx, TO_HZ, &ac1_reason(), &[]).await })
-    };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    h.ctx.ptt_active.store(true, Ordering::Release);
-    drop(held);
-    assert_eq!(
-        task.await.unwrap(),
+        outcome,
         BandHopOutcome::Waiting("Band hop 20m -> 17m waiting: rig is keyed".into())
     );
     assert_sent_nothing(&h);
+
+    // A partner answered while the gate was held: the retry sees it.
+    drop(held);
+    let outcome = execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &["K1ABC".to_string()]).await;
+    assert_eq!(
+        outcome,
+        BandHopOutcome::Waiting("Band hop 20m -> 17m waiting: QSO with K1ABC in progress".into())
+    );
+    assert_sent_nothing(&h);
+
+    // With the gate free and no exchange, the hop runs.
+    assert!(matches!(
+        execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &[]).await,
+        BandHopOutcome::Moved { dial_hz: TO_HZ, .. }
+    ));
+    assert_eq!(set_freqs(&drain(&h.hamlib_rx)), vec![TO_HZ]);
+}
+
+#[tokio::test]
+async fn undelivered_set_frequency_restores_the_dial_and_waits() {
+    let h = harness(false, false).await;
+    // Saturate the registered Hamlib route.
+    let mut filled = 0;
+    loop {
+        let msg = ComponentMessage::new(
+            ComponentId::Autonomous,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: FROM_HZ,
+            }),
+            Instant::now(),
+        );
+        if !h.ctx.bus.send_message_checked(msg).await.unwrap() {
+            break;
+        }
+        filled += 1;
+        assert!(filled < 100_000, "the Hamlib channel never filled");
+    }
+    let outcome = execute_band_hop(&h.ctx, TO_HZ, &ac1_reason(), &[]).await;
+    assert_eq!(
+        outcome,
+        BandHopOutcome::Waiting(
+            "Band hop 20m -> 17m waiting: rig command was not delivered".into()
+        )
+    );
+    assert_eq!(
+        h.ctx.operating_frequency_hz.load(Ordering::Relaxed),
+        FROM_HZ,
+        "the dial is restored"
+    );
+    assert!(
+        h.ctx.last_freq_command.lock().unwrap().is_none(),
+        "the C9 anchor is restored"
+    );
+    assert!(
+        drain(&h.tui_rx)
+            .iter()
+            .all(|m| !matches!(m.message_type, MessageType::DiagnosticEvent { .. })),
+        "no Why line for a hop that did not happen"
+    );
+    let queued = drain(&h.hamlib_rx);
+    assert_eq!(queued.len(), filled);
+    assert!(set_freqs(&queued).iter().all(|f| *f == FROM_HZ));
+}
+
+#[test]
+fn exchange_waiting_text_names_the_partners() {
+    assert_eq!(exchange_waiting_text(&ac1_reason(), &[]), None);
+    assert_eq!(
+        exchange_waiting_text(&ac1_reason(), &["K1ABC".to_string()]).as_deref(),
+        Some("Band hop 20m -> 17m waiting: QSO with K1ABC in progress")
+    );
+    assert_eq!(
+        exchange_waiting_text(&ac1_reason(), &["K1ABC".to_string(), "DL1XYZ".to_string()])
+            .as_deref(),
+        Some("Band hop 20m -> 17m waiting: 2 QSOs in progress")
+    );
 }
 
 #[tokio::test]

@@ -884,3 +884,109 @@ fn pan385_grey_line_breaks_ties_toward_low_bands() {
 
     assert!(run(Some("FN42"), true, sunrise, &zero).is_none());
 }
+
+#[test]
+fn pan385_plan_entry_before_the_first_dial_is_judged_on_the_first_dial() {
+    // The configured fallback band (20m) is in the window, but the rig is
+    // really on 40m: the first live dial must still owe the window a move.
+    let plan = vec![window("06:00-24:00", &[Band::Band20m, Band::Band17m])];
+    let mut h = Harness::new(DEFAULT_BANDS, plan.clone(), Some("FN42"), |_| {});
+    let entry = utc(2026, 11, 17, 6, 0, 0);
+    h.dial = 0;
+    let a = h.slot(entry, &two_cqs(), None);
+    assert!(hop_of(&a).is_none(), "fallback 20m is in the window");
+    h.dial = 7_074_000;
+    let mut moved = None;
+    for k in 1..=20 {
+        let a = h.slot(entry + secs(15 * k), &two_cqs(), None);
+        if let Some((dial, reason)) = hop_of(&a) {
+            moved = Some((k, dial, reason));
+            break;
+        }
+    }
+    let (k, dial, reason) = moved.expect("a plan hop within one hop interval");
+    assert_eq!(k, 1, "the first live dial decides");
+    assert_eq!(dial, 14_074_000);
+    assert!(
+        matches!(reason, BandHopReason::PlanWindow { .. }),
+        "{reason:?}"
+    );
+
+    // The first live dial on a window band owes nothing, and a later manual
+    // QSY inside the window is still left alone.
+    let mut h = Harness::new(DEFAULT_BANDS, plan, Some("FN42"), |_| {});
+    h.dial = 0;
+    assert!(hop_of(&h.slot(entry, &two_cqs(), None)).is_none());
+    h.dial = 18_100_000;
+    assert!(hop_of(&h.slot(entry + secs(15), &two_cqs(), None)).is_none());
+    h.dial = 7_074_000;
+    for k in 2..40 {
+        let a = h.slot(entry + secs(15 * k), &two_cqs(), None);
+        assert!(hop_of(&a).is_none(), "no hop after a manual QSY (k = {k})");
+    }
+}
+
+#[test]
+fn pan385_window_rotation_skips_duplicate_bands() {
+    // `[40m, 40m, 80m]` passes validation (duplicates stay legal); the quiet
+    // rotation must still reach 80m and come back.
+    let plan = vec![window(
+        "00:00-06:00",
+        &[Band::Band40m, Band::Band40m, Band::Band80m],
+    )];
+    let bands = &[(14_074_000, "20m"), (7_074_000, "40m")];
+    let mut h = Harness::new(bands, plan, Some("FN42"), |_| {});
+    h.dial = 7_074_000;
+    let start = utc(2026, 11, 17, 1, 0, 0);
+    let mut hops = Vec::new();
+    for k in 0..80 {
+        let a = h.slot(start + secs(15 * k), &[], None);
+        if let Some((dial, _)) = hop_of(&a) {
+            hops.push(dial);
+            h.dial = dial;
+        }
+    }
+    assert!(hops.len() >= 3, "hops: {hops:?}");
+    assert_eq!(&hops[..3], &[3_573_000, 7_074_000, 3_573_000]);
+}
+
+#[test]
+fn pan385_plan_hop_held_by_an_exchange_is_reported_as_waiting() {
+    let mut h = Harness::new(SCENARIO2_BANDS, scenario2_plan(), Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    let a = h.slot(utc(2026, 11, 16, 23, 59, 30), &two_cqs(), None);
+    assert!(hop_of(&a).is_none());
+    assert!(h.op.take_held_band_hop().is_none());
+    h.op.set_exchange_in_progress(true);
+    let midnight = utc(2026, 11, 17, 0, 0, 0);
+    let a = h.slot(midnight, &two_cqs(), None);
+    assert!(
+        hop_of(&a).is_none(),
+        "no ChangeBand while a partner answered"
+    );
+    let held = h.op.take_held_band_hop().expect("the window move is held");
+    assert!(h.op.take_held_band_hop().is_none(), "taken once");
+    assert!(matches!(held, BandHopReason::PlanWindow { .. }), "{held:?}");
+    assert_eq!(held.to_band(), Some(Band::Band40m));
+    assert_eq!(
+        held.waiting_text("QSO with K1ABC in progress"),
+        "Band hop 20m -> 40m waiting: QSO with K1ABC in progress"
+    );
+    h.op.set_exchange_in_progress(false);
+    let a = h.slot(midnight + secs(15), &two_cqs(), None);
+    assert!(
+        hop_of(&a).is_some(),
+        "the held move runs once the exchange ends"
+    );
+    assert!(h.op.take_held_band_hop().is_none());
+}
+
+#[test]
+fn pan385_needed_hop_needs_a_known_current_band_count() {
+    // 20m's needed set has not loaded, so the snapshot has no 20m entry: a
+    // tie read as 0 on 20m must not become a hop.
+    let mut h = Harness::new(AC1_BANDS, vec![], Some("FN42"), |_| {});
+    h.dial = 14_074_000;
+    let partial = |now| Some(snap(now, &[(Band::Band17m, 2, 0)]));
+    assert!(first_hop_slot(&mut h, 60, partial).is_none());
+}

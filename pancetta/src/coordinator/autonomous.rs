@@ -2512,14 +2512,14 @@ impl super::ApplicationCoordinator {
                             // so the operator lock is never held while
                             // waiting on the QSO manager. Bound to a `let`
                             // so the watch `Ref` is dropped before `.await`.
-                            let hop_exchange_in_progress = if band_hopping_enabled {
+                            let hop_exchanges = if band_hopping_enabled {
                                 let manager = qso_manager_watch.borrow().clone();
-                                !crate::coordinator::spot_call::exchange_in_progress(manager)
+                                crate::coordinator::spot_call::exchange_in_progress(manager)
                                     .await
-                                    .is_empty()
                             } else {
-                                false
+                                Vec::new()
                             };
+                            let hop_exchange_in_progress = !hop_exchanges.is_empty();
 
                             let mut op = operator.lock().await;
 
@@ -2915,6 +2915,14 @@ impl super::ApplicationCoordinator {
                             }
                             let actions = op.decide();
                             let skip_records = op.take_skip_log();
+                            // PAN-385: a plan-window hop held back by the
+                            // exchange gate emits no `ChangeBand`; report it
+                            // as waiting below.
+                            let held_band_hop = if band_hopping_enabled {
+                                op.take_held_band_hop()
+                            } else {
+                                None
+                            };
                             // PAN-38: captured before `drop(op)` — if a
                             // self-CQ reached the radio this cycle (not
                             // suppressed below), tag its `StartAutonomousQso`
@@ -2923,6 +2931,33 @@ impl super::ApplicationCoordinator {
                             // attempt's pre-mutation state.
                             let self_cq_attempt_id = op.last_cq_attempt_id();
                             drop(op);
+
+                            if let Some(reason) = held_band_hop {
+                                if let Some(text) = super::band_hop::exchange_waiting_text(
+                                    &reason,
+                                    &hop_exchanges,
+                                ) {
+                                    let to_band =
+                                        reason.to_band().map(|b| b.name()).unwrap_or("?");
+                                    if should_report_skip(
+                                        &mut skip_seen,
+                                        "band_hop_waiting",
+                                        Some(to_band),
+                                        std::time::Instant::now(),
+                                    ) {
+                                        crate::coordinator::tx::emit_diagnostic_full(
+                                            &message_bus,
+                                            ComponentId::Autonomous,
+                                            "qso.autonomous",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            text,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
 
                             for record in skip_records {
                                 if !should_report_skip(

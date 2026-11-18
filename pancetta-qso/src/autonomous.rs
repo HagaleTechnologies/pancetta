@@ -711,6 +711,10 @@ pub struct BandStrategy {
     /// returned, so `hop_waited` can restore it when the hop is not carried
     /// out. Replaced at every `next_hop`.
     before_last_hop: Option<LowActivityState>,
+    /// PAN-385: the plan-window hop held back this slot because a partner
+    /// has answered, for the Diagnostics waiting line. Replaced at every
+    /// `next_hop`.
+    held_hop: Option<crate::band_scheduler::BandHopReason>,
 }
 
 /// Low-activity counters and round-robin index a hop resets.
@@ -737,6 +741,7 @@ impl BandStrategy {
             activity_per_band,
             scheduler: crate::band_scheduler::BandScheduler::new(),
             before_last_hop: None,
+            held_hop: None,
         }
     }
 
@@ -852,6 +857,18 @@ impl BandStrategy {
             .and_then(Self::entry_band)
     }
 
+    /// Whether the opportunity poll counts `band`: a plan-window band or the
+    /// band a `bands` entry's dial classifies to, exactly as the
+    /// coordinator's `opportunity_candidate_bands` builds the poll's set.
+    fn is_opportunity_candidate(&self, band: pancetta_core::Band) -> bool {
+        self.config.plan.iter().any(|e| e.bands.contains(&band))
+            || self
+                .config
+                .bands
+                .iter()
+                .any(|e| pancetta_core::Band::from_frequency(e.dial_frequency) == Some(band))
+    }
+
     /// Bands of the `bands` entries, distinct, by priority then list order.
     fn list_bands(&self) -> Vec<pancetta_core::Band> {
         let mut order: Vec<usize> = (0..self.config.bands.len()).collect();
@@ -914,12 +931,58 @@ impl BandStrategy {
         }
     }
 
+    /// PAN-385: take the plan-window hop the last `next_hop` held back
+    /// because a partner had answered (the exchange gate was closed). The
+    /// coordinator reports it as a Diagnostics waiting line; nothing moves
+    /// the dial. Taking it means a slot that does not evaluate (paused)
+    /// reports nothing stale.
+    pub fn take_held_hop(&mut self) -> Option<crate::band_scheduler::BandHopReason> {
+        self.held_hop.take()
+    }
+
+    /// The pending plan-window move for window `i`: the destination, its
+    /// dial and why.
+    fn plan_pick(
+        &self,
+        entry: &crate::band_scheduler::BandPlanEntry,
+        current: Option<pancetta_core::Band>,
+        grey: Option<&'static str>,
+    ) -> Option<(
+        pancetta_core::Band,
+        u64,
+        crate::band_scheduler::BandHopReason,
+    )> {
+        use crate::band_scheduler::{is_low_band, BandHopReason};
+        let first = entry.bands.first().copied();
+        let pick = if grey.is_some() {
+            entry
+                .bands
+                .iter()
+                .copied()
+                .find(|b| is_low_band(*b))
+                .or(first)
+        } else {
+            first
+        };
+        let to = pick?;
+        let dial = self.dial_for(to)?;
+        let reason = BandHopReason::PlanWindow {
+            from: current,
+            to,
+            window: entry.window,
+            bands: entry.bands.clone(),
+            grey_line: if Some(to) != first { grey } else { None },
+        };
+        Some((to, dial, reason))
+    }
+
     fn evaluate_hop(
         &mut self,
         now: DateTime<Utc>,
         slot_ns: i64,
     ) -> Option<(u64, crate::band_scheduler::BandHopReason)> {
-        use crate::band_scheduler::{is_low_band, BandHopReason};
+        use crate::band_scheduler::BandHopReason;
+        self.held_hop = None;
         if !self.config.enabled {
             return None;
         }
@@ -928,37 +991,21 @@ impl BandStrategy {
         let current = self.scheduler.current_band(self.configured_band());
         let plan = self.config.plan.clone();
         let (active, pending) = self.scheduler.update_plan(&plan, now, current);
+        let grey = self.scheduler.grey_line(self.config.grey_line, now);
         if self.scheduler.exchange_in_progress() {
+            // The plan move stays pending; report it as waiting without
+            // emitting a hop (no frequency command, no allocator reset).
+            self.held_hop = pending
+                .and_then(|i| self.plan_pick(&plan[i], current, grey))
+                .map(|(_, _, reason)| reason);
             return None;
         }
-        let grey = self.scheduler.grey_line(self.config.grey_line, now);
 
         // (a) Plan-window entry: ignores the needed-activity dwell.
         if let Some(i) = pending {
-            let entry = &plan[i];
-            let first = entry.bands.first().copied();
-            let pick = if grey.is_some() {
-                entry
-                    .bands
-                    .iter()
-                    .copied()
-                    .find(|b| is_low_band(*b))
-                    .or(first)
-            } else {
-                first
-            };
-            if let Some(to) = pick {
-                if let Some(dial) = self.dial_for(to) {
-                    let reason = BandHopReason::PlanWindow {
-                        from: current,
-                        to,
-                        window: entry.window,
-                        bands: entry.bands.clone(),
-                        grey_line: if Some(to) != first { grey } else { None },
-                    };
-                    self.commit_hop(Some(to), false, now);
-                    return Some((dial, reason));
-                }
+            if let Some((to, dial, reason)) = self.plan_pick(&plan[i], current, grey) {
+                self.commit_hop(Some(to), false, now);
+                return Some((dial, reason));
             }
         }
 
@@ -977,8 +1024,13 @@ impl BandStrategy {
                 return None;
             }
             let bands = &plan[i].bands;
+            // The next band after the current one that differs from it, in
+            // window order, so a duplicate entry (legal in config) cannot
+            // pin the rotation on the current band.
             let next = match current.and_then(|c| bands.iter().position(|b| *b == c)) {
-                Some(p) => bands.get((p + 1) % bands.len()).copied(),
+                Some(p) => (1..bands.len())
+                    .map(|k| bands[(p + k) % bands.len()])
+                    .find(|b| Some(*b) != current),
                 None => bands.first().copied(),
             }?;
             if Some(next) == current {
@@ -1061,7 +1113,18 @@ impl BandStrategy {
         };
         let best = ranked.iter().max_by_key(|c| key(grey.is_some(), c))?;
         let plain = ranked.iter().max_by_key(|c| key(false, c))?;
-        let here = current.map(|b| snapshot.for_band(b));
+        // The current band's counts must be known: a candidate band with no
+        // entry has no loaded needed set, and reading it as zero would turn a
+        // tie into a hop. A band outside the candidates is never polled and
+        // counts as zero.
+        let here = match current {
+            Some(b) => match snapshot.get(b) {
+                Some(o) => Some(o),
+                None if self.is_opportunity_candidate(b) => return None,
+                None => None,
+            },
+            None => None,
+        };
         let (here_atno, here_needed) = here
             .map(|o| (o.atno_entities, o.needed_entities))
             .unwrap_or((0, 0));
@@ -2799,6 +2862,13 @@ impl AutonomousOperator {
     /// hop reset so the next slot retries it.
     pub fn band_hop_waited(&mut self) {
         self.band_strategy.hop_waited();
+    }
+
+    /// PAN-385: take the plan-window hop the last `decide` held back because
+    /// a partner had answered. No `ChangeBand` was emitted for it; the
+    /// coordinator reports it as a Diagnostics waiting line.
+    pub fn take_held_band_hop(&mut self) -> Option<crate::band_scheduler::BandHopReason> {
+        self.band_strategy.take_held_hop()
     }
 
     /// PAN-385: whether a partner-answered exchange is in progress; while

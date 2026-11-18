@@ -126,10 +126,24 @@ pub(crate) struct BandHopCtx {
     pub active_is_ft4: bool,
 }
 
+/// The Diagnostics waiting line for a hop held back by partner-answered
+/// `exchanges`, or `None` when there are none.
+pub(crate) fn exchange_waiting_text(
+    reason: &pancetta_qso::BandHopReason,
+    exchanges: &[String],
+) -> Option<String> {
+    match exchanges {
+        [] => None,
+        [partner] => Some(reason.waiting_text(&format!("QSO with {partner} in progress"))),
+        many => Some(reason.waiting_text(&format!("{} QSOs in progress", many.len()))),
+    }
+}
+
 /// What `execute_band_hop` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BandHopOutcome {
-    /// The dial moved and `SetFrequency` went to Hamlib.
+    /// The dial moved and `SetFrequency` was enqueued for Hamlib (or no
+    /// Hamlib route exists, as in `--replay`).
     Moved { previous_hz: u64, dial_hz: u64 },
     /// Nothing was sent; the text says why (Diagnostics overlay line).
     Waiting(String),
@@ -137,29 +151,26 @@ pub(crate) enum BandHopOutcome {
 
 /// Carry out an operator `ChangeBand` (PAN-385, PAN-287 style). Waits,
 /// sending nothing, while a partner has answered (`exchanges`) or while the
-/// rig is keyed (rechecked under `ptt_sync_gate`). Otherwise, under the gate,
+/// rig is keyed (rechecked under `ptt_sync_gate`). The gate is only tried,
+/// never awaited: a held gate means a key-down is under way, so the hop
+/// waits for the next slot, which reads a fresh exchange snapshot, instead of
+/// acting on this one after an unbounded wait. Otherwise, under the gate,
 /// stores the dial, stamps the C9 anchor, tears down QSOs and clears split on
 /// a band change, then sends `SetFrequency`, and reports why in one
-/// Diagnostics line. Never locks the autonomous operator, so it is safe
-/// under `ptt_sync_gate`.
+/// Diagnostics line. A `SetFrequency` the registered Hamlib route refuses
+/// (full or disconnected) restores the dial and C9 anchor and waits; the
+/// teardown and split clear already sent are not undone (as in
+/// `spot_call::qsy_send`). With no Hamlib route the hop counts as moved, as
+/// before. Never locks the autonomous operator, so it is safe under
+/// `ptt_sync_gate`.
 pub(crate) async fn execute_band_hop(
     ctx: &BandHopCtx,
     dial_frequency: u64,
     reason: &pancetta_qso::BandHopReason,
     exchanges: &[String],
 ) -> BandHopOutcome {
-    match exchanges {
-        [] => {}
-        [partner] => {
-            return BandHopOutcome::Waiting(
-                reason.waiting_text(&format!("QSO with {partner} in progress")),
-            );
-        }
-        many => {
-            return BandHopOutcome::Waiting(
-                reason.waiting_text(&format!("{} QSOs in progress", many.len())),
-            );
-        }
+    if let Some(text) = exchange_waiting_text(reason, exchanges) {
+        return BandHopOutcome::Waiting(text);
     }
     // FT4-mode dial override: the band-hop config carries FT8 dials. In FT4
     // mode, resolve the hopped band and substitute its FT4 sub-band
@@ -185,8 +196,10 @@ pub(crate) async fn execute_band_hop(
     let old_freq_hz = {
         // PAN-287: every key-down passes `ptt_sync_gate` before its PTT-on
         // enqueue, so a keyed recheck and the retune under the gate cannot
-        // interleave with a key-down.
-        let _gate = ctx.ptt_sync_gate.lock().await;
+        // interleave with a key-down. A held gate is a key-down under way.
+        let Ok(_gate) = ctx.ptt_sync_gate.try_lock() else {
+            return BandHopOutcome::Waiting(reason.waiting_text("rig is keyed"));
+        };
         if super::spot_call::rig_is_keyed(&ctx.ptt_active, bus) {
             return BandHopOutcome::Waiting(reason.waiting_text("rig is keyed"));
         }
@@ -199,9 +212,11 @@ pub(crate) async fn execute_band_hop(
         let old_freq_hz = ctx.operating_frequency_hz.load(Ordering::Relaxed);
         ctx.operating_frequency_hz
             .store(dial_frequency, Ordering::Relaxed);
-        if let Ok(mut anchor) = ctx.last_freq_command.lock() {
-            *anchor = Some((dial_frequency, Instant::now()));
-        }
+        let previous_anchor = if let Ok(mut anchor) = ctx.last_freq_command.lock() {
+            anchor.replace((dial_frequency, Instant::now()))
+        } else {
+            None
+        };
         if super::is_band_change(old_freq_hz, dial_frequency) {
             info!(
                 target: "operator.override",
@@ -257,8 +272,27 @@ pub(crate) async fn execute_band_hop(
             }),
             Instant::now(),
         );
-        if let Err(e) = bus.send_message(msg).await {
+        let delivered = bus.send_message_checked(msg).await.unwrap_or_else(|e| {
             warn!("Failed to send ChangeBand: {}", e);
+            false
+        });
+        if !delivered && bus.has_rig_route() {
+            // Only undo our own store: a dial the Hamlib poll read in the
+            // meantime stays.
+            let _ = ctx.operating_frequency_hz.compare_exchange(
+                dial_frequency,
+                old_freq_hz,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            if let Ok(mut anchor) = ctx.last_freq_command.lock() {
+                *anchor = previous_anchor;
+            }
+            warn!(
+                "Autonomous band hop to {} Hz: SetFrequency was not delivered to Hamlib",
+                dial_frequency
+            );
+            return BandHopOutcome::Waiting(reason.waiting_text("rig command was not delivered"));
         }
         old_freq_hz
     };

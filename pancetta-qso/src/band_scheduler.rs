@@ -45,7 +45,8 @@ pub struct BandOpportunity {
 pub struct OpportunitySnapshot {
     /// When the underlying spots were fetched.
     pub as_of: DateTime<Utc>,
-    /// One entry per candidate band (zero counts included).
+    /// One entry per candidate band whose needed set has loaded (zero
+    /// counts included); a band with no entry has unknown counts.
     pub bands: Vec<BandOpportunity>,
 }
 
@@ -61,6 +62,12 @@ impl OpportunitySnapshot {
                 needed_entities: 0,
                 atno_entities: 0,
             })
+    }
+
+    /// Counts for `band`, `None` when the snapshot has no entry for it (its
+    /// needed set has not loaded, or it is not a candidate).
+    pub fn get(&self, band: Band) -> Option<BandOpportunity> {
+        self.bands.iter().find(|o| o.band == band).copied()
     }
 
     /// True when the snapshot is no older than [`OPPORTUNITY_MAX_AGE_SECS`].
@@ -238,6 +245,10 @@ pub struct BandScheduler {
     last_window: Option<Option<usize>>,
     /// Plan window whose entry still owes a move.
     pending_plan: Option<usize>,
+    /// The last window entry was judged before any live dial was seen, so
+    /// against the configured fallback band: judge it again against the
+    /// first live dial.
+    plan_entry_unconfirmed: bool,
     /// Band of the last non-zero live dial observed.
     live_band: Option<Band>,
     /// Destination of the last hop emitted while the live dial was unknown.
@@ -363,7 +374,10 @@ impl BandScheduler {
 
     /// Track plan-window entry (edge-triggered, including the first
     /// evaluation) and return the active window index and the window that
-    /// still owes a move.
+    /// still owes a move. An entry judged before any live dial was seen is
+    /// judged again once, against the first live dial, so a configured
+    /// fallback band that happens to be in the window cannot consume the
+    /// entry for a rig that is really on another band.
     pub fn update_plan(
         &mut self,
         plan: &[BandPlanEntry],
@@ -375,10 +389,16 @@ impl BandScheduler {
         let in_window = |i: usize| current.is_some_and(|b| plan[i].bands.contains(&b));
         if self.last_window != Some(active) {
             self.last_window = Some(active);
+            self.plan_entry_unconfirmed = self.live_band.is_none();
             self.pending_plan = match active {
                 Some(i) if !in_window(i) => Some(i),
                 _ => None,
             };
+        } else if self.plan_entry_unconfirmed && self.live_band.is_some() {
+            self.plan_entry_unconfirmed = false;
+            if let Some(i) = active.filter(|&i| !in_window(i)) {
+                self.pending_plan = Some(i);
+            }
         }
         if let Some(i) = self.pending_plan {
             if active != Some(i) || in_window(i) {

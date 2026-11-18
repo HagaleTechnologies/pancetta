@@ -68,6 +68,22 @@ fn count_needed_by_band_counts_fresh_distinct_digital_entities() {
     );
 }
 
+#[test]
+fn count_needed_by_band_omits_a_band_whose_needed_set_has_not_loaded() {
+    // 20m's needed fetch failed: its counts are unknown, not zero, so the
+    // scheduler cannot read a tie as "0 on 20m".
+    let fresh = NOW - 30;
+    let groups = vec![
+        group("A1A", "17m", "FT8", 1, fresh),
+        group("A2A", "17m", "FT8", 2, fresh),
+        group("A5A", "20m", "FT8", 5, fresh),
+        group("A6A", "20m", "FT8", 6, fresh),
+    ];
+    let needed = HashMap::from([(Band::Band17m, HashMap::from([(1, false), (2, false)]))]);
+    let got = count_needed_by_band(&groups, &needed, &[Band::Band20m, Band::Band17m], NOW);
+    assert_eq!(got, vec![counts(Band::Band17m, 2, 0)]);
+}
+
 fn spot_json(call: &str, band: &str, mode: &str, dxcc: u32, last_seen: i64) -> serde_json::Value {
     serde_json::json!({
         "dxCall": call,

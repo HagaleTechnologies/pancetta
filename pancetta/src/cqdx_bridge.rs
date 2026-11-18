@@ -87,7 +87,9 @@ const OPPORTUNITY_NEEDED_REFRESH: Duration = Duration::from_secs(600);
 /// (case-insensitive), its band text names a candidate (case-insensitive),
 /// its `last_seen` is within [`OPPORTUNITY_WINDOW_SECS`] of `now_unix`, and
 /// its `dx_dxcc` is in that band's needed map (entity id -> ATNO flag).
-/// Returns one entry per candidate, in candidate order, zero counts included.
+/// Returns one entry per candidate whose needed set has loaded, in candidate
+/// order, zero counts included. A candidate with no loaded set is omitted, so
+/// its counts read as unknown rather than zero.
 pub(crate) fn count_needed_by_band(
     groups: &[SpotGroup],
     needed: &HashMap<Band, HashMap<u32, bool>>,
@@ -115,6 +117,7 @@ pub(crate) fn count_needed_by_band(
     }
     candidates
         .iter()
+        .filter(|band| needed.contains_key(band))
         .map(|&band| {
             let ids = seen.get(&band);
             let needed_entities = ids.map_or(0, HashSet::len);
@@ -782,13 +785,26 @@ impl CqdxBridge {
                 let refresh_due = last_needed_refresh.is_none_or(|t| {
                     Instant::now().saturating_duration_since(t) >= OPPORTUNITY_NEEDED_REFRESH
                 });
-                if refresh_due {
+                // A band whose needed set has never loaded is retried every
+                // poll until it loads; until then the snapshot has no entry
+                // for it (unknown, never zero).
+                let missing: Vec<Band> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|band| !needed.contains_key(band))
+                    .collect();
+                if refresh_due || !missing.is_empty() {
+                    let to_fetch = if refresh_due {
+                        candidates.clone()
+                    } else {
+                        missing
+                    };
                     // Stamp the refresh only once a pass loads something, so
                     // an all-failed pass retries on the next poll instead of
                     // publishing all-zero snapshots for ten minutes.
                     let mut any_loaded = false;
                     let mut server_unreachable = false;
-                    for band in &candidates {
+                    for band in &to_fetch {
                         match client.fetch_needed(Some(band.name())).await {
                             Ok(rows) => {
                                 any_loaded = true;
@@ -827,7 +843,7 @@ impl CqdxBridge {
                     if bridge.pending().blocked || (server_unreachable && !any_loaded) {
                         continue;
                     }
-                    if any_loaded {
+                    if refresh_due && any_loaded {
                         last_needed_refresh = Some(Instant::now());
                     }
                 }
