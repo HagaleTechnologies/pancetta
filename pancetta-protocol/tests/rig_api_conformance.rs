@@ -271,7 +271,7 @@ fn branches<'a>(
         .iter()
         .enumerate()
     {
-        let branch =
+        let (_, branch) =
             resolve(s, member).map_err(|error| format!("{family}/oneOf/{position}: {error}"))?;
         let properties = branch.get("properties").and_then(Value::as_object);
         let tag = properties
@@ -363,18 +363,22 @@ fn check_schema(
     }
     Ok(())
 }
-fn resolve<'a>(root: &'a Value, mut node: &'a Value) -> Result<&'a Value, String> {
+fn resolve<'a>(
+    root: &'a Value,
+    mut node: &'a Value,
+) -> Result<(Option<&'a str>, &'a Value), String> {
     let mut seen = BTreeSet::new();
+    let mut location = None;
     while let Some(reference) = node.get("$ref").and_then(Value::as_str) {
         if !seen.insert(reference) {
             return Err(format!("cyclic reference {reference:?}"));
         }
-        node = reference
-            .strip_prefix('#')
+        location = reference.strip_prefix('#');
+        node = location
             .and_then(|pointer| root.pointer(pointer))
             .ok_or_else(|| format!("unresolved local JSON Pointer {reference:?}"))?;
     }
-    Ok(node)
+    Ok((location, node))
 }
 // Values at the same schema location share a property set, including array items.
 // Keep each instance path for per-object required-field diagnostics.
@@ -388,7 +392,7 @@ fn compare_shape(
         return;
     };
     let node = match resolve(root, node) {
-        Ok(node) => node,
+        Ok((_, node)) => node,
         Err(error) => {
             errors.push(format!("{path}: {error}"));
             return;
@@ -559,9 +563,24 @@ fn handshake_frames_conform_and_round_trip() {
     schemas.validate(&v, server).unwrap();
     assert_eq!(serde_json::from_value::<ServerFrame>(v).unwrap(), frame);
 }
+fn branch_mut<'a>(s: &'a mut Value, family: &str, index: usize) -> &'a mut Value {
+    let member = format!("/$defs/{family}/oneOf/{index}");
+    let (location, _) = resolve(s, s.pointer(&member).unwrap()).unwrap();
+    let target = location.map(str::to_owned).unwrap_or(member);
+    s.pointer_mut(&target).unwrap()
+}
+
+fn reference_union_member(s: &mut Value, family: &str, key: &str, tag: &str) {
+    let (index, _) = branches(s, family, key).unwrap()[tag];
+    let member = &mut s["$defs"][family]["oneOf"][index];
+    let definition = std::mem::replace(member, json!({"$ref": "#/$defs/driftTestAlias"}));
+    s["$defs"]["driftTestAlias"] = json!({"$ref": "#/$defs/driftTestDefinition"});
+    s["$defs"]["driftTestDefinition"] = definition;
+}
+
 fn rename(s: &mut Value, family: &str, key: &str, tag: &str, old: &str, new: &str, required: bool) {
     let (index, _) = branches(s, family, key).unwrap()[tag];
-    let b = &mut s["$defs"][family]["oneOf"][index];
+    let b = branch_mut(s, family, index);
     let props = b["properties"].as_object_mut().unwrap();
     let value = props.remove(old).unwrap();
     props.insert(new.into(), value);
@@ -576,6 +595,7 @@ fn rename(s: &mut Value, family: &str, key: &str, tag: &str, old: &str, new: &st
 #[test]
 fn required_field_rename_reports_variant_and_fields() {
     let mut s = schema();
+    reference_union_member(&mut s, "serverEvent", "event", "frequency");
     check_schema(&s, "serverEvent", "event", &event_samples()).unwrap();
     rename(
         &mut s,
@@ -594,8 +614,9 @@ fn required_field_rename_reports_variant_and_fields() {
 #[test]
 fn optional_field_rename_reports_variant_and_fields() {
     let mut s = schema();
+    reference_union_member(&mut s, "clientCommand", "cmd", "callStation");
     check_schema(&s, "clientCommand", "cmd", &command_samples()).unwrap();
-    let (_, branch) = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
+    let (index, branch) = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
     assert!(!branch["required"]
         .as_array()
         .unwrap()
@@ -609,10 +630,7 @@ fn optional_field_rename_reports_variant_and_fields() {
         "slotParity",
         false,
     );
-    let (index, _) = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
-    let branch = s
-        .pointer_mut(&format!("/$defs/clientCommand/oneOf/{index}"))
-        .unwrap();
+    let branch = branch_mut(&mut s, "clientCommand", index);
     branch["additionalProperties"] = json!(true);
     let id = s["$id"].as_str().unwrap();
     let mut compiler = Compiler::new();
@@ -640,12 +658,11 @@ fn optional_field_rename_reports_variant_and_fields() {
 #[test]
 fn renamed_discriminator_reports_tag_drift() {
     let mut s = schema();
+    reference_union_member(&mut s, "serverEvent", "event", "frequency");
     check_schema(&s, "serverEvent", "event", &event_samples()).unwrap();
     let (index, _) = branches(&s, "serverEvent", "event").unwrap()["frequency"];
-    let b = s
-        .pointer_mut(&format!(
-            "/$defs/serverEvent/oneOf/{index}/properties/event/const"
-        ))
+    let b = branch_mut(&mut s, "serverEvent", index)
+        .pointer_mut("/properties/event/const")
         .unwrap();
     assert_eq!(b, "frequency");
     *b = json!("dialFrequency");
@@ -689,11 +706,7 @@ fn nested_event_samples_cover_both_parities_and_null() {
 #[test]
 fn union_members_can_use_local_references() {
     let mut s = schema();
-    let (index, _) = branches(&s, "serverEvent", "event").unwrap()["frequency"];
-    let member = &mut s["$defs"]["serverEvent"]["oneOf"][index];
-    let frequency = std::mem::replace(member, json!({"$ref": "#/$defs/frequencyEvent"}));
-    s["$defs"]["frequencyEvent"] = json!({"$ref": "#/$defs/frequencyDefinition"});
-    s["$defs"]["frequencyDefinition"] = frequency;
+    reference_union_member(&mut s, "serverEvent", "event", "frequency");
     check_schema(&s, "serverEvent", "event", &event_samples()).unwrap();
 }
 
