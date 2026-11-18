@@ -10,6 +10,7 @@
 > `project_symptom_c_multi_tx_deferred` in the assistant's memory (historical) or
 > `docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md` for the fix. For anything else, trust the newer
 > review; this file is kept for historical context only.
+> The state machine's code is in `pancetta-qso/src/qso_manager/transition.rs` (transitions) and `pancetta-qso/src/qso_manager/relevance.rs` (decode routing); see `docs/DECISIONS/qso-engine.md` § PAN-375 for the full map.
 
 A deep pass over pancetta's autonomous QSO handling: (A) state-machine correctness for
 happy-path and edge-case QSOs, and (B) the TX-timing "jank" the operator observes

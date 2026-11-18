@@ -193,8 +193,9 @@ pub(crate) fn overdrive_alert(max_alc: f32) -> String {
 /// The Shift+D and headless log detail.
 pub(crate) fn overdrive_detail(readings: [f32; 2], max_alc: f32) -> String {
     format!(
-        "ALC read {:.2} then {:.2} while transmitting, above max_alc {:.2}. Reduce audio drive: \
-         lower the computer's sound-card output level or the rig's USB/DATA input level until \
+        "ALC read {:.2} then {:.2} while transmitting, above max_alc {:.2}. \
+         Press F7 to reduce TX audio drive by 1 dB for the next transmission. \
+         If needed, lower the computer's sound-card output level or the rig's USB/DATA input level until \
          ALC stays at or below the limit. TX continues. Set [rig.power_control.protection] \
          alc_overdrive_warning = false to silence this warning",
         readings[0], readings[1], max_alc
@@ -398,9 +399,10 @@ mod tests {
         );
         assert_eq!(
             overdrive_detail([0.81, 0.84], 0.5),
-            "ALC read 0.81 then 0.84 while transmitting, above max_alc 0.50. Reduce audio \
-             drive: lower the computer's sound-card output level or the rig's USB/DATA input \
-             level until ALC stays at or below the limit. TX continues. Set \
+            "ALC read 0.81 then 0.84 while transmitting, above max_alc 0.50. Press F7 to \
+             reduce TX audio drive by 1 dB for the next transmission. If needed, lower the \
+             computer's sound-card output level or the rig's USB/DATA input level until ALC \
+             stays at or below the limit. TX continues. Set \
              [rig.power_control.protection] alc_overdrive_warning = false to silence this \
              warning"
         );

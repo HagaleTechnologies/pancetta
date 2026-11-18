@@ -57,6 +57,7 @@ mod swr_guard;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_drive;
 mod tx_halt;
 mod tx_log;
 mod tx_meter;
@@ -1371,6 +1372,8 @@ pub struct ApplicationCoordinator {
     /// this path is absolute but symlinks are not resolved until each TUI
     /// write runs, so a repointed link sends saves to its current target.
     pub(crate) config_path: PathBuf,
+    pub(crate) tx_drive: Arc<tx_drive::TxDrive>,
+    pub(crate) tx_drive_config_path: PathBuf,
 
     /// PAN-62 review round 2 (Codex P1): whether `config_path` is TOML
     /// (the targeted setters `SelectDevice`/`SelectRig`/`SaveRigBookmark`/
@@ -2209,6 +2212,11 @@ fn degradation_message(id: ComponentId) -> &'static str {
 }
 
 impl ApplicationCoordinator {
+    /// Select the config source that receives live TX drive updates.
+    pub fn set_tx_drive_config_path(&mut self, path: PathBuf) {
+        self.tx_drive_config_path = path;
+    }
+
     /// Create a new application coordinator
     // rationale: the coordinator constructor takes many independent dependencies;
     // a builder/params struct would relocate the same fields without simplifying.
@@ -2234,6 +2242,7 @@ impl ApplicationCoordinator {
         info!("Initializing Application Coordinator");
 
         let id = uuid::Uuid::new_v4();
+        let tx_drive = Arc::new(tx_drive::TxDrive::from_config(&config));
         let startup_time = Instant::now();
 
         // Create message bus with high-performance configuration
@@ -2545,7 +2554,9 @@ impl ApplicationCoordinator {
             headless,
             wav_path,
             replay_path,
+            tx_drive_config_path: config_path.clone(),
             config_path,
+            tx_drive,
             config_write_is_toml,
             pancetta_home_override: pancetta_home,
             // PAN-270: the coordinator-owned session record (canonical from
