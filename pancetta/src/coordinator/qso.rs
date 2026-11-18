@@ -4051,12 +4051,6 @@ impl super::ApplicationCoordinator {
             }));
         }
 
-<<<<<<< HEAD
-        // PAN-382: queue completions before publishing the manager. The
-        // emitter starts after local log setup, which can await disk I/O.
-        let n1mm_subscription =
-            n1mm_destination.map(|destination| (destination, qso_manager.subscribe()));
-=======
         // The local logbook and upload receivers are taken before the manager
         // is published below. Both consumers start inside the spawned task,
         // the upload subscriber only after the startup index rebuild and
@@ -4066,7 +4060,11 @@ impl super::ApplicationCoordinator {
         // ADIF receiver.
         let adif_events = (!replay_mode).then(|| qso_manager.subscribe());
         let upload_events = upload_enabled.then(|| qso_manager.subscribe());
->>>>>>> 8d3e262b01cb3c95e540b2e0b19aaa8a7ef97bee
+
+        // PAN-382: queue completions before publishing the manager. The
+        // emitter starts after local log setup, which can await disk I/O.
+        let n1mm_subscription =
+            n1mm_destination.map(|destination| (destination, qso_manager.subscribe()));
 
         // PAN-72 critical-finding fix: also publish the fresh handle onto
         // the watch channel so the (not respawned on a Qso-only restart)
