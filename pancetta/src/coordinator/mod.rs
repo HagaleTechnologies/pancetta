@@ -1675,8 +1675,8 @@ pub struct ApplicationCoordinator {
     pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
 
     /// Test handshake after waveform construction, immediately before the gate wait.
-    #[cfg(test)]
-    tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) tx_before_ptt_gate: Arc<tokio::sync::Notify>,
 
     /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
     /// and the key-down when armed.
@@ -2624,7 +2624,7 @@ impl ApplicationCoordinator {
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
             tx_frame_log: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-harness"))]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),

@@ -32,10 +32,15 @@ Drop requests shutdown as a failure-path backstop.
 
 To check supersede sensitivity, first run
 `supersede_during_playback_unkeys_before_rekey` alone. Back up
-`pancetta/src/coordinator/tx.rs` outside the checkout. Within
+`pancetta/src/coordinator/tx/supersede.rs` outside the checkout. Within
 `supersede_and_rekey_or_bundle` only, replace
 `ptt_guard.release("Supersede").await;` with `ptt_guard.disarm();`.
 Run that same test and require failure at the PTT sequence assertion, showing
 the missing middle off edge. Restore the source and require the test to pass
 again, then repeat the restored test three times. Never retain the mutation or
 re-bless the abort golden.
+
+The final gate scenarios inject a shared UTC clock into the worker and playback
+acknowledgment. They hold `ptt_sync_gate` until the worker signals that Step 4b
+has completed, then advance UTC to the key-time boundary or record a fresh DX
+sighting. This keeps the tested check at the actual pre-PTT gate.
