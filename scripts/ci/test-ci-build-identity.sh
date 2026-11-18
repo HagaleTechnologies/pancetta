@@ -20,9 +20,11 @@ check "pancetta 0.9.6 ($sha 2026-11-18 aarch64-unknown-linux-gnu)" fail
 check 'pancetta 0.9.6' fail
 check "pancetta 0.9.6 ($sha 2026-11-18 x86_64-unknown-linux-gnu)
 extra" fail
-ruby -ryaml -e '
+# Quoted heredoc: the Ruby program matches the literal text "$BIN" and "${{ matrix.target }}".
+ruby -ryaml - <<'RUBY'
+# encoding: utf-8
 r=YAML.load_file(".github/workflows/release.yml"); steps=r.fetch("jobs").values.flat_map { |j| j.fetch("steps",[]) }; names=steps.map { |s| s["name"] }; i=names.index("Smoke test — binary names its commit and target (PAN-377)"); abort "missing release gate" unless i && names.index("Build release binary") < i && i < names.index("Package"); s=steps[i]; abort "wrong release gate" unless s["shell"]=="bash" && s["run"].include?(%q{bash scripts/check-build-identity.sh "$BIN" "${{ matrix.target }}"}) && s["run"].include?(%q{BIN="target/${{ matrix.target }}/release/pancetta"})
-'
+RUBY
 ruby -ryaml -e '
 r=YAML.load_file(".github/workflows/ci.yml"); steps=r.fetch("jobs").fetch("workspace-tests").fetch("steps"); i=steps.index { |s| s["name"]=="Install zsh (PAN-377 completion check)" }; j=steps.index { |s| s["name"]=="Test workspace partition" }; abort "missing zsh check" unless i && j && i<j && steps[i]["run"].include?("zsh") && steps[j].fetch("env",{})["PANCETTA_REQUIRE_ZSH"]=="1"
 '

@@ -23,8 +23,16 @@ pub(crate) fn write_script(out: &mut impl Write, script: &str) -> io::Result<()>
 fn first_sentence(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let bytes = collapsed.as_bytes();
+    // A `.` that closes a dotted abbreviation (`.`, one letter, `.`, as in `e.g.`) ends no sentence.
+    let abbreviation =
+        |i: usize| i >= 2 && bytes[i - 2] == b'.' && bytes[i - 1].is_ascii_alphabetic();
     let cut = (0..bytes.len().saturating_sub(2))
-        .find(|&i| bytes[i] == b'.' && bytes[i + 1] == b' ' && bytes[i + 2].is_ascii_uppercase())
+        .find(|&i| {
+            bytes[i] == b'.'
+                && bytes[i + 1] == b' '
+                && bytes[i + 2].is_ascii_uppercase()
+                && !abbreviation(i)
+        })
         .unwrap_or(bytes.len());
     collapsed[..cut].trim_end_matches('.').to_owned()
 }
@@ -220,9 +228,9 @@ fn zsh(mut cmd: Command) -> String {
     cmd.build();
     let bin = cmd.get_bin_name().unwrap_or(cmd.get_name()).to_owned();
     let mut out = format!("#compdef {bin}\n\nautoload -U is-at-least\n\n_{}() {{\n    typeset -A opt_args\n    typeset -a _arguments_options\n    local ret=1\n\n    if is-at-least 5.2; then\n        _arguments_options=(-s -S -C)\n    else\n        _arguments_options=(-s -C)\n    fi\n\n    local context curcontext=\"$curcontext\" state line\n", bin.replace('-', "_"));
-    command_block(&cmd, &[bin.clone()], &mut out);
+    command_block(&cmd, std::slice::from_ref(&bin), &mut out);
     out.push_str("}\n\n");
-    describe_functions(&cmd, &[bin.clone()], &mut out);
+    describe_functions(&cmd, std::slice::from_ref(&bin), &mut out);
     out.push_str(&format!("\nif [ \"$funcstack[1]\" = \"_{}\" ]; then\n    _{} \"$@\"\nelse\n    compdef _{} {}\nfi\n", bin, bin, bin, bin));
     out
 }

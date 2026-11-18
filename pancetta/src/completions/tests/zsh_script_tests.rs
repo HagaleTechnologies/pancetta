@@ -50,6 +50,18 @@ fn descriptions_are_one_escaped_sentence() {
             .as_str()
     ));
     assert!(s.contains("Measure receive gain for 1..3600 seconds (600 when omitted)"));
+    // A dotted abbreviation before a capital is not a sentence end.
+    assert_eq!(
+        first_sentence("Only QSOs in this mode, e.g. FT8 (MODE or SUBMODE, ignoring case)"),
+        "Only QSOs in this mode, e.g. FT8 (MODE or SUBMODE, ignoring case)"
+    );
+    assert_eq!(
+        first_sentence("Pick one, i.e. FT8. Then stop"),
+        "Pick one, i.e. FT8"
+    );
+    assert!(s.contains(
+        "'--mode=[Only QSOs in this mode, e.g. FT8 (MODE or SUBMODE, ignoring case)]:MODE:'"
+    ));
     assert!(
         s.contains("--since=[Only export QSOs on or after this date]:YYYY-MM-DD:")
             || s.contains(":YYYY-MM-DD:")
