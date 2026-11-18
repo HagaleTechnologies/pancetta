@@ -300,6 +300,15 @@ fn append_theme_warning(config: &Config, warnings: &mut Vec<String>) {
     }
 }
 
+/// Push the PAN-385 warning for a `[[autonomous.band_plan]]` that cannot act
+/// because `autonomous.band_hopping.enabled` is off. Called beside
+/// [`append_theme_warning`] by every config loader that returns warnings.
+fn append_band_plan_warning(config: &Config, warnings: &mut Vec<String>) {
+    if let Some(warning) = config.autonomous.band_plan_warning() {
+        warnings.push(warning);
+    }
+}
+
 impl Config {
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
@@ -318,6 +327,7 @@ impl Config {
         let config = loader.load()?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
         Ok((config, warnings))
     }
 
@@ -330,6 +340,7 @@ impl Config {
         let config = loader.load_merged()?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
         let report = LoadReport {
             files: loader.loaded_files(),
             searched: loader.search_paths().to_vec(),
@@ -353,6 +364,7 @@ impl Config {
         let config = loader.load_from_file(path).map_err(wrap)?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
         let report = LoadReport {
             files: vec![path.to_path_buf()],
             searched: Vec::new(),
@@ -380,6 +392,7 @@ impl Config {
         let config = loader.load_from_file(path)?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
         Ok((config, warnings))
     }
 
@@ -2242,6 +2255,10 @@ mod merge_guard {
                 ("slot_parity", json!("even")),
                 ("unattended_policy", json!("respond_only")),
                 ("pounce_min_tier", json!("atno")),
+                (
+                    "band_plan",
+                    json!([{"utc": "00:00-06:00", "bands": ["40m", "80m"]}]),
+                ),
             ],
             |a, b| a.merge_with(b),
         );

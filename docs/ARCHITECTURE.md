@@ -111,6 +111,8 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `audio.rs` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
 | `autonomous.rs` | Autonomous operator component. |
+| `band_hop.rs` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
+| `band_hop/` | Autonomous band-hop config mapping and the gated hop executor (PAN-385). |
 | `clock_monitor.rs` | Live-session clock-skew monitor (PAN-114). |
 | `config_reload.rs` | Applying saved config edits: live security fields, restart list. |
 | `contest.rs` | Durable contest scoring refresh. |

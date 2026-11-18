@@ -5,11 +5,13 @@
 
 use crate::coordinator::upload_outbox::clip;
 use crate::priority_evaluator::{CachedStationLookup, NeedListAvailability};
+use pancetta_core::Band;
 use pancetta_cqdx::{
     frequency_to_band, rank_to_rarity, CqdxCache, CqdxClient, CqdxError, NeededEntity, QsoRecord,
-    SpotReport,
+    SpotGroup, SpotReport,
 };
-use std::collections::HashMap;
+use pancetta_qso::{BandOpportunity, OpportunitySnapshot};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,6 +77,61 @@ fn need_retry_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.saturating_duration_since(t) >= NEED_DATA_RETRY)
 }
 
+/// PAN-385: how recently a spot group must have been seen to count as
+/// activity on its band, and how often the per-band needed sets refresh.
+const OPPORTUNITY_WINDOW_SECS: i64 = 600;
+const OPPORTUNITY_NEEDED_REFRESH: Duration = Duration::from_secs(600);
+
+/// PAN-385 (decision 11): count, per candidate band, the distinct needed DXCC
+/// entities cqdx spots show there. A group counts when its mode is FT8 or FT4
+/// (case-insensitive), its band text names a candidate (case-insensitive),
+/// its `last_seen` is within [`OPPORTUNITY_WINDOW_SECS`] of `now_unix`, and
+/// its `dx_dxcc` is in that band's needed map (entity id -> ATNO flag).
+/// Returns one entry per candidate, in candidate order, zero counts included.
+pub(crate) fn count_needed_by_band(
+    groups: &[SpotGroup],
+    needed: &HashMap<Band, HashMap<u32, bool>>,
+    candidates: &[Band],
+    now_unix: i64,
+) -> Vec<BandOpportunity> {
+    let mut seen: HashMap<Band, HashSet<u32>> = HashMap::new();
+    for g in groups {
+        let digital = g.mode.eq_ignore_ascii_case("FT8") || g.mode.eq_ignore_ascii_case("FT4");
+        if !digital || now_unix.saturating_sub(g.last_seen) > OPPORTUNITY_WINDOW_SECS {
+            continue;
+        }
+        let Ok(band) = g.band.trim().to_lowercase().parse::<Band>() else {
+            continue;
+        };
+        if !candidates.contains(&band) {
+            continue;
+        }
+        if needed
+            .get(&band)
+            .is_some_and(|ids| ids.contains_key(&g.dx_dxcc))
+        {
+            seen.entry(band).or_default().insert(g.dx_dxcc);
+        }
+    }
+    candidates
+        .iter()
+        .map(|&band| {
+            let ids = seen.get(&band);
+            let needed_entities = ids.map_or(0, HashSet::len);
+            let atno_entities = ids.map_or(0, |ids| {
+                ids.iter()
+                    .filter(|id| needed.get(&band).and_then(|m| m.get(id)) == Some(&true))
+                    .count()
+            });
+            BandOpportunity {
+                band,
+                needed_entities: u32::try_from(needed_entities).unwrap_or(u32::MAX),
+                atno_entities: u32::try_from(atno_entities).unwrap_or(u32::MAX),
+            }
+        })
+        .collect()
+}
+
 /// PAN-93: which startup-dependent cqdx loads have not succeeded yet.
 #[derive(Debug, Clone, Copy)]
 struct PendingLoads {
@@ -129,6 +186,9 @@ pub struct CqdxBridge {
     /// PAN-93: loads still owed after a failed or partial start, retried by
     /// the spot poller. Never held across an await.
     pending: std::sync::Mutex<PendingLoads>,
+    /// PAN-385: the latest all-band needed-activity snapshot written by the
+    /// opportunity poller (`None` until its first successful spots fetch).
+    opportunities: Arc<RwLock<Option<OpportunitySnapshot>>>,
 }
 
 impl CqdxBridge {
@@ -172,7 +232,13 @@ impl CqdxBridge {
             current_band: Arc::new(RwLock::new(None)),
             operating_frequency_hz: None,
             pending: std::sync::Mutex::new(PendingLoads::default()),
+            opportunities: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// PAN-385: the latest all-band needed-activity snapshot, if any.
+    pub async fn band_opportunities(&self) -> Option<OpportunitySnapshot> {
+        self.opportunities.read().await.clone()
     }
 
     /// Attach the coordinator's shared dial-frequency atomic so the spot
@@ -641,6 +707,156 @@ impl CqdxBridge {
         })
     }
 
+    /// PAN-385 (decision 11): spawn the all-band needed-activity poll that
+    /// feeds the band hopper's needed trigger.
+    ///
+    /// Every `poll_interval` it fetches live spots for every band and mode
+    /// (`fetch_live_spots(None, None)`) and, after each successful fetch,
+    /// writes an [`OpportunitySnapshot`] counted by [`count_needed_by_band`].
+    /// Every [`OPPORTUNITY_NEEDED_REFRESH`] it re-fetches each candidate
+    /// band's needed set (lowercase band name, per the API contract), keeping
+    /// a band's previous set when its fetch fails. It shares the live-spot
+    /// poll's gates: nothing is requested once a permanent error has blocked
+    /// the session, nor before the DXCC need list has loaded, nor while the
+    /// 2-hour no-decode watchdog has paused polling. A permanent error from
+    /// either request blocks the session the way the spot poll does.
+    ///
+    /// It never writes the callsign-keyed maps on [`CachedStationLookup`]
+    /// (rarity, notable, network SNR, network last-seen) nor the cache's
+    /// spot groups: those stay scoped to the dial band by the spot poll.
+    pub fn spawn_opportunity_poller(
+        self: &Arc<Self>,
+        shutdown: Arc<AtomicBool>,
+        last_decode: Arc<AtomicU64>,
+        candidates: Vec<Band>,
+    ) -> tokio::task::JoinHandle<()> {
+        let bridge = Arc::clone(self);
+        let client = self.client.clone();
+        let cached_lookup = self.cached_lookup.clone();
+        let opportunities = self.opportunities.clone();
+        let interval = self.poll_interval;
+        let watchdog_timeout = std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            let mut polling_paused = false;
+            let mut needed: HashMap<Band, HashMap<u32, bool>> = HashMap::new();
+            let mut last_needed_refresh: Option<Instant> = None;
+
+            loop {
+                timer.tick().await;
+
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+
+                // Same gates as the live-spot poll: a permanent error stops
+                // every request until restart, and nothing is counted before
+                // the needed-entity list has loaded.
+                if bridge.pending().blocked
+                    || !matches!(
+                        cached_lookup.dxcc_need_list(),
+                        NeedListAvailability::Loaded { .. }
+                    )
+                {
+                    continue;
+                }
+
+                // Watchdog: pause with the spot poll after 2 h without a
+                // decode (epoch ms; 0 = never decoded yet).
+                let last_ms = last_decode.load(Ordering::Relaxed);
+                if last_ms != 0 {
+                    let elapsed_ms = crate::coordinator::now_epoch_ms().saturating_sub(last_ms);
+                    if elapsed_ms > watchdog_timeout.as_millis() as u64 {
+                        if !polling_paused {
+                            info!("cqdx.io opportunity poll: no decode activity for 2h, pausing");
+                            polling_paused = true;
+                        }
+                        continue;
+                    } else if polling_paused {
+                        info!("cqdx.io opportunity poll: decode activity resumed");
+                        polling_paused = false;
+                    }
+                }
+
+                let refresh_due = last_needed_refresh.is_none_or(|t| {
+                    Instant::now().saturating_duration_since(t) >= OPPORTUNITY_NEEDED_REFRESH
+                });
+                if refresh_due {
+                    // Stamp the refresh only once a pass loads something, so
+                    // an all-failed pass retries on the next poll instead of
+                    // publishing all-zero snapshots for ten minutes.
+                    let mut any_loaded = false;
+                    let mut server_unreachable = false;
+                    for band in &candidates {
+                        match client.fetch_needed(Some(band.name())).await {
+                            Ok(rows) => {
+                                any_loaded = true;
+                                needed.insert(
+                                    *band,
+                                    rows.iter().map(|r| (r.entity_id, r.atno)).collect(),
+                                );
+                            }
+                            Err(e) if !retry_can_help(&e) => {
+                                warn!(
+                                    "cqdx.io needed fetch for {} failed permanently ({e}); \
+                                     stopping until restart",
+                                    band.name()
+                                );
+                                bridge.pending().blocked = true;
+                                break;
+                            }
+                            // A transport error ends the pass, as it does
+                            // for the PAN-93 loads (`stops_sequence`): the
+                            // next band would only wait out another timeout.
+                            Err(e @ CqdxError::Http(_)) => {
+                                debug!(
+                                    "cqdx.io needed fetch for {} failed ({e}); keeping prior \
+                                     sets until the next poll",
+                                    band.name()
+                                );
+                                server_unreachable = true;
+                                break;
+                            }
+                            Err(e) => debug!(
+                                "cqdx.io needed fetch for {} failed ({e}); keeping its prior set",
+                                band.name()
+                            ),
+                        }
+                    }
+                    if bridge.pending().blocked || (server_unreachable && !any_loaded) {
+                        continue;
+                    }
+                    if any_loaded {
+                        last_needed_refresh = Some(Instant::now());
+                    }
+                }
+
+                match client.fetch_live_spots(None, None).await {
+                    Ok(groups) => {
+                        let as_of = chrono::Utc::now();
+                        let bands =
+                            count_needed_by_band(&groups, &needed, &candidates, as_of.timestamp());
+                        debug!(
+                            "cqdx.io opportunity poll: {} spot groups, {:?}",
+                            groups.len(),
+                            bands
+                        );
+                        *opportunities.write().await = Some(OpportunitySnapshot { as_of, bands });
+                    }
+                    Err(e) if !retry_can_help(&e) => {
+                        warn!(
+                            "cqdx.io all-band spot poll failed permanently ({e}); \
+                             stopping until restart"
+                        );
+                        bridge.pending().blocked = true;
+                    }
+                    Err(e) => debug!("cqdx.io all-band spot poll failed: {e}"),
+                }
+            }
+        })
+    }
+
     /// Report a batch of spots to cqdx.io. Fire-and-forget (spawns a task).
     ///
     /// PAN-93: skipped once cqdx.io has rejected the token (or the config is
@@ -693,6 +909,10 @@ impl CqdxBridge {
         self.cache.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "cqdx_bridge/tests/opportunity_tests.rs"]
+mod opportunity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -800,9 +1020,9 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const TOKEN: &str = "pat_0123456789abcdef";
+    pub(super) const TOKEN: &str = "pat_0123456789abcdef";
 
-    fn cfg(base_url: &str, token: Option<&str>) -> pancetta_config::network::CqdxConfig {
+    pub(super) fn cfg(base_url: &str, token: Option<&str>) -> pancetta_config::network::CqdxConfig {
         pancetta_config::network::CqdxConfig {
             enabled: true,
             base_url: base_url.to_string(),
@@ -818,7 +1038,12 @@ mod tests {
         (Arc::new(bridge), lookup)
     }
 
-    async fn mount(server: &MockServer, route: &str, status: u16, body: serde_json::Value) {
+    pub(super) async fn mount(
+        server: &MockServer,
+        route: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) {
         Mock::given(method("GET"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(status).set_body_json(body))
