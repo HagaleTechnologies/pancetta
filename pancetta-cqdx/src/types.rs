@@ -239,12 +239,12 @@ pub struct QsoReportRequest {
 /// Outcome of a [`crate::CqdxClient::log_qso`] upload. A duplicate is a
 /// successful, non-fatal result (the QSO is already in the logbook) — the
 /// caller should treat it like `Logged`, not an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QsoUploadOutcome {
     /// The QSO was accepted and recorded in the cqdx.io logbook.
-    Logged,
+    Logged { remote_id: Option<String> },
     /// cqdx.io already had this QSO; nothing to do.
-    Duplicate,
+    Duplicate { remote_id: Option<String> },
 }
 
 /// View of the `POST /api/v1/qsos` 2xx response body, used to recognise a

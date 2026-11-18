@@ -157,3 +157,7 @@ PAN-300 verifies actual subprocess execution with fake tqsl, including optional 
 ### Export (PAN-299)
 
 `pancetta export` reads `qsos.adi` directly without opening the index or taking the writer lock. It converts records through `record_to_qso`, `adif_to_qso`, `qso_to_adif` and `qso_to_record`, preserving export-time entity enrichment and imported type indicators. Filters combine with AND: `--since` is an inclusive UTC date, `--band` matches BAND or falls back to FREQ, `--mode` matches MODE or SUBMODE, and `--callsign` matches a CALL substring. Text comparisons ignore case; unknown bands do not match. Unreadable records are reported and skipped. `--logbook` replaces `--database`; without `--output`, ADIF goes to standard output and status goes to standard error. Records keep logbook order.
+
+## cqdx upload receipts (PAN-378)
+
+The schema-1 upload outbox saves up to 100 accepted cqdx IDs in insertion order, separately from pending uploads. A repeated QSO UUID and destination replaces its earlier receipt; a response without a usable ID leaves the old receipt intact. The worker saves the receipt with the removal of the accepted pending entry. An older Pancetta build can read the additive `accepted` field but drops it when it next rewrites the queue, so downgrades lose these receipts.

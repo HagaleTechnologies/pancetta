@@ -12663,7 +12663,10 @@ mod cqdx_upload_tests {
             }
             async fn deliver(&self, destination: UploadDestination, payload: String) -> Delivery {
                 self.0.lock().unwrap().push((destination, payload));
-                Delivery::Accepted { duplicate: false }
+                Delivery::Accepted {
+                    duplicate: false,
+                    remote_id: None,
+                }
             }
         }
         for enabled in [false, true] {
@@ -12744,7 +12747,10 @@ mod cqdx_upload_tests {
                 vec![UploadDestination::QrzLogbook, UploadDestination::Cqdx]
             }
             async fn deliver(&self, _: UploadDestination, _: String) -> Delivery {
-                Delivery::Accepted { duplicate: false }
+                Delivery::Accepted {
+                    duplicate: false,
+                    remote_id: None,
+                }
             }
         }
         for closed in [false, true] {
@@ -14590,7 +14596,10 @@ mod replay_history_seed_tests {
             payload: String,
         ) -> super::super::upload_outbox::Delivery {
             self.0.lock().unwrap().push(payload);
-            super::super::upload_outbox::Delivery::Accepted { duplicate: false }
+            super::super::upload_outbox::Delivery::Accepted {
+                duplicate: false,
+                remote_id: None,
+            }
         }
     }
 

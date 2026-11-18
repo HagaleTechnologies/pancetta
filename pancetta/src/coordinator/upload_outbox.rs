@@ -52,7 +52,10 @@ pub(crate) const UPLOAD_TEXT_MAX_CHARS: usize = 160;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Delivery {
     /// The service took it (`duplicate`: it already had it).
-    Accepted { duplicate: bool },
+    Accepted {
+        duplicate: bool,
+        remote_id: Option<String>,
+    },
     /// The service refused it, or could not be reached.
     Failed {
         class: UploadFailureClass,
@@ -125,19 +128,24 @@ impl OutboxTransport for LogbookClients {
         match d {
             UploadDestination::ClubLog => match &self.clublog {
                 Some(c) => match c.upload_adif(&payload).await {
-                    Ok(()) => Delivery::Accepted { duplicate: false },
+                    Ok(()) => Delivery::Accepted {
+                        duplicate: false,
+                        remote_id: None,
+                    },
                     Err(e) => failed(&e),
                 },
                 None => missing(),
             },
             UploadDestination::QrzLogbook => match &self.qrz {
                 Some(c) => match c.upload_adif(&payload).await {
-                    Ok(pancetta_dx::QrzInsertOutcome::Inserted { .. }) => {
-                        Delivery::Accepted { duplicate: false }
-                    }
-                    Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => {
-                        Delivery::Accepted { duplicate: true }
-                    }
+                    Ok(pancetta_dx::QrzInsertOutcome::Inserted { .. }) => Delivery::Accepted {
+                        duplicate: false,
+                        remote_id: None,
+                    },
+                    Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => Delivery::Accepted {
+                        duplicate: true,
+                        remote_id: None,
+                    },
                     Err(e) => failed(&e),
                 },
                 None => missing(),
@@ -146,6 +154,7 @@ impl OutboxTransport for LogbookClients {
                 Some(c) => match c.upload_adif(&payload).await {
                     Ok(outcome) => Delivery::Accepted {
                         duplicate: outcome == pancetta_dx::QsoUploadOutcome::Duplicate,
+                        remote_id: None,
                     },
                     Err(e) => failed(&e),
                 },
@@ -153,12 +162,14 @@ impl OutboxTransport for LogbookClients {
             },
             UploadDestination::Eqsl => match &self.eqsl {
                 Some(c) => match c.upload_adif(&payload).await {
-                    Ok(pancetta_dx::QsoUploadOutcome::Logged) => {
-                        Delivery::Accepted { duplicate: false }
-                    }
-                    Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => {
-                        Delivery::Accepted { duplicate: true }
-                    }
+                    Ok(pancetta_dx::QsoUploadOutcome::Logged) => Delivery::Accepted {
+                        duplicate: false,
+                        remote_id: None,
+                    },
+                    Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => Delivery::Accepted {
+                        duplicate: true,
+                        remote_id: None,
+                    },
                     Err(e) => failed(&e),
                 },
                 None => missing(),
@@ -175,11 +186,17 @@ impl OutboxTransport for LogbookClients {
                         }
                     };
                     match c.log_qso(record).await {
-                        Ok(pancetta_cqdx::QsoUploadOutcome::Logged) => {
-                            Delivery::Accepted { duplicate: false }
+                        Ok(pancetta_cqdx::QsoUploadOutcome::Logged { remote_id }) => {
+                            Delivery::Accepted {
+                                duplicate: false,
+                                remote_id,
+                            }
                         }
-                        Ok(pancetta_cqdx::QsoUploadOutcome::Duplicate) => {
-                            Delivery::Accepted { duplicate: true }
+                        Ok(pancetta_cqdx::QsoUploadOutcome::Duplicate { remote_id }) => {
+                            Delivery::Accepted {
+                                duplicate: true,
+                                remote_id,
+                            }
                         }
                         Err(e) => Delivery::Failed {
                             class: classify_cqdx_error(&e),
@@ -896,7 +913,10 @@ impl<T: OutboxTransport> Worker<T> {
         let mut row: Option<(DiagnosticLevel, String)> = None;
         use pancetta_tui::upload_status::UploadState;
         match delivery {
-            Delivery::Accepted { duplicate } => {
+            Delivery::Accepted {
+                duplicate,
+                remote_id,
+            } => {
                 // PAN-344: explicit acceptance (duplicates included) is
                 // recorded BEFORE the queue entry is deleted, from the
                 // identity copied above.
@@ -911,7 +931,7 @@ impl<T: OutboxTransport> Worker<T> {
                         ""
                     },
                 );
-                store.delivered(id);
+                store.accept(id, remote_id, Utc::now());
                 let recovered = lane.delivered(now, self.timing.drain_spacing);
                 if duplicate {
                     info!(
@@ -1582,7 +1602,10 @@ mod tests {
                 .unwrap()
                 .get(&d)
                 .cloned()
-                .unwrap_or(Delivery::Accepted { duplicate: false })
+                .unwrap_or(Delivery::Accepted {
+                    duplicate: false,
+                    remote_id: None,
+                })
         }
     }
 
@@ -1606,7 +1629,10 @@ mod tests {
         }
     }
     fn ok() -> Delivery {
-        Delivery::Accepted { duplicate: false }
+        Delivery::Accepted {
+            duplicate: false,
+            remote_id: None,
+        }
     }
 
     const TIMING: OutboxTiming = OutboxTiming {
@@ -1703,7 +1729,13 @@ mod tests {
         use pancetta_tui::upload_status::{TargetUploadStatus, UploadState, UploadTarget};
         let dir = tempfile::tempdir().unwrap();
         let transport = FakeTransport::new(&[ClubLog, QrzLogbook, Eqsl])
-            .always(QrzLogbook, Delivery::Accepted { duplicate: true })
+            .always(
+                QrzLogbook,
+                Delivery::Accepted {
+                    duplicate: true,
+                    remote_id: None,
+                },
+            )
             .always(
                 ClubLog,
                 Delivery::Failed {
@@ -2250,10 +2282,13 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_counts_as_delivered() {
-        let rig = start(
-            FakeTransport::new(&[QrzLogbook])
-                .always(QrzLogbook, Delivery::Accepted { duplicate: true }),
-        );
+        let rig = start(FakeTransport::new(&[QrzLogbook]).always(
+            QrzLogbook,
+            Delivery::Accepted {
+                duplicate: true,
+                remote_id: None,
+            },
+        ));
         rig.handle.enqueue(vec![upload(QrzLogbook, "K1ABC")]).await;
         wait_until(|| rig.transport.calls_to(QrzLogbook) == 1).await;
         wait_until(|| rig.entries().is_empty()).await;
@@ -2915,6 +2950,67 @@ mod tests {
             .await;
         wait_until(|| *served.lock().unwrap() == 2).await;
         wait_until(|| OutboxStore::open(path.clone()).0.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn cqdx_acceptance_persists_remote_id() {
+        for duplicate in [false, true] {
+            for header in [Some("abc123"), None] {
+                let body = format!(r#"{{"duplicate":{duplicate}}}"#);
+                let header_line = header.map_or(String::new(), |id| format!("X-QSO-Id: {id}\r\n"));
+                let (addr, served) = serve_sequence(vec![format!(
+                    "HTTP/1.1 201 Created\r\n{header_line}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )]);
+                let client = pancetta_cqdx::CqdxClient::new(
+                    format!("http://{addr}"),
+                    "pat_0123456789abcdef".into(),
+                )
+                .unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(OUTBOX_FILE_NAME);
+                let qso_id = Uuid::new_v4();
+                let handle = start_upload_outbox(
+                    path.clone(),
+                    Arc::new(LogbookClients {
+                        lotw: None,
+                        clublog: None,
+                        qrz: None,
+                        eqsl: None,
+                        cqdx: Some(Arc::new(client)),
+                    }),
+                    schedule(),
+                    TIMING,
+                    Arc::new(std::sync::Mutex::new(UploadHealth::default())),
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                )
+                .0;
+                handle
+                    .enqueue(vec![NewUpload {
+                        qso_id,
+                        destination: Cqdx,
+                        call: "K1ABC".into(),
+                        payload: cqdx_record_json(),
+                    }])
+                    .await;
+                wait_until(|| *served.lock().unwrap() == 1).await;
+                wait_until(|| {
+                    let store = OutboxStore::open(path.clone()).0;
+                    store.is_empty()
+                        && (header.is_none() || store.accepted_receipt(qso_id, Cqdx).is_some())
+                })
+                .await;
+                let store = OutboxStore::open(path).0;
+                assert_eq!(
+                    store
+                        .accepted_receipt(qso_id, Cqdx)
+                        .map(|r| r.remote_id.as_str()),
+                    header
+                );
+            }
+        }
     }
 
     #[tokio::test]
