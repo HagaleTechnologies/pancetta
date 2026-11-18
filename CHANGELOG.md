@@ -7,12 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 - PAN-378: capture cqdx `X-QSO-Id` on fresh and duplicate uploads and retain the latest 100 accepted IDs in the upload outbox.
-
-=======
 - PAN-381: with `[network.wsjtx_udp] accept_decodes = true`, pancetta listens on `decode_listen` (default `127.0.0.1:2238`, loopback only) for a same-host WSJT-X's Decode and Status datagrams. Live decodes appear in Band Activity (`EXT` before the message) and DX Hunter (`EXT` or `EX+N` in Src) and are scored like pancetta's own; they never start a QSO, an autonomous call, an alert or a PSKReporter report. Space and Callers replies on a WSJT-X decode from a band or mode other than pancetta's live dial and mode are refused with a status line (PAN-435). Restart required.
->>>>>>> 50e5208a7fea382ca8042627a109fc5668c3ae4f
 - PAN-315: use rustls for HTTPS and WSS, remove SQLite TLS and unused dependencies, replace validator with equivalent station bound checks, align WebSocket and system utility versions, declare Rust 1.98, and enforce dependency hygiene in Supply Chain. The sha2 0.11 migration remains follow-up work.
 - PAN-295: a silent audio-output stall (no callbacks for 2 s, no cpal error) now requests a forced device reopen, retrying every 10 s while the output stays silent, at most three times in a rolling ten minutes. The cap covers only these output-watchdog reopens; input-stale and processing-error recovery keep their own cadence. TX stays muted until output callbacks resume; a reopen result alone never unmutes. When the limit is reached the readiness strip shows `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d`. Automated coverage only; hardware qualification pending.
 - PAN-290: a poisoned false-positive filter lock no longer stops FT8 decoding; each window decodes with the filter bypassed and logs a warning, and the autonomous TX-side gate keeps its stored filter.
