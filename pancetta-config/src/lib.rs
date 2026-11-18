@@ -317,11 +317,13 @@ impl Config {
         if !levels.output_gain_db.is_finite()
             || !levels.output_gain_ceiling_db.is_finite()
             || !(-20.0..=5.0).contains(&levels.output_gain_ceiling_db)
+            || !levels.output_gain_floor_db.is_finite()
+            || !(-20.0..=levels.output_gain_ceiling_db).contains(&levels.output_gain_floor_db)
         {
             return None;
         }
         let raw = levels.output_gain_db;
-        let applied = raw.clamp(-20.0, levels.output_gain_ceiling_db);
+        let applied = raw.clamp(levels.output_gain_floor_db, levels.output_gain_ceiling_db);
         if raw == applied {
             return None;
         }
@@ -441,6 +443,20 @@ impl Config {
         self.station.validate_section()?;
         self.audio.validate_section()?;
         self.rig.validate_section()?;
+        if self.audio.auto_drive.enabled {
+            let configured = self.rig.power_control.protection.max_alc;
+            let limit = if configured.is_finite() && configured > 0.0 && configured < 1.0 {
+                configured
+            } else {
+                rig::DEFAULT_MAX_ALC
+            };
+            if self.audio.auto_drive.alc_onset >= limit {
+                return Err(ConfigError::InvalidValue {
+                    field: "audio.auto_drive.alc_onset".into(),
+                    value: self.audio.auto_drive.alc_onset.to_string(),
+                });
+            }
+        }
         self.ui.validate_section()?;
         self.network.validate_section()?;
         self.autonomous.validate_section()?;

@@ -161,6 +161,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tx.rs` | TX worker scheduling, playback and PTT gates. |
 | `tx/` | TX worker scheduling, playback and PTT gates. |
 | `tx_drive.rs` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
+| `tx_drive/` | Live TX audio drive in dB, bounded by floor and ceiling, applied to FT and Tune audio (PAN-438). |
 | `tx_halt.rs` | Station-wide TX halt shared by emergency stop and SWR trip. |
 | `tx_log.rs` | Durable TX log, one JSON line per keyed frame (PAN-122). |
 | `tx_meter.rs` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |

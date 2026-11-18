@@ -2143,6 +2143,7 @@ impl super::ApplicationCoordinator {
         // doc comment.
         let hamlib_command_in_flight_for_polling = self.hamlib_command_in_flight.clone();
         let split_tx_hz_for_polling = self.split_tx_frequency_hz();
+        let operating_frequency_hz_for_polling = self.operating_frequency_hz.clone();
         let split_tx_hz_for_startup = self.split_tx_frequency_hz();
         // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
         // rig state is applied". The message loop's own SetFrequency/
@@ -2640,12 +2641,14 @@ impl super::ApplicationCoordinator {
                                     )
                                     .await;
                                     if let Some(plan) = tx_meter_plan.as_ref() {
-                                        super::tx_meter::tx_meter_poll_step(
+                                        super::tx_meter::tx_meter_poll_step_with_dial(
                                             rig_for_polling.as_ref(),
                                             plan,
                                             &mut alc_guard,
                                             keyed,
                                             &message_bus,
+                                            &operating_frequency_hz_for_polling,
+                                            &split_tx_hz_for_polling,
                                         )
                                         .await;
                                     }
@@ -3450,6 +3453,29 @@ impl super::ApplicationCoordinator {
                                                     "rig set_ptt {} OK",
                                                     if *state { "ON" } else { "OFF" }
                                                 );
+                                                if *state {
+                                                    if let Ok(mut slot) = message_bus_for_connect
+                                                        .active_tx_drive_attempt
+                                                        .lock()
+                                                    {
+                                                        if let Some(old) = slot.take() {
+                                                            old.stop();
+                                                        }
+                                                        if let Some(attempt) =
+                                                            message.tx_drive_attempt.as_ref()
+                                                        {
+                                                            attempt.confirm();
+                                                            *slot = Some(attempt.clone());
+                                                        }
+                                                    }
+                                                } else if let Ok(mut slot) = message_bus_for_connect
+                                                    .active_tx_drive_attempt
+                                                    .lock()
+                                                {
+                                                    if let Some(attempt) = slot.take() {
+                                                        attempt.stop();
+                                                    }
+                                                }
                                                 if !*state {
                                                     if let Some(d) = drain.as_mut() {
                                                         d.unkey_confirmed = true;
@@ -10179,6 +10205,30 @@ mod pan291_tx_meter_tests {
             pancetta_core::TxPolicy::Full
         );
         assert_eq!(s.rig.get_ptt(Vfo::Current).await.unwrap(), PttState::On);
+    }
+
+    #[test]
+    fn disabled_auto_keeps_warn_only_and_gain() {
+        let mut config = Config::default();
+        config.audio.auto_drive.enabled = false;
+        config.audio.levels.output_gain_db = -4.0;
+        let drive = super::super::tx_drive::TxDrive::from_config(&config);
+        let mut guard = super::super::tx_meter::AlcGuard::new(&config.rig.power_control.protection);
+        assert_eq!(
+            guard.observe(true, Some(0.8)),
+            super::super::tx_meter::AlcAction::None
+        );
+        assert!(matches!(
+            guard.observe(true, Some(0.9)),
+            super::super::tx_meter::AlcAction::ReportOverdrive { .. }
+        ));
+        assert_eq!(drive.get(), -4.0);
+        assert_eq!(
+            drive
+                .snapshot_for_band(pancetta_core::Band::from_frequency(14_074_000))
+                .db,
+            -4.0
+        );
     }
 
     #[tokio::test]

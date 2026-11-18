@@ -42,7 +42,7 @@ CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implem
 The autonomous band scheduler (PAN-385) is implemented, unreleased: `[[autonomous.band_plan]]` UTC windows acting on entry, needed-activity hops from cqdx.io spots and a grey-line tie-break, all under `band_hopping.enabled`; automated coverage only, on-air and live cqdx qualification pending.
 WSJT-X decode ingest (PAN-381) is implemented, unreleased: a loopback `decode_listen` socket shows live WSJT-X Decode(2) datagrams, banded by WSJT-X's Status dial, in Band Activity and DX Hunter tagged `EXT`; automated coverage only, not yet checked against a real WSJT-X.
 TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
-Live TX audio drive (PAN-438) is implemented, unreleased: F7/F8 step the station's drive in dB, saved in `audio.levels.output_gain_db` and applied at the next TX or Tune; hardware qualification pending.
+TX audio drive (PAN-438/439) is implemented, unreleased: completed FT bursts with valid CAT ALC adjust the next burst within configured bounds. F7/F8 select Manual for the current band; F9 toggles Auto and Manual. Per-band gain and mode persist across restarts; hardware qualification pending.
 FT8 Fox slots and type 0.1 multiplexing (PAN-386) are implemented, unreleased: Fox CQ and Hound streams on 60 Hz slots in 300-900 Hz, RR73 and a report shared in one type 0.1 frame, contact logged when RR73 airs; decoded by pancetta's own decoders only, WSJT-X Hound and on-air qualification pending.
 
 ## Building and Testing

@@ -7091,6 +7091,176 @@ pub(crate) fn send_ptt_command(
     state: bool,
     authorize: impl FnOnce() -> bool,
 ) -> SendIfOutcome {
+    send_ptt_command_with_attempt(message_bus, source, state, None, authorize)
+}
+
+/// Publish a completed FT burst's selected drive and queue session persistence.
+async fn finish_auto_drive_burst(
+    bus: &MessageBus,
+    drive: &std::sync::Arc<super::tx_drive::TxDrive>,
+    snapshot: super::tx_drive::DriveSnapshot,
+    samples: &[pancetta_core::tx_meter::TxMeterReading],
+    context: super::tx_drive::DriveContext,
+    session_record: &std::sync::Arc<std::sync::Mutex<super::session_state::SessionRecord>>,
+    session_path: &Option<std::path::PathBuf>,
+    operating_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    split_tx_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    rig_generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ft_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) {
+    use super::tx_drive::DriveDecision;
+    let live_band = pancetta_core::Band::from_frequency(tx_log_dial_hz(
+        operating_frequency_hz,
+        split_tx_frequency_hz,
+    ));
+    let still_same_context = snapshot.band == live_band
+        && rig_generation.load(Ordering::Acquire) == context.rig_generation
+        && ft_mode.load(Ordering::Acquire) == context.ft_mode;
+    let decision = if still_same_context {
+        drive.complete(snapshot, samples, context)
+    } else {
+        DriveDecision::Stale
+    };
+    if decision == DriveDecision::Stale
+        && snapshot.mode == pancetta_core::tx_drive_mode::TxDriveMode::Auto
+    {
+        if let Some(limit) = drive.warn_only_limit() {
+            let mut previous = None;
+            for sample in samples {
+                match sample
+                    .alc
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                {
+                    Some(alc) if alc > limit => {
+                        if let Some(earlier) = previous {
+                            super::tx_meter::act(
+                                super::tx_meter::AlcAction::ReportOverdrive {
+                                    readings: [earlier, alc],
+                                    max_alc: limit,
+                                },
+                                bus,
+                            )
+                            .await;
+                            break;
+                        }
+                        previous = Some(alc);
+                    }
+                    Some(_) => previous = None,
+                    None => (),
+                }
+            }
+        }
+    }
+    let selected = drive.snapshot_for_band(snapshot.band);
+    if selected.band == live_band && selected != snapshot {
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                    db: selected.db,
+                    ceiling_db: drive.ceiling_db(),
+                    mode: selected.mode,
+                    available: selected.available,
+                }),
+                Instant::now(),
+            ))
+            .await;
+    }
+    let alert = match decision {
+        DriveDecision::Overdrive(db) => Some(format!("ALC high: drive {} dB", format_drive_db(db))),
+        DriveDecision::Floor => Some("ALC high: lower the rig's USB/DATA input level".to_string()),
+        _ => None,
+    };
+    if let Some(alert) = alert {
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::Error {
+                    component_id: ComponentId::Ft8Transmitter,
+                    error_message: alert.clone(),
+                    error_code: None,
+                },
+                Instant::now(),
+            ))
+            .await;
+        let _ = bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::DiagnosticEvent {
+                    target: "tx.drive",
+                    level: pancetta_core::DiagnosticLevel::Warn,
+                    text: alert,
+                    qso_id: None,
+                    callsign: None,
+                },
+                Instant::now(),
+            ))
+            .await;
+    }
+    if drive.needs_persist() {
+        let record = session_record.clone();
+        let path = session_path.clone();
+        let drive = drive.clone();
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                super::session_state::persist_tx_drive_current(&record, &path, &drive)
+            })
+            .await;
+            if let Ok(Err(error)) = result {
+                tracing::warn!("Could not save TX drive: {error}");
+                let notice =
+                    "TX drive changed for this session only. Could not save TX drive.".to_string();
+                let _ = bus
+                    .send_message(ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Tui,
+                        MessageType::Error {
+                            component_id: ComponentId::Ft8Transmitter,
+                            error_message: notice.clone(),
+                            error_code: None,
+                        },
+                        Instant::now(),
+                    ))
+                    .await;
+                let _ = bus
+                    .send_message(ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Tui,
+                        MessageType::DiagnosticEvent {
+                            target: "tx.drive",
+                            level: pancetta_core::DiagnosticLevel::Warn,
+                            text: format!("{notice} {error}"),
+                            qso_id: None,
+                            callsign: None,
+                        },
+                        Instant::now(),
+                    ))
+                    .await;
+            }
+        });
+    }
+}
+
+fn format_drive_db(db: f32) -> String {
+    let value = if db.fract() == 0.0 {
+        format!("{db:.0}")
+    } else {
+        format!("{db:.1}")
+    };
+    value.replace('-', "−")
+}
+
+pub(crate) fn send_ptt_command_with_attempt(
+    message_bus: &MessageBus,
+    source: ComponentId,
+    state: bool,
+    attempt: Option<std::sync::Arc<super::tx_meter::TxDriveAttempt>>,
+    authorize: impl FnOnce() -> bool,
+) -> SendIfOutcome {
     // One CAS arbitrates gain admission and every key-down enqueue, without
     // introducing a lock or await into the last-gate-to-enqueue path.
     if state {
@@ -7108,29 +7278,28 @@ pub(crate) fn send_ptt_command(
         }
     }
     let mut admitted = false;
-    let outcome = message_bus.send_rig_command_if(
-        ComponentMessage::new(
-            source,
-            ComponentId::Hamlib,
-            MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
-            Instant::now(),
-        ),
-        || {
-            if !authorize() {
-                return false;
-            }
-            if !state {
-                return true;
-            }
-            if !message_bus.data_mode.is_ready() {
-                return false;
-            }
-            admitted = message_bus
-                .receive_gain
-                .admit_ptt(chrono::Utc::now().timestamp_millis());
-            admitted
-        },
+    let mut command = ComponentMessage::new(
+        source,
+        ComponentId::Hamlib,
+        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
+        Instant::now(),
     );
+    command.tx_drive_attempt = attempt;
+    let outcome = message_bus.send_rig_command_if(command, || {
+        if !authorize() {
+            return false;
+        }
+        if !state {
+            return true;
+        }
+        if !message_bus.data_mode.is_ready() {
+            return false;
+        }
+        admitted = message_bus
+            .receive_gain
+            .admit_ptt(chrono::Utc::now().timestamp_millis());
+        admitted
+    });
     if admitted && outcome != SendIfOutcome::Enqueued {
         message_bus.receive_gain.ptt_command_consumed();
     }
@@ -9784,6 +9953,9 @@ impl super::ApplicationCoordinator {
             let fox_mode = self.fox_mode();
             let fox_max_streams = self.fox_max_streams();
             let tx_drive = self.tx_drive.clone();
+            let tx_drive_session_record = self.session_record.clone();
+            let tx_drive_session_path = self.session_state_path.clone();
+            let tx_drive_rig_generation = self.hamlib_generation.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -11564,10 +11736,29 @@ impl super::ApplicationCoordinator {
                                         // PAN-202). The mid-TX poll remains a backstop.
                                         // PTT hardware is not asserted yet. Denial only unwinds the local
                                         // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                        let outcome = send_ptt_command(
+                                        let drive_snapshot = tx_drive.snapshot_for_band(
+                                            pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                            )),
+                                        );
+                                        let drive_context = super::tx_drive::DriveContext {
+                                            rig_generation: tx_drive_rig_generation
+                                                .load(Ordering::Acquire),
+                                            ft_mode: active_protocol_mode_atomic
+                                                .load(Ordering::Acquire),
+                                            stream_count: 1,
+                                        };
+                                        let drive_attempt = super::tx_meter::TxDriveAttempt::new(
+                                            drive_snapshot.mode
+                                                == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                            drive_snapshot.band,
+                                        );
+                                        let outcome = send_ptt_command_with_attempt(
                                             &message_bus,
                                             ComponentId::Ft8Transmitter,
                                             true,
+                                            Some(drive_attempt.clone()),
                                             || {
                                                 tx_send_authorized(
                                                     origin,
@@ -11577,7 +11768,7 @@ impl super::ApplicationCoordinator {
                                             },
                                         );
                                         drop(live_timing_guard);
-                                        let drive_at_key = tx_drive.get();
+                                        let drive_at_key = drive_snapshot.db;
                                         match outcome {
                                             SendIfOutcome::Enqueued => {
                                                 info!(
@@ -12046,6 +12237,8 @@ impl super::ApplicationCoordinator {
                                         );
                                         let (playback_ack, mut playback_waiter) =
                                             PlaybackStartAck::new();
+                                        let playback_ack = playback_ack
+                                            .with_tx_drive_attempt(drive_attempt.clone());
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -12478,7 +12671,24 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue 'worker;
                                         }
-                                        ptt_guard.release("Step 9 unkey").await;
+                                        let release = ptt_guard.release("Step 9 unkey").await;
+                                        if success && release == PttRelease::Delivered {
+                                            let samples = drive_attempt.finish();
+                                            finish_auto_drive_burst(
+                                                &message_bus,
+                                                &tx_drive,
+                                                drive_snapshot,
+                                                &samples,
+                                                drive_context,
+                                                &tx_drive_session_record,
+                                                &tx_drive_session_path,
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                                &tx_drive_rig_generation,
+                                                &active_protocol_mode_atomic,
+                                            )
+                                            .await;
+                                        }
 
                                         // --- Step 10: Send TransmitComplete ---
                                         if let Err(e) = report_played_transmit_complete(
@@ -14542,10 +14752,29 @@ impl super::ApplicationCoordinator {
                                     // PAN-202). The mid-TX poll remains a backstop.
                                     // PTT hardware is not asserted yet. Denial only unwinds the local
                                     // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                    let outcome = send_ptt_command(
+                                    let drive_snapshot = tx_drive.snapshot_for_band(
+                                        pancetta_core::Band::from_frequency(tx_log_dial_hz(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                        )),
+                                    );
+                                    let drive_context = super::tx_drive::DriveContext {
+                                        rig_generation: tx_drive_rig_generation
+                                            .load(Ordering::Acquire),
+                                        ft_mode: active_protocol_mode_atomic
+                                            .load(Ordering::Acquire),
+                                        stream_count: items.len(),
+                                    };
+                                    let drive_attempt = super::tx_meter::TxDriveAttempt::new(
+                                        drive_snapshot.mode
+                                            == pancetta_core::tx_drive_mode::TxDriveMode::Auto,
+                                        drive_snapshot.band,
+                                    );
+                                    let outcome = send_ptt_command_with_attempt(
                                         &message_bus,
                                         ComponentId::Ft8Transmitter,
                                         true,
+                                        Some(drive_attempt.clone()),
                                         || {
                                             tx_send_authorized(
                                                 origin,
@@ -14555,7 +14784,7 @@ impl super::ApplicationCoordinator {
                                         },
                                     );
                                     drop(live_timing_guard);
-                                    let drive_at_key = tx_drive.get();
+                                    let drive_at_key = drive_snapshot.db;
                                     match outcome {
                                         SendIfOutcome::Enqueued => {
                                             info!(
@@ -14800,6 +15029,8 @@ impl super::ApplicationCoordinator {
                                     );
                                     let (playback_ack, mut playback_waiter) =
                                         PlaybackStartAck::new();
+                                    let playback_ack =
+                                        playback_ack.with_tx_drive_attempt(drive_attempt.clone());
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -15075,7 +15306,24 @@ impl super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
-                                    ptt_guard.release("Multi-TX Step 9 unkey").await;
+                                    let release = ptt_guard.release("Multi-TX Step 9 unkey").await;
+                                    if success && release == PttRelease::Delivered {
+                                        let samples = drive_attempt.finish();
+                                        finish_auto_drive_burst(
+                                            &message_bus,
+                                            &tx_drive,
+                                            drive_snapshot,
+                                            &samples,
+                                            drive_context,
+                                            &tx_drive_session_record,
+                                            &tx_drive_session_path,
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            &tx_drive_rig_generation,
+                                            &active_protocol_mode_atomic,
+                                        )
+                                        .await;
+                                    }
 
                                     // --- Step 10: Send TransmitComplete for each item ---
                                     for ((text, qso_id), item) in item_texts
@@ -15263,7 +15511,14 @@ impl super::ApplicationCoordinator {
                                         true,
                                         || true,
                                     );
-                                    let drive_at_key = tx_drive.get();
+                                    let drive_at_key = tx_drive
+                                        .snapshot_for_band(pancetta_core::Band::from_frequency(
+                                            tx_log_dial_hz(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                            ),
+                                        ))
+                                        .db;
                                     if ptt_on != SendIfOutcome::Enqueued {
                                         // `Denied` here is the receive-gain gate, never
                                         // `authorize` (always true for a tune).

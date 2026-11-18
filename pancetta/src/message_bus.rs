@@ -797,6 +797,13 @@ pub enum RigControlMessage {
     /// PAN-291: which TX meters this Hamlib session reads while keyed, and the
     /// ALC warning limit when the warning is on. Sent once per Hamlib session.
     TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
+    /// PAN-439 selected drive after a completed FT burst.
+    TxDriveState {
+        db: f32,
+        ceiling_db: f32,
+        mode: pancetta_core::tx_drive_mode::TxDriveMode,
+        available: bool,
+    },
     /// Enable/disable rig-level split (RX dial ≠ TX dial). When `enabled`,
     /// the rig transmits on VFO B at `tx_frequency` (Hz) while receiving on
     /// VFO A. When disabled, `tx_frequency` is ignored. Produced by the TUI
@@ -1198,6 +1205,7 @@ pub struct ComponentMessage {
     pub latency_tracking: LatencyTracking,
     /// Local split-poll lifetime guard; absent on every other message type.
     pub(crate) split_observation_guard: Option<Arc<SplitObservationGuard>>,
+    pub(crate) tx_drive_attempt: Option<Arc<crate::coordinator::tx_meter::TxDriveAttempt>>,
 }
 
 /// Latency tracking for message bus performance monitoring
@@ -1238,6 +1246,7 @@ impl ComponentMessage {
             hop_count: 0,
             latency_tracking,
             split_observation_guard: None,
+            tx_drive_attempt: None,
         }
     }
 
@@ -1383,6 +1392,7 @@ pub enum PlaybackStartState {
 #[derive(Clone)]
 pub struct PlaybackStartAck {
     slot: AckSlot<Option<chrono::DateTime<chrono::Utc>>>,
+    tx_drive_attempt: Option<Arc<crate::coordinator::tx_meter::TxDriveAttempt>>,
 }
 
 impl PlaybackStartAck {
@@ -1392,13 +1402,25 @@ impl PlaybackStartAck {
         (
             Self {
                 slot: AckSlot::new(tx),
+                tx_drive_attempt: None,
             },
             PlaybackStartWaiter { rx, settled: None },
         )
     }
 
+    pub(crate) fn with_tx_drive_attempt(
+        mut self,
+        attempt: Arc<crate::coordinator::tx_meter::TxDriveAttempt>,
+    ) -> Self {
+        self.tx_drive_attempt = Some(attempt);
+        self
+    }
+
     /// Report the audio thread's observation time. Later settlements do nothing.
     pub fn started(&self, at: chrono::DateTime<chrono::Utc>) {
+        if let Some(attempt) = &self.tx_drive_attempt {
+            attempt.started();
+        }
         self.slot.settle(Some(at));
     }
 
@@ -1639,6 +1661,8 @@ pub struct MessageBus {
     /// Shared only by split-command producers and the split poll. PTT routing
     /// never takes this lock (PAN-202).
     pub(crate) split_observation_fence: Arc<SplitObservationFence>,
+    pub(crate) active_tx_drive_attempt:
+        Arc<std::sync::Mutex<Option<Arc<crate::coordinator::tx_meter::TxDriveAttempt>>>>,
     /// Configuration
     config: MessageBusConfig,
     /// Component channels
@@ -1671,6 +1695,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            active_tx_drive_attempt: Arc::new(std::sync::Mutex::new(None)),
             data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1692,6 +1717,7 @@ impl MessageBus {
         Ok(Self {
             config,
             split_observation_fence: Arc::new(SplitObservationFence::default()),
+            active_tx_drive_attempt: Arc::new(std::sync::Mutex::new(None)),
             data_mode: pancetta_hamlib::DataModeReadiness::new(false),
             receive_gain: Arc::new(crate::coordinator::receive_overload::GainSafety::default()),
             gain_tx_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
