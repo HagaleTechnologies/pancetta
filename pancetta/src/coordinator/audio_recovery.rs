@@ -258,6 +258,12 @@ impl OutputWatchdog {
         self.epoch = now;
     }
 
+    /// PAN-295: a `WentDead` (stall or stream error) has been announced and
+    /// not yet followed by `Recovered`. Survives a rebaseline.
+    pub(crate) fn is_dead_announced(&self) -> bool {
+        self.announced_dead
+    }
+
     /// `true` only while an output callback has been observed within
     /// [`OUTPUT_STALL_AFTER`] and no stall/error is outstanding.
     pub(crate) fn is_alive(&self, now: Instant) -> bool {
@@ -265,6 +271,167 @@ impl OutputWatchdog {
             && self
                 .last_progress
                 .is_some_and(|p| now.saturating_duration_since(p) < OUTPUT_STALL_AFTER)
+    }
+}
+
+/// PAN-295: wait this long after an attempted rebuild (or a refused send)
+/// before the next automatic output reopen while the output stays stalled.
+pub(crate) const OUTPUT_REOPEN_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// PAN-295: an output-watchdog reopen stops counting against the budget once
+/// its age reaches this.
+pub(crate) const OUTPUT_REOPEN_WINDOW: Duration = Duration::from_secs(600);
+/// PAN-295: at most this many output-watchdog reopens in [`OUTPUT_REOPEN_WINDOW`].
+pub(crate) const OUTPUT_REOPEN_MAX_ATTEMPTS: usize = 3;
+
+/// What [`OutputReopenPolicy::decide`] asks the audio thread to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputReopenDecision {
+    /// Nothing to do (healthy, not stalled, waiting, or a request outstanding).
+    None,
+    /// Enqueue one forced reopen now, then call [`OutputReopenPolicy::on_request_sent`].
+    Request,
+    /// A reopen is due but the rolling budget is spent.
+    Refused,
+}
+
+/// PAN-295: bounded automatic recovery for a silent output stall.
+///
+/// [`OutputWatchdog`] latches `WentDead` once per episode and keeps the latch
+/// across a rebaseline, so it cannot drive retries by itself. This policy
+/// keeps its own stalled-episode flag: the first `WentDead` makes a reopen
+/// due at once, and while the output stays stalled the next one is due
+/// [`OUTPUT_REOPEN_RETRY_AFTER`] after the last attempted rebuild finished.
+/// Every queued request counts against a rolling budget of
+/// [`OUTPUT_REOPEN_MAX_ATTEMPTS`] per [`OUTPUT_REOPEN_WINDOW`], whatever the
+/// rebuild's result. Callback progress ends the episode but keeps the
+/// history. Pure (the caller supplies `now`).
+pub(crate) struct OutputReopenPolicy {
+    /// When each counted request was queued, oldest first.
+    attempts: std::collections::VecDeque<Instant>,
+    /// A silent stall has been announced and no callback progress seen since.
+    stalled: bool,
+    /// A queued request has not settled yet.
+    outstanding: bool,
+    /// This policy's own retry delay: set when its request settles or a
+    /// send fails. Also paces the limit indication.
+    retry_at: Option<Instant>,
+    /// Any rebuild's settling time (operator pick, input-stale, processing
+    /// error): postpones a request, never the limit indication.
+    quiet_until: Option<Instant>,
+    /// The last due reopen was refused by the budget; display only.
+    exhausted: bool,
+}
+
+impl OutputReopenPolicy {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempts: std::collections::VecDeque::with_capacity(OUTPUT_REOPEN_MAX_ATTEMPTS),
+            stalled: false,
+            outstanding: false,
+            retry_at: None,
+            quiet_until: None,
+            exhausted: false,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .attempts
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= OUTPUT_REOPEN_WINDOW)
+        {
+            self.attempts.pop_front();
+        }
+    }
+
+    /// Call after every successful output observation with the watchdog's
+    /// edge, its `is_alive` verdict and its dead latch
+    /// ([`OutputWatchdog::is_dead_announced`]) at `now`. The latch makes an
+    /// output that stayed silent after a processing-error rebuild (whose
+    /// `WentDead` that branch consumed) a stall too.
+    pub(crate) fn decide(
+        &mut self,
+        edge: OutputEdge,
+        alive: bool,
+        dead: bool,
+        now: Instant,
+    ) -> OutputReopenDecision {
+        self.prune(now);
+        if alive || edge == OutputEdge::Recovered {
+            self.stalled = false;
+            self.exhausted = false;
+            return OutputReopenDecision::None;
+        }
+        if edge == OutputEdge::WentDead || dead {
+            self.stalled = true;
+        }
+        if !self.stalled || self.outstanding {
+            return OutputReopenDecision::None;
+        }
+        let own_wait = self.retry_at.is_some_and(|t| now < t);
+        if self.attempts.len() >= OUTPUT_REOPEN_MAX_ATTEMPTS {
+            // A new stall with the budget spent shows the limit at once;
+            // otherwise at this policy's own next retry time. Other rebuilds
+            // cannot postpone the indication.
+            if own_wait && edge != OutputEdge::WentDead {
+                return OutputReopenDecision::None;
+            }
+            self.exhausted = true;
+            return OutputReopenDecision::Refused;
+        }
+        // Expiry made recovery eligible again.
+        self.exhausted = false;
+        if own_wait || self.quiet_until.is_some_and(|t| now < t) {
+            return OutputReopenDecision::None;
+        }
+        OutputReopenDecision::Request
+    }
+
+    /// The requested reopen was queued: it counts, and no other is due
+    /// until it settles.
+    pub(crate) fn on_request_sent(&mut self, now: Instant) {
+        self.attempts.push_back(now);
+        self.outstanding = true;
+        self.retry_at = None;
+    }
+
+    /// The request channel refused the send: no budget used, retry later.
+    pub(crate) fn on_send_failed(&mut self, now: Instant) {
+        self.retry_at = Some(now + OUTPUT_REOPEN_RETRY_AFTER);
+    }
+
+    /// This policy's own request settled (any result, or a dropped reply).
+    pub(crate) fn on_request_settled(&mut self, now: Instant) {
+        self.outstanding = false;
+        self.retry_at = Some(now + OUTPUT_REOPEN_RETRY_AFTER);
+    }
+
+    /// Any rebuild finished (operator pick, input-stale, processing error or
+    /// this policy's own): give the new stream time to call back. History is
+    /// kept and the episode does not end.
+    pub(crate) fn on_rebuild(&mut self, now: Instant) {
+        self.quiet_until = Some(now + OUTPUT_REOPEN_RETRY_AFTER);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_outstanding(&self) -> bool {
+        self.outstanding
+    }
+
+    /// `true` while stalled and the last due reopen was refused by the budget.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Counted requests still inside the window as of the last `decide`.
+    pub(crate) fn attempts_in_window(&self) -> usize {
+        self.attempts.len()
+    }
+}
+
+impl Default for OutputReopenPolicy {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -472,6 +639,10 @@ mod tests {
         assert!(!w.is_alive(ms(t0, 21)));
     }
 }
+
+#[cfg(test)]
+#[path = "audio_recovery/tests/output_reopen_policy_tests.rs"]
+mod output_reopen_policy_tests;
 
 #[cfg(test)]
 mod pan71_playback_watch_tests {

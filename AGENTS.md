@@ -35,6 +35,7 @@ LoTW outbox retries, optional certificate passwords and duplicate tqsl exits 8/9
 
 Operator-facing capability state: README.md § Capability status — keep both consistent.
 ADIF entity enrichment (PAN-306) is implemented, unreleased: offline COUNTRY/DXCC/CQZ/ITUZ with token zone overrides, stored-field precedence and unknown omission, including export-time enrichment. Automated coverage only; live qualification pending.
+Silent audio-output stall recovery (PAN-295) is implemented, unreleased: output-watchdog forced reopens capped at 3 per rolling 10 min (input-stale and processing-error recovery unchanged), TX muted until callbacks resume, limit shown on the readiness strip; hardware qualification pending.
 TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses configured XML credentials, a two-second deadline and a session cache; live-account qualification is pending.
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
 CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.

@@ -2143,7 +2143,24 @@ impl super::ApplicationCoordinator {
         // CQs from callsigns absent from the trust set (defense in
         // depth — the decode-side filter still runs in
         // coordinator/ft8.rs).
-        let fp_filter_snapshot = self.fp_filter.read().unwrap().clone();
+        //
+        // PAN-290: a poisoned lock keeps the stored filter instead of
+        // panicking this start. This gate only ever stops a CQ reply, so
+        // dropping it would fail toward more transmissions, and every start
+        // builds a fresh operator that holds only what this read returns.
+        // The lock guards one `Option<Arc<_>>` that a panic cannot leave
+        // half-written, so the recovered value is whole.
+        let fp_filter_snapshot = self
+            .fp_filter
+            .read()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "pancetta::fp_filter",
+                    "FP filter lock poisoned by an earlier panic; keeping the stored filter for TX-side gating"
+                );
+                poisoned.into_inner()
+            })
+            .clone();
         if let Some(filter) = fp_filter_snapshot {
             let op = operator.clone();
             let mut guard = op.lock().await;
@@ -7735,6 +7752,7 @@ mod fq_f9_placement_feed_when_disabled_tests {
         ));
     }
 
+<<<<<<< HEAD
     /// PAN-385 AC18: a plan hop goes through the real Autonomous task to
     /// Hamlib and shows why in the Diagnostics overlay. The full-day window
     /// keeps the test independent of the wall clock.
@@ -7799,6 +7817,12 @@ mod fq_f9_placement_feed_when_disabled_tests {
     }
 
     async fn build_coordinator(autonomous_enabled: bool, headless: bool) -> ApplicationCoordinator {
+=======
+    pub(super) async fn build_coordinator(
+        autonomous_enabled: bool,
+        headless: bool,
+    ) -> ApplicationCoordinator {
+>>>>>>> 331e0c0739084262a1da0c58565ba521af866de5
         let mut config = Config::default();
         config.autonomous.enabled = autonomous_enabled;
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -8172,6 +8196,10 @@ mod fq_f9_placement_feed_when_disabled_tests {
         coordinator.shutdown_signal.store(true, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+#[path = "autonomous/tests/fp_filter_poison_tests.rs"]
+mod fp_filter_poison_tests;
 
 /// Apply both operator edits and QSO-completion removal at the watchlist owner.
 pub(crate) fn apply_watchlist_edit(

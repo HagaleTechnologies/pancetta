@@ -13,7 +13,6 @@
 //! - [`Band`] -- amateur radio band (20m, 40m, etc.)
 //! - [`Mode`] -- operating mode (FT8, USB, etc.)
 //! - [`PancettaError`] -- unified error type
-//! - [`ComponentError`] -- per-component error with severity and context
 //! - [`dxcc`] -- offline callsign to DXCC entity resolver (cty.dat prefix index)
 //!
 //! ## Crate Relationships
@@ -32,7 +31,6 @@ mod dxcc_exact;
 mod dxcc_registry;
 mod dxcc_table;
 mod dxcc_zones;
-pub mod error;
 pub mod freq_bin;
 pub mod ft8_tokens;
 pub mod gridsquare;
@@ -52,12 +50,6 @@ pub use response_step::ResponseStep;
 pub use tx_freq_mode::TxFreqMode;
 pub use tx_policy::TxPolicy;
 pub use types::{Band, IaruRegion, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};
-
-// Re-export error handling types
-pub use error::{
-    ComponentError, ErrorBuilder, ErrorContext, ErrorRecovery, ErrorSeverity,
-    PancettaError as UnifiedError, PancettaResult as UnifiedResult, ResultExt, RetryDelay,
-};
 
 /// Crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
