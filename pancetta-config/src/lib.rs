@@ -2122,7 +2122,7 @@ mod merge_guard {
     use std::collections::HashSet;
 
     #[derive(Clone)]
-    enum Seg {
+    pub(super) enum Seg {
         Key(String),
         Idx(usize),
     }
@@ -2130,7 +2130,7 @@ mod merge_guard {
     /// Collect paths to every scalar (bool / number / string) leaf. `null` and
     /// empty containers carry no type information, so they're skipped here and
     /// handled via the per-type `overrides` instead.
-    fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
+    pub(super) fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
         match v {
             Value::Object(m) => {
                 for (k, val) in m {
@@ -2151,7 +2151,7 @@ mod merge_guard {
         }
     }
 
-    fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    pub(super) fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
         let mut cur = root;
         for seg in path {
             cur = match seg {
@@ -2162,7 +2162,7 @@ mod merge_guard {
         Some(cur)
     }
 
-    fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
+    pub(super) fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
         let mut cur = root;
         for (i, seg) in path.iter().enumerate() {
             let last = i + 1 == path.len();
@@ -2187,11 +2187,44 @@ mod merge_guard {
         }
     }
 
+    /// Which probe values `build_source_probed` writes. `Base` is the
+    /// default-base guard's probe. `Overlay` (PAN-371) differs from `Base` at
+    /// every string and number leaf and leaves booleans at their default, so a
+    /// populated base and a populated overlay disagree wherever they can.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Probe {
+        Base,
+        Overlay,
+    }
+
     /// A different, non-empty, non-zero value for a scalar leaf. Non-zero /
     /// non-empty matters because several `merge_with` impls skip empty/zero
     /// `other` values, so a zero would be legitimately ignored and mask a real
     /// drop. Numbers stay within their original type's range.
-    fn perturb_scalar(v: &Value) -> Value {
+    fn perturb_scalar(v: &Value, probe: Probe) -> Value {
+        if probe == Probe::Overlay {
+            return match v {
+                Value::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        Value::from(if u <= 2 { u + 3 } else { u - 2 })
+                    } else if let Some(i) = n.as_i64() {
+                        Value::from(if (0..=2).contains(&i) { i + 3 } else { i - 2 })
+                    } else if let Some(f) = n.as_f64() {
+                        Value::from(if f == 0.0 {
+                            3.0
+                        } else if f > 0.0 {
+                            f + 2.0
+                        } else {
+                            f - 2.0
+                        })
+                    } else {
+                        v.clone()
+                    }
+                }
+                Value::String(_) => Value::String("MERGE_GUARD_OVERLAY".to_string()),
+                other => other.clone(),
+            };
+        }
         match v {
             Value::Bool(b) => Value::Bool(!b),
             Value::Number(n) => {
@@ -2225,6 +2258,14 @@ mod merge_guard {
     where
         T: Default + Serialize + DeserializeOwned,
     {
+        build_source_probed(overrides, Probe::Base)
+    }
+
+    /// `build_source` with a chosen probe (PAN-371 populated-base guard).
+    pub(super) fn build_source_probed<T>(overrides: &[(&str, Value)], probe: Probe) -> T
+    where
+        T: Default + Serialize + DeserializeOwned,
+    {
         let mut working = serde_json::to_value(T::default()).expect("serialize default");
         let override_keys: HashSet<&str> = overrides.iter().map(|(k, _)| *k).collect();
         {
@@ -2246,7 +2287,7 @@ mod merge_guard {
                 }
             }
             let cur = get_path(&working, path).expect("path exists");
-            let candidate = perturb_scalar(cur);
+            let candidate = perturb_scalar(cur, probe);
             if &candidate == cur {
                 continue;
             }
@@ -2447,3 +2488,7 @@ mod merge_guard {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lib/tests/merge_rules_tests.rs"]
+mod merge_rules_tests;
