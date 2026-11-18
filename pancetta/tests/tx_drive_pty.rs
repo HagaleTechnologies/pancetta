@@ -20,9 +20,9 @@ fn attached_terminal_reaches_the_running_station() {
     .unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    // SAFETY: openpty initializes both descriptors; the child receives only
-    // the slave, and the parent owns the master after spawn.
     assert_eq!(
+        // SAFETY: openpty initializes both descriptors; the child receives only
+        // the slave, and the parent owns the master after spawn.
         unsafe {
             libc::openpty(
                 &mut master_fd,
@@ -45,6 +45,7 @@ fn attached_terminal_reaches_the_running_station() {
     assert_eq!(unsafe { libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size) }, 0);
     // SAFETY: openpty returned valid owned descriptors.
     let mut master = unsafe { File::from_raw_fd(master_fd) };
+    // SAFETY: openpty returned a valid slave descriptor that nothing else owns.
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let stdout = slave.try_clone().unwrap();
     let stderr = slave.try_clone().unwrap();
