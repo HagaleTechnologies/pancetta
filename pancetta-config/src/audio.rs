@@ -428,7 +428,7 @@ pub struct RecordingConfig {
 
     /// Where recordings go; created if missing. A leading `~` is expanded
     /// by pancetta itself (the loader never expands values); `~user` is not.
-    /// Empty means `~/.pancetta/recordings`.
+    /// Omitted or empty means `<data-dir>/recordings`.
     pub directory: String,
 
     /// File naming pattern. Not read yet (recordings are always named
@@ -688,7 +688,7 @@ impl Default for RecordingConfig {
             sample_rate: 44100,
             max_length_minutes: 60,
             raw_capture_minutes: 0,
-            directory: "~/Documents/Pancetta/Recordings".to_string(),
+            directory: String::new(),
             filename_pattern: "pancetta_%Y%m%d_%H%M%S".to_string(),
             compression_level: 5,
         }

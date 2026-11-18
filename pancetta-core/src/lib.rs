@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 pub mod callsign;
+pub mod data_dir;
 pub mod diagnostic_level;
 pub mod dxcc;
 mod dxcc_continents;

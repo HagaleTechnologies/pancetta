@@ -28,7 +28,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-core` | Shared types, error handling, offline DXCC entity resolver | Stable |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
-| `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
+| `pancetta-research` | Local-only decoder-iteration harness | Local-only; excluded from CI except a non-required compile-only check lane (PAN-372) |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 LoTW outbox retries, optional certificate passwords and duplicate tqsl exits 8/9 are integration-tested with fake tqsl, unreleased; live-account qualification remains pending.
@@ -44,6 +44,7 @@ WSJT-X decode ingest (PAN-381) is implemented, unreleased: a loopback `decode_li
 TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
 TX audio drive (PAN-438/439) is implemented, unreleased: completed FT bursts with valid CAT ALC adjust the next burst within configured bounds. F7/F8 select Manual for the current band; F9 toggles Auto and Manual. Per-band gain and mode persist across restarts; hardware qualification pending.
 FT8 Fox slots and type 0.1 multiplexing (PAN-386) are implemented, unreleased: Fox CQ and Hound streams on 60 Hz slots in 300-900 Hz, RR73 and a report shared in one type 0.1 frame, contact logged when RR73 airs; decoded by pancetta's own decoders only, WSJT-X Hound and on-air qualification pending.
+Separate data directories (PAN-376) are implemented, unreleased: a global `--data-dir <DIR>` moves config, logbook, logs, keys, the upload outbox and all other station state from `~/.pancetta` to `DIR`, and a live station holds `<data-dir>/pancetta.lock` so a second one on the same directory refuses with `another pancetta is running (pid N)`; Linux-tested only, Windows compile-checked, macOS relaunch with the flag unverified.
 
 ## Building and Testing
 
@@ -124,6 +125,8 @@ New unit tests go in the same crate, `src/<module>/tests/<behaviour>_tests.rs`, 
 - Fox streams (PAN-386): in FT8 Fox mode every Fox-role QSO (`metadata.fox`: the Fox CQ and each Hound answer) transmits on a 60 Hz slot in 300-900 Hz from `pancetta_qso::fox_slot_offset`, pinned for its life; a type 0.1 frame is formed only inside `encode_and_modulate_multi_tx_with_fox` from one RR73 and one report item of Fox-admitted QSOs, at the report item's slot, and each item keeps its own attempt id and outcome; a Fox-role R-report completes through the PAN-280 hold.
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
+
+- Data directory and instance lock (PAN-376): every default path resolves through `pancetta_core::data_dir`, set only by `main()` from `--data-dir`; a live station (no subcommand or `run`, not `--wav`/`--replay`) holds `<data-dir>/pancetta.lock` from before logging until exit and refuses to start when another process holds it, naming the pid in `pancetta.pid`; subcommands never take it, and `qsos.adi.lock` stays the per-write lock (PAN-214).
 
 - The startup index rebuild builds `qso.db.new`, checkpoints the old index, keeps it as `qso.db.pre-rebuild[.N]` when it holds contacts ADIF lacks or cannot be read, then renames over. Staleness compares contacts, never mtimes. Legacy migration copies `qso.db` to `qso.db.pre-migration` first, refuses unreadable rows, and keeps the ADIF writer closed on refusal (PAN-282).
 - TX-worker aborts (PAN-322): every Step 6/8 `SleepOutcome` goes through `on_sleep_outcome` and every Step 4 `PttWait` through `on_ptt_wait`; any change to what an abort unkeys, settles or reports must re-bless `pancetta/tests/fixtures/tx_abort_transcripts.golden` (`PANCETTA_BLESS_TX_ABORT=1`) from the base commit.

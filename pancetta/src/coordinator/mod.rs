@@ -954,6 +954,19 @@ pub(crate) fn operator_present_now(last_input_ms: &std::sync::atomic::AtomicU64)
     now_ms.saturating_sub(last) < OPERATOR_PRESENCE_WINDOW.as_millis() as u64
 }
 
+/// PAN-376: the data directory station state lives in.
+///
+/// Under the test-only `pancetta_home_override` (a test **home**) it is
+/// `<home>/.pancetta`, so the in-process test seams keep their meaning;
+/// otherwise it is the process data directory (`--data-dir`, else
+/// `~/.pancetta`). `None` only with no override, no `--data-dir` and no home.
+pub(crate) fn data_dir_for(home_override: Option<&std::path::Path>) -> Option<PathBuf> {
+    match home_override {
+        Some(home) => Some(home.join(pancetta_core::data_dir::DEFAULT_DIR_NAME)),
+        None => pancetta_core::data_dir::try_current(),
+    }
+}
+
 use anyhow::{Context, Result};
 use pancetta_config::Config;
 use pancetta_ft8::Ft8Config;
@@ -1373,8 +1386,10 @@ pub struct ApplicationCoordinator {
     /// a stalled filesystem must never suspend those.
     pub(crate) config_write_is_toml: bool,
 
-    /// PAN-41 round 3: test-only override for the `~/.pancetta` directory
-    /// `start_qso_component` otherwise always derives from `dirs::home_dir()`
+    /// PAN-41 round 3: test-only home override for the data directory
+    /// `start_qso_component` otherwise always derives from the process data
+    /// directory (PAN-376: `--data-dir`, else `~/.pancetta`; see
+    /// [`data_dir_for`])
     /// -- including under `--replay`, whose own documented contract is to
     /// still *read* the real ADIF/index for duplicate/DX-Hunter history
     /// seeding (only writes are suppressed). Without this, an in-process
@@ -1660,8 +1675,8 @@ pub struct ApplicationCoordinator {
     pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
 
     /// Test handshake after waveform construction, immediately before the gate wait.
-    #[cfg(test)]
-    tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) tx_before_ptt_gate: Arc<tokio::sync::Notify>,
 
     /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
     /// and the key-down when armed.
@@ -2291,7 +2306,9 @@ impl ApplicationCoordinator {
                 .audit_log_path
                 .clone()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(pancetta_agent::audit::default_audit_path),
+                .unwrap_or_else(|| {
+                    pancetta_agent::audit::audit_path_in(&pancetta_core::data_dir::current())
+                }),
         );
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
@@ -2608,7 +2625,7 @@ impl ApplicationCoordinator {
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
             tx_frame_log: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-harness"))]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             key_down_probe: Arc::new(tx::KeyDownProbe::default()),
@@ -2850,8 +2867,11 @@ impl ApplicationCoordinator {
         // now enough to flip into strict mode immediately.
         const COLD_START_THRESHOLD: usize = 5;
         {
-            let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
-            let seed_path = dirs::home_dir().map(|h| h.join(".pancetta").join("callsign_seed.txt"));
+            // PAN-376: the worked-call history lives in the data directory
+            // (and honours the test-only home override).
+            let fp_data_dir = data_dir_for(self.pancetta_home_override.as_deref());
+            let adif_path = fp_data_dir.as_ref().map(|d| d.join("qsos.adi"));
+            let seed_path = fp_data_dir.as_ref().map(|d| d.join("callsign_seed.txt"));
             let adif_count = adif_path
                 .as_ref()
                 .filter(|p| p.exists())
@@ -4234,9 +4254,9 @@ mod tests {
         let coordinator = build_coordinator(config).await;
         assert_eq!(
             coordinator.audit_log().path(),
-            &pancetta_agent::audit::default_audit_path(),
+            &pancetta_agent::audit::audit_path_in(&pancetta_core::data_dir::current()),
             "with no configured path, the shared AuditLog must fall back to \
-             the standard default path"
+             the standard default path in the data directory"
         );
     }
 
@@ -5787,3 +5807,7 @@ mod active_qso_freq_tests {
 #[cfg(test)]
 #[path = "tests/waterfall_session_restore_tests.rs"]
 mod waterfall_session_restore_tests;
+
+#[cfg(test)]
+#[path = "tests/data_dir_tests.rs"]
+mod data_dir_tests;

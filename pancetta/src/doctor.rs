@@ -52,12 +52,8 @@ pub struct DoctorCtx {
 }
 
 pub fn build_ctx(config_override: Option<PathBuf>) -> DoctorCtx {
-    let config_path = config_override.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".pancetta")
-            .join("pancetta.toml")
-    });
+    let config_path =
+        config_override.unwrap_or_else(|| pancetta_core::data_dir::current().join("pancetta.toml"));
     if !config_path.exists() {
         return DoctorCtx {
             config_path,
@@ -668,9 +664,7 @@ pub(crate) fn check_submodule() -> DoctorCheck {
 const MIB: u64 = 1024 * 1024;
 
 fn log_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta/logs")
+    pancetta_core::data_dir::current().join("logs")
 }
 
 fn existing_ancestor(path: &std::path::Path) -> std::io::Result<PathBuf> {

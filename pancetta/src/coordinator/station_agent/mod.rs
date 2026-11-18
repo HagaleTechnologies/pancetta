@@ -2341,14 +2341,11 @@ impl super::ApplicationCoordinator {
     }
 }
 
-/// The default agent key directory: `~/.pancetta/agent`. Also used by the
-/// `pancetta pair` CLI subcommand so both paths resolve the same directory.
+/// The default agent key directory: `<data-dir>/agent` (PAN-376:
+/// `--data-dir`, else `~/.pancetta`). Also used by the `pancetta pair` CLI
+/// subcommand so both paths resolve the same directory.
 pub fn default_key_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".pancetta")
-        .join("agent")
+    pancetta_core::data_dir::current().join("agent")
 }
 
 /// Load client device verifying keys from `key_dir/clients/<keyId>.pub` (raw

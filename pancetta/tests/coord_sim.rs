@@ -2394,3 +2394,182 @@ async fn fox_two_hounds_share_one_type01_frame_on_60_hz_slots() {
     let _ = slot1;
     sim.shutdown().await;
 }
+
+/// Exercise the final key-time cap after Step 4b with the production worker.
+#[tokio::test]
+async fn key_time_late_cap_preserves_drop_and_offset() {
+    for (elapsed_ms, should_air) in [(3_000, true), (3_001, false)] {
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let utc_clock: pancetta_core::time::UtcClock = {
+            let clock = clock.clone();
+            std::sync::Arc::new(move || *clock.lock().unwrap())
+        };
+        let mut sim = CoordSim::new_with_utc_clock("K5ARH", utc_clock).await;
+        sim.set_rx_dial(14_074_000);
+        let qso_id = sim
+            .manager
+            .respond_to_cq_with(
+                "W1AW".to_string(),
+                2317.0,
+                Some(SlotParity::Even),
+                CallInitiation::Auto,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("start QSO");
+        let pending = sim.pump_qso_events();
+        assert_eq!(pending.len(), 1);
+        let required_parity = pending[0].tx_parity.expect("latched parity");
+        let target = pancetta_core::slot::next_slot_with_parity_with_period(
+            chrono::Utc::now() + chrono::Duration::seconds(15),
+            required_parity,
+            15_000_000_000,
+        );
+        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(500);
+        let attempt_id = pending[0].attempt_id.expect("attempt identity");
+        let gate = sim.ptt_sync_gate();
+        let held = gate.lock().await;
+        let before = sim.before_ptt_gate();
+        sim.submit(&pending).await;
+        if tokio::time::timeout(Duration::from_secs(8), before.notified())
+            .await
+            .is_err()
+        {
+            panic!("Step 4b timeout: {:?}", sim.observations.lock().unwrap());
+        }
+        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(elapsed_ms);
+        drop(held);
+        sim.drive_submitted_slot(pending).await;
+        assert!(sim
+            .observations
+            .lock()
+            .unwrap()
+            .settlements
+            .iter()
+            .any(|(_, id, aired)| *id == Some(attempt_id) && *aired == should_air));
+        if should_air {
+            sim.timeline
+                .assert_keyed_at_offset(&qso_id.to_string(), 2317.0);
+            sim.timeline.assert_all_released();
+            let obs = sim.observations.lock().unwrap();
+            assert_eq!(obs.ptt, [true, false]);
+            assert_eq!(obs.audio_frames.len(), 1);
+            assert!(!obs.audio_frames[0].0.is_empty());
+        } else {
+            sim.timeline.assert_not_keyed_for_qso(&qso_id.to_string());
+            sim.timeline.assert_silent();
+            assert!(sim.observations.lock().unwrap().ptt.is_empty());
+            assert_eq!(sim.observations.lock().unwrap().audio, 0);
+            assert_worker_diagnostic(&sim, "3001ms into the slot exceeds tx_late_max_ms=3000ms")
+                .await;
+        }
+        sim.shutdown().await;
+    }
+}
+
+/// A fresh same-grid sighting at the last gate holds only colliding parity.
+#[tokio::test]
+async fn final_dx_parity_gate_preserves_drop_and_offset() {
+    for should_air in [false, true] {
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let utc_clock: pancetta_core::time::UtcClock = {
+            let clock = clock.clone();
+            std::sync::Arc::new(move || *clock.lock().unwrap())
+        };
+        let mut sim = CoordSim::new_with_utc_clock("K5ARH", utc_clock).await;
+        sim.set_rx_dial(14_074_000);
+        let qso_id = sim
+            .manager
+            .respond_to_cq_with(
+                "W1AW".to_string(),
+                2317.0,
+                Some(SlotParity::Even),
+                CallInitiation::Auto,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("start QSO");
+        let pending = sim.pump_qso_events();
+        assert_eq!(pending.len(), 1);
+        let required_parity = pending[0].tx_parity.expect("latched parity");
+        let target = pancetta_core::slot::next_slot_with_parity_with_period(
+            chrono::Utc::now() + chrono::Duration::seconds(15),
+            required_parity,
+            15_000_000_000,
+        );
+        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(500);
+        let attempt_id = pending[0].attempt_id.expect("attempt identity");
+        let gate = sim.ptt_sync_gate();
+        let held = gate.lock().await;
+        let before = sim.before_ptt_gate();
+        sim.submit(&pending).await;
+        if tokio::time::timeout(Duration::from_secs(8), before.notified())
+            .await
+            .is_err()
+        {
+            panic!("Step 4b timeout: {:?}", sim.observations.lock().unwrap());
+        }
+        let sighting_parity = if should_air {
+            match required_parity {
+                SlotParity::Even => SlotParity::Odd,
+                SlotParity::Odd => SlotParity::Even,
+            }
+        } else {
+            required_parity
+        };
+        sim.record_dx_sighting("W1AW", sighting_parity, 14_074_000);
+        *clock.lock().unwrap() = target + chrono::Duration::milliseconds(1_000);
+        drop(held);
+        sim.drive_submitted_slot(pending).await;
+        assert!(sim
+            .observations
+            .lock()
+            .unwrap()
+            .settlements
+            .iter()
+            .any(|(_, id, aired)| *id == Some(attempt_id) && *aired == should_air));
+        if should_air {
+            sim.timeline
+                .assert_keyed_at_offset(&qso_id.to_string(), 2317.0);
+            sim.timeline.assert_all_released();
+            let obs = sim.observations.lock().unwrap();
+            assert_eq!(obs.ptt, [true, false]);
+            assert_eq!(obs.audio_frames.len(), 1);
+            assert!(!obs.audio_frames[0].0.is_empty());
+        } else {
+            sim.timeline.assert_not_keyed_for_qso(&qso_id.to_string());
+            sim.timeline.assert_silent();
+            assert!(sim.observations.lock().unwrap().ptt.is_empty());
+            assert_eq!(sim.observations.lock().unwrap().audio, 0);
+            assert_worker_diagnostic(&sim, "DX observed transmitting on the colliding parity")
+                .await;
+        }
+        sim.shutdown().await;
+    }
+}
+
+async fn assert_worker_diagnostic(sim: &CoordSim, needle: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if sim
+            .observations
+            .lock()
+            .unwrap()
+            .diagnostics
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "missing diagnostic {needle}: {:?}",
+            sim.observations.lock().unwrap().diagnostics
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}

@@ -14,68 +14,103 @@ use crate::dto::{DecodedView, DxRow, PendingCall, Placement, QsoProgress, Spectr
 use crate::wire_serde;
 use serde::{Deserialize, Serialize};
 
+/// A server→client event, tagged by `event` on the wire (rig-api.v1
+/// `serverEvent`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum ServerEvent {
     /// A single FT8 decode — nested as `{"event":"decoded","decoded":{…}}`.
     Decoded {
+        /// The decode, enriched for display.
         decoded: DecodedView,
     },
+    /// DX Hunter list update.
     DxHunter {
+        /// DX Hunter rows.
         rows: Vec<DxRow>,
     },
+    /// Full replacement of the active-QSO and pending-call lists.
     ActiveQsos {
+        /// QSOs currently active.
         qsos: Vec<QsoProgress>,
+        /// Manual calls parked in the cross-parity queue, not yet started.
         pending: Vec<PendingCall>,
     },
+    /// Rig dial frequency readback.
     Frequency {
+        /// VFO index the reading is for (0 = VFO A).
         vfo: u8,
+        /// Dial frequency in Hz.
         #[serde(rename = "frequencyHz")]
         frequency_hz: u64,
     },
+    /// Split TX state changed.
     Split {
+        /// Split TX dial frequency in Hz, or 0 for simplex.
         #[serde(rename = "txHz")]
         tx_hz: u64,
     },
     /// Station-wide operating mode changed (operator Shift+M). Additive,
     /// dispensa Q-0027 — see `StateSnapshot::mode`.
     Mode {
+        /// New active operating mode (`"FT8"`, `"FT4"` or `"FT2"`).
         mode: String,
     },
+    /// Rig S-meter reading.
     SignalStrength {
+        /// Signal strength in dB relative to S9 (0 = S9, about -54 = S0,
+        /// +20 = S9+20), per the hamlib `STRENGTH` convention.
         #[serde(rename = "dbOverS9")]
         db_over_s9: i32,
     },
     /// Waterfall/spectrum magnitude snapshot — nested as
     /// `{"event":"spectrum","spectrum":{…}}`. Additive, dispensa Q-0024.
     Spectrum {
+        /// The spectrum frame.
         spectrum: Spectrum,
     },
     /// Per-window TX-placement/openness ranking — nested as
     /// `{"event":"placement","placement":{…}}`. Additive, dispensa Q-0026.
     Placement {
+        /// The placement ranking.
         placement: Placement,
     },
+    /// Transmit-activity indicator reported by the TX worker.
     TxStatus {
+        /// `true` while a transmission is being keyed or aired, `false`
+        /// otherwise. Software-reported — set before the final key-down
+        /// checks — so it does not confirm hardware PTT.
         active: bool,
     },
+    /// Global TX policy changed.
     TxPolicy {
+        /// The current global TX policy.
         #[serde(with = "wire_serde::tx_policy")]
         policy: pancetta_core::TxPolicy,
     },
     /// Control/arm state for the receiving session.
     ControlState {
+        /// Whether the receiving session holds the control role.
         #[serde(rename = "controlHeldByMe")]
         control_held_by_me: bool,
+        /// Whether transmit is currently armed.
         #[serde(rename = "transmitArmed")]
         transmit_armed: bool,
     },
+    /// Free-form status report from a server component.
     Status {
+        /// Name of the reporting component.
         component: String,
+        /// Human-readable status text.
         status: String,
     },
+    /// Error report from a server component, such as a refused command or a
+    /// denied remote TX.
     Error {
+        /// Name of the reporting component (for example `"tx"` or
+        /// `"stationAgent"`).
         component: String,
+        /// Human-readable error text.
         message: String,
     },
 }

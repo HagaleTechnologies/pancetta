@@ -281,14 +281,14 @@ impl Default for Config {
     }
 }
 
-/// Whether `parent` is the default application-owned `~/.pancetta`
-/// directory, as opposed to an arbitrary custom `--config` parent this
-/// crate doesn't own. `home_dir` is taken explicitly (rather than calling
-/// `dirs::home_dir()` internally) purely for testability -- the real home
-/// directory can't be faked in a test process; production code always
-/// passes `dirs::home_dir()`.
-fn is_default_app_dir(parent: &std::path::Path, home_dir: Option<&std::path::Path>) -> bool {
-    home_dir.map(|h| h.join(".pancetta")).as_deref() == Some(parent)
+/// Whether `parent` is the application-owned data directory (`~/.pancetta`,
+/// or the `--data-dir` directory, PAN-376), as opposed to an arbitrary custom
+/// `--config` parent this crate doesn't own. `app_dir` is taken explicitly
+/// (rather than reading the process data directory internally) purely for
+/// testability; production code passes
+/// `pancetta_core::data_dir::try_current()`.
+fn is_app_data_dir(parent: &std::path::Path, app_dir: Option<&std::path::Path>) -> bool {
+    app_dir == Some(parent)
 }
 
 /// Push the `[ui] theme` load warning (PAN-387) when the label is unknown.
@@ -360,6 +360,43 @@ impl Config {
         append_theme_warning(&config, &mut warnings);
         append_band_plan_warning(&config, &mut warnings);
         Ok((config, warnings, loader.loaded_files()))
+    }
+
+    /// Like [`load_default_with_warnings`](Self::load_default_with_warnings),
+    /// but the only config search directory is `dir` (PAN-376: `pancetta
+    /// --data-dir DIR` without `--config`). Embedded defaults and `PANCETTA_*`
+    /// environment overrides still apply.
+    pub fn load_from_dir_with_warnings(dir: &std::path::Path) -> ConfigResult<(Self, Vec<String>)> {
+        let (config, warnings, _) = Self::load_from_dir_with_warnings_and_files(dir)?;
+        Ok((config, warnings))
+    }
+
+    /// Load from one directory and report its contributing files in precedence order.
+    pub fn load_from_dir_with_warnings_and_files(
+        dir: &std::path::Path,
+    ) -> ConfigResult<(Self, Vec<String>, Vec<PathBuf>)> {
+        let loader = ConfigLoader::with_search_paths(vec![dir.to_path_buf()])?;
+        let config = loader.load()?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
+        Ok((config, warnings, loader.loaded_files()))
+    }
+
+    /// Like [`load_default_unvalidated`](Self::load_default_unvalidated), but
+    /// the only config search directory is `dir` (PAN-376).
+    pub fn load_from_dir_unvalidated(dir: &std::path::Path) -> ConfigResult<(Self, LoadReport)> {
+        let loader = ConfigLoader::with_search_paths(vec![dir.to_path_buf()])?;
+        let config = loader.load_merged()?;
+        let mut warnings = loader.load_warnings();
+        append_theme_warning(&config, &mut warnings);
+        append_band_plan_warning(&config, &mut warnings);
+        let report = LoadReport {
+            files: loader.loaded_files(),
+            searched: loader.search_paths().to_vec(),
+            warnings,
+        };
+        Ok((config, report))
     }
 
     /// Discover and merge the config files on the default search path
@@ -523,7 +560,8 @@ impl Config {
     /// On Unix the temporary sibling is created `0o600` (owner-only from the
     /// first byte) and the rename preserves that mode, so every file this
     /// writes is owner-only. A parent directory this method just created —
-    /// or the default application-owned `~/.pancetta` directory — is forced
+    /// or the application-owned data directory (`~/.pancetta`, or the
+    /// `--data-dir` directory, PAN-376) — is forced
     /// to `0o700` (best effort); a pre-existing custom parent is left at
     /// whatever mode its owner intended. On non-Unix the per-user ACL
     /// restricts access; the write is still atomic (temp + rename).
@@ -566,7 +604,12 @@ impl Config {
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
                 {
-                    if !parent_existed || is_default_app_dir(parent, dirs::home_dir().as_deref()) {
+                    if !parent_existed
+                        || is_app_data_dir(
+                            parent,
+                            pancetta_core::data_dir::try_current().as_deref(),
+                        )
+                    {
                         use std::os::unix::fs::PermissionsExt;
                         // Best-effort. Ignore failure — the 0600 file is
                         // the real guarantee.
@@ -1475,23 +1518,24 @@ mod tests {
     /// alone when it already existed. `home_dir` is passed explicitly
     /// since `dirs::home_dir()` can't be faked in a test process.
     #[test]
-    fn is_default_app_dir_matches_only_the_dot_pancetta_child_of_home() {
+    fn is_app_data_dir_matches_only_the_app_data_dir() {
         let home = std::path::Path::new("/home/operator");
+        let app_dir = home.join(".pancetta");
         assert!(
-            is_default_app_dir(&home.join(".pancetta"), Some(home)),
+            is_app_data_dir(&home.join(".pancetta"), Some(&app_dir)),
             "the default app-owned directory must be recognized"
         );
         assert!(
-            !is_default_app_dir(&home.join("shared-configs"), Some(home)),
+            !is_app_data_dir(&home.join("shared-configs"), Some(&app_dir)),
             "a different directory under home must NOT be treated as app-owned"
         );
         assert!(
-            !is_default_app_dir(std::path::Path::new("/srv/shared"), Some(home)),
+            !is_app_data_dir(std::path::Path::new("/srv/shared"), Some(&app_dir)),
             "an unrelated custom directory must NOT be treated as app-owned"
         );
         assert!(
-            !is_default_app_dir(&home.join(".pancetta"), None),
-            "with no resolvable home dir, nothing can be recognized as the default"
+            !is_app_data_dir(&home.join(".pancetta"), None),
+            "with no resolvable data dir, nothing can be recognized as app-owned"
         );
     }
 
@@ -2061,6 +2105,10 @@ mod tests {
         assert!(!generated.contains("[metadata]"));
     }
 }
+
+#[cfg(test)]
+#[path = "lib/tests/data_dir_hardening_tests.rs"]
+mod data_dir_hardening_tests;
 
 /// Structural guardrail against the "field silently dropped by `merge_with`"
 /// bug class (see the 2026-07-05 CLAUDE.md entry and the
