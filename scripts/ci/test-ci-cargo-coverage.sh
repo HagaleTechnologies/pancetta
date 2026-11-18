@@ -90,3 +90,42 @@ raise 'failure step must read codex-clean result' unless script.include?('${{ ne
 end
 puts 'PASS: CI Cargo coverage, caches and routing'
 RUBY
+
+# PAN-372 remediation: the guard's sanctioned forms must excuse only their own
+# occurrence. A workflow line that pairs an allowed form (a compile-only check
+# command, an --exclude flag, the path-filter glob) with a forbidden research
+# reference -- a research test run on the same line -- must still trip the
+# guard. Each fixture writes a one-line workflow inside a disposable git repo
+# and runs the shipped script against it.
+repo_root=$PWD
+guard_repo=$(mktemp -d)
+trap 'rm -rf "$guard_repo"' EXIT
+git init -q "$guard_repo"
+mkdir -p "$guard_repo/.github/workflows"
+guard_case() {
+    local expect=$1 line=$2 got
+    printf '%s\n' "$line" > "$guard_repo/.github/workflows/ci.yml"
+    if (cd "$guard_repo" && bash "$repo_root/scripts/research-env.sh" --guard-ci) >/dev/null 2>&1; then
+        got=accept
+    else
+        got=reject
+    fi
+    if [ "$got" != "$expect" ]; then
+        echo "FAIL: guard verdict was '$got', expected '$expect': $line" >&2
+        exit 1
+    fi
+}
+# A research test run stays forbidden, alone or sharing a line with an
+# allowed form.
+guard_case reject "        run: cargo test -p pancetta-research --all-targets"
+guard_case reject "        run: cargo check -p pancetta-research --all-targets && cargo test -p pancetta-research --all-targets"
+guard_case reject "        run: cargo check -p pancetta-research --all-targets --features research-eval && cargo test -p pancetta-research"
+guard_case reject "        run: cargo build --workspace --exclude pancetta-research && cargo test -p pancetta-research"
+guard_case reject "        run: cargo test -p pancetta-research && echo 'pancetta-research/**'"
+# The sanctioned forms stay allowed on their own lines.
+guard_case accept "        run: cargo check -p pancetta-research --all-targets"
+guard_case accept "        run: cargo check -p pancetta-research --all-targets --features research-eval"
+guard_case accept "        run: cargo clippy --workspace --exclude pancetta-research --all-targets -- -D warnings"
+guard_case accept "              - 'pancetta-research/**'"
+guard_case accept "          # every Rust lane passes --exclude pancetta-research"
+echo "PASS: research guard allowances are occurrence-scoped"

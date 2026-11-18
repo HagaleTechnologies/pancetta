@@ -1,12 +1,14 @@
 # pancetta-research
 
 **Local-only crate. Run experiments on your dev machine. GitHub Actions
-runs only the non-required, compile-only Research Check (PAN-372). No CI tests,
-corpus runs, or cron jobs. If you find yourself wiring more into CI, stop.**
+runs only the non-required, compile-only Research Check (PAN-372): on
+dependency-affecting PRs and in the repo's weekly CI cron. No CI tests or
+corpus runs. If you find yourself wiring more into CI, stop.**
 
 PAN-372 adds one exception: the non-required, compile-only Research Check
-type-checks this crate on dependency-affecting PRs. It runs no tests and
-does not gate merges.
+type-checks this crate on dependency-affecting PRs and on the repo's weekly
+CI cron (`ci.yml` schedule, Mondays 12:00 UTC). It runs no tests and does
+not gate merges.
 
 This crate is the iteration harness for improving the pancetta decoder. It is
 deliberately excluded from the workspace `default-members`, so `cargo build`
