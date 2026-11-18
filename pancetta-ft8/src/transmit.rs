@@ -999,18 +999,28 @@ impl SafetyMonitor {
 /// Transmission configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TransmissionConfig {
+    /// Audio base frequency and band-edge limits.
     pub frequency_config: FrequencyConfig,
+    /// Drive level and station power limit.
     pub power_config: PowerConfig,
+    /// Output sample rate, sample format and device.
     pub audio_config: AudioConfig,
+    /// How PTT is keyed.
     pub ptt_config: PttConfig,
+    /// Safety limits (see `SafetyConfig`: its fields are stored but not read).
     pub safety_config: SafetyConfig,
 }
 
 /// Frequency configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrequencyConfig {
+    /// Audio base frequency in Hz handed to the modulator (default 1500). `transmit_message` adds
+    /// its offset to it and checks the sum against `band_limits`; the `transmit_*` helpers do not.
     pub base_frequency: f64,
+    /// Band edges that `transmit_message` requires `base_frequency` plus the TX offset to stay
+    /// `BAND_EDGE_MARGIN_HZ` inside.
     pub band_limits: BandLimits,
+    /// Frequency calibration correction (default 0.0). Stored but not applied by the transmitter.
     pub frequency_calibration: f64,
 }
 
@@ -1030,15 +1040,22 @@ impl Default for FrequencyConfig {
 /// Band edge limits
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BandLimits {
+    /// Lower band edge in Hz.
     pub lower_edge: f64,
+    /// Upper band edge in Hz.
     pub upper_edge: f64,
 }
 
 /// Power configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PowerConfig {
-    pub tx_power_level: f64,    // 0.0 - 1.0
-    pub max_power_watts: u8,    // Hardware limit
+    /// Drive level from 0.0 to 1.0, passed to the modulator as its TX power; `update_config`
+    /// rejects values outside that range.
+    pub tx_power_level: f64, // 0.0 - 1.0
+    /// Station power limit in watts; `transmit_message` is refused when it exceeds
+    /// `DEFAULT_MAX_POWER_WATTS` (the `transmit_*` helpers do not check it).
+    pub max_power_watts: u8, // Hardware limit
+    /// Power calibration factor (default 1.0). Stored but not applied by the transmitter.
     pub power_calibration: f64, // Calibration factor
 }
 
@@ -1055,9 +1072,17 @@ impl Default for PowerConfig {
 /// Audio configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// Output sample rate in Hz. The modulator is built with it; `update_config` passes a new
+    /// value to the output stream only.
     pub sample_rate: u32,
+    /// Sample format `convert_samples` writes the waveform in before playback. Playback reads the
+    /// bytes back as little-endian `f32`, so only a 32-bit float format plays correctly.
     pub format: AudioFormat,
+    /// Output device, matched against cpal device descriptions; `None` uses the host's default
+    /// output device.
     pub device_name: Option<String>,
+    /// Requested output buffer size (default 1024). Not read: the output stream uses cpal's default
+    /// buffer size.
     pub buffer_size: usize,
 }
 
@@ -1075,13 +1100,24 @@ impl Default for AudioConfig {
 /// PTT configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PttConfig {
+    /// Which interface keys the transmitter.
     pub method: PttMethod,
+    /// Serial port opened for `SerialDtr`, `SerialRts` and `CatCommand` PTT; `None` opens no port,
+    /// so those methods key nothing.
     pub serial_port: Option<String>,
+    /// Baud rate used when opening `serial_port`.
     pub serial_baud_rate: u32,
+    /// GPIO pin number passed to rppal's `Gpio::get` for `Gpio` PTT (needs the `gpio` feature).
     pub gpio_pin_number: u8,
+    /// When true the GPIO pin is driven high to key and low to unkey; when false the levels are
+    /// inverted.
     pub gpio_active_high: bool,
+    /// Bytes written to `serial_port` to key the rig with `CatCommand` PTT (default `TX1;`).
     pub cat_ptt_on_command: String,
+    /// Bytes written to `serial_port` to unkey the rig with `CatCommand` PTT (default `TX0;`).
     pub cat_ptt_off_command: String,
+    /// VOX delay in milliseconds (default `VOX_DELAY_MS`). Stored but not read by the PTT
+    /// controller.
     pub vox_delay_ms: u64,
 }
 
@@ -1103,21 +1139,38 @@ impl Default for PttConfig {
 /// PTT control methods
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PttMethod {
+    /// No PTT control; keying and unkeying do nothing.
     None,
+    /// Key by asserting DTR on `serial_port`.
     SerialDtr,
+    /// Key by asserting RTS on `serial_port`.
     SerialRts,
+    /// Key by writing `cat_ptt_on_command` and `cat_ptt_off_command` to `serial_port`.
     CatCommand,
+    /// Key by driving a GPIO pin; without the `gpio` feature, construction fails with
+    /// `Ft8Error::ConfigError`.
     Gpio,
+    /// Rely on the rig's VOX; the controller drives no hardware.
     Vox,
 }
 
 /// Safety configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfig {
+    /// Whether to enforce the cumulative TX-time limit. Not read: `transmit_message` always
+    /// enforces `MAX_TX_TIME_SECONDS` through the safety monitor.
     pub enable_tx_timeout: bool,
+    /// Cumulative TX-time limit in seconds (default `MAX_TX_TIME_SECONDS`). Not read: the safety
+    /// monitor uses the constant.
     pub max_tx_time_seconds: u64,
+    /// Minimum time in seconds since the previous transmission started (default
+    /// `MIN_TX_INTERVAL_SECONDS`). Not read: the safety monitor uses the constant.
     pub min_tx_interval_seconds: u64,
+    /// Whether to check band edges. Not read: `transmit_message` always checks them and the
+    /// `transmit_*` helpers never do.
     pub enable_band_edge_protection: bool,
+    /// Band-edge margin in Hz (default `BAND_EDGE_MARGIN_HZ`). Not read: the band-edge check uses
+    /// the constant.
     pub band_edge_margin_hz: f64,
 }
 
@@ -1136,67 +1189,103 @@ impl Default for SafetyConfig {
 /// Current transmission state
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransmissionState {
+    /// Not transmitting: the state at construction, after `transmit_message` completes and after
+    /// `clear_emergency_stop`.
     Idle,
+    /// `transmit_message` is encoding, modulating and waiting for the slot, before PTT is keyed.
     Preparing,
+    /// PTT is keyed and audio is playing. The `transmit_*` helpers leave the state here after
+    /// they return.
     Transmitting,
+    /// `emergency_stop` ran; transmissions are refused until `clear_emergency_stop`.
     EmergencyStop,
 }
 
 /// Transmission report
 #[derive(Debug, Clone)]
 pub struct TransmissionReport {
+    /// Message text that was transmitted.
     pub message: String,
+    /// Wall-clock time keying began, computed at completion as now minus `duration`.
     pub start_time: SystemTime,
+    /// Time from keying to PTT release, including the PTT lead and tail times.
     pub duration: Duration,
+    /// Audio offset in Hz; currently always 0.0, not the requested offset.
     pub frequency_offset: f64,
+    /// Drive level (0.0 to 1.0) from `PowerConfig::tx_power_level`.
     pub power_level: f64,
+    /// Whether the transmission succeeded; always true, since failures return `Err` instead.
     pub success: bool,
+    /// Error text; always `None`, since failures return `Err` instead.
     pub error_message: Option<String>,
 }
 
 /// Transmission statistics
 #[derive(Debug, Clone)]
 pub struct TransmissionStatistics {
+    /// `transmit_message` transmissions in the safety log since the last reset (the log keeps the
+    /// last 100); the `transmit_*` helpers are not recorded.
     pub total_transmissions: usize,
+    /// Cumulative `transmit_message` TX time since the last reset, in whole seconds.
     pub total_tx_time_seconds: u64,
+    /// Seconds left before the `MAX_TX_TIME_SECONDS` limit is reached.
     pub remaining_tx_time_seconds: u64,
+    /// Time since the safety monitor was created or last reset by `clear_emergency_stop`.
     pub time_since_reset: Duration,
+    /// Whether the safety monitor would allow a transmission now.
     pub transmission_allowed: bool,
 }
 
 /// Test report
 #[derive(Debug, Clone)]
 pub struct TestReport {
+    /// Result of keying and releasing PTT.
     pub ptt_test: PttTestResult,
+    /// Result of playing a 1000 Hz test tone.
     pub audio_test: AudioTestResult,
+    /// Frequency-accuracy result; a placeholder (zeros, within tolerance) because the measurement
+    /// is not implemented.
     pub frequency_test: FrequencyTestResult,
+    /// Wall time the whole test took.
     pub total_test_time: Duration,
+    /// Overall result; always true, since failures return `Err` instead.
     pub success: bool,
 }
 
 /// PTT test result
 #[derive(Debug, Clone)]
 pub struct PttTestResult {
+    /// Whether PTT keyed and released; always true, since failures return `Err` instead.
     pub success: bool,
+    /// Time from keying to release, including a 100 ms hold.
     pub test_duration: Duration,
+    /// Error text; always `None`, since failures return `Err` instead.
     pub error_message: Option<String>,
 }
 
 /// Audio test result
 #[derive(Debug, Clone)]
 pub struct AudioTestResult {
+    /// Whether the test tone played; always true, since failures return `Err` instead.
     pub success: bool,
+    /// Time the test took, including the tone's playback.
     pub test_duration: Duration,
+    /// Configured output sample rate in Hz.
     pub sample_rate: u32,
+    /// Error text; always `None`, since failures return `Err` instead.
     pub error_message: Option<String>,
 }
 
 /// Frequency test result
 #[derive(Debug, Clone)]
 pub struct FrequencyTestResult {
+    /// Expected tone frequency in Hz (0.0 in the placeholder result).
     pub target_frequency: f64,
+    /// Measured tone frequency in Hz (0.0 in the placeholder result).
     pub measured_frequency: f64,
+    /// Difference between measured and target frequency in Hz (0.0 in the placeholder result).
     pub frequency_error: f64,
+    /// Whether the error is within tolerance (true in the placeholder result).
     pub within_tolerance: bool,
 }
 

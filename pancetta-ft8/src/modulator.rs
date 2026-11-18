@@ -49,7 +49,10 @@ pub enum PulseShape {
     Rectangular,
     /// Gaussian pulse shaping with configurable BT product
     /// BT=2.0 is the FT8 standard (close to rectangular but with smooth transitions)
-    Gaussian { bt: f64 },
+    Gaussian {
+        /// Gaussian filter bandwidth-time product (BT).
+        bt: f64,
+    },
 }
 
 /// FT8 audio modulator for generating transmission signals

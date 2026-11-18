@@ -12,42 +12,59 @@ use crate::wire_serde;
 use pancetta_core::{slot::SlotParity, ResponseStep};
 use serde::{Deserialize, Serialize};
 
+/// A client→server command, tagged by `cmd` on the wire (rig-api.v1
+/// `clientCommand`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 pub enum ClientCommand {
     /// Set the RX dial (Hz). `vfo` 0 = A.
     SetFrequency {
+        /// Target VFO index (0 = VFO A).
         vfo: u8,
+        /// Target dial frequency in Hz.
         #[serde(rename = "frequencyHz")]
         frequency_hz: u64,
     },
     /// Enable/disable split; `tx_frequency_hz` ignored when disabled.
     SetSplit {
+        /// Whether split operation is enabled.
         enabled: bool,
+        /// TX dial frequency in Hz; meaningful only when `enabled`.
         #[serde(rename = "txFrequencyHz")]
         tx_frequency_hz: u64,
     },
     /// Call a station selected from the DX Hunter list.
     CallStation {
+        /// Callsign of the DX station to call.
         callsign: String,
+        /// The DX station's audio offset in Hz within the passband, where it
+        /// was heard.
         #[serde(rename = "frequencyHz")]
         frequency_hz: u64,
+        /// The DX station's TX slot parity; `None` when unknown.
         #[serde(rename = "dxParity", with = "wire_serde::slot_parity_opt")]
         dx_parity: Option<SlotParity>,
     },
     /// Answer a station calling us, opening at `step`.
     AnswerCaller {
+        /// Callsign of the station calling us.
         callsign: String,
+        /// The caller's audio offset in Hz within the passband.
         #[serde(rename = "frequencyHz")]
         frequency_hz: u64,
+        /// The caller's TX slot parity; `None` when unknown.
         #[serde(rename = "dxParity", with = "wire_serde::slot_parity_opt")]
         dx_parity: Option<SlotParity>,
+        /// Exchange step our first reply opens at.
         #[serde(with = "wire_serde::response_step")]
         step: ResponseStep,
+        /// The caller's decoded SNR in dB; `None` when the client did not
+        /// supply one.
         snr: Option<f32>,
     },
     /// Start a manual CQ at the given audio offset (Hz).
     StartCq {
+        /// Audio offset in Hz within the passband to call CQ on.
         #[serde(rename = "frequencyOffsetHz")]
         frequency_offset_hz: f64,
     },
@@ -60,7 +77,10 @@ pub enum ClientCommand {
     /// Release the control role.
     ReleaseControl,
     /// Arm/disarm transmit for this control session (must be armed before any TX).
-    SetTransmitArmed { armed: bool },
+    SetTransmitArmed {
+        /// `true` to arm transmit, `false` to disarm.
+        armed: bool,
+    },
 }
 
 #[cfg(test)]
