@@ -1261,3 +1261,13 @@ when that contract exists; this ticket does not wait for it.
   the key's generation is unchanged, so a reopened, failed or re-completed QSO
   keeps the key it needs. A reopened QSO shows `73 to <call> was not sent; QSO
   not logged, still open`.
+
+## Rig API schema conformance (PAN-379)
+
+`pancetta-protocol/tests/fixtures/rig-api.v1.schema.json` is a verbatim copy of
+`contracts/rig/rig-api.v1.schema.json` from dispensa commit
+`869efaa7d565dcb15f81b4003643bd3da53012ca` (v1.4). On a contract bump,
+re-vendor the upstream bytes, update the source revision and version assertion
+in `rig_api_conformance.rs`, and run `cargo test --locked -p pancetta-protocol
+--test rig_api_conformance`. The existing Workspace Tests CI lane runs this
+suite, including for a change to the vendored schema alone.
