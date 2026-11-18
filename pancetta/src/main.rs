@@ -2471,7 +2471,14 @@ async fn load_configuration_with_warnings(
                     // selects before JSON in the same search directory.
                     match run_first_time_setup(&defaults, &failed_path, true)? {
                         Some(fixed) => {
-                            config_after_recovery(fixed, Config::load_default_with_warnings)
+                            // Codex P1 on #705: keep the contributing files, so F7/F8
+                            // saves go to the recovered source that wins, not a fallback.
+                            let (config, warnings, files) = config_after_recovery(
+                                fixed,
+                                Config::load_default_with_warnings_and_files,
+                            );
+                            loaded_files = files;
+                            (config, warnings)
                         }
                         None => {
                             return Err(anyhow::anyhow!(e))
@@ -2554,12 +2561,15 @@ fn config_file_to_repair(e: &pancetta_config::ConfigError) -> Option<PathBuf> {
 /// A warning names the sections where other files change the wizard's
 /// `fixed` values. When the reload still fails (the operator declined to
 /// save, or another file is broken too) this warns and falls back to `fixed`.
+/// The reload's contributing files come back in precedence order, so live
+/// targeted writes (TX drive) reach the file that won; the fallback has none
+/// and those writes use the default config path.
 fn config_after_recovery(
     fixed: Config,
-    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>)>,
-) -> (Config, Vec<String>) {
+    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>, Vec<PathBuf>)>,
+) -> (Config, Vec<String>, Vec<PathBuf>) {
     match reload() {
-        Ok((config, mut warnings)) => {
+        Ok((config, mut warnings, files)) => {
             let changed = sections_that_differ(&fixed, &config);
             if !changed.is_empty() {
                 warnings.push(format!(
@@ -2568,7 +2578,7 @@ fn config_after_recovery(
                     changed.join(", ")
                 ));
             }
-            (config, warnings)
+            (config, warnings, files)
         }
         Err(e) => (
             fixed,
@@ -2576,6 +2586,7 @@ fn config_after_recovery(
                 "The configuration on disk still does not load ({e}); this session runs \
                  on the setup values only"
             )],
+            Vec::new(),
         ),
     }
 }
@@ -3800,9 +3811,9 @@ mod tests {
         fixed.station.callsign = "W1AW".to_string();
         persist_wizard_config(&fixed, &broken, true).unwrap();
 
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             let config = loader.load()?;
-            Ok((config, loader.load_warnings()))
+            Ok((config, loader.load_warnings(), loader.loaded_files()))
         });
         let next_start = loader.load().unwrap();
         assert_eq!(config.station.callsign, next_start.station.callsign);
@@ -3811,6 +3822,10 @@ mod tests {
         // The operator is told the wizard's values did not all survive.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[audio], [station]"), "{warnings:?}");
+        // Both files come back, the higher-precedence one last, so a live
+        // drive save targets the file whose value the next start reads.
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files.last(), Some(&high.path().join("pancetta.toml")));
     }
 
     #[test]
@@ -3826,19 +3841,20 @@ mod tests {
         fixed.audio.input_device = "USB Audio CODEC".to_string();
         persist_wizard_config(&fixed, &broken, true).unwrap();
 
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             let config = loader.load()?;
-            Ok((config, loader.load_warnings()))
+            Ok((config, loader.load_warnings(), loader.loaded_files()))
         });
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(config.station.callsign, "W1AW");
+        assert_eq!(files, vec![broken]);
     }
 
     #[test]
     fn config_after_recovery_falls_back_when_the_reload_fails() {
         let mut fixed = Config::default();
         fixed.station.callsign = "W1AW".to_string();
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             Err(pancetta_config::ConfigError::Validation(
                 "still broken".into(),
             ))
@@ -3847,6 +3863,7 @@ mod tests {
         // A warning, not just stderr: the TUI takes over the terminal.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("still broken"), "{warnings:?}");
+        assert!(files.is_empty(), "{files:?}");
     }
 
     #[test]
