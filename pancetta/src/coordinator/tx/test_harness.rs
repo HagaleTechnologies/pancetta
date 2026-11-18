@@ -18,6 +18,9 @@ pub struct WorkerHarness {
     pub operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     pub split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     pub remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    /// The worker's Fox-admitted QSO keys (PAN-386), so a scenario can admit
+    /// Fox streams the way the coordinator's Fox mode does.
+    pub fox_admitted_qsos: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 
     pub hamlib: crossbeam_channel::Receiver<ComponentMessage>,
     pub audio: crossbeam_channel::Receiver<ComponentMessage>,
@@ -88,6 +91,7 @@ impl WorkerHarness {
             operating_frequency_hz: coordinator.operating_frequency_hz.clone(),
             split_tx_frequency_hz: coordinator.split_tx_frequency_hz.clone(),
             remote_tx_arm: coordinator.remote_tx_arm.clone(),
+            fox_admitted_qsos: coordinator.fox_admitted_qsos.clone(),
             outcomes: Default::default(),
             coordinator,
             bus,
