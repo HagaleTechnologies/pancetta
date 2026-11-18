@@ -53,7 +53,9 @@ pub struct ftx_message_t {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ftx_candidate_t {
-    /// Candidate score (non-negative number; higher score means higher likelihood).
+    /// Candidate sync score; higher score means higher likelihood. The sync
+    /// kernels average magnitude differences, so with a permissive `min_score`
+    /// the raw value can be negative.
     pub score: i16,
     /// Index of the time block.
     pub time_offset: i16,
@@ -104,7 +106,9 @@ pub struct Ft8LibSeed {
 /// Declared outside any `cfg` so the real and stub builds share one signature.
 #[derive(Debug, Clone, Default)]
 pub struct Ft8LibSeedSet {
-    /// The sync-search candidates ft8_lib found, in its heap order.
+    /// The sync-search candidates ft8_lib found, in descending score order
+    /// (`ftx_find_candidates` heap-sorts before returning; the copy here
+    /// preserves that order).
     pub seeds: Vec<Ft8LibSeed>,
     /// The monitor's `min_bin`: first FFT bin in the analysed frequency range.
     pub min_bin: i32,
@@ -112,7 +116,8 @@ pub struct Ft8LibSeedSet {
     pub time_osr: i32,
     /// The waterfall's number of frequency subdivisions per tone spacing.
     pub freq_osr: i32,
-    /// The waterfall's number of FFT bins, in 6.25 Hz tone-spacing units.
+    /// The waterfall's number of FFT bins, one per protocol tone spacing
+    /// (6.25 Hz for FT8, about 20.83 Hz for FT4).
     pub num_bins: i32,
     /// The number of blocks (symbols) stored in the waterfall.
     pub num_blocks: i32,
@@ -160,7 +165,8 @@ pub struct ftx_waterfall_t {
     pub max_blocks: i32, // offset 0
     /// Number of blocks (symbols) stored in the `mag` array.
     pub num_blocks: i32, // offset 4
-    /// Number of FFT bins in terms of 6.25 Hz.
+    /// Number of FFT bins, in units of one protocol tone spacing (6.25 Hz for
+    /// FT8, about 20.83 Hz for FT4); independent of `freq_osr`.
     pub num_bins: i32, // offset 8
     /// Number of time subdivisions.
     pub time_osr: i32, // offset 12

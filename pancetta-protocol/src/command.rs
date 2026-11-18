@@ -76,9 +76,13 @@ pub enum ClientCommand {
     TakeControl,
     /// Release the control role.
     ReleaseControl,
-    /// Arm/disarm transmit for this control session (must be armed before any TX).
+    /// Legacy disarm command. Arming is NOT done through it: the station
+    /// agent maps `armed: false` to a disarm of any current arm and treats
+    /// `armed: true` as unsupported, because a real arm requires the
+    /// separately-signed `txArm` frame (e2e-auth.v1).
     SetTransmitArmed {
-        /// `true` to arm transmit, `false` to disarm.
+        /// `false` disarms transmit; `true` is unsupported (arming needs a
+        /// signed `txArm`, not this command).
         armed: bool,
     },
 }

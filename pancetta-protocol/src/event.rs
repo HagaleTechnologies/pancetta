@@ -75,9 +75,11 @@ pub enum ServerEvent {
         /// The placement ranking.
         placement: Placement,
     },
-    /// Transmitter keyed/unkeyed indicator.
+    /// Transmit-activity indicator reported by the TX worker.
     TxStatus {
-        /// `true` while PTT is asserted, `false` once the transmission ends.
+        /// `true` while a transmission is being keyed or aired, `false`
+        /// otherwise. Software-reported — set before the final key-down
+        /// checks — so it does not confirm hardware PTT.
         active: bool,
     },
     /// Global TX policy changed.

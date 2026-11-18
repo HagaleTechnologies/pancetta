@@ -299,7 +299,8 @@ pub enum Ft8Error {
     #[error("Signal processing error: {0}")]
     SignalProcessingError(String),
 
-    /// A message could not be decoded or unpacked; the string describes why.
+    /// A message could not be decoded or unpacked, or the LDPC encoder
+    /// rejected an input length; the string describes why.
     #[error("Message decoding error: {0}")]
     MessageDecodingError(String),
 
@@ -307,7 +308,8 @@ pub enum Ft8Error {
     #[error("Time synchronization error: {0}")]
     SyncError(String),
 
-    /// A configuration value was invalid; the string describes which.
+    /// A configuration value was invalid, or an audio output stream could
+    /// not be built or started; the string describes which.
     #[error("Configuration error: {0}")]
     ConfigError(String),
 

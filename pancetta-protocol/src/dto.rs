@@ -54,7 +54,8 @@ pub struct DxRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QsoProgress {
-    /// Stable id of the QSO (UUID string); commands target a QSO by this id.
+    /// Stable id of the QSO (UUID string). No `ClientCommand` targets a QSO
+    /// by this id; the call and answer commands select stations by callsign.
     pub qso_id: String,
     /// The other station's callsign.
     pub their_callsign: String,
@@ -69,13 +70,16 @@ pub struct QsoProgress {
     pub ladder_labels: Vec<String>,
     /// Per rung of `ladder_labels`, true when that rung's message is one we transmit.
     pub ladder_ours: Vec<bool>,
-    /// Index of the current rung in `ladder_labels`.
+    /// Index of the current rung in `ladder_labels`; `0` when the labels are
+    /// empty (states with no ladder), so check the labels before indexing.
     pub ladder_index: usize,
     /// Human-readable line describing what the QSO is doing now; empty when there is no ladder.
     pub now_line: String,
     /// Human-readable line describing what is expected next; empty when there is no ladder.
     pub next_line: String,
-    /// Raw text of the last message we transmitted in this QSO; `None` before our first TX.
+    /// Raw text of the most recent recorded outbound message; `None` until
+    /// one is recorded. A manual opener records its first message before it
+    /// airs, so this can be set before the first transmission.
     pub last_tx_text: Option<String>,
     /// Raw text of the last message received from the other station; `None` before any.
     pub last_rx_text: Option<String>,

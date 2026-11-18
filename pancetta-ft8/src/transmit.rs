@@ -1102,8 +1102,9 @@ impl Default for AudioConfig {
 pub struct PttConfig {
     /// Which interface keys the transmitter.
     pub method: PttMethod,
-    /// Serial port opened for `SerialDtr`, `SerialRts` and `CatCommand` PTT; `None` opens no port,
-    /// so those methods key nothing.
+    /// Serial port opened for `SerialDtr`, `SerialRts` and `CatCommand` PTT. `None` opens no port
+    /// at initialization, so those methods key nothing; a later reconfiguration to `None` leaves
+    /// an already-open port in place.
     pub serial_port: Option<String>,
     /// Baud rate used when opening `serial_port`.
     pub serial_baud_rate: u32,
@@ -1194,10 +1195,12 @@ pub enum TransmissionState {
     Idle,
     /// `transmit_message` is encoding, modulating and waiting for the slot, before PTT is keyed.
     Preparing,
-    /// PTT is keyed and audio is playing. The `transmit_*` helpers leave the state here after
-    /// they return.
+    /// Software transmit state: set in `execute_transmission` before PTT is asserted and audio
+    /// starts, and left set after the `transmit_*` helpers return (audio and PTT may already
+    /// have stopped). `transmit_message` resets it to `Idle` once its transmission completes.
     Transmitting,
-    /// `emergency_stop` ran; transmissions are refused until `clear_emergency_stop`.
+    /// `emergency_stop` ran; `transmit_message` refuses to transmit until `clear_emergency_stop`.
+    /// The `transmit_*` helpers do not check this flag.
     EmergencyStop,
 }
 
@@ -1255,7 +1258,9 @@ pub struct TestReport {
 /// PTT test result
 #[derive(Debug, Clone)]
 pub struct PttTestResult {
-    /// Whether PTT keyed and released; always true, since failures return `Err` instead.
+    /// Whether the PTT controller's key and unkey calls succeeded; always true, since failures
+    /// return `Err` instead. `None` and `Vox` take no hardware action, so this does not verify
+    /// radio keying.
     pub success: bool,
     /// Time from keying to release, including a 100 ms hold.
     pub test_duration: Duration,
