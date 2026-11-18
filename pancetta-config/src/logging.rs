@@ -15,6 +15,6 @@ impl ConfigSection for LoggingConfig {
         Ok(())
     }
     fn merge_with(&mut self, other: Self) {
-        self.attribution_comment = other.attribution_comment;
+        *self = other;
     }
 }

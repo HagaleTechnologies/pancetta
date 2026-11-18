@@ -2098,12 +2098,13 @@ mod data_dir_hardening_tests;
 /// bug class (see the 2026-07-05 CLAUDE.md entry and the
 /// `merge_with_carries_over_*` regression tests in network.rs / station.rs).
 ///
-/// Every `ConfigSection::merge_with` is a hand-maintained list of
-/// `self.field = other.field` lines, so a field added to a config struct later
-/// is trivially forgotten — the parse and validation passes both succeed and
+/// A `ConfigSection::merge_with` that is not a plain `*self = other` is a
+/// hand-maintained list of per-field lines, so a field added to its struct
+/// later is easily forgotten. The parse and validation passes both succeed and
 /// only the *merge* silently reverts the field to its compiled-in default. The
 /// field-specific regression tests only guard the fields someone thought to
-/// list; this test is structural.
+/// list; this test is structural. `merge_rules_tests` (PAN-371) pins what each
+/// field does when the base is populated.
 ///
 /// For each config type we build a *fully non-default* instance by serializing
 /// its `Default`, then perturbing every scalar leaf to a different, non-empty,
