@@ -340,6 +340,27 @@ fn create_message_row<'a>(
         app.theme.text
     };
 
+    // PAN-381: a decode a same-host WSJT-X sent over UDP leads its Msg cell
+    // with `EXT ` — Msg is the one column shown at every width. On a row
+    // directed at us the marker takes the row's directed style so it stays
+    // legible on that background. Every other row keeps the plain cell.
+    let msg_cell = if msg.external && !msg.is_own_tx {
+        let prefix_style = if msg.is_directed_at_us {
+            msg_style
+        } else {
+            app.theme.external
+        };
+        // The cell keeps `msg_style` too, so the padding after the text
+        // fills like a native row's (Light's directed row has a background).
+        Cell::from(Line::from(vec![
+            Span::styled("EXT ", prefix_style),
+            Span::styled(msg_str, msg_style),
+        ]))
+        .style(msg_style)
+    } else {
+        Cell::from(msg_str).style(msg_style)
+    };
+
     let neutral_style = if msg.is_directed_at_us {
         directed_style
     } else {
@@ -387,10 +408,7 @@ fn create_message_row<'a>(
             BandActivityColumn::Dist,
             Cell::from(dist_str).style(neutral_style),
         ),
-        (
-            BandActivityColumn::Msg,
-            Cell::from(msg_str).style(msg_style),
-        ),
+        (BandActivityColumn::Msg, msg_cell),
     ];
 
     Row::new(
@@ -811,6 +829,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -1008,3 +1027,7 @@ mod tests {
         assert!(!is_valid_callsign(""));
     }
 }
+
+#[cfg(test)]
+#[path = "band_activity/tests/external_tag_tests.rs"]
+mod external_tag_tests;

@@ -181,7 +181,7 @@ ft8_to_tui_tx    ->  ft8_to_tui_rx     (RelayedDecode, bounded 500)
 waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, bounded 100)
 ```
 
-**`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs}`) speaks
+**`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs,ingest.rs}`) speaks
 the WSJT-X-compatible UDP protocol for GridTracker/JTAlert/logger interop, following the
 same disabled-drain / enabled-task lifecycle as `psk_reporter.rs`. It taps into the rest
 of the coordinator additively, in three places: an FT8-decode fan-out tap in `ft8.rs`
@@ -193,9 +193,15 @@ QSO into `QSOLogged(5)` + `LoggedADIF(12)`; and an inbound-dispatch gate on the 
 socket processes `Reply`/`HaltTx`/`Replay` requests only after they pass the fail-closed
 source/consent checks described in `docs/DECISIONS/remote-operation.md` (a GridTracker
 double-click becomes a `QsoMessage::StartQso { remote_origin: true }`, which routes
-through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses). None of
-these taps touch an existing `→Tui` send path — `pancetta-tui` behavior stays
-byte-identical whether or not `[network.wsjtx_udp]` is enabled.
+through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses). A fourth
+piece, the PAN-381 decode listener (`pancetta/src/coordinator/wsjtx_udp/ingest.rs`), binds
+a separate receive-only loopback socket on `decode_listen`, learns a same-host WSJT-X's
+dial from its `Status(1)` datagrams and turns each live `Decode(2)` into a `RelayedDecode`
+tagged `DecodeOrigin::WsjtxUdp`. The outbound taps touch no existing `→Tui` send path.
+The decode listener is the one exception: when `accept_decodes = true` it sends only on a
+clone of `ft8_to_tui_tx` (never the message bus, so the QSO engine, Autonomous, PSKReporter
+and the remote gateway never see its decodes), and with it off `pancetta-tui` behavior
+stays byte-identical whether or not `[network.wsjtx_udp]` is enabled.
 
 ---
 

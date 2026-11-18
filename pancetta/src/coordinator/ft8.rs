@@ -615,7 +615,7 @@ fn cross_time_decode_record(
 /// belt-and-suspenders strip applied once, at the boundary:
 ///   - drops control chars (`< 0x20`), DEL (`0x7f`), and ESC (`0x1b`),
 ///   - caps length to [`MAX_DECODED_FIELD_LEN`] chars.
-fn sanitize_decoded_field(s: &str) -> String {
+pub(super) fn sanitize_decoded_field(s: &str) -> String {
     s.chars()
         .filter(|&c| c != '\u{1b}' && c != '\u{7f}' && c >= '\u{20}')
         .take(MAX_DECODED_FIELD_LEN)
@@ -626,7 +626,7 @@ fn sanitize_decoded_field(s: &str) -> String {
 /// in place — applied once at the bus boundary before the message is broadcast.
 /// Covers the top-level `text` plus the inner `message`'s `from_callsign`,
 /// `to_callsign`, `grid_square`, and `text` (all the operator-/log-visible strings).
-fn sanitize_decoded_message(decoded_msg: &mut pancetta_ft8::DecodedMessage) {
+pub(super) fn sanitize_decoded_message(decoded_msg: &mut pancetta_ft8::DecodedMessage) {
     decoded_msg.text = sanitize_decoded_field(&decoded_msg.text);
     if let Some(ref call) = decoded_msg.message.from_callsign {
         decoded_msg.message.from_callsign = Some(sanitize_decoded_field(call));
@@ -2220,6 +2220,7 @@ impl super::ApplicationCoordinator {
                                 .send(super::pipeline::RelayedDecode {
                                     message: decoded_msg.clone(),
                                     dial_hz,
+                                    origin: super::pipeline::DecodeOrigin::Native,
                                 })
                                 .is_err()
                             {

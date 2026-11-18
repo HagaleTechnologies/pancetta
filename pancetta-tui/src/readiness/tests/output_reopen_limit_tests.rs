@@ -25,6 +25,7 @@ fn pan295_decode() -> crate::app::DecodedMessageView {
         priority_score: None,
         priority_factors: None,
         is_own_tx: false,
+        external: false,
     }
 }
 
