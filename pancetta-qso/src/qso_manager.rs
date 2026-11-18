@@ -7861,7 +7861,7 @@ impl QsoManager {
                 MessageType::ReportAck {
                     from_station,
                     to_station,
-                    ..
+                    report,
                 },
             ) => {
                 if self
@@ -7877,9 +7877,13 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
+                // With no report latched yet (we answered with a report, as a
+                // Fox answers a Hound, or the DX returned our call bare), the
+                // R-report the DX just sent is their report of us; log that,
+                // not the -15 placeholder (PAN-386).
                 Ok(QsoState::WaitingForConfirmation {
                     their_callsign: their_callsign.clone(),
-                    their_report: their_report.unwrap_or(-15),
+                    their_report: their_report.unwrap_or(*report),
                     our_report: *our_report,
                     frequency: *frequency,
                     grid_square: None,

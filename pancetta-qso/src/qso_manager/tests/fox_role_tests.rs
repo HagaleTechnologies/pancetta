@@ -261,6 +261,59 @@ async fn fox_r_report_completes_when_rr73_airs() {
     assert_eq!(completions(&drain(&mut rx)), 0);
 }
 
+/// The Fox answered with a report, so it holds no report from the Hound
+/// until the Hound's R-report. The logged RST_RCVD is that R-report's
+/// value, never the -15 placeholder.
+#[tokio::test]
+async fn fox_logs_the_hounds_r_report_as_received() {
+    let manager = manager();
+    let id = answer(&manager, "W9XYZ", 360.0, 1500.0).await;
+    assert!(manager.mark_fox_role(id).await);
+    let mut rx = manager.subscribe();
+    manager
+        .process_message(
+            MessageType::ReportAck {
+                to_station: FOX.into(),
+                from_station: "W9XYZ".into(),
+                report: -3,
+            },
+            format!("{FOX} W9XYZ R-03"),
+            360.0,
+            Some(-10.0),
+        )
+        .await
+        .unwrap();
+    let (attempt, _) = last_send(&drain(&mut rx)).unwrap();
+    assert!(matches!(
+        manager.get_qso(id).await.unwrap().state,
+        QsoState::Completed {
+            their_report: -3,
+            our_report: -8,
+            ..
+        }
+    ));
+
+    let payload = UnsentAttemptPayload {
+        frequency_hz: 360.0,
+        remote_binding: None,
+    };
+    assert_eq!(
+        manager
+            .confirm_completion_aired(id, attempt, "", &payload, Utc::now())
+            .await,
+        CompletionAired::Committed
+    );
+    let logged = drain(&mut rx)
+        .into_iter()
+        .find_map(|e| match e {
+            QsoEvent::QsoCompleted { metadata, .. } => Some(metadata),
+            _ => None,
+        })
+        .expect("the contact is logged once RR73 airs");
+    assert_eq!(logged.reports.received, Some(-3));
+    assert_eq!(logged.reports.sent, Some(-8));
+}
+
 #[tokio::test]
 async fn fox_rr73_not_aired_reopens_the_qso() {
     let manager = manager();
