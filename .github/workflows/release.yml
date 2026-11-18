@@ -9,8 +9,9 @@ name: Release
 #     guard + a run-the-binary smoke step verify the real C decoder is baked
 #     in. Without the submodule, pancetta-ft8/build.rs silently falls back to
 #     ft8lib_stub (degraded decode recall) — a stub binary must NEVER ship.
-#   - pancetta-research is a local-only iteration harness (CLAUDE.md): never
-#     built in CI. This workflow builds `-p pancetta` only, so it is excluded
+#   - pancetta-research is a local-only iteration harness (CLAUDE.md). The
+#     non-required Research Check in ci.yml is its only CI compile lane.
+#     This workflow builds `-p pancetta` only, so it is excluded
 #     structurally — do not change this to a --workspace build.
 #   - Windows uses the GNU (MinGW) toolchain, never MSVC: MSVC cannot compile
 #     the VLAs in vendor/ft8_lib/ft8/decode.c (error C2057; see the
