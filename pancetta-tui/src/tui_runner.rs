@@ -10327,5 +10327,7 @@ mod waterfall_key_tests;
 #[cfg(test)]
 #[path = "tui_runner/tests/tx_drive_tests.rs"]
 mod tx_drive_tests;
+
+#[cfg(test)]
 #[path = "tui_runner/tests/external_reply_tests.rs"]
 mod external_reply_tests;
