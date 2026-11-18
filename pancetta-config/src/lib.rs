@@ -365,12 +365,20 @@ impl Config {
     /// --data-dir DIR` without `--config`). Embedded defaults and `PANCETTA_*`
     /// environment overrides still apply.
     pub fn load_from_dir_with_warnings(dir: &std::path::Path) -> ConfigResult<(Self, Vec<String>)> {
+        let (config, warnings, _) = Self::load_from_dir_with_warnings_and_files(dir)?;
+        Ok((config, warnings))
+    }
+
+    /// Load from one directory and report its contributing files in precedence order.
+    pub fn load_from_dir_with_warnings_and_files(
+        dir: &std::path::Path,
+    ) -> ConfigResult<(Self, Vec<String>, Vec<PathBuf>)> {
         let loader = ConfigLoader::with_search_paths(vec![dir.to_path_buf()])?;
         let config = loader.load()?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
         append_band_plan_warning(&config, &mut warnings);
-        Ok((config, warnings))
+        Ok((config, warnings, loader.loaded_files()))
     }
 
     /// Like [`load_default_unvalidated`](Self::load_default_unvalidated), but

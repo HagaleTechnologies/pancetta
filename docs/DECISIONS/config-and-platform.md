@@ -714,11 +714,9 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
 - `directory` is honored, and pancetta expands a leading `~` itself: the
   config loader never expands `~` inside values (`loader.rs` tests). Empty
   means `~/.pancetta/recordings`.
-- The `directory` default stays `~/Documents/Pancetta/Recordings`, and
-  `defaults.toml` is unchanged. The station corpus offload (magazzino
-  `clients/pancetta-wav-offload.sh`) reads `~/.pancetta/recordings`, so a
-  corpus station sets `directory` explicitly. sophon did so on 2026-10-16,
-  before this shipped.
+- PAN-125 kept `~/Documents/Pancetta/Recordings` as the default. Corpus
+  stations set `directory` to `~/.pancetta/recordings` for offload. PAN-376
+  made an omitted directory use the station's data directory.
 - The cap stays a hardcoded 10 GB. The other `[audio.recording]` keys stay
   unread. Restart-required like every non-live key — including across DSP
   supervisor restarts, because the running config snapshot is patched only
@@ -1347,7 +1345,8 @@ draft. macOS signing and notarization remain PAN-265.
 
 A global `--data-dir <DIR>` flag moves all station state out of
 `~/.pancetta`. A live station locks `<data-dir>/pancetta.lock`, so two
-stations cannot share one logbook. Without the flag nothing moves.
+stations cannot share one logbook. Without the flag the data directory
+is still `~/.pancetta`.
 
 1. Flag only, `global = true`, `value_name = "DIR"`. There is no
    `PANCETTA_DATA_DIR` variable. The ticket names the flag, the macOS
@@ -1371,7 +1370,8 @@ stations cannot share one logbook. Without the flag nothing moves.
 4. An explicit config value still wins over the data directory for
    `key_dir`, `audit_log_path`, `[audio.recording] directory` and
    `adif_backup_directory`. `~` inside a config value still expands
-   against the home directory, so existing configs keep their meaning.
+   against the home directory. With recording enabled, an omitted or empty
+   directory uses `<data-dir>/recordings`.
 5. `Config::write_secure_atomic*` re-hardens the process data directory to
    0700 on Unix, as it did for `~/.pancetta` alone. A custom directory
    holds the same secrets.

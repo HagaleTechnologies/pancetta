@@ -173,7 +173,7 @@ directory = "~/.pancetta/recordings"
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
-| `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+| `directory` | string | `""` | Where recordings go. Omitted or empty uses `<data-dir>/recordings` (`~/.pancetta/recordings` by default). Pancetta creates the directory if needed and expands a leading `~` to your home directory (`~user` is not expanded). |
 | `raw_capture_minutes` | integer | `0` | Minutes of raw 48 kHz capture after each start, one WAV per FT8 slot, into `raw48/` inside `directory`. `0` is off. Needs `auto_record = true` and `[audio] sample_rate = 48000`. |
 
 - Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
@@ -197,9 +197,9 @@ directory = "~/.pancetta/recordings"
 **Station decoder corpus.** The corpus offload job (magazzino
 `clients/pancetta-wav-offload.sh`) and the decoder research tools
 (`curate --source-dir ~/.pancetta/recordings`, see docs/RUNBOOK.md) read
-`~/.pancetta/recordings`. A station that feeds them must set both keys as
-shown above. `auto_record = true` on its own records into the default
-`~/Documents/Pancetta/Recordings`, which nothing collects.
+`~/.pancetta/recordings`. A station using the default data directory only
+needs `auto_record = true`. With a custom data directory, point the tools
+at that station's recordings or set `directory` explicitly as shown above.
 
 **Raw 48 kHz capture.** For decimation studies, pancetta can also keep the
 raw capture stream, before it is decimated to 12 kHz, for a set time after
@@ -1853,11 +1853,9 @@ for this file.
 ### Decode-window recordings
 
 Decode-window WAVs exist only on a station whose config sets
-`[audio.recording] auto_record = true`, and land in
-`audio.recording.directory` (see the `[audio.recording]` section above).
-The station decoder corpus — the magazzino offload job and the
-`pancetta-research` curation tools — reads `~/.pancetta/recordings`, so a
-corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
+`[audio.recording] auto_record = true`. They land in `<data-dir>/recordings`
+unless `audio.recording.directory` names a path (see the `[audio.recording]`
+section above).
 Releases before this setting existed recorded every window into
 `~/.pancetta/recordings` unconditionally; upgrading does not touch those
 files, and deleting them reclaims the space (the directory was capped at
