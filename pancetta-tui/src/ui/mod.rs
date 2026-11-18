@@ -2144,7 +2144,10 @@ fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(vec![
             marker,
-            Span::raw(crate::presentation::tx_meter_text(row)),
+            Span::raw(crate::presentation::tx_meter_text_with_drive(
+                row,
+                app.tx_drive,
+            )),
         ]));
     }
     // PAN-89: was inverted (green "system default" for the misconfig).

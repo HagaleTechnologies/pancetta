@@ -13,7 +13,6 @@ const WAIVERS: &[(&str, &str)] = &[
     ("audio.levels.meter_ballistics.peak_attack_ms", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("audio.levels.meter_ballistics.peak_decay_ms", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("audio.levels.meter_ballistics.rms_averaging_ms", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
-    ("audio.levels.output_gain_db", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("audio.levels.peak_clip_db", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("audio.levels.peak_warning_db", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),
     ("audio.levels.rms_target_db", "Pre-existing audio schema debt or reference omitted by the conservative cfg(test) cutoff; outside PAN-303 removals"),

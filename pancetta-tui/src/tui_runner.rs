@@ -185,6 +185,11 @@ pub enum TuiMessage {
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on.
     TxMeterCapability(pancetta_core::tx_meter::TxMeterCapability),
+    /// Authoritative TX audio drive from the station.
+    TxDriveState {
+        db: f32,
+        ceiling_db: f32,
+    },
     /// DX spot
     DxSpot {
         callsign: String,
@@ -565,6 +570,8 @@ pub enum TuiCommand {
     /// Coordinator owns the tone-active state; the TUI just sends the
     /// toggle.
     ToggleTune,
+    /// Adjust station TX audio drive by one signed dB step.
+    AdjustTxDrive { delta_db: i8 },
     /// Call a station (click-to-call from band activity)
     CallStation {
         callsign: String,
@@ -1083,6 +1090,9 @@ impl TuiRunner {
             TuiMessage::TxMeterCapability(capability) => {
                 app.set_tx_meter_capability(capability);
             }
+            TuiMessage::TxDriveState { db, ceiling_db } => {
+                app.tx_drive = Some((db, ceiling_db));
+            }
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
@@ -1498,6 +1508,11 @@ impl TuiRunner {
         self.dispatched.push(action);
 
         match action {
+            Action::TxDriveDown | Action::TxDriveUp => {
+                self.message_tx.send(TuiCommand::AdjustTxDrive {
+                    delta_db: if action == Action::TxDriveDown { -1 } else { 1 },
+                })?;
+            }
             Action::AckOutOfBand => {
                 app.out_of_band_ack_visible = false;
                 {
@@ -10282,3 +10297,7 @@ mod pan333_terminal_guard {
 #[cfg(test)]
 #[path = "tui_runner/tests/waterfall_key_tests.rs"]
 mod waterfall_key_tests;
+
+#[cfg(test)]
+#[path = "tui_runner/tests/tx_drive_tests.rs"]
+mod tx_drive_tests;

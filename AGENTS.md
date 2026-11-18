@@ -40,6 +40,7 @@ TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses config
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
 CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
 TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
+Live TX audio drive (PAN-438) is implemented, unreleased: F7/F8 step the station's drive in dB, saved in `audio.levels.output_gain_db` and applied at the next TX or Tune; hardware qualification pending.
 
 ## Building and Testing
 

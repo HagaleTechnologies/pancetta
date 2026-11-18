@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- PAN-438: F7/F8 in the station TUI adjust TX audio drive by 1 dB, bounded by a −20 dB floor and configurable ceiling (0 dB by default). The station saves `audio.levels.output_gain_db`; FT transmissions and Tune use the selected level. ALC diagnostics name F7. Positive ceilings reserve bundle headroom. Automated tests cover the setting; on-air qualification is pending.
+
 - PAN-315: use rustls for HTTPS and WSS, remove SQLite TLS and unused dependencies, replace validator with equivalent station bound checks, align WebSocket and system utility versions, declare Rust 1.98, and enforce dependency hygiene in Supply Chain. The sha2 0.11 migration remains follow-up work.
 - PAN-295: a silent audio-output stall (no callbacks for 2 s, no cpal error) now requests a forced device reopen, retrying every 10 s while the output stays silent, at most three times in a rolling ten minutes. The cap covers only these output-watchdog reopens; input-stale and processing-error recovery keep their own cadence. TX stays muted until output callbacks resume; a reopen result alone never unmutes. When the limit is reached the readiness strip shows `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d`. Automated coverage only; hardware qualification pending.
 - PAN-290: a poisoned false-positive filter lock no longer stops FT8 decoding; each window decodes with the filter bypassed and logs a warning, and the autonomous TX-side gate keeps its stored filter.

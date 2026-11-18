@@ -1179,6 +1179,20 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         &[main_no_ctrl_alt(c('T'), Action::ToggleTune)],
     ),
     kb(
+        "F7 / F8",
+        "TX audio drive down / up by 1 dB",
+        Category::TxControl,
+        false,
+        &[
+            ch(Scope::Main, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Main, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+            ch(Scope::Health, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Health, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+            ch(Scope::Diagnostics, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Diagnostics, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+        ],
+    ),
+    kb(
         "h",
         "Halt current TX",
         Category::TxControl,

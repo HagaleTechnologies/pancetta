@@ -301,6 +301,27 @@ fn append_theme_warning(config: &Config, warnings: &mut Vec<String>) {
 }
 
 impl Config {
+    /// Bound a finite legacy TX gain after all config layers have merged.
+    /// Invalid values remain untouched so validation can name the field.
+    pub fn clamp_tx_drive(&mut self) -> Option<String> {
+        let levels = &mut self.audio.levels;
+        if !levels.output_gain_db.is_finite()
+            || !levels.output_gain_ceiling_db.is_finite()
+            || !(-20.0..=5.0).contains(&levels.output_gain_ceiling_db)
+        {
+            return None;
+        }
+        let raw = levels.output_gain_db;
+        let applied = raw.clamp(-20.0, levels.output_gain_ceiling_db);
+        if raw == applied {
+            return None;
+        }
+        levels.output_gain_db = applied;
+        Some(format!(
+            "audio.levels.output_gain_db {raw} dB is outside the selectable range; using {applied} dB"
+        ))
+    }
+
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
@@ -314,11 +335,19 @@ impl Config {
     /// A discovered config file that fails to load is an error
     /// ([`ConfigError::FileLoad`]), never a warning.
     pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
+        let (config, warnings, _) = Self::load_default_with_warnings_and_files()?;
+        Ok((config, warnings))
+    }
+
+    /// Load the effective config and report its contributing files in
+    /// precedence order, so live targeted writes can use the source that won.
+    pub fn load_default_with_warnings_and_files() -> ConfigResult<(Self, Vec<String>, Vec<PathBuf>)>
+    {
         let loader = ConfigLoader::new()?;
         let config = loader.load()?;
         let mut warnings = loader.load_warnings();
         append_theme_warning(&config, &mut warnings);
-        Ok((config, warnings))
+        Ok((config, warnings, loader.loaded_files()))
     }
 
     /// Discover and merge the config files on the default search path
@@ -364,7 +393,11 @@ impl Config {
     /// Load configuration from a specific file
     pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
-        loader.load_from_file(path)
+        let mut config = loader.load_from_file(path)?;
+        if let Some(warning) = config.clamp_tx_drive() {
+            tracing::warn!("{warning}");
+        }
+        Ok(config)
     }
 
     /// Load configuration from a specific file, additionally returning any
@@ -377,8 +410,12 @@ impl Config {
         path: P,
     ) -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
-        let config = loader.load_from_file(path)?;
+        let mut config = loader.load_from_file(path)?;
         let mut warnings = loader.load_warnings();
+        if let Some(warning) = config.clamp_tx_drive() {
+            tracing::warn!("{warning}");
+            warnings.push(warning);
+        }
         append_theme_warning(&config, &mut warnings);
         Ok((config, warnings))
     }
@@ -857,6 +894,43 @@ impl Config {
                 .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Save only the selected TX audio drive. The caller serializes this with
+    /// other config writes and resolves any symlink before entering here.
+    pub fn save_output_gain_db(path: &std::path::Path, is_toml: bool, db: f32) -> ConfigResult<()> {
+        if !db.is_finite() || !(-20.0..=5.0).contains(&db) {
+            return Err(ConfigError::InvalidValue {
+                field: "audio.levels.output_gain_db".into(),
+                value: db.to_string(),
+            });
+        }
+        if is_toml {
+            let mut doc = Self::read_edit_doc(path)?;
+            let levels = Self::edit_table_at(doc.as_item_mut(), &["audio", "levels"], "")?
+                .as_table_like_mut()
+                .expect("edit_table_at returns a table");
+            Self::set_edit_leaf(levels, "output_gain_db", &toml::Value::Float(db as f64))?;
+            Self::write_secure_atomic(path, &doc.to_string())
+        } else {
+            let mut doc: serde_json::Value = match std::fs::read_to_string(path) {
+                Ok(contents) => serde_json::from_str(&contents)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(e.into()),
+            };
+            let mut parent = &mut doc;
+            for key in ["audio", "levels"] {
+                let map = parent.as_object_mut().ok_or_else(|| {
+                    ConfigError::Validation(format!("[{key}] parent in config is not an object"))
+                })?;
+                parent = map.entry(key).or_insert_with(|| serde_json::json!({}));
+            }
+            let map = parent.as_object_mut().ok_or_else(|| {
+                ConfigError::Validation("[audio.levels] in config is not an object".into())
+            })?;
+            map.insert("output_gain_db".into(), serde_json::json!(db));
+            Self::write_secure_atomic(path, &serde_json::to_string_pretty(&doc)?)
         }
     }
 

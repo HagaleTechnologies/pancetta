@@ -524,7 +524,8 @@ async fn run_application(cli: Cli) -> Result<()> {
     let sweep_requested = cli.gain_sweep_seconds.is_some();
     let gain_options = cli.gain_sweep_seconds.zip(cli.gain_sweep_report.clone());
     // Load configuration
-    let (config, config_warnings) = load_configuration_with_warnings(&cli).await?;
+    let (config, config_warnings, loaded_config_files) =
+        load_configuration_with_warnings(&cli).await?;
 
     info!("Configuration loaded successfully");
     debug!("Configuration: {}", config.summary());
@@ -582,6 +583,10 @@ async fn run_application(cli: Cli) -> Result<()> {
     }
 
     // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
+    let tx_drive_config_path = loaded_config_files
+        .last()
+        .map(|path| std::path::absolute(path).unwrap_or_else(|_| path.clone()))
+        .unwrap_or_else(|| config_write_path(&cli));
     let config_write_path = config_write_path(&cli);
     let config_write_is_toml = config_write_is_toml(&cli);
     // PAN-103: config reloads watch and read the path as given, so a
@@ -608,6 +613,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         None,
     )
     .await?;
+    coordinator.set_tx_drive_config_path(tx_drive_config_path);
     if let Some((seconds, path)) = gain_options {
         coordinator.configure_gain_sweep(seconds, path)?;
     }
@@ -2319,7 +2325,7 @@ fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path)
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {
-    let (config, _warnings) = load_configuration_with_warnings(cli).await?;
+    let (config, _warnings, _files) = load_configuration_with_warnings(cli).await?;
     Ok(config)
 }
 
@@ -2387,15 +2393,21 @@ fn config_write_is_toml(cli: &Cli) -> bool {
 /// (e.g. an unknown section or misspelled key). The warnings are printed to
 /// the console here and also returned so they can be surfaced in the TUI. A
 /// config file that fails to load is an error, never a warning (PAN-90).
-async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<String>)> {
+async fn load_configuration_with_warnings(
+    cli: &Cli,
+) -> Result<(Config, Vec<String>, Vec<PathBuf>)> {
+    let mut loaded_files = Vec::new();
     let (mut config, warnings) = if let Some(config_path) = &cli.config {
         // PAN-90: the warnings-returning loader, so an explicit `--config`
         // file's unknown-key warnings reach the console and the TUI too.
         Config::load_from_file_with_warnings(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
-        match Config::load_default_with_warnings() {
-            Ok(pair) => pair,
+        match Config::load_default_with_warnings_and_files() {
+            Ok((config, warnings, files)) => {
+                loaded_files = files;
+                (config, warnings)
+            }
             Err(e)
                 if offer_wizard_on_load_failure(
                     cli.headless,
@@ -2474,7 +2486,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         }
     }
 
-    Ok((config, warnings))
+    Ok((config, warnings, loaded_files))
 }
 
 /// The de-brick wizard offer fires only for interactive TUI launches —
