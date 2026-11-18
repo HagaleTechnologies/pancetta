@@ -2,6 +2,26 @@
 //!
 //! This module provides the core QSO management functionality including
 //! state transitions, timeout handling, and QSO lifecycle management.
+//!
+//! ## Where the code lives
+//!
+//! `QsoManager` is one struct with `impl QsoManager` blocks in five files.
+//! This file holds the struct, its types and constants, the constructor and
+//! source injectors, the shared open path (`start_cq`, `respond_to_cq_with`),
+//! `process_message_with_parity`, the TX attempt ledger, the completion hold
+//! and event emission. The child modules hold the rest:
+//!
+//! - `qso_manager/relevance.rs`: which active QSO a decoded frame belongs to.
+//! - `qso_manager/transition.rs`: the state machine, including
+//!   `determine_state_transition`.
+//! - `qso_manager/relocation.rs`: moving a QSO's TX offset and relatching a
+//!   partner's frequency.
+//! - `qso_manager/manual_calls.rs`: operator-initiated calls, keep-calling
+//!   and the timeout watchdog.
+//!
+//! A decoded frame goes from `process_message_with_parity` to
+//! `find_qsos_for_message` (relevance.rs), then to `process_message_for_qso`
+//! and `determine_state_transition` (transition.rs).
 
 use crate::async_database::QsoDatabase;
 use crate::states::*;
