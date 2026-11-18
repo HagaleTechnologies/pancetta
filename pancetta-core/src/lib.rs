@@ -37,10 +37,12 @@ pub mod gridsquare;
 pub mod response_step;
 pub mod slot;
 pub mod slot_clock;
+pub mod solar;
 pub mod tx_freq_mode;
 pub mod tx_meter;
 pub mod tx_policy;
 pub mod types;
+pub mod utc_window;
 
 // Re-export core types at the crate root for convenience
 pub use diagnostic_level::DiagnosticLevel;
