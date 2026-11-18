@@ -56,6 +56,7 @@ mod swr_guard;
 mod tier;
 mod tui_relay;
 mod tx;
+#[path = "tx/drive.rs"]
 mod tx_drive;
 mod tx_halt;
 mod tx_log;

@@ -64,5 +64,5 @@ pub(crate) fn apply(samples: &mut [f32], db: f32, ceiling_db: f32, bundle: bool)
 }
 
 #[cfg(test)]
-#[path = "tx/tests/tx_drive_tests.rs"]
+#[path = "tests/tx_drive_tests.rs"]
 mod tx_drive_tests;

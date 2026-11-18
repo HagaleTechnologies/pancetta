@@ -40,11 +40,8 @@ TUI QRZ station lookup (PAN-343) is implemented, unreleased: Shift+L uses config
 Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watchlist pins, the local logbook needed/ATNO/confirmed fallback with LoTW file import and opt-in confirmation-based need, and per-target upload state in Recent QSOs (row glyphs, selected-contact detail, completion toast) are implemented, unreleased; live notification-service and on-air qualification are pending.
 CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
 TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
-<<<<<<< HEAD
 Live TX audio drive (PAN-438) is implemented, unreleased: F7/F8 step the station's drive in dB, saved in `audio.levels.output_gain_db` and applied at the next TX or Tune; hardware qualification pending.
-=======
 FT8 Fox slots and type 0.1 multiplexing (PAN-386) are implemented, unreleased: Fox CQ and Hound streams on 60 Hz slots in 300-900 Hz, RR73 and a report shared in one type 0.1 frame, contact logged when RR73 airs; decoded by pancetta's own decoders only, WSJT-X Hound and on-air qualification pending.
->>>>>>> 8e4a8361eb133100423ef40ec2a11e22b812fe8c
 
 ## Building and Testing
 
