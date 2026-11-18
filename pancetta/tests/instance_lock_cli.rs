@@ -242,7 +242,8 @@ fn a_second_station_on_the_default_data_dir_is_refused() {
     let refusal = format!(
         "another pancetta is running (pid {}) with data directory {}",
         first.pid(),
-        dir.display()
+        // As the OS resolves it (macOS temp dirs live under /private/var).
+        fs::canonicalize(&dir).unwrap().display()
     );
     assert!(err.contains(&refusal), "missing {refusal:?} in:\n{err}");
 
