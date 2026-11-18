@@ -756,6 +756,14 @@ fn hound_switch_range_for(
     metadata: &crate::states::QsoMetadata,
     config: &QsoManagerConfig,
 ) -> Option<(f64, f64)> {
+    if metadata.fox {
+        // PAN-386: a Fox-role stream owns one 60 Hz slot in 300-900 Hz for
+        // its whole life, so its switch window is that single point. A stall
+        // switch, revert or `u` nudge to any other offset is refused at
+        // commit, exactly as a QSY'd Hound's is.
+        let slot = metadata.frequency;
+        return slot.is_finite().then_some((slot, slot));
+    }
     if !metadata.hound {
         return None;
     }
@@ -2677,6 +2685,7 @@ impl QsoManager {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin,
             remote_client_key_id: remote_client_key_id.clone(),
             // CQ-path latch: resolved from our own preference, not an
@@ -2820,6 +2829,7 @@ impl QsoManager {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
             remote_origin,
@@ -3120,6 +3130,36 @@ impl QsoManager {
         }
     }
 
+    /// PAN-386: mark an active, non-Hound QSO as a Fox-role stream.
+    ///
+    /// Fox mode calls this right after it opens the Fox CQ or answers a
+    /// Hound, next to `record_fox_admitted`, the same way `stamp_hound_flag`
+    /// marks a Hound after creation. A Fox stream is pinned to its slot (see
+    /// `hound_switch_range_for`) and never drift-relatched, so a pending drift
+    /// candidate is cleared here, with a state refresh only when one existed.
+    /// Returns `false` for an unknown or Hound QSO, or one that is neither
+    /// active nor `Completed`.
+    pub async fn mark_fox_role(&self, qso_id: QsoId) -> bool {
+        let mut qsos = self.qsos.write().await;
+        let Some(progress) = qsos.get_mut(&qso_id) else {
+            return false;
+        };
+        // A Hound answered at its RR73 step opens already `Completed` with
+        // the closing RR73 still to air; it is a Fox stream too, so its slot
+        // stays held through the completion grace.
+        let open_or_closing =
+            progress.state.is_active() || matches!(progress.state, QsoState::Completed { .. });
+        if progress.metadata.hound || !open_or_closing {
+            return false;
+        }
+        progress.metadata.fox = true;
+        if progress.metadata.pending_freq_drift.take().is_some() {
+            let state = progress.state.clone();
+            self.emit_state_change(qso_id, state.clone(), state).await;
+        }
+        true
+    }
+
     /// PAN-15 item 3: returns `Some(separation)` when a candidate relatched
     /// `partner_freq` has drifted within [`MIN_TX_SEPARATION_HZ`] of our own
     /// TX offset — the caller should warn, since we may now be keying
@@ -3315,6 +3355,7 @@ impl QsoManager {
             partner_freq,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin,
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
@@ -3766,6 +3807,7 @@ impl QsoManager {
             partner_freq,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin,
             remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
@@ -4004,7 +4046,9 @@ impl QsoManager {
             if !progress.state.is_active() {
                 continue;
             }
-            if progress.metadata.hound {
+            if progress.metadata.hound || progress.metadata.fox {
+                // PAN-386: a Fox-role stream is pinned to its slot, so its TX
+                // offset and `partner_freq` never relatch either.
                 // Genuine Hound/Fox only. The Fox's RX offset is protocol-fixed for
                 // the QSO's life and Hound has its own one-shot QSY mechanism.
                 // `partner_freq` alone is not a Hound discriminator: ordinary manual
@@ -4373,6 +4417,39 @@ impl QsoManager {
             .collect()
     }
 
+    /// PAN-386: active TX offsets split into `(fox_role, others)`, with the
+    /// same `is_active()` filter as [`Self::active_tx_offsets`]. Fox slot
+    /// selection (`fox_slot_offset`) spaces Fox streams 60 Hz apart and keeps
+    /// 75 Hz from every other stream.
+    ///
+    /// A Fox-role QSO that completed within [`COMPLETED_QSO_REWORK_GRACE`]
+    /// still holds its slot: its closing RR73 may not have aired yet (the
+    /// PAN-280 hold), and a new Hound answered on that slot would collide
+    /// with it in the same bundle.
+    pub async fn active_tx_offsets_by_fox_role(&self) -> (Vec<f64>, Vec<f64>) {
+        let qsos = self.qsos.read().await;
+        let now = self.now_utc();
+        let mut fox = Vec::new();
+        let mut others = Vec::new();
+        let holds_slot = |p: &&QsoProgress| {
+            p.state.is_active()
+                || (p.metadata.fox
+                    && matches!(
+                        p.state,
+                        QsoState::Completed { completed_at, .. }
+                            if now - completed_at < COMPLETED_QSO_REWORK_GRACE
+                    ))
+        };
+        for p in qsos.values().filter(holds_slot) {
+            if p.metadata.fox {
+                fox.push(p.metadata.frequency);
+            } else {
+                others.push(p.metadata.frequency);
+            }
+        }
+        (fox, others)
+    }
+
     /// Cancel a QSO
     pub async fn cancel_qso(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
         let mut qsos = self.qsos.write().await;
@@ -4696,6 +4773,7 @@ impl QsoManager {
         matches!(p.state, QsoState::Completed { .. })
             && p.metadata.initiated_by == CallInitiation::Manual
             && !p.metadata.hound
+            && !p.metadata.fox
             && Self::completed_band(p) == want_band
     }
 
@@ -6284,7 +6362,7 @@ impl QsoManager {
         // `initiated_by` is threaded through so the manual-only state-regression
         // arms ("back up to where the DX thinks we are") never fire for
         // autonomous QSOs.
-        let new_state = self
+        let mut new_state = self
             .determine_state_transition(
                 qso_id,
                 &old_state,
@@ -6394,6 +6472,43 @@ impl QsoManager {
         // on, and a 73 would only add QRM to the Fox's next Hounds.
         if progress.metadata.hound && hound_suppresses_reply(reply_to_emit.as_ref()) {
             reply_to_emit = None;
+        }
+        // PAN-386: a WSJT-X Fox logs a Hound when it sends RR73
+        // (`mainwindow.cpp` Fox logging at RR73); the Hound sends no 73 back.
+        // So for a Fox-role QSO the Hound's R-report completes the contact:
+        // the `WaitingForConfirmation` result becomes `Completed`, and the
+        // held-completion arm below keeps `QsoCompleted` until the RR73's
+        // `TxFrameSent` arrives, reverting to `old_state` if it never airs
+        // (PAN-280).
+        if progress.metadata.fox
+            && matches!(message.message_type, MessageType::ReportAck { .. })
+            && matches!(
+                old_state,
+                QsoState::WaitingForReport { .. } | QsoState::SendingReport { .. }
+            )
+            && matches!(reply_to_emit, Some(MessageType::FinalConfirmation { .. }))
+        {
+            if let QsoState::WaitingForConfirmation {
+                their_callsign,
+                their_report,
+                our_report,
+                frequency,
+                grid_square,
+                started_at,
+            } = &new_state
+            {
+                let completed_at = self.now_utc();
+                let duration_seconds = (completed_at - *started_at).num_seconds().max(0) as u32;
+                new_state = QsoState::Completed {
+                    their_callsign: their_callsign.clone(),
+                    their_report: *their_report,
+                    our_report: *our_report,
+                    frequency: *frequency,
+                    grid_square: grid_square.clone(),
+                    completed_at,
+                    duration_seconds,
+                };
+            }
         }
 
         // UX audit Batch 2 #8: latch the DX's grid the moment it arrives in a
@@ -7746,7 +7861,7 @@ impl QsoManager {
                 MessageType::ReportAck {
                     from_station,
                     to_station,
-                    ..
+                    report,
                 },
             ) => {
                 if self
@@ -7762,9 +7877,13 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
+                // With no report latched yet (we answered with a report, as a
+                // Fox answers a Hound, or the DX returned our call bare), the
+                // R-report the DX just sent is their report of us; log that,
+                // not the -15 placeholder (PAN-386).
                 Ok(QsoState::WaitingForConfirmation {
                     their_callsign: their_callsign.clone(),
-                    their_report: their_report.unwrap_or(-15),
+                    their_report: their_report.unwrap_or(*report),
                     our_report: *our_report,
                     frequency: *frequency,
                     grid_square: None,
@@ -8254,7 +8373,12 @@ impl QsoManager {
                 FREQ_TOLERANCE_HZ
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
+            // PAN-386: same Fox-slot baseline as `is_message_relevant`.
+            let fox_slot_baseline = metadata.fox
+                && state.their_callsign().is_some()
+                && matches_baseline(metadata.frequency);
             matches_baseline(match_frequency)
+                || fox_slot_baseline
                 || live_pre_switch_offset_at(
                     metadata,
                     self.now_utc(),
@@ -8541,7 +8665,16 @@ impl QsoManager {
                 FREQ_TOLERANCE_HZ
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
+            // PAN-386: a WSJT-X Hound answers on the audio frequency where it
+            // decoded the Fox's report, which is the Fox-role QSO's own TX
+            // slot, not the Hound's calling frequency in `partner_freq`. Once
+            // the partner call is known, that slot is one more baseline; the
+            // callsign and state match above still decide who may use it.
+            let fox_slot_baseline = metadata.fox
+                && state.their_callsign().is_some()
+                && matches_baseline(metadata.frequency);
             if !matches_baseline(match_freq)
+                && !fox_slot_baseline
                 && !live_pre_switch_offset_at(
                     metadata,
                     self.now_utc(),
@@ -10184,6 +10317,9 @@ mod answered_frame_tests;
 #[path = "qso_manager/tests/has_active_or_recent_qso_tests.rs"]
 mod has_active_or_recent_qso_tests;
 
+#[cfg(test)]
+#[path = "qso_manager/tests/fox_role_tests.rs"]
+mod fox_role_tests;
 #[cfg(test)]
 #[path = "qso_manager/tests/hound_tests.rs"]
 mod hound_tests;
