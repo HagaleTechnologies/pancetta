@@ -135,6 +135,28 @@ pub(crate) fn tx_meter_text(row: TxMeterRow) -> String {
     }
 }
 
+/// Prefix the CAT meter with the station's audio drive, which is available without CAT.
+pub(crate) fn tx_meter_text_with_drive(row: TxMeterRow, drive: Option<(f32, f32)>) -> String {
+    let meter = tx_meter_text(row);
+    let drive = match drive {
+        Some((db, ceiling)) if (db - ceiling).abs() < 0.0001 => {
+            format!("drive {} dB (ceiling)", format_drive_db(db))
+        }
+        Some((db, _)) => format!("drive {} dB", format_drive_db(db)),
+        None => "drive pending".to_string(),
+    };
+    meter.replacen("TX meter: ", &format!("TX meter: {drive}, "), 1)
+}
+
+fn format_drive_db(db: f32) -> String {
+    let value = if db.fract() == 0.0 {
+        format!("{db:.0}")
+    } else {
+        format!("{db}")
+    };
+    value.replace('-', "−")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

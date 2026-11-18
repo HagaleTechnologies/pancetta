@@ -440,4 +440,8 @@ GridTracker stays off unless you turn it on.
 6. What went out on the air: `~/.pancetta/tx-log.jsonl`, one JSON line
    per transmitted frame (written headless too).
 
+TX audio drive is set on the station. Press `F7` to lower drive by 1 dB or `F8` to raise it by 1 dB. The Station Health `TX meter` row shows the selected drive even when the rig does not provide CAT power or ALC readings. A change takes effect on the next transmission or Tune carrier and is saved in the station config. If an ALC overdrive warning appears, try F7 before changing sound-card output or the rig USB/DATA input level.
+
+For a station TUI running in a named tmux session, attach from another terminal with `ssh -tt station.example 'tmux attach-session -t pancetta'`. The keys act on that running station. After reattaching, Station Health shows the current drive. Your SSH account controls terminal access; the read-only WebSocket gateway does not carry these keys.
+
 Press `?` any time for the complete key list.

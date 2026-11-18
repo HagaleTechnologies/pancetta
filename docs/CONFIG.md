@@ -134,6 +134,18 @@ Fresh generated configs omit it. This setting never applied automatic gain.
 input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
+`[audio.levels].output_gain_db` controls transmitted audio drive relative to
+the former fixed level of 0.5 full scale. It defaults to 0 dB, changes in
+1 dB steps with F7/F8 in the station TUI, and is saved after each change.
+The floor is -20 dB. `output_gain_ceiling_db` defaults to 0 dB and may be
+set from -20 to +5 dB. A positive ceiling reserves headroom for FT audio
+(single frames and bundles, both normalized to a 0.95 peak) before the
+selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
+0 dB are quieter than the original baseline in that mode; Tune is not
+reserved. A finite legacy gain outside the selectable
+range starts at the nearest bound with a warning. Invalid or non-finite
+ceilings and non-finite gain values fail config validation.
+
 ### `[audio.recording]` — save decode windows as WAV (off by default)
 
 Pancetta can save every live decode window it hands the decoder as a WAV

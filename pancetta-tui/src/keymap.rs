@@ -1179,6 +1179,20 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         &[main_no_ctrl_alt(c('T'), Action::ToggleTune)],
     ),
     kb(
+        "F7 / F8",
+        "TX audio drive down / up by 1 dB",
+        Category::TxControl,
+        false,
+        &[
+            ch(Scope::Main, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Main, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+            ch(Scope::Health, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Health, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+            ch(Scope::Diagnostics, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
+            ch(Scope::Diagnostics, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+        ],
+    ),
+    kb(
         "h",
         "Halt current TX",
         Category::TxControl,
@@ -1840,6 +1854,7 @@ mod tests {
             KeyCode::BackTab => vec!["Shift+Tab".into()],
             KeyCode::PageUp => vec!["PgUp".into()],
             KeyCode::PageDown => vec!["PgDn".into()],
+            KeyCode::F(n) => vec![format!("F{n}")],
             other => vec![format!("{other:?}")],
         }
     }
@@ -1944,7 +1959,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 49);
+        assert_eq!(KEYBINDINGS.len(), 50);
     }
 
     #[test]

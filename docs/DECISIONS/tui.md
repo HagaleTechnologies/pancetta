@@ -734,3 +734,13 @@ when absent, so a file without waterfall choices keeps the PAN-270 format, and
 a bad waterfall field is dropped on its own rather than discarding the saved
 TX mode and decode effort. The first frame gets its values from the TUI config
 the coordinator builds after the startup resolve, so the TUI reads no file.
+
+## TX audio drive (PAN-438)
+
+F7 and F8 send relative 1 dB requests to the station. The TUI does not
+predict or persist the result: the coordinator owns the bound drive value and
+sends its effective value back to the view. This keeps a TUI attached over an
+SSH terminal in step with the audio worker. The Station Health TX meter shows
+that setting before any CAT power or ALC text, including when the rig has no
+meter. Text-entry dialogs keep their keys; the drive chords belong only to
+the main view, Station Health, and Diagnostics.

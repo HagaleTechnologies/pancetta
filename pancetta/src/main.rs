@@ -553,7 +553,8 @@ async fn run_application(cli: Cli) -> Result<()> {
     let sweep_requested = cli.gain_sweep_seconds.is_some();
     let gain_options = cli.gain_sweep_seconds.zip(cli.gain_sweep_report.clone());
     // Load configuration
-    let (config, config_warnings) = load_configuration_with_warnings(&cli).await?;
+    let (config, config_warnings, loaded_config_files) =
+        load_configuration_with_warnings(&cli).await?;
 
     info!("Configuration loaded successfully");
     debug!("Configuration: {}", config.summary());
@@ -611,6 +612,10 @@ async fn run_application(cli: Cli) -> Result<()> {
     }
 
     // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
+    let tx_drive_config_path = loaded_config_files
+        .last()
+        .map(|path| std::path::absolute(path).unwrap_or_else(|_| path.clone()))
+        .unwrap_or_else(|| config_write_path(&cli));
     let config_write_path = config_write_path(&cli);
     let config_write_is_toml = config_write_is_toml(&cli);
     // PAN-103: config reloads watch and read the path as given, so a
@@ -637,6 +642,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         None,
     )
     .await?;
+    coordinator.set_tx_drive_config_path(tx_drive_config_path);
     if let Some((seconds, path)) = gain_options {
         coordinator.configure_gain_sweep(seconds, path)?;
     }
@@ -2352,7 +2358,7 @@ fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path)
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {
-    let (config, _warnings) = load_configuration_with_warnings(cli).await?;
+    let (config, _warnings, _files) = load_configuration_with_warnings(cli).await?;
     Ok(config)
 }
 
@@ -2420,15 +2426,21 @@ fn config_write_is_toml(cli: &Cli) -> bool {
 /// (e.g. an unknown section or misspelled key). The warnings are printed to
 /// the console here and also returned so they can be surfaced in the TUI. A
 /// config file that fails to load is an error, never a warning (PAN-90).
-async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<String>)> {
+async fn load_configuration_with_warnings(
+    cli: &Cli,
+) -> Result<(Config, Vec<String>, Vec<PathBuf>)> {
+    let mut loaded_files = Vec::new();
     let (mut config, warnings) = if let Some(config_path) = &cli.config {
         // PAN-90: the warnings-returning loader, so an explicit `--config`
         // file's unknown-key warnings reach the console and the TUI too.
         Config::load_from_file_with_warnings(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
-        match Config::load_default_with_warnings() {
-            Ok(pair) => pair,
+        match Config::load_default_with_warnings_and_files() {
+            Ok((config, warnings, files)) => {
+                loaded_files = files;
+                (config, warnings)
+            }
             Err(e)
                 if offer_wizard_on_load_failure(
                     cli.headless,
@@ -2459,7 +2471,14 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                     // selects before JSON in the same search directory.
                     match run_first_time_setup(&defaults, &failed_path, true)? {
                         Some(fixed) => {
-                            config_after_recovery(fixed, Config::load_default_with_warnings)
+                            // Codex P1 on #705: keep the contributing files, so F7/F8
+                            // saves go to the recovered source that wins, not a fallback.
+                            let (config, warnings, files) = config_after_recovery(
+                                fixed,
+                                Config::load_default_with_warnings_and_files,
+                            );
+                            loaded_files = files;
+                            (config, warnings)
                         }
                         None => {
                             return Err(anyhow::anyhow!(e))
@@ -2507,7 +2526,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         }
     }
 
-    Ok((config, warnings))
+    Ok((config, warnings, loaded_files))
 }
 
 /// The de-brick wizard offer fires only for interactive TUI launches —
@@ -2542,12 +2561,15 @@ fn config_file_to_repair(e: &pancetta_config::ConfigError) -> Option<PathBuf> {
 /// A warning names the sections where other files change the wizard's
 /// `fixed` values. When the reload still fails (the operator declined to
 /// save, or another file is broken too) this warns and falls back to `fixed`.
+/// The reload's contributing files come back in precedence order, so live
+/// targeted writes (TX drive) reach the file that won; the fallback has none
+/// and those writes use the default config path.
 fn config_after_recovery(
     fixed: Config,
-    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>)>,
-) -> (Config, Vec<String>) {
+    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>, Vec<PathBuf>)>,
+) -> (Config, Vec<String>, Vec<PathBuf>) {
     match reload() {
-        Ok((config, mut warnings)) => {
+        Ok((config, mut warnings, files)) => {
             let changed = sections_that_differ(&fixed, &config);
             if !changed.is_empty() {
                 warnings.push(format!(
@@ -2556,7 +2578,7 @@ fn config_after_recovery(
                     changed.join(", ")
                 ));
             }
-            (config, warnings)
+            (config, warnings, files)
         }
         Err(e) => (
             fixed,
@@ -2564,6 +2586,7 @@ fn config_after_recovery(
                 "The configuration on disk still does not load ({e}); this session runs \
                  on the setup values only"
             )],
+            Vec::new(),
         ),
     }
 }
@@ -3788,9 +3811,9 @@ mod tests {
         fixed.station.callsign = "W1AW".to_string();
         persist_wizard_config(&fixed, &broken, true).unwrap();
 
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             let config = loader.load()?;
-            Ok((config, loader.load_warnings()))
+            Ok((config, loader.load_warnings(), loader.loaded_files()))
         });
         let next_start = loader.load().unwrap();
         assert_eq!(config.station.callsign, next_start.station.callsign);
@@ -3799,6 +3822,10 @@ mod tests {
         // The operator is told the wizard's values did not all survive.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[audio], [station]"), "{warnings:?}");
+        // Both files come back, the higher-precedence one last, so a live
+        // drive save targets the file whose value the next start reads.
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files.last(), Some(&high.path().join("pancetta.toml")));
     }
 
     #[test]
@@ -3814,19 +3841,20 @@ mod tests {
         fixed.audio.input_device = "USB Audio CODEC".to_string();
         persist_wizard_config(&fixed, &broken, true).unwrap();
 
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             let config = loader.load()?;
-            Ok((config, loader.load_warnings()))
+            Ok((config, loader.load_warnings(), loader.loaded_files()))
         });
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(config.station.callsign, "W1AW");
+        assert_eq!(files, vec![broken]);
     }
 
     #[test]
     fn config_after_recovery_falls_back_when_the_reload_fails() {
         let mut fixed = Config::default();
         fixed.station.callsign = "W1AW".to_string();
-        let (config, warnings) = config_after_recovery(fixed, || {
+        let (config, warnings, files) = config_after_recovery(fixed, || {
             Err(pancetta_config::ConfigError::Validation(
                 "still broken".into(),
             ))
@@ -3835,6 +3863,7 @@ mod tests {
         // A warning, not just stderr: the TUI takes over the terminal.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("still broken"), "{warnings:?}");
+        assert!(files.is_empty(), "{files:?}");
     }
 
     #[test]

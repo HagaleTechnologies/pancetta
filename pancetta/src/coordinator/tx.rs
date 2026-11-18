@@ -9783,6 +9783,7 @@ impl super::ApplicationCoordinator {
             // flip at runtime, not a startup-only config value).
             let fox_mode = self.fox_mode();
             let fox_max_streams = self.fox_max_streams();
+            let tx_drive = self.tx_drive.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -11576,6 +11577,7 @@ impl super::ApplicationCoordinator {
                                             },
                                         );
                                         drop(live_timing_guard);
+                                        let drive_at_key = tx_drive.get();
                                         match outcome {
                                             SendIfOutcome::Enqueued => {
                                                 info!(
@@ -12036,6 +12038,12 @@ impl super::ApplicationCoordinator {
                                         // Round-9 review: denied frames must never appear in Band Activity
                                         // as genuine own-transmissions. Log only on Enqueued, so dropped
                                         // audio cannot appear as an aired frame either.
+                                        super::tx_drive::apply(
+                                            &mut audio_out,
+                                            drive_at_key,
+                                            tx_drive.ceiling_db(),
+                                            true,
+                                        );
                                         let (playback_ack, mut playback_waiter) =
                                             PlaybackStartAck::new();
                                         let audio_msg = ComponentMessage::new(
@@ -14547,6 +14555,7 @@ impl super::ApplicationCoordinator {
                                         },
                                     );
                                     drop(live_timing_guard);
+                                    let drive_at_key = tx_drive.get();
                                     match outcome {
                                         SendIfOutcome::Enqueued => {
                                             info!(
@@ -14783,6 +14792,12 @@ impl super::ApplicationCoordinator {
                                     // Round-9 review: denied frames must never appear in Band Activity
                                     // as genuine own-transmissions. Log only on Enqueued, so dropped
                                     // audio cannot appear as an aired frame either.
+                                    super::tx_drive::apply(
+                                        &mut audio_out,
+                                        drive_at_key,
+                                        tx_drive.ceiling_db(),
+                                        true,
+                                    );
                                     let (playback_ack, mut playback_waiter) =
                                         PlaybackStartAck::new();
                                     let audio_msg = ComponentMessage::new(
@@ -15248,6 +15263,7 @@ impl super::ApplicationCoordinator {
                                         true,
                                         || true,
                                     );
+                                    let drive_at_key = tx_drive.get();
                                     if ptt_on != SendIfOutcome::Enqueued {
                                         // `Denied` here is the receive-gain gate, never
                                         // `authorize` (always true for a tune).
@@ -15294,6 +15310,13 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // Emit the audio buffer.
+                                    let mut tone_samples = tone_samples;
+                                    super::tx_drive::apply(
+                                        &mut tone_samples,
+                                        drive_at_key,
+                                        tx_drive.ceiling_db(),
+                                        false,
+                                    );
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
