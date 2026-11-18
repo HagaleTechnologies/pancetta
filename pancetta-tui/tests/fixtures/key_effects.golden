@@ -65,6 +65,8 @@ empty/band | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta T
 empty/band | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/band | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/band | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/band | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/band | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 empty/qso | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 empty/qso | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 empty/qso | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -128,6 +130,8 @@ empty/qso | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TU
 empty/qso | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/qso | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/qso | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/qso | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/qso | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 empty/callers | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 empty/callers | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 empty/callers | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -191,6 +195,8 @@ empty/callers | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancett
 empty/callers | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Reply step: signal report"; caller_reply_override: None -> Some(Report)
 empty/callers | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/callers | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/callers | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/callers | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 empty/dx | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 empty/dx | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 empty/dx | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -254,6 +260,8 @@ empty/dx | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI
 empty/dx | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/dx | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/dx | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/dx | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/dx | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 empty/placement | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 empty/placement | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 empty/placement | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -315,6 +323,8 @@ empty/placement | Tab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlaceme
 empty/placement | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlacement -> Callers
 empty/placement | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/placement | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/placement | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/placement | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 empty/waterfall | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 empty/waterfall | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 empty/waterfall | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -378,6 +388,8 @@ empty/waterfall | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pance
 empty/waterfall | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 empty/waterfall | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 empty/waterfall | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+empty/waterfall | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+empty/waterfall | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -442,6 +454,8 @@ rich/band | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TU
 rich/band | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/qso | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "W1AW already has an active QSO — cancel it first"
 rich/qso | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/qso | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -506,6 +520,8 @@ rich/qso | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI
 rich/qso | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/qso | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/qso | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/qso | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/qso | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/callers | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/callers | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/callers | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -570,6 +586,8 @@ rich/callers | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta
 rich/callers | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Reply step: acknowledged report"; caller_reply_override: None -> Some(ReportAck)
 rich/callers | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/callers | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/callers | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/callers | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/dx | Char(' ') | none,shift | cmds=["CallStation { callsign: \"VK9XX\", frequency: 750, dx_parity: Some(Even) }"]; status_message: "Pancetta TUI Ready" -> "Calling VK9XX..."
 rich/dx | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/dx | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -634,6 +652,8 @@ rich/dx | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI 
 rich/dx | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/dx | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/dx | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/dx | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/dx | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/placement | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 rich/placement | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/placement | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -697,6 +717,8 @@ rich/placement | BackTab | none,shift,ctrl,alt,ctrl+shift | active_panel: TxPlac
 rich/placement | Right | none,shift,ctrl,alt,ctrl+shift | placement_cursor: 0 -> 1
 rich/placement | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/placement | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/placement | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/placement | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/waterfall | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "No station selected"
 rich/waterfall | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/waterfall | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -761,6 +783,8 @@ rich/waterfall | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancet
 rich/waterfall | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/waterfall | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/waterfall | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/waterfall | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/waterfall | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band/ext-off-band | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "Can't work G8KHF. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8."
 rich/band/ext-off-band | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/ext-off-band | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -825,6 +849,8 @@ rich/band/ext-off-band | Left | none,shift,ctrl,alt,ctrl+shift | status_message:
 rich/band/ext-off-band | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/ext-off-band | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band/ext-off-band | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band/ext-off-band | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band/ext-off-band | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/callers/ext-off-band | Char(' ') | none,shift | status_message: "Pancetta TUI Ready" -> "Can't work G8KHF. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8."
 rich/callers/ext-off-band | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/callers/ext-off-band | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -889,6 +915,8 @@ rich/callers/ext-off-band | Left | none,shift,ctrl,alt,ctrl+shift | status_messa
 rich/callers/ext-off-band | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Reply step: acknowledged report"; caller_reply_override: None -> Some(ReportAck)
 rich/callers/ext-off-band | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/callers/ext-off-band | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/callers/ext-off-band | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/callers/ext-off-band | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/callers/ext-on-band | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/callers/ext-on-band | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/callers/ext-on-band | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -953,6 +981,8 @@ rich/callers/ext-on-band | Left | none,shift,ctrl,alt,ctrl+shift | status_messag
 rich/callers/ext-on-band | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Reply step: acknowledged report"; caller_reply_override: None -> Some(ReportAck)
 rich/callers/ext-on-band | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/callers/ext-on-band | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/callers/ext-on-band | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/callers/ext-on-band | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band/zoomed | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band/zoomed | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/zoomed | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -1018,6 +1048,8 @@ rich/band/zoomed | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Panc
 rich/band/zoomed | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/zoomed | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band/zoomed | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band/zoomed | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band/zoomed | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band/stopped | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band/stopped | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/stopped | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -1083,6 +1115,8 @@ rich/band/stopped | Left | none,shift,ctrl,alt,ctrl+shift | status_message: "Pan
 rich/band/stopped | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/stopped | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band/stopped | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band/stopped | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band/stopped | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band/zoomed+stopped | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band/zoomed+stopped | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/zoomed+stopped | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -1148,6 +1182,8 @@ rich/band/zoomed+stopped | Left | none,shift,ctrl,alt,ctrl+shift | status_messag
 rich/band/zoomed+stopped | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/zoomed+stopped | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band/zoomed+stopped | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band/zoomed+stopped | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band/zoomed+stopped | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/band/tx-disabled | Char(' ') | none,shift | cmds=["RespondToCaller { callsign: \"G8KHF\", frequency: 1234, dx_parity: Some(Even), step: Report, snr: Some(-8.0) }"]; status_message: "Pancetta TUI Ready" -> "Replying report to G8KHF"
 rich/band/tx-disabled | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Nothing to acknowledge"
 rich/band/tx-disabled | Char(',') | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
@@ -1212,6 +1248,8 @@ rich/band/tx-disabled | Left | none,shift,ctrl,alt,ctrl+shift | status_message: 
 rich/band/tx-disabled | Right | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "TX offset: 1550 Hz"; tx_frequency_offset: 1500.0 -> 1550.0
 rich/band/tx-disabled | Home | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to newest (realtime)"
 rich/band/tx-disabled | End | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Jumped to oldest"
+rich/band/tx-disabled | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/band/tx-disabled | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/out-of-band-ack | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 rich/out-of-band-ack | Enter | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Out-of-band TX acknowledged"; out_of_band_ack_visible: true -> false
 rich/out-of-band-ack | Esc | none,shift,ctrl,alt,ctrl+shift | status_message: "Pancetta TUI Ready" -> "Out-of-band TX acknowledged"; out_of_band_ack_visible: true -> false
@@ -1988,10 +2026,14 @@ rich/diagnostics | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorE
 rich/diagnostics | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/diagnostics | Esc | none,shift,ctrl,alt,ctrl+shift | show_diagnostics: true -> false
 rich/diagnostics | Down | none,shift,ctrl,alt,ctrl+shift | diagnostics_scroll: 0 -> 1
+rich/diagnostics | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/diagnostics | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/health | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 rich/health | Char('S') | none,shift,ctrl,alt,ctrl+shift | show_health: true -> false
 rich/health | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/health | Esc | none,shift,ctrl,alt,ctrl+shift | show_health: true -> false
+rich/health | F(7) | none | cmds=["AdjustTxDrive { delta_db: -1 }"]
+rich/health | F(8) | none | cmds=["AdjustTxDrive { delta_db: 1 }"]
 rich/recent-qsos | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergencyStop"]; status_message: "Pancetta TUI Ready" -> "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"; stopped_by_operator: false -> true; tx_policy: Full -> Disabled
 rich/recent-qsos | Char('R') | none,shift,ctrl,alt,ctrl+shift | show_recent_qsos: true -> false
 rich/recent-qsos | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
@@ -2007,7 +2049,7 @@ rich/help | Char('Q') | none,shift,ctrl,alt,ctrl+shift | cmds=["OperatorEmergenc
 rich/help | Char('k') | none | cmds=["AbortQso { qso_id: \"qso-1\" }"]; status_message: "Pancetta TUI Ready" -> "Aborting QSO with W1AW"
 rich/help | Esc | none,shift,ctrl,alt,ctrl+shift | help_visible: true -> false
 rich/help | Down | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 1
-rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 54
+rich/help | End | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 55
 rich/help | PageDown | none,shift,ctrl,alt,ctrl+shift | help_scroll: 0 -> 17
 rich/compose | Char(' ') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST "; tx_input_buffer: "CQ TEST" -> "CQ TEST "; tx_input_cursor: 7 -> 8
 rich/compose | Char('!') | none,shift,ctrl,alt,ctrl+shift | status_message: "TX: CQ TEST" -> "TX: CQ TEST!"; tx_input_buffer: "CQ TEST" -> "CQ TEST!"; tx_input_cursor: 7 -> 8

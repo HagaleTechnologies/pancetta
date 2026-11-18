@@ -33,7 +33,7 @@ r14 |│                                                                    │|
 r14 s 0+1 Cyan/Black/- 1+68 White/Black/- 69+1 Cyan/Black/-
 r15 |│● Rig: not connected                                                │|
 r15 s 0+1 Cyan/Black/- 1+1 Green/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
-r16 |│● TX meter: needs a connected CAT rig                               │|
+r16 |│● TX meter: drive pending, needs a connected CAT rig                │|
 r16 s 0+1 Cyan/Black/- 1+1 DarkGray/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-
 r17 |│● TX audio output: SYSTEM DEFAULT — check device                    │|
 r17 s 0+1 Cyan/Black/- 1+1 Red/Black/- 2+67 White/Black/- 69+1 Cyan/Black/-

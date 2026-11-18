@@ -1713,6 +1713,8 @@ pub struct App {
     /// PAN-291: which TX meters this Hamlib session reads, and the ALC
     /// warning limit when the warning is on. `None` until announced.
     pub tx_meter_capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
+    /// Station-confirmed TX audio drive and its configured ceiling, in dB.
+    pub tx_drive: Option<(f32, f32)>,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -2054,6 +2056,7 @@ impl App {
             tx_meter: None,
             tx_meter_at: None,
             tx_meter_capability: None,
+            tx_drive: None,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
