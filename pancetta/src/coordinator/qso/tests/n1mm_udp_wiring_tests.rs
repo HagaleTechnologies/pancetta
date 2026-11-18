@@ -79,14 +79,40 @@ fn manager_of(coordinator: &ApplicationCoordinator) -> pancetta_qso::QsoManager 
         .expect("QSO manager published")
 }
 
+async fn wait_for_qso_consumer(coordinator: &ApplicationCoordinator) {
+    let mut ready = coordinator.qso_consumer_ready.subscribe();
+    tokio::time::timeout(Duration::from_secs(30), ready.wait_for(|ready| *ready))
+        .await
+        .expect("QSO consumer startup timed out")
+        .expect("QSO consumer readiness channel closed");
+}
+
+#[tokio::test]
+async fn completion_before_qso_consumer_is_ready_is_still_broadcast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (socket, addr) = listener().await;
+    let mut coordinator = coordinator_with_home(tmp.path(), false, Some(addr)).await;
+    coordinator.start_qso_component().await.unwrap();
+
+    let manager = manager_of(&coordinator);
+    complete_one_qso(&manager).await;
+    assert!(!*coordinator.qso_consumer_ready.borrow());
+    wait_for_qso_consumer(&coordinator).await;
+
+    let xml = recv_within(&socket, Duration::from_secs(3))
+        .await
+        .expect("contactinfo for the QSO completed during startup");
+    assert_eq!(element(&xml, "call"), "K1DEF");
+    coordinator.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn live_qso_component_broadcasts_one_contactinfo_per_completed_qso() {
     let tmp = tempfile::tempdir().unwrap();
     let (socket, addr) = listener().await;
     let mut coordinator = coordinator_with_home(tmp.path(), false, Some(addr)).await;
     coordinator.start_qso_component().await.unwrap();
-    // Let the writers and the emitter subscribe.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_qso_consumer(&coordinator).await;
     let manager = manager_of(&coordinator);
     complete_one_qso(&manager).await;
 
@@ -136,7 +162,7 @@ async fn replay_qso_component_sends_no_contactinfo() {
     let (socket, addr) = listener().await;
     let mut coordinator = coordinator_with_home(tmp.path(), true, Some(addr)).await;
     coordinator.start_qso_component().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_qso_consumer(&coordinator).await;
     let manager = manager_of(&coordinator);
     complete_one_qso(&manager).await;
     assert!(
@@ -152,7 +178,7 @@ async fn qso_completed_after_the_shutdown_flag_is_still_broadcast() {
     let (socket, addr) = listener().await;
     let mut coordinator = coordinator_with_home(tmp.path(), false, Some(addr)).await;
     coordinator.start_qso_component().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_qso_consumer(&coordinator).await;
     let manager = manager_of(&coordinator);
     coordinator.shutdown_signal.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(200)).await;

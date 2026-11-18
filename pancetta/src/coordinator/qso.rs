@@ -4008,6 +4008,11 @@ impl super::ApplicationCoordinator {
             }));
         }
 
+        // PAN-382: queue completions before publishing the manager. The
+        // emitter starts after local log setup, which can await disk I/O.
+        let n1mm_subscription =
+            n1mm_destination.map(|destination| (destination, qso_manager.subscribe()));
+
         // PAN-72 critical-finding fix: also publish the fresh handle onto
         // the watch channel so the (not respawned on a Qso-only restart)
         // Autonomous task's drain can pick up this brand-new manager
@@ -4146,19 +4151,18 @@ impl super::ApplicationCoordinator {
                 // PAN-382: N1MM Logger+ contactinfo UDP, one datagram per
                 // `QsoCompleted`, built from the same ADIF record as
                 // `qsos.adi`. `n1mm_destination` is `None` under `--replay`.
-                // Subscribed here, before the decode and command loops start,
-                // so no completion is missed. The task ends when this
-                // manager's event channel closes, never on the shutdown flag
+                // The receiver also holds completions from startup. The task
+                // ends when this manager's event channel closes, never on the shutdown flag
                 // (the PAN-232/PAN-274 rule), so a QSO that completes after
                 // the flag is set is still broadcast. Shutdown does not wait
                 // for it: a UDP send has nothing to flush.
-                if let Some(dest) = n1mm_destination {
+                if let Some((destination, events)) = n1mm_subscription {
                     // Detached: the task ends on its own when the channel closes.
                     drop(super::n1mm_udp::start_n1mm_udp_emitter(
-                        dest,
+                        destination,
                         station_power_watts,
                         attribution_comment,
-                        qso_manager.subscribe(),
+                        events,
                     ));
                 }
 
