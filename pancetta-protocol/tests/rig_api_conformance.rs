@@ -21,7 +21,8 @@ fn schema() -> Value {
 fn stamp() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap()
 }
-fn decoded(full: bool) -> DecodedView {
+fn decoded(slot_parity: Option<SlotParity>) -> DecodedView {
+    let full = slot_parity.is_some();
     DecodedView {
         timestamp: stamp(),
         frequency_hz: 14_075_200.0,
@@ -31,7 +32,7 @@ fn decoded(full: bool) -> DecodedView {
         call_sign: full.then(|| "D2UY".into()),
         grid_square: full.then(|| "JI64".into()),
         message: "CQ D2UY JI64".into(),
-        slot_parity: full.then_some(SlotParity::Even),
+        slot_parity,
         is_directed_at_us: false,
         worked_before: false,
         needed: true,
@@ -39,7 +40,8 @@ fn decoded(full: bool) -> DecodedView {
         priority_score: full.then_some(720),
     }
 }
-fn row(full: bool, source: &str) -> DxRow {
+fn row(slot_parity: Option<SlotParity>, source: &str) -> DxRow {
+    let full = slot_parity.is_some();
     DxRow {
         call_sign: "D2UY".into(),
         grid_square: full.then(|| "JI64".into()),
@@ -55,18 +57,19 @@ fn row(full: bool, source: &str) -> DxRow {
         entity_name: full.then(|| "Angola".into()),
         rarity_tier: full.then(|| "rare".into()),
         audio_offset_hz: full.then_some(1200),
-        slot_parity: full.then_some(SlotParity::Odd),
+        slot_parity,
         last_seen: stamp(),
         source: source.into(),
     }
 }
-fn qso(full: bool) -> QsoProgress {
+fn qso(tx_parity: Option<SlotParity>) -> QsoProgress {
+    let full = tx_parity.is_some();
     QsoProgress {
         qso_id: "q1".into(),
         their_callsign: "D2UY".into(),
         state: "calling".into(),
         frequency_hz: 14_075_200.0,
-        tx_parity: full.then_some(SlotParity::Even),
+        tx_parity,
         ladder_labels: vec!["grid".into()],
         ladder_ours: vec![true],
         ladder_index: 0,
@@ -80,27 +83,42 @@ fn qso(full: bool) -> QsoProgress {
         started_at: stamp(),
     }
 }
-fn pending(full: bool) -> PendingCall {
+fn pending(dx_parity: Option<SlotParity>) -> PendingCall {
     PendingCall {
         callsign: "D2UY".into(),
-        dx_parity: full.then_some(SlotParity::Odd),
+        dx_parity,
         waited_secs: 15,
     }
 }
 fn events() -> Vec<E> {
     vec![
         E::Decoded {
-            decoded: decoded(true),
+            decoded: decoded(Some(SlotParity::Even)),
         },
         E::Decoded {
-            decoded: decoded(false),
+            decoded: decoded(Some(SlotParity::Odd)),
+        },
+        E::Decoded {
+            decoded: decoded(None),
         },
         E::DxHunter {
-            rows: vec![row(true, "local"), row(false, "network"), row(true, "both")],
+            rows: vec![
+                row(Some(SlotParity::Odd), "local"),
+                row(None, "network"),
+                row(Some(SlotParity::Even), "both"),
+            ],
         },
         E::ActiveQsos {
-            qsos: vec![qso(true), qso(false)],
-            pending: vec![pending(true), pending(false)],
+            qsos: vec![
+                qso(Some(SlotParity::Even)),
+                qso(Some(SlotParity::Odd)),
+                qso(None),
+            ],
+            pending: vec![
+                pending(Some(SlotParity::Odd)),
+                pending(Some(SlotParity::Even)),
+                pending(None),
+            ],
         },
         E::Frequency {
             vfo: 0,
@@ -244,35 +262,39 @@ fn branches<'a>(
     s: &'a Value,
     family: &str,
     tag_key: &str,
-) -> Result<BTreeMap<String, &'a Value>, String> {
+) -> Result<BTreeMap<&'a str, (usize, &'a Value)>, String> {
     let mut out = BTreeMap::new();
-    for branch in s
+    for (position, member) in s
         .pointer(&format!("/$defs/{family}/oneOf"))
         .and_then(Value::as_array)
         .ok_or("missing union")?
+        .iter()
+        .enumerate()
     {
-        let tag = branch
-            .pointer(&format!("/properties/{tag_key}/const"))
+        let branch =
+            resolve(s, member).map_err(|error| format!("{family}/oneOf/{position}: {error}"))?;
+        let properties = branch.get("properties").and_then(Value::as_object);
+        let tag = properties
+            .and_then(|properties| properties.get(tag_key))
+            .and_then(|rule| rule.get("const"))
             .and_then(Value::as_str)
-            .ok_or("unreadable discriminator")?;
-        if out.insert(tag.into(), branch).is_some() {
+            .ok_or_else(|| {
+                let constants: BTreeMap<_, _> = properties
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(key, rule)| Some((key, rule.get("const")?.as_str()?)))
+                    .collect();
+                format!(
+                    "{family}/oneOf/{position}: missing or invalid discriminator field {tag_key:?}; string constant fields {constants:?}"
+                )
+            })?;
+        if out.insert(tag, (position, branch)).is_some() {
             return Err(format!("duplicate discriminator {tag}"));
         }
     }
     Ok(out)
 }
-fn branch_index(s: &Value, family: &str, key: &str, tag: &str) -> usize {
-    s.pointer(&format!("/$defs/{family}/oneOf"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .position(|b| {
-            b.pointer(&format!("/properties/{key}/const"))
-                .and_then(Value::as_str)
-                == Some(tag)
-        })
-        .unwrap()
-}
+
 fn check_schema(
     s: &Value,
     family: &str,
@@ -280,8 +302,12 @@ fn check_schema(
     samples: &[(String, Value, Value)],
 ) -> Result<(), String> {
     let branches = branches(s, family, tag_key)?;
-    let sample_tags: BTreeSet<_> = samples.iter().map(|(t, _, _)| t.clone()).collect();
-    let schema_tags: BTreeSet<_> = branches.keys().cloned().collect();
+    let mut by_tag: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+    for (tag, payload, frame) in samples {
+        by_tag.entry(tag).or_default().push((payload, frame));
+    }
+    let sample_tags: BTreeSet<_> = by_tag.keys().copied().collect();
+    let schema_tags: BTreeSet<_> = branches.keys().copied().collect();
     if sample_tags != schema_tags {
         return Err(format!(
             "{family} tag drift: missing samples {:?}; surplus samples {:?}",
@@ -306,11 +332,8 @@ fn check_schema(
     let frame_schema = compiler
         .compile(&format!("{id}#/$defs/{frame_family}"), &mut schemas)
         .map_err(|e| e.to_string())?;
-    for (tag, payload, frame) in samples {
-        let branch = branches
-            .get(tag)
-            .ok_or_else(|| format!("missing branch {tag}"))?;
-        let position = branch_index(s, family, tag_key, tag);
+    for (tag, samples) in by_tag {
+        let (position, branch) = branches[tag];
         let branch_schema = compiler
             .compile(
                 &format!("{id}#/$defs/{family}/oneOf/{position}"),
@@ -318,14 +341,20 @@ fn check_schema(
             )
             .map_err(|e| e.to_string())?;
         let mut errors = Vec::new();
-        compare_shape(s, branch, payload, "", &mut errors);
-        for (name, value, index) in [
-            ("branch", payload, branch_schema),
-            ("union", payload, union),
-            ("frame", frame, frame_schema),
-        ] {
-            if let Err(e) = schemas.validate(value, index) {
-                errors.push(format!("{name}: {e:#}"));
+        let payloads: Vec<_> = samples
+            .iter()
+            .map(|&(payload, _)| (String::new(), payload))
+            .collect();
+        compare_shape(s, branch, &payloads, &mut errors);
+        for (payload, frame) in samples {
+            for (name, value, index) in [
+                ("branch", payload, branch_schema),
+                ("union", payload, union),
+                ("frame", frame, frame_schema),
+            ] {
+                if let Err(e) = schemas.validate(value, index) {
+                    errors.push(format!("{name}: {e:#}"));
+                }
             }
         }
         if !errors.is_empty() {
@@ -334,48 +363,95 @@ fn check_schema(
     }
     Ok(())
 }
-fn resolve<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
-    if let Some(r) = node.get("$ref").and_then(Value::as_str) {
-        root.pointer(r.strip_prefix('#').unwrap()).unwrap()
-    } else {
-        node
+fn resolve<'a>(root: &'a Value, mut node: &'a Value) -> Result<&'a Value, String> {
+    let mut seen = BTreeSet::new();
+    while let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        if !seen.insert(reference) {
+            return Err(format!("cyclic reference {reference:?}"));
+        }
+        node = reference
+            .strip_prefix('#')
+            .and_then(|pointer| root.pointer(pointer))
+            .ok_or_else(|| format!("unresolved local JSON Pointer {reference:?}"))?;
     }
+    Ok(node)
 }
-fn compare_shape(root: &Value, node: &Value, value: &Value, path: &str, errors: &mut Vec<String>) {
-    let node = resolve(root, node);
-    if let (Some(props), Some(obj)) = (
-        node.get("properties").and_then(Value::as_object),
-        value.as_object(),
-    ) {
+// Values at the same schema location share a property set, including array items.
+// Keep each instance path for per-object required-field diagnostics.
+fn compare_shape(
+    root: &Value,
+    node: &Value,
+    values: &[(String, &Value)],
+    errors: &mut Vec<String>,
+) {
+    let Some((path, _)) = values.first() else {
+        return;
+    };
+    let node = match resolve(root, node) {
+        Ok(node) => node,
+        Err(error) => {
+            errors.push(format!("{path}: {error}"));
+            return;
+        }
+    };
+    if let Some(props) = node.get("properties").and_then(Value::as_object) {
+        let mut objects = values
+            .iter()
+            .filter_map(|(path, value)| Some((path, value.as_object()?)))
+            .peekable();
+        let Some(&(first_object_path, _)) = objects.peek() else {
+            return;
+        };
         let declared: BTreeSet<_> = props.keys().map(String::as_str).collect();
-        let emitted: BTreeSet<_> = obj.keys().map(String::as_str).collect();
+        let mut emitted = BTreeSet::new();
+        let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (path, object) in objects {
+            for required in node
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if !object.contains_key(required) {
+                    errors.push(format!("{path}: missing required {required}"));
+                }
+            }
+            for (key, value) in object {
+                emitted.insert(key.as_str());
+                if props.contains_key(key) {
+                    children
+                        .entry(key)
+                        .or_default()
+                        .push((format!("{path}/{key}"), value));
+                }
+            }
+        }
         let missing: Vec<_> = declared.difference(&emitted).collect();
         let extra: Vec<_> = emitted.difference(&declared).collect();
         if !missing.is_empty() || !extra.is_empty() {
+            let location = if first_object_path.is_empty() {
+                "/"
+            } else {
+                first_object_path
+            };
             errors.push(format!(
-                "{path}: declared but unemitted {missing:?}; emitted but undeclared {extra:?}"
+                "property set across samples (first object at {location}): declared but unemitted {missing:?}; emitted but undeclared {extra:?}"
             ));
         }
-        for required in node
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if !obj.contains_key(required) {
-                errors.push(format!("{path}: missing required {required}"));
+        for (key, values) in children {
+            compare_shape(root, &props[key], &values, errors);
+        }
+    } else if let Some(items) = node.get("items") {
+        let mut elements = Vec::new();
+        for (path, value) in values {
+            if let Some(array) = value.as_array() {
+                for (index, element) in array.iter().enumerate() {
+                    elements.push((format!("{path}/{index}"), element));
+                }
             }
         }
-        for (k, v) in obj {
-            if let Some(sub) = props.get(k) {
-                compare_shape(root, sub, v, &format!("{path}/{k}"), errors);
-            }
-        }
-    } else if let (Some(items), Some(array)) = (node.get("items"), value.as_array()) {
-        for (i, v) in array.iter().enumerate() {
-            compare_shape(root, items, v, &format!("{path}/{i}"), errors);
-        }
+        compare_shape(root, items, &elements, errors);
     }
 }
 fn event_samples() -> Vec<(String, Value, Value)> {
@@ -473,10 +549,10 @@ fn handshake_frames_conform_and_round_trip() {
             split_tx_hz: 14_075_000,
             tx_policy: TxPolicy::Full,
             mode: "FT8".into(),
-            dx_hunter: vec![row(true, "local")],
-            active_qsos: vec![qso(true)],
-            pending_calls: vec![pending(true)],
-            recent_decodes: vec![decoded(true)],
+            dx_hunter: vec![row(Some(SlotParity::Odd), "local")],
+            active_qsos: vec![qso(Some(SlotParity::Even))],
+            pending_calls: vec![pending(Some(SlotParity::Odd))],
+            recent_decodes: vec![decoded(Some(SlotParity::Even))],
         },
     });
     let v = serde_json::to_value(&frame).unwrap();
@@ -484,18 +560,8 @@ fn handshake_frames_conform_and_round_trip() {
     assert_eq!(serde_json::from_value::<ServerFrame>(v).unwrap(), frame);
 }
 fn rename(s: &mut Value, family: &str, key: &str, tag: &str, old: &str, new: &str, required: bool) {
-    let b = s
-        .pointer_mut(&format!("/$defs/{family}/oneOf"))
-        .unwrap()
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|b| {
-            b.pointer(&format!("/properties/{key}/const"))
-                .and_then(Value::as_str)
-                == Some(tag)
-        })
-        .unwrap();
+    let (index, _) = branches(s, family, key).unwrap()[tag];
+    let b = &mut s["$defs"][family]["oneOf"][index];
     let props = b["properties"].as_object_mut().unwrap();
     let value = props.remove(old).unwrap();
     props.insert(new.into(), value);
@@ -529,7 +595,7 @@ fn required_field_rename_reports_variant_and_fields() {
 fn optional_field_rename_reports_variant_and_fields() {
     let mut s = schema();
     check_schema(&s, "clientCommand", "cmd", &command_samples()).unwrap();
-    let branch = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
+    let (_, branch) = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
     assert!(!branch["required"]
         .as_array()
         .unwrap()
@@ -543,7 +609,7 @@ fn optional_field_rename_reports_variant_and_fields() {
         "slotParity",
         false,
     );
-    let index = branch_index(&s, "clientCommand", "cmd", "callStation");
+    let (index, _) = branches(&s, "clientCommand", "cmd").unwrap()["callStation"];
     let branch = s
         .pointer_mut(&format!("/$defs/clientCommand/oneOf/{index}"))
         .unwrap();
@@ -575,7 +641,7 @@ fn optional_field_rename_reports_variant_and_fields() {
 fn renamed_discriminator_reports_tag_drift() {
     let mut s = schema();
     check_schema(&s, "serverEvent", "event", &event_samples()).unwrap();
-    let index = branch_index(&s, "serverEvent", "event", "frequency");
+    let (index, _) = branches(&s, "serverEvent", "event").unwrap()["frequency"];
     let b = s
         .pointer_mut(&format!(
             "/$defs/serverEvent/oneOf/{index}/properties/event/const"
@@ -587,5 +653,114 @@ fn renamed_discriminator_reports_tag_drift() {
     assert!(
         e.contains("frequency") && e.contains("dialFrequency"),
         "{e}"
+    );
+}
+
+#[test]
+fn nested_event_samples_cover_both_parities_and_null() {
+    let samples = event_samples();
+    for (tag, array, key) in [
+        ("decoded", None, "slotParity"),
+        ("dxHunter", Some("rows"), "slotParity"),
+        ("activeQsos", Some("qsos"), "txParity"),
+        ("activeQsos", Some("pending"), "dxParity"),
+    ] {
+        let parities: BTreeSet<_> = samples
+            .iter()
+            .filter(|(sample_tag, _, _)| sample_tag == tag)
+            .flat_map(|(_, payload, _)| match array {
+                Some(array) => payload[array]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                None => vec![&payload["decoded"]],
+            })
+            .map(|dto| dto.get(key).unwrap().as_str())
+            .collect();
+        assert_eq!(
+            parities,
+            BTreeSet::from([None, Some("even"), Some("odd")]),
+            "{tag} {array:?} {key}"
+        );
+    }
+}
+
+#[test]
+fn union_members_can_use_local_references() {
+    let mut s = schema();
+    let (index, _) = branches(&s, "serverEvent", "event").unwrap()["frequency"];
+    let member = &mut s["$defs"]["serverEvent"]["oneOf"][index];
+    let frequency = std::mem::replace(member, json!({"$ref": "#/$defs/frequencyEvent"}));
+    s["$defs"]["frequencyEvent"] = json!({"$ref": "#/$defs/frequencyDefinition"});
+    s["$defs"]["frequencyDefinition"] = frequency;
+    check_schema(&s, "serverEvent", "event", &event_samples()).unwrap();
+}
+
+#[test]
+fn discriminator_field_rename_reports_variant_and_fields() {
+    let mut s = schema();
+    rename(
+        &mut s,
+        "serverEvent",
+        "event",
+        "frequency",
+        "event",
+        "kind",
+        true,
+    );
+    let error = check_schema(&s, "serverEvent", "event", &event_samples()).unwrap_err();
+    for part in ["\"frequency\"", "\"event\"", "\"kind\""] {
+        assert!(error.contains(part), "{error}");
+    }
+}
+
+#[test]
+fn optional_properties_can_be_omitted_from_individual_instances() {
+    let s = schema();
+    let mut commands = command_samples();
+    let (_, payload, frame) = commands
+        .iter_mut()
+        .find(|(tag, _, _)| tag == "callStation")
+        .unwrap();
+    assert!(payload
+        .as_object_mut()
+        .unwrap()
+        .remove("dxParity")
+        .is_some());
+    frame["command"] = payload.clone();
+    let command_result = check_schema(&s, "clientCommand", "cmd", &commands);
+
+    let mut events = event_samples();
+    let (_, payload, frame) = events
+        .iter_mut()
+        .find(|(tag, _, _)| tag == "dxHunter")
+        .unwrap();
+    assert!(payload["rows"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("slotParity")
+        .is_some());
+    frame["event"] = payload.clone();
+    let event_result = check_schema(&s, "serverEvent", "event", &events);
+    assert!(
+        command_result.is_ok() && event_result.is_ok(),
+        "{command_result:?}; {event_result:?}"
+    );
+
+    let (_, payload, frame) = events
+        .iter_mut()
+        .find(|(tag, _, _)| tag == "dxHunter")
+        .unwrap();
+    assert!(payload["rows"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("callSign")
+        .is_some());
+    frame["event"] = payload.clone();
+    let error = check_schema(&s, "serverEvent", "event", &events).unwrap_err();
+    assert!(
+        error.contains("/rows/0: missing required callSign"),
+        "{error}"
     );
 }
