@@ -256,6 +256,18 @@ pub struct BandScheduler {
     exchange_in_progress: bool,
     /// Station latitude/longitude (grid centre) for grey-line.
     station_location: Option<(f64, f64)>,
+    /// What the last `note_hop` replaced, for `undo_hop`.
+    before_hop: Option<HopMarks>,
+}
+
+/// The state `note_hop` changes, kept so a hop that was not carried out
+/// can be undone.
+#[derive(Debug, Clone, Copy)]
+struct HopMarks {
+    assumed_band: Option<Band>,
+    arrived_at: Option<DateTime<Utc>>,
+    last_needed_hop: Option<DateTime<Utc>>,
+    in_flight: Option<InFlightHop>,
 }
 
 impl BandScheduler {
@@ -396,6 +408,12 @@ impl BandScheduler {
     /// Record an emitted hop. With a known live dial the hop waits for the
     /// dial to confirm it; with an unknown dial it is assumed carried out.
     pub fn note_hop(&mut self, to: Option<Band>, needed: bool, now: DateTime<Utc>) {
+        self.before_hop = Some(HopMarks {
+            assumed_band: self.assumed_band,
+            arrived_at: self.arrived_at,
+            last_needed_hop: self.last_needed_hop,
+            in_flight: self.in_flight,
+        });
         if self.live_band.is_some() {
             self.in_flight = to.map(|target| InFlightHop {
                 target,
@@ -408,6 +426,18 @@ impl BandScheduler {
             if needed {
                 self.last_needed_hop = Some(now);
             }
+        }
+    }
+
+    /// The hop last noted was not carried out: put back what `note_hop`
+    /// changed, so an unknown dial is not assumed to be on its target and a
+    /// needed hop does not start the dwell. Does nothing twice.
+    pub fn undo_hop(&mut self) {
+        if let Some(marks) = self.before_hop.take() {
+            self.assumed_band = marks.assumed_band;
+            self.arrived_at = marks.arrived_at;
+            self.last_needed_hop = marks.last_needed_hop;
+            self.in_flight = marks.in_flight;
         }
     }
 }

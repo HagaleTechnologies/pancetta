@@ -548,6 +548,91 @@ fn pan385_unexecuted_hop_is_retried_next_slot() {
     assert!(hop_of(&a).is_none(), "carried out: no further hop");
 }
 
+/// A low-activity hop the executor waited on (rig keyed) is retried the
+/// next slot once the coordinator reports it with `band_hop_waited`,
+/// instead of waiting out the two-slot settle and another `hop_threshold`
+/// of silence. Covers the round-robin over `bands` and the round-robin
+/// inside an active plan window.
+#[test]
+fn pan385_waited_low_activity_hop_is_retried_next_slot() {
+    fn first_low_activity_hop(h: &mut Harness, start: DateTime<Utc>) -> Option<(i64, u64)> {
+        (0..30).find_map(|k| {
+            hop_of(&h.slot(start + secs(15 * k), &[], None)).map(|(dial, reason)| {
+                assert!(
+                    matches!(reason, BandHopReason::LowActivity { .. }),
+                    "{reason:?}"
+                );
+                (k, dial)
+            })
+        })
+    }
+
+    // Round-robin over `bands`.
+    for waited in [false, true] {
+        let mut h = Harness::new(DEFAULT_BANDS, vec![], Some("FN42"), |_| {});
+        h.dial = 14_074_000;
+        assert_eq!(first_low_activity_hop(&mut h, t0()), Some((19, 7_074_000)));
+        if waited {
+            h.op.band_hop_waited();
+        }
+        // The dial still shows 20m: the hop was not carried out.
+        let next = hop_of(&h.slot(t0() + secs(15 * 20), &[], None));
+        if waited {
+            let (dial, reason) = next.expect("waited hop retried next slot");
+            assert_eq!(dial, 7_074_000);
+            assert_eq!(reason.to_band(), Some(Band::Band40m));
+            assert!(matches!(reason, BandHopReason::LowActivity { .. }));
+        } else {
+            assert!(next.is_none(), "not reported as waited: settling");
+        }
+    }
+
+    // Round-robin inside the active window.
+    let plan = vec![window("00:00-06:00", &[Band::Band40m, Band::Band80m])];
+    let bands = &[(14_074_000, "20m"), (18_100_000, "17m"), (7_074_000, "40m")];
+    let mut h = Harness::new(bands, plan, Some("FN42"), |_| {});
+    h.dial = 7_074_000;
+    let start = utc(2026, 11, 17, 1, 0, 0);
+    assert_eq!(first_low_activity_hop(&mut h, start), Some((19, 3_573_000)));
+    h.op.band_hop_waited();
+    let (dial, reason) = hop_of(&h.slot(start + secs(15 * 20), &[], None))
+        .expect("waited window hop retried next slot");
+    assert_eq!(dial, 3_573_000);
+    assert!(matches!(reason, BandHopReason::LowActivity { .. }));
+}
+
+/// With the dial unknown, a waited plan hop must not leave the scheduler
+/// assuming the station reached the window's band: the next slot emits the
+/// plan move again.
+#[test]
+fn pan385_waited_plan_hop_with_unknown_dial_is_retried_next_slot() {
+    for waited in [false, true] {
+        let mut h = Harness::new(SCENARIO2_BANDS, scenario2_plan(), Some("FN42"), |_| {});
+        h.slot(utc(2026, 11, 16, 23, 59, 45), &two_cqs(), None);
+        let a = h.slot(utc(2026, 11, 17, 0, 0, 0), &two_cqs(), None);
+        assert_eq!(hop_of(&a).map(|(d, _)| d), Some(7_076_000));
+        if waited {
+            h.op.band_hop_waited();
+        }
+        let next = hop_of(&h.slot(utc(2026, 11, 17, 0, 0, 15), &two_cqs(), None));
+        if waited {
+            assert_eq!(
+                next.map(|(d, r)| (d, r.why_text())),
+                Some((
+                    7_076_000,
+                    "Band hop 20m -> 40m: UTC plan window 00:00-06:00 (40m, 80m)".to_string()
+                )),
+                "waited: the plan move is still owed"
+            );
+        } else {
+            assert!(
+                next.is_none(),
+                "not reported as waited: assumed carried out"
+            );
+        }
+    }
+}
+
 #[test]
 fn pan385_needed_hop_dwell_is_one_hop_interval() {
     let bands = &[

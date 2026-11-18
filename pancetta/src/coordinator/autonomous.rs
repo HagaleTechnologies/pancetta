@@ -3019,6 +3019,11 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await
                                         {
+                                            // Not carried out: give back the
+                                            // low-activity eligibility the
+                                            // hop reset, so the next slot
+                                            // retries it.
+                                            operator.lock().await.band_hop_waited();
                                             let to_band =
                                                 reason.to_band().map(|b| b.name()).unwrap_or("?");
                                             if should_report_skip(
@@ -7752,7 +7757,6 @@ mod fq_f9_placement_feed_when_disabled_tests {
         ));
     }
 
-<<<<<<< HEAD
     /// PAN-385 AC18: a plan hop goes through the real Autonomous task to
     /// Hamlib and shows why in the Diagnostics overlay. The full-day window
     /// keeps the test independent of the wall clock.
@@ -7816,13 +7820,10 @@ mod fq_f9_placement_feed_when_disabled_tests {
         c.shutdown_signal.store(true, Ordering::Release);
     }
 
-    async fn build_coordinator(autonomous_enabled: bool, headless: bool) -> ApplicationCoordinator {
-=======
     pub(super) async fn build_coordinator(
         autonomous_enabled: bool,
         headless: bool,
     ) -> ApplicationCoordinator {
->>>>>>> 331e0c0739084262a1da0c58565ba521af866de5
         let mut config = Config::default();
         config.autonomous.enabled = autonomous_enabled;
         let shutdown = Arc::new(AtomicBool::new(false));

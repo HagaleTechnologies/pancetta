@@ -707,6 +707,18 @@ pub struct BandStrategy {
     activity_per_band: HashMap<String, u32>,
     /// PAN-385: plan, needed-activity and grey-line decision state.
     scheduler: crate::band_scheduler::BandScheduler,
+    /// PAN-385: the low-activity state before the hop `next_hop` last
+    /// returned, so `hop_waited` can restore it when the hop is not carried
+    /// out. Replaced at every `next_hop`.
+    before_last_hop: Option<LowActivityState>,
+}
+
+/// Low-activity counters and round-robin index a hop resets.
+#[derive(Debug, Clone, Copy)]
+struct LowActivityState {
+    low_activity_cycles: u32,
+    settling_cycles: u32,
+    current_band_index: usize,
 }
 
 impl BandStrategy {
@@ -724,6 +736,7 @@ impl BandStrategy {
             settling_cycles: 0,
             activity_per_band,
             scheduler: crate::band_scheduler::BandScheduler::new(),
+            before_last_hop: None,
         }
     }
 
@@ -867,8 +880,41 @@ impl BandStrategy {
 
     /// PAN-385: evaluate the triggers for this slot, in order: (a) a pending
     /// plan-window move, (b) needed activity, (c) low activity. Returns the
-    /// dial to move to and why.
+    /// dial to move to and why. A returned hop resets the low-activity
+    /// counters and moves the round-robin index; `hop_waited` undoes that
+    /// when the executor does not carry the hop out.
     pub fn next_hop(
+        &mut self,
+        now: DateTime<Utc>,
+        slot_ns: i64,
+    ) -> Option<(u64, crate::band_scheduler::BandHopReason)> {
+        let before = LowActivityState {
+            low_activity_cycles: self.low_activity_cycles,
+            settling_cycles: self.settling_cycles,
+            current_band_index: self.current_band_index,
+        };
+        let hop = self.evaluate_hop(now, slot_ns);
+        self.before_last_hop = hop.as_ref().map(|_| before);
+        hop
+    }
+
+    /// PAN-385: the hop `next_hop` last returned waited (rig keyed or an
+    /// exchange in progress) and was not carried out. Restores the
+    /// low-activity counters, settling period and round-robin index it
+    /// reset, and the scheduler's record of the hop, so the next slot
+    /// evaluates the same hop again instead of waiting out another
+    /// `hop_threshold` of silence or assuming an unknown dial moved. Does
+    /// nothing when no hop is outstanding.
+    pub fn hop_waited(&mut self) {
+        if let Some(before) = self.before_last_hop.take() {
+            self.low_activity_cycles = before.low_activity_cycles;
+            self.settling_cycles = before.settling_cycles;
+            self.current_band_index = before.current_band_index;
+            self.scheduler.undo_hop();
+        }
+    }
+
+    fn evaluate_hop(
         &mut self,
         now: DateTime<Utc>,
         slot_ns: i64,
@@ -2746,6 +2792,13 @@ impl AutonomousOperator {
         snapshot: Option<crate::band_scheduler::OpportunitySnapshot>,
     ) {
         self.band_strategy.scheduler_mut().set_snapshot(snapshot);
+    }
+
+    /// PAN-385: the `ChangeBand` this operator last emitted was not carried
+    /// out (the executor waited). Restores the low-activity eligibility the
+    /// hop reset so the next slot retries it.
+    pub fn band_hop_waited(&mut self) {
+        self.band_strategy.hop_waited();
     }
 
     /// PAN-385: whether a partner-answered exchange is in progress; while
