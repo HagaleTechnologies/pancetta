@@ -137,6 +137,7 @@ shape = "sine"
 
 [autonomous]
 # pounce_min_tier = "atno" # Optional; supersedes numeric pounce thresholds
+band_plan = []
 cq_after_idle_cycles = 10
 cq_direction = ""
 cq_no_response_switch_after = 4
@@ -154,7 +155,10 @@ unattended_policy = "off"
 
 [autonomous.band_hopping]
 enabled = false
+grey_line = true
 hop_threshold = 20
+needed_activity = true
+needed_idle_secs = 600
 
 [[autonomous.band_hopping.bands]]
 band_name = "20m"
@@ -352,9 +356,11 @@ remote_tx_enabled = false
 tx_allow_list = []
 
 [network.wsjtx_udp]
+accept_decodes = false
 accept_udp_requests = false
 allow_tx_initiation = false
 allowed_request_hosts = []
+decode_listen = "127.0.0.1:2238"
 destination = "127.0.0.1:2237"
 enabled = false
 instance_id = "WSJT-X - pancetta"

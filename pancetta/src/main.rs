@@ -23,14 +23,27 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use pancetta_lib::coordinator::ApplicationCoordinator;
 
+mod completions;
 mod doctor;
 mod mic_access;
 mod responsibility;
 
+/// PAN-377: one build identity in the CLI, info and startup log.
+const VERSION_LINE: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PANCETTA_GIT_SHA"),
+    " ",
+    env!("PANCETTA_BUILD_DATE"),
+    " ",
+    env!("PANCETTA_BUILD_TARGET"),
+    ")"
+);
+
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
 #[command(name = "pancetta")]
-#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(version = VERSION_LINE)]
 #[command(about = "A full FT8 station in one binary — decode, score, work, log")]
 #[command(long_about = r#"
 Pancetta is an FT8 station in one binary: decoder, priority scoring, the
@@ -199,6 +212,18 @@ enum Commands {
     TrustClient(TrustClientArgs),
     /// Remove a client's local TX trust
     UntrustClient(UntrustClientArgs),
+    /// Print a shell completion script to standard output
+    ///
+    /// zsh: save the output as `_pancetta` in a directory on your `fpath`, or add
+    /// `source <(pancetta completions zsh)` to ~/.zshrc after `compinit`.
+    Completions(CompletionsArgs),
+}
+
+#[derive(Clone, Args)]
+struct CompletionsArgs {
+    /// Shell to print the completion script for
+    #[arg(value_enum)]
+    shell: completions::Shell,
 }
 
 #[derive(Clone, Args)]
@@ -428,6 +453,10 @@ fn main() -> Result<()> {
         .exit();
     }
 
+    // Completion output needs no logging, config, audio, or responsibility relaunch.
+    if let Some(Commands::Completions(args)) = &cli.command {
+        return completions_command(args);
+    }
     responsibility::prepare(opens_microphone(&cli, stub_audio_requested()));
     async_main(cli)
 }
@@ -498,7 +527,7 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     info!(
         "Starting Pancetta v{} - High-Performance Amateur Radio FT8 Processing",
-        env!("CARGO_PKG_VERSION")
+        VERSION_LINE
     );
 
     responsibility::log_outcome();
@@ -687,6 +716,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Identity(args) => identity_command(args, cli).await,
         Commands::TrustClient(args) => trust_client_command(args, cli).await,
         Commands::UntrustClient(args) => untrust_client_command(args, cli).await,
+        Commands::Completions(args) => completions_command(&args),
     }
 }
 
@@ -2117,6 +2147,9 @@ async fn info_command() -> Result<()> {
     println!("Pancetta System Information");
     println!("===========================");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("Commit: {}", env!("PANCETTA_GIT_SHA"));
+    println!("Build date: {}", env!("PANCETTA_BUILD_DATE"));
+    println!("Target: {}", env!("PANCETTA_BUILD_TARGET"));
     println!();
 
     // System information
@@ -4693,6 +4726,7 @@ mod microphone_command_tests {
             vec!["setup"],
             vec!["test-audio", "--list"],
             vec!["config", "--show"],
+            vec!["completions", "zsh"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("pancetta").chain(args)).unwrap();
             assert!(!opens_microphone(&cli, false));
@@ -4938,3 +4972,14 @@ mod pan333_panic_tests {
 
 #[cfg(test)]
 mod docs_cli_drift;
+
+fn completions_command(args: &CompletionsArgs) -> Result<()> {
+    completions::write_script(
+        &mut std::io::stdout().lock(),
+        &completions::script(args.shell, Cli::command()),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod build_identity;

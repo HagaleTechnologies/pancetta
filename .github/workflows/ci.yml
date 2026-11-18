@@ -464,6 +464,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: workspace-tests
 
+      # The completion test validates and loads the generated script.
+      - name: Install zsh (PAN-377 completion check)
+        run: sudo apt-get install -y zsh && zsh --version
+
       - name: Install nextest
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$HOME/.cargo/bin" cargo-nextest
@@ -473,6 +477,8 @@ jobs:
         run: cargo nextest run --profile ci --workspace --exclude pancetta-research --features transmit --no-run
 
       - name: Test workspace partition
+        env:
+          PANCETTA_REQUIRE_ZSH: "1"
         run: cargo nextest run --profile ci --workspace --exclude pancetta-research --features transmit --partition count:${{ matrix.partition }}/4 --no-fail-fast
 
   workspace-check:

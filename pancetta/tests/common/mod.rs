@@ -280,6 +280,7 @@ impl CoordSim {
                         match message.message_type {
                             MessageType::AudioOutput {
                                 samples,
+                                sample_rate,
                                 playback_started,
                                 ..
                             } => {
@@ -288,7 +289,9 @@ impl CoordSim {
                                         samples.iter().any(|x| *x != 0.0),
                                         "worker waveform is silent"
                                     );
-                                    obs.lock().unwrap().audio += 1;
+                                    let mut obs = obs.lock().unwrap();
+                                    obs.audio += 1;
+                                    obs.audio_frames.push((samples.clone(), sample_rate));
                                 }
                                 if let Some(ack) = playback_started {
                                     ack.started(chrono::Utc::now());
@@ -742,6 +745,17 @@ impl CoordSim {
     pub fn home(&self) -> &std::path::Path {
         self.home.path()
     }
+
+    /// Admit `qso_id` as a Fox stream in the worker's `fox_admitted_qsos`,
+    /// as the coordinator's Fox mode does (PAN-386).
+    #[allow(dead_code)]
+    pub fn admit_fox(&self, qso_id: &pancetta_qso::QsoId) {
+        self.worker
+            .fox_admitted_qsos
+            .write()
+            .unwrap()
+            .insert(active_tx_qso_key(&qso_id.to_string()));
+    }
 }
 
 impl Drop for CoordSim {
@@ -756,6 +770,33 @@ pub struct Observations {
     pub audio: usize,
     pub diagnostics: Vec<String>,
     pub settlements: Vec<(String, Option<pancetta_qso::TxAttemptId>, bool)>,
+    /// Every non-empty `AudioOutput` waveform the worker played, with its
+    /// sample rate (PAN-386: decoded to prove what aired).
+    pub audio_frames: Vec<(Vec<f32>, u32)>,
+}
+
+/// Decode a worker waveform (12 kHz) with a Hound context for `fox` through
+/// both production decoders, native first. Returns `(frequency, text)` rows.
+#[allow(dead_code)]
+pub fn decode_fox_audio(samples: &[f32], fox: &str) -> Vec<(f64, String)> {
+    let mut audio = samples.to_vec();
+    audio.resize(pancetta_ft8::WINDOW_SAMPLES, 0.0);
+    let mut decoder =
+        pancetta_ft8::Ft8Decoder::new(pancetta_ft8::Ft8Config::default()).expect("decoder");
+    decoder.set_hound_foxes(&[fox.to_string()]);
+    let mut rows: Vec<(f64, String)> = decoder
+        .decode_window(&audio)
+        .expect("native decode")
+        .into_iter()
+        .map(|m| (m.frequency_offset, m.text))
+        .collect();
+    rows.extend(
+        decoder
+            .decode_window_ft8lib_with_context(&audio, pancetta_ft8::Protocol::Ft8)
+            .into_iter()
+            .map(|m| (m.frequency_offset, m.text)),
+    );
+    rows
 }
 
 #[derive(Debug, Clone)]

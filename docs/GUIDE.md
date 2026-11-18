@@ -292,9 +292,15 @@ waits for it to finish.
 
 Select the Fox in the DX Hunter panel (`4`) and press **Shift+H**.
 Pancetta engages the WSJT-X Fox/Hound convention: calls above 1000 Hz,
-then obeys the Fox's QSY instruction after being called. `Shift+X`
-toggles Fox mode itself (running your own pileup — read
-`docs/superpowers/specs/` on Fox mode before using this in anger).
+then obeys the Fox's QSY instruction after being called.
+
+`Shift+X` toggles Fox mode itself (running your own pileup). In FT8 it
+runs a WSJT-X-style Fox (PAN-386, unreleased). The CQ and every answer
+transmit at 300-900 Hz, each on its own 60 Hz slot. An RR73 to one Hound
+and a report to another are multiplexed into one frame. A contact is
+logged when its RR73 airs. This has been checked with pancetta's own
+decoders only, not yet with a real WSJT-X Hound or on the air. Read
+`docs/DECISIONS/modes.md` on Fox mode before using this in anger.
 
 ### …use GridTracker with pancetta?
 
@@ -373,6 +379,51 @@ but `accept_udp_requests` and `allow_tx_initiation` are still both
 required. GridTracker's "Halt TX" button (`HaltTx`) is always honored
 once `accept_udp_requests = true`, independent of `allow_tx_initiation`
 — stopping TX doesn't need the same consent as starting it.
+
+### …feed WSJT-X's decodes into pancetta?
+
+If WSJT-X runs on the same machine as pancetta (for example as a second
+receiver on another radio, or as your modem while pancetta watches), pancetta
+can show WSJT-X's decodes in Band Activity and DX Hunter and score them with
+the same priority scorer as its own. Turn the listener on in
+`~/.pancetta/pancetta.toml` and restart:
+
+```toml
+[network.wsjtx_udp]
+accept_decodes = true
+decode_listen = "127.0.0.1:2238"
+```
+
+Then in WSJT-X, open **File → Settings → Reporting** and set **UDP Server**
+to `127.0.0.1` and **UDP Server port number** to `2238`. WSJT-X's own "Accept
+UDP requests" box does not matter: pancetta never sends anything to WSJT-X.
+`accept_decodes` does not need `enabled = true`; the companion broadcast to
+GridTracker stays off unless you turn it on.
+
+- **`EXT` marks a WSJT-X decode.** Band Activity shows `EXT` before the
+  message. DX Hunter's Src column shows `EXT` (heard only through WSJT-X) or
+  `EX+N` (heard through WSJT-X and spotted on the network). Once pancetta's
+  own receiver hears the station, the row shows `RX` or `RX+N`.
+- **Nothing transmits on its own.** A WSJT-X decode never starts a QSO, an
+  autonomous call, an alert or a PSKReporter report. Answering it is still
+  your own key press.
+- **Only on pancetta's band and mode.** Space and Callers Enter refuse an
+  `EXT` decode that WSJT-X heard on another band or mode. The status line
+  explains the mismatch, for example
+  `Can't work N4BP. WSJT-X heard it on 40m FT8. Pancetta is on 20m FT8.`
+  The action is also refused when rig readback reports a different band.
+- **Decodes wait for WSJT-X's status.** Pancetta bands each decode by the
+  dial WSJT-X reports in its Status messages, so it drops decodes until
+  WSJT-X has sent one (normally within a few seconds of starting). Only live
+  FT8 and FT4 decodes are shown: replays, `.wav` decodes and low-confidence
+  decodes are dropped.
+- **WSJT-X sends to one UDP Server.** Pointing it at pancetta stops its
+  traffic to companions on port 2237, such as GridTracker. Use pancetta's own
+  companion broadcast (`enabled = true`, above) to feed GridTracker instead.
+- **Loopback only.** `decode_listen` must be `127.0.0.1` or `[::1]` with a
+  fixed port that differs from `destination`; anything else is refused at
+  load. `Shift+D` shows the listener's bind line and any dropped-datagram
+  summary under `remote.wsjtx`.
 
 ### …see why something isn't working?
 

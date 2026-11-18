@@ -513,6 +513,9 @@ pub enum TuiMessage {
         callsign: String,
         score: u32,
         factors: pancetta_qso::priority::PriorityFactors,
+        /// The rescored inputs came from a same-host WSJT-X decode (PAN-381).
+        /// It applies only to a row of the same origin.
+        external: bool,
     },
 }
 
@@ -1393,8 +1396,9 @@ impl TuiRunner {
                 callsign,
                 score,
                 factors,
+                external,
             } => {
-                app.refresh_local_rank(&callsign, score, factors);
+                app.refresh_local_rank_from(&callsign, score, factors, external);
             }
         }
 
@@ -2947,7 +2951,22 @@ impl TuiRunner {
             // legacy Unix terminals send Ctrl+Enter and Ctrl+M as a plain
             // Enter, which no guard can tell apart.
             Action::ReplyToSelectedCaller => {
-                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+                let selected = app.get_selected_station();
+                // PAN-435: a reply to a caller heard only through a same-host
+                // WSJT-X on another band or mode would key on pancetta's own
+                // dial and mode, where that station is not; refuse it.
+                let refusal = selected.as_ref().and_then(|(callsign, _, _)| {
+                    app.selected_caller()
+                        .filter(|m| {
+                            m.call_sign.as_deref().is_some_and(|c| {
+                                pancetta_core::callsign::callsigns_match(c, callsign)
+                            })
+                        })
+                        .and_then(|m| app.external_decode_refusal(m))
+                });
+                if let Some(text) = refusal {
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                } else if let Some((callsign, frequency, dx_parity)) = selected {
                     let step = app.current_caller_reply_step();
                     let snr = app.selected_caller().map(|m| m.snr as f32);
                     self.message_tx.send(TuiCommand::RespondToCaller {
@@ -4992,6 +5011,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -5522,6 +5542,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             a.callers_scroll = 0;
             assert!(a.get_selected_station().is_some());
@@ -5611,6 +5632,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
         }
         for event in [
@@ -7017,6 +7039,7 @@ mod key_tests {
                 priority_score: None,
                 priority_factors: None,
                 is_own_tx: false,
+                external: false,
             });
             for i in 0..2 {
                 a.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
@@ -8827,6 +8850,7 @@ mod key_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
@@ -9220,6 +9244,7 @@ mod key_tests {
                     priority_score: None,
                     priority_factors: None,
                     is_own_tx: false,
+                    external: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
             assert!(a.is_engaged("G8KHF"));
@@ -10130,6 +10155,7 @@ mod decode_log_level_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 
@@ -10301,3 +10327,5 @@ mod waterfall_key_tests;
 #[cfg(test)]
 #[path = "tui_runner/tests/tx_drive_tests.rs"]
 mod tx_drive_tests;
+#[path = "tui_runner/tests/external_reply_tests.rs"]
+mod external_reply_tests;

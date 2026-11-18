@@ -2348,6 +2348,7 @@ mod view_render_tests {
                         priority_score: None,
                         priority_factors: None,
                         is_own_tx: false,
+                        external: false,
                     });
                 app.tx_now_sending = Some(crate::app::TxQueueItem {
                     text: "CQ N2ABC FN42".into(),
@@ -4425,6 +4426,7 @@ mod view_render_tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         }
     }
 

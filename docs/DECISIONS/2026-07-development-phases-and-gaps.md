@@ -76,7 +76,9 @@
     once wired they take the same path.
   - DX Hunter rows on another band carry no band tag, so the operator learns that Space will QSY
     only from the keypress status line.
-  - An autonomous band hop can undo a manual spot QSY.
+  - An autonomous band hop can undo a manual spot QSY. Since PAN-385 a `[[autonomous.band_plan]]`
+    window acts only on entry, so it leaves a manual QSY alone until the next window starts, but a
+    needed-activity hop can still move away from it after `needed_idle_secs`.
   - Cluster rows are labelled `RX` (`source = Local`), `DxStation.frequency` holds Hz for cluster
     rows and MHz for cqdx rows, and `add_dx_spot` replaces a locally heard row. The spot path
     reads only `spot_rf_hz`.

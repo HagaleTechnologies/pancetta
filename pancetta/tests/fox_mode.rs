@@ -53,7 +53,9 @@ async fn fox_engage_creates_calling_cq_qso() {
     let manager = QsoManager::new(config);
     manager.start().await.expect("QsoManager::start");
 
-    // Mimic SetFoxMode{on:true}: start_cq_manual at Fox default 1500 Hz.
+    // Calls `start_cq_manual` directly to exercise the CQ lifecycle. Production
+    // Fox engage in FT8 uses the lowest free Fox slot (300 Hz, PAN-386); these
+    // assertions do not depend on the offset.
     let qso_id = manager
         .start_cq_manual(1500.0, None, false, None)
         .await

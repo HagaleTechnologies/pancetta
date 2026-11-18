@@ -76,6 +76,7 @@ async fn decode(app: &mut App, lookup: &CachedStationLookup, call: &str, mhz: f6
         priority_score: Some(explained.score.as_display_u32()),
         priority_factors: Some(explained.factors),
         is_own_tx: false,
+        external: false,
     })
     .await
     .unwrap();
