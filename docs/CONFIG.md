@@ -47,6 +47,18 @@ a single file at `~/.pancetta/pancetta.toml`, and run
 `pancetta config --validate` to see which file(s) were read. A table only
 needs the keys you change; every key you leave out keeps its default.
 
+With `--data-dir <DIR>` and no `--config`, pancetta searches only `DIR` for
+those four file names. It does not merge the current directory, the
+system directories, `~/.pancetta` or `~/.config/pancetta`, so a second
+station never picks up the first station's config. `PANCETTA_*`
+environment overrides still apply. With both `--config <path>` and
+`--data-dir <DIR>`, pancetta reads the `--config` file, and `DIR` holds
+everything else (logbook, logs, keys, upload queue). `--data-dir` is a
+global flag, so it works before or after a subcommand. A leading `~`
+expands to your home directory even when the shell does not expand it,
+and a relative path is resolved against the current directory. See
+[Running a second station](#running-a-second-station).
+
 ---
 
 ## Minimum viable config
@@ -134,6 +146,18 @@ Fresh generated configs omit it. This setting never applied automatic gain.
 input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
+`[audio.levels].output_gain_db` controls transmitted audio drive relative to
+the former fixed level of 0.5 full scale. It defaults to 0 dB, changes in
+1 dB steps with F7/F8 in the station TUI, and is saved after each change.
+The floor is -20 dB. `output_gain_ceiling_db` defaults to 0 dB and may be
+set from -20 to +5 dB. A positive ceiling reserves headroom for FT audio
+(single frames and bundles, both normalized to a 0.95 peak) before the
+selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
+0 dB are quieter than the original baseline in that mode; Tune is not
+reserved. A finite legacy gain outside the selectable
+range starts at the nearest bound with a warning. Invalid or non-finite
+ceilings and non-finite gain values fail config validation.
+
 ### `[audio.recording]` — save decode windows as WAV (off by default)
 
 Pancetta can save every live decode window it hands the decoder as a WAV
@@ -149,7 +173,7 @@ directory = "~/.pancetta/recordings"
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
-| `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+| `directory` | string | `""` | Where recordings go. Omitted or empty uses `<data-dir>/recordings` (`~/.pancetta/recordings` by default). Pancetta creates the directory if needed and expands a leading `~` to your home directory (`~user` is not expanded). |
 | `raw_capture_minutes` | integer | `0` | Minutes of raw 48 kHz capture after each start, one WAV per FT8 slot, into `raw48/` inside `directory`. `0` is off. Needs `auto_record = true` and `[audio] sample_rate = 48000`. |
 
 - Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
@@ -173,9 +197,9 @@ directory = "~/.pancetta/recordings"
 **Station decoder corpus.** The corpus offload job (magazzino
 `clients/pancetta-wav-offload.sh`) and the decoder research tools
 (`curate --source-dir ~/.pancetta/recordings`, see docs/RUNBOOK.md) read
-`~/.pancetta/recordings`. A station that feeds them must set both keys as
-shown above. `auto_record = true` on its own records into the default
-`~/Documents/Pancetta/Recordings`, which nothing collects.
+`~/.pancetta/recordings`. A station using the default data directory only
+needs `auto_record = true`. With a custom data directory, point the tools
+at that station's recordings or set `directory` explicitly as shown above.
 
 **Raw 48 kHz capture.** For decimation studies, pancetta can also keep the
 raw capture stream, before it is decimated to 12 kHz, for a set time after
@@ -1685,7 +1709,12 @@ To revoke a suspect remote client step by step, see
 
 ## Pancetta data files
 
-All persistent state lives under `~/.pancetta/`.
+All persistent state lives in the data directory: `~/.pancetta/` unless
+`--data-dir` names another. The paths below use `~/.pancetta/`; with
+`--data-dir`, the same files are in that directory instead. An explicit
+`[network.station_agent] key_dir` or `audit_log_path`, `[audio.recording]
+directory` or `[database] adif_backup_directory` still wins over the data
+directory, and `~` inside a config value still means your home directory.
 
 Before upgrading, stop all writers and follow [Upgrade and rollback](UPGRADING.md).
 Pancetta keeps up to seven changed startup snapshots of qsos.adi by default.
@@ -1702,7 +1731,9 @@ and external keys.
 | `~/.pancetta/qso.db.pre-rebuild[.N]` | Previous index kept when it held contacts ADIF lacked or could not be read. | Yes, safe to delete. |
 | `~/.pancetta/qso.db.pre-migration`, `qso.db.pre-migration-wal` | Legacy index copied before the first migration. | Keep until migration is confirmed. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` or `--undo` changed it. | This *is* the recovery copy. |
-| `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. | Yes — safe to delete while nothing runs. |
+| `~/.pancetta/qsos.adi.lock` | An empty file. Pancetta's logging and `pancetta import` lock it while writing `qsos.adi`, so they take turns. This is the per-write lock. | Yes — safe to delete while nothing runs. |
+| `~/.pancetta/pancetta.lock` | An empty file. A running station (no subcommand, or `run`) locks it from startup until it exits, so a second station on the same data directory refuses to start with `another pancetta is running (pid N)`. Subcommands such as `import`, `export` and `doctor`, `--wav` and `--replay` never take it. The operating system releases the lock when the station exits or crashes. | Never delete it while a station runs. Safe to delete while nothing runs. |
+| `~/.pancetta/pancetta.pid` | The process id of the last station that took `pancetta.lock`. The refusal message reads it. It goes stale after that station exits, and the next station overwrites it. | Yes, safe to delete. |
 | `~/.pancetta/imports/import-YYYYMMDD-HHMMSS.json` (UTC; `-2`, `-3`… if one already exists) | One receipt per import that added contacts, owner-only (0600). `--undo` reads it. Kept after the undo, marked `undone_at`. | No — `pancetta import --undo` needs it to remove that import. |
 | `~/.pancetta/backups/qsos_adi_YYYYMMDD_HHMMSS_microseconds.adi` | Changed startup snapshots of the ADIF source. Seven kept by default, configurable under `[database]`. | Contains contacts only through the latest snapshot. |
 | `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only; ADIF snapshots have independent retention. | Yes — same recovery path as `qso.db`. |
@@ -1724,6 +1755,58 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 `--dry-run` to preview). It appends only the contacts you don't already have
 and backs up `qsos.adi` first. Do not copy another logger's file over
 `qsos.adi`: that replaces your own contacts.
+
+### Running a second station
+
+Give each station its own data directory. For example, to run a 40 m
+station beside the 20 m station that uses `~/.pancetta`, create its
+config first:
+
+```bash
+pancetta --data-dir ~/.pancetta-40m setup
+pancetta --data-dir ~/.pancetta-40m config --validate
+```
+
+Then start it:
+
+```bash
+pancetta --headless --data-dir ~/.pancetta-40m
+```
+
+That station keeps its config, logbook, logs, station keys and upload
+queue in `~/.pancetta-40m`:
+
+```
+~/.pancetta-40m/
+  pancetta.toml          config (unless --config names another file)
+  pancetta.lock          locked by the running station; never delete it while a station runs
+  pancetta.pid           pid of the last station that took the lock
+  qsos.adi  qsos.adi.lock  qso.db*  imports/  backups/
+  logs/
+  agent/  agent-audit.log
+  upload_outbox.json
+  session_state.json  tui_state.json  tx-log.jsonl*  tier_cache.json
+  contest_serial.txt  callsign_seed.txt  recordings/
+```
+
+Each data directory runs one station at a time. A second station started
+on a directory that already has one running exits with status 1 and
+prints:
+
+```
+Error: another pancetta is running (pid 4242) with data directory /home/op/.pancetta
+Stop it first, or give this station its own directory with --data-dir.
+```
+
+Two spellings of one directory (a relative path, `..`, a symlink) still
+point at one lock file, so they are refused too. Maintenance commands run
+beside a station on the same directory, for example
+`pancetta --data-dir ~/.pancetta-40m export`. Commands that print a
+follow-up command, such as `config --validate` and `identity`, include
+`--data-dir` in it when you gave one.
+
+The two stations still need separate rigs, audio devices and listener
+ports. Pancetta does not check those.
 
 ### TX log
 
@@ -1770,11 +1853,9 @@ for this file.
 ### Decode-window recordings
 
 Decode-window WAVs exist only on a station whose config sets
-`[audio.recording] auto_record = true`, and land in
-`audio.recording.directory` (see the `[audio.recording]` section above).
-The station decoder corpus — the magazzino offload job and the
-`pancetta-research` curation tools — reads `~/.pancetta/recordings`, so a
-corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
+`[audio.recording] auto_record = true`. They land in `<data-dir>/recordings`
+unless `audio.recording.directory` names a path (see the `[audio.recording]`
+section above).
 Releases before this setting existed recorded every window into
 `~/.pancetta/recordings` unconditionally; upgrading does not touch those
 files, and deleting them reclaims the space (the directory was capped at

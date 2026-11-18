@@ -17,6 +17,7 @@ pancetta-core = { path = "../pancetta-core" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+boon = "=0.6.1"
 
 [lints]
 workspace = true

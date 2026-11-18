@@ -43,6 +43,7 @@ Press `?` inside the TUI for the same list as an overlay.
 | `u` | Nudge TX offset now: active QSO or CQ (Auto mode only) |
 | `Shift+F` | Set dial / split freq (RX MHz + optional TX MHz) |
 | `Shift+T` | Tune (12 s tone; blocked while TX DISABLED) |
+| `F7 / F8` | TX audio drive down / up by 1 dB |
 | `h` | Halt current TX |
 | `p` | Toggle PTT (blocked while TX DISABLED) |
 | `g` | Cycle TX policy: Full → Respond-only → Disabled |

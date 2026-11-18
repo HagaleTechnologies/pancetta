@@ -16,9 +16,11 @@ publish.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
