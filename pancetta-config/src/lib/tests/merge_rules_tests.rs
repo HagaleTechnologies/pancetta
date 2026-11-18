@@ -307,12 +307,15 @@ where
     }
 
     // `Some(empty)` is a real value for a SkipNone field: it must clear the
-    // base, not fall through to it.
+    // base, not fall through to it. That covers `Some("")` and `Some(0)` on
+    // scalar options as well as `Some([])` and `Some({})` on collections.
     let mut cleared_json = zj.clone();
     for (ptr, rule) in rules {
         let empty_value = match (rule, bj.pointer(ptr)) {
             (SkipNone, Some(Value::Array(_))) => json!([]),
             (SkipNone, Some(Value::Object(_))) => json!({}),
+            (SkipNone, Some(Value::String(_))) => json!(""),
+            (SkipNone, Some(Value::Number(_))) => json!(0),
             _ => continue,
         };
         let mut trial = cleared_json.clone();
