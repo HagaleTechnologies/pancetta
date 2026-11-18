@@ -138,9 +138,11 @@ ADC even with the rig's audio output turned all the way down.
 the former fixed level of 0.5 full scale. It defaults to 0 dB, changes in
 1 dB steps with F7/F8 in the station TUI, and is saved after each change.
 The floor is -20 dB. `output_gain_ceiling_db` defaults to 0 dB and may be
-set from -20 to +5 dB. A positive ceiling reserves bundle headroom before
-the selected multiplier, so bundles at 0 dB are quieter than the original
-bundle baseline in that mode. A finite legacy gain outside the selectable
+set from -20 to +5 dB. A positive ceiling reserves headroom for FT audio
+(single frames and bundles, both normalized to a 0.95 peak) before the
+selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
+0 dB are quieter than the original baseline in that mode; Tune is not
+reserved. A finite legacy gain outside the selectable
 range starts at the nearest bound with a warning. Invalid or non-finite
 ceilings and non-finite gain values fail config validation.
 

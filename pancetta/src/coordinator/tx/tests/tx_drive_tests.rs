@@ -44,9 +44,9 @@ fn drive_limits_preserve_default_buffers_and_positive_headroom() {
     assert_eq!(drive.get(), -20.0);
     assert_eq!(drive.adjust(-1), -20.0);
     let boosted = TxDrive::new(5.0, 5.0);
-    for (baseline, bundle) in [(0.5, false), (0.95, true)] {
+    for (baseline, ft_frame) in [(0.5, false), (FT_NORMALIZED_PEAK, true)] {
         let mut output = [baseline, -baseline];
-        apply(&mut output, boosted.get(), boosted.ceiling_db(), bundle);
+        apply(&mut output, boosted.get(), boosted.ceiling_db(), ft_frame);
         assert!(output.iter().all(|s| s.is_finite()));
         assert!(output
             .iter()
@@ -133,4 +133,36 @@ async fn configured_drive_scales_real_worker_audio() {
         (ratio_db + 6.0).abs() < 0.02,
         "worker audio delta {ratio_db} dB"
     );
+}
+
+/// Codex P1 on #705: a single FT8 frame leaves the modulator normalized to a
+/// 0.95 peak, not 0.5, so a positive ceiling must reserve headroom for it too.
+#[test]
+fn positive_drive_keeps_a_real_single_frame_below_minus_one_dbfs() {
+    let mut modulator = pancetta_ft8::Ft8Modulator::new_default().unwrap();
+    let symbols: [u8; pancetta_ft8::NUM_SYMBOLS] =
+        std::array::from_fn(|i| u8::try_from(i % 8).unwrap());
+    let frame = modulator.modulate_symbols(&symbols, 1500.0).unwrap();
+    let peak = |s: &[f32]| s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+    assert!(
+        (peak(&frame) - FT_NORMALIZED_PEAK).abs() < 0.01,
+        "{}",
+        peak(&frame)
+    );
+    let limit = 10.0_f32.powf(-1.0 / 20.0) + 0.00001;
+    for ceiling in [1.0, 3.0, 5.0] {
+        let drive = TxDrive::new(ceiling, ceiling);
+        let mut output = frame.clone();
+        apply(&mut output, drive.get(), drive.ceiling_db(), true);
+        assert!(
+            peak(&output) <= limit,
+            "+{ceiling} dB peaks at {}",
+            peak(&output)
+        );
+        // One step down is still exactly 1 dB quieter than the ceiling.
+        let mut lower = frame.clone();
+        apply(&mut lower, drive.get() - 1.0, drive.ceiling_db(), true);
+        let ratio = peak(&lower) / peak(&output);
+        assert!((20.0 * ratio.log10() + 1.0).abs() < 0.01, "{ratio}");
+    }
 }

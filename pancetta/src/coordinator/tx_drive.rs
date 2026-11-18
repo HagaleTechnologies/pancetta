@@ -48,10 +48,18 @@ impl TxDrive {
     }
 }
 
+/// Peak of FT audio after the modulator's final normalization
+/// (`Ft8Modulator::apply_final_processing` and the multi-TX sum both leave it here).
+pub(crate) const FT_NORMALIZED_PEAK: f32 = 0.95;
+
 /// Scale only the final buffer. Provisional modulator buffers remain reusable.
-pub(crate) fn apply(samples: &mut [f32], db: f32, ceiling_db: f32, bundle: bool) {
-    let reserve = if bundle && ceiling_db > 0.0 {
-        (10.0_f32.powf(-1.0 / 20.0) / 0.95) / 10.0_f32.powf(ceiling_db / 20.0)
+///
+/// `ft_frame` marks FT audio, single frame or bundle, whose peak is already
+/// [`FT_NORMALIZED_PEAK`]. With a positive ceiling such audio is reserved down
+/// so the ceiling itself peaks at −1 dBFS; Tune's 0.5-peak sine needs no reserve.
+pub(crate) fn apply(samples: &mut [f32], db: f32, ceiling_db: f32, ft_frame: bool) {
+    let reserve = if ft_frame && ceiling_db > 0.0 {
+        (10.0_f32.powf(-1.0 / 20.0) / FT_NORMALIZED_PEAK) / 10.0_f32.powf(ceiling_db / 20.0)
     } else {
         1.0
     };

@@ -12042,7 +12042,7 @@ impl super::ApplicationCoordinator {
                                             &mut audio_out,
                                             drive_at_key,
                                             tx_drive.ceiling_db(),
-                                            false,
+                                            true,
                                         );
                                         let (playback_ack, mut playback_waiter) =
                                             PlaybackStartAck::new();
