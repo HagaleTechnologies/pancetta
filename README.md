@@ -272,6 +272,8 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 
 | Command | What it does |
 |---|---|
+| `pancetta --version` | Version, commit, build date and target, e.g. `pancetta 0.9.6 (50e5208 2026-11-18 x86_64-unknown-linux-gnu)`. Paste it into bug reports. |
+| `pancetta completions zsh` | Print a zsh completion script for every subcommand and flag ([Shell completions](#shell-completions)). |
 | `pancetta` | Run the station (TUI). First run launches the setup wizard. |
 | `pancetta doctor [--json]` | Station prerequisites and fixes. Exit 0: ON-AIR READY; 1: DECODE-ONLY; 2: NOT CONFIGURED; 3: NOT READY. JSON includes all checks. |
 | `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
@@ -289,6 +291,21 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
 | `pancetta --headless --log-format json` | The same, with one JSON object per log line on stderr and in the log file (for journald, jq or a log shipper). |
 | `pancetta --headless --gain-sweep-seconds 600 --gain-sweep-report gain.json` | Measure per-band receive gain and save an advisory report. [Limits and timing](docs/receive-gain-sweep.md). |
+
+### Shell completions
+
+`pancetta completions zsh` prints a zsh completion script generated from the
+binary's own command line, so it always matches the installed version.
+Save it as `_pancetta` in a directory on your `fpath`:
+
+    mkdir -p ~/.zfunc
+    pancetta completions zsh > ~/.zfunc/_pancetta
+    # in ~/.zshrc, before compinit:
+    fpath=(~/.zfunc $fpath)
+    autoload -U compinit && compinit
+
+or add `source <(pancetta completions zsh)` to `~/.zshrc` after `compinit`.
+Regenerate the file after upgrading. Only zsh is supported for now.
 
 ### LoTW confirmations
 

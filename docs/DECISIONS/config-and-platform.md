@@ -1342,3 +1342,10 @@ Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
 receive a release-candidate notice. They require a real, matching CHANGELOG
 section; there is no Unreleased fallback. The operator still publishes the
 draft. macOS signing and notarization remain PAN-265.
+
+## Build identity and shell completions (PAN-377, 2026-11-18)
+
+- `--version` and `-V` print `pancetta <semver> (<sha> <UTC date> <target>)`; `info` and the startup log show those fields. The SHA comes from git, the date from `SOURCE_DATE_EPOCH` or build time, and the target from Cargo. A malformed epoch fails the build to avoid publishing an identity with a false date. No `-dirty` suffix is used because the release gate checks the exact commit instead.
+- The build script watches existing git `HEAD`, `refs/heads`, `packed-refs` and `reftable` paths. Missing watched paths make Cargo rebuild on every invocation. A HEAD move rebuilt `pancetta` once in 1m27s on the 32-core research container. Git location environment overrides are removed so a hook or outer command cannot redirect discovery away from the compiled sources.
+- Wire versions, user agents and cache keys retain bare semver. The generated zsh completion script is not checked in. It follows clap's live command tree, including global flags as `--help` lists them, and uses first-sentence descriptions. Only zsh is supported. Completions return before logging and config startup; broken pipes are tolerated.
+- No `vergen`, `clap_complete` or `clap_mangen` dependency is needed. The release gate `scripts/check-build-identity.sh` verifies the binary's identity against the checked-out commit and matrix target.

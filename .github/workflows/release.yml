@@ -157,6 +157,14 @@ jobs:
               || { echo "::error::macOS binary lacks the embedded Info.plist (PAN-264)"; exit 1; }
           fi
 
+      - name: Smoke test — binary names its commit and target (PAN-377)
+        # Catch a stale or missing identity from a cached build.
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/pancetta"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          bash scripts/check-build-identity.sh "$BIN" "${{ matrix.target }}"
+
       - name: Decode fixture verification (ARM only) — proves decoding, not just linkage
         # The smoke test above only proves the native C decoder is linked in;
         # it never decodes anything, so it can't catch an ARM-specific
