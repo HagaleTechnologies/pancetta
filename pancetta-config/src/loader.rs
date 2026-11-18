@@ -305,6 +305,10 @@ impl ConfigLoader {
     pub fn load(&self) -> ConfigResult<Config> {
         let (mut config, sources) = self.load_merged_with_sources()?;
 
+        if let Some(warning) = config.clamp_tx_drive() {
+            self.push_load_warning(warning);
+        }
+
         // Validate the final configuration
         config.validate()?;
 
