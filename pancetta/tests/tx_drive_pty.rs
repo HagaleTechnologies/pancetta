@@ -29,7 +29,8 @@ fn attached_terminal_reaches_the_running_station() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                // `*mut` on macOS, `*const` on Linux; null_mut coerces to both.
+                std::ptr::null_mut(),
             )
         },
         0
@@ -58,7 +59,7 @@ fn attached_terminal_reaches_the_running_station() {
     // SAFETY: pre_exec performs only async-signal-safe descriptor/session calls.
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+            if libc::setsid() < 0 || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
