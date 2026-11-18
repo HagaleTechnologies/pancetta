@@ -99,6 +99,13 @@ async fn error_body_text(resp: reqwest::Response) -> String {
 }
 
 impl CqdxClient {
+    fn http_builder() -> reqwest::ClientBuilder {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            // Never follow redirects: the bearer token must stay on this host.
+            .redirect(reqwest::redirect::Policy::none())
+    }
+
     /// Create a new client for the given base URL and PAT token.
     ///
     /// The base URL must use `https://` or `http://localhost` (for development).
@@ -148,13 +155,7 @@ impl CqdxClient {
         // stack is misconfigured. Surface as a Result instead of panicking
         // — pancetta runs as a long-lived daemon and a startup panic here
         // takes the whole TUI down with no operator-visible reason.
-        let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            // Never follow redirects: a 3xx could relocate the bearer token to
-            // another host. The cqdx API does not redirect.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(CqdxError::HttpInit)?;
+        let http = Self::http_builder().build().map_err(CqdxError::HttpInit)?;
         Ok(Self {
             http,
             base_url,
@@ -1465,3 +1466,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client/tests/tls_security_tests.rs"]
+mod tls_security_tests;

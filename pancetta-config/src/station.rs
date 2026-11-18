@@ -6,40 +6,33 @@
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use validator::Validate;
 
 /// Station configuration settings
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: any field omitted from a partial config file
 // falls back to this struct's `Default` impl rather than failing to
 // deserialize (which previously reverted the WHOLE config to defaults).
 #[serde(default)]
 pub struct StationConfig {
-    /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P")
-    #[validate(length(min = 3, max = 20))]
+    /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P"); 3 to 20 characters
     pub callsign: String,
 
-    /// Maidenhead grid square locator (e.g., "FN31pr", "JO65cx")
-    #[validate(length(min = 4, max = 8))]
+    /// Maidenhead grid square locator (e.g., "FN31pr", "JO65cx"); 4 to 8 characters
     pub grid_square: String,
 
-    /// Transmitter power in watts
-    #[validate(range(min = 1, max = 1500))]
+    /// Transmitter power in watts (1 to 1500)
     pub power_watts: u32,
 
     /// QTH (location) description
     pub qth: String,
 
-    /// DXCC entity code (ITU country code)
-    #[validate(range(min = 1, max = 999))]
+    /// DXCC entity code (ITU country code, 1 to 999)
     pub dxcc_entity: u16,
 
-    /// ITU zone number
-    #[validate(range(min = 1, max = 90))]
+    /// ITU zone number (1 to 90)
     pub itu_zone: u8,
 
-    /// CQ zone number
-    #[validate(range(min = 1, max = 40))]
+    /// CQ zone number (1 to 40)
     pub cq_zone: u8,
 
     /// Station coordinates for accurate distance calculations
@@ -195,10 +188,14 @@ impl Default for StationConfig {
 
 impl ConfigSection for StationConfig {
     fn validate_section(&self) -> ConfigResult<()> {
-        // Perform validation using the validator crate
-        use validator::Validate;
-        Validate::validate(self)
-            .map_err(|e| ConfigError::Validation(format!("Station validation failed: {}", e)))?;
+        // Bounds first, all reported together, then the semantic checks.
+        let bound_errors = self.bound_errors();
+        if !bound_errors.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "Station validation failed: {}",
+                bound_errors.join("\n")
+            )));
+        }
 
         // Additional custom validation
         self.validate_callsign()?;
@@ -273,6 +270,69 @@ impl ConfigSection for StationConfig {
 }
 
 impl StationConfig {
+    /// Inclusive length and range bounds, one diagnostic per failing field.
+    ///
+    /// PAN-315: these replace the validator 0.21 derive attributes and keep
+    /// its `field: Validation error: code [params]` text, with `min`, `max`
+    /// and `value` rendered as debug-formatted JSON values. Lengths count
+    /// Unicode characters, as validator did.
+    fn bound_errors(&self) -> Vec<String> {
+        use serde_json::Value;
+        let mut errors = Vec::new();
+        let mut check =
+            |field: &str, code: &str, measured: u64, min: u64, max: u64, value: Value| {
+                if measured < min || measured > max {
+                    let params = HashMap::from([
+                        ("min", Value::from(min)),
+                        ("max", Value::from(max)),
+                        ("value", value),
+                    ]);
+                    errors.push(format!("{field}: Validation error: {code} [{params:?}]"));
+                }
+            };
+        let callsign = self.callsign.as_str();
+        check(
+            "callsign",
+            "length",
+            callsign.chars().count() as u64,
+            3,
+            20,
+            Value::from(callsign),
+        );
+        let grid = self.grid_square.as_str();
+        check(
+            "grid_square",
+            "length",
+            grid.chars().count() as u64,
+            4,
+            8,
+            Value::from(grid),
+        );
+        let power = self.power_watts;
+        check(
+            "power_watts",
+            "range",
+            power.into(),
+            1,
+            1500,
+            Value::from(power),
+        );
+        let dxcc = self.dxcc_entity;
+        check(
+            "dxcc_entity",
+            "range",
+            dxcc.into(),
+            1,
+            999,
+            Value::from(dxcc),
+        );
+        let itu = self.itu_zone;
+        check("itu_zone", "range", itu.into(), 1, 90, Value::from(itu));
+        let cq = self.cq_zone;
+        check("cq_zone", "range", cq.into(), 1, 40, Value::from(cq));
+        errors
+    }
+
     /// Validate the callsign format and characters
     fn validate_callsign(&self) -> ConfigResult<()> {
         let callsign = &self.callsign;
@@ -619,3 +679,10 @@ mod tests {
         assert_eq!(cfg.ptt_lead_ms, 80);
     }
 }
+
+#[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
+#[path = "station/tests/station_bounds_tests.rs"]
+mod station_bounds_tests;

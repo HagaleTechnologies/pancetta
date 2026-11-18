@@ -169,6 +169,12 @@ pub struct PskReporterClient {
 }
 
 impl PskReporterClient {
+    fn http_builder(config: &PskReporterConfig) -> reqwest::ClientBuilder {
+        Client::builder()
+            .timeout(TokioDuration::from_secs(config.timeout_seconds))
+            .user_agent(format!("{}/1.0", config.software))
+    }
+
     /// Create new PSKReporter client
     pub fn new() -> Self {
         Self::with_config(PskReporterConfig::default())
@@ -176,9 +182,7 @@ impl PskReporterClient {
 
     /// Create new PSKReporter client with custom configuration
     pub fn with_config(config: PskReporterConfig) -> Self {
-        let client = Client::builder()
-            .timeout(TokioDuration::from_secs(config.timeout_seconds))
-            .user_agent(format!("{}/1.0", config.software))
+        let client = Self::http_builder(&config)
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -1871,3 +1875,7 @@ mod tests {
         crate::test_support::served(h).await;
     }
 }
+
+#[cfg(test)]
+#[path = "pskreporter/tests/tls_security_tests.rs"]
+mod tls_security_tests;
