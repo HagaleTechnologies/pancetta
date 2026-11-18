@@ -264,7 +264,7 @@ impl ConfigLoader {
 
         // Home directory
         if let Some(home_dir) = dirs::home_dir() {
-            paths.push(home_dir.join(".pancetta"));
+            paths.extend(pancetta_core::data_dir::default_for_home(Some(&home_dir)));
             paths.push(home_dir.join(".config").join("pancetta"));
         }
 
@@ -1143,6 +1143,10 @@ impl Default for ConfigManager {
         Self::new().unwrap()
     }
 }
+
+#[cfg(test)]
+#[path = "loader/tests/data_dir_discovery_tests.rs"]
+mod data_dir_discovery_tests;
 
 #[cfg(test)]
 mod tests {

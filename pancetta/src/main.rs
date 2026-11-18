@@ -71,6 +71,16 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
+    /// Keep this station's config, logbook, logs, keys and upload queue in DIR
+    /// instead of ~/.pancetta. Give each station its own directory.
+    //
+    // An OS-string parser, not clap's `PathBuf` one, so an empty value reaches
+    // `resolve_flag` and fails with "--data-dir must name a directory".
+    #[arg(long, global = true, value_name = "DIR",
+        value_parser = clap::builder::TypedValueParser::map(
+            clap::builder::OsStringValueParser::new(), PathBuf::from))]
+    data_dir: Option<PathBuf>,
+
     /// Audio input device name or index
     #[arg(short, long, global = true)]
     audio_device: Option<String>,
@@ -185,6 +195,8 @@ enum Commands {
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
     /// Export logged QSOs from your logbook (~/.pancetta/qsos.adi) to ADIF
+    ///
+    /// With --data-dir, these files are in that directory instead.
     Export(ExportArgs),
     /// Import contacts from another logger's ADIF (.adi) file into your logbook
     ///
@@ -195,7 +207,7 @@ enum Commands {
     /// ~/.pancetta/qsos.adi.bak (or the next free .bak.N), and the import saves
     /// a receipt in ~/.pancetta/imports/ that --undo uses to remove exactly the
     /// contacts it added. Use --dry-run to see the result first; it changes
-    /// nothing.
+    /// nothing. With --data-dir, these files are in that directory instead.
     //
     // "30 minutes" is `pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES`;
     // `import_duplicate_window_is_thirty_minutes` keeps the two in step.
@@ -421,7 +433,7 @@ impl std::fmt::Display for LogFormat {
 
 fn main() -> Result<()> {
     let matches = Cli::command().get_matches();
-    let cli =
+    let mut cli =
         Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit());
     if test_tx_offset_without_test_tx(&cli, &matches) {
         clap::Error::raw(
@@ -453,12 +465,35 @@ fn main() -> Result<()> {
         .exit();
     }
 
+    // PAN-376: resolve `--data-dir` once, before the macOS relaunch, so a bad
+    // value fails like other flag errors. Memory only: nothing opens a file.
+    if let Some(raw) = cli.data_dir.take() {
+        // Same home lookup as the default data directory: `dirs`, then `$HOME`.
+        let home = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let resolved =
+            pancetta_core::data_dir::resolve_flag(&raw, home.as_deref()).unwrap_or_else(|e| {
+                clap::Error::raw(clap::error::ErrorKind::ValueValidation, format!("{e}\n")).exit()
+            });
+        // `main()` is the only setter, so this cannot already be set.
+        let _ = pancetta_core::data_dir::set_process_data_dir(resolved.clone());
+        cli.data_dir = Some(resolved);
+    }
+
     // Completion output needs no logging, config, audio, or responsibility relaunch.
     if let Some(Commands::Completions(args)) = &cli.command {
         return completions_command(args);
     }
     responsibility::prepare(opens_microphone(&cli, stub_audio_requested()));
     async_main(cli)
+}
+
+/// Whether this run is a live station that must hold the data directory's
+/// instance lock (PAN-376): no subcommand or `run`, and not `--wav` or
+/// `--replay`. Subcommands (`import`, `export`, `doctor`, `setup`, …) never
+/// take it, so `pancetta import` beside a running station keeps working
+/// (PAN-214).
+fn takes_instance_lock(cli: &Cli) -> bool {
+    matches!(cli.command, None | Some(Commands::Run)) && cli.wav.is_none() && cli.replay.is_none()
 }
 
 /// The first receiving-service flag given with a subcommand that never reads
@@ -520,6 +555,16 @@ async fn async_main(cli: Cli) -> Result<()> {
     if let Some(Commands::ImportConfirmations(args)) = &cli.command {
         return import_confirmations_command(args.clone()).await;
     }
+    // PAN-376: a live station holds the data directory's instance lock for the
+    // whole of `async_main`. It is taken before logging starts and before the
+    // TUI takes the terminal, so a refused second station writes nothing into
+    // the running station's log.
+    let _instance_lock = takes_instance_lock(&cli)
+        .then(|| {
+            pancetta_lib::instance_lock::InstanceLock::acquire(&pancetta_core::data_dir::current())
+        })
+        .transpose()?;
+
     // Initialize logging first
     let _log_guard = init_logging(&cli, cli.headless)?;
 
@@ -528,6 +573,10 @@ async fn async_main(cli: Cli) -> Result<()> {
     info!(
         "Starting Pancetta v{} - High-Performance Amateur Radio FT8 Processing",
         VERSION_LINE
+    );
+    info!(
+        "Data directory: {}",
+        pancetta_core::data_dir::current().display()
     );
 
     responsibility::log_outcome();
@@ -638,7 +687,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         config_write_path,
         config_write_is_toml,
         // PAN-270: no home override in production — the session-state
-        // resolver falls back to the real home directory.
+        // resolver falls back to the process data directory (PAN-376).
         None,
     )
     .await?;
@@ -653,9 +702,12 @@ async fn run_application(cli: Cli) -> Result<()> {
         // validate the merged configuration the same way. The merged result
         // carries fresh load metadata (timestamp, instance id) every time;
         // it is dropped so it never reads as an edit.
-        coordinator.set_config_reload_loader(|| {
-            let (mut config, warnings) =
-                Config::load_default_with_warnings().map_err(|e| e.to_string())?;
+        // PAN-376: with `--data-dir`, reloads search only that directory too.
+        let reload_dir = cli.data_dir.clone();
+        coordinator.set_config_reload_loader(move || {
+            let (mut config, warnings, _) =
+                discovered_config_with_warnings_and_files(reload_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
             config.metadata = None;
             Ok((config, warnings))
         });
@@ -783,7 +835,10 @@ async fn identity_command(args: IdentityArgs, cli: &Cli) -> Result<()> {
             println!("Paired: yes ({} pinned IdP key(s)).", paired.idp_keys.len());
         }
         Err(_) => {
-            println!("Paired: no — run `pancetta pair <code>` to enroll with cqdx.");
+            println!(
+                "Paired: no — run `{} pair <code>` to enroll with cqdx.",
+                pancetta_invocation(cli.data_dir.as_deref())
+            );
         }
     }
     println!();
@@ -960,12 +1015,11 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// `~/.pancetta`: where the logbook (`qsos.adi`) and its search index
-/// (`qso.db`) live, the same directory the coordinator logs into.
+/// The data directory (`~/.pancetta` unless `--data-dir`, PAN-376): where
+/// the logbook (`qsos.adi`) and its search index (`qso.db`) live, the same
+/// directory the coordinator logs into.
 fn pancetta_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta")
+    pancetta_core::data_dir::current()
 }
 
 /// The files `pancetta import`, `--undo` and `export` work on, all in
@@ -2280,7 +2334,45 @@ fn load_config_report(
 ) -> Result<(Config, pancetta_config::LoadReport), pancetta_config::ConfigError> {
     match &cli.config {
         Some(path) => Config::load_from_file_with_report(path),
+        None => discovered_config_unvalidated(cli.data_dir.as_deref()),
+    }
+}
+
+/// Discover and merge config files without `--config` (PAN-376): with
+/// `--data-dir` the data directory is the only search directory, otherwise
+/// the default six-place search. Embedded defaults and `PANCETTA_*`
+/// environment overrides apply either way.
+fn discovered_config_with_warnings_and_files(
+    data_dir: Option<&Path>,
+) -> pancetta_config::ConfigResult<(Config, Vec<String>, Vec<PathBuf>)> {
+    match data_dir {
+        Some(dir) => Config::load_from_dir_with_warnings_and_files(dir),
+        None => Config::load_default_with_warnings_and_files(),
+    }
+}
+
+/// Like [`discovered_config_with_warnings_and_files`], without validation and with the
+/// load report `config --validate` prints.
+fn discovered_config_unvalidated(
+    data_dir: Option<&Path>,
+) -> pancetta_config::ConfigResult<(Config, pancetta_config::LoadReport)> {
+    match data_dir {
+        Some(dir) => Config::load_from_dir_unvalidated(dir),
         None => Config::load_default_unvalidated(),
+    }
+}
+
+/// How to spell a `pancetta` command in a hint: with `--data-dir D` when the
+/// operator gave one (PAN-376), so the hint acts on the same station.
+fn pancetta_invocation(data_dir: Option<&Path>) -> String {
+    match data_dir {
+        // Quote a path with whitespace so the hint still pastes as one
+        // argument.
+        Some(dir) if dir.to_string_lossy().contains(char::is_whitespace) => {
+            format!("pancetta --data-dir \"{}\"", dir.display())
+        }
+        Some(dir) => format!("pancetta --data-dir {}", dir.display()),
+        None => "pancetta".to_string(),
     }
 }
 
@@ -2301,7 +2393,11 @@ fn config_validate(cli: &Cli) -> Result<()> {
     };
     print!(
         "{}",
-        format_load_report(&report, &default_pancetta_toml_path())
+        format_load_report(
+            &report,
+            &default_pancetta_toml_path(),
+            cli.data_dir.as_deref()
+        )
     );
     match config.validate() {
         Ok(()) => {
@@ -2321,7 +2417,11 @@ fn config_validate(cli: &Cli) -> Result<()> {
 /// `config --validate`: the file(s) in merge order, or -- when none was
 /// found -- every directory searched plus a note that built-in defaults
 /// apply; then any load warnings as `WARNING:` lines.
-fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path) -> String {
+fn format_load_report(
+    report: &pancetta_config::LoadReport,
+    default_path: &Path,
+    data_dir: Option<&Path>,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if report.files.is_empty() {
@@ -2340,7 +2440,8 @@ fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path)
         }
         let _ = writeln!(
             out,
-            "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create {}.",
+            "Using built-in defaults (callsign N0CALL). Run `{} setup` to create {}.",
+            pancetta_invocation(data_dir),
             default_path.display()
         );
     } else {
@@ -2363,12 +2464,10 @@ async fn load_configuration(cli: &Cli) -> Result<Config> {
 }
 
 /// The default `pancetta.toml` location used when no `--config <path>` is
-/// given -- `~/.pancetta/pancetta.toml`.
+/// given -- `pancetta.toml` in the data directory (`~/.pancetta` unless
+/// `--data-dir`, PAN-376).
 fn default_pancetta_toml_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta")
-        .join("pancetta.toml")
+    pancetta_core::data_dir::current().join("pancetta.toml")
 }
 
 /// The `--config <path>` if the operator passed one, else the default
@@ -2436,7 +2535,7 @@ async fn load_configuration_with_warnings(
         Config::load_from_file_with_warnings(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
-        match Config::load_default_with_warnings_and_files() {
+        match discovered_config_with_warnings_and_files(cli.data_dir.as_deref()) {
             Ok((config, warnings, files)) => {
                 loaded_files = files;
                 (config, warnings)
@@ -2452,10 +2551,11 @@ async fn load_configuration_with_warnings(
                 eprintln!();
                 eprintln!("ERROR: your saved configuration failed to load:");
                 eprintln!("  {e}");
-                let Some(failed_path) = config_file_to_repair(&e) else {
+                let Some(failed_path) = config_file_to_repair(&e, cli.data_dir.as_deref()) else {
                     eprintln!(
                         "Could not tell which config file to fix; run \
-                         `pancetta config --validate` to list them and edit by hand."
+                         `{} config --validate` to list them and edit by hand.",
+                        pancetta_invocation(cli.data_dir.as_deref())
                     );
                     return Err(anyhow::anyhow!(e)).context("Failed to load default configuration");
                 };
@@ -2473,10 +2573,9 @@ async fn load_configuration_with_warnings(
                         Some(fixed) => {
                             // Codex P1 on #705: keep the contributing files, so F7/F8
                             // saves go to the recovered source that wins, not a fallback.
-                            let (config, warnings, files) = config_after_recovery(
-                                fixed,
-                                Config::load_default_with_warnings_and_files,
-                            );
+                            let (config, warnings, files) = config_after_recovery(fixed, || {
+                                discovered_config_with_warnings_and_files(cli.data_dir.as_deref())
+                            });
                             loaded_files = files;
                             (config, warnings)
                         }
@@ -2547,11 +2646,14 @@ fn offer_wizard_on_load_failure(
 /// validation, the one discovered file that fails validation on its own.
 /// `None` when no single file can be blamed (several invalid files, an
 /// invalid environment override, or a failure only the merge produces).
-fn config_file_to_repair(e: &pancetta_config::ConfigError) -> Option<PathBuf> {
+fn config_file_to_repair(
+    e: &pancetta_config::ConfigError,
+    data_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if let pancetta_config::ConfigError::FileLoad { path, .. } = e {
         return Some(path.clone());
     }
-    let (_, report) = Config::load_default_unvalidated().ok()?;
+    let (_, report) = discovered_config_unvalidated(data_dir).ok()?;
     sole_invalid_config_file(&report.files)
 }
 
@@ -3176,9 +3278,7 @@ async fn setup_command() -> Result<()> {
     println!();
 
     // Load existing config or defaults
-    let config_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta");
+    let config_dir = pancetta_core::data_dir::current();
     let config_path = config_dir.join("pancetta.toml");
     let mut config = if config_path.exists() {
         match Config::load_from_file(&config_path) {
@@ -3576,11 +3676,9 @@ fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_block
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("pancetta={},warn", log_level)));
 
-    // Set up file logging with daily rotation to ~/.pancetta/logs/
-    let log_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta")
-        .join("logs");
+    // Set up file logging with daily rotation to <data-dir>/logs/
+    // (`~/.pancetta/logs/` unless `--data-dir`, PAN-376)
+    let log_dir = pancetta_core::data_dir::current().join("logs");
 
     // Create log directory (ignore errors — file logging is best-effort)
     let _ = std::fs::create_dir_all(&log_dir);
@@ -3897,7 +3995,7 @@ mod tests {
             searched: vec![],
             warnings: vec![],
         };
-        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"), None);
         assert_eq!(
             text,
             "Config file: /home/op/.pancetta/pancetta.toml\n\
@@ -3916,7 +4014,7 @@ mod tests {
             ],
             warnings: vec![],
         };
-        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"), None);
         assert!(text.starts_with("No config file found. Searched these directories"));
         assert!(
             text.contains("\n  /etc/pancetta\n  /home/op/.pancetta\n"),
@@ -3938,7 +4036,7 @@ mod tests {
             searched: vec![],
             warnings: vec!["Unknown config key `enable` in [network.wsjtx_udp]".to_string()],
         };
-        let text = format_load_report(&report, Path::new("/x"));
+        let text = format_load_report(&report, Path::new("/x"), None);
         assert_eq!(
             text,
             "Config file: /home/op/.pancetta/pancetta.toml\n\
@@ -4659,6 +4757,14 @@ mod tests {
         assert_eq!(pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES, 30);
     }
 }
+
+#[cfg(test)]
+#[path = "main/tests/instance_lock_command_tests.rs"]
+mod instance_lock_command_tests;
+
+#[cfg(test)]
+#[path = "main/tests/data_dir_hint_tests.rs"]
+mod data_dir_hint_tests;
 
 #[cfg(test)]
 mod wizard_validation_tests {

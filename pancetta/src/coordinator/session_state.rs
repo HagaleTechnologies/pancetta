@@ -304,11 +304,13 @@ fn parse_waterfall_gain(value: &serde_json::Value, path: &Path) -> Option<Waterf
     }
 }
 
-/// Path of the session state file: `<home>/.pancetta/session_state.json`.
-/// `home_override` is the test-only override (the coordinator's
-/// `pancetta_home` parameter, mirroring `qso.rs`'s `pancetta_home_override`);
-/// `None` in production resolves the real home directory. `None` is returned
-/// only when neither resolves — no home, no persistence, defaults apply.
+/// Path of the session state file: `<data-dir>/session_state.json`.
+/// `home_override` is the test-only home override (the coordinator's
+/// `pancetta_home` parameter, mirroring `qso.rs`'s `pancetta_home_override`)
+/// and resolves to `<home>/.pancetta`; `None` in production resolves the
+/// process data directory (PAN-376: `--data-dir`, else `~/.pancetta`).
+/// `None` is returned only when neither resolves — no home, no persistence,
+/// defaults apply.
 ///
 /// Test builds (`#[cfg(test)]`) never resolve the real home (PAN-194
 /// discipline, same as `pancetta-tui`'s `tui_state_path`): without an
@@ -318,13 +320,8 @@ fn parse_waterfall_gain(value: &serde_json::Value, path: &Path) -> Option<Waterf
 /// never write to it either.
 pub(crate) fn session_state_path(home_override: Option<&Path>) -> Option<PathBuf> {
     #[cfg(test)]
-    if home_override.is_none() {
-        return None;
-    }
-    let base = home_override
-        .map(Path::to_path_buf)
-        .or_else(dirs::home_dir)?;
-    Some(base.join(".pancetta").join("session_state.json"))
+    let home_override = Some(home_override?);
+    Some(super::data_dir_for(home_override)?.join("session_state.json"))
 }
 
 /// Read and strictly parse the session file. `NotFound` is
