@@ -2780,6 +2780,16 @@ mod view_render_tests {
         row
     }
 
+    /// The TX meter row plus the row the panel wraps it onto, joined with
+    /// a space, so the drive prefix cannot push the tail out of view.
+    fn tx_meter_wrapped(buf: &ratatui::buffer::Buffer) -> String {
+        let rig_y = (0..buf.area.height)
+            .find(|&y| row_text(buf, y).contains("Rig: "))
+            .expect("Rig: row rendered");
+        let inner = |y| row_text(buf, y).trim().trim_matches('│').trim().to_string();
+        format!("{} {}", inner(rig_y + 1), inner(rig_y + 2))
+    }
+
     async fn tx_meter_app(
         reading: Option<pancetta_core::tx_meter::TxMeterReading>,
         capability: Option<pancetta_core::tx_meter::TxMeterCapability>,
@@ -2818,10 +2828,10 @@ mod view_render_tests {
         let buf = render_health(&app).await;
         let row = tx_meter_row(&buf);
         assert!(
-            row.contains("TX meter: 48 W, ALC 0.12 (limit 0.50)"),
+            row.contains("TX meter: drive pending, 48 W, ALC 0.12 (limit 0.50)"),
             "{row:?}"
         );
-        assert!(!row.contains("reduce audio drive"), "{row:?}");
+        assert!(!tx_meter_wrapped(&buf).contains("reduce audio"), "{row:?}");
         assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.success.fg.unwrap());
     }
 
@@ -2837,10 +2847,13 @@ mod view_render_tests {
         )
         .await;
         let buf = render_health(&app).await;
-        let row = tx_meter_row(&buf);
+        tx_meter_row(&buf);
+        let text = tx_meter_wrapped(&buf);
         assert!(
-            row.contains("TX meter: 52 W, ALC 0.81 (limit 0.50), reduce audio drive"),
-            "{row:?}"
+            text.contains(
+                "TX meter: drive pending, 52 W, ALC 0.81 (limit 0.50), reduce audio drive"
+            ),
+            "{text:?}"
         );
         assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.error.fg.unwrap());
     }
@@ -2855,7 +2868,7 @@ mod view_render_tests {
                     alc: Some(0.12),
                 },
                 BOTH_METERS,
-                "TX meter: 48% of max power, ALC 0.12 (limit 0.50)",
+                "TX meter: drive pending, 48% of max power, ALC 0.12 (limit 0.50)",
             ),
             (
                 TxMeterReading {
@@ -2863,7 +2876,7 @@ mod view_render_tests {
                     alc: Some(0.12),
                 },
                 BOTH_METERS,
-                "TX meter: power n/a, ALC 0.12 (limit 0.50)",
+                "TX meter: drive pending, power n/a, ALC 0.12 (limit 0.50)",
             ),
             (
                 TxMeterReading {
@@ -2871,7 +2884,7 @@ mod view_render_tests {
                     alc: None,
                 },
                 BOTH_METERS,
-                "TX meter: 48 W, ALC n/a",
+                "TX meter: drive pending, 48 W, ALC n/a",
             ),
             (
                 TxMeterReading {
@@ -2882,14 +2895,14 @@ mod view_render_tests {
                     alc_limit: None,
                     ..BOTH_METERS
                 },
-                "TX meter: 48 W, ALC 0.12",
+                "TX meter: drive pending, 48 W, ALC 0.12",
             ),
         ] {
             let app = tx_meter_app(Some(reading), Some(capability)).await;
             let buf = render_health(&app).await;
             let row = tx_meter_row(&buf);
             assert!(row.contains(expected), "{expected:?} not in {row:?}");
-            assert!(!row.contains("reduce audio drive"), "{row:?}");
+            assert!(!tx_meter_wrapped(&buf).contains("reduce audio"), "{row:?}");
             if capability.alc_limit.is_none() {
                 assert!(!row.contains("(limit"), "{row:?}");
             }
@@ -2906,7 +2919,7 @@ mod view_render_tests {
             app.rig_connected = state;
             let buf = render_health(&app).await;
             assert!(
-                tx_meter_row(&buf).contains("TX meter: needs a connected CAT rig"),
+                tx_meter_row(&buf).contains("TX meter: drive pending, needs a connected CAT rig"),
                 "{state:?}"
             );
             assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
@@ -2921,15 +2934,15 @@ mod view_render_tests {
         )
         .await;
         let buf = render_health(&app).await;
-        assert!(
-            tx_meter_row(&buf).contains("TX meter: this rig does not report power or ALC over CAT")
-        );
+        tx_meter_row(&buf);
+        assert!(tx_meter_wrapped(&buf)
+            .contains("TX meter: drive pending, this rig does not report power or ALC over CAT"));
         assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
 
         // Connected, capability unknown, no reading yet.
         let app = tx_meter_app(None, None).await;
         let buf = render_health(&app).await;
-        assert!(tx_meter_row(&buf).contains("TX meter: shown while transmitting"));
+        assert!(tx_meter_row(&buf).contains("TX meter: drive pending, shown while transmitting"));
 
         // Connected with a 3 s old reading: idle again.
         let mut app = tx_meter_app(
@@ -2942,7 +2955,7 @@ mod view_render_tests {
         .await;
         app.tx_meter_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3));
         let buf = render_health(&app).await;
-        assert!(tx_meter_row(&buf).contains("TX meter: shown while transmitting"));
+        assert!(tx_meter_row(&buf).contains("TX meter: drive pending, shown while transmitting"));
         assert_eq!(dot_fg_for(&buf, "TX meter:"), app.theme.muted.fg.unwrap());
     }
 

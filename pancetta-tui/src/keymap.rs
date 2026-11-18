@@ -1854,6 +1854,7 @@ mod tests {
             KeyCode::BackTab => vec!["Shift+Tab".into()],
             KeyCode::PageUp => vec!["PgUp".into()],
             KeyCode::PageDown => vec!["PgDn".into()],
+            KeyCode::F(n) => vec![format!("F{n}")],
             other => vec![format!("{other:?}")],
         }
     }
@@ -1958,7 +1959,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 49);
+        assert_eq!(KEYBINDINGS.len(), 50);
     }
 
     #[test]
