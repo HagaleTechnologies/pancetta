@@ -3008,7 +3008,6 @@ name = "pancetta-agent"
 version = "0.9.6"
 dependencies = [
  "base64 0.23.1",
- "dirs",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
@@ -3069,8 +3068,10 @@ dependencies = [
  "approx",
  "chrono",
  "criterion",
+ "dirs",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -254,14 +254,12 @@ pub fn is_safe_compound_upgrade(latched: &str, candidate: &str) -> bool {
 impl MessageExchange {
     /// Create a new message exchange handler.
     ///
-    /// The contest serial number is loaded from `~/.pancetta/contest_serial.txt`
-    /// if that file exists, so it persists across restarts.
+    /// The contest serial number is loaded from `<data-dir>/contest_serial.txt`
+    /// (PAN-376: `--data-dir`, else `~/.pancetta`) if that file exists, so it
+    /// persists across restarts.
     pub fn new(our_callsign: String) -> Self {
-        let serial_persist_path: Option<PathBuf> = dirs::home_dir().map(|mut p| {
-            p.push(".pancetta");
-            p.push("contest_serial.txt");
-            p
-        });
+        let serial_persist_path: Option<PathBuf> =
+            pancetta_core::data_dir::try_current().map(|d| d.join("contest_serial.txt"));
 
         let starting_serial = serial_persist_path
             .as_deref()

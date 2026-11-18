@@ -40,7 +40,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, TryLockError};
@@ -1030,15 +1030,16 @@ fn encode_record(ev: &AuditEvent, limits: &Limits) -> Result<String, AuditError>
     }
 }
 
-/// The default production audit-log path: `~/.pancetta/agent-audit.log`.
+/// The default production audit-log path in a data directory:
+/// `<data_dir>/agent-audit.log`.
 ///
-/// Falls back to `$HOME/.pancetta/...`, then to the current directory if no
-/// home can be resolved (audit should still land *somewhere* rather than error).
-pub fn default_audit_path() -> PathBuf {
-    let home = dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".pancetta").join("agent-audit.log")
+/// The caller passes the process data directory (PAN-376:
+/// `pancetta_core::data_dir::current()`, which is `~/.pancetta` unless
+/// `--data-dir` names another directory, and falls back to the current
+/// directory when no home can be resolved, so audit still lands *somewhere*
+/// rather than erroring). This crate stays free of workspace dependencies.
+pub fn audit_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("agent-audit.log")
 }
 
 #[cfg(test)]
@@ -2063,13 +2064,10 @@ mod tests {
     }
 
     #[test]
-    fn default_audit_path_ends_with_expected_suffix() {
-        let p = default_audit_path();
-        assert!(p.ends_with("agent-audit.log"), "path = {}", p.display());
-        assert!(
-            p.to_string_lossy().contains(".pancetta"),
-            "path = {}",
-            p.display()
-        );
+    fn audit_path_in_puts_the_log_in_the_data_dir() {
+        let data_dir = std::env::temp_dir().join("pancetta-40m");
+        let p = audit_path_in(&data_dir);
+        assert_eq!(p, data_dir.join("agent-audit.log"));
+        assert!(p.starts_with(&data_dir), "path = {}", p.display());
     }
 }

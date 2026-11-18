@@ -714,6 +714,7 @@ pub(crate) fn resolve_wav_recording(
     replay: bool,
     no_audio: bool,
     home: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
 ) -> WavRecording {
     if !recording.auto_record {
         return WavRecording::DisabledByConfig;
@@ -724,7 +725,7 @@ pub(crate) fn resolve_wav_recording(
     if no_audio {
         return WavRecording::SuppressedNoAudio;
     }
-    match expand_recording_dir(&recording.directory, home) {
+    match expand_recording_dir(&recording.directory, home, data_dir) {
         Some(dir) => WavRecording::Enabled { dir },
         None => WavRecording::NoHomeDir {
             directory: recording.directory.trim().to_string(),
@@ -736,16 +737,20 @@ pub(crate) fn resolve_wav_recording(
 /// passes through trimmed. `~user` is not expanded. The config loader never
 /// expands `~` inside values (its tests pin that), so this is the only
 /// place. An empty/whitespace directory means the location pancetta always
-/// recorded to before PAN-125: `<home>/.pancetta/recordings`.
+/// recorded to before PAN-125, now in the data directory (PAN-376):
+/// `<data-dir>/recordings`, which is `~/.pancetta/recordings` unless
+/// `--data-dir` names another directory. `~` still expands against `home`.
 ///
-/// Returns `None` only when the value needs `home` and none exists.
+/// Returns `None` only when the value needs `home` (or, for an empty value,
+/// the data directory) and none exists.
 fn expand_recording_dir(
     directory: &str,
     home: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     let trimmed = directory.trim();
     if trimmed.is_empty() {
-        return home.map(|h| h.join(".pancetta").join("recordings"));
+        return data_dir.map(|d| d.join("recordings"));
     }
     if let Some(rest) = trimmed.strip_prefix('~') {
         if let Some(home) = home {
@@ -813,6 +818,7 @@ impl super::ApplicationCoordinator {
             self.replay_mode(),
             self.no_audio,
             dirs::home_dir().as_deref(),
+            super::data_dir_for(self.pancetta_home_override.as_deref()).as_deref(),
         )
     }
 }
@@ -3192,10 +3198,21 @@ mod wav_recording_gate_tests {
         std::path::PathBuf::from("/home/op")
     }
 
+    /// The default data directory for [`home`] (no `--data-dir`).
+    fn data_dir() -> std::path::PathBuf {
+        home().join(".pancetta")
+    }
+
     #[test]
     fn default_config_is_disabled() {
         assert_eq!(
-            resolve_wav_recording(&Default::default(), false, false, Some(&home())),
+            resolve_wav_recording(
+                &Default::default(),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::DisabledByConfig
         );
     }
@@ -3204,11 +3221,11 @@ mod wav_recording_gate_tests {
     fn disabled_wins_over_replay_and_no_audio() {
         let off = rec(false, "~/rec");
         assert_eq!(
-            resolve_wav_recording(&off, true, false, Some(&home())),
+            resolve_wav_recording(&off, true, false, Some(&home()), Some(&data_dir())),
             WavRecording::DisabledByConfig
         );
         assert_eq!(
-            resolve_wav_recording(&off, false, true, Some(&home())),
+            resolve_wav_recording(&off, false, true, Some(&home()), Some(&data_dir())),
             WavRecording::DisabledByConfig
         );
     }
@@ -3220,7 +3237,8 @@ mod wav_recording_gate_tests {
                 &rec(true, "~/.pancetta/recordings"),
                 false,
                 false,
-                Some(&home())
+                Some(&home()),
+                Some(&data_dir())
             ),
             WavRecording::Enabled {
                 dir: home().join(".pancetta").join("recordings")
@@ -3231,7 +3249,13 @@ mod wav_recording_gate_tests {
     #[test]
     fn bare_tilde_is_home() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~"),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled { dir: home() }
         );
     }
@@ -3239,7 +3263,13 @@ mod wav_recording_gate_tests {
     #[test]
     fn windows_style_tilde_expands() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~\\rec"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~\\rec"),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled {
                 dir: home().join("rec")
             }
@@ -3249,18 +3279,36 @@ mod wav_recording_gate_tests {
     #[test]
     fn absolute_and_relative_pass_through() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "/abs/rec"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "/abs/rec"),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled {
                 dir: "/abs/rec".into()
             }
         );
         assert_eq!(
-            resolve_wav_recording(&rec(true, "rec"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "rec"),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled { dir: "rec".into() }
         );
         // `~user` is not expanded (same as the config loader's tilde).
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~user/rec"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~user/rec"),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled {
                 dir: "~user/rec".into()
             }
@@ -3270,7 +3318,13 @@ mod wav_recording_gate_tests {
     #[test]
     fn surrounding_whitespace_is_trimmed() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "  ~/rec  "), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "  ~/rec  "),
+                false,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::Enabled {
                 dir: home().join("rec")
             }
@@ -3281,9 +3335,15 @@ mod wav_recording_gate_tests {
     fn empty_directory_falls_back_to_dot_pancetta_recordings() {
         for directory in ["", "   "] {
             assert_eq!(
-                resolve_wav_recording(&rec(true, directory), false, false, Some(&home())),
+                resolve_wav_recording(
+                    &rec(true, directory),
+                    false,
+                    false,
+                    Some(&home()),
+                    Some(&data_dir())
+                ),
                 WavRecording::Enabled {
-                    dir: home().join(".pancetta").join("recordings")
+                    dir: data_dir().join("recordings")
                 },
                 "directory = {directory:?}"
             );
@@ -3291,9 +3351,57 @@ mod wav_recording_gate_tests {
     }
 
     #[test]
+    fn an_empty_recording_directory_uses_the_data_dir_and_tilde_uses_home() {
+        // PAN-376: with `--data-dir D`, an empty directory records to
+        // `D/recordings`, while `~` in the configured value still expands
+        // against the home directory.
+        let custom = std::path::PathBuf::from("/srv/pancetta-40m");
+        for directory in ["", "   "] {
+            assert_eq!(
+                resolve_wav_recording(
+                    &rec(true, directory),
+                    false,
+                    false,
+                    Some(&home()),
+                    Some(&custom)
+                ),
+                WavRecording::Enabled {
+                    dir: custom.join("recordings")
+                },
+                "directory = {directory:?}"
+            );
+        }
+        assert_eq!(
+            resolve_wav_recording(
+                &rec(true, "~/rec"),
+                false,
+                false,
+                Some(&home()),
+                Some(&custom)
+            ),
+            WavRecording::Enabled {
+                dir: home().join("rec")
+            }
+        );
+        // No data directory and an empty value: recording stays off.
+        assert_eq!(
+            resolve_wav_recording(&rec(true, ""), false, false, Some(&home()), None),
+            WavRecording::NoHomeDir {
+                directory: String::new()
+            }
+        );
+    }
+
+    #[test]
     fn replay_overrides_enabled() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~/rec"), true, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~/rec"),
+                true,
+                false,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::SuppressedReplay
         );
     }
@@ -3301,7 +3409,13 @@ mod wav_recording_gate_tests {
     #[test]
     fn no_audio_overrides_enabled() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~/rec"), false, true, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~/rec"),
+                false,
+                true,
+                Some(&home()),
+                Some(&data_dir())
+            ),
             WavRecording::SuppressedNoAudio
         );
     }
@@ -3309,7 +3423,7 @@ mod wav_recording_gate_tests {
     #[test]
     fn tilde_without_home_disables() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~/rec"), false, false, None),
+            resolve_wav_recording(&rec(true, "~/rec"), false, false, None, None),
             WavRecording::NoHomeDir {
                 directory: "~/rec".to_string()
             }
@@ -3319,7 +3433,7 @@ mod wav_recording_gate_tests {
     #[test]
     fn absolute_without_home_still_records() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "/abs/rec"), false, false, None),
+            resolve_wav_recording(&rec(true, "/abs/rec"), false, false, None, None),
             WavRecording::Enabled {
                 dir: "/abs/rec".into()
             }

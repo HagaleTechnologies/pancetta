@@ -1342,3 +1342,75 @@ Tags with a SemVer pre-release suffix create GitHub pre-release drafts and
 receive a release-candidate notice. They require a real, matching CHANGELOG
 section; there is no Unreleased fallback. The operator still publishes the
 draft. macOS signing and notarization remain PAN-265.
+
+## Separate data directories and the instance lock (PAN-376, 2026-11-18)
+
+A global `--data-dir <DIR>` flag moves all station state out of
+`~/.pancetta`. A live station locks `<data-dir>/pancetta.lock`, so two
+stations cannot share one logbook. Without the flag nothing moves.
+
+1. Flag only, `global = true`, `value_name = "DIR"`. There is no
+   `PANCETTA_DATA_DIR` variable. The ticket names the flag, the macOS
+   responsibility relaunch forwards argv unchanged, and a service unit
+   puts the flag in its command line.
+2. The default is unchanged. `pancetta_core::data_dir` keeps the resolved
+   flag in a process-wide `OnceLock`, set only when the flag is given.
+   Without it, `try_current()` returns `<home>/.pancetta` (home from
+   `dirs::home_dir()`, then `$HOME`) and `current()` adds the old
+   `./.pancetta` fallback. Each resolver keeps its old no-home behaviour.
+   A process-wide value replaces one process-global input (`HOME`) with
+   another that defaults to the same value, so it reaches the TUI's static
+   path functions and `MessageExchange::new` without a new argument
+   through every `ApplicationCoordinator::new` call site.
+3. With `--data-dir` and no `--config`, config discovery searches only the
+   data directory, plus embedded defaults and `PANCETTA_*` overrides. This
+   applies at startup, on reload, in de-brick recovery and in
+   `config --validate`. Merging the usual six places would let a 40 m
+   station silently read the 20 m station's `~/.pancetta/pancetta.toml`.
+   With `--config`, the file is read as before.
+4. An explicit config value still wins over the data directory for
+   `key_dir`, `audit_log_path`, `[audio.recording] directory` and
+   `adif_backup_directory`. `~` inside a config value still expands
+   against the home directory, so existing configs keep their meaning.
+5. `Config::write_secure_atomic*` re-hardens the process data directory to
+   0700 on Unix, as it did for `~/.pancetta` alone. A custom directory
+   holds the same secrets.
+6. The lock is `pancetta.lock` plus `pancetta.pid`. `File::try_lock` takes
+   an OS lock that the station holds for the whole of `async_main`, and
+   the pid goes into a sibling file through `Config::write_secure_atomic`
+   right after the lock is taken. Windows locks are mandatory, so a
+   refused process cannot read the locked file; it reads the sibling.
+   `pancetta.lock` is never deleted, because deleting a lock file lets two
+   processes lock different inodes. There is no pid-liveness probe: the
+   OS releases the lock on exit or crash, and the next station overwrites
+   the stale pid. A refused process that races the holder's first
+   milliseconds may print the previous pid or `pid unknown`; that is
+   accepted.
+7. Only a live station takes the lock: no subcommand or `run`, without
+   `--wav` or `--replay`. It is taken in `async_main` after the
+   `import-confirmations` early return and before `init_logging`, so a
+   refused process writes nothing to the running station's log and the
+   TUI never takes the terminal. `main()` resolves and stores the flag
+   before `responsibility::prepare`, in memory only, so a bad value fails
+   like other flag errors before any macOS relaunch. `import` beside a
+   running station is PAN-214's tested behaviour, and replay never writes
+   the logbook. `import` keeps the per-write `qsos.adi.lock` and never
+   takes the instance lock, which settles the question PAN-204 raised.
+8. The coordinator's `pancetta_home_override` stays a test-only home.
+   `coordinator::data_dir_for(home_override)` returns `<home>/.pancetta`
+   under it, else the process data directory, so the 30 or so test sites
+   that set it need no change. The worked-call filter now honours the
+   override too.
+9. Unit tests never set the `OnceLock`. Only dedicated integration-test
+   binaries with exactly one `#[test]` set it, so threaded `cargo test`
+   and per-process nextest runs both stay correct.
+10. When `--data-dir` was given, the `config --validate` setup hint and the
+    `identity` pair hint print `pancetta --data-dir <D> ...`, so a copied
+    command acts on the same station.
+11. `pancetta-agent` stays free of workspace-crate dependencies.
+    `default_audit_path()` becomes `audit_path_in(data_dir)` and callers
+    pass `pancetta_core::data_dir::current()`.
+
+Out of scope: keeping two stations off one rig, audio device or listener
+port; moving data between directories; Windows and macOS qualification of
+the lock and paths (CI compiles both, Linux CI runs the tests).

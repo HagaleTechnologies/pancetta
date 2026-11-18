@@ -2144,9 +2144,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/tui_state.json`; `None` if the home directory can't be resolved.
+    /// The real `<data-dir>/tui_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_tui_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("tui_state.json"))
     }
 
     /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
@@ -2238,10 +2239,10 @@ impl App {
         }
     }
 
-    /// The real `~/.pancetta/session_state.json`; `None` if the home
-    /// directory can't be resolved.
+    /// The real `<data-dir>/session_state.json` (PAN-376: `--data-dir`, else
+    /// `~/.pancetta`); `None` if no data directory can be resolved.
     fn home_session_state_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".pancetta").join("session_state.json"))
+        pancetta_core::data_dir::try_current().map(|d| d.join("session_state.json"))
     }
 
     /// Test-only: point [`Self::session_state_path`] at `path` for the
