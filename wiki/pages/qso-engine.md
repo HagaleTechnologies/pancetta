@@ -6,6 +6,10 @@ status: current
 maintainer: agent
 sources:
   - pancetta-qso/src/qso_manager.rs
+  - pancetta-qso/src/qso_manager/relevance.rs
+  - pancetta-qso/src/qso_manager/transition.rs
+  - pancetta-qso/src/qso_manager/relocation.rs
+  - pancetta-qso/src/qso_manager/manual_calls.rs
   - pancetta-qso/src/autonomous.rs
   - pancetta-qso/src/exchange.rs
   - docs/DECISIONS/qso-engine.md
@@ -31,11 +35,13 @@ this whole engine end to end and shipped 5 batches of fixes — see that doc and
 ## How it works
 
 - **State transitions** — `determine_state_transition` / `is_message_relevant`
-  in `pancetta-qso/src/qso_manager.rs` advance state only on frames that pass
-  verification. The CQer ladder now has resend resilience symmetric with the
-  Caller ladder: a caller repeating their grid after missing our `SignalReport`
-  in `WaitingForReport` re-triggers the SAME latched report (no SNR jitter) —
-  `WaitingForReport` didn't have this arm at all before 2026-07-18.
+  (`pancetta-qso/src/qso_manager/transition.rs` and
+  `pancetta-qso/src/qso_manager/relevance.rs`) advance state only on frames
+  that pass verification. The CQer ladder now has resend resilience symmetric
+  with the Caller ladder: a caller repeating their grid after missing our
+  `SignalReport` in `WaitingForReport` re-triggers the SAME latched report (no
+  SNR jitter) — `WaitingForReport` didn't have this arm at all before
+  2026-07-18.
 - **Sender verification** — every advance checks `from_station` == expected DX
   and frequency within tolerance (15 Hz initial, 100 Hz once established);
   mismatches are logged (`target: "qso.security"`), discarded, and emitted through
