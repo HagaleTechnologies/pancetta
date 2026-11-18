@@ -25,6 +25,12 @@ use crate::message_bus::{
 use super::tx_log::{TxFrameLog, TxFrameRecord, TX_LOG_ACK_WAIT};
 use super::tx_outcome::{self, AutonomousOutcome, TxFrame};
 
+mod fox_multiplex;
+
+#[cfg(test)]
+#[path = "tx/tests/fox_multiplex_tests.rs"]
+mod fox_multiplex_tests;
+
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 const DELAY_MS: u64 = 500;
 
@@ -6736,37 +6742,144 @@ fn encode_and_modulate_multi_tx(
     tx_params: &pancetta_ft8::ProtocolParams,
     items: &[crate::message_bus::TransmitRequestItem],
 ) -> MultiTxEncodeOutcome {
+    encode_and_modulate_multi_tx_with_fox(encoder, active_protocol, tx_params, items, &|_| false)
+}
+
+/// Whether a bundle item's QSO is a Fox-admitted stream (PAN-386), read from
+/// the coordinator's `fox_admitted_qsos`. A poisoned lock reads as "not Fox",
+/// which falls back to the 75 Hz spacing and one frame per item.
+fn fox_stream_predicate(
+    set: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> impl Fn(&str) -> bool + '_ {
+    move |id| {
+        set.read()
+            .is_ok_and(|s| s.contains(&super::active_tx_qso_key(id)))
+    }
+}
+
+/// [`encode_and_modulate_multi_tx`] with FT8 Fox streams (PAN-386).
+///
+/// `is_fox` says which items' QSOs are Fox-admitted. In FT8, the n-th Fox
+/// RR73 item and the n-th Fox report item naming the same Fox air as ONE
+/// type 0.1 frame (`K1ABC RR73; W9XYZ <KH7Z> -08`) at the report item's
+/// frequency ([`fox_multiplex::plan_fox_frames`]); if that encode fails (a
+/// nonstandard Hound call) the pair falls back to two standard frames. Two
+/// frames that carry only Fox items may sit [`pancetta_qso::FOX_MIN_SEPARATION_HZ`]
+/// apart; every other pair keeps the bandwidth + 25 Hz rule. With no Fox
+/// items this is byte-identical to the legacy path.
+///
+/// `encoded_items`, `item_texts` and `encoded_qso_ids` keep one entry per
+/// successfully encoded item, in input order, so every item keeps its own
+/// attempt id, outcome report and frequency downstream.
+fn encode_and_modulate_multi_tx_with_fox(
+    encoder: &mut Ft8Encoder,
+    active_protocol: pancetta_ft8::Protocol,
+    tx_params: &pancetta_ft8::ProtocolParams,
+    items: &[crate::message_bus::TransmitRequestItem],
+    is_fox: &dyn Fn(&str) -> bool,
+) -> MultiTxEncodeOutcome {
     // TransmitRequestItem.frequency_offset is the ABSOLUTE audio
     // frequency (matching TransmitRequest semantics). modulate_multi_tx
     // wants per-item OFFSETS from a shared base. Use base=200 (lowest
     // valid) so any audio frequency in the 200-2500 Hz FT8 passband maps
     // to a non-negative per-item offset.
     const MULTI_TX_BASE_HZ: f64 = 200.0;
+    /// Guard the modulator uses for every pair outside Fox mode.
+    const DEFAULT_GUARD_HZ: f64 = 25.0;
 
-    let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
-    let mut encoded_items: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
-    let mut item_texts: Vec<String> = Vec::new();
-    let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
-    let mut freq_offsets: Vec<f64> = Vec::new();
-    let mut encode_failed: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+    /// One frame ready to modulate.
+    struct EncodedFrame {
+        symbols: Vec<u8>,
+        /// Offset from `MULTI_TX_BASE_HZ`.
+        offset: f64,
+        /// Every item in the frame is a Fox-admitted FT8 stream.
+        fox: bool,
+    }
 
-    for item in items {
-        match encode_for_protocol(encoder, active_protocol, &item.message_text) {
-            Ok(symbols) => {
-                encoded_items.push(item.clone());
-                item_texts.push(item.message_text.clone());
-                encoded_qso_ids.push(item.qso_id.clone());
-                freq_offsets.push(item.frequency_offset - MULTI_TX_BASE_HZ);
-                symbol_sets.push(symbols);
+    let fox_ft8 = active_protocol == pancetta_ft8::Protocol::Ft8;
+    let item_is_fox = |item: &crate::message_bus::TransmitRequestItem| {
+        fox_ft8 && item.qso_id.as_deref().is_some_and(is_fox)
+    };
+
+    let plan = fox_multiplex::plan_fox_frames(items, active_protocol, is_fox);
+    let mut frames: Vec<EncodedFrame> = Vec::with_capacity(plan.len());
+    let mut encoded = vec![false; items.len()];
+    let mut failed = vec![false; items.len()];
+
+    for frame in &plan {
+        if let Some((rr73_to, report_to, fox_call, db)) = &frame.dxpedition {
+            match encoder.encode_dxpedition_contacts(rr73_to, report_to, fox_call, *db) {
+                Ok(symbols) => {
+                    let texts: Vec<&str> = frame
+                        .item_indices
+                        .iter()
+                        .map(|&i| items[i].message_text.as_str())
+                        .collect();
+                    info!(
+                        "Fox multiplex: {} -> '{} RR73; {} <{}> {:+03}' @ {:.0} Hz",
+                        texts
+                            .iter()
+                            .map(|t| format!("'{t}'"))
+                            .collect::<Vec<_>>()
+                            .join(" + "),
+                        rr73_to,
+                        report_to,
+                        fox_call,
+                        db,
+                        frame.frequency_offset
+                    );
+                    for &i in &frame.item_indices {
+                        encoded[i] = true;
+                    }
+                    frames.push(EncodedFrame {
+                        symbols: symbols.to_vec(),
+                        offset: frame.frequency_offset - MULTI_TX_BASE_HZ,
+                        fox: true,
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    debug!(
+                        "Fox multiplex not possible ({}); sending the pair as standard frames",
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                warn!("Encoding failed for '{}': {}", item.message_text, e);
-                encode_failed.push(item.clone());
+        }
+        for &i in &frame.item_indices {
+            let item = &items[i];
+            match encode_for_protocol(encoder, active_protocol, &item.message_text) {
+                Ok(symbols) => {
+                    encoded[i] = true;
+                    frames.push(EncodedFrame {
+                        symbols,
+                        offset: item.frequency_offset - MULTI_TX_BASE_HZ,
+                        fox: item_is_fox(item),
+                    });
+                }
+                Err(e) => {
+                    warn!("Encoding failed for '{}': {}", item.message_text, e);
+                    failed[i] = true;
+                }
             }
         }
     }
 
-    if symbol_sets.is_empty() {
+    let mut encoded_items: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+    let mut item_texts: Vec<String> = Vec::new();
+    let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
+    let mut encode_failed: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if encoded[i] {
+            encoded_items.push(item.clone());
+            item_texts.push(item.message_text.clone());
+            encoded_qso_ids.push(item.qso_id.clone());
+        } else if failed[i] {
+            encode_failed.push(item.clone());
+        }
+    }
+
+    if frames.is_empty() {
         return MultiTxEncodeOutcome {
             samples: Err("no items to modulate".to_string()),
             encoded_items,
@@ -6776,18 +6889,59 @@ fn encode_and_modulate_multi_tx(
         };
     }
 
-    let multi_items: Vec<_> = symbol_sets
+    // PAN-386: only a pair of all-Fox FT8 frames may sit closer than the
+    // modulator's default bandwidth + 25 Hz, and then only down to
+    // `FOX_MIN_SEPARATION_HZ`. The modulator then runs with the narrower
+    // guard, so this check is what keeps every other pair at the default.
+    let any_fox = frames.iter().any(|f| f.fox);
+    let guard_hz = if any_fox {
+        let bandwidth = tx_params.signal_bandwidth();
+        for (i, a) in frames.iter().enumerate() {
+            for b in &frames[i + 1..] {
+                let sep = (a.offset - b.offset).abs();
+                let min_sep = if a.fox && b.fox {
+                    pancetta_qso::FOX_MIN_SEPARATION_HZ
+                } else {
+                    bandwidth + DEFAULT_GUARD_HZ
+                };
+                if sep < min_sep {
+                    let e = pancetta_ft8::Ft8Error::ConfigError(format!(
+                        "Frequency separation {:.1} Hz too small (minimum {:.1} Hz) \
+                         between signals at {:.1} and {:.1} Hz",
+                        sep, min_sep, a.offset, b.offset
+                    ));
+                    warn!("Multi-TX modulation failed: {}", e);
+                    return MultiTxEncodeOutcome {
+                        samples: Err(format!("{e}")),
+                        encoded_items,
+                        item_texts,
+                        encoded_qso_ids,
+                        encode_failed,
+                    };
+                }
+            }
+        }
+        (pancetta_qso::FOX_MIN_SEPARATION_HZ - bandwidth).min(DEFAULT_GUARD_HZ)
+    } else {
+        DEFAULT_GUARD_HZ
+    };
+
+    let multi_items: Vec<_> = frames
         .iter()
-        .zip(freq_offsets.iter())
-        .map(|(symbols, &frequency_offset)| pancetta_ft8::MultiTxItem {
-            symbols: symbols.as_slice(),
-            frequency_offset,
+        .map(|f| pancetta_ft8::MultiTxItem {
+            symbols: f.symbols.as_slice(),
+            frequency_offset: f.offset,
             params: tx_params,
         })
         .collect();
 
-    let samples = match pancetta_ft8::modulate_multi_tx(&multi_items, 12000, MULTI_TX_BASE_HZ, 0.5)
-    {
+    let samples = match pancetta_ft8::modulate_multi_tx_with_guard(
+        &multi_items,
+        12000,
+        MULTI_TX_BASE_HZ,
+        0.5,
+        guard_hz,
+    ) {
         Ok(samples) => {
             info!(
                 "Multi-TX: {} messages -> {} samples ({:.2}s)",
@@ -7674,13 +7828,38 @@ pub fn coalesce_transmit_requests(
 ///    into this cycle's bundle. Only ordinary streams are truncated, and only
 ///    to the room `max_concurrent_qsos` leaves. A Fox-admitted QSO with no
 ///    frame in this backlog (e.g. a completed Hound in its grace window)
-///    lends no slot to anyone. With no Fox-admitted stream present the
-///    outcome is identical to [`coalesce_transmit_requests`].
+///    lends no slot to anyone. Two Fox-admitted streams need only
+///    [`pancetta_qso::FOX_MIN_SEPARATION_HZ`] between them (60 Hz Fox slots,
+///    PAN-386); any pair that includes an ordinary stream, and every manual
+///    send (never Fox), keeps [`pancetta_qso::MIN_TX_SEPARATION_HZ`]. With no
+///    Fox-admitted stream present the outcome is identical to
+///    [`coalesce_transmit_requests`].
 pub fn coalesce_transmit_requests_with_fox_priority(
+    drained: Vec<CoalesceEntry>,
+    max_concurrent_qsos: u32,
+    qso_is_live: impl FnMut(Option<&str>) -> bool,
+    is_fox_admitted: impl FnMut(&str) -> bool,
+) -> CoalesceOutcome {
+    coalesce_with_fox(
+        drained,
+        max_concurrent_qsos,
+        qso_is_live,
+        is_fox_admitted,
+        true,
+    )
+}
+
+/// [`coalesce_transmit_requests_with_fox_priority`] with the Fox-pair spacing
+/// switchable: `fox_spacing` is `true` only while the worker's protocol is
+/// FT8, the only protocol whose encode relaxes the modulator guard for Fox
+/// frames (PAN-386). With `false` every pair keeps
+/// [`pancetta_qso::MIN_TX_SEPARATION_HZ`], as before PAN-386.
+fn coalesce_with_fox(
     drained: Vec<CoalesceEntry>,
     max_concurrent_qsos: u32,
     mut qso_is_live: impl FnMut(Option<&str>) -> bool,
     mut is_fox_admitted: impl FnMut(&str) -> bool,
+    fox_spacing: bool,
 ) -> CoalesceOutcome {
     use std::collections::HashMap;
 
@@ -7807,18 +7986,40 @@ pub fn coalesce_transmit_requests_with_fox_priority(
     // It is reported to the QSO engine as not sent (PAN-279): the rollback
     // returns a keep-call frame's call to the budget, so the engine's rearm
     // can re-emit it.
+    // PAN-386: two Fox-admitted streams sit on 60 Hz Fox slots, so a pair of
+    // them needs only `FOX_MIN_SEPARATION_HZ`; any pair with an ordinary
+    // stream (or a manual send, which is never Fox) keeps
+    // `MIN_TX_SEPARATION_HZ`.
+    let fox_keys: std::collections::HashSet<String> = qso_entries
+        .iter()
+        .filter_map(|e| e.qso_id.as_deref())
+        .map(super::active_tx_qso_key)
+        .filter(|k| is_fox_admitted(k))
+        .collect();
+    let entry_is_fox = |e: &CoalesceEntry| {
+        e.qso_id
+            .as_deref()
+            .is_some_and(|id| fox_keys.contains(&super::active_tx_qso_key(id)))
+    };
+    let min_separation = |a: &CoalesceEntry, b: &CoalesceEntry| {
+        if fox_spacing && entry_is_fox(a) && entry_is_fox(b) {
+            pancetta_qso::FOX_MIN_SEPARATION_HZ
+        } else {
+            pancetta_qso::MIN_TX_SEPARATION_HZ
+        }
+    };
     let mut qso_survivors: Vec<CoalesceEntry> = Vec::with_capacity(qso_entries.len());
     for entry in qso_entries {
-        let too_close = qso_survivors.iter().any(|k: &CoalesceEntry| {
-            (k.frequency_offset - entry.frequency_offset).abs() < pancetta_qso::MIN_TX_SEPARATION_HZ
+        let conflict = qso_survivors.iter().find(|k: &&CoalesceEntry| {
+            (k.frequency_offset - entry.frequency_offset).abs() < min_separation(k, &entry)
         });
-        if too_close {
+        if let Some(k) = conflict {
             warn!(
                 target: "pancetta::tx.policy",
                 "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
                  {:.0} Hz of an already-retained stream this cycle; excluding it from \
                  this bundle and reporting it to the QSO engine as not sent",
-                entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
+                entry.qso_id, entry.frequency_offset, min_separation(k, &entry)
             );
             outcome.freq_excluded += 1;
             outcome.excluded_entries.push(entry);
@@ -7923,6 +8124,8 @@ fn coalesce_entry_frame(entry: &CoalesceEntry) -> TxFrame {
 /// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
 /// truncated, so silent backlog reduction is always operator-visible.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn coalesce_backlog_into(
     head: MessageType,
     inbox: &TxInbox,
@@ -7930,6 +8133,42 @@ pub(crate) async fn coalesce_backlog_into(
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    audit_log: &pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pivots: Option<(
+        &mut std::collections::HashMap<String, (String, f64)>,
+        &mut PivotReplaced,
+    )>,
+) -> MessageType {
+    coalesce_backlog_into_with_fox_spacing(
+        head,
+        inbox,
+        message_bus,
+        active_tx_qsos,
+        fox_admitted_qsos,
+        max_concurrent_qsos,
+        true,
+        remote_tx_arm,
+        audit_log,
+        display_feed_enabled,
+        pivots,
+    )
+    .await
+}
+
+/// The worker's backlog coalescer. `fox_spacing` is `true` while the worker's
+/// protocol is FT8, so two Fox-admitted streams may sit on adjacent 60 Hz Fox
+/// slots (PAN-386); otherwise every pair keeps 75 Hz.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn coalesce_backlog_into_with_fox_spacing(
+    head: MessageType,
+    inbox: &TxInbox,
+    message_bus: &MessageBus,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    max_concurrent_qsos: u32,
+    fox_spacing: bool,
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -8201,11 +8440,12 @@ pub(crate) async fn coalesce_backlog_into(
         .read()
         .map(|s| s.clone())
         .unwrap_or_default();
-    let mut outcome = coalesce_transmit_requests_with_fox_priority(
+    let mut outcome = coalesce_with_fox(
         admitted,
         max_concurrent_qsos,
         |id| tx_qso_is_live(id, active_tx_qsos),
         |key| fox_admitted.contains(key),
+        fox_spacing,
     );
 
     if !outcome.is_noop() {
@@ -8607,6 +8847,10 @@ struct SupersedeIo<'a> {
     inbox: &'a TxInbox,
     encoder: &'a mut Ft8Encoder,
     ptt_guard: &'a mut PttGuard,
+    /// The coordinator's Fox-admitted QSO keys, so a superseding bundle's
+    /// encode uses the same Fox spacing and pairing as the worker's own
+    /// (PAN-386).
+    fox_admitted_qsos: &'a std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 /// Recompute scheduling for a superseding request against *now* and, if
@@ -9077,6 +9321,7 @@ async fn supersede_multi_reenqueue(
         inbox,
         encoder,
         ptt_guard,
+        fox_admitted_qsos,
     } = io;
     let in_flight_items = in_flight.items;
     let origin = in_flight.origin;
@@ -9178,8 +9423,13 @@ async fn supersede_multi_reenqueue(
             new_remote_client_key_id,
             new_attempt_id,
         } => {
-            let bundle_outcome =
-                encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
+            let bundle_outcome = encode_and_modulate_multi_tx_with_fox(
+                encoder,
+                active_protocol,
+                tx_params,
+                &items,
+                &fox_stream_predicate(fox_admitted_qsos),
+            );
             let successor = if bundle_outcome.samples.is_ok() {
                 MessageType::MultiTransmitRequest {
                     items,
@@ -9849,7 +10099,7 @@ impl super::ApplicationCoordinator {
                                     continue;
                                 }
 
-                                message.message_type = coalesce_backlog_into(
+                                message.message_type = coalesce_backlog_into_with_fox_spacing(
                                     message.message_type,
                                     &inbox,
                                     &message_bus,
@@ -9863,6 +10113,8 @@ impl super::ApplicationCoordinator {
                                         &fox_mode,
                                         &fox_max_streams,
                                     ),
+                                    // PAN-386: Fox-pair spacing only in FT8.
+                                    active_protocol == pancetta_ft8::Protocol::Ft8,
                                     &remote_tx_arm,
                                     &audit_log,
                                     &display_feed_enabled,
@@ -11691,11 +11943,14 @@ impl super::ApplicationCoordinator {
                                                                 active_protocol,
                                                             );
                                                         let bundle_outcome =
-                                                            encode_and_modulate_multi_tx(
+                                                            encode_and_modulate_multi_tx_with_fox(
                                                                 &mut encoder,
                                                                 active_protocol,
                                                                 &tx_params,
                                                                 &items,
+                                                                &fox_stream_predicate(
+                                                                    &fox_admitted_qsos,
+                                                                ),
                                                             );
                                                         if bundle_outcome.samples.is_ok() {
                                                             let successor =
@@ -12090,11 +12345,14 @@ impl super::ApplicationCoordinator {
                                                                 active_protocol,
                                                             );
                                                         let bundle_outcome =
-                                                            encode_and_modulate_multi_tx(
+                                                            encode_and_modulate_multi_tx_with_fox(
                                                                 &mut encoder,
                                                                 active_protocol,
                                                                 &tx_params,
                                                                 &items,
+                                                                &fox_stream_predicate(
+                                                                    &fox_admitted_qsos,
+                                                                ),
                                                             );
                                                         if bundle_outcome.samples.is_ok() {
                                                             let successor =
@@ -12617,11 +12875,12 @@ impl super::ApplicationCoordinator {
                                     let tx_params = pancetta_ft8::ProtocolParams::from_protocol(
                                         active_protocol,
                                     );
-                                    let outcome = encode_and_modulate_multi_tx(
+                                    let outcome = encode_and_modulate_multi_tx_with_fox(
                                         &mut encoder,
                                         active_protocol,
                                         &tx_params,
                                         &items,
+                                        &fox_stream_predicate(&fox_admitted_qsos),
                                     );
 
                                     for item in &outcome.encode_failed {
@@ -12883,11 +13142,12 @@ impl super::ApplicationCoordinator {
                                                     .map(|(item, _)| item.clone())
                                                     .collect();
 
-                                                let rebuild = encode_and_modulate_multi_tx(
+                                                let rebuild = encode_and_modulate_multi_tx_with_fox(
                                                     &mut encoder,
                                                     active_protocol,
                                                     &tx_params,
                                                     &live_items,
+                                                    &fox_stream_predicate(&fox_admitted_qsos),
                                                 );
 
                                                 for item in &rebuild.encode_failed {
@@ -13513,11 +13773,12 @@ impl super::ApplicationCoordinator {
                                                 .map(|(item, _)| item.clone())
                                                 .collect();
 
-                                            let rebuild = encode_and_modulate_multi_tx(
+                                            let rebuild = encode_and_modulate_multi_tx_with_fox(
                                                 &mut encoder,
                                                 active_protocol,
                                                 &tx_params,
                                                 &live_items,
+                                                &fox_stream_predicate(&fox_admitted_qsos),
                                             );
 
                                             for item in &rebuild.encode_failed {
@@ -14507,6 +14768,7 @@ impl super::ApplicationCoordinator {
                                                     inbox: &inbox,
                                                     encoder: &mut encoder,
                                                     ptt_guard: &mut ptt_guard,
+                                                    fox_admitted_qsos: &fox_admitted_qsos,
                                                 },
                                             )
                                             .await;
@@ -14739,6 +15001,7 @@ impl super::ApplicationCoordinator {
                                                     inbox: &inbox,
                                                     encoder: &mut encoder,
                                                     ptt_guard: &mut ptt_guard,
+                                                    fox_admitted_qsos: &fox_admitted_qsos,
                                                 },
                                             )
                                             .await;
@@ -19426,6 +19689,7 @@ tx_parity: None,
                 inbox: &inbox,
                 encoder: &mut encoder,
                 ptt_guard: &mut guard,
+                fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
             },
         )
         .await;
@@ -19556,6 +19820,7 @@ tx_parity: None,
                 inbox: &inbox,
                 encoder: &mut encoder,
                 ptt_guard: &mut guard,
+                fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
             },
         )
         .await;
@@ -19698,6 +19963,7 @@ tx_parity: None,
                 inbox: &inbox,
                 encoder: &mut encoder,
                 ptt_guard: &mut guard,
+                fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
             },
         )
         .await;
@@ -19880,6 +20146,7 @@ tx_parity: None,
                 inbox: &inbox,
                 encoder: &mut encoder,
                 ptt_guard: &mut guard,
+                fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
             },
         )
         .await;
@@ -20230,6 +20497,7 @@ inbox: &inbox,
 encoder: // the ESTABLISHED in-flight bundle's own parity
             &mut encoder,
 ptt_guard: &mut guard,
+fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
 },
         )
         .await;
@@ -30188,6 +30456,7 @@ mod pan183_attempt_identity_tests {
                 inbox: &inbox,
                 encoder: &mut encoder,
                 ptt_guard: &mut guard,
+                fox_admitted_qsos: &std::sync::RwLock::new(Default::default()),
             },
         )
         .await;

@@ -292,9 +292,15 @@ waits for it to finish.
 
 Select the Fox in the DX Hunter panel (`4`) and press **Shift+H**.
 Pancetta engages the WSJT-X Fox/Hound convention: calls above 1000 Hz,
-then obeys the Fox's QSY instruction after being called. `Shift+X`
-toggles Fox mode itself (running your own pileup — read
-`docs/superpowers/specs/` on Fox mode before using this in anger).
+then obeys the Fox's QSY instruction after being called.
+
+`Shift+X` toggles Fox mode itself (running your own pileup). In FT8 it
+runs a WSJT-X-style Fox (PAN-386, unreleased). The CQ and every answer
+transmit at 300-900 Hz, each on its own 60 Hz slot. An RR73 to one Hound
+and a report to another are multiplexed into one frame. A contact is
+logged when its RR73 airs. This has been checked with pancetta's own
+decoders only, not yet with a real WSJT-X Hound or on the air. Read
+`docs/DECISIONS/modes.md` on Fox mode before using this in anger.
 
 ### …use GridTracker with pancetta?
 

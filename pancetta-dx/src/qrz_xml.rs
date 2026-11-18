@@ -84,6 +84,10 @@ pub struct QrzXmlClient {
 }
 
 impl QrzXmlClient {
+    fn http_builder() -> reqwest::ClientBuilder {
+        Client::builder().timeout(Duration::from_secs(QRZ_XML_TIMEOUT_SECS))
+    }
+
     /// QRZ XML API base URL.
     const BASE_URL: &'static str = "https://xmldata.qrz.com/xml/current/";
 
@@ -101,8 +105,7 @@ impl QrzXmlClient {
             password: password.into(),
             agent: agent.into(),
             base_url: Self::BASE_URL.to_string(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(QRZ_XML_TIMEOUT_SECS))
+            client: Self::http_builder()
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             session_key: Mutex::new(None),
@@ -767,3 +770,7 @@ mod tests {
         assert!(served(h).await.completed);
     }
 }
+
+#[cfg(test)]
+#[path = "qrz_xml/tests/tls_security_tests.rs"]
+mod tls_security_tests;

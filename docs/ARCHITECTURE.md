@@ -108,6 +108,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 |---|---|
 | `adif_backup.rs` | Changed startup ADIF snapshots and independent retention. |
 | `alerts.rs` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
+| `alerts/` | Decode alert evaluation and bell/ntfy/webhook deliveries. |
 | `audio.rs` | Audio component startup. |
 | `audio/` | Audio component startup. |
 | `audio_recovery.rs` | Pure recovery decisions for the audio thread. |
@@ -134,6 +135,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `psk_reporter.rs` | PSKReporter component. |
 | `qrz_lookup.rs` | Interactive, session-cached QRZ station lookups. |
 | `qso.rs` | QSO state-machine component and ADIF/SQLite persistence wiring. |
+| `qso/` | QSO state-machine component and ADIF/SQLite persistence wiring. |
 | `qso_filter.rs` | QSO partner band-collapse filtering (hb-229). |
 | `qso_upload_status.rs` | Registry of per-QSO upload results for the TUI (PAN-344). |
 | `raw_capture.rs` | Timed raw 48 kHz capture, one WAV per FT8 slot (PAN-393). |

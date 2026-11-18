@@ -225,8 +225,8 @@ pub use sync::{SyncResult, TimeSync};
 // Encoder and modulator exports (every build)
 pub use encoder::{Ft8Encoder, Ft8EncodingConfig};
 pub use modulator::{
-    convert_samples, modulate_multi_tx, AudioFormat, Ft8Modulator, ModulatorConfig, MultiTxItem,
-    PulseShape, SampleType,
+    convert_samples, modulate_multi_tx, modulate_multi_tx_with_guard, AudioFormat, Ft8Modulator,
+    ModulatorConfig, MultiTxItem, PulseShape, SampleType,
 };
 // Audio/PTT transmitter exports (`transmit` feature)
 #[cfg(feature = "transmit")]
