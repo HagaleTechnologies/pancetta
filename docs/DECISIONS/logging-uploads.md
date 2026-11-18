@@ -172,8 +172,9 @@ The key is an `Option<String>` that is not serialized when unset, so
 editor that writes `""` from breaking startup. A non-blank value must parse as
 a socket address, the same rule as `network.wsjtx_udp.destination`, and the
 error names the field and gives an example. Hostnames, a bare port and an
-address without a port are rejected. Port 0 and the unspecified addresses
-(`0.0.0.0`, `[::]`) parse but cannot be sent to, so they are rejected too.
+address without a port are rejected. The recipient must have a nonzero
+port and a specific IP address. Rejecting the wildcard addresses
+(`0.0.0.0`, `[::]`) avoids relying on how an OS routes sends to them.
 
 The datagram is built from the `AdifQso` record `qso_to_adif` makes for
 `qsos.adi`, with the station power and attribution settings, so it never
@@ -196,9 +197,9 @@ send has nothing to flush. A Qso supervisor restart closes the old channel and
 spawns a new emitter on the new manager. Under `--replay` the gate returns no
 destination and no socket is bound.
 
-`app` is `N1MM`, because programs written for N1MM may filter on it. Other
-constants copy the N1MM+ documentation example. The 60 m token `5.3` and the
-70 cm token `432` are not in that page and are listed as unverified.
+`app` is `N1MM`, because programs written for N1MM may filter on it.
+`docs/INTEROP.md` shows the emitted subset and Pancetta's fixed defaults.
+The 60 m token `5.3` and the 70 cm token `432` are listed as unverified.
 
 `docs/INTEROP.md` lists GridTracker 2, JTAlert, Log4OM 2 and WaveLogGate on
 both outbound channels, because review item L3 D2 concerns the WSJT-X path

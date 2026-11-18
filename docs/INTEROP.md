@@ -121,10 +121,12 @@ Where each value comes from:
 | `zone` | CQ zone, or `0` when unknown | `AdifQso.cqz`, or the stored `CQZ` the record carries instead |
 | `IsRunQSO` | `1` when we called CQ, else `0` | `metadata.role == QsoRole::Cqer` |
 | `ID` | 32 lowercase hex characters | `metadata.qso_id.simple()` |
-| everything else | the constants shown | not carried by Pancetta; values copied from the N1MM+ documentation example |
+| everything else | the defaults shown above | fixed values in Pancetta's emitter |
 
-- The element set follows the N1MM+ documentation. It was not checked against
-  a packet captured from a running N1MM Logger+.
+- Pancetta emits the 45 elements shown above. The N1MM+ reference also shows
+  `oldtimestamp`, `oldcall` and `SentExchange`. Pancetta uses `DX` for
+  `contestname`, `1` for `contestnr` and `True` for `IsOriginal`. The
+  example above comes from Pancetta.
 - All timestamps are UTC.
 - The 60 m token `5.3`, the 70 cm token `432` and the mode strings `FT8`,
   `FT4` and `FT2` are unverified: the N1MM+ page lists none of them.

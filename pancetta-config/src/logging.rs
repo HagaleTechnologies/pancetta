@@ -30,8 +30,8 @@ impl ConfigSection for LoggingConfig {
     fn validate_section(&self) -> ConfigResult<()> {
         if let Some(raw) = self.n1mm_udp.as_deref() {
             let trimmed = raw.trim();
-            // A destination must be a concrete address: port 0 and the
-            // unspecified address (0.0.0.0, [::]) parse but cannot be sent to.
+            // Require an explicit recipient and a nonzero port. Wildcard
+            // addresses name no recipient and their send behavior can vary by OS.
             let usable = trimmed
                 .parse::<std::net::SocketAddr>()
                 .is_ok_and(|addr| addr.port() != 0 && !addr.ip().is_unspecified());

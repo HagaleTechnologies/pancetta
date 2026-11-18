@@ -7,11 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 - PAN-382: `[logging] n1mm_udp = "127.0.0.1:12060"` sends one N1MM Logger+ `<contactinfo>` UDP datagram per logged QSO, with call, band, mode, time, reports and grid taken from the `qsos.adi` record. It is off by default and never sends under `--replay`. A QSO whose frequency is outside a known band (for example, with no rig dial) is skipped with a warning. `docs/INTEROP.md` lists GridTracker 2, JTAlert, Log4OM and WaveLogGate on the WSJT-X UDP and N1MM channels; no row is verified yet. Changes require a restart.
-=======
 - PAN-315: use rustls for HTTPS and WSS, remove SQLite TLS and unused dependencies, replace validator with equivalent station bound checks, align WebSocket and system utility versions, declare Rust 1.98, and enforce dependency hygiene in Supply Chain. The sha2 0.11 migration remains follow-up work.
->>>>>>> 331e0c0739084262a1da0c58565ba521af866de5
 - PAN-295: a silent audio-output stall (no callbacks for 2 s, no cpal error) now requests a forced device reopen, retrying every 10 s while the output stays silent, at most three times in a rolling ten minutes. The cap covers only these output-watchdog reopens; input-stale and processing-error recovery keep their own cadence. TX stays muted until output callbacks resume; a reopen result alone never unmutes. When the limit is reached the readiness strip shows `⚠ TX AUDIO AUTO-REOPEN LIMIT: press d`. Automated coverage only; hardware qualification pending.
 - PAN-290: a poisoned false-positive filter lock no longer stops FT8 decoding; each window decodes with the filter bypassed and logs a warning, and the autonomous TX-side gate keeps its stored filter.
 - PAN-388: the TUI footer shows the keys for the focused panel and names the current view. DX Hunter shows `Space:Call`, `Enter:Details`, `W:Watchlist` and `L:Lookup`; TX Placement no longer shows `Space:Call`. Enter on DX Hunter opens the Why overlay. At 80 columns Band Activity's footer drops `=/-:Band` to fit the view name. The focused Monitor waterfall shows `{/}:Gain` and `b/B:Palette`.
