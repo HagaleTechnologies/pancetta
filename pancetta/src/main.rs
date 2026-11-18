@@ -705,8 +705,9 @@ async fn run_application(cli: Cli) -> Result<()> {
         // PAN-376: with `--data-dir`, reloads search only that directory too.
         let reload_dir = cli.data_dir.clone();
         coordinator.set_config_reload_loader(move || {
-            let (mut config, warnings) = discovered_config_with_warnings(reload_dir.as_deref())
-                .map_err(|e| e.to_string())?;
+            let (mut config, warnings, _) =
+                discovered_config_with_warnings_and_files(reload_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
             config.metadata = None;
             Ok((config, warnings))
         });
@@ -2341,16 +2342,16 @@ fn load_config_report(
 /// `--data-dir` the data directory is the only search directory, otherwise
 /// the default six-place search. Embedded defaults and `PANCETTA_*`
 /// environment overrides apply either way.
-fn discovered_config_with_warnings(
+fn discovered_config_with_warnings_and_files(
     data_dir: Option<&Path>,
-) -> pancetta_config::ConfigResult<(Config, Vec<String>)> {
+) -> pancetta_config::ConfigResult<(Config, Vec<String>, Vec<PathBuf>)> {
     match data_dir {
-        Some(dir) => Config::load_from_dir_with_warnings(dir),
-        None => Config::load_default_with_warnings(),
+        Some(dir) => Config::load_from_dir_with_warnings_and_files(dir),
+        None => Config::load_default_with_warnings_and_files(),
     }
 }
 
-/// Like [`discovered_config_with_warnings`], without validation and with the
+/// Like [`discovered_config_with_warnings_and_files`], without validation and with the
 /// load report `config --validate` prints.
 fn discovered_config_unvalidated(
     data_dir: Option<&Path>,
@@ -2534,16 +2535,11 @@ async fn load_configuration_with_warnings(
         Config::load_from_file_with_warnings(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
-<<<<<<< HEAD
-        match discovered_config_with_warnings(cli.data_dir.as_deref()) {
-            Ok(pair) => pair,
-=======
-        match Config::load_default_with_warnings_and_files() {
+        match discovered_config_with_warnings_and_files(cli.data_dir.as_deref()) {
             Ok((config, warnings, files)) => {
                 loaded_files = files;
                 (config, warnings)
             }
->>>>>>> bb8fca8a48704e8900d628dd5cf2ff35d8923c5d
             Err(e)
                 if offer_wizard_on_load_failure(
                     cli.headless,
@@ -2574,22 +2570,15 @@ async fn load_configuration_with_warnings(
                     // JSON recovery writes a sibling TOML file that discovery
                     // selects before JSON in the same search directory.
                     match run_first_time_setup(&defaults, &failed_path, true)? {
-<<<<<<< HEAD
-                        Some(fixed) => config_after_recovery(fixed, || {
-                            discovered_config_with_warnings(cli.data_dir.as_deref())
-                        }),
-=======
                         Some(fixed) => {
                             // Codex P1 on #705: keep the contributing files, so F7/F8
                             // saves go to the recovered source that wins, not a fallback.
-                            let (config, warnings, files) = config_after_recovery(
-                                fixed,
-                                Config::load_default_with_warnings_and_files,
-                            );
+                            let (config, warnings, files) = config_after_recovery(fixed, || {
+                                discovered_config_with_warnings_and_files(cli.data_dir.as_deref())
+                            });
                             loaded_files = files;
                             (config, warnings)
                         }
->>>>>>> bb8fca8a48704e8900d628dd5cf2ff35d8923c5d
                         None => {
                             return Err(anyhow::anyhow!(e))
                                 .context("Failed to load default configuration")

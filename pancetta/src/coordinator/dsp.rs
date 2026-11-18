@@ -13,7 +13,7 @@
 //! Validation captures (PAN-125): only when
 //! `[audio.recording] auto_record = true` on a live-audio run, every full
 //! window is written to `audio.recording.directory` (a leading `~`
-//! expanded; empty means `~/.pancetta/recordings`) as `ft8_*.wav` for
+//! expanded; omitted or empty means `<data-dir>/recordings`) as `ft8_*.wav` for
 //! off-line decoder comparison — `--replay` and `--no-audio` never record.
 //! Disk usage is capped at 10 GB; oldest files are evicted when the cap is
 //! hit. The decision is made once per start by [`resolve_wav_recording`].
@@ -736,9 +736,8 @@ pub(crate) fn resolve_wav_recording(
 /// Expand a leading `~` (`~`, `~/x`, `~\x`) against `home`; anything else
 /// passes through trimmed. `~user` is not expanded. The config loader never
 /// expands `~` inside values (its tests pin that), so this is the only
-/// place. An empty/whitespace directory means the location pancetta always
-/// recorded to before PAN-125, now in the data directory (PAN-376):
-/// `<data-dir>/recordings`, which is `~/.pancetta/recordings` unless
+/// place. An omitted or blank directory uses `<data-dir>/recordings`
+/// (PAN-376), which is `~/.pancetta/recordings` unless
 /// `--data-dir` names another directory. `~` still expands against `home`.
 ///
 /// Returns `None` only when the value needs `home` (or, for an empty value,
@@ -750,6 +749,7 @@ fn expand_recording_dir(
 ) -> Option<std::path::PathBuf> {
     let trimmed = directory.trim();
     if trimmed.is_empty() {
+        // The config defaults leave this empty so each station uses its own directory.
         return data_dir.map(|d| d.join("recordings"));
     }
     if let Some(rest) = trimmed.strip_prefix('~') {
