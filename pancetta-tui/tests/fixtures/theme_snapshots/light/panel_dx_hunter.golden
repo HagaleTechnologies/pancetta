@@ -15,8 +15,8 @@ r05 |│  RX+N ★P#DX        ---   DPR of Korea     QH##  -##  -             ##
 r05 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Magenta/White/BOLD|ITALIC 20+7 Black/White/- 27+12 Blue/White/- 39+11 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
 r06 |│  RX   ▲ZL#AB       ---   New Zealand      QH##  -##  -             ##s   ### │|
 r06 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 Black/White/BOLD 20+7 Black/White/- 27+11 Blue/White/- 38+12 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
-r07 |│  RX   K#ABC        ---   United States    QH##  -##  -             ##s   ### │|
-r07 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/- 7+1 Black/White/- 8+12 DarkGray/White/- 20+7 Black/White/- 27+13 Blue/White/- 40+10 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
+r07 |│  EXT  K#ABC        ---   United States    QH##  -##  -             ##s   ### │|
+r07 s 0+1 Magenta/White/BOLD 1+2 Black/White/- 3+4 Blue/White/ITALIC 7+1 Black/White/- 8+12 DarkGray/White/- 20+7 Black/White/- 27+13 Blue/White/- 40+10 Black/White/- 50+4 Black/Yellow/- 54+25 Black/White/- 79+1 Magenta/White/BOLD
 r08 |│                                                                              │|
 r08 s 0+1 Magenta/White/BOLD 1+78 Black/White/- 79+1 Magenta/White/BOLD
 r09 |│                                                                              │|
