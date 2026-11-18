@@ -28,6 +28,10 @@ name = "libudev-dev"
 [[environment.system_packages]]
 name = "pkg-config"
 
+# Completion tests load the generated script in zsh.
+[[environment.system_packages]]
+name = "zsh"
+
 # Catalyst's runner exports GIT_CONFIG_KEY_n overrides (remote.origin.url and
 # remote.origin.fetch = this ticket's branch) to every git process, so the
 # submodule clone behind `submodules = true` fetches pancetta instead of
