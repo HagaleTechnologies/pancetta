@@ -322,6 +322,7 @@ fn create_dx_row<'a>(
     let src_style = match station.source {
         SpotSource::Local => app.theme.success,
         SpotSource::Network | SpotSource::Both => app.theme.info,
+        SpotSource::External | SpotSource::ExternalNetwork => app.theme.external,
     };
 
     // Callsign with need/notable markers. `!` = ATNO (all-time new one),
@@ -341,7 +342,7 @@ fn create_dx_row<'a>(
     let call_display = format_call_display(station, atno, needed, is_engaged);
 
     // Staleness check for network-only spots
-    let is_stale = if station.source != SpotSource::Local {
+    let is_stale = if !matches!(station.source, SpotSource::Local | SpotSource::External) {
         station
             .last_seen_network
             .map(|ts| {
@@ -1216,6 +1217,7 @@ mod tests {
             priority_score: None,
             priority_factors: None,
             is_own_tx: false,
+            external: false,
         };
 
         app.add_decoded_message(view).await.unwrap();
@@ -1546,3 +1548,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dx_hunter/tests/external_source_tests.rs"]
+mod external_source_tests;

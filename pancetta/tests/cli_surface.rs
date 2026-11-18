@@ -1,4 +1,5 @@
-//! PAN-334: every flag `pancetta --help` (or a subcommand's `--help`) lists
+//! PAN-334 and PAN-377: CLI flags, build identity and shell completions.
+//! Every flag `pancetta --help` (or a subcommand's `--help`) lists
 //! does what it says. JSON logs are real; dead flags and stubs are gone and
 //! fail at parse time instead of being silently ignored.
 
@@ -364,12 +365,16 @@ fn test_audio_lists_devices_with_or_without_list() {
 
 #[test]
 fn run_subcommand_still_starts_the_station() {
-    Scratch::new()
+    let scratch = Scratch::new();
+    let (version, sha, date, target) = version_fields(&scratch);
+    scratch
         .command()
         .args(["run", "--headless", "--wav", DEMO_WAV])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Starting Pancetta"));
+        .stdout(predicate::str::contains(format!(
+            "Starting Pancetta v{version} ({sha} {date} {target}) - "
+        )));
 }
 
 /// No CLI path may print "not yet implemented" (`test-rig --ptt` with CAT PTT
@@ -581,4 +586,183 @@ fn trust_commands_accept_key_ids_starting_with_hyphen() {
         .assert()
         .success();
     assert!(!s.cwd.path().join("keys/clients/-k1.pub").exists());
+}
+
+// PAN-377: version identity and generated shell completions.
+fn version_fields(scratch: &Scratch) -> (String, String, String, String) {
+    let out = scratch.command().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(line.lines().count(), 1);
+    let fields = line.trim().strip_prefix("pancetta ").unwrap();
+    let (version, rest) = fields.split_once(" (").unwrap();
+    let parts: Vec<_> = rest.strip_suffix(')').unwrap().split(' ').collect();
+    assert_eq!(parts.len(), 3);
+    let sha = parts[0];
+    assert!(
+        sha == "unknown"
+            || ((7..=64).contains(&sha.len())
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    );
+    let date = chrono::NaiveDate::parse_from_str(parts[1], "%Y-%m-%d").unwrap();
+    assert!(date <= chrono::Utc::now().date_naive());
+    assert!(parts[2].starts_with(&format!("{}-", std::env::consts::ARCH)));
+    let os_fragment = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "windows" => "windows",
+        _ => "linux",
+    };
+    assert!(parts[2].contains(os_fragment));
+    (version.into(), sha.into(), parts[1].into(), parts[2].into())
+}
+#[test]
+fn version_line_names_commit_date_and_target() {
+    let scratch = Scratch::new();
+    let (version, sha, date, target) = version_fields(&scratch);
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    let short = scratch.command().arg("-V").output().unwrap();
+    assert!(short.status.success());
+    assert!(short.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(short.stdout).unwrap(),
+        format!("pancetta {version} ({sha} {date} {target})\n")
+    );
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .output()
+        .unwrap();
+    if git.status.success() {
+        assert_ne!(sha, "unknown");
+        let verified = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_PREFIX")
+            .output()
+            .unwrap();
+        assert!(verified.status.success());
+        assert_eq!(verified.stdout, git.stdout);
+    } else {
+        assert_eq!(sha, "unknown");
+    }
+    assert_eq!(std::fs::read_dir(scratch.home.path()).unwrap().count(), 0);
+}
+#[test]
+fn info_shows_the_build_identity() {
+    let scratch = Scratch::new();
+    let (version, sha, date, target) = version_fields(&scratch);
+    let out = scratch.command().arg("info").output().unwrap();
+    assert!(out.status.success());
+    let body = String::from_utf8(out.stdout).unwrap();
+    for expected in [
+        format!("Version: {version}"),
+        format!("Commit: {sha}"),
+        format!("Build date: {date}"),
+        format!("Target: {target}"),
+        "ft8_lib C decoder: ".into(),
+    ] {
+        assert!(body.contains(&expected), "missing {expected}");
+    }
+}
+#[test]
+fn completions_zsh_prints_a_script_and_touches_nothing() {
+    let scratch = Scratch::new();
+    let out = scratch
+        .command()
+        .args(["completions", "zsh"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    let script = String::from_utf8(out.stdout).unwrap();
+    assert!(script.starts_with("#compdef pancetta\n"));
+    assert!(script.contains("compdef _pancetta pancetta"));
+    assert!(!script.contains('\x1b'));
+    assert_eq!(std::fs::read_dir(scratch.home.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(scratch.cwd.path()).unwrap().count(), 0);
+}
+#[test]
+fn completions_zsh_script_passes_zsh_checks() {
+    let scratch = Scratch::new();
+    let out = scratch
+        .command()
+        .args(["completions", "zsh"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let path = scratch.cwd.path().join("_pancetta");
+    std::fs::write(&path, out.stdout).unwrap();
+    if std::process::Command::new("zsh")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        if std::env::var_os("PANCETTA_REQUIRE_ZSH").is_some() {
+            panic!("zsh required");
+        }
+        eprintln!("skipping: zsh not found");
+        return;
+    }
+    assert!(std::process::Command::new("zsh")
+        .arg("-n")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    let status = std::process::Command::new("zsh").args(["-f", "-c", "autoload -U compinit && compinit -u -D && source \"$1\" && [[ ${_comps[pancetta]} == _pancetta ]] && (( $+functions[_pancetta_commands] ))", "zsh"]).arg(&path).env("HOME", scratch.home.path()).status().unwrap();
+    if !status.success() && std::env::var_os("PANCETTA_REQUIRE_ZSH").is_none() {
+        let modules = std::process::Command::new("zsh")
+            .args(["-f", "-c", "zmodload zsh/parameter"])
+            .status()
+            .unwrap();
+        if !modules.success() {
+            eprintln!("skipping: zsh modules unavailable");
+            return;
+        }
+    }
+    assert!(status.success());
+}
+#[test]
+fn completions_rejects_unknown_shells_and_run_only_flags() {
+    let scratch = Scratch::new();
+    for (args, expected) in [
+        (vec!["completions", "fish"], "[possible values: zsh]"),
+        (vec!["completions"], "<SHELL>"),
+        (
+            vec!["completions", "zsh", "--wav", "x"],
+            "--wav applies only",
+        ),
+    ] {
+        let out = scratch.command().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8(out.stderr).unwrap().contains(expected));
+    }
+}
+#[test]
+fn completions_tolerates_a_closed_stdout() {
+    let scratch = Scratch::new();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin!("pancetta"))
+        .args(["completions", "zsh"])
+        .env("HOME", scratch.home.path())
+        .current_dir(scratch.cwd.path())
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
 }

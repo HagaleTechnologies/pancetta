@@ -85,6 +85,9 @@ pub struct Theme {
     pub engaged: Style,
     /// DX Hunter notable (`★`).
     pub notable: Style,
+    /// A decode another program sent over UDP (PAN-381): Band Activity's
+    /// `EXT` marker and DX Hunter's `EXT`/`EX+N` source.
+    pub external: Style,
     /// Highlighted table row; selected row in the active picker list.
     pub selection: Style,
     /// Selected row in the inactive picker list.
@@ -192,6 +195,7 @@ impl Theme {
         atno: fg(Color::Magenta),
         engaged: fg(Color::Green),
         notable: fg(Color::Magenta),
+        external: fg(Color::LightBlue),
         selection: on(Color::Black, Color::Cyan),
         selection_inactive: on(Color::White, Color::DarkGray),
         chip_blocker: on(Color::White, Color::Red),
@@ -250,6 +254,7 @@ impl Theme {
         atno: bold(fg(Color::Magenta)).add_modifier(U),
         engaged: fg(Color::Blue).add_modifier(U),
         notable: bold(fg(Color::Magenta)).add_modifier(I),
+        external: fg(Color::Blue).add_modifier(I),
         selection: Style::new().add_modifier(R),
         selection_inactive: Style::new().add_modifier(U),
         chip_blocker: bold(on(Color::White, Color::Red)),
@@ -308,6 +313,7 @@ impl Theme {
         atno: bold(fg(Color::LightMagenta)).add_modifier(U),
         engaged: fg(Color::LightGreen).add_modifier(U),
         notable: bold(fg(Color::LightMagenta)),
+        external: fg(Color::LightCyan).add_modifier(I),
         selection: Style::new().add_modifier(R).add_modifier(B),
         selection_inactive: Style::new().add_modifier(U),
         chip_blocker: bold(on(Color::White, Color::Red)),
@@ -397,8 +403,8 @@ impl Theme {
         style.add_modifier(Modifier::UNDERLINED)
     }
 
-    /// Every token with its name, in declaration order (53 tokens).
-    pub fn tokens(&self) -> [(&'static str, Style); 53] {
+    /// Every token with its name, in declaration order (54 tokens).
+    pub fn tokens(&self) -> [(&'static str, Style); 54] {
         [
             ("page", self.page),
             ("text", self.text),
@@ -426,6 +432,7 @@ impl Theme {
             ("atno", self.atno),
             ("engaged", self.engaged),
             ("notable", self.notable),
+            ("external", self.external),
             ("selection", self.selection),
             ("selection_inactive", self.selection_inactive),
             ("chip_blocker", self.chip_blocker),
@@ -747,7 +754,7 @@ mod tests {
     fn dark_tokens_match_legacy_dark_colours() {
         use Color::*;
         let n = None;
-        let legacy: [(&str, Option<Color>, Option<Color>, &str); 53] = [
+        let legacy: [(&str, Option<Color>, Option<Color>, &str); 54] = [
             (
                 "page",
                 Some(White),
@@ -839,6 +846,12 @@ mod tests {
                 "ui/band_activity.rs in-QSO station",
             ),
             ("notable", Some(Magenta), n, "ui/dx_hunter.rs notable star"),
+            (
+                "external",
+                Some(LightBlue),
+                n,
+                "PAN-381 external decode tag (new token)",
+            ),
             (
                 "selection",
                 Some(Black),
@@ -1201,3 +1214,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "theme/tests/external_token_tests.rs"]
+mod external_token_tests;

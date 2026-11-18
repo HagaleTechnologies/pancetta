@@ -53,6 +53,10 @@ fn roles() -> BTreeMap<&'static str, &'static str> {
         ),
         ("autonomous", "Autonomous operator component."),
         (
+            "band_hop",
+            "Autonomous band-hop config mapping and the gated hop executor (PAN-385).",
+        ),
+        (
             "clock_monitor",
             "Live-session clock-skew monitor (PAN-114).",
         ),

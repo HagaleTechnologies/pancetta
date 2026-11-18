@@ -654,6 +654,13 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub hound: bool,
 
+    /// `true` for a QSO that Fox mode opened in FT8 (the Fox CQ or a Hound
+    /// answer, PAN-386). A Fox-role QSO transmits on a 60 Hz slot in
+    /// 300-900 Hz and keeps that slot for its life. Never set together with
+    /// `hound`.
+    #[serde(default)]
+    pub fox: bool,
+
     /// Where we hear the DX when it differs from our TX offset. Hound sets this
     /// to the protocol-fixed Fox offset; ordinary manual QSOs set it after an
     /// operator hold, collision nudge, or `[300, 2700]` TX clamp. The relevance
@@ -1333,6 +1340,7 @@ mod tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
         }

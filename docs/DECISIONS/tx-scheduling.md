@@ -873,6 +873,15 @@ followed by a full fresh set of Hounds. Together these hold TX-live
 Fox-admitted QSOs to `fox.max_streams + 1` (at most 8), the same as a single
 engage.
 
+**PAN-386 spacing and multiplexing.** In FT8 Fox mode every Fox-admitted
+stream sits on a 60 Hz slot in 300-900 Hz. The coalescer and the modulator
+(`pancetta_ft8::modulate_multi_tx_with_guard`, 9 Hz guard) accept two
+Fox-admitted streams 59 Hz apart (`pancetta_qso::FOX_MIN_SEPARATION_HZ`). Any
+pair that includes an ordinary stream keeps the 75 Hz minimum. Type 0.1
+pairing of an RR73 item with a report item happens only at encode time, in
+`encode_and_modulate_multi_tx_with_fox`, after coalescing; each item keeps
+its own attempt id and outcome report. See `docs/DECISIONS/modes.md`.
+
 **PAN-78.** PAN-78's admission cap decides whether a new QSO may open; PAN-76
 decides which open QSOs keep their TX slots. While Hounds finish, a new
 ordinary QSO is refused at admission (with PAN-78) or held at TX by the

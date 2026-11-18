@@ -13,8 +13,13 @@
 //! with `New=false`, and emit Close(6) on shutdown. `--replay` forces the
 //! drain-only shape regardless of config (see
 //! [`super::ApplicationCoordinator::replay_mode`]).
+//!
+//! PAN-381: [`ingest`] is a separate, receive-only loopback decode listener
+//! (`accept_decodes`, independent of `enabled`) that shows a same-host
+//! WSJT-X's live Decode(2) datagrams in the TUI, display and scoring only.
 
 pub mod codec;
+pub(crate) mod ingest;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1409,6 +1414,8 @@ impl RequestState {
 fn msg_type_label(msg: &InMsg) -> String {
     match msg {
         InMsg::Heartbeat { .. } => "Heartbeat".to_string(),
+        InMsg::Status { .. } => "Status".to_string(),
+        InMsg::Decode { .. } => "Decode".to_string(),
         InMsg::Clear { .. } => "Clear".to_string(),
         InMsg::Reply { .. } => "Reply".to_string(),
         InMsg::Close => "Close".to_string(),
@@ -2294,6 +2301,7 @@ mod qso_logged_tests {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,
