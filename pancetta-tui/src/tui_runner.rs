@@ -2936,7 +2936,22 @@ impl TuiRunner {
             // legacy Unix terminals send Ctrl+Enter and Ctrl+M as a plain
             // Enter, which no guard can tell apart.
             Action::ReplyToSelectedCaller => {
-                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+                let selected = app.get_selected_station();
+                // PAN-435: a reply to a caller heard only through a same-host
+                // WSJT-X on another band or mode would key on pancetta's own
+                // dial and mode, where that station is not; refuse it.
+                let refusal = selected.as_ref().and_then(|(callsign, _, _)| {
+                    app.selected_caller()
+                        .filter(|m| {
+                            m.call_sign.as_deref().is_some_and(|c| {
+                                pancetta_core::callsign::callsigns_match(c, callsign)
+                            })
+                        })
+                        .and_then(|m| app.external_decode_refusal(m))
+                });
+                if let Some(text) = refusal {
+                    app.set_local_status(text, pancetta_core::DiagnosticLevel::Warn);
+                } else if let Some((callsign, frequency, dx_parity)) = selected {
                     let step = app.current_caller_reply_step();
                     let snr = app.selected_caller().map(|m| m.snr as f32);
                     self.message_tx.send(TuiCommand::RespondToCaller {
@@ -10293,3 +10308,7 @@ mod pan333_terminal_guard {
 #[cfg(test)]
 #[path = "tui_runner/tests/waterfall_key_tests.rs"]
 mod waterfall_key_tests;
+
+#[cfg(test)]
+#[path = "tui_runner/tests/external_reply_tests.rs"]
+mod external_reply_tests;
