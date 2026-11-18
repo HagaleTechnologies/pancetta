@@ -246,7 +246,7 @@ avoid QRM from active signals, maintain minimum spacing between simultaneous TX 
 prefer clear channels, align with band segment conventions. Enables parallel QSOs
 within a single 15-second slot.
 
-### TX Slot Scheduler (`pancetta/src/coordinator/tx.rs`)
+### TX Slot Scheduler (`pancetta/src/coordinator/tx/worker.rs`)
 
 `TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
 (or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and
