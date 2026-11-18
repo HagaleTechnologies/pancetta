@@ -4694,50 +4694,15 @@ mod tests {
     fn import_duplicate_window_is_thirty_minutes() {
         assert_eq!(pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES, 30);
     }
-
-    /// PAN-376: only a live station takes the data directory's instance
-    /// lock; subcommands, `--wav` and `--replay` never do.
-    #[test]
-    fn instance_lock_is_taken_only_by_a_live_station() {
-        let parse = |args: &[&str]| {
-            Cli::try_parse_from(std::iter::once("pancetta").chain(args.iter().copied()))
-                .unwrap_or_else(|e| panic!("{args:?}: {e}"))
-        };
-        for args in [
-            &[][..],
-            &["run"],
-            &["--headless", "--no-audio"],
-            &["--data-dir", "/tmp/pancetta-40m", "run"],
-        ] {
-            assert!(takes_instance_lock(&parse(args)), "{args:?}");
-        }
-        for args in [
-            &["--wav", "x.wav"][..],
-            &["--replay", "d"],
-            &["export"],
-            &["import", "f.adi"],
-            &["doctor"],
-            &["setup"],
-            &["config", "--validate"],
-        ] {
-            assert!(!takes_instance_lock(&parse(args)), "{args:?}");
-        }
-    }
-
-    /// PAN-376: a hint names `--data-dir` only when the operator gave it.
-    #[test]
-    fn hints_carry_the_data_dir_flag() {
-        assert_eq!(pancetta_invocation(None), "pancetta");
-        assert_eq!(
-            pancetta_invocation(Some(Path::new("/home/op/.pancetta-40m"))),
-            "pancetta --data-dir /home/op/.pancetta-40m"
-        );
-        assert_eq!(
-            pancetta_invocation(Some(Path::new("/home/op/My Stations/40m"))),
-            "pancetta --data-dir \"/home/op/My Stations/40m\""
-        );
-    }
 }
+
+#[cfg(test)]
+#[path = "main/tests/instance_lock_command_tests.rs"]
+mod instance_lock_command_tests;
+
+#[cfg(test)]
+#[path = "main/tests/data_dir_hint_tests.rs"]
+mod data_dir_hint_tests;
 
 #[cfg(test)]
 mod wizard_validation_tests {

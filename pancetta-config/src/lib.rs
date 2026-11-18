@@ -1441,17 +1441,6 @@ mod tests {
         );
     }
 
-    /// PAN-376: a `--data-dir` directory is application-owned too, so a
-    /// pre-existing lax one is re-hardened like `~/.pancetta`, and
-    /// `~/.pancetta` is then just another directory.
-    #[test]
-    fn a_custom_data_dir_is_hardened_like_the_default() {
-        let home = std::path::Path::new("/home/operator");
-        let custom = std::path::Path::new("/srv/pancetta-40m");
-        assert!(is_app_data_dir(custom, Some(custom)));
-        assert!(!is_app_data_dir(&home.join(".pancetta"), Some(custom)));
-    }
-
     #[test]
     fn test_config_save_load() {
         let config = Config::default();
@@ -2018,6 +2007,10 @@ mod tests {
         assert!(!generated.contains("[metadata]"));
     }
 }
+
+#[cfg(test)]
+#[path = "lib/tests/data_dir_hardening_tests.rs"]
+mod data_dir_hardening_tests;
 
 /// Structural guardrail against the "field silently dropped by `merge_with`"
 /// bug class (see the 2026-07-05 CLAUDE.md entry and the
