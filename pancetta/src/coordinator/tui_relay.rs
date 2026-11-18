@@ -1695,6 +1695,10 @@ impl super::ApplicationCoordinator {
             crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
+        let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+            db: self.tx_drive.get(),
+            ceiling_db: self.tx_drive.ceiling_db(),
+        });
 
         // Set up station coordinates for distance/bearing calculation
         let station_coords = {
@@ -2062,6 +2066,11 @@ impl super::ApplicationCoordinator {
         // in this relay loop, which must stay free of synchronous disk
         // I/O -- see `config_write_is_toml`'s doc comment in main.rs).
         let cmd_config_write_is_toml = self.config_write_is_toml;
+        let cmd_tx_drive_path = self.tx_drive_config_path.clone();
+        let cmd_tx_drive_is_toml = !pancetta_config::path_is_json_format(&cmd_tx_drive_path);
+        let cmd_tx_drive = self.tx_drive.clone();
+        let drive_save_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let drive_save_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
         // serializes every targeted-write persist call to
         // `cmd_config_path` -- SelectDevice, SelectRig, SaveRigBookmark,
@@ -2303,6 +2312,75 @@ impl super::ApplicationCoordinator {
 
                 match tui_cmd_rx.try_recv() {
                     Ok(cmd) => match cmd {
+                        pancetta_tui::tui_runner::TuiCommand::AdjustTxDrive { delta_db } => {
+                            let old = cmd_tx_drive.get();
+                            let db = cmd_tx_drive.adjust(delta_db);
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                    db,
+                                    ceiling_db: cmd_tx_drive.ceiling_db(),
+                                },
+                            );
+                            if db != old {
+                                drive_save_dirty.store(true, Ordering::Release);
+                                cmd_config.write().await.audio.levels.output_gain_db = db;
+                            }
+                            if drive_save_dirty.load(Ordering::Acquire) {
+                                let path = cmd_tx_drive_path.clone();
+                                let is_toml = cmd_tx_drive_is_toml;
+                                let (respond, response) = tokio::sync::oneshot::channel();
+                                let submitted = cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                    work: Box::new(move || {
+                                        let target = resolve_config_write_target(&path)?;
+                                        pancetta_config::Config::save_output_gain_db(
+                                            &target, is_toml, db,
+                                        )
+                                    }),
+                                    respond,
+                                });
+                                let generation =
+                                    drive_save_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                                let latest = drive_save_generation.clone();
+                                let dirty = drive_save_dirty.clone();
+                                let echo = cmd_tui_msg_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = if submitted.is_ok() {
+                                        response.await.unwrap_or_else(|_| {
+                                            Err(pancetta_config::ConfigError::Validation(
+                                                "TX drive config write worker closed".into(),
+                                            ))
+                                        })
+                                    } else {
+                                        Err(pancetta_config::ConfigError::Validation(
+                                            "TX drive config write worker closed".into(),
+                                        ))
+                                    };
+                                    if result.is_ok()
+                                        && latest.load(Ordering::Acquire) == generation
+                                    {
+                                        dirty.store(false, Ordering::Release);
+                                    }
+                                    if let Err(error) = result {
+                                        warn!("Could not save TX drive: {error}");
+                                        if latest.load(Ordering::Acquire) == generation {
+                                            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "TX drive".into(),
+                                                status: "TX drive changed for this session only. Could not save TX drive.".into(),
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                            });
+                                            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                                                ts: chrono::Utc::now(),
+                                                target: "tx.drive",
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                                text: "TX drive changed for this session only. Could not save TX drive.".into(),
+                                                qso_id: None,
+                                                callsign: None,
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::SendMessage {
                             text,
                             frequency_offset,

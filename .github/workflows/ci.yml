@@ -128,6 +128,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
               - '.config/nextest.toml'
+              - 'pancetta-protocol/tests/fixtures/rig-api.v1.schema.json'
               # PAN-284: the Workspace Check lane runs this gate on real bench output.
               - 'scripts/ci/check-criterion-budget.sh'
 
