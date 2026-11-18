@@ -3186,7 +3186,7 @@ mod wav_recorder_tests {
 mod wav_recording_gate_tests {
     use super::*;
 
-    fn rec(auto_record: bool, directory: &str) -> pancetta_config::RecordingConfig {
+    pub(super) fn rec(auto_record: bool, directory: &str) -> pancetta_config::RecordingConfig {
         pancetta_config::RecordingConfig {
             auto_record,
             directory: directory.into(),
@@ -3194,7 +3194,7 @@ mod wav_recording_gate_tests {
         }
     }
 
-    fn home() -> std::path::PathBuf {
+    pub(super) fn home() -> std::path::PathBuf {
         std::path::PathBuf::from("/home/op")
     }
 
@@ -3351,48 +3351,6 @@ mod wav_recording_gate_tests {
     }
 
     #[test]
-    fn an_empty_recording_directory_uses_the_data_dir_and_tilde_uses_home() {
-        // PAN-376: with `--data-dir D`, an empty directory records to
-        // `D/recordings`, while `~` in the configured value still expands
-        // against the home directory.
-        let custom = std::path::PathBuf::from("/srv/pancetta-40m");
-        for directory in ["", "   "] {
-            assert_eq!(
-                resolve_wav_recording(
-                    &rec(true, directory),
-                    false,
-                    false,
-                    Some(&home()),
-                    Some(&custom)
-                ),
-                WavRecording::Enabled {
-                    dir: custom.join("recordings")
-                },
-                "directory = {directory:?}"
-            );
-        }
-        assert_eq!(
-            resolve_wav_recording(
-                &rec(true, "~/rec"),
-                false,
-                false,
-                Some(&home()),
-                Some(&custom)
-            ),
-            WavRecording::Enabled {
-                dir: home().join("rec")
-            }
-        );
-        // No data directory and an empty value: recording stays off.
-        assert_eq!(
-            resolve_wav_recording(&rec(true, ""), false, false, Some(&home()), None),
-            WavRecording::NoHomeDir {
-                directory: String::new()
-            }
-        );
-    }
-
-    #[test]
     fn replay_overrides_enabled() {
         assert_eq!(
             resolve_wav_recording(
@@ -3471,6 +3429,10 @@ mod wav_recording_gate_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dsp/tests/recording_data_dir_tests.rs"]
+mod recording_data_dir_tests;
 
 #[cfg(test)]
 mod decimation_stage_tests {
