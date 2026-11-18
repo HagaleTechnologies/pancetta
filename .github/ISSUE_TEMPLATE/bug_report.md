@@ -27,7 +27,7 @@ in use, and any TUI keybinds pressed.
 
 ## Environment
 
-- Pancetta version / commit: `git rev-parse --short HEAD`
+- Pancetta version: output of `pancetta --version`
 - OS: (Linux / macOS / Windows; distro/version)
 - Rust toolchain: `rustc --version`
 - Rig (if relevant): make/model
