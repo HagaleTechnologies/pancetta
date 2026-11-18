@@ -2983,6 +2983,8 @@ impl ApplicationCoordinator {
         self.start_remote_gateway_component().await?;
         self.start_station_agent_component().await?;
         self.start_wsjtx_udp_component().await?;
+        // PAN-381: the receive-only WSJT-X decode listener (display only).
+        self.start_wsjtx_decode_ingest().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;

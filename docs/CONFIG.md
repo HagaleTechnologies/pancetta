@@ -1123,13 +1123,15 @@ JTAlert, and most loggers already consume — decodes, status, and logged
 QSOs show up live with zero work on the companion app's side. It can
 also *consume* the protocol's Reply/HaltTx requests, which is what makes
 a GridTracker double-click call a station on pancetta's behalf. Default
-**off** end to end: `enabled = false` binds no socket and emits nothing.
+**off** end to end: `enabled = false` binds no companion-broadcast socket and
+emits nothing, and `accept_decodes = false` binds no decode listener.
 See `docs/GUIDE.md`'s "…use GridTracker with pancetta?" section for the
-same-host and cross-machine setup recipes.
+same-host and cross-machine setup recipes, and its "…feed WSJT-X's decodes
+into pancetta?" section for the decode listener.
 
 ```toml
 [network.wsjtx_udp]
-enabled = false                     # master: emit nothing, bind nothing
+enabled = false                     # companion broadcast: emit nothing, bind nothing
 destination = "127.0.0.1:2237"      # unicast host:port or multicast group:port
 multicast_interface = ""            # LAN IP to send multicast from ("" = OS default)
 multicast_ttl = 3                   # only used for multicast destinations
@@ -1137,11 +1139,13 @@ instance_id = "WSJT-X - pancetta"   # the protocol Id field
 accept_udp_requests = false         # master switch for ALL inbound processing
 allow_tx_initiation = false         # Reply(4) may start a QSO (arm-gated, see below)
 allowed_request_hosts = []          # required for multicast inbound; unicast infers the peer
+accept_decodes = false              # listen for a same-host WSJT-X's Decode/Status datagrams
+decode_listen = "127.0.0.1:2238"    # loopback address:port WSJT-X's UDP Server points at
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch. `false` ⇒ no socket is ever bound and nothing is emitted. |
+| `enabled` | bool | `false` | Companion-broadcast switch (pancetta in the WSJT-X role). `false` ⇒ the companion-broadcast socket is never bound and nothing is emitted. The decode listener has its own switch, `accept_decodes`. |
 | `destination` | string | `"127.0.0.1:2237"` | Where pancetta sends. A unicast `host:port` for a same-host or point-to-point companion, or a multicast group `address:port` (e.g. `"224.0.0.73:2237"`) to reach multiple companions / another machine. |
 | `multicast_interface` | string | `""` | Local LAN interface IP to send multicast from. `""` = OS default (which is typically loopback-only — cross-host multicast needs this set to your real NIC's IP). Only used when `destination` is a multicast group. |
 | `multicast_ttl` | integer (`u32`) | `3` | IP multicast TTL/hop-limit. Only used for multicast destinations; GridTracker uses `3` for its own sends, so `3` is a safe match. |
@@ -1149,10 +1153,50 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 | `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
 | `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may **create** a QSO. Consent is tracked per channel (PAN-98), so this setting gates only the WSJT-X UDP channel's own request path — it never arms anything and never satisfies the station-agent channel's `[network.station_agent].remote_tx_enabled`. Putting the resulting QSO's frames on the air additionally requires a **live remote-TX arm**, which only the station-agent channel can establish: `[network.station_agent].remote_tx_enabled = true` plus a paired, TX-arm-eligible remote client that has armed and keeps heartbeating (see `docs/DECISIONS/remote-operation.md`). With no live arm the QSO is created but every transmission is dropped and audited `not-armed`. Requires `enabled = true` and `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means no Reply-initiated QSOs. |
 | `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (the configured destination host must also pass source-port pinning below) and this list is unused. |
+| `accept_decodes` | bool | `false` | Listen on `decode_listen` for a same-host WSJT-X's Decode(2) and Status(1) datagrams (PAN-381). Live decodes are shown in Band Activity and DX Hunter tagged `EXT` and scored like pancetta's own; display and scoring only, they never start a transmission. Independent of `enabled`: the listener runs whether or not the companion broadcast is on. Restart required. |
+| `decode_listen` | string | `"127.0.0.1:2238"` | Loopback `address:port` WSJT-X's UDP Server is pointed at. Checked only when `accept_decodes = true`: it must be an IP address and port, a loopback address (`127.0.0.1` or `[::1]`), a fixed (non-zero) port, and must differ from `destination`. Restart required. |
 
 `destination` must parse as a valid `host:port` socket address, and
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
+
+#### WSJT-X decode listener (PAN-381)
+
+With `accept_decodes = true`, pancetta binds a second, receive-only UDP socket
+on `decode_listen` and never sends a datagram from it. Point WSJT-X's
+**Settings → Reporting → UDP Server** at that address and port. The listener
+learns WSJT-X's dial from its Status datagrams and drops every Decode until
+that WSJT-X instance has sent a Status with a non-zero dial; there is no
+fallback to pancetta's own dial. It keeps only live, confident FT8 (`~`) and
+FT4 (`+`) decodes: replays (`New = false`), `.wav` decodes, low-confidence
+decodes, other modes and datagrams carrying pancetta's own `instance_id` are
+dropped silently. At most 250 decodes are accepted per 15 s window.
+
+An accepted decode reaches the TUI only. Band Activity shows `EXT` before
+its message; DX Hunter's Src column shows `EXT` (heard only through WSJT-X)
+or `EX+N` (heard through WSJT-X and spotted on the network). As soon as
+pancetta's own decoder hears the station, the row becomes `RX` or `RX+N`.
+It is scored by the same priority scorer as a native decode, banded by
+WSJT-X's Status dial. It never reaches the QSO engine, the autonomous
+operator, alerts, PSKReporter, the remote gateway or the WSJT-X re-emit.
+
+Validation runs at load only when `accept_decodes = true`:
+
+```
+network.wsjtx_udp.decode_listen 0.0.0.0:2238 is not a loopback address; the decode listener accepts only a same-host WSJT-X, so bind to 127.0.0.1 or [::1]
+network.wsjtx_udp.decode_listen needs a fixed port (got 0) so WSJT-X can be pointed at it
+network.wsjtx_udp.decode_listen must differ from network.wsjtx_udp.destination (127.0.0.1:2237), or pancetta would receive its own datagrams
+Invalid configuration value: network.wsjtx_udp.decode_listen = localhost:2238
+```
+
+Diagnostics go to the Shift+D overlay under target `remote.wsjtx`: one Info
+line when the listener binds, one Warn line when it cannot bind (the station
+keeps running with WSJT-X decodes off), and at most one summary per 60 s when
+datagrams were dropped for an operator-actionable reason, for example
+`WSJT-X decode listener dropped 4 datagrams in the last 60 s: 4 before WSJT-X sent a Status`
+(Info when the only reason is a missing Status, Warn otherwise). Headless
+mode and `--replay` do not start the listener; each writes one log line.
+Both keys need a restart to take effect.
 
 #### WSJT-X UDP admission and Replay (PAN-312)
 

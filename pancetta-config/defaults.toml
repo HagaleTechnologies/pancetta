@@ -355,9 +355,11 @@ remote_tx_enabled = false
 tx_allow_list = []
 
 [network.wsjtx_udp]
+accept_decodes = false
 accept_udp_requests = false
 allow_tx_initiation = false
 allowed_request_hosts = []
+decode_listen = "127.0.0.1:2238"
 destination = "127.0.0.1:2237"
 enabled = false
 instance_id = "WSJT-X - pancetta"

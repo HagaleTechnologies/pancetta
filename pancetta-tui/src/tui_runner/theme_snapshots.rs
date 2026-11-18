@@ -136,6 +136,13 @@ surfaces! {
 
 // ---------------------------------------------------------------- fixture
 
+#[derive(PartialEq, Eq)]
+enum DecodeSource {
+    Native,
+    External,
+    OwnTx,
+}
+
 fn decode(
     message: &str,
     call: &str,
@@ -143,7 +150,7 @@ fn decode(
     delta_freq: f32,
     parity: pancetta_core::slot::SlotParity,
     directed: bool,
-    own: bool,
+    source: DecodeSource,
 ) -> crate::app::DecodedMessageView {
     crate::app::DecodedMessageView {
         timestamp: chrono::Utc::now() - chrono::Duration::seconds(10),
@@ -165,7 +172,8 @@ fn decode(
         band_needed: false,
         priority_score: None,
         priority_factors: None,
-        is_own_tx: own,
+        is_own_tx: source == DecodeSource::OwnTx,
+        external: source == DecodeSource::External,
     }
 }
 
@@ -281,9 +289,10 @@ fn placement() -> crate::app::PlacementView {
 /// station, a plain exchange; SNRs +4/-4/-12); one active QSO with a
 /// watchdog deadline, a queued call and ✓/✗ history (the hound and drift
 /// QSOs are added for `panel_qso_status`, see `render_with`); DX Hunter
-/// stations that are needed, ATNO, notable, worked, engaged, Network and
-/// Both; a transmit in progress; readiness Blocker/Warning/Notice and a
-/// status line; a 20-row waterfall ramp; and overlay data with every
+/// stations that are needed, ATNO, notable, worked, engaged, Network,
+/// Both and External; a WSJT-X (`EXT`) decode in Band Activity; a transmit in
+/// progress; readiness Blocker/Warning/Notice and a status line; a 20-row
+/// waterfall ramp; and overlay data with every
 /// diagnostic level, outcome and upload state. Title-bar chips are set for
 /// `view_operate` only (see `render_with`), so the other views keep room for
 /// the dial and view chip.
@@ -295,6 +304,7 @@ fn placement() -> crate::app::PlacementView {
 /// single-QSO panel than any surface draws, and the readiness strip folds
 /// the Notice into its `+N more` counter at 100 columns.
 async fn fixture(name: ThemeName) -> App {
+    use self::DecodeSource::{External, Native, OwnTx};
     use crate::app::{ActivePanel, SpotSource};
     use crate::upload_status::{QsoUploadStatus, TargetUploadStatus, UploadState, UploadTarget};
     use pancetta_core::slot::SlotParity::{Even, Odd};
@@ -311,11 +321,19 @@ async fn fixture(name: ThemeName) -> App {
     // so the focused, engaged CQ from W1AW is last: it then shows in every
     // view's Band Activity, not only in the taller panel.
     let mut decodes = vec![
-        decode("CQ DX JA1ABC PM95", "JA1ABC", 4, 800.0, Odd, false, false),
-        decode("CQ VK9XX QH30", "VK9XX", -4, 600.0, Even, false, false),
-        decode("CQ 3Y0J JD10", "3Y0J", -12, 950.0, Odd, false, false),
-        decode("CQ K1ABC FN42", "K1ABC", 4, 1100.0, Even, false, false),
-        decode("CQ ZL2AB RF70", "ZL2AB", -4, 1700.0, Odd, false, false),
+        decode(
+            "CQ DX JA1ABC PM95",
+            "JA1ABC",
+            4,
+            800.0,
+            Odd,
+            false,
+            External,
+        ),
+        decode("CQ VK9XX QH30", "VK9XX", -4, 600.0, Even, false, Native),
+        decode("CQ 3Y0J JD10", "3Y0J", -12, 950.0, Odd, false, Native),
+        decode("CQ K1ABC FN42", "K1ABC", 4, 1100.0, Even, false, Native),
+        decode("CQ ZL2AB RF70", "ZL2AB", -4, 1700.0, Odd, false, Native),
         decode(
             "K2XYZ DL1ABC -05",
             "DL1ABC",
@@ -323,7 +341,7 @@ async fn fixture(name: ThemeName) -> App {
             1900.0,
             Even,
             false,
-            false,
+            Native,
         ),
         decode(
             &format!("{own} G8KHF IO91"),
@@ -332,7 +350,7 @@ async fn fixture(name: ThemeName) -> App {
             1234.0,
             Odd,
             true,
-            false,
+            Native,
         ),
         decode(
             &format!("{own} W1AW R-08"),
@@ -341,7 +359,7 @@ async fn fixture(name: ThemeName) -> App {
             2100.0,
             Odd,
             true,
-            false,
+            Native,
         ),
         decode(
             &format!("CQ {own} FN42"),
@@ -350,9 +368,9 @@ async fn fixture(name: ThemeName) -> App {
             1500.0,
             Even,
             false,
-            true,
+            OwnTx,
         ),
-        decode("CQ W1AW FN31", "W1AW", -12, 2100.0, Odd, false, false),
+        decode("CQ W1AW FN31", "W1AW", -12, 2100.0, Odd, false, Native),
     ];
     decodes[1].needed = true;
     decodes[2].atno = true;
@@ -463,6 +481,8 @@ async fn fixture(name: ThemeName) -> App {
     stations[3].notable_type = Some("DXpedition".to_string());
     stations[3].source = SpotSource::Both;
     stations[4].worked_before = true;
+    // PAN-381: DX Hunter's `EXT` source label in every theme.
+    stations[4].source = SpotSource::External;
     stations[5].band_needed = true;
     for s in stations {
         app.dx_stations.insert(s.call_sign.clone(), s);
