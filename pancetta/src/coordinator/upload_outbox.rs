@@ -182,7 +182,7 @@ impl OutboxTransport for LogbookClients {
                             return Delivery::Failed {
                                 class: UploadFailureClass::RecordRejected,
                                 text: format!("cqdx.io: queued record unreadable: {e}"),
-                            }
+                            };
                         }
                     };
                     match c.log_qso(record).await {
@@ -1252,6 +1252,10 @@ pub(crate) fn clip(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "upload_outbox/tests/cqdx_receipt_tests.rs"]
+mod cqdx_receipt_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pancetta_dx::upload_outbox::{EntryState, OUTBOX_FILE_NAME};
@@ -1635,7 +1639,7 @@ mod tests {
         }
     }
 
-    const TIMING: OutboxTiming = OutboxTiming {
+    pub(super) const TIMING: OutboxTiming = OutboxTiming {
         slow_retry: Duration::from_millis(200),
         drain_spacing: Duration::from_millis(5),
         tick: Duration::from_millis(5),
@@ -1644,7 +1648,7 @@ mod tests {
         persist_retry_cap: Duration::from_millis(20),
     };
 
-    fn schedule() -> RetrySchedule {
+    pub(super) fn schedule() -> RetrySchedule {
         RetrySchedule::new(3, 10, 40, 2.0, 0.0, TIMING.slow_retry)
     }
 
@@ -2126,7 +2130,7 @@ mod tests {
         );
     }
 
-    async fn wait_until(mut cond: impl FnMut() -> bool) {
+    pub(super) async fn wait_until(mut cond: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !cond() {
             assert!(Instant::now() < deadline, "condition not met within 5s");
@@ -2842,7 +2846,7 @@ mod tests {
         }
     }
 
-    fn cqdx_record_json() -> String {
+    pub(super) fn cqdx_record_json() -> String {
         let t = chrono::DateTime::parse_from_rfc3339("2026-10-17T14:02:11Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -2861,7 +2865,9 @@ mod tests {
     }
 
     /// A raw HTTP server answering each connection with the next response.
-    fn serve_sequence(responses: Vec<String>) -> (std::net::SocketAddr, Arc<Mutex<usize>>) {
+    pub(super) fn serve_sequence(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, Arc<Mutex<usize>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2950,67 +2956,6 @@ mod tests {
             .await;
         wait_until(|| *served.lock().unwrap() == 2).await;
         wait_until(|| OutboxStore::open(path.clone()).0.is_empty()).await;
-    }
-
-    #[tokio::test]
-    async fn cqdx_acceptance_persists_remote_id() {
-        for duplicate in [false, true] {
-            for header in [Some("abc123"), None] {
-                let body = format!(r#"{{"duplicate":{duplicate}}}"#);
-                let header_line = header.map_or(String::new(), |id| format!("X-QSO-Id: {id}\r\n"));
-                let (addr, served) = serve_sequence(vec![format!(
-                    "HTTP/1.1 201 Created\r\n{header_line}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )]);
-                let client = pancetta_cqdx::CqdxClient::new(
-                    format!("http://{addr}"),
-                    "pat_0123456789abcdef".into(),
-                )
-                .unwrap();
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join(OUTBOX_FILE_NAME);
-                let qso_id = Uuid::new_v4();
-                let handle = start_upload_outbox(
-                    path.clone(),
-                    Arc::new(LogbookClients {
-                        lotw: None,
-                        clublog: None,
-                        qrz: None,
-                        eqsl: None,
-                        cqdx: Some(Arc::new(client)),
-                    }),
-                    schedule(),
-                    TIMING,
-                    Arc::new(std::sync::Mutex::new(UploadHealth::default())),
-                    None,
-                    Arc::new(AtomicBool::new(false)),
-                    None,
-                )
-                .0;
-                handle
-                    .enqueue(vec![NewUpload {
-                        qso_id,
-                        destination: Cqdx,
-                        call: "K1ABC".into(),
-                        payload: cqdx_record_json(),
-                    }])
-                    .await;
-                wait_until(|| *served.lock().unwrap() == 1).await;
-                wait_until(|| {
-                    let store = OutboxStore::open(path.clone()).0;
-                    store.is_empty()
-                        && (header.is_none() || store.accepted_receipt(qso_id, Cqdx).is_some())
-                })
-                .await;
-                let store = OutboxStore::open(path).0;
-                assert_eq!(
-                    store
-                        .accepted_receipt(qso_id, Cqdx)
-                        .map(|r| r.remote_id.as_str()),
-                    header
-                );
-            }
-        }
     }
 
     #[tokio::test]
