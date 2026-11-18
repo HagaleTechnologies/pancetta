@@ -127,6 +127,7 @@ pub use crate::async_logger::{
 pub use crate::autonomous::*;
 pub use crate::band_scheduler::*;
 pub use crate::exchange::*;
+pub use crate::fox::*;
 pub use crate::frequency::*;
 pub use crate::priority::*;
 pub use crate::qso_manager::*;
@@ -145,6 +146,7 @@ pub mod async_logger;
 pub mod autonomous;
 pub mod band_scheduler;
 pub mod exchange;
+pub mod fox;
 pub mod frequency;
 pub mod logbook_lock;
 pub mod priority;

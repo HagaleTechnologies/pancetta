@@ -5558,6 +5558,7 @@ async fn manual_cqer_emits_report_then_rr73() {
             partner_freq: None,
             pending_freq_drift: None,
             hound_qsyed: false,
+            fox: false,
             remote_origin: false,
             remote_client_key_id: None,
             tx_parity_provisional: false,

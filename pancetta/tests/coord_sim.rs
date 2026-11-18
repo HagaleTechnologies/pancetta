@@ -2225,3 +2225,172 @@ async fn independent_fixtures_do_not_share_state() {
     first.shutdown().await;
     second.shutdown().await;
 }
+
+/// PAN-386 end to end, through the real `QsoManager` and the production TX
+/// worker: the Fox CQ and two Hound streams sit on 60 Hz Fox slots, and RR73
+/// to one Hound plus a report to the other air as one type 0.1 frame at the
+/// report Hound's slot. Each Hound completes when its RR73 airs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fox_two_hounds_share_one_type01_frame_on_60_hz_slots() {
+    use pancetta_qso::{fox_slot_offset, fox_slots};
+
+    let mut sim = CoordSim::new("KH7Z").await;
+    let near = |rows: &[(f64, String)], hz: f64, tol: f64| -> Vec<String> {
+        rows.iter()
+            .filter(|(f, _)| (f - hz).abs() <= tol)
+            .map(|(_, t)| t.clone())
+            .collect()
+    };
+    let on_a_fox_slot = |hz: f64| fox_slots().any(|slot| (slot - hz).abs() <= 2.0);
+
+    // The Fox CQ on the lowest free slot, as Fox engage opens it.
+    let (fox, others) = sim.manager.active_tx_offsets_by_fox_role().await;
+    let cq_slot = fox_slot_offset(&fox, &others).expect("free Fox slot");
+    assert_eq!(cq_slot, 300.0);
+    let cq = sim
+        .manager
+        .start_cq_manual(cq_slot, Some(SlotParity::Even), false, None)
+        .await
+        .expect("Fox CQ");
+    assert!(sim.manager.mark_fox_role(cq).await);
+    sim.admit_fox(&cq);
+
+    // K1ABC called at 1200 Hz: answered on the next slot, heard at 1200 Hz.
+    let (fox, others) = sim.manager.active_tx_offsets_by_fox_role().await;
+    let k1abc_slot = fox_slot_offset(&fox, &others).expect("free Fox slot");
+    assert_eq!(k1abc_slot, 360.0);
+    let k1abc = sim
+        .manager
+        .respond_to_caller(
+            "K1ABC".to_string(),
+            k1abc_slot,
+            Some(SlotParity::Odd),
+            pancetta_core::ResponseStep::Report,
+            Some(-10.0),
+            None,
+            Some(1200.0),
+            false,
+            None,
+        )
+        .await
+        .expect("answer K1ABC");
+    assert!(sim.manager.mark_fox_role(k1abc).await);
+    sim.admit_fox(&k1abc);
+
+    // Slot 0: the CQ at 300 Hz and K1ABC's report at 360 Hz.
+    let pending = sim.pump_qso_events();
+    let slot0 = sim.drive_slot(pending).await;
+    let mut offsets0 = sim.timeline.offsets_in_slot(slot0);
+    offsets0.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(offsets0, vec![300.0, 360.0], "{}", sim.timeline);
+
+    // K1ABC's R-report arrives on the Fox's own slot; W9XYZ calls at 1240 Hz.
+    sim.inject_decode("KH7Z K1ABC R-10", 360.0).await;
+    let (fox, others) = sim.manager.active_tx_offsets_by_fox_role().await;
+    let w9xyz_slot = fox_slot_offset(&fox, &others).expect("free Fox slot");
+    assert_eq!(w9xyz_slot, 420.0);
+    let w9xyz = sim
+        .manager
+        .respond_to_caller(
+            "W9XYZ".to_string(),
+            w9xyz_slot,
+            Some(SlotParity::Odd),
+            pancetta_core::ResponseStep::Report,
+            Some(-8.0),
+            None,
+            Some(1240.0),
+            false,
+            None,
+        )
+        .await
+        .expect("answer W9XYZ");
+    assert!(sim.manager.mark_fox_role(w9xyz).await);
+    sim.admit_fox(&w9xyz);
+
+    // Slot 1: RR73 to K1ABC and the report to W9XYZ share one type 0.1 frame.
+    let audio_before = sim.observations.lock().unwrap().audio_frames.len();
+    let settled_before = sim.observations.lock().unwrap().settlements.len();
+    let pending = sim.pump_qso_events();
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.text == "K1ABC KH7Z RR73" && p.frequency_offset == 360.0),
+        "{pending:?}"
+    );
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.text == "W9XYZ KH7Z -8" && p.frequency_offset == 420.0),
+        "{pending:?}"
+    );
+    let slot1 = sim.drive_slot(pending).await;
+    let frames: Vec<(Vec<f32>, u32)> =
+        sim.observations.lock().unwrap().audio_frames[audio_before..].to_vec();
+    assert!(!frames.is_empty(), "slot 1 aired audio");
+    let mut decoded = Vec::new();
+    for (samples, rate) in &frames {
+        assert_eq!(*rate, 12000);
+        decoded.extend(decode_fox_audio(samples, "KH7Z"));
+    }
+    let mux = near(&decoded, 420.0, 4.0);
+    assert!(
+        !mux.is_empty() && mux.iter().all(|t| t == "K1ABC RR73; W9XYZ <KH7Z> -08"),
+        "one type 0.1 frame at 420 Hz: {decoded:?}"
+    );
+    assert!(
+        near(&decoded, 360.0, 20.0).is_empty(),
+        "nothing airs at 360 Hz: {decoded:?}"
+    );
+    let settled: Vec<(String, bool)> = sim.observations.lock().unwrap().settlements
+        [settled_before..]
+        .iter()
+        .map(|(id, _, aired)| (id.clone(), *aired))
+        .collect();
+    for id in [k1abc, w9xyz] {
+        assert!(
+            settled.contains(&(id.to_string(), true)),
+            "TxFrameSent for {id}: {settled:?}"
+        );
+    }
+    sim.pump_qso_events();
+    assert!(
+        sim.completed
+            .iter()
+            .any(|m| m.their_callsign.as_deref() == Some("K1ABC")),
+        "K1ABC completes when its RR73 airs"
+    );
+    let mut all_decoded = decoded;
+
+    // W9XYZ's R-report on its slot; its RR73 airs in slot 2 and it completes.
+    sim.inject_decode("KH7Z W9XYZ R-08", 420.0).await;
+    let audio_before = sim.observations.lock().unwrap().audio_frames.len();
+    let pending = sim.pump_qso_events();
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.text == "W9XYZ KH7Z RR73" && p.frequency_offset == 420.0),
+        "{pending:?}"
+    );
+    sim.drive_slot(pending).await;
+    sim.timeline.assert_keyed_for_qso(&w9xyz.to_string());
+    for (samples, _) in sim.observations.lock().unwrap().audio_frames[audio_before..].iter() {
+        all_decoded.extend(decode_fox_audio(samples, "KH7Z"));
+    }
+    sim.pump_qso_events();
+    assert!(
+        sim.completed
+            .iter()
+            .any(|m| m.their_callsign.as_deref() == Some("W9XYZ")),
+        "W9XYZ completes when its RR73 airs"
+    );
+
+    // Every keyed item and every decoded frame sits on a Fox slot.
+    for k in &sim.timeline.keyed {
+        assert!(on_a_fox_slot(k.freq_hz), "keyed off-slot: {k:?}");
+    }
+    for (hz, text) in &all_decoded {
+        assert!(on_a_fox_slot(*hz), "decoded off-slot: {hz} {text}");
+    }
+    let _ = slot1;
+    sim.shutdown().await;
+}

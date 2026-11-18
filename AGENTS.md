@@ -41,6 +41,7 @@ Tier-based pouncing, decode alerts (bell/ntfy/webhook), persistent operator watc
 CQ DX and regional CQ modifier gating in autonomous pouncing (PAN-292) is implemented, unreleased: offline continent data, fail-open on unresolved calls; automated coverage only, on-air qualification pending.
 The autonomous band scheduler (PAN-385) is implemented, unreleased: `[[autonomous.band_plan]]` UTC windows acting on entry, needed-activity hops from cqdx.io spots and a grey-line tie-break, all under `band_hopping.enabled`; automated coverage only, on-air and live cqdx qualification pending.
 TUI themes (PAN-387) are implemented, unreleased: Dark (unchanged), Light and HighContrast palettes selected by `[ui] theme` or `[ui.accessibility] high_contrast`, restart required; contrast is checked by snapshot tests on the xterm default palette, not yet on a real terminal.
+FT8 Fox slots and type 0.1 multiplexing (PAN-386) are implemented, unreleased: Fox CQ and Hound streams on 60 Hz slots in 300-900 Hz, RR73 and a report shared in one type 0.1 frame, contact logged when RR73 airs; decoded by pancetta's own decoders only, WSJT-X Hound and on-air qualification pending.
 
 ## Building and Testing
 
@@ -115,7 +116,11 @@ New unit tests go in the same crate, `src/<module>/tests/<behaviour>_tests.rs`, 
 
 - Spot-call QSY (PAN-287): Space on a DX Hunter network spot changes the dial only through `coordinator::spot_call`, never while the rig is keyed (the `rig_is_keyed` recheck and the `SetFrequency` enqueue run under `ptt_sync_gate`, which every key-down passes before its PTT-on enqueue; the autonomous operator is never locked under that gate), never across a QSO the admission snapshot shows as answered, and never without a Hamlib route. A call parked for PTT-off is dropped after 30 s, on any operator frequency change or operating-mode switch, by a newer spot call, or when TX policy no longer allows initiation.
 
+<<<<<<< HEAD
 - Every autonomous band hop goes through `coordinator::band_hop::execute_band_hop`: never while the rig is keyed (the `rig_is_keyed` recheck and every send run under `ptt_sync_gate`, with the operator unlocked) and never across an exchange in progress; a hop that waits is re-evaluated next slot (PAN-385).
+=======
+- Fox streams (PAN-386): in FT8 Fox mode every Fox-role QSO (`metadata.fox`: the Fox CQ and each Hound answer) transmits on a 60 Hz slot in 300-900 Hz from `pancetta_qso::fox_slot_offset`, pinned for its life; a type 0.1 frame is formed only inside `encode_and_modulate_multi_tx_with_fox` from one RR73 and one report item of Fox-admitted QSOs, at the report item's slot, and each item keeps its own attempt id and outcome; a Fox-role R-report completes through the PAN-280 hold.
+>>>>>>> 8e4a8361eb133100423ef40ec2a11e22b812fe8c
 
 - A station-agent `setFrequency`/`setSplit` is refused, with an `error` frame to that peer, while the rig is keyed or while any active QSO has no `remote_client_key_id`; the Hamlib loop also drops a `StationAgent`-sourced `SetFrequency` while keyed (PAN-252).
 

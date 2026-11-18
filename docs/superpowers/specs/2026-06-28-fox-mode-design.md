@@ -20,6 +20,9 @@ The hard parts already exist (verified against the codebase):
   `maybe_answer_caller` in `coordinator/qso.rs`) already auto-opens a reply QSO to each station calling
   us, gated by a concurrent-answer cap (`max_concurrent_qsos`) + TxPolicy + parity. Each runs as an
   independent QSO state machine.
+
+> Superseded in part by PAN-386: in FT8 the Fox CQ and every Hound answer transmit on a pinned 60 Hz slot in 300-900 Hz (`pancetta_qso::fox_slot_offset`), not the de-conflicted Tx=Rx offsets below; FT4/FT2 Fox keeps this geometry. See `docs/DECISIONS/modes.md`.
+
 - **Per-stream offset de-confliction:** the just-shipped TX-offset feature made `respond_to_caller`
   compute its offset via `compute_manual_tx_offset` (held → **`deconflict_offset`** → Tx=Rx) and set
   `partner_freq` (Tx≠Rx). So when the Fox answers N callers, each reply already lands on a distinct,
@@ -86,6 +89,9 @@ the existing exchange), no new codec.
 - **Manual-engaged Fox**, answers callers as they arrive up to `fox_max_streams` (no fancy
   priority-pick-N-best-per-slot; the caller pool + cap is sufficient for v1 — a smarter selector is a
   follow-up if needed).
+
+> Superseded in part by PAN-386: in FT8 the Fox now places each stream on a 60 Hz slot in 300-900 Hz and multiplexes an RR73 and a report into one WSJT-X type 0.1 frame; SuperFox is still not supported.
+
 - **Standard messages only** (no SuperFox codec — that's the separate, deferred build).
 - **No Fox→Hound frequency *assignment* protocol** (we don't tell Hounds exact slots; we reply on our
   de-conflicted offsets; real Hounds QSY into the Fox region by convention and we hear them anywhere).
