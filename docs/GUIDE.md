@@ -401,6 +401,11 @@ GridTracker stays off unless you turn it on.
 - **Nothing transmits on its own.** A WSJT-X decode never starts a QSO, an
   autonomous call, an alert or a PSKReporter report. Answering it is still
   your own key press.
+- **Only on pancetta's band and mode.** Space, or Enter on a Callers row,
+  calls on pancetta's own dial and mode. So on an `EXT` decode that WSJT-X
+  heard on another band or mode, both are refused with a status line such as
+  `Can't work N4BP — WSJT-X heard it on 40m FT8, pancetta is on 20m FT8`.
+  A rig readback on another band than pancetta's also refuses.
 - **Decodes wait for WSJT-X's status.** Pancetta bands each decode by the
   dial WSJT-X reports in its Status messages, so it drops decodes until
   WSJT-X has sent one (normally within a few seconds of starting). Only live

@@ -4540,8 +4540,9 @@ impl App {
     /// This is the same notion of "directed at us" the Callers panel uses
     /// (`is_directed_at_us`), filtered to a single callsign. `decoded_messages`
     /// is push-back (oldest→newest) so we walk it in reverse and take the first
-    /// match. Used by [`Self::resolve_space_action`] to decide whether Space
-    /// should answer a CQ (grid) or reply at the correct exchange step.
+    /// match. [`Self::resolve_space_action`] uses the same predicate, minus
+    /// any WSJT-X decode PAN-435 refuses, to decide whether Space should
+    /// answer a CQ (grid) or reply at the correct exchange step.
     pub fn last_directed_at_us_from(&self, callsign: &str) -> Option<&DecodedMessageView> {
         self.decoded_messages.iter().rev().find(|m| {
             m.is_directed_at_us
@@ -4593,7 +4594,19 @@ impl App {
     pub fn resolve_space_action(&self) -> Option<SpaceAction> {
         let callsign = self.focused_callsign()?;
 
-        if let Some(msg) = self.last_directed_at_us_from(&callsign) {
+        // PAN-435: a WSJT-X decode from another band or mode is never a
+        // reply target, because a reply keys on pancetta's own dial and mode,
+        // where that station is not. Reply to the newest directed decode that
+        // is not refused. With none, an `EXT` row under the cursor is refused
+        // below (`focused_external_row_refusal`) and any other row is called.
+        let directed = self.decoded_messages.iter().rev().find(|m| {
+            m.is_directed_at_us
+                && m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&callsign))
+                && self.external_decode_refusal(m).is_none()
+        });
+        if let Some(msg) = directed {
             let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
             // Reply on the passband where we actually heard them, on their slot
             // parity if we know it — mirrors the Callers-Enter reply target.
@@ -4655,6 +4668,13 @@ impl App {
             }
         }
 
+        // PAN-435: the focused row was heard only through a same-host WSJT-X.
+        // Calling it keys at WSJT-X's offset on pancetta's own dial and mode,
+        // so refuse when WSJT-X heard it on another band or mode.
+        if let Some(message) = self.focused_external_row_refusal(&callsign) {
+            return Some(SpaceAction::Refused { message });
+        }
+
         let (frequency, dx_parity) = self
             .get_selected_station()
             .filter(|(c, _, _)| pancetta_core::callsign::callsigns_match(c, &callsign))
@@ -4685,6 +4705,92 @@ impl App {
             frequency,
             dx_parity,
         })
+    }
+
+    /// PAN-435: the status line refusing Space or a directed reply on a
+    /// decode a same-host WSJT-X sent (PAN-381) whose band or mode differs
+    /// from pancetta's live dial and mode; `None` for a native decode or a
+    /// WSJT-X decode on pancetta's own band and mode. Pancetta's band is the
+    /// operating frequency's, and a rig readback that names another band
+    /// also refuses, because the readback lags a band key and the rig
+    /// transmits on its own dial. A band `pancetta_core::Band` cannot name
+    /// refuses, because a match cannot be shown.
+    pub fn external_decode_refusal(&self, msg: &DecodedMessageView) -> Option<String> {
+        if !msg.external {
+            return None;
+        }
+        let call = msg.call_sign.as_deref().unwrap_or("this station");
+        self.external_origin_refusal(call, band_from_mhz(msg.frequency), &msg.mode)
+    }
+
+    /// PAN-435: [`Self::external_decode_refusal`] for the row under the
+    /// focused panel's cursor, when that row is `callsign` and was heard only
+    /// through WSJT-X: a Band Activity or Callers decode tagged `EXT`, or a
+    /// DX Hunter `EXT`/`EX+N` row. A row pancetta heard itself is never
+    /// refused here.
+    fn focused_external_row_refusal(&self, callsign: &str) -> Option<String> {
+        let same = |c: &str| pancetta_core::callsign::callsigns_match(c, callsign);
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                let displayed = self.displayed_messages();
+                let msg = displayed.get(self.band_activity_scroll)?;
+                if !msg.call_sign.as_deref().is_some_and(same) {
+                    return None;
+                }
+                self.external_decode_refusal(msg)
+            }
+            ActivePanel::DxHunter => {
+                let row = self
+                    .selected_dx_hunter_row()
+                    .filter(|r| same(&r.call_sign))?;
+                if !matches!(
+                    row.source,
+                    SpotSource::External | SpotSource::ExternalNetwork
+                ) {
+                    return None;
+                }
+                self.external_origin_refusal(&row.call_sign, row.band, &row.mode)
+            }
+            ActivePanel::Callers => self
+                .selected_caller()
+                .filter(|m| m.call_sign.as_deref().is_some_and(same))
+                .and_then(|m| self.external_decode_refusal(m)),
+            _ => None,
+        }
+    }
+
+    /// PAN-435: refuse unless WSJT-X's `band` and `mode` are pancetta's live
+    /// band and mode.
+    fn external_origin_refusal(
+        &self,
+        callsign: &str,
+        band: Option<pancetta_core::Band>,
+        mode: &str,
+    ) -> Option<String> {
+        let ours = band_from_mhz(self.station_info.operating_frequency);
+        let rig = self.radio_frequency.and_then(band_from_mhz);
+        let rig_agrees = rig.is_none() || rig == ours;
+        let ours_mode = self.station_info.mode.as_str();
+        if band.is_some()
+            && band == ours
+            && rig_agrees
+            && mode.trim().eq_ignore_ascii_case(ours_mode.trim())
+        {
+            return None;
+        }
+        let rig_note = match rig {
+            Some(r) if !rig_agrees => format!(" (rig reads {r})"),
+            _ => String::new(),
+        };
+        let name = |b: Option<pancetta_core::Band>| {
+            b.map_or_else(|| "an unknown band".to_string(), |b| b.to_string())
+        };
+        Some(format!(
+            "Can't work {callsign} — WSJT-X heard it on {} {mode}, pancetta is on {} \
+             {ours_mode}{rig_note}",
+            name(band),
+            name(ours),
+        ))
     }
 
     // === Callers panel ====================================================

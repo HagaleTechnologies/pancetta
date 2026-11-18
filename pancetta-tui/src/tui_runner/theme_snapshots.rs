@@ -282,8 +282,8 @@ fn placement() -> crate::app::PlacementView {
 /// station, a plain exchange; SNRs +4/-4/-12); one active QSO with a
 /// watchdog deadline, a queued call and ✓/✗ history (the hound and drift
 /// QSOs are added for `panel_qso_status`, see `render_with`); DX Hunter
-/// stations that are needed, ATNO, notable, worked, engaged, Network and
-/// Both; a transmit in progress; readiness Blocker/Warning/Notice and a
+/// stations that are needed, ATNO, notable, worked, engaged, Network,
+/// Both and External; a WSJT-X (`EXT`) decode in Band Activity; a transmit in progress; readiness Blocker/Warning/Notice and a
 /// status line; a 20-row waterfall ramp; and overlay data with every
 /// diagnostic level, outcome and upload state. Title-bar chips are set for
 /// `view_operate` only (see `render_with`), so the other views keep room for
@@ -360,6 +360,9 @@ async fn fixture(name: ThemeName) -> App {
     decodes[2].needed = true;
     decodes[3].worked_before = true;
     decodes[4].band_needed = true;
+    // PAN-381: a decode heard only through a same-host WSJT-X, so every
+    // theme's Band Activity paints the `EXT` marker.
+    decodes[0].external = true;
     app.decoded_messages.extend(decodes);
 
     app.device_selection.input_devices = vec![
@@ -464,6 +467,8 @@ async fn fixture(name: ThemeName) -> App {
     stations[3].notable_type = Some("DXpedition".to_string());
     stations[3].source = SpotSource::Both;
     stations[4].worked_before = true;
+    // PAN-381: DX Hunter's `EXT` source label in every theme.
+    stations[4].source = SpotSource::External;
     stations[5].band_needed = true;
     for s in stations {
         app.dx_stations.insert(s.call_sign.clone(), s);
