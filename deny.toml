@@ -14,6 +14,9 @@ all-features = false
 [advisories]
 # Fail on any RustSec advisory in dependencies. Yanked crates also fail.
 yanked = "deny"
+# Unmaintained crates fail whether direct or transitive. This is cargo-deny's
+# default, set here so a change to that default cannot relax the check.
+unmaintained = "all"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
 ignore = [
@@ -33,21 +36,6 @@ ignore = [
     # the owner on PAN-430/PAN-431 (2026-11-17). Remove this once the
     # workspace has moved to jiff or time and sqlx no longer pulls chrono.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; workspace-wide chrono migration tracked separately (PAN-430/PAN-431)" },
-
-    # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
-    # instant transitively via tokio/cpal; both are working on migration.
-    # Nothing actionable at our layer.
-    { id = "RUSTSEC-2024-0384", reason = "transitive via tokio/cpal; upstream migration to web-time pending" },
-
-    # `paste` is unmaintained but is a proc-macro crate that runs only at
-    # compile time. No runtime code, no security surface from being
-    # unmaintained.
-    { id = "RUSTSEC-2024-0436", reason = "proc-macro only — runs at build time, no runtime exposure" },
-
-    # `proc-macro-error2` was a maintained fork of proc-macro-error; both
-    # the original and the fork are now unmaintained. Proc-macro only
-    # (compile time), no runtime surface.
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro only — runs at build time, no runtime exposure (also tracked as RUSTSEC-2024-0370)" },
 ]
 
 [licenses]
