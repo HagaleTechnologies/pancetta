@@ -40,7 +40,7 @@ fn coordinator_dir() -> PathBuf {
 /// One concise, accurate role per immediate coordinator module. Keys are
 /// names without the directory suffix. Keep in sync with the module docs.
 fn roles() -> BTreeMap<&'static str, &'static str> {
-    let entries: [(&str, &str); 50] = [
+    let entries: [(&str, &str); 51] = [
         ("adif_backup", "Changed startup ADIF snapshots and independent retention."),
         (
             "alerts",
