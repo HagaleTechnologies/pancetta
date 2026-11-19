@@ -78,7 +78,7 @@ raise 'changes job lost the research output' unless jobs.fetch('changes').fetch(
 %w['pancetta-research/**' 'pancetta-ft8/**' 'pancetta-qso/**' 'pancetta-dsp/**' 'Cargo.toml' 'Cargo.lock' 'rust-toolchain.toml' 'pancetta-ft8/vendor/ft8_lib' '.github/workflows/ci.yml'].each do |pat|
   raise "research filter lost a path: #{pat}" unless filters.include?(pat)
 end
-expected_if = "always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))"
+expected_if = "always() && ((needs.changes.outputs.code == 'true' && needs.changes.outputs.merge_group_verified != 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))"
 raise 'workspace event gate changed' unless workspace['if'] == expected_if
 failure = steps.first
 raise 'explicit failure step changed' unless failure['name'] == 'Fail explicitly (not silently skip) if codex-clean did not pass' && !failure.key?('if')
