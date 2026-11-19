@@ -134,15 +134,17 @@ impl AdifLogWriter {
                 }
             }
 
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .map_err(|source| AdifLogError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&path).await.map_err(|source| AdifLogError::Io {
+                path: path.clone(),
+                source,
+            })?;
 
             if !already_exists {
                 let header = processor.generate_header();
@@ -354,11 +356,14 @@ pub fn write_import_block(path: &Path, block: &ImportBlock) -> AdifLogResult<()>
         }
     }
     // Only a block for a new logbook may create the file.
-    let mut file = std::fs::OpenOptions::new()
-        .create(expected == 0)
-        .append(true)
-        .open(path)
-        .map_err(io)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(expected == 0).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).map_err(io)?;
     let found = file.metadata().map_err(io)?.len();
     if found != expected {
         return Err(AdifLogError::LogbookMoved {
@@ -663,7 +668,7 @@ mod tests {
     }
 
     /// An imported contact as another logger wrote it.
-    fn imported_record() -> AdifRecord {
+    pub(super) fn imported_record() -> AdifRecord {
         let adif = "<CALL:5>K1ABC <QSO_DATE:8>20240102 <TIME_ON:4>0815 <MODE:3>FT8 \
                     <BAND:3>40M <QSL_RCVD:1>Y <APP_N1MM_ID:4>1234 \
                     <COMMENT:9>from N1MM <EOR>\n";
@@ -1005,3 +1010,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "adif_log_writer/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;

@@ -603,12 +603,12 @@ struct SessionRecordOnDisk<'a> {
     waterfall_gain_db_config_at_save: Option<f32>,
 }
 
-/// Atomically write the record: create the parent directory, write a tmp
-/// sibling, rename over the target.
+/// Atomically write through a random, exclusive (`O_CREAT|O_EXCL`) 0600
+/// sibling that is fsynced and then renamed over `path`. The legacy fixed
+/// temp name (`session_state.json.tmp`) is never opened, written or
+/// followed, so a symlink planted there cannot redirect the record; the save
+/// still succeeds and the planted link is left alone (PAN-464 decision B).
 pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let on_disk = SessionRecordOnDisk {
         tx_drive_by_band: &record.tx_drive_by_band,
         tx_freq_mode: record.tx_freq_mode.map(|m| m.label()),
@@ -622,10 +622,10 @@ pub(crate) fn save(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
         waterfall_gain_db_config_at_save: record.waterfall_gain_db.map(|c| c.config_at_save),
     };
     let text = serde_json::to_string(&on_disk)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    pancetta_config::Config::write_secure_atomic(path, &text).map_err(|e| match e {
+        pancetta_config::ConfigError::Io(e) => e,
+        other => std::io::Error::other(other),
+    })
 }
 
 /// Apply one live mutation to the shared record and rewrite the file
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_a_tmp_sibling_then_renames_with_no_leftovers() {
+    fn save_replaces_the_target_atomically_with_no_temp_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".pancetta").join("session_state.json");
         save(
@@ -1321,10 +1321,8 @@ mod tests {
         // took effect (the shared record updated) and the call returned.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session_state.json");
-        // A directory AT the path: create_dir_all succeeds (parent exists),
-        // the tmp write lands at session_state.json.tmp, and the rename
-        // fails because the target is a non-empty dir — or the write itself
-        // fails; either way save errors and must be swallowed.
+        // A directory at the target makes the atomic persist fail;
+        // the persistence error must be swallowed.
         std::fs::create_dir(&path).unwrap();
         let record = shared_record(SessionRecord::default());
         persist_session_choice(
@@ -1369,3 +1367,7 @@ mod waterfall_choice_tests;
 #[cfg(test)]
 #[path = "session_state/tests/auto_drive_tests.rs"]
 mod auto_drive_tests;
+
+#[cfg(all(test, unix))]
+#[path = "session_state/tests/private_atomic_save_tests.rs"]
+mod private_atomic_save_tests;

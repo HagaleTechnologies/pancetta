@@ -74,6 +74,18 @@ pub(crate) mod perms {
         opts.open(path)
     }
 
+    /// Append to a file created owner-only on Unix.
+    pub(crate) fn open_append_private(path: &Path) -> io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+
     /// Belt-and-suspenders re-tightening of `path` to 0600 on Unix, for the
     /// re-persist (pre-existing file) case where the create-mode above is a
     /// no-op. No-op on Windows — see the module doc.
@@ -276,7 +288,7 @@ fn read_key_file(path: &Path) -> Result<[u8; 32], KeyError> {
 ///
 /// The file is **created** with mode 0600 in a single `open` (no umask-wide
 /// window between create and chmod). A pre-existing file is truncated and its
-/// perms are re-tightened to 0600 afterward (the create-mode only applies on
+/// perms are re-tightened to 0600 before writing (the create-mode only applies on
 /// creation), so re-persisting an identity can never leave secret bytes under
 /// looser perms.
 fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), KeyError> {
@@ -285,10 +297,13 @@ fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), KeyError> {
         source: e,
     };
     let mut f = perms::create_key_file(path).map_err(io_err)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io_err)?;
+    }
     f.write_all(bytes).map_err(io_err)?;
-    // Belt-and-suspenders for the re-persist (pre-existing file) case, where the
-    // create-mode above is a no-op.
-    perms::tighten_file(path).map_err(io_err)?;
     Ok(())
 }
 
@@ -299,7 +314,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    pub(super) fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
             "pancetta-agent-keys-test-{}-{}-{}",
@@ -489,3 +504,7 @@ mod tests {
         assert!(!dbg.contains("agreement: SigningKey"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "keys/tests/private_file_mode_tests.rs"]
+mod private_file_mode_tests;
