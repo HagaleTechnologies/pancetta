@@ -48,6 +48,14 @@ const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 /// Most bytes of a 2xx `log_qso` body read to look for a duplicate marker.
 const MAX_LOG_QSO_BODY_BYTES: usize = 64 * 1024;
 
+fn qso_remote_id(resp: &reqwest::Response) -> Option<String> {
+    let value = resp.headers().get("X-QSO-Id")?.to_str().ok()?.trim();
+    (value.len() <= 128
+        && !value.is_empty()
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)))
+    .then(|| value.to_owned())
+}
+
 /// A response body read up to a byte budget by [`read_body_capped`].
 struct CappedBody {
     /// The body, or its first `limit` bytes when `truncated`.
@@ -329,6 +337,7 @@ impl CqdxClient {
             .await?;
 
         let status = resp.status();
+        let remote_id = qso_remote_id(&resp);
 
         // 401 is always an auth failure regardless of body.
         if status.as_u16() == 401 {
@@ -337,7 +346,7 @@ impl CqdxClient {
         // 409 Conflict is the conventional "already logged" signal — treat as
         // a non-fatal duplicate.
         if status.as_u16() == 409 {
-            return Ok(QsoUploadOutcome::Duplicate);
+            return Ok(QsoUploadOutcome::Duplicate { remote_id });
         }
         if !status.is_success() {
             let body = error_body_text(resp).await;
@@ -361,12 +370,12 @@ impl CqdxClient {
             if !bytes.is_empty() {
                 if let Ok(parsed) = serde_json::from_slice::<QsoUploadBody>(&bytes) {
                     if parsed.is_duplicate() {
-                        return Ok(QsoUploadOutcome::Duplicate);
+                        return Ok(QsoUploadOutcome::Duplicate { remote_id });
                     }
                 }
             }
         }
-        Ok(QsoUploadOutcome::Logged)
+        Ok(QsoUploadOutcome::Logged { remote_id })
     }
 
     async fn check_status(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
@@ -474,7 +483,7 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_client(base_url: &str) -> CqdxClient {
+    pub(super) fn test_client(base_url: &str) -> CqdxClient {
         CqdxClient::new(base_url.to_string(), "pat_test_token".to_string()).unwrap()
     }
 
@@ -938,7 +947,7 @@ mod tests {
     }
 
     /// Build a representative completed-QSO record for the logbook tests.
-    fn sample_qso() -> QsoRecord {
+    pub(super) fn sample_qso() -> QsoRecord {
         QsoRecord {
             callsign: "JA1ABC".to_string(),
             remote_grid: Some("PM95".to_string()),
@@ -984,7 +993,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Logged);
+        assert_eq!(outcome, QsoUploadOutcome::Logged { remote_id: None });
     }
 
     /// A 409 Conflict is a non-fatal duplicate, not an error.
@@ -999,7 +1008,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// A 200 whose body marks the record as a duplicate is also non-fatal.
@@ -1017,7 +1026,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// cqdx-api.v1 (cqdx PR #126, Q-0007): the upload always returns HTTP 201
@@ -1040,7 +1049,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate { remote_id: None });
     }
 
     /// cqdx-api.v1: a 201 with `duplicate: false` (a freshly-inserted contact)
@@ -1061,7 +1070,7 @@ mod tests {
 
         let client = test_client(&server.uri());
         let outcome = client.log_qso(sample_qso()).await.unwrap();
-        assert_eq!(outcome, QsoUploadOutcome::Logged);
+        assert_eq!(outcome, QsoUploadOutcome::Logged { remote_id: None });
     }
 
     /// A 401 is surfaced as `Unauthorized` so the caller can stop retrying.
@@ -1424,7 +1433,10 @@ mod tests {
         let (url, h) = serve_body("201 Created", Framing::Chunked, br#"{"ok":true}"#, 64 * MIB);
         let result = test_client(&url).log_qso(sample_qso()).await;
         let s = served(h).await;
-        assert_eq!(result.unwrap(), QsoUploadOutcome::Logged);
+        assert_eq!(
+            result.unwrap(),
+            QsoUploadOutcome::Logged { remote_id: None }
+        );
         assert!(
             !s.completed && s.written < 32 * MIB,
             "client kept reading: {} bytes written, completed={}",
@@ -1438,7 +1450,10 @@ mod tests {
         let (url, h) = serve_body("200 OK", Framing::Chunked, br#"{"status":"duplicate"}"#, 0);
         let result = test_client(&url).log_qso(sample_qso()).await;
         let s = served(h).await;
-        assert_eq!(result.unwrap(), QsoUploadOutcome::Duplicate);
+        assert_eq!(
+            result.unwrap(),
+            QsoUploadOutcome::Duplicate { remote_id: None }
+        );
         assert!(s.completed);
     }
 
@@ -1470,3 +1485,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client/tests/tls_security_tests.rs"]
 mod tls_security_tests;
+
+#[cfg(test)]
+#[path = "client/tests/remote_id_tests.rs"]
+mod remote_id_tests;

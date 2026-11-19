@@ -172,6 +172,7 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 | `tx_meter/` | TX power and ALC readback while keyed, and the ALC overdrive warning (PAN-291). |
 | `tx_outcome.rs` | Single reporting point for TX frame outcomes (PAN-279). |
 | `upload_outbox.rs` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
+| `upload_outbox/` | Persistent pending-upload worker with per-destination retry lanes (PAN-57). |
 | `util.rs` | Linear resampling for WAV playback. |
 | `wav_playback.rs` | WAV file playback for offline testing. |
 | `wsjtx_udp/` | WSJT-X-compatible UDP interop component. |

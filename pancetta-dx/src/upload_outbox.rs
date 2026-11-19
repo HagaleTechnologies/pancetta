@@ -25,6 +25,8 @@ pub const OUTBOX_FILE_NAME: &str = "upload_outbox.json";
 pub const OUTBOX_SCHEMA_VERSION: u32 = 1;
 /// Most entries the queue holds; new uploads are refused past this.
 pub const OUTBOX_MAX_ENTRIES: usize = 5_000;
+/// Most accepted upload IDs retained independently of pending queue capacity.
+pub const ACCEPTED_RECEIPT_LIMIT: usize = 100;
 /// Longest `last_error` kept in the file, in characters.
 pub const LAST_ERROR_MAX_CHARS: usize = 300;
 
@@ -114,6 +116,15 @@ pub struct OutboxEntry {
     pub state: EntryState,
 }
 
+/// ID returned for an accepted upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedReceipt {
+    pub qso_id: Uuid,
+    pub destination: UploadDestination,
+    pub remote_id: String,
+    pub accepted_at: DateTime<Utc>,
+}
+
 /// An upload to add to the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewUpload {
@@ -170,12 +181,16 @@ pub struct DestinationCounts {
 struct FileRef<'a> {
     schema_version: u32,
     entries: &'a [OutboxEntry],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    accepted: &'a [AcceptedReceipt],
 }
 
 #[derive(Deserialize)]
 struct FileOwned {
     schema_version: u32,
     entries: Vec<OutboxEntry>,
+    #[serde(default)]
+    accepted: Vec<AcceptedReceipt>,
 }
 
 /// The queue file and its entries. One owner per process writes it.
@@ -184,6 +199,7 @@ pub struct OutboxStore {
     path: PathBuf,
     capacity: usize,
     entries: Vec<OutboxEntry>,
+    accepted: Vec<AcceptedReceipt>,
 }
 
 impl OutboxStore {
@@ -199,6 +215,7 @@ impl OutboxStore {
             path,
             capacity,
             entries: Vec::new(),
+            accepted: Vec::new(),
         };
         let bytes = match std::fs::read(&store.path) {
             Ok(b) => b,
@@ -211,6 +228,15 @@ impl OutboxStore {
         let reason = match serde_json::from_slice::<FileOwned>(&bytes) {
             Ok(f) if f.schema_version == OUTBOX_SCHEMA_VERSION => {
                 store.entries = f.entries;
+                for receipt in f.accepted {
+                    store.accepted.retain(|old| {
+                        old.qso_id != receipt.qso_id || old.destination != receipt.destination
+                    });
+                    store.accepted.push(receipt);
+                    if store.accepted.len() > ACCEPTED_RECEIPT_LIMIT {
+                        store.accepted.remove(0);
+                    }
+                }
                 return (store, None);
             }
             Ok(f) => format!("unknown schema_version {}", f.schema_version),
@@ -254,6 +280,7 @@ impl OutboxStore {
         serde_json::to_vec_pretty(&FileRef {
             schema_version: OUTBOX_SCHEMA_VERSION,
             entries: &self.entries,
+            accepted: &self.accepted,
         })
     }
 
@@ -413,6 +440,48 @@ impl OutboxStore {
     pub fn delivered(&mut self, id: Uuid) -> Option<OutboxEntry> {
         let pos = self.entries.iter().position(|e| e.id == id)?;
         Some(self.entries.remove(pos))
+    }
+
+    /// Remove an accepted entry and retain its service ID in the same save.
+    pub fn accept(
+        &mut self,
+        id: Uuid,
+        remote_id: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Option<OutboxEntry> {
+        let entry = self.delivered(id)?;
+        if let Some(remote_id) = remote_id.filter(|id| !id.is_empty()) {
+            if self
+                .accepted_receipt(entry.qso_id, entry.destination)
+                .is_some()
+            {
+                self.accepted.retain(|receipt| {
+                    receipt.qso_id != entry.qso_id || receipt.destination != entry.destination
+                });
+            }
+            self.accepted.push(AcceptedReceipt {
+                qso_id: entry.qso_id,
+                destination: entry.destination,
+                remote_id,
+                accepted_at: now,
+            });
+            if self.accepted.len() > ACCEPTED_RECEIPT_LIMIT {
+                self.accepted.remove(0);
+            }
+        }
+        Some(entry)
+    }
+
+    /// Look up the most recent service ID for one QSO and destination.
+    pub fn accepted_receipt(
+        &self,
+        qso_id: Uuid,
+        destination: UploadDestination,
+    ) -> Option<&AcceptedReceipt> {
+        self.accepted
+            .iter()
+            .rev()
+            .find(|receipt| receipt.qso_id == qso_id && receipt.destination == destination)
     }
 
     /// Record a failed attempt; the entry stays pending.
@@ -1221,3 +1290,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "upload_outbox/tests/accepted_receipt_tests.rs"]
+mod accepted_receipt_tests;
