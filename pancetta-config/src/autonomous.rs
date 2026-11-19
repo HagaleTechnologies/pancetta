@@ -463,26 +463,7 @@ impl ConfigSection for AutonomousConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        self.enabled = other.enabled;
-        self.recent_failure_window_secs = other.recent_failure_window_secs;
-        self.needed_means = other.needed_means;
-        self.unattended_policy = other.unattended_policy;
-        self.slot_parity = other.slot_parity;
-        self.cq_after_idle_cycles = other.cq_after_idle_cycles;
-        self.cq_no_response_switch_after = other.cq_no_response_switch_after;
-        self.qso_stall_switch_after = other.qso_stall_switch_after;
-        self.max_concurrent_qsos = other.max_concurrent_qsos;
-        self.tx_offset_hz = other.tx_offset_hz;
-        self.min_dx_score = other.min_dx_score;
-        self.pounce_min_tier = other.pounce_min_tier;
-        self.min_multi_slot_score = other.min_multi_slot_score;
-        self.frequency = other.frequency;
-        self.cq_direction = other.cq_direction;
-        self.listen_cycle = other.listen_cycle;
-        self.band_hopping = other.band_hopping;
-        self.band_plan = other.band_plan;
-        self.priorities = other.priorities;
-        self.dry_run = other.dry_run;
+        *self = other;
     }
 }
 
