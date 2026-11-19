@@ -61,7 +61,7 @@ mod tx;
 mod tx_drive;
 mod tx_halt;
 mod tx_log;
-mod tx_meter;
+pub(crate) mod tx_meter;
 mod tx_outcome;
 pub(crate) mod upload_outbox;
 mod util;
@@ -2334,6 +2334,7 @@ impl ApplicationCoordinator {
                 None => session_state::SessionLoad::Missing,
             },
         );
+        tx_drive.restore_map(&session_startup.record.tx_drive_by_band);
         let session_report = session_state::startup_report(&session_startup);
         if let Some(reason) = &session_startup.ignored_reason {
             warn!("Session: saved choices ignored ({reason}); using defaults");

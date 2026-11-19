@@ -33,12 +33,20 @@ output_channels = 2
 output_device = "default"
 sample_rate = 48000
 
+[audio.auto_drive]
+alc_onset = 0.10000000149011612
+enabled = true
+start_db = -6.0
+step_down_db = 2.0
+step_up_db = 0.5
+
 [audio.device_parameters]
 
 [audio.levels]
 input_gain_db = 0.0
 output_gain_ceiling_db = 0.0
 output_gain_db = 0.0
+output_gain_floor_db = -20.0
 peak_clip_db = -1.0
 peak_warning_db = -6.0
 rms_target_db = -20.0

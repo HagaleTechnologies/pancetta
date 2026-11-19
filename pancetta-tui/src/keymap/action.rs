@@ -291,11 +291,13 @@ pub enum Action {
     TxDriveDown,
     /// F8: raise TX audio drive by 1 dB.
     TxDriveUp,
+    /// F9: toggle the selected band between automatic and manual TX drive.
+    ToggleTxDriveMode,
 }
 
 impl Action {
     /// Every variant once, in declaration order (`ALL[i].ordinal() == i`).
-    pub const ALL: [Action; 141] = [
+    pub const ALL: [Action; 142] = [
         Action::EmergencyStop,
         Action::OpenQuitConfirm,
         Action::ToggleHelp,
@@ -437,6 +439,7 @@ impl Action {
         Action::WaterfallFocusHint,
         Action::TxDriveDown,
         Action::TxDriveUp,
+        Action::ToggleTxDriveMode,
     ];
 
     /// Position in [`Action::ALL`]. Exhaustive with no `_` arm, so a new
@@ -585,6 +588,7 @@ impl Action {
             Action::WaterfallFocusHint => 138,
             Action::TxDriveDown => 139,
             Action::TxDriveUp => 140,
+            Action::ToggleTxDriveMode => 141,
         }
     }
 
@@ -734,7 +738,8 @@ impl Action {
             | Action::CycleWaterfallPaletteBack
             | Action::WaterfallFocusHint
             | Action::TxDriveDown
-            | Action::TxDriveUp => false,
+            | Action::TxDriveUp
+            | Action::ToggleTxDriveMode => false,
         }
     }
 }

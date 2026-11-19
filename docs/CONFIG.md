@@ -147,9 +147,12 @@ input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
 `[audio.levels].output_gain_db` controls transmitted audio drive relative to
-the former fixed level of 0.5 full scale. It defaults to 0 dB, changes in
-1 dB steps with F7/F8 in the station TUI, and is saved after each change.
-The floor is -20 dB. `output_gain_ceiling_db` defaults to 0 dB and may be
+the former fixed level of 0.5 full scale. It defaults to 0 dB and remains the
+station-wide value when automatic drive is disabled. F7/F8 change drive in
+1 dB steps and select Manual for the current band when automatic drive is on.
+F9 toggles Auto and Manual for that band. `output_gain_floor_db` defaults to
+-20 dB and may be set between -20 dB and the ceiling.
+`output_gain_ceiling_db` defaults to 0 dB and may be
 set from -20 to +5 dB. A positive ceiling reserves headroom for FT audio
 (single frames and bundles, both normalized to a 0.95 peak) before the
 selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
@@ -157,6 +160,16 @@ selected multiplier, so the ceiling peaks at -1 dBFS and FT transmissions at
 reserved. A finite legacy gain outside the selectable
 range starts at the nearest bound with a warning. Invalid or non-finite
 ceilings and non-finite gain values fail config validation.
+
+`[audio.auto_drive]` enables per-band automatic drive by default. Its defaults
+are `enabled = true`, `alc_onset = 0.10`, `step_up_db = 0.5`,
+`step_down_db = 2.0`, and `start_db = -6.0`. A band without learned drive
+starts at the bounded `start_db`. Valid ALC below the onset permits a slow
+increase; confirmed ALC above `[rig.power_control.protection].max_alc` backs
+drive off. Values between onset and limit hold drive. `alc_onset` must be below
+the effective ALC limit while automatic drive is enabled. All numeric settings
+must be finite, and step magnitudes must be positive. Config edits apply at
+restart. A rig without ALC readback cannot train automatic drive.
 
 ### `[audio.recording]` — save decode windows as WAV (off by default)
 

@@ -1180,7 +1180,7 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
     ),
     kb(
         "F7 / F8",
-        "TX audio drive down / up by 1 dB",
+        "TX audio drive down / up by 1 dB (Manual)",
         Category::TxControl,
         false,
         &[
@@ -1190,6 +1190,17 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
             ch(Scope::Health, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
             ch(Scope::Diagnostics, KeyCode::F(7), Mods::Bare, When::Always, Action::TxDriveDown),
             ch(Scope::Diagnostics, KeyCode::F(8), Mods::Bare, When::Always, Action::TxDriveUp),
+        ],
+    ),
+    kb(
+        "F9",
+        "Toggle Auto / Manual TX drive for this band",
+        Category::TxControl,
+        false,
+        &[
+            ch(Scope::Main, KeyCode::F(9), Mods::Bare, When::Always, Action::ToggleTxDriveMode),
+            ch(Scope::Health, KeyCode::F(9), Mods::Bare, When::Always, Action::ToggleTxDriveMode),
+            ch(Scope::Diagnostics, KeyCode::F(9), Mods::Bare, When::Always, Action::ToggleTxDriveMode),
         ],
     ),
     kb(
@@ -1959,7 +1970,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 50);
+        assert_eq!(KEYBINDINGS.len(), 51);
     }
 
     #[test]

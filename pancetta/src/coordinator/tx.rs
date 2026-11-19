@@ -7359,11 +7359,40 @@ pub(super) mod pan115_worker_gate_tests {
     }
 
     pub(super) async fn build_worker_harness(
+        cfg: Config,
+        prepare: impl FnOnce(&mut ApplicationCoordinator),
+        arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
+        utc_clock: pancetta_core::time::UtcClock,
+        register_rig: bool,
+    ) -> Harness {
+        build_worker_harness_in_home(cfg, prepare, arm_clock, utc_clock, register_rig, None).await
+    }
+
+    /// PAN-439: [`worker_harness_with`] whose coordinator starts from the
+    /// session home `home`, so a restart reads that home's saved session.
+    pub(crate) async fn worker_harness_in_home(
+        cfg: Config,
+        home: std::path::PathBuf,
+        prepare: impl FnOnce(&mut ApplicationCoordinator),
+    ) -> Harness {
+        build_worker_harness_in_home(
+            cfg,
+            prepare,
+            Arc::new(pancetta_agent::arm::ArmTime::now),
+            pancetta_core::time::system_utc_clock(),
+            true,
+            Some(home),
+        )
+        .await
+    }
+
+    async fn build_worker_harness_in_home(
         mut cfg: Config,
         prepare: impl FnOnce(&mut ApplicationCoordinator),
         arm_clock: Arc<dyn Fn() -> pancetta_agent::arm::ArmTime + Send + Sync>,
         utc_clock: pancetta_core::time::UtcClock,
         register_rig: bool,
+        home: Option<std::path::PathBuf>,
     ) -> Harness {
         // This TX-only fixture historically sends CQ requests as Autonomous.
         // Grant their config permission so each test reaches the gate it targets;
@@ -7386,15 +7415,17 @@ pub(super) mod pan115_worker_gate_tests {
                 uuid::Uuid::new_v4()
             )),
             true,
-            None, // PAN-270: no session-home override
+            home.clone(), // PAN-270: session home (None: no override)
         )
         .await
         .expect("coordinator creation should succeed");
-        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
-            "pancetta-pan115-home-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        )));
+        coordinator.pancetta_home_override = Some(home.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "pancetta-pan115-home-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+        }));
         prepare(&mut coordinator);
         // As in a live session once the Hamlib message loop is consuming.
         coordinator

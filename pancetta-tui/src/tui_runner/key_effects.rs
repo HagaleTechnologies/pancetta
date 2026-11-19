@@ -319,6 +319,7 @@ pub(super) fn key_universe() -> Vec<KeyCode> {
         KeyCode::F(5),
         KeyCode::F(7),
         KeyCode::F(8),
+        KeyCode::F(9),
     ]);
     codes
 }

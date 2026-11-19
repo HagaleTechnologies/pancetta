@@ -821,6 +821,9 @@ struct TuiRelayLoop {
     gain_mutation_tx:
         tokio::sync::mpsc::UnboundedSender<(String, pancetta_config::rig::ReceiveGainPreset)>,
     gain_frequency: Arc<std::sync::atomic::AtomicU64>,
+    /// PAN-439: live drive state and split TX dial for worker drive reports.
+    tx_drive: Arc<super::tx_drive::TxDrive>,
+    drive_split_tx_hz: Arc<std::sync::atomic::AtomicU64>,
     station_lookup: Arc<crate::priority_evaluator::CachedStationLookup>,
     station_coords: Option<(f64, f64)>,
     our_callsign: String,
@@ -1200,6 +1203,22 @@ impl RelayDriverHost for TuiRelayLoop {
                 // forward verbatim; the TUI shows it only during TX.
                 let _ =
                     tui_msg_tx_relay.send(pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr });
+            }
+            MessageType::RigControl(crate::message_bus::RigControlMessage::TxDriveState {
+                band,
+                ..
+            }) => {
+                // PAN-439: a worker report is asynchronous and can trail a
+                // direct band-change, F7/F8 or F9 echo. Forward the live state
+                // of the current TX band, never the report's own payload.
+                if let Some(tui_msg) = live_tx_drive_message(
+                    band,
+                    &self.tx_drive,
+                    &self.gain_frequency,
+                    &self.drive_split_tx_hz,
+                ) {
+                    let _ = tui_msg_tx_relay.send(tui_msg);
+                }
             }
             MessageType::RigControl(
                 msg @ (crate::message_bus::RigControlMessage::TxMeterResponse(_)
@@ -1695,9 +1714,17 @@ impl super::ApplicationCoordinator {
             crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
+        let initial_band =
+            pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                self.operating_frequency_hz.load(Ordering::Relaxed),
+                self.split_tx_frequency_hz().load(Ordering::Relaxed),
+            ));
+        let initial_drive = self.tx_drive.snapshot_for_band(initial_band);
         let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
-            db: self.tx_drive.get(),
+            db: initial_drive.db,
             ceiling_db: self.tx_drive.ceiling_db(),
+            mode: initial_drive.mode,
+            available: initial_drive.available,
         });
 
         // Set up station coordinates for distance/bearing calculation
@@ -1801,6 +1828,8 @@ impl super::ApplicationCoordinator {
         let relay_pending_gain_save = pending_gain_save.clone();
         let relay_gain_mutation_tx = gain_mutation_tx.clone();
         let relay_gain_frequency = self.operating_frequency_hz.clone();
+        let relay_tx_drive = self.tx_drive.clone();
+        let relay_drive_split_tx_hz = self.split_tx_frequency_hz();
         let watchlist_pins = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let relay_watchlist_pins = watchlist_pins.clone();
         let watchlist_write_tx = cmd_config_write_tx.clone();
@@ -1834,6 +1863,8 @@ impl super::ApplicationCoordinator {
                     pending_gain_save: relay_pending_gain_save,
                     gain_mutation_tx: relay_gain_mutation_tx,
                     gain_frequency: relay_gain_frequency,
+                    tx_drive: relay_tx_drive,
+                    drive_split_tx_hz: relay_drive_split_tx_hz,
                     station_lookup: relay_station_lookup,
                     station_coords,
                     our_callsign: our_callsign_for_relay,
@@ -2273,7 +2304,29 @@ impl super::ApplicationCoordinator {
                 });
             }
 
+            let mut last_drive_band =
+                pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+                    cmd_operating_freq_hz.load(Ordering::Acquire),
+                    cmd_split_tx_hz.load(Ordering::Acquire),
+                ));
             while !cmd_shutdown.load(Ordering::Acquire) {
+                let current_drive_band = pancetta_core::Band::from_frequency(
+                    pancetta_qso::qso_manager::effective_tx_dial(
+                        cmd_operating_freq_hz.load(Ordering::Acquire),
+                        cmd_split_tx_hz.load(Ordering::Acquire),
+                    ),
+                );
+                if current_drive_band != last_drive_band {
+                    last_drive_band = current_drive_band;
+                    let selected = cmd_tx_drive.snapshot_for_band(current_drive_band);
+                    let _ =
+                        cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                            db: selected.db,
+                            ceiling_db: cmd_tx_drive.ceiling_db(),
+                            mode: selected.mode,
+                            available: selected.available,
+                        });
+                }
                 // CQ is now TRANSMITTED by a real CallingCq QSO owned by the
                 // QSO component (StartCq → QsoManager::start_cq_manual, which
                 // keep-calls every slot and auto-sequences the exchange to
@@ -2313,12 +2366,48 @@ impl super::ApplicationCoordinator {
                 match tui_cmd_rx.try_recv() {
                     Ok(cmd) => match cmd {
                         pancetta_tui::tui_runner::TuiCommand::AdjustTxDrive { delta_db } => {
+                            if cmd_tx_drive.auto_enabled() {
+                                let band = pancetta_core::Band::from_frequency(
+                                    pancetta_qso::qso_manager::effective_tx_dial(
+                                        cmd_operating_freq_hz.load(Ordering::Relaxed),
+                                        cmd_split_tx_hz.load(Ordering::Relaxed),
+                                    ),
+                                );
+                                if band.is_none() {
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX drive".into(),
+                                            status: "TX drive needs a known TX band".into(),
+                                            level: pancetta_core::DiagnosticLevel::Warn,
+                                        },
+                                    );
+                                    continue;
+                                }
+                                let snapshot = cmd_tx_drive.adjust_band(band, delta_db);
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                        db: snapshot.db,
+                                        ceiling_db: cmd_tx_drive.ceiling_db(),
+                                        mode: snapshot.mode,
+                                        available: snapshot.available,
+                                    },
+                                );
+                                queue_tx_drive_save(
+                                    cmd_session_record.clone(),
+                                    cmd_session_state_path.clone(),
+                                    cmd_tx_drive.clone(),
+                                    cmd_tui_msg_tx.clone(),
+                                );
+                                continue;
+                            }
                             let old = cmd_tx_drive.get();
                             let db = cmd_tx_drive.adjust(delta_db);
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::TxDriveState {
                                     db,
                                     ceiling_db: cmd_tx_drive.ceiling_db(),
+                                    mode: pancetta_core::tx_drive_mode::TxDriveMode::Manual,
+                                    available: false,
                                 },
                             );
                             if db != old {
@@ -2380,6 +2469,49 @@ impl super::ApplicationCoordinator {
                                     }
                                 });
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleTxDriveMode => {
+                            if !cmd_tx_drive.auto_enabled() {
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX drive".into(),
+                                        status: "Auto drive is disabled in config".into(),
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                    },
+                                );
+                                continue;
+                            }
+                            let band = pancetta_core::Band::from_frequency(
+                                pancetta_qso::qso_manager::effective_tx_dial(
+                                    cmd_operating_freq_hz.load(Ordering::Relaxed),
+                                    cmd_split_tx_hz.load(Ordering::Relaxed),
+                                ),
+                            );
+                            if band.is_none() {
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX drive".into(),
+                                        status: "TX drive needs a known TX band".into(),
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                    },
+                                );
+                                continue;
+                            }
+                            let snapshot = cmd_tx_drive.toggle_band(band);
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+                                    db: snapshot.db,
+                                    ceiling_db: cmd_tx_drive.ceiling_db(),
+                                    mode: snapshot.mode,
+                                    available: snapshot.available,
+                                },
+                            );
+                            queue_tx_drive_save(
+                                cmd_session_record.clone(),
+                                cmd_session_state_path.clone(),
+                                cmd_tx_drive.clone(),
+                                cmd_tui_msg_tx.clone(),
+                            );
                         }
                         pancetta_tui::tui_runner::TuiCommand::SendMessage {
                             text,
@@ -4744,6 +4876,37 @@ struct ClusterSpotRelay {
 
 /// PAN-291: the TUI message for a TX meter bus message, or `None` for any
 /// other rig-control message. Readings pass through unchanged.
+fn queue_tx_drive_save(
+    record: Arc<std::sync::Mutex<super::session_state::SessionRecord>>,
+    path: Option<std::path::PathBuf>,
+    drive: Arc<super::tx_drive::TxDrive>,
+    echo: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            super::session_state::persist_tx_drive_current(&record, &path, &drive)
+        })
+        .await;
+        if let Ok(Err(error)) = result {
+            tracing::warn!("Could not save TX drive: {error}");
+            let notice = "TX drive changed for this session only. Could not save TX drive.";
+            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "TX drive".into(),
+                status: notice.into(),
+                level: pancetta_core::DiagnosticLevel::Warn,
+            });
+            let _ = echo.send(pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                ts: chrono::Utc::now(),
+                target: "tx.drive",
+                level: pancetta_core::DiagnosticLevel::Warn,
+                text: format!("{notice} {error}"),
+                qso_id: None,
+                callsign: None,
+            });
+        }
+    });
+}
+
 fn tx_meter_tui_message(
     msg: &crate::message_bus::RigControlMessage,
 ) -> Option<pancetta_tui::tui_runner::TuiMessage> {
@@ -4756,6 +4919,34 @@ fn tx_meter_tui_message(
         ),
         _ => None,
     }
+}
+
+/// PAN-439: the TUI drive readout for a worker's `TxDriveState` report. A
+/// report whose band differs from the current split-aware TX band is dropped
+/// (`None`, an unknown dial's station-wide fallback, matches only `None`);
+/// otherwise the live selection is sent, so a late report cannot replace a
+/// newer band-change, F7/F8 or F9 echo.
+fn live_tx_drive_message(
+    report_band: Option<pancetta_core::Band>,
+    drive: &super::tx_drive::TxDrive,
+    operating_hz: &std::sync::atomic::AtomicU64,
+    split_tx_hz: &std::sync::atomic::AtomicU64,
+) -> Option<pancetta_tui::tui_runner::TuiMessage> {
+    let live_band =
+        pancetta_core::Band::from_frequency(pancetta_qso::qso_manager::effective_tx_dial(
+            operating_hz.load(Ordering::Acquire),
+            split_tx_hz.load(Ordering::Acquire),
+        ));
+    if report_band != live_band {
+        return None;
+    }
+    let selected = drive.snapshot_for_band(live_band);
+    Some(pancetta_tui::tui_runner::TuiMessage::TxDriveState {
+        db: selected.db,
+        ceiling_db: drive.ceiling_db(),
+        mode: selected.mode,
+        available: selected.available,
+    })
 }
 
 /// The TUI message for a relayed cluster spot. Frequency (Hz), mode and band
@@ -9674,3 +9865,7 @@ mod waterfall_session_tests;
 #[cfg(test)]
 #[path = "tui_relay/tests/external_decode_tests.rs"]
 mod external_decode_tests;
+
+#[cfg(test)]
+#[path = "tui_relay/tests/auto_drive_tests.rs"]
+mod auto_drive_tests;
