@@ -1179,6 +1179,13 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         &[main_no_ctrl_alt(c('T'), Action::ToggleTune)],
     ),
     kb(
+        "Shift+C",
+        "Calibrate TX audio drive for this band (steps until ALC onset)",
+        Category::TxControl,
+        false,
+        &[main_no_ctrl_alt(c('C'), Action::CalibrateTxDrive)],
+    ),
+    kb(
         "F7 / F8",
         "TX audio drive down / up by 1 dB (Manual)",
         Category::TxControl,
@@ -1970,7 +1977,7 @@ mod tests {
     fn keybinding_display_fields_are_unchanged() {
         // The drift test above guards the rendered text; this guards the
         // row count the help overlay and README essentials depend on.
-        assert_eq!(KEYBINDINGS.len(), 51);
+        assert_eq!(KEYBINDINGS.len(), 52);
     }
 
     #[test]

@@ -4688,6 +4688,7 @@ async fn tx_policy_changes_reach_status_peer_within_one_second() {
         },
         cq_active: Arc::new(AtomicBool::new(false)),
         tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+        calibration_until: Arc::new(tokio::sync::RwLock::new(None)),
         tui_msg_tx: crossbeam_channel::bounded(1000).0,
     };
     let swr_halt = super::super::tx_halt::TxHaltHandles {
@@ -4858,6 +4859,7 @@ async fn tx_policy_respects_peer_authority() {
             },
             cq_active: Arc::new(AtomicBool::new(false)),
             tune_until: Arc::new(tokio::sync::RwLock::new(None)),
+            calibration_until: Arc::new(tokio::sync::RwLock::new(None)),
             tui_msg_tx: crossbeam_channel::bounded(1000).0,
         };
 

@@ -300,6 +300,27 @@ impl TxDrive {
         state.snapshot(Some(band))
     }
 
+    /// Replace a band's learned drive after a Tune calibration. This invalidates
+    /// every burst that captured an earlier generation.
+    pub(crate) fn calibrate_band(&self, band: Band, db: f32) -> DriveSnapshot {
+        let mut bands = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+        let state = bands
+            .entry(band)
+            .or_insert_with(|| BandDrive::new(self.start_db, TxDriveMode::Auto));
+        state.db = db.clamp(self.floor_db, self.ceiling_db);
+        state.mode = TxDriveMode::Auto;
+        state.available = true;
+        state.established = true;
+        state.generation = state.generation.wrapping_add(1);
+        state.clear_power();
+        self.persistence_generation.fetch_add(1, Ordering::AcqRel);
+        state.snapshot(Some(band))
+    }
+
+    pub(crate) fn calibration_limits(&self) -> (f32, f32, f32) {
+        (self.floor_db, self.ceiling_db, self.onset)
+    }
+
     pub(crate) fn toggle_band(&self, band: Option<Band>) -> DriveSnapshot {
         if !self.auto_enabled || band.is_none() {
             return self.snapshot_for_band(None);

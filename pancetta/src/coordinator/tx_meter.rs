@@ -17,6 +17,12 @@ use tracing::{debug, warn};
 use super::swr_guard::to_tui;
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
+/// Keyed CAT ticks for the currently active drive sweep.
+#[derive(Debug, Default)]
+pub(crate) struct DriveCalibrationReads {
+    pub(crate) ticks: std::sync::Mutex<Vec<(Instant, Option<f32>)>>,
+}
+
 /// Samples belonging to one acknowledged, played FT waveform.
 #[derive(Debug, Default)]
 pub(crate) struct TxDriveAttempt {
@@ -397,6 +403,18 @@ pub(crate) async fn tx_meter_poll_step_with_dial(
     } else {
         None
     };
+    if keyed {
+        if let Some(sink) = bus
+            .active_drive_calibration
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            if let Ok(mut ticks) = sink.ticks.lock() {
+                ticks.push((Instant::now(), alc));
+            }
+        }
+    }
     let warning = guard.observe(keyed, alc);
     if !bus
         .active_tx_drive_attempt
@@ -843,6 +861,24 @@ mod tests {
         alc: true,
         forward_power: Some(TxMeter::ForwardPowerWatts),
     };
+
+    #[tokio::test]
+    async fn keyed_poll_feeds_calibration_valid_and_missing_alc_ticks() {
+        let ib = inboxes().await;
+        let rig = MeterRig::new(Levels::Fail).await;
+        rig.script(TxMeter::Alc, vec![Ok(0.12), Err(anyhow!("no ALC"))]);
+        let sink = std::sync::Arc::new(DriveCalibrationReads::default());
+        *ib.bus.active_drive_calibration.lock().unwrap() = Some(sink.clone());
+        let mut guard = guard_with(0.5);
+        let plan = TxMeterPlan {
+            alc: true,
+            forward_power: None,
+        };
+        tx_meter_poll_step(&rig, &plan, &mut guard, true, &ib.bus).await;
+        tx_meter_poll_step(&rig, &plan, &mut guard, true, &ib.bus).await;
+        let values: Vec<_> = sink.ticks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+        assert_eq!(values, vec![Some(0.12), None]);
+    }
 
     #[tokio::test]
     async fn step_keyed_reads_each_planned_meter_once_and_sends_one_reading() {

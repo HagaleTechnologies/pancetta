@@ -2390,6 +2390,8 @@ impl super::ApplicationCoordinator {
                     // warning, on the same keyed tick as SWR.
                     let mut alc_guard = super::tx_meter::AlcGuard::new(&swr_protection);
                     let mut tx_meter_plan: Option<super::tx_meter::TxMeterPlan> = None;
+                    // A new rig session must not inherit the previous rig's ALC capability.
+                    *message_bus.tx_meter_capability.lock().unwrap() = None;
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -2612,14 +2614,14 @@ impl super::ApplicationCoordinator {
                                             rig_for_polling.as_ref(),
                                         )
                                         .await;
+                                        let capability = plan.capability(alc_guard.alc_limit());
+                                        *message_bus.tx_meter_capability.lock().unwrap() = Some(capability);
                                         let _ = message_bus
                                             .send_message(ComponentMessage::new(
                                                 ComponentId::Hamlib,
                                                 ComponentId::Tui,
                                                 MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::TxMeterCapability(
-                                                        plan.capability(alc_guard.alc_limit()),
-                                                    ),
+                                                    crate::message_bus::RigControlMessage::TxMeterCapability(capability),
                                                 ),
                                                 Instant::now(),
                                             ))
@@ -2742,6 +2744,8 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             RigPollTransition::PollingFailed => {
+                                tx_meter_plan = None;
+                                *message_bus.tx_meter_capability.lock().unwrap() = None;
                                 warn!(
                                     "Rig polling has failed {} consecutive times -- rigctld may have crashed. \
                                      Check rigctld process and restart Pancetta if needed.",
