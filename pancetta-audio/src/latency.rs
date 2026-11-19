@@ -3,8 +3,8 @@
 //! Provides tools to measure and analyze audio callback latency with nanosecond precision.
 //! Critical for proving <1ms latency requirement for the Pancetta project.
 
-use instant::Instant;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 /// High-precision latency measurement utilities
 pub struct LatencyMeasurer {
