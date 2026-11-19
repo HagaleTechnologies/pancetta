@@ -1,8 +1,8 @@
 //! Registry packaging gate (PAN-384).
 //!
 //! `pancetta-ft8` publishes to crates.io together with `pancetta-core`. These
-//! tests pin what the `.crate` ships (the ft8_lib C sources `build.rs`
-//! compiles, the license files and notices, and nothing outside the
+//! tests pin what the `.crate` ships (the ft8_lib `ft8/`, `fft/` and
+//! `common/` directories `build.rs` compiles from, the license files and notices, and nothing outside the
 //! `include` whitelist), the registry metadata, the set of publishable
 //! workspace crates, and the `build.rs` guard that refuses a packaged crate
 //! without its C sources.

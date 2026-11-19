@@ -1376,7 +1376,7 @@ draft. macOS signing and notarization remain PAN-265.
   alone.
 - **Vendored ft8_lib through an `include` whitelist, no `build.rs` fetch.**
   The C that `build.rs` compiles is about 0.2 MB, and the package is about
-  780 KB. A fetch would add a network dependency and a checksum to maintain,
+  790 KB. A fetch would add a network dependency and a checksum to maintain,
   and docs.rs builds have no network. The whitelist fails closed: a new
   large file in the submodule cannot slip in, and the unlicensed WSJT-X
   files under `vendor/ft8_lib/ft4_ft8_public/` stay out of an
@@ -1415,9 +1415,10 @@ draft. macOS signing and notarization remain PAN-265.
 - **The `cty.dat` gate.** `pancetta-core`'s DXCC tables are generated from
   the AD1C BigCTY `cty.dat`, whose terms the repository records only as
   "free for amateur use". A person must confirm the redistribution terms
-  before the publish (follow-up ticket). If the terms forbid it, the
+  before the publish (PAN-425, an open owner decision). If the terms forbid it, the
   fallback is to move the DXCC modules out of `pancetta-core` into a crate
   that stays unpublished; `pancetta-ft8` does not use them.
+
 ## Separate data directories and the instance lock (PAN-376, 2026-11-18)
 
 A global `--data-dir <DIR>` flag moves all station state out of

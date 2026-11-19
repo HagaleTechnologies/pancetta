@@ -179,12 +179,12 @@ Nothing is published yet. These steps publish `pancetta-core` and
 so run the dry-run first and stop at any surprise.
 
 1. Preconditions: E9 and G4 have landed (ticket PAN-384). The AD1C `cty.dat`
-   redistribution terms for `pancetta-core`'s DXCC tables are confirmed (the
-   follow-up ticket). `cargo login` is done with the publisher's token.
+   redistribution terms for `pancetta-core`'s DXCC tables are confirmed (PAN-425,
+   an open owner decision that blocks the `pancetta-core` publish). `cargo login` is done with the publisher's token.
 2. On the commit to publish (a `main` merge commit), run
    `git submodule update --init` and confirm `git status` is clean.
 3. Run `cargo publish --dry-run -p pancetta-core -p pancetta-ft8`. Expect
-   "Packaged 33 files" for `pancetta-core`, "Packaged 72 files" for
+   "Packaged 39 files" for `pancetta-core`, "Packaged 74 files" for
    `pancetta-ft8`, two "aborting upload due to dry run" lines and one
    `warning: ignoring ...` line for each test, bench and example target the
    `include` whitelists leave out of the packages. Each of those warnings ends
