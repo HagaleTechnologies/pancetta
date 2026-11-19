@@ -1854,6 +1854,9 @@ pub struct ApplicationCoordinator {
     /// rebuilds its decoder when a `DecoderRebuildKey` field changes.
     pub(crate) decode_window: Arc<RwLock<DecodeWindowConfig>>,
 
+    /// Budget override resolved with the restored effort at construction.
+    startup_decode_budget_override: Option<u64>,
+
     /// Non-fatal config-load warnings (e.g. a `pancetta.toml` that existed but
     /// failed to parse and was silently reverted to defaults). Surfaced to the
     /// TUI as an error banner at startup so the operator is never left guessing
@@ -2411,11 +2414,8 @@ impl ApplicationCoordinator {
             Duration::from_secs(config.autonomous.recent_failure_window_secs);
         let config = Arc::new(RwLock::new(config));
 
-        // hb-216 S2: shared FT8 decoder config + scoped-fast-path atomic.
-        // `tier::initialize` seeds the atomic from env, reads the on-disk
-        // cache if present, and spawns a background probe on cache miss.
-        // The FT8 hot loop reads both fields without blocking on probe
-        // completion.
+        // hb-216 S2: shared FT8 decoder config. Station startup in `run`
+        // applies the tier before the FT8 hot loop starts.
         // Seed the shared decoder config with the active protocol from
         // [rig].mode so the FT8 hot loop actually demodulates FT4 (4-GFSK / FT4
         // Costas) in FT4 mode, not just retunes the slot grid. Without this the
@@ -2459,15 +2459,6 @@ impl ApplicationCoordinator {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let scoped_fast_path = tier::initialize(
-            decoder_effort_init,
-            decoder_budget_override_init,
-            current_decode_effort.clone(),
-            resolved_hardware_tier.clone(),
-            decode_window.clone(),
-        )
-        .await;
-
         // Created here (not inside start_autonomous_component) so the FT8
         // pipeline — started earlier in run() — captures a live Sender by
         // value at start_ft8_pipeline time. Creating it later left the FT8
@@ -2687,11 +2678,12 @@ impl ApplicationCoordinator {
             rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),
             )),
-            scoped_fast_path,
+            scoped_fast_path: Arc::new(AtomicBool::new(false)),
             // Seeded above (Task 14 / PAN-164) from `[decoder]`
             // effort/budget_ms and the assumed-then-probed hardware tier;
             // re-published on tier-probe completion by `tier::initialize`.
             decode_window,
+            startup_decode_budget_override: decoder_budget_override_init,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -2737,6 +2729,22 @@ impl ApplicationCoordinator {
         let _enter = span.enter();
 
         info!("Starting Pancetta application");
+
+        // Apply the cached or deferred tier before starting any components.
+        // A due probe runs in the background. Keep it out of construction
+        // so component-only users don't benchmark the receive pipeline.
+        let effort = pancetta_config::DecodeEffort::from_u8(
+            self.current_decode_effort.load(Ordering::Acquire),
+        );
+        self.scoped_fast_path = tier::initialize(
+            effort,
+            self.startup_decode_budget_override,
+            self.current_decode_effort.clone(),
+            self.resolved_hardware_tier.clone(),
+            self.decode_window.clone(),
+        )
+        .await;
+
         self.is_running.store(true, Ordering::Release);
 
         // If WAV playback mode, run the short-circuit pipeline and exit
