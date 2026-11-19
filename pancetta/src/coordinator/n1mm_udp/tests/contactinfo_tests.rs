@@ -195,7 +195,7 @@ fn render(meta: &QsoMetadata, power: u32, attribution: bool) -> String {
         .with_station_power_watts(power)
         .with_attribution_comment(attribution)
         .qso_to_adif(meta, meta.contest_info.as_ref());
-    contactinfo_xml(meta, &adif, power).expect("contactinfo builds")
+    contactinfo_xml(meta, &adif).expect("contactinfo builds")
 }
 
 #[test]
@@ -227,7 +227,8 @@ fn contactinfo_carries_call_band_mode_time_reports_and_grid() {
     assert_eq!(parsed.value("operator"), "K5ARH");
     assert_eq!(parsed.value("stationprefix"), "K5ARH");
     assert_eq!(parsed.value("continent"), "NA");
-    assert_eq!(parsed.value("power"), "100");
+    // PAN-444: `power` is the worked station's power, unknown to Pancetta.
+    assert_eq!(parsed.value("power"), "");
     let id = meta.qso_id.simple().to_string();
     assert_eq!(id.len(), 32);
     assert_eq!(parsed.value("ID"), id);
@@ -248,6 +249,20 @@ fn contactinfo_marks_a_qso_we_called_cq_for_as_a_run_qso() {
     assert_eq!(parse(&render(&meta, 100, false)).value("IsRunQSO"), "1");
     meta.role = QsoRole::Caller;
     assert_eq!(parse(&render(&meta, 100, false)).value("IsRunQSO"), "0");
+}
+
+#[test]
+fn power_stays_empty_while_local_watts_go_to_adif_tx_pwr() {
+    // PAN-444 option A: the local station power never fills N1MM's `power`
+    // (the worked station's power); it is kept in ADIF TX_PWR only.
+    let meta = metadata();
+    let adif = AdifProcessor::new()
+        .with_station_power_watts(100)
+        .qso_to_adif(&meta, None);
+    assert_eq!(adif.tx_pwr, Some(100.0));
+    let parsed = parse(&contactinfo_xml(&meta, &adif).expect("builds"));
+    assert_eq!(parsed.value("power"), "");
+    assert!(parsed.elements.iter().all(|(_, v)| v != "100"));
 }
 
 #[test]
@@ -274,7 +289,7 @@ fn contactinfo_escapes_every_text_value() {
         .with_attribution_comment(true)
         .qso_to_adif(&meta, None);
     let expected = adif.comment.clone().expect("comment").replace('\u{7}', "");
-    let xml = contactinfo_xml(&meta, &adif, 100).expect("builds");
+    let xml = contactinfo_xml(&meta, &adif).expect("builds");
     let parsed = parse(&xml);
     assert_eq!(parsed.value("comment"), expected);
     assert!(parsed.value("comment").contains("Using cqdx.io & Pancetta"));
@@ -349,7 +364,7 @@ fn no_contactinfo_without_their_callsign() {
     meta.their_callsign = None;
     let adif = AdifProcessor::new().qso_to_adif(&meta, None);
     assert_eq!(
-        contactinfo_xml(&meta, &adif, 100),
+        contactinfo_xml(&meta, &adif),
         Err(ContactinfoSkip::NoContraCallsign)
     );
 }
@@ -360,7 +375,7 @@ fn no_contactinfo_when_frequency_is_not_in_a_known_band() {
         let mut meta = metadata();
         meta.frequency = freq;
         let adif = AdifProcessor::new().qso_to_adif(&meta, None);
-        match contactinfo_xml(&meta, &adif, 100) {
+        match contactinfo_xml(&meta, &adif) {
             Err(ContactinfoSkip::FrequencyNotInBand { .. }) => {}
             other => panic!("{freq}: expected FrequencyNotInBand, got {other:?}"),
         }

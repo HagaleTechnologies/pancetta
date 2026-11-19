@@ -49,8 +49,7 @@ the host, and the two result columns hold what was seen.
 Each logged QSO sends one UTF-8 XML document in one UDP datagram. It is built
 from the same record that goes into `qsos.adi`, so call, band, reports, grid
 and comment match the log. Elements appear in the order the N1MM+
-documentation gives. Here is a QSO with K1DEF on 20 m, with
-`[station] power_watts = 100`:
+documentation gives. Here is a QSO with K1DEF on 20 m:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
@@ -80,7 +79,7 @@ documentation gives. Here is a QSO with K1DEF on 20 m, with
   <comment></comment>
   <qth></qth>
   <name></name>
-  <power>100</power>
+  <power></power>
   <misctext></misctext>
   <zone>5</zone>
   <prec></prec>
@@ -117,7 +116,7 @@ Where each value comes from:
 | `snt`, `rcv` | signed SNR such as `-11`, `+03`, or empty | `AdifQso.rst_sent` / `rst_rcvd`, the same text `qsos.adi` holds |
 | `gridsquare` | their grid or empty | `AdifQso.gridsquare` |
 | `comment` | notes, `HOUND`, opt-in attribution, XML-escaped | `AdifQso.comment` |
-| `power` | watts, or empty when 0 | `[station] power_watts` |
+| `power` | always empty | N1MM's `power` is the worked station's power, which Pancetta does not know. `[station] power_watts` goes only to ADIF `TX_PWR` in `qsos.adi` (PAN-444) |
 | `zone` | CQ zone, or `0` when unknown | `AdifQso.cqz`, or the stored `CQZ` the record carries instead |
 | `IsRunQSO` | `1` when we called CQ, else `0` | `metadata.role == QsoRole::Cqer` |
 | `ID` | 32 lowercase hex characters | `metadata.qso_id.simple()` |

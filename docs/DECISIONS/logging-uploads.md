@@ -183,6 +183,11 @@ outside the 13 known bands (as when the rig dial is unknown and the event
 still carries the audio offset), logs one warning and sends nothing; a wrong
 band would land in the operator's other logbook.
 
+`<power>` is always empty. In N1MM it holds the worked station's power, and
+Pancetta never knows that. Putting `[station] power_watts` there would record
+our own watts as theirs in the receiving logger, so local power stays in the
+ADIF `TX_PWR` field only (PAN-444, option A).
+
 Each text value drops the characters XML 1.0 cannot carry and is then
 escaped with `quick_xml::escape::escape`. `quick-xml` was already built for
 `pancetta-dx`, so no new crate enters the build.

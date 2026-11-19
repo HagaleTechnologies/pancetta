@@ -8,7 +8,9 @@
 //! The datagram is built from the same `AdifQso` record that goes into
 //! `qsos.adi` (`AdifProcessor::qso_to_adif` with the station power and
 //! attribution settings), so call, band, reports, grid, zone and comment are
-//! never formatted a second way. `QsoCompleted` is emitted only once the
+//! never formatted a second way. `<power>` is always empty: in N1MM it is the
+//! worked station's power, which Pancetta does not know; our own watts stay in
+//! ADIF `TX_PWR` (PAN-444). `QsoCompleted` is emitted only once the
 //! closing frame aired (PAN-280), so a QSO whose 73 never aired is never
 //! broadcast.
 //!
@@ -103,7 +105,6 @@ fn xml_text(raw: &str) -> String {
 pub(crate) fn contactinfo_xml(
     metadata: &QsoMetadata,
     adif: &AdifQso,
-    station_power_watts: u32,
 ) -> Result<String, ContactinfoSkip> {
     let call = metadata
         .their_callsign
@@ -123,11 +124,6 @@ pub(crate) fn contactinfo_xml(
     let continent = pancetta_core::dxcc::continent_for_callsign(call)
         .map(|c| c.code())
         .unwrap_or("");
-    let power = if station_power_watts == 0 {
-        String::new()
-    } else {
-        station_power_watts.to_string()
-    };
     // A stored CQZ tag wins over the inferred zone: `qso_to_adif` then leaves
     // `cqz` empty and writes the stored value from `additional_fields`.
     let zone = adif
@@ -174,7 +170,10 @@ pub(crate) fn contactinfo_xml(
         ("comment", adif.comment.as_deref().unwrap_or("")),
         ("qth", ""),
         ("name", ""),
-        ("power", &power),
+        // N1MM's `power` is the worked station's power, which Pancetta never
+        // knows, so it stays empty (PAN-444). Our own watts go only to the
+        // ADIF `TX_PWR` field in `qsos.adi`.
+        ("power", ""),
         ("misctext", ""),
         ("zone", &zone),
         ("prec", ""),
@@ -259,7 +258,7 @@ pub(crate) fn start_n1mm_udp_emitter(
                     qso_id, metadata, ..
                 }) => {
                     let adif = processor.qso_to_adif(&metadata, metadata.contest_info.as_ref());
-                    match contactinfo_xml(&metadata, &adif, station_power_watts) {
+                    match contactinfo_xml(&metadata, &adif) {
                         Ok(xml) => match socket.send_to(xml.as_bytes(), destination).await {
                             Ok(_) => debug!(
                                 "N1MM UDP: sent contactinfo for {} ({} bytes) to {}",
