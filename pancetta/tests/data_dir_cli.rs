@@ -503,17 +503,20 @@ fn a_station_keeps_its_logbook_and_state_in_the_data_dir() {
     station.wait_until("QSO component ready", Duration::from_secs(60), || {
         log_text(&dir).contains("QSO component ready (callsign=K1ABC")
     });
-    // The hardware-tier probe writes its cache shortly after start.
-    station.wait_until("tier_cache.json", Duration::from_secs(120), || {
-        dir.join("tier_cache.json").exists()
-    });
-    for name in [
-        "qsos.adi",
-        "qso.db",
-        "tier_cache.json",
-        "pancetta.lock",
-        "pancetta.pid",
-    ] {
+    // The hardware-tier probe writes its cache shortly after start, unless
+    // the host's 1-minute load exceeds its logical cores: then it defers to
+    // a later startup and writes no cache anywhere (PAN-369).
+    station.wait_until(
+        "tier_cache.json or a deferred tier probe",
+        Duration::from_secs(120),
+        || dir.join("tier_cache.json").exists() || log_text(&dir).contains("tier probe deferred:"),
+    );
+    let probe_deferred = log_text(&dir).contains("tier probe deferred:");
+    let mut expected = vec!["qsos.adi", "qso.db", "pancetta.lock", "pancetta.pid"];
+    if !probe_deferred {
+        expected.push("tier_cache.json");
+    }
+    for name in expected {
         assert!(dir.join(name).exists(), "{} missing", name);
     }
     let pid = fs::read_to_string(dir.join("pancetta.pid")).unwrap();

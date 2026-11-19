@@ -101,6 +101,16 @@ chip follows:
 | `Deep` | A generous budget — more passes/candidates, better recall. |
 | `Max` | Runs every decode stage, still bounded by the coordinator's per-slot ceiling (2 s on FT8). |
 
+The hardware tier comes from a startup probe that times a committed off-air
+busy-band FT8 window through the station's own overlapped ft8_lib and native
+passes and merge, cached per host and build in `<data-dir>/tier_cache.json`.
+If a new measurement is due and the 1-minute load average exceeds the logical
+core count, the probe waits for a later startup: Auto uses the previous tier
+measured on this host, or the Standard 250 ms budget when there is none, and
+the station log says why (`tier probe deferred: …`). Windows has no load
+average, so the probe always runs there. The tier thresholds are provisional:
+no MiniPC or Raspberry Pi measurement exists yet.
+
 Pin it at startup via `[decoder]` in `pancetta.toml`
 ([`docs/CONFIG.md`](docs/CONFIG.md)); `e` is the only *live* control. Full
 keybinding reference: [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md), or press

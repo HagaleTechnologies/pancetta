@@ -696,3 +696,97 @@ cargo run --release -p pancetta-research --bin leaderboard   # ranked scorecards
 - `Ctrl-C` an in-progress eval to abort (eval is idempotent; rerun resumes).
 - `./scripts/research-env.sh --pin <slug>` to protect a specific experiment's artifacts from purge.
 - `./scripts/research-env.sh --cleanup` (dry-run) shows what would be purged; add `--execute` to actually remove.
+
+---
+
+## Weekly FT8 benchmark (PAN-369)
+
+`.github/workflows/ft8-benchmark.yml` ("Weekly FT8 benchmark") runs
+`cargo bench -p pancetta-ft8` on one dedicated self-hosted machine and fails
+when any benchmark mean is more than 15 % above the reference stored on that
+machine. Timings are only comparable on the same hardware, so the reference
+lives on the bench host and nowhere else.
+
+Live activation is still pending: no host is registered under the
+`ft8-bench` label yet and no baseline has been seeded. Until both are done,
+no runner picks up the scheduled run.
+
+### Register the bench host
+
+1. Pick one quiet Linux machine that runs nothing else while it benches:
+   no other runners, desktop sessions or cron jobs that load the CPU. Turn off
+   CPU frequency boosting if you can, so results stay stable.
+2. Install the build prerequisites: `git`, `jq`, a C compiler (the
+   `pancetta-ft8` build script compiles the vendored `ft8_lib` C sources) and
+   `curl` (the toolchain step installs `rustup` and the pinned Rust version
+   if they are missing).
+3. Register a GitHub Actions self-hosted runner for this repository with the
+   labels `self-hosted, linux, ft8-bench`, and run it as a service under a
+   dedicated user. Register exactly one host with the `ft8-bench` label: two
+   hosts under one label would compare one machine's timings against
+   another's reference.
+
+### Where the baseline lives
+
+The reference is a copy of Criterion's output tree, stored in the runner
+service user's state directory, outside the checkout:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/pancetta/ft8-bench/<rust-version>/<baseline-revision>
+```
+
+`<rust-version>` comes from `rustc --version` (the version pinned in
+`rust-toolchain.toml`, for example `1.98.0`) and `<baseline-revision>` is the
+workflow's `BASELINE_REVISION` (currently `v1`). This directory must survive
+across runs: do not put it on a tmpfs, and do not let the runner's work-dir
+cleanup or a reinstall of the runner remove it. Each run writes its
+fresh Criterion output to a temporary directory under `$RUNNER_TEMP` and
+deletes it afterwards.
+
+### Seed the reference
+
+Once the host is registered, run Actions → "Weekly FT8 benchmark" → "Run
+workflow" on the default branch with `seed_baseline: true`. The run benches,
+checks that every benchmark produced a valid estimate, and then moves the
+result into place with one atomic rename. A seed run is refused when a
+non-empty baseline already exists at that path, and the job only runs on the
+default branch.
+
+### What the schedule checks
+
+The schedule runs every Monday at 12:00 UTC. A manual dispatch without
+`seed_baseline` makes the same comparison. For every benchmark it prints a
+line like:
+
+```text
+basic_decode/example: baseline 100 ns, current 116 ns (+16.00%)
+```
+
+The run fails when any benchmark's mean is more than 15 % above its baseline
+mean (`current × 100 > baseline × 115`; exactly +15.00 % passes), and names
+each one in a `REGRESSION <benchmark> exceeds +15%` line. It also fails when
+a benchmark is missing from either side, when the current run has a benchmark
+the baseline lacks, or when an estimate is unreadable or not a positive
+number. If no baseline exists at the expected path, the run fails and asks
+for a seed. The schedule never writes the baseline.
+
+To reproduce a comparison by hand on the host:
+
+```sh
+CRITERION_HOME=$(mktemp -d) cargo bench -p pancetta-ft8
+bash scripts/ci/check-criterion-regression.sh <baseline-dir> "$CRITERION_HOME" 15
+```
+
+The comparator's own tests run offline with
+`bash scripts/ci/tests/check-criterion-regression.sh`.
+
+### Hardware or toolchain changes
+
+- **Toolchain bump.** A new pinned Rust version resolves to a new
+  `<rust-version>` directory, so the first scheduled run after the bump fails
+  for lack of a baseline. Seed it as above.
+- **Hardware change, or a deliberate rebaseline** (an accepted slowdown, an
+  OS upgrade that shifts timings). Bump `BASELINE_REVISION` in the workflow
+  (`v1` → `v2`) in a PR, merge it, then seed the new revision.
+- Never edit, overwrite or delete the stored baseline in place to make a
+  failing run pass. Old revisions can stay on disk as history.
