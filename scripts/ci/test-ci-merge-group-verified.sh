@@ -184,8 +184,8 @@ ruby -ryaml -rjson -rtmpdir -rfileutils -ropen3 <<'RUBY'
 
     exec_case = lambda do |name, cache_inputs, runs_pages, jobs_pages, fail_runs: false, fail_jobs: false|
       work = Dir.mktmpdir("case-#{name}-", dir)
-      runs_pages.each_with_index { |p, i| File.write(File.join(work, "runs-page#{i}.json"), JSON.generate(p)) }
-      jobs_pages.each_with_index { |p, i| File.write(File.join(work, "jobs-page#{i}.json"), JSON.generate(p)) }
+      runs_pages.each_with_index { |p, i| File.write(File.join(work, "runs-page#{i}.json"), p.is_a?(String) ? p : JSON.generate(p)) }
+      jobs_pages.each_with_index { |p, i| File.write(File.join(work, "jobs-page#{i}.json"), p.is_a?(String) ? p : JSON.generate(p)) }
       log = File.join(work, 'gh.log')
       out_file = File.join(work, 'output')
       summary = File.join(work, 'summary')
@@ -216,6 +216,8 @@ ruby -ryaml -rjson -rtmpdir -rfileutils -ropen3 <<'RUBY'
       'no-run' => ['false', [runs_page.call(decoys)], [], false, false],
       'gh-fails' => ['false', [runs_page.call([good_run])], [jobs_page.call(verified_jobs)], true, false],
       'jobs-fails' => ['false', [runs_page.call([good_run])], [jobs_page.call(verified_jobs)], false, true],
+      # AC2's unparseable-response shape: a truncated body makes jq fail.
+      'bad-json' => ['false', ['{"total_count": 1, "workflow_runs": ['], [jobs_page.call(verified_jobs)], false, false],
       'cache-inputs' => ['true', [runs_page.call([good_run])], [jobs_page.call(verified_jobs)], false, false]
     }.each do |name, (cache_inputs, runs_pages, jobs_pages, fail_runs, fail_jobs)|
       check.call("case/#{name}") do
@@ -249,6 +251,11 @@ ruby -ryaml -rjson -rtmpdir -rfileutils -ropen3 <<'RUBY'
           expect.call(outputs == { 'verified' => 'false' }, "outputs #{outputs.inspect}")
           expect.call(summary.include?("job lookup for merge-group run #{RUN_ID} failed (fail closed)"),
                       "jobs-failed reason missing: #{summary.inspect}")
+        when 'bad-json'
+          expect.call(calls == [runs_call], "gh calls #{calls.inspect}")
+          expect.call(outputs == { 'verified' => 'false' }, "outputs #{outputs.inspect}")
+          expect.call(summary.include?('could not parse the run list (fail closed)'),
+                      "unparseable-response reason missing: #{summary.inspect}")
         when 'cache-inputs'
           expect.call(calls.empty?, "cache-input change must make no API call: #{calls.inspect}")
           expect.call(outputs == { 'verified' => 'false' }, "outputs #{outputs.inspect}")
