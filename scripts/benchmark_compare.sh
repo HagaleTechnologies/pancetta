@@ -12,19 +12,19 @@ OUTPUT_DIR="benchmarks/results"
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "Building release binary..."
-cargo build --release -p pancetta 2>&1 | tail -3
+echo "Building release-fast binary..."
+cargo build --profile release-fast -p pancetta 2>&1 | tail -3
 
 echo ""
 echo "Running benchmark against: $WAV_DIR"
 echo "======================================="
 
-cargo run --release -p pancetta -- \
+cargo run --profile release-fast -p pancetta -- \
     benchmark-decode "$WAV_DIR" --format json \
     > "$OUTPUT_DIR/benchmark_${TIMESTAMP}.json" 2>/dev/null
 
 # Also print text summary
-cargo run --release -p pancetta -- \
+cargo run --profile release-fast -p pancetta -- \
     benchmark-decode "$WAV_DIR" 2>/dev/null
 
 echo ""
